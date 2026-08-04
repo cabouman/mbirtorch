@@ -1,0 +1,20 @@
+# IDE / harness local state
+.idea/
+.claude/*.json
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# build artifacts
+build/
+dist/
+*.egg-info/
+
+# local outputs (mirrors the mbirjax convention: results/ and output/ are
+# per-machine scratch; numbers that drive decisions go into committed prose)
+output/
+results/
+logs/
+
+# environments
+.venv/

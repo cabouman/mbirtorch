@@ -1,0 +1,14 @@
+name: mbirtorch
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      # torch wheels bundle their accelerator support: CPU+MPS on macOS arm64,
+      # CUDA via the extra-index wheels on linux (see dev_scripts/ notes when the
+      # cluster env lands).  Keep the floor in sync with pyproject.toml.
+      - torch>=2.13
+      - numpy
+      - pytest
+      - pyyaml

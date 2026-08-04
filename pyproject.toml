@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mbirtorch"
+version = "0.0.1"
+description = "High-performance tomographic reconstruction (PyTorch port of mbirjax; Phase 0 scaffold)"
+keywords = ["tomography", "tomographic reconstruction", "computed tomography"]
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "MBIRJAX development team", email = "buzzard@purdue.edu" }
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "License :: OSI Approved :: BSD License",
+    "Operating System :: OS Independent"
+]
+requires-python = ">=3.11"
+dependencies = [
+    # Pinning style follows mbirjax's pyproject: a FLOOR that advances deliberately, plus
+    # known-bad exclusions as they are found (none yet).  The floor is the torch recorded at
+    # Phase 0 start (port_plan.md section 9); re-test on each torch bump via the metrics
+    # harness backend cells before advancing it.
+    "torch>=2.13",  # the Phase 0 recorded version (2.13.0, 2026-08-04)
+    "numpy",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools.packages]
+# Restrict discovery to the mbirtorch package (same rationale as mbirjax: the TOML `find`
+# defaults to namespaces=true, which would sweep __init__.py-less top-level dirs into the
+# wheel).
+find = {include = ["mbirtorch*"]}
+
+[project.urls]
+source = "https://github.com/cabouman/mbirjax"
