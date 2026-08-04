@@ -104,10 +104,21 @@ class TomographyModel(ParameterHandler):
         return vcd_utils.gen_full_indices(recon_shape, use_ror_mask=use_ror_mask)
 
     def forward_project(self, recon, output_sharded=False):
-        """Full-volume forward projection.
+        """
+        Perform a full forward projection at all voxels in the region of
+        reconstruction (the pixels selected by the ROR mask; see
+        :func:`vcd_utils.get_2d_ror_mask`).
 
-        ``output_sharded`` keeps the device tensor (the name matches the
-        mbirjax API; here it simply means "skip the numpy exit").
+        Args:
+            recon (numpy or tensor): 3D volume with shape
+                (num_recon_rows, num_recon_cols, num_recon_slices).
+            output_sharded (bool, optional): If False (default), return a numpy
+                array.  If True, return the device tensor (the mbirjax argument
+                name, kept for API compatibility; here it means "skip the numpy
+                exit").
+
+        Returns:
+            The sinogram, shape (num_views, num_det_rows, num_det_channels).
         """
         recon_shape = self.get_params('recon_shape')
         recon = torch.as_tensor(recon, dtype=torch.float32, device=self.torch_device)
@@ -118,7 +129,20 @@ class TomographyModel(ParameterHandler):
         return sinogram if output_sharded else sinogram.cpu().numpy()
 
     def back_project(self, sinogram, output_sharded=False):
-        """Full-volume back projection (zeros outside the ROR mask)."""
+        """
+        Perform a full back projection at all voxels in the region of
+        reconstruction (zeros outside the ROR mask).
+
+        Args:
+            sinogram (numpy or tensor): 3D array with shape
+                (num_views, num_det_rows, num_det_channels).
+            output_sharded (bool, optional): If False (default), return a numpy
+                array.  If True, return the device tensor.
+
+        Returns:
+            The back projection, shape (num_recon_rows, num_recon_cols,
+            num_recon_slices).
+        """
         recon_shape = self.get_params('recon_shape')
         sinogram = torch.as_tensor(sinogram, dtype=torch.float32, device=self.torch_device)
         indices = torch.as_tensor(self._full_indices(), dtype=torch.int64,
@@ -131,8 +155,25 @@ class TomographyModel(ParameterHandler):
         return recon if output_sharded else recon.cpu().numpy()
 
     def compute_hessian_diagonal(self, weights=None, output_sharded=False):
-        """Back projection of the weights with squared coefficients (all pixels,
-        matching mbirjax's arange over the full grid)."""
+        """
+        Computes the diagonal of the Hessian matrix, which is computed by doing
+        a backprojection of the weight matrix except using the square of the
+        coefficients in the backprojection to a given voxel.  If weights is not
+        None, it must be an array with the same shape as the sinogram; if None,
+        constant weights of 1 are used.
+
+        The indices cover ALL pixels of the grid (matching mbirjax's arange over
+        the full grid, not the ROR-masked set).
+
+        Args:
+            weights (numpy or tensor, optional): 3D positive weights with the
+                same shape as the sinogram.  Defaults to all 1s.
+            output_sharded (bool, optional): If False (default), return numpy;
+                if True, return the device tensor.
+
+        Returns:
+            Diagonal of the Hessian matrix with the same shape as the recon.
+        """
         sinogram_shape, recon_shape = self.get_params(['sinogram_shape', 'recon_shape'])
         if weights is None:
             weights = torch.ones(tuple(sinogram_shape), dtype=torch.float32,
@@ -152,12 +193,34 @@ class TomographyModel(ParameterHandler):
 
     # ── auto-regularization (verbatim-math numpy ports) ───────────────────────
     def auto_set_regularization_params(self, sinogram, weights=None):
+        """
+        Automatically sets the regularization parameters (sigma_y, sigma_x, and
+        sigma_prox) used in MBIR reconstruction based on the provided sinogram
+        and optional weights.
+
+        Args:
+            sinogram (ndarray or tensor): 3D sinogram with shape
+                (num_views, num_det_rows, num_det_channels).
+            weights (ndarray or tensor, optional): 3D weights array with the same
+                shape as the sinogram.  Defaults to all 1s.
+
+        Returns:
+            dict containing the parameters sigma_y, sigma_x, sigma_prox.
+
+        Notes:
+            The method adjusts the regularization parameters only if
+            `auto_regularize_flag` is set to True within the model's parameters.
+            Inputs are cast to numpy before calculation (the statistics run on
+            the host, on a view subsample, exactly as in mbirjax).
+        """
         # Host-side statistics: accept tensors (any device) or numpy.
         if torch.is_tensor(sinogram):
             sinogram = sinogram.cpu().numpy()
         if torch.is_tensor(weights):
             weights = weights.cpu().numpy()
         if self.get_params('auto_regularize_flag'):
+            # Estimate the regularization stats from a view subsample (see
+            # subsample_views) -- both cheap and independent of sinogram size.
             num_real_views = self.get_params('sinogram_shape')[0]
             small_sinogram = self.subsample_views(sinogram, num_real_views=num_real_views)
             small_weights = 1 if weights is None else self.subsample_views(
@@ -176,7 +239,19 @@ class TomographyModel(ParameterHandler):
         return dict(zip(_AUTO_REGULARIZATION_PARAM_NAMES, values))
 
     def _check_lateral_truncation(self, sino_indicator):
+        """Warn if the sinogram support reaches the detector's edge channels
+        (lateral FoV truncation).
+
+        Args:
+            sino_indicator (ndarray): binary support indicator from
+                :meth:`_get_sino_indicator`, shaped (views, rows, channels) --
+                typically view-subsampled.
+        """
         if np.all(sino_indicator):
+            # An all-ones indicator is either the undeterminable-background
+            # fallback (which has already warned on its own) or support
+            # genuinely everywhere -- indistinguishable here, so skip rather
+            # than risk a spurious warning on the fallback.
             return
         edge_frac = float(np.mean(np.logical_or(sino_indicator[:, :, 0],
                                                 sino_indicator[:, :, -1])))
@@ -187,33 +262,95 @@ class TomographyModel(ParameterHandler):
                 f"scale_recon_shape(s, s) where s >= 1.1 to improve image quality.")
 
     def auto_set_sigma_y(self, sinogram, sino_indicator, weights=1):
+        """
+        Sets the value of the parameter sigma_y for use in MBIR reconstruction.
+
+        Args:
+            sinogram (ndarray): 3D sinogram with shape
+                (num_views, num_det_rows, num_det_channels), typically
+                view-subsampled.
+            sino_indicator (ndarray): a binary mask that indicates the region of
+                sinogram support; same shape as sinogram.
+            weights (ndarray, optional): 3D positive weights with the same shape
+                as the sinogram.  Defaults to all 1s.
+        """
         snr_db = self.get_params('snr_db')
         magnification = self.get_magnification()
         delta_voxel, delta_det_channel = self.get_params(['delta_voxel', 'delta_det_channel'])
 
+        # Compute RMS value of sinogram excluding empty space
         signal_rms = float(np.average(weights * np.asarray(sinogram) ** 2, None,
                                       sino_indicator) ** 0.5)
+
+        # Convert snr to relative noise standard deviation
         rel_noise_std = 10 ** (-snr_db / 20)
+
+        # This section adjusts the regularization when the reconstruction
+        # resolution is greater or less than normal.  For normal resolution,
+        # pixel_pitch_relative_to_default = 1.0; low resolution >> 1.0; high
+        # resolution << 1.0.  The default pixel pitch is the detector pixel
+        # pitch in the recon plane given the magnification.
         default_pixel_pitch = delta_det_channel / magnification
         pixel_pitch_relative_to_default = delta_voxel / default_pixel_pitch
 
+        # Compute sigma_y and scale by relative pixel pitch
         sigma_y = np.float32(rel_noise_std * signal_rms *
                              (pixel_pitch_relative_to_default ** 0.5))
         self.set_params(no_warning=True, sigma_y=float(sigma_y), auto_regularize_flag=True)
 
     def auto_set_sigma_x(self, recon_std):
+        """
+        Compute the automatic value of ``sigma_x`` for use in MBIR reconstruction
+        with the qGGMRF prior.
+
+        Args:
+            recon_std (float): Estimated standard deviation of the reconstruction
+                from :meth:`_get_estimate_of_recon_std`.
+        """
         sharpness = self.get_params('sharpness')
+        # Compute sigma_x as a fraction of the typical recon value.
+        # 0.2 is an empirically determined constant.
         sigma_x = np.float32(0.2 * (2 ** sharpness) * recon_std)
         self.set_params(no_warning=True, sigma_x=float(sigma_x), auto_regularize_flag=True)
 
     def auto_set_sigma_prox(self, recon_std):
+        """
+        Compute the automatic value of ``sigma_prox`` for use in MBIR
+        reconstruction with the proximal map prior.
+
+        Args:
+            recon_std (float): Estimated standard deviation of the reconstruction
+                from :meth:`_get_estimate_of_recon_std`.
+        """
         sharpness = self.get_params('sharpness')
+        # Compute sigma_prox as a fraction of the typical recon value.
+        # 0.2 is an empirically determined constant.
         sigma_prox = np.float32(0.2 * (2 ** sharpness) * recon_std)
         self.set_params(no_warning=True, sigma_prox=float(sigma_prox),
                         auto_regularize_flag=True)
 
     @staticmethod
     def subsample_views(array, max_views_to_use=20, num_real_views=None):
+        """Return an evenly-spaced subsample of approximately ``max_views_to_use``
+        views (axis 0) as a host numpy array.
+
+        Statistical sinogram estimates -- the support indicator, the RMS /
+        typical value, the auto-regularization stats -- do not need every view,
+        so they are computed on such a subsample.  Callers that need to
+        subsample a companion array (e.g. weights) the same way just call this
+        again with the same arguments (the stride depends only on the view
+        count).
+
+        Args:
+            array (ndarray or tensor): array batched along axis 0 (views).
+            max_views_to_use (int, optional): approximate number of views to
+                retain.  Defaults to 20.
+            num_real_views (int or None, optional): if set, sample only
+                ``array[:num_real_views]``.
+
+        Returns:
+            numpy.ndarray: the view-subsampled array on the host.
+        """
         num_views = array.shape[0] if num_real_views is None else num_real_views
         max_views_to_use = min(max_views_to_use, num_views)
         step_size = max(num_views // max_views_to_use, 1)
@@ -221,12 +358,31 @@ class TomographyModel(ParameterHandler):
 
     @staticmethod
     def _get_sino_indicator(sinogram, verbose=1):
+        """
+        Compute a binary mask that indicates the region of sinogram support.
+
+        Typically called on a view SUBSAMPLE (see :meth:`subsample_views`), not
+        the full sinogram: this runs several host-side reductions.
+
+        Args:
+            sinogram (ndarray): 3D sinogram with shape
+                (num_views, num_det_rows, num_det_channels).
+            verbose (int, optional): Verbosity level.  Defaults to 1.
+
+        Returns:
+            (ndarray): int8 support indicator with the same shape as the input.
+        """
+        # Sometimes users accidentally create complex sinograms when they take
+        # the -log.  So we check for complex numbers or NaNs and raise an error.
         sinogram = np.asarray(sinogram)
         if np.iscomplexobj(sinogram):
             raise TypeError("sinogram must be real-valued; got complex dtype.")
         if not np.isfinite(sinogram).all():
             raise ValueError("sinogram contains NaN and/or Inf values.")
 
+        # Compute an initial threshold that results in a non-empty region that
+        # contains no background: the background cluster's right boundary plus
+        # one cluster width of safety.
         left, right = vcd_utils.estimate_background_cluster_boundaries(sinogram)
         threshold = right + (right - left)
 
@@ -242,30 +398,80 @@ class TomographyModel(ParameterHandler):
                               'regularization.\n')
             return np.ones_like(sinogram, dtype=np.int8)
 
+        # Compute a final threshold that is a fraction of the median of the
+        # object region.
         object_level = 0.25
         object_median = np.median(sinogram[sinogram >= threshold])
         object_threshold = object_level * object_median
         return np.int8(sinogram >= object_threshold)
 
     def _get_estimate_of_recon_std(self, sinogram, sino_indicator):
+        """
+        Estimate the standard deviation of the reconstruction from the sinogram.
+        This is used to scale sigma_prox and sigma_x in MBIR reconstruction.
+
+        Args:
+            sinogram (ndarray): 3D sinogram with shape
+                (num_views, num_det_rows, num_det_channels), typically
+                view-subsampled.
+            sino_indicator (ndarray): a binary mask that indicates the region of
+                sinogram support; same shape as sinogram.
+        """
         delta_det_channel = self.get_params('delta_det_channel')
         delta_voxel = self.get_params('delta_voxel')
         recon_shape = self.get_params('recon_shape')
         magnification = self.get_magnification()
         num_det_channels = sinogram.shape[-1]
 
+        # Compute the typical magnitude of a sinogram value
         typical_sinogram_value = np.average(np.abs(sinogram), weights=sino_indicator)
+
+        # Compute a typical projection path length based on the soft minimum of
+        # the recon width and height
         typical_path_length_space = (2 * recon_shape[0] * recon_shape[1]) / (
                 recon_shape[0] + recon_shape[1]) * delta_voxel
+
+        # Compute a typical projection path length based on the detector column width
         typical_path_length_sino = num_det_channels * delta_det_channel / magnification
+
+        # Compute a typical projection path as the minimum of the two estimates
         typical_path_length = np.minimum(typical_path_length_space, typical_path_length_sino)
+
+        # Compute a typical recon value by dividing the average sinogram value by
+        # a typical projection path length
         return typical_sinogram_value / typical_path_length
 
     # ── direct recon (FBP) machinery ──────────────────────────────────────────
     def _apply_direct_recon_filter(self, sinogram, filter_name, filter_scale,
                                    output_sharded=False):
-        """Scale the (tiny) filter by filter_scale * pi / num_views, then filter
-        every detector row ('valid'); the scalar fold keeps everything f32."""
+        """Shared FBP row-filter for direct reconstruction.
+
+        Scales the recon filter by ``filter_scale * pi / num_views`` -- folded
+        into the (tiny) filter array, NOT applied as an out-of-place
+        full-sinogram multiply (which would promote f32 -> f64 via np.pi and
+        ~double peak memory -- the mbirjax lesson carried over).
+
+        Equally-spaced-angle assumption: the ``pi / num_views`` factor is the
+        angular quadrature weight ``d(theta)`` of the backprojection sum that
+        approximates the FBP angular integral, so it assumes the views are
+        EQUALLY SPACED over the conventional full angular range (the [0, pi)
+        period for parallel beam, via the conjugate-ray symmetry).  For
+        nonuniformly-spaced angles, limited-angle scans, or short scans this
+        scalar is only approximate -- acceptable for direct recon as a quick
+        analytic image or an MBIR initializer (iterative ``recon()`` absorbs a
+        global angular mis-weighting in a few iterations); a STANDALONE direct
+        recon on such data is not quantitatively accurate -- prefer ``recon()``.
+
+        Args:
+            sinogram: (num_views, num_rows, num_channels); numpy or tensor.
+            filter_name (str): filter for generate_direct_recon_filter ('ramp').
+            filter_scale (float): geometry-specific filter scaling
+                (FBP: 1/(delta_voxel * delta_voxel_row)).
+            output_sharded (bool): True returns the device tensor; False numpy.
+
+        Returns:
+            The filtered sinogram.
+        """
         sinogram = torch.as_tensor(sinogram, dtype=torch.float32, device=self.torch_device)
         num_channels = sinogram.shape[2]
         num_views = self.get_params('sinogram_shape')[0]
@@ -279,6 +485,25 @@ class TomographyModel(ParameterHandler):
     # ── loss / stats (mirrors get_forward_model_loss + _vcd_iteration_stats) ──
     @staticmethod
     def get_forward_model_loss(error_sinogram, sigma_y, weights=None, normalize=True):
+        """
+        Calculate the loss function for the forward model from the error
+        sinogram and weights, where
+        error_sinogram = measured_sinogram - forward_proj(recon).
+
+        Args:
+            error_sinogram (tensor): 3D error sinogram with shape
+                (num_views, num_det_rows, num_det_channels).
+            sigma_y (float): Estimate obtained from auto_set_sigma_y or
+                get_params('sigma_y').
+            weights (tensor, optional): 3D positive weights with the same shape
+                as the sinogram.  Defaults to all 1s.
+            normalize (bool, optional, default=True): If True, return the
+                weight-normalized RMSE form; otherwise the unnormalized
+                weighted squared error.
+
+        Returns:
+            The loss as a device scalar tensor.
+        """
         if weights is None:
             weights = 1
             avg_weight = 1
@@ -305,6 +530,23 @@ class TomographyModel(ParameterHandler):
 
     def get_forward_lin_quad(self, weighted_error_sinogram, delta_sinogram, weights,
                              fm_constant, const_weights):
+        """
+        Compute forward model terms used in line-search updates:
+        ``forward_linear = fm_constant * sum(weighted_error_sinogram * delta_sinogram)``
+        and
+        ``forward_quadratic = fm_constant * sum(delta_sinogram^2 * weights)``.
+
+        Args:
+            weighted_error_sinogram (tensor): weights * error_sinogram (or the
+                error sinogram itself under constant weights).
+            delta_sinogram (tensor): forward projection of the update direction.
+            weights (tensor or constant): the sinogram weights.
+            fm_constant (float): 1 / sigma_y^2.
+            const_weights (bool): True if the weights are the constant 1.
+
+        Returns:
+            tuple: ``(forward_linear, forward_quadratic)`` as device scalars.
+        """
         forward_linear = fm_constant * torch.sum(weighted_error_sinogram * delta_sinogram)
         if const_weights:
             forward_quadratic = fm_constant * torch.sum(delta_sinogram * delta_sinogram)
@@ -314,9 +556,52 @@ class TomographyModel(ParameterHandler):
         return forward_linear, forward_quadratic
 
     # ── the VCD engine ────────────────────────────────────────────────────────
+    def _get_update_direction(self, forward_grad, prior_grad, forward_hess,
+                              prior_hess, pixel_indices):
+        """Return the update direction for one subset of pixels.
+
+        The base implementation is the preconditioned gradient:
+            update_direction = -(forward_grad + prior_grad) / (forward_hess + prior_hess)
+        Geometry subclasses may override this to apply a different preconditioner
+        (the mbirjax preconditioning seam, kept for architectural parity).
+
+        Rule for overrides (from mbirjax): to preserve the cost's minimizers,
+        this function must return a linear positive definite transformation of
+        the total gradient, update_direction = -M (forward_grad + prior_grad)
+        with M positive definite.
+
+        Args:
+            forward_grad: data-term gradient, shape (num_subset_pixels, num_slices).
+            prior_grad: prior gradient, same shape.
+            forward_hess: data-term Hessian diagonal, same shape.
+            prior_hess: prior curvature, same shape (a scalar on the
+                proximal-map path).
+            pixel_indices: flat in-plane indices of this subset.  Unused by the
+                base implementation; spatially-aware overrides may use it.
+
+        Returns:
+            The update direction, same shape as forward_grad.
+        """
+        return -((forward_grad + prior_grad) / (forward_hess + prior_hess))
+
     def create_vcd_subset_updater(self, fm_hessian, weights, prox_input=None):
-        """One-subset update closure; mirrors mbirjax's create_vcd_subset_updater
-        with in-place torch state updates replacing donation."""
+        """
+        Create a function to update a subset of pixels in the recon and error
+        sinogram (mirrors mbirjax's create_vcd_subset_updater, with in-place
+        torch state updates replacing jax's buffer donation).
+
+        Args:
+            fm_hessian (tensor): (num_pixels, num_slices) diagonal of the
+                Hessian for the forward model loss.
+            weights (tensor or 1): 3D positive weights with the same shape as
+                the sinogram, or the constant 1.
+            prox_input (tensor, optional): input for the proximal map, flattened
+                to (num_pixels, num_slices).
+
+        Returns:
+            (callable) vcd_subset_updater(flat_recon, error_sinogram,
+            pixel_indices) that updates the recon and error sinogram in place.
+        """
         positivity_flag = self.get_params('positivity_flag')
         fm_constant = 1.0 / (self.get_params('sigma_y') ** 2.0)
         qggmrf_nbr_wts, sigma_x, p, q, T = self.get_params(
@@ -332,42 +617,80 @@ class TomographyModel(ParameterHandler):
             raise ValueError('Constant weights must have value 1.')
 
         def vcd_subset_updater(flat_recon, error_sinogram, pixel_indices):
-            # Prior gradient/Hessian at the subset's cylinders.
+            """
+            Calculate an iteration of the VCD algorithm on a single subset of the
+            partition.  Each application should return a better reconstruction.
+
+            The combination (error_sinogram, recon) forms an overcomplete state
+            that makes computation efficient, maintained under the invariant
+                error_sinogram = measured_sinogram - forward_proj(recon).
+
+            Args:
+                flat_recon (tensor): (num_recon_rows x num_recon_cols,
+                    num_recon_slices); updated IN PLACE.
+                error_sinogram (tensor): (num_views, num_det_rows,
+                    num_det_channels); updated IN PLACE.
+                pixel_indices (int tensor): 1D array of pixel indices.
+
+            Returns:
+                flat_recon, error_sinogram, ell1_for_subset, alpha_for_subset,
+                delta_sumsq_subset: the state (updated to reduce the overall
+                loss), the L1 norm of this subset's recon change, the relative
+                step size, and the per-slice sum of squared update values.
+            """
+            # Compute the prior model gradient and Hessian (i.e., second
+            # derivative) terms at each pixel in the index set.
             if prox_input is None:
+                # qGGMRF prior.
                 prior_grad, prior_hess = _qggmrf.qggmrf_gradient_and_hessian_at_indices(
                     flat_recon, recon_shape, pixel_indices, qggmrf_params)
             else:
+                # Proximal map prior: pointwise, so the Hessian is a scalar.
                 prior_hess = 1 / (sigma_prox ** 2)
                 prior_grad = _qggmrf.prox_gradient_at_indices(
                     flat_recon, prox_input, pixel_indices, sigma_prox)
 
+            # Compute the forward model gradient and Hessian at each pixel in the
+            # index set.  Assumes Loss(delta) =
+            # 1/(2 sigma_y^2) || error_sinogram - A delta ||_weights^2.
             weighted_error_sinogram = (error_sinogram if const_weights
                                        else weights * error_sinogram)
 
-            # Forward-model gradient and Hessian on the subset.
+            # Back project to get the gradient; note fm_constant = 1/sigma_y^2.
             forward_grad = -fm_constant * self.sparse_back_project(
                 weighted_error_sinogram, pixel_indices)
+
+            # Get the forward Hessian for this subset.
             forward_hess = fm_constant * fm_hessian[pixel_indices]
 
-            # Diagonally-preconditioned direction.
-            delta_recon_at_indices = -((forward_grad + prior_grad)
-                                       / (forward_hess + prior_hess))
+            # Compute the update direction in the recon domain -- the per-subset
+            # preconditioning seam (base: the diagonally-preconditioned
+            # direction; geometry models may override _get_update_direction).
+            delta_recon_at_indices = self._get_update_direction(
+                forward_grad, prior_grad, forward_hess, prior_hess, pixel_indices)
 
+            # Compute delta^T \nabla Q(x_hat; x'=x_hat) for use in finding alpha.
             prior_linear = torch.sum(prior_grad * delta_recon_at_indices)
+
+            # Estimated upper bound for the prior Hessian term.
             prior_quadratic_approx = torch.sum(prior_hess * delta_recon_at_indices ** 2)
 
-            # Sinogram-domain direction and the on-device line search.
+            # Compute the update direction in the sinogram domain.
             delta_sinogram = self.sparse_forward_project(delta_recon_at_indices,
                                                          pixel_indices)
             forward_linear, forward_quadratic = self.get_forward_lin_quad(
                 weighted_error_sinogram, delta_sinogram, weights, fm_constant,
                 const_weights)
 
+            # Compute the optimal update step.  The line search stays ON DEVICE
+            # (alpha is a scalar tensor; no host synchronization per subset).
             alpha_numerator = forward_linear - prior_linear
             alpha_denominator = forward_quadratic + prior_quadratic_approx + _F32_EPS
             alpha = alpha_numerator / alpha_denominator
             alpha = torch.clamp(alpha, _F32_EPS, max_alpha)
 
+            # Enforce the positivity constraint if desired: clip updates so that
+            # recon + alpha * delta >= 0, then recompute the sinogram projection.
             if positivity_flag is True:
                 recon_at_indices = flat_recon[pixel_indices]
                 pos_constant = 1.0 / (alpha + _F32_EPS)
@@ -376,11 +699,19 @@ class TomographyModel(ParameterHandler):
                 delta_sinogram = self.sparse_forward_project(delta_recon_at_indices,
                                                              pixel_indices)
 
-            # Apply the update in place (the donation-free torch idiom).
+            # Perform sparse updates at the index locations, IN PLACE.  In jax
+            # this required buffer donation (out-of-place per-subset updates
+            # leak via sharded-array reference cycles); in torch a plain
+            # index_add_ / sub_ is the whole mechanism.  The per-slice sum of
+            # squared updates is the per-slice convergence diagnostic
+            # (delta_norm_per_slice in the recon dict).
             delta_recon_at_indices = alpha * delta_recon_at_indices
             flat_recon.index_add_(0, pixel_indices, delta_recon_at_indices)
             delta_sumsq_subset = torch.sum(
                 delta_recon_at_indices * delta_recon_at_indices, dim=0)
+
+            # Update the error sinogram:
+            # error_sinogram <- error_sinogram - alpha * delta_sinogram.
             error_sinogram.sub_(alpha * delta_sinogram)
 
             ell1_for_subset = torch.sum(torch.abs(delta_recon_at_indices))
@@ -391,8 +722,32 @@ class TomographyModel(ParameterHandler):
 
     def vcd_partition_iterator(self, vcd_subset_updater, flat_recon, error_sinogram,
                                partition):
-        """One full pass over the partition's subsets in np.random order (the
-        same RNG call as mbirjax, for trace parity)."""
+        """
+        Calculate a full iteration of the VCD algorithm by scanning over the
+        subsets of the partition.  Each iteration should return a better
+        reconstruction.  The error_sinogram should always satisfy
+        error_sinogram = measured_sinogram - forward_proj(recon).
+
+        Args:
+            vcd_subset_updater (callable): function to apply to each subset.
+            flat_recon (tensor): (num_recon_rows x num_recon_cols,
+                num_recon_slices); updated in place across subsets.
+            error_sinogram (tensor): (num_views, num_det_rows,
+                num_det_channels); updated in place across subsets.
+            partition (int tensor): 2D array where partition[subset_index] gives
+                a 1D array of pixel indices.
+
+        Returns:
+            (flat_recon, error_sinogram, ell1_for_partition, alpha,
+            delta_sumsq_partition): the updated state; the summed L1 recon
+            change over all subsets; alpha averaged over the subsets; and the
+            per-slice sum of squared update values accumulated over the
+            partition's subsets -- since the subsets tile the in-mask pixels,
+            this is the squared per-slice L2 norm of the iteration's total
+            update.
+        """
+        # Loop over the subsets of the partition, using random subset_indices to
+        # order them (the same np.random call as mbirjax, for trace parity).
         ell1_for_partition = 0
         alpha_sum = 0
         delta_sumsq_partition = 0
@@ -412,8 +767,35 @@ class TomographyModel(ParameterHandler):
     def vcd_recon(self, sinogram, partitions, partition_sequence,
                   stop_threshold_change_pct, weights=None, init_recon=None,
                   prox_input=None, first_iteration=0):
-        """The VCD loop for a given set of partitions and sequence (single
-        device; mirrors mbirjax.vcd_recon minus sharding and checkpointing)."""
+        """
+        Perform MBIR reconstruction using the Multi-Granular Vector Coordinate
+        Descent algorithm for a given set of partitions and a prescribed
+        partition sequence (single device; mirrors mbirjax.vcd_recon minus
+        sharding and checkpoint resume).
+
+        Args:
+            sinogram (numpy or tensor): 3D sinogram data with shape
+                (num_views, num_det_rows, num_det_channels).
+            partitions (list): K partitions, each an (N_subsets, N_indices)
+                integer index tensor of voxels to be updated in a flattened recon.
+            partition_sequence (ndarray): sequence of integers specifying which
+                partition is used at each iteration.
+            stop_threshold_change_pct (float): stop when the NMAE percent change
+                from one iteration to the next falls below this value.
+            weights (numpy or tensor, optional): 3D positive weights with the
+                same shape as the sinogram.  Defaults to all 1s.
+            init_recon (array or int or None): initial reconstruction.  If None,
+                direct_recon (FBP) is used.  An int gives a constant volume.
+            prox_input (array, optional): reconstruction input to a proximal map.
+            first_iteration (int, optional): iteration offset for restarts (used
+                only in the printed iteration labels here).
+
+        Returns:
+            (recon, recon_stats): the 3D reconstruction tensor and a tuple of
+            per-iteration stats (fm_rmse, pm_loss, nmae_update, alpha_values,
+            delta_norm_per_slice), where nmae_update is
+            ||recon(i+1) - recon(i)||_1 / ||recon(i+1)||_1.
+        """
         self.verify_valid_params()
         dev = self.torch_device
         recon_shape = self.get_params('recon_shape')
@@ -440,8 +822,11 @@ class TomographyModel(ParameterHandler):
             raise ValueError(f"init_recon does not have the correct shape. Expected "
                              f"{tuple(recon_shape)}, got {tuple(init_recon.shape)}.")
 
-        # Initialize the error sinogram, scaling the init to the sinogram:
-        # alpha* = argmin ||y - alpha A x0||_W^2.
+        # Initialize the error sinogram.  We find the optimal alpha to minimize
+        # (1/2) ||y - alpha A x0||_weights^2, where y is the sinogram and x0 is
+        # init_recon, and scale both the error sinogram and the init by it.
+        # The scaling applies only to the default (direct-recon) init; a
+        # user-supplied init_recon is used as-is (scale_recon_to_sinogram).
         self.logger.info('Initializing error sinogram')
         error_sinogram = self.forward_project(init_recon, output_sharded=True)
         weighted_error_sinogram = (error_sinogram if constant_weights
@@ -461,6 +846,9 @@ class TomographyModel(ParameterHandler):
 
         verbose, sigma_y = self.get_params(['verbose', 'sigma_y'])
 
+        # Initialize the diagonal of the Hessian of the forward model: the back
+        # projection of the weights with squared coefficients (constant weights
+        # use an all-ones sinogram).
         self.logger.info('Computing Hessian diagonal')
         hess_weights = None if constant_weights else weights
         fm_hessian = self.compute_hessian_diagonal(weights=hess_weights,
@@ -516,7 +904,18 @@ class TomographyModel(ParameterHandler):
 
     def initialize_recon(self, sinogram, weights=None, init_recon=None,
                          max_iterations=15, first_iteration=0):
-        """Partitions, sequence, input checks, and auto-regularization."""
+        """
+        Do the parameter initialization needed for recon: generate the set of
+        voxel partitions and the partition sequence, validate the inputs, and
+        run auto-regularization.
+
+        Args:
+            See :meth:`recon` for arguments.
+
+        Returns:
+            sinogram, weights, init_recon, partitions, partition_sequence,
+            granularity, regularization_params
+        """
         recon_shape, granularity, use_ror_mask = self.get_params(
             ['recon_shape', 'granularity', 'use_ror_mask'])
         partitions = vcd_utils.gen_set_of_pixel_partitions(
@@ -551,14 +950,40 @@ class TomographyModel(ParameterHandler):
 
     def recon(self, sinogram, weights=None, init_recon=None, max_iterations=15,
               stop_threshold_change_pct=0.2, first_iteration=0):
-        """MBIR reconstruction via multi-granular VCD (see mbirjax.recon).
+        """
+        Perform MBIR reconstruction using the Multi-Granular Vector Coordinate
+        Descent algorithm.  This function takes care of generating its own
+        partitions and partition sequence.
 
-        Reproducibility: partitions and subset order draw from numpy's global
-        RNG; call ``np.random.seed(seed)`` first for a reproducible run.
+        To restart a recon using the same partition sequence, set
+        first_iteration to the number of iterations completed so far and set
+        init_recon to the output of the previous recon; this continues the
+        partition sequence from where the previous recon left off.
+
+        Reproducibility note: the pixel partitions are drawn from numpy's
+        global random number generator, so reconstructions vary slightly from
+        run to run.  For a reproducible result, call ``np.random.seed(seed)``
+        before calling this method.
+
+        Args:
+            sinogram (numpy or tensor): 3D sinogram data with shape
+                (num_views, num_det_rows, num_det_channels).
+            weights (numpy or tensor, optional): 3D positive weights with the
+                same shape as the sinogram.  Defaults to None (all 1s).
+            init_recon (array, int, or None, optional): initial reconstruction.
+                If None, direct_recon is called with default arguments.
+            max_iterations (int, optional): maximum number of VCD iterations.
+            stop_threshold_change_pct (float, optional): stop when
+                100 * ||delta_recon||_1 / ||recon||_1 between iterations drops
+                below this value.  Defaults to 0.2; set 0 to guarantee exactly
+                max_iterations.
+            first_iteration (int, optional): the number of iterations previously
+                completed when restarting a recon.  Defaults to 0.
 
         Returns:
-            (recon, recon_dict): numpy volume and a dict with 'recon_params'
-            and 'model_params'.
+            (recon, recon_dict): the numpy reconstruction volume, and a dict
+            with entries 'recon_params' (per-iteration traces and settings) and
+            'model_params' (a snapshot of the model parameters).
         """
         (sinogram, weights, init_recon, partitions, partition_sequence, granularity,
          regularization_params) = self.initialize_recon(

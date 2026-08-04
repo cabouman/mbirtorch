@@ -16,13 +16,39 @@ _F32 = torch.float32
 
 
 class ParallelBeamModel(TomographyModel):
-    """Parallel-beam projection model.
+    """
+    A class designed for handling forward and backward projections in a parallel
+    beam geometry, extending :class:`TomographyModel`.  This class offers
+    specialized methods and parameters tailored for parallel beam setups.
+
+    This class inherits all methods and properties from TomographyModel and
+    overrides some to suit parallel beam geometrical requirements.  See the
+    parent class for standard methods like setting parameters and performing
+    projections and reconstructions.
+
+    Parameters not included in the constructor can be set using the set_params
+    method of TomographyModel.
 
     Args:
-        sinogram_shape (tuple): (num_views, num_det_rows, num_det_channels).
-        angles (array): 1D projection angles in radians.
-        device (str): 'auto' (cuda > mps > cpu), or an explicit torch device.
-        view_batch_size (int): views per eager kernel batch (the memory knob).
+        sinogram_shape (tuple):
+            Shape of the sinogram as a tuple in the form (views, rows, channels),
+            where 'views' is the number of different projection angles, 'rows'
+            correspond to the number of detector rows, and 'channels' index
+            columns of the detector that are assumed to be aligned with the
+            rotation axis.
+        angles (ndarray):
+            A 1D array of projection angles, in radians, specifying the angle of
+            each projection relative to the origin.
+        device (str): 'auto' (cuda > mps > cpu), or an explicit torch device
+            string.  Device selection is an execution-environment choice, not a
+            saved model parameter (the mbirjax configure_devices rationale).
+        view_batch_size (int): views per eager kernel batch (the single
+            memory/speed knob of the Phase 1 drivers).
+
+    Example:
+        >>> import numpy as np, mbirtorch
+        >>> angles = np.linspace(0, np.pi, 180, endpoint=False)
+        >>> model = mbirtorch.ParallelBeamModel((180, 256, 10), angles)
     """
 
     def __init__(self, sinogram_shape, angles, device='auto', view_batch_size=64):
@@ -32,10 +58,20 @@ class ParallelBeamModel(TomographyModel):
                          angles=angles)
 
     def get_magnification(self):
+        """
+        Compute the scale factor from a voxel at iso (at the origin on the center
+        of rotation) to its projection on the detector.  For parallel beam, this
+        is 1, but it may be parameter-dependent for other geometries.
+
+        Returns:
+            (float): magnification
+        """
         return 1.0
 
     def get_psf_radius(self):
-        """Integer radius of the channel psf, as in mbirjax."""
+        """Computes the integer radius of the PSF kernel for parallel beam
+        projection: the maximum number of detector channels on either side of
+        the center channel hit by a voxel."""
         delta_det_channel, delta_voxel, voxel_row_aspect = self.get_params(
             ['delta_det_channel', 'delta_voxel', 'voxel_row_aspect'])
         delta_voxel_row = voxel_row_aspect * delta_voxel
@@ -43,8 +79,11 @@ class ParallelBeamModel(TomographyModel):
         return int(np.ceil(np.ceil(max_footprint / delta_det_channel) / 2))
 
     def auto_set_recon_geometry(self, no_compile=False, no_warning=False):
-        """Default recon shape and voxel pitch from the sinogram shape
-        (verbatim mbirjax math)."""
+        """Compute the default recon size using the internal parameters
+        delta_det_channel and delta_det_row plus the number of channels from the
+        sinogram (verbatim mbirjax math).  Run this after changing geometry
+        parameters such as ``delta_det_channel``; it resets ``recon_shape`` and
+        ``delta_voxel`` to reasonable values."""
         delta_det_row, delta_det_channel = self.get_params(
             ['delta_det_row', 'delta_det_channel'])
         voxel_row_aspect = self.get_params('voxel_row_aspect')
@@ -66,6 +105,12 @@ class ParallelBeamModel(TomographyModel):
                         recon_shape=recon_shape, delta_voxel=delta_voxel)
 
     def verify_valid_params(self):
+        """
+        Check that all parameters are compatible for a reconstruction.
+
+        Note:
+            Raises ValueError for invalid parameters.
+        """
         super().verify_valid_params()
         sinogram_shape, angles, voxel_row_aspect, voxel_slice_aspect = self.get_params(
             ['sinogram_shape', 'angles', 'voxel_row_aspect', 'voxel_slice_aspect'])
@@ -86,12 +131,22 @@ class ParallelBeamModel(TomographyModel):
                              f'{sinogram_shape} for sinogram_shape')
 
     def compute_hfan_data_batched(self, pixel_indices, angles_batch):
-        """The horizontal fan's inputs for a batch of views (the batched form of
-        mbirjax's compute_proj_data + the wrapper's center rounding).
+        """Compute the quantities needed for horizontal projection, for a batch
+        of views (the batched form of mbirjax's compute_proj_data plus the
+        wrapper's center rounding).
+
+        Parallel-beam mapping: the voxel cylinders are assumed to have slices
+        aligned with detector rows, so a parallel beam maps a cylinder slice to
+        a detector row and the fan mixes CHANNELS only.  n_p is the continuous
+        projected channel coordinate; its rounded value is the fans' integer
+        scatter/gather center, computed ONCE per (view, pixel) so forward and
+        back stay consistent (see the Projectors class note).  The weight scale
+        is the in-plane voxel area over the footprint length, a per-view scalar.
 
         Args:
-            pixel_indices: (P,) int64 tensor on the model device.
-            angles_batch: (Vb,) float32 tensor of view angles.
+            pixel_indices: (P,) int64 tensor of indices into the flattened
+                (rows, cols) grid, on the model device.
+            angles_batch: (Vb,) float32 tensor of view angles in radians.
 
         Returns:
             (n_p, centers, W_p_c, weight_scale, L_max): n_p/centers (Vb, P);
@@ -128,7 +183,25 @@ class ParallelBeamModel(TomographyModel):
 
     # ── direct recon ──────────────────────────────────────────────────────────
     def fbp_filter(self, sinogram, filter_name="ramp", output_sharded=False):
-        """FBP row filter (the voxel-size scaling folded into the filter)."""
+        """
+        Perform FBP filtering on the given sinogram.
+
+        Args:
+            sinogram (numpy or tensor): input with shape
+                (num_views, num_rows, num_channels).
+            filter_name (string, optional): Name of the filter.  Defaults to "ramp".
+            output_sharded (bool, optional): If False (default), return numpy;
+                if True, return the device tensor (the mbirjax argument name,
+                kept for API compatibility).
+
+        Returns:
+            The filtered sinogram.
+        """
+        # Voxel-size scaling factor: adjusts the filter to account for voxel
+        # size.  For the theoretical derivation see the zip linked at
+        # https://mbirjax.readthedocs.io/en/latest/theory.html
+        # The FBP weight pi/num_views is folded into the filter by the shared
+        # method; parallel beam has no FDK cosine pre-weight.
         delta_voxel, voxel_row_aspect = self.get_params(['delta_voxel',
                                                          'voxel_row_aspect'])
         delta_voxel_row = voxel_row_aspect * delta_voxel
@@ -138,8 +211,34 @@ class ParallelBeamModel(TomographyModel):
                                                output_sharded=output_sharded)
 
     def fbp_recon(self, sinogram, filter_name="ramp", output_sharded=False):
-        """Filtered back-projection: filter, then the exact adjoint back
-        projector.  Assumes equally spaced views over the full angular range."""
+        """
+        Perform filtered back-projection (FBP) reconstruction on the given
+        sinogram.
+
+        Our implementation uses standard filtering of the sinogram, then uses
+        the adjoint of the forward projector to perform the backprojection.
+        This is different from many implementations, in which the
+        backprojection is not exactly the adjoint of the forward projection.
+        For a detailed theoretical derivation, see the zip file linked at
+        https://mbirjax.readthedocs.io/en/latest/theory.html
+
+        Note:
+            FBP assumes the view angles are EQUALLY SPACED over the full angular
+            range (the ``pi / num_views`` angular weight in the ramp filter).
+            On nonuniformly-spaced or limited-angle data it is only approximate
+            and is best used as an initializer for the iterative ``recon()``,
+            which corrects the angular weighting.
+
+        Args:
+            sinogram (numpy or tensor): input with shape
+                (num_views, num_rows, num_channels).
+            filter_name (string, optional): Name of the filter.  Defaults to "ramp".
+            output_sharded (bool, optional): If False (default), return numpy;
+                if True, return the device tensor.
+
+        Returns:
+            recon (numpy or tensor): the reconstructed volume.
+        """
         filtered_sinogram = self.fbp_filter(sinogram, filter_name=filter_name,
                                             output_sharded=True)
         recon = self.back_project(filtered_sinogram, output_sharded=True)

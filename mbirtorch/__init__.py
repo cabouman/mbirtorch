@@ -17,6 +17,7 @@ from .vcd_utils import (gen_weights, gen_full_indices, gen_pixel_partition,
                         get_2d_ror_mask)
 from .qggmrf import (qggmrf_gradient_and_hessian_at_indices, get_b_from_nbr_wts,
                      b_tilde_by_definition)
+from .utilities import generate_3d_shepp_logan_low_dynamic_range
 
 __all__ = [
     "ParallelBeamModel", "TomographyModel", "TorchProjector",
@@ -24,5 +25,5 @@ __all__ = [
     "gen_weights", "gen_full_indices", "gen_pixel_partition",
     "gen_set_of_pixel_partitions", "gen_partition_sequence", "get_2d_ror_mask",
     "qggmrf_gradient_and_hessian_at_indices", "get_b_from_nbr_wts",
-    "b_tilde_by_definition",
+    "b_tilde_by_definition", "generate_3d_shepp_logan_low_dynamic_range",
 ]

@@ -34,11 +34,25 @@ class ParameterHandler:
         return values
 
     def set_params(self, no_warning=False, no_compile=False, **kwargs):
-        """Update parameters; recompile the projectors if a geometry parameter changed.
+        """
+        Update parameters using keyword arguments.
 
-        Mirrors mbirjax: each parameter carries a recompile flag; setting any
-        flagged parameter triggers ``create_projectors`` (unless ``no_compile``),
-        and validity checking runs unless ``no_warning``.
+        This method updates internal model parameters.  If any key
+        geometry-related parameters are modified, it triggers a rebuild of the
+        projector system unless suppressed via the `no_compile` flag (each
+        parameter carries a recompile flag, mirroring mbirjax; in torch the
+        rebuild is cheap -- there is no jit compilation -- but it refreshes the
+        projectors' cached view-parameter array).
+
+        Args:
+            no_warning (bool, optional): If True, disables validity checking.
+                Defaults to False.
+            no_compile (bool, optional): If True, suppresses the projector
+                rebuild after updates.  Defaults to False.
+            **kwargs: parameter names and values to update.
+
+        Example:
+            >>> model.set_params(recon_shape=(128, 128, 128), sharpness=0.7)
         """
         recompile = False
         for key, val in kwargs.items():
