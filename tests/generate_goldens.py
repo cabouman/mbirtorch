@@ -1,0 +1,103 @@
+"""Generate cross-framework golden data from mbirjax (the confirmed Phase 1
+golden mechanism: a jax-side script writes the goldens; mbirtorch tests read
+them, so the mbirtorch test env never imports jax).
+
+Run in the mbirjax conda env:
+    /Users/gbuzzard/miniforge3/envs/mbirjax/bin/python tests/generate_goldens.py
+
+Writes tests/goldens/golden_<cell>.npz (gitignored; regenerate at will).  The
+recorded jax version is the frozen Phase 0 baseline (0.10.1).
+
+Contents per cell: the shepp-logan phantom, its sinogram, transmission-root
+weights, sparse fwd/back outputs on a fixed subset, the qGGMRF gradient and
+Hessian on that subset, the Hessian diagonal, the FBP recon, the auto-set
+regularization values, and a seeded 5-iteration recon with its per-iteration
+traces (fm_rmse, alpha, nmae) -- the convergence-parity reference.
+"""
+
+import os
+
+import numpy as np
+
+CELL = (64, 64, 64)          # small: the parity gate is per-iteration, not per-size
+SEED = 42
+RECON_SEED = 7
+MAX_ITERATIONS = 5
+OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "goldens")
+
+
+def main():
+    import jax
+    import mbirjax
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+    n_views, n_rows, n_channels = CELL
+    angles = np.linspace(0, np.pi, n_views, endpoint=False)
+    model = mbirjax.ParallelBeamModel(CELL, angles)
+    recon_shape = tuple(int(x) for x in model.get_params('recon_shape'))
+
+    phantom = np.asarray(mbirjax.generate_3d_shepp_logan_low_dynamic_range(recon_shape))
+    sinogram = np.asarray(model.forward_project(phantom))
+    weights = np.asarray(mbirjax.gen_weights(sinogram, weight_type='transmission_root'))
+
+    # Sparse projector goldens on a fixed subset.
+    rng = np.random.RandomState(SEED)
+    full_indices = np.asarray(mbirjax.gen_full_indices(
+        recon_shape, use_ror_mask=model.get_params('use_ror_mask')))
+    subset = np.sort(rng.choice(full_indices, size=min(500, len(full_indices)),
+                                replace=False))
+    voxel_values = rng.rand(len(subset), recon_shape[2]).astype(np.float32)
+    sparse_fwd = np.asarray(model.sparse_forward_project(voxel_values, subset))
+    sparse_back = np.asarray(model.sparse_back_project(sinogram, subset))
+
+    # qGGMRF goldens at the same subset on the phantom.
+    flat_phantom = phantom.reshape(-1, recon_shape[2])
+    b = mbirjax.get_b_from_nbr_wts(model.get_params('qggmrf_nbr_wts'))
+    sigma_x, p, q, T = model.get_params(['sigma_x', 'p', 'q', 'T'])
+    qggmrf_params = tuple((b, float(sigma_x), float(p), float(q), float(T)))
+    qg_grad, qg_hess = mbirjax.qggmrf_gradient_and_hessian_at_indices(
+        flat_phantom, recon_shape, subset, qggmrf_params)
+
+    hessian_diag = np.asarray(model.compute_hessian_diagonal(weights=weights))
+    fbp = np.asarray(model.fbp_recon(sinogram))
+
+    # Auto-set regularization values on this sinogram+weights.
+    reg = model.auto_set_regularization_params(sinogram, weights=weights)
+
+    # Seeded short recon with traces (verbose off to keep logs quiet).
+    model.set_params(no_warning=True, verbose=0)
+    np.random.seed(RECON_SEED)
+    recon, recon_dict = model.recon(sinogram, weights=weights,
+                                    max_iterations=MAX_ITERATIONS,
+                                    stop_threshold_change_pct=0.0)
+    rp = recon_dict['recon_params']
+    if not isinstance(rp, dict):
+        rp = dict(rp)
+
+    out = os.path.join(OUT_DIR, f"golden_{'x'.join(map(str, CELL))}.npz")
+    np.savez_compressed(
+        out,
+        jax_version=jax.__version__,
+        cell=np.array(CELL), recon_shape=np.array(recon_shape), angles=angles,
+        phantom=phantom.astype(np.float32), sinogram=sinogram.astype(np.float32),
+        weights=weights.astype(np.float32),
+        subset=subset, voxel_values=voxel_values,
+        sparse_fwd=sparse_fwd.astype(np.float32),
+        sparse_back=sparse_back.astype(np.float32),
+        qg_grad=np.asarray(qg_grad, dtype=np.float32),
+        qg_hess=np.asarray(qg_hess, dtype=np.float32),
+        qggmrf_sigma_x=np.float32(sigma_x),
+        hessian_diag=hessian_diag.astype(np.float32),
+        fbp=fbp.astype(np.float32),
+        sigma_y=np.float32(reg['sigma_y']), sigma_x_auto=np.float32(reg['sigma_x']),
+        sigma_prox=np.float32(reg['sigma_prox']),
+        recon=np.asarray(recon, dtype=np.float32),
+        fm_rmse=np.array(rp['fm_rmse']), alpha_values=np.array(rp['alpha_values']),
+        nmae_pct=np.array(rp['stop_threshold_change_pct']),
+        recon_seed=np.array(RECON_SEED), max_iterations=np.array(MAX_ITERATIONS),
+    )
+    print('wrote', out)
+
+
+if __name__ == '__main__':
+    main()

@@ -16,5 +16,9 @@ output/
 results/
 logs/
 
+# cross-framework golden data: generated on demand by tests/generate_goldens.py
+# (run in the mbirjax env); binary, regenerable, so not committed
+tests/goldens/
+
 # environments
 .venv/
