@@ -259,10 +259,18 @@ class ParallelBeamModel(TomographyModel):
         Returns:
             recon (numpy or tensor): the reconstructed volume.
         """
+        # Place once at entry so the filter receives device-form data (a no-op
+        # when already placed; a single device is the trivial 1-shard case).
+        sinogram = self._shard_sinogram(sinogram)
+
+        # Internal pipeline stage: keep the device form, no host transfer.
         filtered_sinogram = self.fbp_filter(sinogram, filter_name=filter_name,
                                             output_sharded=True)
+
+        # Keep the recon in the device form through the pipeline; the exit
+        # handling below is the single place the output form is decided.
         recon = self.back_project(filtered_sinogram, output_sharded=True)
-        return recon if output_sharded else recon.cpu().numpy()
+        return recon if output_sharded else self._gather_recon(recon)
 
     def direct_recon(self, sinogram, filter_name="ramp", output_sharded=False):
         return self.fbp_recon(sinogram, filter_name=filter_name,

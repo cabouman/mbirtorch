@@ -220,6 +220,37 @@ class Projectors:
     # already 0.4-0.6x of jax's, and the small batches the scaled budget
     # implies were measured slower there (the measured CPU optimum is a large
     # batch).
+    # TODO(sharding/tuning): revisit this budget when multi-device lands.
+    # Known limits of the current form (measured 2026-08-05, MPS 256^3):
+    #   - The accounting is per-SLAB nominal, and the kernels hold several
+    #     slab-scale tensors at once (forward: product + accumulator; back:
+    #     transpose copy + gather), so the actual per-view transient is a small
+    #     multiple (~2-5x) of the nominal slab; the 8x sinogram multiple was
+    #     calibrated empirically with that multiplier baked in.  Recalibrate
+    #     against a measured per-view delta, not the nominal slab, if retuned.
+    #   - Below the 2 GiB cap the formula gives vb ~ 10 for ROR-masked cubes at
+    #     ANY size (8*sino / slab ~ 10.2 by construction); raising vb past that
+    #     bought only ~5-7% speed for ~6x more device memory, so the small vb
+    #     is deliberate, not accidental.
+    #   - Above ~810^3 the cap forces vb=1 and the SINGLE-view slab keeps
+    #     growing as N^3 (3.2 GB at 1024^3, 26 GB at 2048^3): past ~1400^3 the
+    #     knob no longer protects at all -- needs pixel-axis chunking or the
+    #     planned fused (Triton) kernels that never materialize the gather.
+    #     Pixel chunking here means mbirjax's TWO-axis tiling (its
+    #     _sparse_forward/_back_project drivers): forward sums partial
+    #     sinograms over PIXEL batches around the view loop
+    #     (sum_function_in_batches), back concatenates per-PIXEL-batch outputs
+    #     inside the view-sum loop (concatenate_function_in_batches), with a
+    #     jointly chosen (view_batch, pixel_batch) tile.  These drivers tile
+    #     views only; the joint tile choice needs a 2-D budget rule and gate
+    #     measurement (tile shape moved mbirjax kernels several-fold in its
+    #     campaign), so it belongs with the Phase 5 kernel work.
+    #   - Under sharding/banding the budget must derive from the PER-DEVICE
+    #     shard shapes (this reads the GLOBAL sinogram_shape: 8x the global
+    #     sino overshoots a view-shard's share by the device count), and any
+    #     adaptive value must keep being derived per call from current params
+    #     -- never frozen at Projectors construction (the mbirjax stale-bind
+    #     lesson).
     VIEW_BATCH_TRANSIENT_BUDGET_BYTES = 2 * 2**30
     VIEW_BATCH_TRANSIENT_FLOOR_BYTES = 256 * 2**20
     VIEW_BATCH_SINO_MULTIPLE = 8

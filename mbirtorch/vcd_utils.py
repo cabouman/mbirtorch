@@ -200,7 +200,7 @@ def gen_full_indices(recon_shape, use_ror_mask=True):
     return partition[0]
 
 
-def gen_weights(sinogram, weight_type):
+def gen_weights(sinogram, weight_type, ct_model=None):
     """
     Compute optional weights used in MBIR reconstruction based on the noise model.
 
@@ -219,6 +219,11 @@ def gen_weights(sinogram, weight_type):
             - 'transmission': Use exponential decay, `exp(-sinogram)`.
             - 'transmission_root': Use square-root decay, `exp(-sinogram / 2)`.
             - 'emission': Use reciprocal decay, `1 / (abs(sinogram) + 0.1)`.
+        ct_model (TomographyModel, optional): if given, the sinogram is first
+            placed in the model's device form (the ``_shard_sinogram``
+            chokepoint), so the weights are built on the model device -- and,
+            under a future sharding port, per shard.  Default None leaves the
+            input where it is.
 
     Returns:
         ndarray or tensor: weights with the same shape and residence as the input.
@@ -231,6 +236,10 @@ def gen_weights(sinogram, weight_type):
         large (e.g., > 5), as this corresponds to near-zero transmission, which
         is not physically meaningful in typical X-ray imaging.
     """
+    # Optionally place the sinogram in the model's device form first, so the
+    # weights are built where the reconstruction will run.
+    if ct_model is not None:
+        sinogram = ct_model._shard_sinogram(sinogram)
     xp = torch if isinstance(sinogram, torch.Tensor) else np
     if weight_type == 'unweighted':
         weights = xp.ones_like(sinogram)

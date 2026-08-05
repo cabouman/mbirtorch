@@ -18,7 +18,8 @@ __version__ = "0.0.1"
 # is imported before torch triggers its first compile, which any
 # import-mbirtorch-first program satisfies.  Dynamo TRACING still runs per
 # process (the cache skips inductor codegen, not tracing), so a cold process
-# keeps a small residual warmup.
+# keeps a small residual warmup.  ``mbirtorch.clear_cache()`` removes the
+# whole ~/.mbirtorch directory (see utilities.py).
 import os as _os
 
 _os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR",
@@ -35,8 +36,9 @@ from .vcd_utils import (gen_weights, gen_full_indices, gen_pixel_partition,
                         gen_set_of_pixel_partitions, gen_partition_sequence,
                         get_2d_ror_mask)
 from .qggmrf import (qggmrf_gradient_and_hessian_at_indices, get_b_from_nbr_wts,
-                     b_tilde_by_definition)
-from .utilities import generate_3d_shepp_logan_low_dynamic_range
+                     b_tilde_by_definition, qggmrf_loss)
+from .utilities import generate_3d_shepp_logan_low_dynamic_range, clear_cache
+from .memory_stats import get_memory_stats
 
 __all__ = [
     "ParallelBeamModel", "ConeBeamModel", "TomographyModel", "QGGMRFDenoiser", "TorchProjector",
@@ -44,5 +46,22 @@ __all__ = [
     "gen_weights", "gen_full_indices", "gen_pixel_partition",
     "gen_set_of_pixel_partitions", "gen_partition_sequence", "get_2d_ror_mask",
     "qggmrf_gradient_and_hessian_at_indices", "get_b_from_nbr_wts",
-    "b_tilde_by_definition", "generate_3d_shepp_logan_low_dynamic_range",
+    "b_tilde_by_definition", "qggmrf_loss", "generate_3d_shepp_logan_low_dynamic_range",
+    "clear_cache", "get_memory_stats",
+    "SliceViewer", "VolumeStack", "slice_viewer",
 ]
+
+# ── slice viewer: lazy export (PEP 562) ──────────────────────────────────────
+# The viewer names resolve on first attribute access so that a headless
+# `import mbirtorch` never imports matplotlib; most mbirtorch runs (batch
+# recons, tests) never open a viewer.
+_VIEWER_EXPORTS = ("SliceViewer", "VolumeStack", "slice_viewer")
+
+
+def __getattr__(name):
+    if name in _VIEWER_EXPORTS:
+        from . import view_utils
+        value = getattr(view_utils, name)
+        globals()[name] = value  # cache: later accesses skip this hook
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

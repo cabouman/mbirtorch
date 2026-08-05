@@ -4,10 +4,9 @@ A PyTorch port of [mbirjax](https://github.com/cabouman/mbirjax) (Phase 0 scaffo
 
 This repo is the home for the port evaluated in
 `mbirjax_plans/plans/torch_port/port_plan.md` (checked out parallel to this
-repo).  The plan defines the motivation, the parity gates against mbirjax, and
-the incremental phase plan.  The current state is Phase 0: the repo scaffold
-plus de-risking benchmarks; the benchmarks live with the plan, in
-`mbirjax_plans/plans/experiments/torch_port/`.
+repo).  The plan defines the motivation, the parity gates against mbirjax,
+the incremental phase plan, and a progress record; its findings pages and the
+supporting scripts live alongside it under `mbirjax_plans/plans/`.
 
 ## Setup
 
@@ -24,3 +23,26 @@ pip install -e ".[test]"
 ```bash
 dev_scripts/run_tests.sh
 ```
+
+## Caches
+
+mbirtorch keeps one on-disk cache: compiled `torch.compile` artifacts, under
+`~/.mbirtorch/torch_cache`.  It exists to make cold starts fast -- with it, a
+fresh process reuses prior compilations instead of recompiling (roughly 14 s
+down to 2 s for a first small reconstruction).  It grows with the number of
+distinct compiled shapes and typically stays in the tens of megabytes; it is
+never cleaned automatically.  To remove it:
+
+```python
+import mbirtorch
+mbirtorch.clear_cache()   # deletes ~/.mbirtorch entirely (recreated empty)
+```
+
+The location can be redirected by setting the `TORCHINDUCTOR_CACHE_DIR`
+environment variable before the first compile (e.g. to node-local or scratch
+storage on a cluster, where home quotas are tight); `clear_cache()` does not
+touch a redirected location.
+
+Everything else the package caches is in-memory only and is freed with the
+objects that hold it (e.g. the per-model pixel-index cache); nothing besides
+`~/.mbirtorch` is written to disk.

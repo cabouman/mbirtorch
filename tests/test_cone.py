@@ -144,3 +144,28 @@ def test_cone_recon_convergence_parity(golden, cone_model):
     assert alpha_rel < 1e-2
     assert fm_rel < 1e-3
     assert final_rel < 1e-3
+
+
+def test_helical_z_weight_zeroes_padded_slices():
+    # A sharding port zero-pads the recon slice axis; the z-weight must force
+    # padded slices to zero (the forced-zero invariant) even if an upstream bug
+    # leaves them nonzero, and must leave the real slices' weights unchanged.
+    cell = (24, 16, 16)
+    angles = np.linspace(0, 2 * np.pi, cell[0], endpoint=False)
+    z_shifts = np.linspace(-4.0, 4.0, cell[0]).astype(np.float32)
+    m = mbirtorch.ConeBeamModel(cell, angles, source_detector_dist=4 * cell[2],
+                                source_iso_dist=2 * cell[2],
+                                helical_z_shifts=z_shifts, device="cpu")
+    m.set_params(no_warning=True, verbose=0)
+    rs = tuple(m.get_params('recon_shape'))
+    sino = torch.zeros(tuple(m.get_params('sinogram_shape')))
+    torch.manual_seed(0)
+    recon = torch.rand(rs)
+    ref = m.helical_fdk_z_weight(recon.clone(), sino)
+
+    extra = 3
+    padded = torch.ones(rs[:2] + (rs[2] + extra,))
+    padded[:, :, :rs[2]] = recon
+    out = m.helical_fdk_z_weight(padded, sino)
+    assert float(torch.abs(out[:, :, rs[2]:]).max()) == 0.0
+    assert torch.allclose(out[:, :, :rs[2]], ref)

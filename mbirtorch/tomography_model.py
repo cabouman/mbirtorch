@@ -3,15 +3,16 @@
 Ported from mbirjax.tomography_model: the VCD engine (numpy partitions, subset updater, on-device line search,
 positivity), FBP via torch.fft, the auto-regularization chain, and the public
 numpy-at-the-boundary API.  Deliberately not (yet) ported: sharding and
-placements, the tile policy, prox_map/denoiser, checkpoint resume, save/load,
-and the memory-management machinery jax needed (donation and .delete() become
-plain in-place ops here).
+placements, the tile policy, save/load, and the memory-management machinery
+jax needed (donation and .delete() become plain in-place ops here; the
+checkpoint-resume path mutates the caller arrays in place, advertised, instead of donating).
 
 Value-parity intent: every formula follows the mbirjax source read 2026-08-04,
 in the same order of operations, so a seeded run matches a seeded mbirjax run
 iteration for iteration (the convergence-parity gate in tests/test_vs_goldens).
 """
 
+import io
 import logging
 import math
 import warnings
@@ -21,6 +22,7 @@ import torch
 
 from . import qggmrf as _qggmrf
 from . import tomography_utils, vcd_utils
+from .memory_stats import get_memory_stats
 from ._utils import _AUTO_REGULARIZATION_PARAM_NAMES, recon_param_names
 from .parameter_handler import ParameterHandler
 from .projectors import Projectors, maybe_compile
@@ -31,9 +33,11 @@ _F32_EPS = float(np.finfo(np.float32).eps)
 # ── compiled updater glue (module level, one compile per process) ─────────────
 # Eagerly there were ~20 kernel launches per subset between the projector
 # calls; these fused forms remove most of them.  Each is pure except
-# _apply_update, which mutates the two state tensors in place (supported by
-# torch.compile); all are value-equal to the eager forms up to float summation
-# order.
+# _apply_update, which updates the two state tensors in place (supported by
+# torch.compile) while RETURNING them for a functional interface -- the
+# in-place ops are the memory mechanism, the returns are the contract the
+# call sites rebind through.  All are value-equal to the eager forms up to
+# float summation order.
 def _diagonal_update_direction(forward_grad, prior_grad, forward_hess, prior_hess):
     # The base preconditioned direction (the mbirjax module-level jitted helper's
     # torch analog), fused so the sums and divide are one kernel.
@@ -60,12 +64,14 @@ def _forward_lin_quad_weighted(error_sinogram, delta_sinogram, weights, fm_const
 def _apply_update(flat_recon, error_sinogram, pixel_indices, delta_scaled,
                   alpha, delta_sinogram):
     # In-place state application: recon scatter-add, per-slice sumsq, the error
-    # sinogram FMA, and the ell1 reduction, in one compiled region.
+    # sinogram FMA, and the ell1 reduction, in one compiled region.  The state
+    # tensors are returned (same storage, no copy) so callers rebind
+    # functionally rather than relying on the side effect.
     flat_recon.index_add_(0, pixel_indices, delta_scaled)
     delta_sumsq = torch.sum(delta_scaled * delta_scaled, dim=0)
     error_sinogram.sub_(alpha * delta_sinogram)
     ell1 = torch.sum(torch.abs(delta_scaled))
-    return delta_sumsq, ell1
+    return flat_recon, error_sinogram, delta_sumsq, ell1
 
 
 def _resolve_device(device):
@@ -145,10 +151,12 @@ class TomographyModel(ParameterHandler):
     # ── projection wrappers (numpy at the public boundary) ────────────────────
     def sparse_forward_project(self, voxel_values, pixel_indices):
         """Cylinders at ``pixel_indices`` -> full sinogram (tensor)."""
+        voxel_values = self._shard_recon(voxel_values)
         return self.projector_functions.sparse_forward_project(voxel_values, pixel_indices)
 
     def sparse_back_project(self, sinogram, pixel_indices, coeff_power=1):
         """Sinogram -> cylinders at ``pixel_indices`` (tensor)."""
+        sinogram = self._shard_sinogram(sinogram)
         return self.projector_functions.sparse_back_project(sinogram, pixel_indices,
                                                             coeff_power=coeff_power)
 
@@ -162,7 +170,12 @@ class TomographyModel(ParameterHandler):
         (forward/back_project, the differentiable wrappers) call this per
         invocation, and rebuilding + re-uploading the indices each time was a
         measured per-call cost.  A custom mask array bypasses
-        the cache (unhashable)."""
+        the cache (unhashable).
+
+        The cache is IN-MEMORY only: a single (key, tensor) entry held on the
+        model instance, replaced in place when the key changes and freed with
+        the model.  Nothing is written to disk (the on-disk state under
+        ``~/.mbirtorch`` is the torch.compile cache; see ``clear_cache``)."""
         recon_shape, use_ror_mask = self.get_params(['recon_shape', 'use_ror_mask'])
         key = (tuple(recon_shape), use_ror_mask if isinstance(use_ror_mask, bool) else None,
                str(self.torch_device))
@@ -175,6 +188,73 @@ class TomographyModel(ParameterHandler):
                                   device=self.torch_device)
             self._full_indices_cache = (key, idx)
         return self._full_indices_cache[1]
+
+    # ── array placement chokepoints (single-device forms of the mbirjax seams) ─
+    def _shard_sinogram(self, sinogram):
+        """Place a sinogram-like array (sinogram or weights) in its device
+        form: float32 on the model device, with the view axis checked against
+        the model.
+
+        In mbirjax this is the pad-aware VIEW-SHARDING chokepoint: a sharding
+        port zero-pads and distributes here (and crops in
+        :meth:`_gather_sinogram`), so routing every sinogram-like placement
+        through these two functions means multi-device support changes them
+        alone instead of every entry point.
+        """
+        sinogram = torch.as_tensor(sinogram, dtype=torch.float32,
+                                   device=self.torch_device)
+        num_views = self.get_params('sinogram_shape')[0]
+        if sinogram.shape[0] != num_views:
+            raise ValueError(
+                'Cannot place the sinogram: its view axis has size '
+                f'{sinogram.shape[0]}, but the model expects {num_views} views.')
+        return sinogram
+
+    def _shard_recon(self, recon):
+        """Place a recon-like array (3-D, or flat (num_pixels, num_slices)) in
+        its device form: float32 on the model device, with the slice axis (the
+        LAST axis in both forms) checked against the model.
+
+        The mbirjax counterpart is the pad-aware SLICE-SHARDING chokepoint; see
+        :meth:`_shard_sinogram` for the seam rationale.
+        """
+        recon = torch.as_tensor(recon, dtype=torch.float32,
+                                device=self.torch_device)
+        num_slices = self.get_params('recon_shape')[2]
+        if recon.shape[-1] != num_slices:
+            raise ValueError(
+                'Cannot place the reconstruction: its slice axis has size '
+                f'{recon.shape[-1]}, but the model expects {num_slices} slices.')
+        return recon
+
+    def _gather_sinogram(self, sinogram):
+        """Return a sinogram-like device tensor as a host numpy array.  The
+        mbirjax counterpart also crops zero-filled padded views and rows back
+        to the real counts; a sharding port adds that crop here, so padded
+        entries can never leak into user-facing arrays."""
+        return sinogram.detach().cpu().numpy()
+
+    def _gather_recon(self, recon):
+        """Return a recon-like device tensor as a host numpy array; the
+        padded-slice crop obligation of :meth:`_gather_sinogram` applies here
+        under a sharding port."""
+        return recon.detach().cpu().numpy()
+
+    def _sino_ones_device_form(self, sino_like=None):
+        """All-ones sinogram in the device form, with any padded entries ZERO.
+
+        The constant-weights Hessian path back-projects a ones sinogram, and
+        padded views and padded detector rows must contribute nothing to it --
+        a bare ``torch.ones`` at whatever shape the device arrays happen to
+        have would silently add padded mass to the Hessian.  On a single
+        device nothing pads, so this is a plain ones tensor at the params
+        sinogram_shape; a sharding port replaces the body with its per-shard
+        zero-tailed build (mbirjax: ``sharded_full`` with the row-pad spec).
+        ``sino_like`` supplies only the dtype; None defaults to float32.
+        """
+        dtype = torch.float32 if sino_like is None else sino_like.dtype
+        return torch.ones(tuple(self.get_params('sinogram_shape')),
+                          dtype=dtype, device=self.torch_device)
 
     def forward_project(self, recon, output_sharded=False):
         """
@@ -194,11 +274,11 @@ class TomographyModel(ParameterHandler):
             The sinogram, shape (num_views, num_det_rows, num_det_channels).
         """
         recon_shape = self.get_params('recon_shape')
-        recon = torch.as_tensor(recon, dtype=torch.float32, device=self.torch_device)
+        recon = self._shard_recon(recon)
         indices = self.full_indices_device()
         voxel_values = recon.reshape(-1, recon.shape[-1])[indices]
         sinogram = self.sparse_forward_project(voxel_values, indices)
-        return sinogram if output_sharded else sinogram.cpu().numpy()
+        return sinogram if output_sharded else self._gather_sinogram(sinogram)
 
     def back_project(self, sinogram, output_sharded=False):
         """
@@ -216,14 +296,14 @@ class TomographyModel(ParameterHandler):
             num_recon_slices).
         """
         recon_shape = self.get_params('recon_shape')
-        sinogram = torch.as_tensor(sinogram, dtype=torch.float32, device=self.torch_device)
+        sinogram = self._shard_sinogram(sinogram)
         indices = self.full_indices_device()
         cylinders = self.sparse_back_project(sinogram, indices)
         recon = torch.zeros((recon_shape[0] * recon_shape[1], cylinders.shape[-1]),
                             dtype=torch.float32, device=self.torch_device)
         recon[indices] = cylinders
         recon = recon.reshape(tuple(recon_shape[:2]) + (cylinders.shape[-1],))
-        return recon if output_sharded else recon.cpu().numpy()
+        return recon if output_sharded else self._gather_recon(recon)
 
     def compute_hessian_diagonal(self, weights=None, output_sharded=False):
         """
@@ -247,17 +327,20 @@ class TomographyModel(ParameterHandler):
         """
         sinogram_shape, recon_shape = self.get_params(['sinogram_shape', 'recon_shape'])
         if weights is None:
-            weights = torch.ones(tuple(sinogram_shape), dtype=torch.float32,
-                                 device=self.torch_device)
+            # Unit weights built through the device-form seam (ones in the
+            # real views/rows, zero in any inert padding).
+            weights = self._sino_ones_device_form()
         elif tuple(weights.shape) != tuple(sinogram_shape):
             raise ValueError('Weights must be constant or an array compatible with sinogram'
                              f'\nGot weights.shape = {tuple(weights.shape)}, but '
                              f'sinogram.shape = {tuple(sinogram_shape)}')
+        else:
+            weights = self._shard_sinogram(weights)
         indices = torch.arange(recon_shape[0] * recon_shape[1], dtype=torch.int64,
                                device=self.torch_device)
         hessian = self.sparse_back_project(weights, indices, coeff_power=2)
         hessian = hessian.reshape((recon_shape[0], recon_shape[1], hessian.shape[-1]))
-        return hessian if output_sharded else hessian.cpu().numpy()
+        return hessian if output_sharded else self._gather_recon(hessian)
 
     def get_voxels_at_indices(self, recon, indices):
         return recon.reshape((-1, recon.shape[-1]))[indices]
@@ -296,6 +379,16 @@ class TomographyModel(ParameterHandler):
             small_sinogram = self.subsample_views(sinogram, num_real_views=num_real_views)
             small_weights = 1 if weights is None else self.subsample_views(
                 weights, num_real_views=num_real_views)
+
+            # Likewise crop padded detector ROWS (a device-form input whose row
+            # axis pads with the recon slices) -- the zero rows would bias the
+            # indicator/sigma stats.  A no-op until a sharding port pads arrays;
+            # kept now so padded inputs can never silently bias the estimates.
+            num_real_rows = self.get_params('sinogram_shape')[1]
+            if small_sinogram.shape[1] != num_real_rows:
+                small_sinogram = small_sinogram[:, :num_real_rows]
+                if weights is not None:
+                    small_weights = small_weights[:, :num_real_rows]
 
             sino_indicator = self._get_sino_indicator(small_sinogram,
                                                       verbose=self.get_params('verbose'))
@@ -547,23 +640,21 @@ class TomographyModel(ParameterHandler):
         Returns:
             The filtered sinogram.
         """
-        sinogram = torch.as_tensor(sinogram, dtype=torch.float32, device=self.torch_device)
+        sinogram = self._shard_sinogram(sinogram)
         num_channels = sinogram.shape[2]
         num_views = self.get_params('sinogram_shape')[0]
         recon_filter = tomography_utils.generate_direct_recon_filter(
             num_channels, filter_name=filter_name)
         recon_filter = recon_filter * np.float32(filter_scale * (np.pi / num_views))
         filter_t = torch.as_tensor(recon_filter, device=self.torch_device)
-        if row_weight is not None:
-            # FDK cosine pre-weight: a view-independent (rows, channels) map
-            # multiplying each detector row before convolution.
-            sinogram = sinogram * row_weight[None, :, :]
-        filtered = tomography_utils.apply_row_filter(sinogram, filter_t)
-        return filtered if output_sharded else filtered.cpu().numpy()
+        filtered = tomography_utils.apply_row_filter(sinogram, filter_t,
+                                                     row_weight=row_weight)
+        return filtered if output_sharded else self._gather_sinogram(filtered)
 
     # ── loss / stats (mirrors get_forward_model_loss + _vcd_iteration_stats) ──
     @staticmethod
-    def get_forward_model_loss(error_sinogram, sigma_y, weights=None, normalize=True):
+    def get_forward_model_loss(error_sinogram, sigma_y, weights=None, normalize=True,
+                               num_real_elements=None):
         """
         Calculate the loss function for the forward model from the error
         sinogram and weights, where
@@ -579,6 +670,12 @@ class TomographyModel(ParameterHandler):
             normalize (bool, optional, default=True): If True, return the
                 weight-normalized RMSE form; otherwise the unnormalized
                 weighted squared error.
+            num_real_elements (int, optional): the number of REAL sinogram
+                elements, when error_sinogram carries extra zero-filled padding
+                (e.g. a padded view or row axis under a future sharding port).
+                The padded entries contribute nothing to the sums, so
+                normalizing by the real count gives exactly the unpadded loss.
+                Default None uses error_sinogram.numel() (the unpadded case).
 
         Returns:
             The loss as a device scalar tensor.
@@ -587,30 +684,48 @@ class TomographyModel(ParameterHandler):
             weights = 1
             avg_weight = 1
         elif np.ndim(weights) == 0:
-            # A true scalar (python or 0-d): the average weight is itself.
+            # A true scalar (python or 0-d): the average weight is itself,
+            # independent of the element count -- so also exact on padded runs.
             avg_weight = weights
-        else:
+        elif num_real_elements is None:
             # Array-likes (numpy included -- a numpy array is not a torch
             # tensor, and a tensor-only test would route it to the scalar
             # branch, returning a sinogram-shaped 'loss').
             weights = torch.as_tensor(weights, dtype=torch.float32,
                                       device=error_sinogram.device)
             avg_weight = torch.mean(weights)
+        else:
+            # Weights ARRAY in a padded device form: the padded entries are
+            # identically zero, so summing and dividing by the REAL count gives
+            # exactly the average over the real elements.
+            weights = torch.as_tensor(weights, dtype=torch.float32,
+                                      device=error_sinogram.device)
+            avg_weight = torch.sum(weights) / float(num_real_elements)
         if normalize:
             weighted_sq_sum = torch.sum(error_sinogram * error_sinogram * weights)
-            loss = torch.sqrt(weighted_sq_sum /
-                              (avg_weight * float(error_sinogram.numel()))) / sigma_y
+            denom = (float(error_sinogram.numel()) if num_real_elements is None
+                     else float(num_real_elements))
+            loss = torch.sqrt(weighted_sq_sum / (avg_weight * denom)) / sigma_y
         else:
             loss = (1.0 / (2 * sigma_y ** 2)) * torch.sum(
                 (error_sinogram * error_sinogram) * weights)
         return loss
 
     @staticmethod
-    def _vcd_iteration_stats(error_sinogram, flat_recon, sigma_y, weights=None):
-        fm_loss = TomographyModel.get_forward_model_loss(error_sinogram, sigma_y, weights)
+    def _vcd_iteration_stats(error_sinogram, flat_recon, sigma_y, weights=None,
+                             num_real_elements=None, real_sino_size=None):
+        """Per-iteration VCD logging stats: (fm_loss, recon_l1, es_rmse).
+
+        ``num_real_elements``/``real_sino_size`` are the REAL element count when
+        the error sinogram carries zero-filled padding (see
+        get_forward_model_loss); padded entries must not dilute the RMSE.
+        Both default to None (unpadded), which uses the array's own size."""
+        fm_loss = TomographyModel.get_forward_model_loss(
+            error_sinogram, sigma_y, weights, num_real_elements=num_real_elements)
         recon_l1 = torch.sum(torch.abs(flat_recon))
-        es_rmse = torch.sqrt(torch.sum(error_sinogram * error_sinogram)
-                             / float(error_sinogram.numel()))
+        denom = (float(error_sinogram.numel()) if real_sino_size is None
+                 else float(real_sino_size))
+        es_rmse = torch.sqrt(torch.sum(error_sinogram * error_sinogram) / denom)
         return fm_loss, recon_l1, es_rmse
 
     def get_forward_lin_quad(self, weighted_error_sinogram, delta_sinogram, weights,
@@ -756,6 +871,13 @@ class TomographyModel(ParameterHandler):
             # Back project to get the gradient; note fm_constant = 1/sigma_y^2.
             forward_grad = -fm_constant * self.sparse_back_project(
                 weighted_error_sinogram, pixel_indices)
+            if not const_weights:
+                # The weighted product (a full-sinogram transient) is dead
+                # here: the non-constant line-search terms fuse the weights
+                # product into their reductions instead of re-reading it, so
+                # free it before the delta projection below (mbirjax must
+                # hold its product through the line search and delete after).
+                del weighted_error_sinogram
 
             # Get the forward Hessian for this subset.
             forward_hess = fm_constant * fm_hessian[pixel_indices]
@@ -773,6 +895,14 @@ class TomographyModel(ParameterHandler):
                                                  device=delta_recon_at_indices.device))
             prior_linear, prior_quadratic_approx = prior_line_terms(
                 prior_grad, prior_hess_t, delta_recon_at_indices)
+
+            # Free the (now-dead) gradient/Hessian buffers BEFORE the
+            # memory-heavy forward projection of the delta -- several
+            # subset-sized buffers at the coarse partitions (mirrors mbirjax's
+            # del at the same point).  No sync is needed: torch's stream-aware
+            # caching allocator keeps a freed block from being reused until
+            # queued reads of it complete (jax needed a block_until_ready).
+            del forward_grad, prior_grad, forward_hess, prior_hess, prior_hess_t
 
             # Compute the update direction in the sinogram domain.
             delta_sinogram = self.sparse_forward_project(delta_recon_at_indices,
@@ -810,9 +940,9 @@ class TomographyModel(ParameterHandler):
             # squared updates is the per-slice convergence diagnostic
             # (delta_norm_per_slice in the recon dict).
             delta_recon_at_indices = alpha * delta_recon_at_indices
-            delta_sumsq_subset, ell1_for_subset = apply_update(
-                flat_recon, error_sinogram, pixel_indices,
-                delta_recon_at_indices, alpha, delta_sinogram)
+            flat_recon, error_sinogram, delta_sumsq_subset, ell1_for_subset = \
+                apply_update(flat_recon, error_sinogram, pixel_indices,
+                             delta_recon_at_indices, alpha, delta_sinogram)
             return (flat_recon, error_sinogram, ell1_for_subset, alpha,
                     delta_sumsq_subset)
 
@@ -864,12 +994,14 @@ class TomographyModel(ParameterHandler):
 
     def vcd_recon(self, sinogram, partitions, partition_sequence,
                   stop_threshold_change_pct, weights=None, init_recon=None,
-                  prox_input=None, first_iteration=0):
+                  prox_input=None, compute_prior_loss=False, first_iteration=0,
+                  init_error_sinogram=None, fm_hessian=None,
+                  return_checkpoint=False):
         """
         Perform MBIR reconstruction using the Multi-Granular Vector Coordinate
         Descent algorithm for a given set of partitions and a prescribed
         partition sequence (single device; mirrors mbirjax.vcd_recon minus
-        sharding and checkpoint resume).
+        sharding).
 
         Args:
             sinogram (numpy or tensor): 3D sinogram data with shape
@@ -885,14 +1017,52 @@ class TomographyModel(ParameterHandler):
             init_recon (array or int or None): initial reconstruction.  If None,
                 direct_recon (FBP) is used.  An int gives a constant volume.
             prox_input (array, optional): reconstruction input to a proximal map.
+            compute_prior_loss (bool, optional): Set True to calculate and
+                return the prior model loss (recorded at verbose >= 1 only,
+                as in mbirjax; a debug/demo path for relatively small recons).
             first_iteration (int, optional): iteration offset for restarts (used
                 only in the printed iteration labels here).
+            init_error_sinogram (array or tensor, optional): Precomputed error
+                sinogram to resume from, skipping the initializing forward
+                projection.  Must be supplied together with init_recon, and the
+                pair is TRUSTED as consistent (init_error_sinogram ==
+                sinogram - A @ init_recon for the SAME sinogram and geometry) --
+                verifying would cost the forward projection this argument
+                exists to avoid.  The array returned via return_checkpoint
+                satisfies this by construction.  NO defensive copy is made (at
+                large sizes a clone would defeat the purpose of this path):
+                both this array and init_recon become the loop's working
+                buffers, updated IN PLACE where memory-compatible (a device
+                tensor, or a CPU-model input of matching dtype), so after the
+                call they -- and any checkpoint dict referencing them --
+                reflect the RESUMED state.  This is the no-copy analog of
+                mbirjax's buffer donation.  To keep or branch from the
+                pre-resume state, copy BEFORE resuming; pairing a pre-resume
+                recon copy with a post-resume error sinogram is an
+                inconsistent pair and resumes silently wrong.
+            fm_hessian (array or tensor, optional): Precomputed forward-model
+                Hessian diagonal (as returned via return_checkpoint, or
+                compute_hessian_diagonal(weights=weights) in either the 3-D or
+                the flat (num_pixels, num_slices) form).  Must correspond to
+                the SAME weights and geometry.  Read-only in the loop.  When
+                None (default), it is computed internally.
+            return_checkpoint (bool, optional): If True, additionally return
+                the resume state -- a dict {'error_sinogram': <device tensor>,
+                'fm_hessian': <device tensor>} suitable for the two arguments
+                above -- so a chunked/checkpointed run continues with no
+                re-initialization cost.  Zero-copy: the dict references the
+                loop's own final device tensors.  A later resume that consumes
+                these arrays updates them in place, so the dict then reflects
+                the resumed state -- chaining resumes through the same dict
+                stays consistent; copy first (e.g. .cpu().numpy()) to
+                snapshot or persist.  Defaults to False.
 
         Returns:
             (recon, recon_stats): the 3D reconstruction tensor and a tuple of
             per-iteration stats (fm_rmse, pm_loss, nmae_update, alpha_values,
             delta_norm_per_slice), where nmae_update is
             ||recon(i+1) - recon(i)||_1 / ||recon(i+1)||_1.
+            With return_checkpoint=True: (recon, recon_stats, checkpoint).
         """
         self.verify_valid_params()
         dev = self.torch_device
@@ -903,13 +1073,25 @@ class TomographyModel(ParameterHandler):
                              f'Expected {tuple(sinogram_shape)}, got '
                              f'{tuple(sinogram.shape)}.')
 
+        # Placement helpers: recon-like arrays and sino-like arrays route
+        # through the _shard_* chokepoints (a single device is the trivial
+        # 1-shard case), keeping the rest of the loop placement-agnostic.
         constant_weights = weights is None
         if constant_weights:
             weights = 1
         else:
-            weights = torch.as_tensor(weights, dtype=torch.float32, device=dev)
+            weights = self._shard_sinogram(weights)
 
-        sinogram = torch.as_tensor(sinogram, dtype=torch.float32, device=dev)
+        if init_error_sinogram is not None and init_recon is None:
+            raise ValueError('init_error_sinogram requires init_recon (the pair must be a '
+                             'consistent resume state; see the docstring).')
+
+        # Place the sinogram only when it is needed -- to compute the error
+        # sinogram.  On the RESUME path the error sinogram replaces its only
+        # use, so no device copy is made (mbirjax likewise never places it
+        # there, and frees its own copy after the fold below).
+        if init_error_sinogram is None:
+            sinogram = self._shard_sinogram(sinogram)
 
         scale_recon_to_sinogram = init_recon is None
         if init_recon is None:
@@ -919,29 +1101,54 @@ class TomographyModel(ParameterHandler):
             init_recon = torch.full(tuple(recon_shape), float(init_recon),
                                     dtype=torch.float32, device=dev)
         else:
-            init_recon = torch.as_tensor(init_recon, dtype=torch.float32, device=dev)
+            init_recon = self._shard_recon(init_recon)
 
         if tuple(init_recon.shape) != tuple(recon_shape):
             raise ValueError(f"init_recon does not have the correct shape. Expected "
                              f"{tuple(recon_shape)}, got {tuple(init_recon.shape)}.")
 
-        # Initialize the error sinogram.  We find the optimal alpha to minimize
-        # (1/2) ||y - alpha A x0||_weights^2, where y is the sinogram and x0 is
-        # init_recon, and scale both the error sinogram and the init by it.
-        # The scaling applies only to the default (direct-recon) init; a
-        # user-supplied init_recon is used as-is (scale_recon_to_sinogram).
-        self.logger.info('Initializing error sinogram')
-        error_sinogram = self.forward_project(init_recon, output_sharded=True)
-        weighted_error_sinogram = (error_sinogram if constant_weights
-                                   else weights * error_sinogram)
-        wtd_err_sino_norm = torch.sum(weighted_error_sinogram * error_sinogram)
-        if wtd_err_sino_norm > 0 and scale_recon_to_sinogram:
-            alpha = (torch.sum(weighted_error_sinogram * sinogram)
-                     / wtd_err_sino_norm).item()
+        if init_error_sinogram is not None:
+            # Resume fast path: trust the (init_recon, init_error_sinogram)
+            # pair and skip the initializing forward projection.  NO defensive
+            # copies (Greg, 2026-08-05): at large sizes cloning the state
+            # arrays would defeat the purpose of the checkpoint path, so the
+            # caller's arrays become the loop's working buffers and are
+            # updated IN PLACE where memory-compatible -- the no-copy analog
+            # of mbirjax's buffer donation.  Callers who need the pre-resume
+            # state copy it before resuming; see the docstring.
+            self.logger.info('Resuming from init_error_sinogram')
+            error_sinogram = self._shard_sinogram(init_error_sinogram)
         else:
-            alpha = 1
-        error_sinogram = sinogram - alpha * error_sinogram
-        init_recon = alpha * init_recon
+            # Initialize the error sinogram.  We find the optimal alpha to
+            # minimize (1/2) ||y - alpha A x0||_weights^2, where y is the
+            # sinogram and x0 is init_recon, and scale both the error sinogram
+            # and the init by it.  The scaling applies only to the default
+            # (direct-recon) init; a user-supplied init_recon is used as-is
+            # (scale_recon_to_sinogram).
+            self.logger.info('Initializing error sinogram')
+            error_sinogram = self.forward_project(init_recon, output_sharded=True)
+            weighted_error_sinogram = (error_sinogram if constant_weights
+                                       else weights * error_sinogram)
+            wtd_err_sino_norm = torch.sum(weighted_error_sinogram * error_sinogram)
+            if wtd_err_sino_norm > 0 and scale_recon_to_sinogram:
+                alpha = (torch.sum(weighted_error_sinogram * sinogram)
+                         / wtd_err_sino_norm).item()
+            else:
+                alpha = 1
+            error_sinogram = sinogram - alpha * error_sinogram
+            init_recon = alpha * init_recon
+
+        # The sinogram's contents are now fully folded into error_sinogram;
+        # its remaining dtype read (the constant-weights ones array) is served
+        # by error_sinogram.  Drop the reference so a device copy this
+        # function made (a numpy or cross-device input) is freed before the
+        # Hessian and the loop -- refcounting replaces mbirjax's explicit
+        # own-and-delete bookkeeping, and a caller-owned tensor is unaffected.
+        sinogram = None
+        # Placement invariant at the loop boundary (mirrors mbirjax): the
+        # error sinogram is in the sino device form -- a no-op re-placement
+        # on a single device.
+        error_sinogram = self._shard_sinogram(error_sinogram)
 
         if prox_input is not None:
             # mbirjax validates the prox input's shape before flattening; a
@@ -951,27 +1158,65 @@ class TomographyModel(ParameterHandler):
                 raise ValueError('prox_input does not have the correct size. \n'
                                  f'Expected {tuple(recon_shape)}, got shape '
                                  f'{tuple(prox_input.shape)} for prox_input shape.')
-            prox_input = torch.as_tensor(prox_input, dtype=torch.float32, device=dev)
-            prox_input = prox_input.reshape((-1, prox_input.shape[-1]))
+            # Flatten first, then place: under sharding the flat
+            # (num_pixels, slices) form is the slice-sharded device form (the
+            # same order as the flat_recon placement below; mbirjax's
+            # to_recon(prox_input.reshape(...))).
+            prox_input = self._shard_recon(
+                prox_input.reshape((-1, prox_input.shape[-1])))
 
         verbose, sigma_y = self.get_params(['verbose', 'sigma_y'])
 
+        # The REAL sinogram element count, from the params (which always hold
+        # the problem's shapes).  Equals the device arrays' size until a
+        # sharding port pads the view/row axes; normalizing the reported
+        # losses by the real count keeps them independent of inert padding.
+        # math.prod (exact Python ints), NOT np.prod: numpy accumulates in the
+        # platform default integer and a >2^31-element sinogram would silently
+        # wrap.  num_real_elements stays None until padding can exist (the
+        # sharding port gates it on its pad-active state, as mbirjax does).
+        real_sino_size = math.prod(sinogram_shape)
+        loss_num_real = None
+
         # Initialize the diagonal of the Hessian of the forward model: the back
         # projection of the weights with squared coefficients (constant weights
-        # use an all-ones sinogram).
-        self.logger.info('Computing Hessian diagonal')
-        hess_weights = None if constant_weights else weights
-        fm_hessian = self.compute_hessian_diagonal(weights=hess_weights,
-                                                   output_sharded=True)
+        # use an all-ones sinogram).  A precomputed fm_hessian (the checkpoint
+        # fast path) skips the back projection; it is read-only in the loop.
+        if fm_hessian is None:
+            if constant_weights:
+                # Ones over the real views, ZEROS over any padded views
+                # (device form): padded views must not contribute to the
+                # Hessian back projection.  _sino_ones_device_form uses only
+                # its argument's dtype; error_sinogram (same dtype, same
+                # device form) stands in.
+                hess_weights = self._sino_ones_device_form(error_sinogram)
+            else:
+                hess_weights = weights
+            self.logger.info('Computing Hessian diagonal')
+            fm_hessian = self.compute_hessian_diagonal(weights=hess_weights,
+                                                       output_sharded=True)
+        else:
+            self.logger.info('Using precomputed Hessian diagonal')
+            fm_hessian = self._shard_recon(fm_hessian)
         fm_hessian = fm_hessian.reshape((-1, fm_hessian.shape[-1]))
 
-        flat_recon = init_recon.reshape((-1, init_recon.shape[-1])).contiguous()
+        # Flat recon layout, placed via the chokepoint (mbirjax: to_recon) --
+        # under sharding the flat (num_pixels, slices) form is the
+        # slice-sharded device form; on a single device the placement is a
+        # no-op and contiguous() gives the engine its packed row layout.
+        flat_recon = self._shard_recon(
+            init_recon.reshape((-1, init_recon.shape[-1]))).contiguous()
 
-        stat_weights = 1 if constant_weights else weights
         vcd_subset_updater = self.create_vcd_subset_updater(
-            fm_hessian, weights=stat_weights, prox_input=prox_input)
+            fm_hessian, weights=weights, prox_input=prox_input)
 
         self.logger.info('Starting VCD iterations')
+        if verbose >= 2:
+            output = io.StringIO()
+            get_memory_stats(file=output)
+            self.logger.debug(output.getvalue())
+            self.logger.debug('--------')
+
         max_iters = partition_sequence.size
         fm_rmse = np.zeros(max_iters)
         pm_loss = np.zeros(max_iters)
@@ -985,8 +1230,13 @@ class TomographyModel(ParameterHandler):
              delta_sumsq_partition) = self.vcd_partition_iterator(
                 vcd_subset_updater, flat_recon, error_sinogram, partition)
 
+            # real_sino_size == error_sinogram.numel() except under padding,
+            # where the padded entries are identically zero and must not
+            # dilute the RMSE.
             fm_loss_i, recon_l1, es_rmse = self._vcd_iteration_stats(
-                error_sinogram, flat_recon, sigma_y, stat_weights)
+                error_sinogram, flat_recon, sigma_y, weights,
+                num_real_elements=loss_num_real,
+                real_sino_size=float(real_sino_size))
             fm_rmse[i] = float(fm_loss_i)
             recon_l1_f = float(recon_l1)
             # An identically-zero recon gives recon_l1 == 0; mbirjax's jnp
@@ -999,14 +1249,42 @@ class TomographyModel(ParameterHandler):
                 delta_sumsq_partition.cpu().numpy())[:recon_shape[2]]
 
             if verbose >= 1:
-                self.logger.info(
+                iter_output = (
                     '\nAfter iteration {} of a max of {}: Pct change={:.4f}, '
                     'Forward loss={:.4f}'.format(i + first_iteration,
                                                  max_iters + first_iteration,
                                                  100 * nmae_update[i], fm_rmse[i]))
+                if compute_prior_loss:
+                    qggmrf_nbr_wts, sigma_x, p, q, T = self.get_params(
+                        ['qggmrf_nbr_wts', 'sigma_x', 'p', 'q', 'T'])
+                    b = _qggmrf.get_b_from_nbr_wts(qggmrf_nbr_wts)
+                    qggmrf_params = (b, sigma_x, p, q, T)
+                    # Evaluate the prior loss on the REAL volume: _gather_recon
+                    # crops any padded slices under a sharding port (whose zero
+                    # values would otherwise add spurious boundary-difference
+                    # terms).  Debug/verbose path only.
+                    real_recon_size = math.prod(recon_shape)
+                    loss_recon = self._gather_recon(flat_recon).reshape(
+                        tuple(recon_shape))
+                    pm_loss[i] = _qggmrf.qggmrf_loss(loss_recon, qggmrf_params)
+                    pm_loss[i] /= real_recon_size
+                    # Each loss is scaled by its element count, but the
+                    # optimization uses unscaled values.  Remove the scaling,
+                    # add, then scale by the average element count of the two.
+                    total_loss = ((fm_rmse[i] * real_sino_size
+                                   + pm_loss[i] * real_recon_size)
+                                  / (0.5 * (real_sino_size + real_recon_size)))
+                    iter_output += ', Prior loss={:.4f}, Weighted total loss={:.4f}'.format(
+                        pm_loss[i], total_loss)
+                self.logger.info(iter_output)
                 self.logger.info(f'Relative step size (alpha)={alpha_values[i]:.2f}, '
                                  f'Error sino RMSE={float(es_rmse):.4f}')
                 self.logger.info('Number subsets = {}'.format(partition.shape[0]))
+                if verbose >= 2:
+                    output = io.StringIO()
+                    get_memory_stats(file=output)
+                    self.logger.debug(output.getvalue())
+                    self.logger.debug('--------')
             num_iters += 1
             if nmae_update[i] < stop_threshold_change_pct / 100:
                 self.logger.warning('Change threshold stopping condition reached')
@@ -1015,6 +1293,9 @@ class TomographyModel(ParameterHandler):
         recon_3d = flat_recon.reshape(tuple(recon_shape[:2]) + (flat_recon.shape[-1],))
         losses = (fm_rmse[:num_iters], pm_loss[:num_iters], nmae_update[:num_iters],
                   alpha_values[:num_iters], delta_norm_per_slice[:num_iters])
+        if return_checkpoint:
+            checkpoint = {'error_sinogram': error_sinogram, 'fm_hessian': fm_hessian}
+            return recon_3d, losses, checkpoint
         return recon_3d, losses
 
     def initialize_recon(self, sinogram, weights=None, init_recon=None,
@@ -1135,7 +1416,7 @@ class TomographyModel(ParameterHandler):
                       'model_params': {k: v.val for k, v in self.params.items()}}
         # output_sharded keeps the device tensor (the mbirjax parameter; here
         # it means "skip the numpy exit").
-        return (recon if output_sharded else recon.cpu().numpy()), recon_dict
+        return (recon if output_sharded else self._gather_recon(recon)), recon_dict
 
     def prox_map(self, prox_input, sinogram, sigma_prox=None, weights=None,
                  init_recon=None, do_initialization=True,
@@ -1216,7 +1497,7 @@ class TomographyModel(ParameterHandler):
                       'model_params': {k: v.val for k, v in self.params.items()}}
         # output_sharded keeps the device tensor (the mbirjax parameter; here
         # it means "skip the numpy exit").
-        return (recon if output_sharded else recon.cpu().numpy()), recon_dict
+        return (recon if output_sharded else self._gather_recon(recon)), recon_dict
 
     @staticmethod
     def gen_weights(sinogram, weight_type):

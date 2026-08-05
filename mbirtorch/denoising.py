@@ -222,13 +222,11 @@ class QGGMRFDenoiser(TomographyModel):
             device=self.torch_device, use_ror_mask=use_ror_mask)
         partition = partitions[0]
 
-        dev = self.torch_device
-        image_t = torch.as_tensor(image, dtype=torch.float32, device=dev)
+        image_t = self._shard_recon(image)
         if init_image is None:
             init_t = image_t.clone()
         else:
-            init_t = torch.as_tensor(init_image, dtype=torch.float32,
-                                     device=dev).clone()
+            init_t = self._shard_recon(init_image).clone()
 
         # Recon-domain flat layout: the image and the residual (the identity
         # model's "error sinogram").
@@ -280,4 +278,4 @@ class QGGMRFDenoiser(TomographyModel):
         denoiser_dict = {'recon_params': recon_params,
                          'model_params': {k: v.val for k, v in self.params.items()}}
         denoised = flat_image.reshape(tuple(image_shape))
-        return (denoised if output_sharded else denoised.cpu().numpy()), denoiser_dict
+        return (denoised if output_sharded else self._gather_recon(denoised)), denoiser_dict

@@ -26,6 +26,13 @@ dependencies = [
     # harness backend cells before advancing it.
     "torch>=2.13",  # the Phase 0 recorded version (2.13.0, 2026-08-04)
     "numpy",
+    # The slice viewer (mbirtorch/viewer.py) needs matplotlib always and h5py
+    # for HDF5 load/save (imported lazily, but required for full function).
+    # Both unversioned, matching mbirjax's pyproject.
+    "matplotlib",
+    "h5py",
+    # get_memory_stats reads host RSS/USS via psutil (mbirjax parity).
+    "psutil",
 ]
 
 [project.optional-dependencies]

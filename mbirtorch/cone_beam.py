@@ -540,7 +540,7 @@ class ConeBeamModel(TomographyModel):
     def fdk_filter(self, sinogram, filter_name="ramp", output_sharded=False):
         """FDK filtering: the shared row filter with the FDK cosine pre-weight
         per detector element and the voxel-size scale alpha."""
-        sinogram = torch.as_tensor(sinogram, dtype=_F32, device=self.torch_device)
+        sinogram = self._shard_sinogram(sinogram)
         num_rows, num_channels = sinogram.shape[1], sinogram.shape[2]
         source_detector_dist = self.get_params('source_detector_dist')
         (delta_voxel, delta_det_row, delta_det_channel, voxel_row_aspect,
@@ -589,6 +589,10 @@ class ConeBeamModel(TomographyModel):
         visible = np.abs(z_k[:, None] - helical_z_shifts[None, :]) <= det_half_height_iso
         coverage = np.sum(visible, axis=1)
         z_weight = np.where(coverage > 0, num_views / np.maximum(coverage, 1), 0.0)
+        # Padded device-form slices (k >= num_real_slices) are identically zero
+        # by the forced-zero invariant and must remain so.  A no-op until a
+        # sharding port pads the slice axis (recon.shape[2] == recon_shape[2]).
+        z_weight = np.where(k < num_real_slices, z_weight, 0.0)
         w = torch.as_tensor(z_weight.astype(np.float32), device=recon.device)
         return recon * w[None, None, :]
 
@@ -602,13 +606,19 @@ class ConeBeamModel(TomographyModel):
             applies no short-scan redundancy weighting; for helical scans it is
             approximate regardless.  Best used as an initializer for ``recon()``.
         """
+        # Place once at entry so the filter receives device-form data (a no-op
+        # when already placed; a single device is the trivial 1-shard case).
+        # The pipeline then stays on-device throughout -- fdk_filter then
+        # back_project, both output_sharded=True (zero host transfer) --
+        # exactly like ParallelBeamModel.fbp_recon.
+        sinogram = self._shard_sinogram(sinogram)
         filtered_sinogram = self.fdk_filter(sinogram, filter_name=filter_name,
                                             output_sharded=True)
         recon = self.back_project(filtered_sinogram, output_sharded=True)
         helical_z_shifts = np.asarray(self.get_params('view_params_array'))[:, 1]
         if float(np.max(helical_z_shifts) - np.min(helical_z_shifts)) > 0:
             recon = self.helical_fdk_z_weight(recon, sinogram)
-        return recon if output_sharded else recon.cpu().numpy()
+        return recon if output_sharded else self._gather_recon(recon)
 
     def direct_recon(self, sinogram, filter_name="ramp", output_sharded=False):
         return self.fdk_recon(sinogram, filter_name=filter_name,

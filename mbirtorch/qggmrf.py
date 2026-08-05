@@ -12,6 +12,7 @@ via flat gathers -- which is value-identical (the ops are elementwise on the
 same operands; validated against the mbirjax goldens at ~1e-7 rel-max).
 """
 
+import numpy as np
 import torch
 
 _F32_EPS = torch.finfo(torch.float32).eps
@@ -175,3 +176,42 @@ def prox_gradient_at_indices(recon, prox_input, pixel_indices, sigma_prox):
     # Compute the prior model gradient at all voxels
     cur_diff = recon[pixel_indices] - prox_input[pixel_indices]
     return (1.0 / (sigma_prox ** 2.0)) * cur_diff
+
+
+def qggmrf_loss(full_recon, qggmrf_params):
+    """
+    Computes the loss for the qGGMRF prior for a given recon.  This is meant
+    only for relatively small recons for debugging and demo purposes (the
+    verbose compute_prior_loss path of vcd_recon); it runs host-side in numpy
+    on the gathered volume, verbatim mbirjax math.
+
+    Args:
+        full_recon (ndarray): 3D volume, (rows, cols, slices).
+        qggmrf_params (tuple): The parameters b, sigma_x, p, q, T.
+
+    Returns:
+        float
+    """
+    b, sigma_x, p, q, T = qggmrf_params
+    full_recon = np.asarray(full_recon)
+
+    # Normalize b to sum to 1, then get the per-axis b.
+    b_per_axis = [(b[j] + b[j + 1]) / (2 * sum(b)) for j in [0, 2, 4]]
+
+    def rho_ref(delta):
+        # Compute rho from Table 8.1 in FCI
+        a_min = T * sigma_x * np.finfo(np.float32).eps
+        abs_delta = np.clip(np.abs(delta), a_min, None)
+        delta_scale = abs_delta / (T * sigma_x)  # delta_scale has a min of eps
+        ds_q_minus_p = delta_scale ** (q - p)
+        numerator = (abs_delta ** p) / (p * sigma_x ** p)
+        numerator *= ds_q_minus_p
+        return numerator / (1 + ds_q_minus_p)
+
+    # Add rho over all the neighbor differences
+    loss = 0.0
+    for axis in [0, 1, 2]:
+        cur_delta = np.diff(full_recon, axis=axis)
+        loss += float(np.sum(b_per_axis[axis] * rho_ref(cur_delta)))
+
+    return loss

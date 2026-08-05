@@ -12,7 +12,39 @@ flip between frameworks (f32 vs f64 grid arithmetic).  The golden test
 therefore allows a small fraction of differing boundary voxels.
 """
 
+import os
+import shutil
+
 import numpy as np
+
+
+def clear_cache(_root=None):
+    """Delete mbirtorch's on-disk state: the ``~/.mbirtorch`` directory.
+
+    Today that directory holds only the persistent torch.compile cache
+    (``~/.mbirtorch/torch_cache``; see the setup block in
+    ``mbirtorch/__init__.py``), and anything the package adds under
+    ``~/.mbirtorch`` in the future is removed with it.  The directory is
+    recreated empty, so a running process is unaffected beyond paying the
+    compile cost again on its next cold compile.  A cache redirected
+    elsewhere via the ``TORCHINDUCTOR_CACHE_DIR`` environment variable is
+    NOT touched -- that location is user-managed.
+
+    The per-model pixel-index cache is unrelated: it is in-memory only (a
+    single entry on the model instance, freed with the model) and never
+    reaches disk.
+
+    Args:
+        _root: internal/testing override of the directory to clear.
+
+    Returns:
+        str: the path that was cleared.
+    """
+    root = os.path.expanduser("~/.mbirtorch") if _root is None else str(_root)
+    if os.path.isdir(root):
+        shutil.rmtree(root, ignore_errors=True)
+    os.makedirs(root, exist_ok=True)
+    return root
 
 
 def add_ellipsoid(current_volume, grids, z_locations, x0, y0, z0, a, b, c,
