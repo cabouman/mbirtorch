@@ -1,12 +1,12 @@
-"""Generate cross-framework golden data from mbirjax (the confirmed Phase 1
-golden mechanism: a jax-side script writes the goldens; mbirtorch tests read
-them, so the mbirtorch test env never imports jax).
+"""Generate cross-framework golden data from mbirjax (a jax-side script writes
+the goldens; mbirtorch tests read them, so the mbirtorch test env never
+imports jax).
 
 Run in the mbirjax conda env:
     /Users/gbuzzard/miniforge3/envs/mbirjax/bin/python tests/generate_goldens.py
 
 Writes tests/goldens/golden_<cell>.npz (gitignored; regenerate at will).  The
-recorded jax version is the frozen Phase 0 baseline (0.10.1).
+recorded jax version is the frozen comparison baseline (0.10.1).
 
 Contents per cell: the shepp-logan phantom, its sinogram, transmission-root
 weights, sparse fwd/back outputs on a fixed subset, the qGGMRF gradient and

@@ -10,8 +10,8 @@ import numpy as np
 import torch
 
 # Detector rows convolved per batch; bounds the FFT work area (the mbirjax
-# constant, kept -- its H100 sweep rationale is backend-independent enough for
-# Phase 1; re-sweep in Phase 2).
+# constant, kept -- its H100 sweep rationale is backend-independent enough to
+# start from; re-sweep as part of the torch tuning).
 ROW_FILTER_BATCH = 1024
 
 

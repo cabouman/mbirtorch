@@ -1,9 +1,9 @@
 """Shared horizontal-fan projector kernels (portable forms) and the batched drivers.
 
-Ported from mbirjax.projectors, Phase 1 scope (port_plan.md section 5): the
-per-tap scatter-add forward and per-tap gather back only -- no sorted channel
-reduction, no stacked gather, no tile policy (those are the jax perf layer;
-their torch analogs are Phase 2/5 work).
+Ported from mbirjax.projectors in the PORTABLE forms: the per-tap scatter-add
+forward and per-tap gather back only -- no sorted channel reduction, no
+stacked gather, no tile policy (those are the jax perf layer; their torch
+analogs belong with the future Triton kernel work).
 
 Every geometry's horizontal fan applies the same trapezoid rule; the geometry
 enters ONLY through (n_p, n_p_center, W_p_c) -- the continuous projected
@@ -17,7 +17,7 @@ across geometries): tap n = n_p_center + offset receives
 outside the detector.  Values match mbirjax's kernels by construction
 (validated cross-framework at <= 1.6e-6 rel-max on the goldens).
 
-Torch semantics note (port_plan.md section 7, item 1): jax DROPS out-of-bounds
+Torch semantics note: jax DROPS out-of-bounds
 scatter indices and CLAMPS out-of-bounds gathers, and mbirjax's per-tap loops
 rely on both.  Torch index ops assert on out-of-bounds instead, so every tap
 here uses the clip-plus-zero-weight pattern (the same pattern mbirjax's sorted
@@ -32,18 +32,17 @@ drivers transpose each view batch up front).
 
 The drivers batch over VIEWS with a plain python loop; the eager transient is
 (view_batch, num_pixels, S) floats, so ``view_batch_size`` is the single
-memory/speed knob.  torch.compile of these bodies is the Phase 2 performance
-pass.
+memory/speed knob; the bodies are torch.compiled (see maybe_compile below).
 """
 
 import torch
 
 _F32 = torch.float32
 
-# ── torch.compile plumbing (the Phase 2 performance pass) ─────────────────────
-# Phase 0 measured chain-level compile wins of 1.7-3.6x (CPU), 5-17x (MPS), and
-# 2.6-22x (CUDA), with the fan chain's peak-memory transients collapsing 6-41x
-# (phase0_findings.md).  The compiled callables are cached per FUNCTION at
+# ── torch.compile plumbing ────────────────────────────────────────────────────
+# Measured chain-level compile wins: 1.7-3.6x (CPU), 5-17x (MPS), and 2.6-22x
+# (CUDA), with the fan chain's peak-memory transients collapsing 6-41x.  The
+# compiled callables are cached per FUNCTION at
 # module level: torch.compile handles multiple input shapes itself (one
 # specialization per shape guard), and the engine's shape set is small (one
 # subset size per partition granularity, plus the full-index size).  A compile
@@ -60,7 +59,7 @@ def maybe_compile(fn, enabled):
 
     torch.compile is LAZY: the wrapper it returns compiles at the first
     invocation, so a broken backend (no C++ toolchain, a broken triton) would
-    surface there, not at torch.compile() time (panel finding).  The returned
+    surface there, not at torch.compile() time.  The returned
     callable therefore guards the FIRST call: on any exception it retries the
     call EAGERLY -- the kernels here are pure, so the retry is safe -- and, if
     eager succeeds, records the compile error in ``_COMPILE_ERRORS`` and
@@ -219,7 +218,7 @@ class Projectors:
     # cells lean while leaving the large cells -- where torch already beat jax
     # on memory -- at the 2 GiB cap.  CPU keeps the flat cap: host RSS was
     # already 0.4-0.6x of jax's, and the small batches the scaled budget
-    # implies were measured slower there (the spike-1 CPU optimum is a large
+    # implies were measured slower there (the measured CPU optimum is a large
     # batch).
     VIEW_BATCH_TRANSIENT_BUDGET_BYTES = 2 * 2**30
     VIEW_BATCH_TRANSIENT_FLOOR_BYTES = 256 * 2**20

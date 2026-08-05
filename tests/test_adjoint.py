@@ -1,4 +1,4 @@
-"""Phase 1 gate: adjointness <Ax, y> == <x, A'y>, and the differentiable
+"""Adjointness gate: <Ax, y> == <x, A'y>, and the differentiable
 wrapper's gradients equal the adjoint operators."""
 
 import numpy as np

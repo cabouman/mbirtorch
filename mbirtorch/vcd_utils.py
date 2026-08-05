@@ -3,8 +3,8 @@
 The partition generators are numpy-for-numpy ports with the SAME global
 np.random call sequence as mbirjax, so a seeded mbirtorch recon draws the
 identical subsets (and subset order) as a seeded mbirjax recon -- the property
-the cross-framework convergence-parity gate rests on.  Not ported in Phase 1:
-the grid and blue-noise partition variants and the MAR weights.
+the cross-framework convergence-parity gate rests on.  Not ported: the grid
+and blue-noise partition variants and the MAR weights.
 """
 
 import warnings

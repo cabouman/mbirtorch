@@ -1,4 +1,4 @@
-"""Panel-review regression tests: set_params semantics, engine paths, and the
+"""Regression tests: set_params semantics, engine paths, and the
 compile/eager and weights equivalences the suite previously never asserted."""
 
 import warnings
@@ -146,7 +146,7 @@ def test_compile_on_off_value_equality():
 
 
 def test_zero_recon_nmae_does_not_raise():
-    # The panel finding: an identically-zero recon gives recon_l1 == 0 and the
+    # An identically-zero recon gives recon_l1 == 0 and the
     # nmae division raised ZeroDivisionError where mbirjax's jnp division
     # yields nan and continues.  Construct that state directly: manual sigmas
     # (auto-regularization off, so the zero sinogram cannot zero sigma_y --

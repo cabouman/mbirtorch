@@ -1,4 +1,4 @@
-"""Phase 0 smoke test: the package imports and torch runs a tensor op on every
+"""Smoke test: the package imports and torch runs a tensor op on every
 available backend (CPU always; MPS or CUDA when present)."""
 
 import torch

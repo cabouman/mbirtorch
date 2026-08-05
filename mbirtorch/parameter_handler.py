@@ -3,8 +3,8 @@
 The public surface the engine and users rely on is kept: ``get_params`` (one
 name or a list), ``set_params(**kwargs)`` with mbirjax's recompile and
 auto-regularization semantics, ``verify_valid_params``, ``print_params``, and
-the shared geometry-params namedtuple cache.  Not ported in Phase 1/2: YAML
-save/load and the ParamNames Literal typing machinery.
+the shared geometry-params namedtuple cache.  Not yet ported: YAML save/load
+and the ParamNames Literal typing machinery.
 """
 
 import warnings

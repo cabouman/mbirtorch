@@ -1,4 +1,4 @@
-"""Phase 1 gate: the recon engine runs on every available backend and reduces
+"""Recon smoke gate: the engine runs on every available backend and reduces
 the forward loss on a simple synthetic object."""
 
 import numpy as np

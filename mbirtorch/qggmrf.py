@@ -1,7 +1,7 @@
 """qGGMRF prior: gradient and Hessian-diagonal at pixel indices.
 
 Ported from mbirjax.qggmrf (single-device path; the sharded halo/mask
-machinery is out of Phase 1 scope).  The formulas are FCI Figure 8.5 /
+machinery is not ported).  The formulas are FCI Figure 8.5 /
 Table 8.1, and ``b_tilde`` deliberately has ONE implementation
 (``b_tilde_by_definition``), matching the mbirjax structure after its
 qggmrf-flake fix: the clip floor lives only there.

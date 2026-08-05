@@ -1,9 +1,8 @@
-"""mbirtorch: a PyTorch port of mbirjax (Phase 1: the parallel-beam vertical slice).
+"""mbirtorch: a PyTorch port of mbirjax (parallel-beam geometry).
 
 The public API mirrors mbirjax where implemented: numpy in, numpy out by
 default, with device tensors available via ``output_sharded=True`` (the name
-kept for API compatibility; here it means "return the device tensor").  The
-port plan and parity gates live in mbirjax_plans/plans/torch_port/.
+kept for API compatibility; here it means "return the device tensor").
 """
 
 __version__ = "0.0.1"

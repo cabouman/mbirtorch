@@ -1,4 +1,4 @@
-"""ParallelBeamModel: the Phase 1 geometry, ported from mbirjax.parallel_beam.
+"""ParallelBeamModel, ported from mbirjax.parallel_beam.
 
 The geometry math (compute_proj_data) is reproduced exactly, vectorized over a
 batch of views: detector row r maps to recon slice r, and the horizontal fan's
@@ -78,7 +78,7 @@ class ParallelBeamModel(TomographyModel):
             string.  Device selection is an execution-environment choice, not a
             saved model parameter (the mbirjax configure_devices rationale).
         view_batch_size (int): views per eager kernel batch (the single
-            memory/speed knob of the Phase 1 drivers).
+            memory/speed knob of the batched drivers).
 
     Example:
         >>> import numpy as np, mbirtorch

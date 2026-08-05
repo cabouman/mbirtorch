@@ -3,7 +3,7 @@ Shepp-Logan used by the demos).
 
 The build is plain numpy: the phantom is a host-side reference object in
 mbirjax too (its jax machinery there exists only to bound peak memory at very
-large sizes, which Phase 1 does not need).  The ellipsoid definitions and the
+large sizes, not needed here yet).  The ellipsoid definitions and the
 attenuation-scale formula are copied verbatim.
 
 Boundary note for cross-framework comparisons: each ellipsoid is a <= 1
@@ -100,7 +100,7 @@ def generate_3d_shepp_logan_low_dynamic_range(phantom_shape,
     Note:
         The build holds a few phantom-sized transients, so very large shapes use
         proportionally more peak memory (mbirjax's blocked/sharded builds exist
-        for that regime; Phase 1 does not need them).
+        for that regime and are not ported).
     """
     n_rows, n_cols, n_slices = phantom_shape
     x_grid, y_grid = np.meshgrid(np.linspace(-1, 1, n_rows),

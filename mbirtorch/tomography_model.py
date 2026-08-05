@@ -1,16 +1,15 @@
 """TomographyModel: the single-device VCD engine, FBP, and projector wrappers.
 
-Ported from mbirjax.tomography_model, Phase 1 scope (port_plan.md section 5):
-the VCD engine (numpy partitions, subset updater, on-device line search,
+Ported from mbirjax.tomography_model: the VCD engine (numpy partitions, subset updater, on-device line search,
 positivity), FBP via torch.fft, the auto-regularization chain, and the public
-numpy-at-the-boundary API.  Deliberately not ported in Phase 1: sharding and
+numpy-at-the-boundary API.  Deliberately not (yet) ported: sharding and
 placements, the tile policy, prox_map/denoiser, checkpoint resume, save/load,
 and the memory-management machinery jax needed (donation and .delete() become
 plain in-place ops here).
 
 Value-parity intent: every formula follows the mbirjax source read 2026-08-04,
 in the same order of operations, so a seeded run matches a seeded mbirjax run
-iteration for iteration (the Phase 1 convergence-parity gate).
+iteration for iteration (the convergence-parity gate in tests/test_vs_goldens).
 """
 
 import logging
@@ -30,7 +29,7 @@ _F32_EPS = float(np.finfo(np.float32).eps)
 
 
 # ── compiled updater glue (module level, one compile per process) ─────────────
-# The panel review measured ~20 eager launches per subset between the projector
+# Eagerly there were ~20 kernel launches per subset between the projector
 # calls; these fused forms remove most of them.  Each is pure except
 # _apply_update, which mutates the two state tensors in place (supported by
 # torch.compile); all are value-equal to the eager forms up to float summation
@@ -90,9 +89,8 @@ class TomographyModel(ParameterHandler):
         super().__init__()
         self.torch_device = _resolve_device(device)
         self.view_batch_size = view_batch_size
-        # torch.compile of the hot chains (Phase 2).  'auto' compiles on every
-        # backend (torch 2.13 supports CPU, CUDA, and MPS; Phase 0 measured the
-        # wins); 'off' keeps pure eager (debugging, or a backend where compile
+        # torch.compile of the hot chains.  'auto' compiles on every backend
+        # (torch 2.13 supports CPU, CUDA, and MPS); 'off' keeps pure eager (debugging, or a backend where compile
         # misbehaves).  An execution-environment choice like `device`, so a
         # plain attribute rather than a saved model parameter.
         self.compile_mode = compile_mode
@@ -163,7 +161,7 @@ class TomographyModel(ParameterHandler):
         device, cached per (recon_shape, use_ror_mask) -- the hot consumers
         (forward/back_project, the differentiable wrappers) call this per
         invocation, and rebuilding + re-uploading the indices each time was a
-        measured per-call cost (panel review).  A custom mask array bypasses
+        measured per-call cost.  A custom mask array bypasses
         the cache (unhashable)."""
         recon_shape, use_ror_mask = self.get_params(['recon_shape', 'use_ror_mask'])
         key = (tuple(recon_shape), use_ror_mask if isinstance(use_ror_mask, bool) else None,
@@ -585,8 +583,8 @@ class TomographyModel(ParameterHandler):
             avg_weight = weights
         else:
             # Array-likes (numpy included -- a numpy array is not a torch
-            # tensor, and the old tensor-only test routed it to the scalar
-            # branch, returning a sinogram-shaped 'loss'; panel finding).
+            # tensor, and a tensor-only test would route it to the scalar
+            # branch, returning a sinogram-shaped 'loss').
             weights = torch.as_tensor(weights, dtype=torch.float32,
                                       device=error_sinogram.device)
             avg_weight = torch.mean(weights)
@@ -696,11 +694,10 @@ class TomographyModel(ParameterHandler):
         if const_weights and abs(weights - 1) > 1e-5:
             raise ValueError('Constant weights must have value 1.')
 
-        # The qGGMRF chain is the engine's memory attention point (Phase 0):
-        # bind the compiled form once for all subsets.  The line-search and
-        # state-application glue is compiled too (the panel review measured the
-        # ~20 eager launches between projector calls as the interactive-VCD
-        # dispatch cost).
+        # The qGGMRF chain is the engine's memory attention point: bind the
+        # compiled form once for all subsets.  The line-search and
+        # state-application glue is compiled too (the ~20 eager launches
+        # between projector calls were the interactive-VCD dispatch cost).
         qggmrf_grad_hess = maybe_compile(
             _qggmrf.qggmrf_gradient_and_hessian_at_indices, self.compile_enabled)
         prior_line_terms = maybe_compile(_prior_line_terms, self.compile_enabled)
@@ -1209,8 +1206,8 @@ class TomographyModel(ParameterHandler):
         self.set_params(no_warning=True, sigma_prox=self_sigma_prox)
         recon_dict = {'recon_params': recon_params,
                       'model_params': {k: v.val for k, v in self.params.items()}}
-        # output_sharded keeps the device tensor (the mbirjax parameter,
-        # restored per the panel review; here it means "skip the numpy exit").
+        # output_sharded keeps the device tensor (the mbirjax parameter; here
+        # it means "skip the numpy exit").
         return (recon if output_sharded else recon.cpu().numpy()), recon_dict
 
     @staticmethod

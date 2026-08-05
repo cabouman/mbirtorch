@@ -1,5 +1,5 @@
 """Demo 1: 3D Shepp-Logan reconstruction with mbirtorch (the mbirjax demo_1
-equivalent, Phase 1 form).
+equivalent).
 
 Generates a Shepp-Logan phantom, forward projects it to a sinogram, and runs
 the VCD reconstruction; prints the per-iteration traces and the final NRMSE

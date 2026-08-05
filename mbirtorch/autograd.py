@@ -1,7 +1,7 @@
-"""Differentiable projectors: the DL-interop deliverable (port_plan.md, Phase 1).
+"""Differentiable projectors, for coupling to deep-learning pipelines.
 
-The forward and back projectors are exact adjoint pairs by construction (the
-Phase 1 adjointness gate tests <Ax, y> == <x, A'y>), so each is the correct
+The forward and back projectors are exact adjoint pairs by construction
+(tests/test_adjoint.py verifies <Ax, y> == <x, A'y>), so each is the correct
 autograd backward of the other -- no autodiff through the kernel internals is
 needed.  ``forward_project_differentiable`` exposes gradient flow through the
 volume; ``TorchProjector`` wraps it as an ``nn.Module`` in the LEAP style so a
@@ -50,8 +50,8 @@ def forward_project_differentiable(model, volume):
     The input may live on any device and dtype: it is moved to the model's
     device as float32 through a DIFFERENTIABLE ``.to`` (autograd then returns
     the gradient on the input's own device and dtype -- without this, a CPU or
-    float64 leaf against a CUDA/MPS model failed at forward or, worse, only at
-    backward; panel finding).  The ROR indices come from the model's per-shape
+    float64 leaf against a CUDA/MPS model would fail at forward or, worse, only
+    at backward).  The ROR indices come from the model's per-shape
     cache rather than being rebuilt and re-uploaded per call.
 
     Args:
