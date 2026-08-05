@@ -514,7 +514,7 @@ class TomographyModel(ParameterHandler):
 
     # ── direct recon (FBP) machinery ──────────────────────────────────────────
     def _apply_direct_recon_filter(self, sinogram, filter_name, filter_scale,
-                                   output_sharded=False):
+                                   output_sharded=False, row_weight=None):
         """Shared FBP row-filter for direct reconstruction.
 
         Scales the recon filter by ``filter_scale * pi / num_views`` -- folded
@@ -537,8 +537,12 @@ class TomographyModel(ParameterHandler):
             sinogram: (num_views, num_rows, num_channels); numpy or tensor.
             filter_name (str): filter for generate_direct_recon_filter ('ramp').
             filter_scale (float): geometry-specific filter scaling
-                (FBP: 1/(delta_voxel * delta_voxel_row)).
+                (FBP: 1/(delta_voxel * delta_voxel_row); FDK: alpha =
+                delta_det_row / (voxel_volume * M_0)).
             output_sharded (bool): True returns the device tensor; False numpy.
+            row_weight (tensor or None): optional (rows, channels) per-detector
+                pre-weight (the FDK cosine map), broadcast over views.  None
+                (default) is pure FBP.
 
         Returns:
             The filtered sinogram.
@@ -550,6 +554,10 @@ class TomographyModel(ParameterHandler):
             num_channels, filter_name=filter_name)
         recon_filter = recon_filter * np.float32(filter_scale * (np.pi / num_views))
         filter_t = torch.as_tensor(recon_filter, device=self.torch_device)
+        if row_weight is not None:
+            # FDK cosine pre-weight: a view-independent (rows, channels) map
+            # multiplying each detector row before convolution.
+            sinogram = sinogram * row_weight[None, :, :]
         filtered = tomography_utils.apply_row_filter(sinogram, filter_t)
         return filtered if output_sharded else filtered.cpu().numpy()
 

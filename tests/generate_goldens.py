@@ -87,6 +87,36 @@ def main():
     den_rp = den_dict['recon_params']
     den_sigma_est = float(denoiser.estimate_image_noise_std(noisy))
 
+    # Cone golden: the harness geometry convention (sdd = 4 * channels,
+    # sid = sdd / 2, magnification 2), full-circle angles, seeded recon traces.
+    cone_cell = (48, 48, 48)
+    cone_angles = np.linspace(0, 2 * np.pi, cone_cell[0], endpoint=False)
+    cone = mbirjax.ConeBeamModel(cone_cell, cone_angles,
+                                 source_detector_dist=4 * cone_cell[2],
+                                 source_iso_dist=2 * cone_cell[2])
+    cone.set_params(no_warning=True, verbose=0)
+    cone_recon_shape = tuple(int(x) for x in cone.get_params('recon_shape'))
+    cone_phantom = np.asarray(
+        mbirjax.generate_3d_shepp_logan_low_dynamic_range(cone_recon_shape))
+    cone_sino = np.asarray(cone.forward_project(cone_phantom))
+    cone_weights = np.asarray(mbirjax.gen_weights(cone_sino / max(1e-6, cone_sino.max()),
+                                                  weight_type='transmission_root'))
+    cone_full = np.asarray(mbirjax.gen_full_indices(
+        cone_recon_shape, use_ror_mask=cone.get_params('use_ror_mask')))
+    cone_subset = np.sort(np.random.RandomState(SEED).choice(
+        cone_full, size=min(400, len(cone_full)), replace=False))
+    cone_vals = np.random.RandomState(SEED + 1).rand(
+        len(cone_subset), cone_recon_shape[2]).astype(np.float32)
+    cone_sp_fwd = np.asarray(cone.sparse_forward_project(cone_vals, cone_subset))
+    cone_sp_back = np.asarray(cone.sparse_back_project(cone_sino, cone_subset))
+    cone_hess = np.asarray(cone.compute_hessian_diagonal(weights=cone_weights))
+    cone_fdk = np.asarray(cone.fdk_recon(cone_sino))
+    np.random.seed(RECON_SEED)
+    cone_recon, cone_dict = cone.recon(cone_sino, weights=cone_weights,
+                                       max_iterations=MAX_ITERATIONS,
+                                       stop_threshold_change_pct=0.0)
+    cone_rp = cone_dict['recon_params']
+
     out = os.path.join(OUT_DIR, f"golden_{'x'.join(map(str, CELL))}.npz")
     np.savez_compressed(
         out,
@@ -113,6 +143,22 @@ def main():
         den_alpha=np.array(den_rp['alpha_values']),
         den_nmae_pct=np.array(den_rp['stop_threshold_change_pct']),
         den_sigma_est=np.float32(den_sigma_est),
+        cone_cell=np.array(cone_cell), cone_angles=cone_angles,
+        cone_recon_shape=np.array(cone_recon_shape),
+        cone_sdd=np.float32(4 * cone_cell[2]), cone_sid=np.float32(2 * cone_cell[2]),
+        cone_slice_offset=np.float32(cone.get_params('recon_slice_offset')),
+        cone_phantom=cone_phantom.astype(np.float32),
+        cone_sino=cone_sino.astype(np.float32),
+        cone_weights=cone_weights.astype(np.float32),
+        cone_subset=cone_subset, cone_vals=cone_vals,
+        cone_sp_fwd=cone_sp_fwd.astype(np.float32),
+        cone_sp_back=cone_sp_back.astype(np.float32),
+        cone_hess=cone_hess.astype(np.float32),
+        cone_fdk=cone_fdk.astype(np.float32),
+        cone_recon=np.asarray(cone_recon, dtype=np.float32),
+        cone_alpha=np.array(cone_rp['alpha_values']),
+        cone_fm_rmse=np.array(cone_rp['fm_rmse']),
+        cone_nmae_pct=np.array(cone_rp['stop_threshold_change_pct']),
     )
     print('wrote', out)
 

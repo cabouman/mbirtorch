@@ -1,0 +1,146 @@
+"""Cone-beam gates: adjointness on every backend, cross-framework goldens
+against mbirjax (single ops, FDK, auto geometry, and seeded convergence
+parity), and a recon smoke."""
+
+import glob
+import os
+
+import numpy as np
+import pytest
+import torch
+
+import mbirtorch
+
+GOLDEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "goldens")
+_paths = sorted(glob.glob(os.path.join(GOLDEN_DIR, "golden_*.npz")))
+_have_cone = bool(_paths) and "cone_sino" in np.load(_paths[0]).files
+
+
+def _rel_max(out, ref):
+    out = np.asarray(out, dtype=np.float64)
+    ref = np.asarray(ref, dtype=np.float64)
+    return float(np.max(np.abs(out - ref)) / np.max(np.abs(ref)))
+
+
+def _small_cone(device="cpu"):
+    cell = (24, 16, 16)
+    angles = np.linspace(0, 2 * np.pi, cell[0], endpoint=False)
+    m = mbirtorch.ConeBeamModel(cell, angles, source_detector_dist=4 * cell[2],
+                                source_iso_dist=2 * cell[2], device=device)
+    m.set_params(no_warning=True, verbose=0)
+    return m
+
+
+def test_cone_adjointness(device):
+    torch.manual_seed(0)
+    m = _small_cone(device)
+    rs = m.get_params('recon_shape')
+    idx = torch.as_tensor(mbirtorch.gen_full_indices(rs), dtype=torch.int64,
+                          device=m.torch_device)
+    x = torch.rand((idx.shape[0], rs[2]), device=m.torch_device)
+    y = torch.rand(tuple(m.get_params('sinogram_shape')), device=m.torch_device)
+    lhs = float(torch.sum(m.sparse_forward_project(x, idx) * y))
+    rhs = float(torch.sum(x * m.sparse_back_project(y, idx)))
+    assert abs(lhs - rhs) / max(abs(rhs), 1e-30) < 1e-4, (lhs, rhs)
+
+
+def test_cone_recon_smoke(device):
+    m = _small_cone(device)
+    rs = m.get_params('recon_shape')
+    phantom = mbirtorch.generate_3d_shepp_logan_low_dynamic_range(rs)
+    sino = m.forward_project(phantom)
+    np.random.seed(0)
+    recon, rd = m.recon(sino, max_iterations=3, stop_threshold_change_pct=0.0)
+    fm = rd['recon_params']['fm_rmse']
+    assert fm[-1] < fm[0]
+    assert recon.shape == tuple(rs)
+
+
+cone_golden = pytest.mark.skipif(
+    not _have_cone, reason="no cone goldens: rerun tests/generate_goldens.py")
+
+
+@pytest.fixture(scope="module")
+def golden():
+    return np.load(_paths[0])
+
+
+@pytest.fixture(scope="module")
+def cone_model(golden):
+    cell = tuple(int(x) for x in golden["cone_cell"])
+    m = mbirtorch.ConeBeamModel(cell, golden["cone_angles"],
+                                source_detector_dist=float(golden["cone_sdd"]),
+                                source_iso_dist=float(golden["cone_sid"]),
+                                device="cpu")
+    m.set_params(no_warning=True, verbose=0)
+    return m
+
+
+@cone_golden
+def test_cone_auto_geometry(golden, cone_model):
+    assert tuple(cone_model.get_params('recon_shape')) == \
+        tuple(int(x) for x in golden["cone_recon_shape"])
+    rel = abs(cone_model.get_params('recon_slice_offset')
+              - float(golden["cone_slice_offset"]))
+    assert rel < 1e-6
+
+
+@cone_golden
+def test_cone_sparse_forward(golden, cone_model):
+    out = cone_model.sparse_forward_project(golden["cone_vals"], golden["cone_subset"])
+    err = _rel_max(out.numpy(), golden["cone_sp_fwd"])
+    print(f"cone sparse_fwd rel_max = {err:.2e}")
+    assert err < 1e-4
+
+
+@cone_golden
+def test_cone_sparse_back(golden, cone_model):
+    out = cone_model.sparse_back_project(golden["cone_sino"], golden["cone_subset"])
+    err = _rel_max(out.numpy(), golden["cone_sp_back"])
+    print(f"cone sparse_back rel_max = {err:.2e}")
+    assert err < 1e-4
+
+
+@cone_golden
+def test_cone_full_forward(golden, cone_model):
+    out = cone_model.forward_project(golden["cone_phantom"])
+    err = _rel_max(out, golden["cone_sino"])
+    print(f"cone forward rel_max = {err:.2e}")
+    assert err < 1e-4
+
+
+@cone_golden
+def test_cone_hessian(golden, cone_model):
+    out = cone_model.compute_hessian_diagonal(
+        weights=torch.as_tensor(golden["cone_weights"]))
+    err = _rel_max(out, golden["cone_hess"])
+    print(f"cone hessian rel_max = {err:.2e}")
+    assert err < 1e-4
+
+
+@cone_golden
+def test_cone_fdk(golden, cone_model):
+    out = cone_model.fdk_recon(golden["cone_sino"])
+    err = _rel_max(out, golden["cone_fdk"])
+    print(f"cone fdk rel_max = {err:.2e}")
+    assert err < 1e-3
+
+
+@cone_golden
+def test_cone_recon_convergence_parity(golden, cone_model):
+    np.random.seed(int(golden["recon_seed"]))
+    recon, rd = cone_model.recon(golden["cone_sino"],
+                                 weights=golden["cone_weights"],
+                                 max_iterations=int(golden["max_iterations"]),
+                                 stop_threshold_change_pct=0.0)
+    rp = rd["recon_params"]
+    alpha_rel = np.max(np.abs(np.array(rp["alpha_values"]) - golden["cone_alpha"])
+                       / np.abs(golden["cone_alpha"]))
+    fm_rel = np.max(np.abs(np.array(rp["fm_rmse"]) - golden["cone_fm_rmse"])
+                    / np.abs(golden["cone_fm_rmse"]))
+    final_rel = _rel_max(recon, golden["cone_recon"])
+    print(f"cone parity: alpha {alpha_rel:.2e}, fm {fm_rel:.2e}, "
+          f"final {final_rel:.2e}")
+    assert alpha_rel < 1e-2
+    assert fm_rel < 1e-3
+    assert final_rel < 1e-3

@@ -77,6 +77,21 @@ def get_2d_ror_mask(recon_shape, *, use_ror_mask=True, crop_radius_pixels=0,
         return mask
 
 
+def get_support_radius(recon_shape, delta_voxel_row, delta_voxel_col, use_ror_mask=True):
+    """Maximum distance (in ALU) from the rotation axis to the outer edge of any
+    voxel the projectors can update.  With the default inscribed-ellipse mask the
+    farthest updatable pixels sit at the ends of the longer grid axis (half the
+    larger physical width); with the mask disabled (or custom) the conservative
+    half-diagonal is used.  Overestimating only pads slightly; underestimating
+    reintroduces truncation artifacts.  (Verbatim mbirjax.vcd_utils math.)"""
+    num_rows, num_cols = recon_shape[:2]
+    half_width_row = 0.5 * num_rows * delta_voxel_row
+    half_width_col = 0.5 * num_cols * delta_voxel_col
+    if use_ror_mask is True:
+        return float(max(half_width_row, half_width_col))
+    return float(np.hypot(half_width_row, half_width_col))
+
+
 def gen_pixel_partition(recon_shape, num_subsets, use_ror_mask=True):
     """
     Generates a partition of pixel indices into a specified number of subsets for
