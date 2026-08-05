@@ -211,7 +211,28 @@ class Projectors:
     # batch at large cells allocates tens of GB (the 512-cell at the default
     # batch of 64 wants ~13 GB).  The batch size never changes values beyond
     # float summation order, so capping it is a pure memory knob.
+    #
+    # On the DEVICE backends the budget also scales DOWN with the problem: a
+    # flat 2 GiB let a 200-class cell hold a gather transient ~12x jax's whole
+    # peak (the CUDA gate readout's back/vcd memory breaches).  Scaling by the
+    # sinogram size (8x, floored at 256 MiB for batch efficiency) keeps small
+    # cells lean while leaving the large cells -- where torch already beat jax
+    # on memory -- at the 2 GiB cap.  CPU keeps the flat cap: host RSS was
+    # already 0.4-0.6x of jax's, and the small batches the scaled budget
+    # implies were measured slower there (the spike-1 CPU optimum is a large
+    # batch).
     VIEW_BATCH_TRANSIENT_BUDGET_BYTES = 2 * 2**30
+    VIEW_BATCH_TRANSIENT_FLOOR_BYTES = 256 * 2**20
+    VIEW_BATCH_SINO_MULTIPLE = 8
+
+    def _transient_budget_bytes(self):
+        if self.model.torch_device.type == 'cpu':
+            return self.VIEW_BATCH_TRANSIENT_BUDGET_BYTES
+        num_views, num_rows, num_channels = self.model.get_params('sinogram_shape')
+        sino_bytes = num_views * num_rows * num_channels * 4
+        return max(self.VIEW_BATCH_TRANSIENT_FLOOR_BYTES,
+                   min(self.VIEW_BATCH_TRANSIENT_BUDGET_BYTES,
+                       self.VIEW_BATCH_SINO_MULTIPLE * sino_bytes))
 
     def __init__(self, model):
         self.model = model
@@ -226,7 +247,7 @@ class Projectors:
     def _effective_view_batch(self, num_pixels, num_cols):
         """The model's view_batch_size, capped so one batch's (Vb, P, cols)
         transient stays within the budget above."""
-        cap = self.VIEW_BATCH_TRANSIENT_BUDGET_BYTES // max(1, num_pixels * num_cols * 4)
+        cap = self._transient_budget_bytes() // max(1, num_pixels * num_cols * 4)
         return max(1, min(self.model.view_batch_size, int(cap)))
 
     def sparse_forward_project(self, voxel_values, pixel_indices):

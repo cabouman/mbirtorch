@@ -74,6 +74,19 @@ def main():
     if not isinstance(rp, dict):
         rp = dict(rp)
 
+    # Denoiser golden: seeded AWGN on the phantom, explicit sigma, exact
+    # iteration count (the harness's determinism recipe), seeded partition.
+    noisy = phantom + 0.1 * np.random.RandomState(21).randn(*phantom.shape).astype(np.float32)
+    denoiser = mbirjax.QGGMRFDenoiser(recon_shape)
+    denoiser.set_params(no_warning=True, verbose=0)
+    np.random.seed(RECON_SEED)
+    denoised, den_dict = denoiser.denoise(noisy, sigma_noise=0.1,
+                                          max_iterations=5,
+                                          stop_threshold_change_pct=0.0,
+                                          print_logs=False)
+    den_rp = den_dict['recon_params']
+    den_sigma_est = float(denoiser.estimate_image_noise_std(noisy))
+
     out = os.path.join(OUT_DIR, f"golden_{'x'.join(map(str, CELL))}.npz")
     np.savez_compressed(
         out,
@@ -95,6 +108,11 @@ def main():
         fm_rmse=np.array(rp['fm_rmse']), alpha_values=np.array(rp['alpha_values']),
         nmae_pct=np.array(rp['stop_threshold_change_pct']),
         recon_seed=np.array(RECON_SEED), max_iterations=np.array(MAX_ITERATIONS),
+        den_noisy=noisy.astype(np.float32),
+        den_out=np.asarray(denoised, dtype=np.float32),
+        den_alpha=np.array(den_rp['alpha_values']),
+        den_nmae_pct=np.array(den_rp['stop_threshold_change_pct']),
+        den_sigma_est=np.float32(den_sigma_est),
     )
     print('wrote', out)
 
