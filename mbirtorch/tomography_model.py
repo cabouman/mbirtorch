@@ -24,9 +24,49 @@ from . import qggmrf as _qggmrf
 from . import tomography_utils, vcd_utils
 from ._utils import _AUTO_REGULARIZATION_PARAM_NAMES, recon_param_names
 from .parameter_handler import ParameterHandler
-from .projectors import Projectors
+from .projectors import Projectors, maybe_compile
 
 _F32_EPS = float(np.finfo(np.float32).eps)
+
+
+# ── compiled updater glue (module level, one compile per process) ─────────────
+# The panel review measured ~20 eager launches per subset between the projector
+# calls; these fused forms remove most of them.  Each is pure except
+# _apply_update, which mutates the two state tensors in place (supported by
+# torch.compile); all are value-equal to the eager forms up to float summation
+# order.
+def _diagonal_update_direction(forward_grad, prior_grad, forward_hess, prior_hess):
+    # The base preconditioned direction (the mbirjax module-level jitted helper's
+    # torch analog), fused so the sums and divide are one kernel.
+    return -((forward_grad + prior_grad) / (forward_hess + prior_hess))
+
+
+def _prior_line_terms(prior_grad, prior_hess, delta):
+    return (torch.sum(prior_grad * delta),
+            torch.sum(prior_hess * delta * delta))
+
+
+def _forward_lin_quad_const(weighted_error_sinogram, delta_sinogram, fm_constant):
+    return (fm_constant * torch.sum(weighted_error_sinogram * delta_sinogram),
+            fm_constant * torch.sum(delta_sinogram * delta_sinogram))
+
+
+def _forward_lin_quad_weighted(error_sinogram, delta_sinogram, weights, fm_constant):
+    # weighted_error = weights * error is fused into the reductions here, so no
+    # sinogram-sized weighted-product transient is materialized per subset.
+    return (fm_constant * torch.sum(weights * error_sinogram * delta_sinogram),
+            fm_constant * torch.sum(delta_sinogram * delta_sinogram * weights))
+
+
+def _apply_update(flat_recon, error_sinogram, pixel_indices, delta_scaled,
+                  alpha, delta_sinogram):
+    # In-place state application: recon scatter-add, per-slice sumsq, the error
+    # sinogram FMA, and the ell1 reduction, in one compiled region.
+    flat_recon.index_add_(0, pixel_indices, delta_scaled)
+    delta_sumsq = torch.sum(delta_scaled * delta_scaled, dim=0)
+    error_sinogram.sub_(alpha * delta_sinogram)
+    ell1 = torch.sum(torch.abs(delta_scaled))
+    return delta_sumsq, ell1
 
 
 def _resolve_device(device):
@@ -45,10 +85,21 @@ class TomographyModel(ParameterHandler):
     (``compute_hfan_data_batched``), the psf radius, and the auto recon
     geometry; this class owns the projction wrappers and the VCD engine."""
 
-    def __init__(self, sinogram_shape, device='auto', view_batch_size=64, **kwargs):
+    def __init__(self, sinogram_shape, device='auto', view_batch_size=64,
+                 compile_mode='auto', **kwargs):
         super().__init__()
         self.torch_device = _resolve_device(device)
         self.view_batch_size = view_batch_size
+        # torch.compile of the hot chains (Phase 2).  'auto' compiles on every
+        # backend (torch 2.13 supports CPU, CUDA, and MPS; Phase 0 measured the
+        # wins); 'off' keeps pure eager (debugging, or a backend where compile
+        # misbehaves).  An execution-environment choice like `device`, so a
+        # plain attribute rather than a saved model parameter.
+        self.compile_mode = compile_mode
+        # Cached prox initialization (partitions/sequence/regularization), so a
+        # Plug-and-Play loop pays initialize_recon once (do_initialization=False
+        # on subsequent prox_map calls) -- the mbirjax mechanism.
+        self.prox_data = None
         self.logger = logging.getLogger('mbirtorch')
         if not self.logger.handlers:
             handler = logging.StreamHandler()
@@ -69,6 +120,10 @@ class TomographyModel(ParameterHandler):
         self.auto_set_recon_geometry(no_compile=True, no_warning=True)
         self.create_projectors()
         self.verify_valid_params()
+
+    @property
+    def compile_enabled(self):
+        return self.compile_mode != 'off'
 
     # ── hooks for geometry subclasses ─────────────────────────────────────────
     def create_projectors(self):
@@ -103,6 +158,26 @@ class TomographyModel(ParameterHandler):
         recon_shape, use_ror_mask = self.get_params(['recon_shape', 'use_ror_mask'])
         return vcd_utils.gen_full_indices(recon_shape, use_ror_mask=use_ror_mask)
 
+    def full_indices_device(self):
+        """The ROR-masked full pixel indices as an int64 tensor on the model
+        device, cached per (recon_shape, use_ror_mask) -- the hot consumers
+        (forward/back_project, the differentiable wrappers) call this per
+        invocation, and rebuilding + re-uploading the indices each time was a
+        measured per-call cost (panel review).  A custom mask array bypasses
+        the cache (unhashable)."""
+        recon_shape, use_ror_mask = self.get_params(['recon_shape', 'use_ror_mask'])
+        key = (tuple(recon_shape), use_ror_mask if isinstance(use_ror_mask, bool) else None,
+               str(self.torch_device))
+        if key[1] is None:
+            return torch.as_tensor(self._full_indices(), dtype=torch.int64,
+                                   device=self.torch_device)
+        cache = getattr(self, '_full_indices_cache', None)
+        if cache is None or cache[0] != key:
+            idx = torch.as_tensor(self._full_indices(), dtype=torch.int64,
+                                  device=self.torch_device)
+            self._full_indices_cache = (key, idx)
+        return self._full_indices_cache[1]
+
     def forward_project(self, recon, output_sharded=False):
         """
         Perform a full forward projection at all voxels in the region of
@@ -122,8 +197,7 @@ class TomographyModel(ParameterHandler):
         """
         recon_shape = self.get_params('recon_shape')
         recon = torch.as_tensor(recon, dtype=torch.float32, device=self.torch_device)
-        indices = torch.as_tensor(self._full_indices(), dtype=torch.int64,
-                                  device=self.torch_device)
+        indices = self.full_indices_device()
         voxel_values = recon.reshape(-1, recon.shape[-1])[indices]
         sinogram = self.sparse_forward_project(voxel_values, indices)
         return sinogram if output_sharded else sinogram.cpu().numpy()
@@ -145,8 +219,7 @@ class TomographyModel(ParameterHandler):
         """
         recon_shape = self.get_params('recon_shape')
         sinogram = torch.as_tensor(sinogram, dtype=torch.float32, device=self.torch_device)
-        indices = torch.as_tensor(self._full_indices(), dtype=torch.int64,
-                                  device=self.torch_device)
+        indices = self.full_indices_device()
         cylinders = self.sparse_back_project(sinogram, indices)
         recon = torch.zeros((recon_shape[0] * recon_shape[1], cylinders.shape[-1]),
                             dtype=torch.float32, device=self.torch_device)
@@ -507,9 +580,15 @@ class TomographyModel(ParameterHandler):
         if weights is None:
             weights = 1
             avg_weight = 1
-        elif not torch.is_tensor(weights) or weights.ndim == 0:
+        elif np.ndim(weights) == 0:
+            # A true scalar (python or 0-d): the average weight is itself.
             avg_weight = weights
         else:
+            # Array-likes (numpy included -- a numpy array is not a torch
+            # tensor, and the old tensor-only test routed it to the scalar
+            # branch, returning a sinogram-shaped 'loss'; panel finding).
+            weights = torch.as_tensor(weights, dtype=torch.float32,
+                                      device=error_sinogram.device)
             avg_weight = torch.mean(weights)
         if normalize:
             weighted_sq_sum = torch.sum(error_sinogram * error_sinogram * weights)
@@ -582,7 +661,8 @@ class TomographyModel(ParameterHandler):
         Returns:
             The update direction, same shape as forward_grad.
         """
-        return -((forward_grad + prior_grad) / (forward_hess + prior_hess))
+        fn = maybe_compile(_diagonal_update_direction, self.compile_enabled)
+        return fn(forward_grad, prior_grad, forward_hess, prior_hess)
 
     def create_vcd_subset_updater(self, fm_hessian, weights, prox_input=None):
         """
@@ -616,6 +696,18 @@ class TomographyModel(ParameterHandler):
         if const_weights and abs(weights - 1) > 1e-5:
             raise ValueError('Constant weights must have value 1.')
 
+        # The qGGMRF chain is the engine's memory attention point (Phase 0):
+        # bind the compiled form once for all subsets.  The line-search and
+        # state-application glue is compiled too (the panel review measured the
+        # ~20 eager launches between projector calls as the interactive-VCD
+        # dispatch cost).
+        qggmrf_grad_hess = maybe_compile(
+            _qggmrf.qggmrf_gradient_and_hessian_at_indices, self.compile_enabled)
+        prior_line_terms = maybe_compile(_prior_line_terms, self.compile_enabled)
+        lin_quad_const = maybe_compile(_forward_lin_quad_const, self.compile_enabled)
+        lin_quad_weighted = maybe_compile(_forward_lin_quad_weighted, self.compile_enabled)
+        apply_update = maybe_compile(_apply_update, self.compile_enabled)
+
         def vcd_subset_updater(flat_recon, error_sinogram, pixel_indices):
             """
             Calculate an iteration of the VCD algorithm on a single subset of the
@@ -642,7 +734,7 @@ class TomographyModel(ParameterHandler):
             # derivative) terms at each pixel in the index set.
             if prox_input is None:
                 # qGGMRF prior.
-                prior_grad, prior_hess = _qggmrf.qggmrf_gradient_and_hessian_at_indices(
+                prior_grad, prior_hess = qggmrf_grad_hess(
                     flat_recon, recon_shape, pixel_indices, qggmrf_params)
             else:
                 # Proximal map prior: pointwise, so the Hessian is a scalar.
@@ -669,18 +761,25 @@ class TomographyModel(ParameterHandler):
             delta_recon_at_indices = self._get_update_direction(
                 forward_grad, prior_grad, forward_hess, prior_hess, pixel_indices)
 
-            # Compute delta^T \nabla Q(x_hat; x'=x_hat) for use in finding alpha.
-            prior_linear = torch.sum(prior_grad * delta_recon_at_indices)
-
-            # Estimated upper bound for the prior Hessian term.
-            prior_quadratic_approx = torch.sum(prior_hess * delta_recon_at_indices ** 2)
+            # Compute delta^T \nabla Q(x_hat; x'=x_hat) and the prior quadratic
+            # bound, fused (one compiled region instead of four launches).
+            prior_hess_t = (prior_hess if torch.is_tensor(prior_hess)
+                            else torch.as_tensor(prior_hess, dtype=torch.float32,
+                                                 device=delta_recon_at_indices.device))
+            prior_linear, prior_quadratic_approx = prior_line_terms(
+                prior_grad, prior_hess_t, delta_recon_at_indices)
 
             # Compute the update direction in the sinogram domain.
             delta_sinogram = self.sparse_forward_project(delta_recon_at_indices,
                                                          pixel_indices)
-            forward_linear, forward_quadratic = self.get_forward_lin_quad(
-                weighted_error_sinogram, delta_sinogram, weights, fm_constant,
-                const_weights)
+            if const_weights:
+                forward_linear, forward_quadratic = lin_quad_const(
+                    weighted_error_sinogram, delta_sinogram, fm_constant)
+            else:
+                # Fusing the weights product into the reductions avoids the
+                # per-subset sinogram-sized weighted transient.
+                forward_linear, forward_quadratic = lin_quad_weighted(
+                    error_sinogram, delta_sinogram, weights, fm_constant)
 
             # Compute the optimal update step.  The line search stays ON DEVICE
             # (alpha is a scalar tensor; no host synchronization per subset).
@@ -706,15 +805,9 @@ class TomographyModel(ParameterHandler):
             # squared updates is the per-slice convergence diagnostic
             # (delta_norm_per_slice in the recon dict).
             delta_recon_at_indices = alpha * delta_recon_at_indices
-            flat_recon.index_add_(0, pixel_indices, delta_recon_at_indices)
-            delta_sumsq_subset = torch.sum(
-                delta_recon_at_indices * delta_recon_at_indices, dim=0)
-
-            # Update the error sinogram:
-            # error_sinogram <- error_sinogram - alpha * delta_sinogram.
-            error_sinogram.sub_(alpha * delta_sinogram)
-
-            ell1_for_subset = torch.sum(torch.abs(delta_recon_at_indices))
+            delta_sumsq_subset, ell1_for_subset = apply_update(
+                flat_recon, error_sinogram, pixel_indices,
+                delta_recon_at_indices, alpha, delta_sinogram)
             return (flat_recon, error_sinogram, ell1_for_subset, alpha,
                     delta_sumsq_subset)
 
@@ -799,6 +892,11 @@ class TomographyModel(ParameterHandler):
         self.verify_valid_params()
         dev = self.torch_device
         recon_shape = self.get_params('recon_shape')
+        sinogram_shape = self.get_params('sinogram_shape')
+        if tuple(sinogram.shape) != tuple(sinogram_shape):
+            raise ValueError('sinogram does not have the shape in sinogram_shape. \n'
+                             f'Expected {tuple(sinogram_shape)}, got '
+                             f'{tuple(sinogram.shape)}.')
 
         constant_weights = weights is None
         if constant_weights:
@@ -841,6 +939,13 @@ class TomographyModel(ParameterHandler):
         init_recon = alpha * init_recon
 
         if prox_input is not None:
+            # mbirjax validates the prox input's shape before flattening; a
+            # size-compatible but mis-shaped input (e.g. a transposed volume)
+            # must fail loudly rather than silently reshape.
+            if tuple(prox_input.shape) != tuple(recon_shape):
+                raise ValueError('prox_input does not have the correct size. \n'
+                                 f'Expected {tuple(recon_shape)}, got shape '
+                                 f'{tuple(prox_input.shape)} for prox_input shape.')
             prox_input = torch.as_tensor(prox_input, dtype=torch.float32, device=dev)
             prox_input = prox_input.reshape((-1, prox_input.shape[-1]))
 
@@ -878,7 +983,12 @@ class TomographyModel(ParameterHandler):
             fm_loss_i, recon_l1, es_rmse = self._vcd_iteration_stats(
                 error_sinogram, flat_recon, sigma_y, stat_weights)
             fm_rmse[i] = float(fm_loss_i)
-            nmae_update[i] = float(ell1_for_partition) / float(recon_l1)
+            recon_l1_f = float(recon_l1)
+            # An identically-zero recon gives recon_l1 == 0; mbirjax's jnp
+            # division produces nan (the stop test is then False and the loop
+            # continues) -- match that rather than raising ZeroDivisionError.
+            nmae_update[i] = (float(ell1_for_partition) / recon_l1_f
+                              if recon_l1_f else float('nan'))
             alpha_values[i] = float(alpha)
             delta_norm_per_slice[i] = np.sqrt(
                 delta_sumsq_partition.cpu().numpy())[:recon_shape[2]]
@@ -949,7 +1059,8 @@ class TomographyModel(ParameterHandler):
                 granularity, regularization_params)
 
     def recon(self, sinogram, weights=None, init_recon=None, max_iterations=15,
-              stop_threshold_change_pct=0.2, first_iteration=0):
+              stop_threshold_change_pct=0.2, first_iteration=0,
+              output_sharded=False):
         """
         Perform MBIR reconstruction using the Multi-Granular Vector Coordinate
         Descent algorithm.  This function takes care of generating its own
@@ -979,9 +1090,12 @@ class TomographyModel(ParameterHandler):
                 max_iterations.
             first_iteration (int, optional): the number of iterations previously
                 completed when restarting a recon.  Defaults to 0.
+            output_sharded (bool, optional): If False (default), return a numpy
+                array; if True, return the device tensor (the mbirjax argument
+                name, kept for API compatibility).
 
         Returns:
-            (recon, recon_dict): the numpy reconstruction volume, and a dict
+            (recon, recon_dict): the reconstruction volume, and a dict
             with entries 'recon_params' (per-iteration traces and settings) and
             'model_params' (a snapshot of the model parameters).
         """
@@ -989,7 +1103,13 @@ class TomographyModel(ParameterHandler):
          regularization_params) = self.initialize_recon(
             sinogram, weights, init_recon, max_iterations, first_iteration)
 
-        with torch.inference_mode():
+        # no_grad, not inference_mode: the engine needs autograd off (it never
+        # differentiates), but torch.compile's guard machinery (torch 2.13)
+        # crashes on compiled calls inside inference_mode with in-place state
+        # updates, while no_grad composes cleanly.  The remaining
+        # inference_mode benefit (skipping version-counter bookkeeping) is
+        # noise next to the kernels.
+        with torch.no_grad():
             recon, loss_vectors = self.vcd_recon(
                 sinogram, partitions, partition_sequence,
                 stop_threshold_change_pct, weights=weights, init_recon=init_recon,
@@ -1008,11 +1128,121 @@ class TomographyModel(ParameterHandler):
                                  stop_pct, alpha_values, delta_norm_per_slice]))
         recon_dict = {'recon_params': recon_params,
                       'model_params': {k: v.val for k, v in self.params.items()}}
-        return recon.cpu().numpy(), recon_dict
+        # output_sharded keeps the device tensor (the mbirjax parameter; here
+        # it means "skip the numpy exit").
+        return (recon if output_sharded else recon.cpu().numpy()), recon_dict
+
+    def prox_map(self, prox_input, sinogram, sigma_prox=None, weights=None,
+                 init_recon=None, do_initialization=True,
+                 stop_threshold_change_pct=0.2, max_iterations=3,
+                 first_iteration=0, output_sharded=False):
+        """
+        Proximal Map function for use in Plug-and-Play applications.  This
+        function is similar to recon, but it essentially uses a prior with a
+        mean of prox_input and a standard deviation of sigma_prox.
+
+        Reproducibility note: the pixel partitions are drawn from numpy's global
+        random number generator; call ``np.random.seed(seed)`` first for a
+        reproducible result.
+
+        Args:
+            prox_input (numpy or tensor): proximal map input with the same shape
+                as the reconstruction.
+            sinogram (numpy or tensor): 3D sinogram data with shape
+                (num_views, num_det_rows, num_det_channels).
+            sigma_prox (None or float, optional): standard deviation of the
+                proximal map prior term.  If None, set automatically from the
+                sinogram.  Defaults to None.
+            weights (numpy or tensor, optional): 3D positive weights with the
+                same shape as the sinogram.  Defaults to None (all 1s).
+            init_recon (numpy or tensor, optional): reconstruction used for
+                initialization.  Defaults to None (determined by vcd_recon).
+            do_initialization (bool, optional): If True, initialize parameters
+                (partitions and regularization).  Set False if a previous
+                prox_map call on this model already initialized this sinogram.
+            stop_threshold_change_pct (float, optional): stop when the NMAE
+                percent change drops below this value.  Defaults to 0.2.
+            max_iterations (int, optional): maximum VCD iterations.  Defaults to 3.
+            first_iteration (int, optional): partition-sequence offset for
+                restarts.  Defaults to 0.
+
+        Returns:
+            (recon, recon_dict): the numpy reconstruction volume and the recon
+            parameters dict.
+        """
+        prior_loss = [0]
+        if do_initialization or self.prox_data is None:
+            (sinogram, weights, init_recon, partitions, partition_sequence,
+             granularity, regularization_params) = self.initialize_recon(
+                sinogram, weights, init_recon, max_iterations, first_iteration)
+            self.prox_data = (partitions, partition_sequence, granularity,
+                              regularization_params)
+        else:
+            (partitions, partition_sequence, granularity,
+             regularization_params) = self.prox_data
+
+        # Override the auto sigma_prox if requested, restoring it afterward.
+        self_sigma_prox = self.get_params('sigma_prox')
+        if sigma_prox is not None:
+            regularization_params = dict(regularization_params,
+                                         sigma_prox=sigma_prox)
+            self.set_params(no_warning=True, sigma_prox=sigma_prox,
+                            auto_regularize_flag=self.get_params('auto_regularize_flag'))
+
+        with torch.no_grad():
+            recon, loss_vectors = self.vcd_recon(
+                sinogram, partitions, partition_sequence,
+                stop_threshold_change_pct, weights=weights,
+                init_recon=init_recon, prox_input=prox_input,
+                first_iteration=first_iteration)
+
+        partition_sequence = [int(val) for val in partition_sequence]
+        fm_rmse = [float(val) for val in loss_vectors[0]]
+        stop_pct = [100 * float(val) for val in loss_vectors[2]]
+        alpha_values = [float(val) for val in loss_vectors[3]]
+        delta_norm_per_slice = [[float(v) for v in row] for row in loss_vectors[4]]
+        num_iterations = len(fm_rmse)
+        recon_params = dict(zip(recon_param_names,
+                                [num_iterations, granularity, partition_sequence,
+                                 fm_rmse, prior_loss, regularization_params,
+                                 stop_pct, alpha_values, delta_norm_per_slice]))
+        self.set_params(no_warning=True, sigma_prox=self_sigma_prox)
+        recon_dict = {'recon_params': recon_params,
+                      'model_params': {k: v.val for k, v in self.params.items()}}
+        # output_sharded keeps the device tensor (the mbirjax parameter,
+        # restored per the panel review; here it means "skip the numpy exit").
+        return (recon if output_sharded else recon.cpu().numpy()), recon_dict
 
     @staticmethod
     def gen_weights(sinogram, weight_type):
         return vcd_utils.gen_weights(sinogram, weight_type)
+
+    def scale_recon_shape(self, row_scale=1.0, col_scale=1.0, slice_scale=1.0):
+        """
+        Scale the reconstruction shape by the given scale factors.
+
+        This can be used before starting a reconstruction to improve results
+        when part of the object projects outside the detector.  The method
+        updates the internal `recon_shape` parameter.
+
+        For lateral field-of-view truncation (flagged by the "Lateral FoV
+        truncation detected" warning), use ``scale_recon_shape(s, s)`` with
+        ``s`` typically chosen as ``s >= 1.1``.
+
+        Args:
+            row_scale (float): Scale factor for the number of recon rows.
+            col_scale (float): Scale factor for the number of recon columns.
+            slice_scale (float): Scale factor for the number of recon slices.
+
+        Returns:
+            tuple[int, int, int]: pixels added to (rows, columns, slices).
+        """
+        old_rows, old_cols, old_slices = self.get_params('recon_shape')
+        new_rows = int(old_rows * row_scale)
+        new_cols = int(old_cols * col_scale)
+        new_slices = int(old_slices * slice_scale)
+        self.set_params(recon_shape=(new_rows, new_cols, new_slices))
+        return new_rows - old_rows, new_cols - old_cols, new_slices - old_slices
 
     def reshape_recon(self, recon):
         recon_shape = self.get_params('recon_shape')

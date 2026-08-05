@@ -124,4 +124,5 @@ def test_recon_convergence_parity(golden, model):
           f"nmae rel = {nmae_rel:.2e}, final recon rel_max = {final_rel:.2e}")
     assert alpha_rel < 1e-2
     assert fm_rel < 1e-3
+    assert nmae_rel < 1e-3
     assert final_rel < 1e-3

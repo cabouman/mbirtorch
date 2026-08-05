@@ -40,6 +40,63 @@ import torch
 
 _F32 = torch.float32
 
+# ── torch.compile plumbing (the Phase 2 performance pass) ─────────────────────
+# Phase 0 measured chain-level compile wins of 1.7-3.6x (CPU), 5-17x (MPS), and
+# 2.6-22x (CUDA), with the fan chain's peak-memory transients collapsing 6-41x
+# (phase0_findings.md).  The compiled callables are cached per FUNCTION at
+# module level: torch.compile handles multiple input shapes itself (one
+# specialization per shape guard), and the engine's shape set is small (one
+# subset size per partition granularity, plus the full-index size).  A compile
+# failure falls back to eager silently-but-recorded, so exotic
+# backends/toolchains keep working (the same availability philosophy as
+# mbirjax's pallas gate).
+_COMPILE_CACHE = {}
+_COMPILE_ERRORS = {}
+
+
+def maybe_compile(fn, enabled):
+    """Return a compiled form of ``fn`` (cached per function) when enabled,
+    else ``fn`` itself.
+
+    torch.compile is LAZY: the wrapper it returns compiles at the first
+    invocation, so a broken backend (no C++ toolchain, a broken triton) would
+    surface there, not at torch.compile() time (panel finding).  The returned
+    callable therefore guards the FIRST call: on any exception it retries the
+    call EAGERLY -- the kernels here are pure, so the retry is safe -- and, if
+    eager succeeds, records the compile error in ``_COMPILE_ERRORS`` and
+    permanently rebinds to eager (the compile failure was environmental).  If
+    eager also raises, that error is the real one and propagates.  After one
+    successful compiled call the guard collapses to a direct dispatch.
+    (A LATER per-shape recompile could still fail on a broken toolchain; in
+    practice the first call exercises the backend end to end.)
+    """
+    if not enabled:
+        return fn
+    if fn in _COMPILE_CACHE:
+        return _COMPILE_CACHE[fn]
+    compiled = torch.compile(fn)
+    state = {"impl": compiled, "validated": False}
+
+    def guarded(*args, **kwargs):
+        if state["validated"]:
+            return state["impl"](*args, **kwargs)
+        try:
+            out = state["impl"](*args, **kwargs)
+            state["validated"] = True
+            return out
+        except Exception as e:                                # noqa: BLE001
+            # Retry eagerly: if the failure was the compile backend, this
+            # succeeds and we fall back for good; a real input error re-raises.
+            out = fn(*args, **kwargs)
+            _COMPILE_ERRORS[fn.__name__] = f"{type(e).__name__}: {e}"[:400]
+            state["impl"] = fn
+            state["validated"] = True
+            return out
+
+    guarded.__name__ = f"compiled_{fn.__name__}"
+    _COMPILE_CACHE[fn] = guarded
+    return guarded
+
 
 def tap_weights(n_p, n, W_p_c, weight_scale, L_max, num_channels):
     """The shared trapezoid weight for tap ``n``, with torch-safe OOB handling.
@@ -148,11 +205,29 @@ class Projectors:
     the same deterministic chain per call preserves the consistency property.
     """
 
+    # Rough per-batch transient budget for the fan kernels' (Vb, P, cols)
+    # arrays.  The back fan's gather output is a REAL materialized tensor even
+    # under torch.compile (a gather cannot fuse away), so an unbounded view
+    # batch at large cells allocates tens of GB (the 512-cell at the default
+    # batch of 64 wants ~13 GB).  The batch size never changes values beyond
+    # float summation order, so capping it is a pure memory knob.
+    VIEW_BATCH_TRANSIENT_BUDGET_BYTES = 2 * 2**30
+
     def __init__(self, model):
         self.model = model
         view_params_name = model.get_params('view_params_name')
         self.view_params_array = torch.as_tensor(
             model.get_params(view_params_name), dtype=_F32, device=model.torch_device)
+        # Bind the (possibly compiled) kernel bodies once per projector build.
+        use_compile = model.compile_enabled
+        self._fan_forward = maybe_compile(fan_forward_batch, use_compile)
+        self._fan_back = maybe_compile(fan_back_batch, use_compile)
+
+    def _effective_view_batch(self, num_pixels, num_cols):
+        """The model's view_batch_size, capped so one batch's (Vb, P, cols)
+        transient stays within the budget above."""
+        cap = self.VIEW_BATCH_TRANSIENT_BUDGET_BYTES // max(1, num_pixels * num_cols * 4)
+        return max(1, min(self.model.view_batch_size, int(cap)))
 
     def sparse_forward_project(self, voxel_values, pixel_indices):
         """Forward project the given voxel cylinders into a full sinogram.
@@ -173,13 +248,14 @@ class Projectors:
         voxel_values = torch.as_tensor(voxel_values, dtype=_F32, device=dev)
         pixel_indices = torch.as_tensor(pixel_indices, dtype=torch.int64, device=dev)
         psf_radius = m.get_psf_radius()
-        vb_size = m.view_batch_size
+        vb_size = self._effective_view_batch(pixel_indices.shape[0],
+                                             voxel_values.shape[1])
         sinogram = torch.empty((num_views, num_rows, num_channels), dtype=_F32,
                                device=dev)
         for v0 in range(0, num_views, vb_size):
             params_batch = self.view_params_array[v0:v0 + vb_size]
             hfan = m.compute_hfan_data_batched(pixel_indices, params_batch)
-            block = fan_forward_batch(hfan, voxel_values, num_channels, psf_radius)
+            block = self._fan_forward(hfan, voxel_values, num_channels, psf_radius)
             # channel-major (Vb, C, S) -> the sinogram's (Vb, rows=S, C) layout.
             sinogram[v0:v0 + params_batch.shape[0]] = block.permute(0, 2, 1)
         return sinogram
@@ -204,12 +280,12 @@ class Projectors:
         sinogram = torch.as_tensor(sinogram, dtype=_F32, device=dev)
         pixel_indices = torch.as_tensor(pixel_indices, dtype=torch.int64, device=dev)
         psf_radius = m.get_psf_radius()
-        vb_size = m.view_batch_size
+        vb_size = self._effective_view_batch(pixel_indices.shape[0], num_rows)
         out = torch.zeros((pixel_indices.shape[0], num_rows), dtype=_F32, device=dev)
         for v0 in range(0, num_views, vb_size):
             params_batch = self.view_params_array[v0:v0 + vb_size]
             hfan = m.compute_hfan_data_batched(pixel_indices, params_batch)
             sino_T = sinogram[v0:v0 + params_batch.shape[0]].permute(0, 2, 1).contiguous()
-            out += fan_back_batch(sino_T, hfan, num_channels, psf_radius,
+            out += self._fan_back(sino_T, hfan, num_channels, psf_radius,
                                   coeff_power=coeff_power)
         return out

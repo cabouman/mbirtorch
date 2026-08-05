@@ -10,9 +10,44 @@ footprint length).
 import numpy as np
 import torch
 
+from .projectors import maybe_compile
 from .tomography_model import TomographyModel
 
 _F32 = torch.float32
+
+
+def _parallel_hfan_math(pixel_indices, angles_batch, num_rows, num_cols,
+                        num_channels, delta_det_channel, det_channel_offset,
+                        delta_voxel, delta_voxel_row):
+    """The pure geometry chain of compute_hfan_data_batched, split out so it
+    can be torch.compiled (the scalar parameters specialize as constants; they
+    are fixed per model)."""
+    row_index = (pixel_indices // num_cols).to(_F32)
+    col_index = (pixel_indices % num_cols).to(_F32)
+    # Compute the un-rotated coordinates relative to iso.  Note the change in
+    # order from (i, j) to (y, x) (recon_ij_to_x in mbirjax).
+    y_tilde = delta_voxel_row * (row_index - (num_rows - 1) / 2.0)
+    x_tilde = delta_voxel * (col_index - (num_cols - 1) / 2.0)
+
+    # Precompute cosine and sine of the view angles, then do the rotation; only
+    # the x coordinate is needed for the channel projection.
+    cosine = torch.cos(angles_batch)[:, None]
+    sine = torch.sin(angles_batch)[:, None]
+    x = cosine * x_tilde[None, :] - sine * y_tilde[None, :]
+
+    # Calculate indices on the detector grid.
+    det_center_channel = (num_channels - 1) / 2.0
+    n_p = (x + det_channel_offset) / delta_det_channel + det_center_channel
+
+    # Compute the footprint of a voxel projected onto the channels, the
+    # projected voxel width in channel units, and the weight scale.
+    footprint_xy = torch.maximum(cosine.abs() * delta_voxel,
+                                 sine.abs() * delta_voxel_row)
+    W_p_c = footprint_xy / delta_det_channel
+    weight_scale = (delta_voxel_row * delta_voxel) / footprint_xy
+    L_max = torch.clamp(W_p_c, max=1.0)
+    centers = torch.round(n_p).to(torch.int64)
+    return n_p, centers, W_p_c, weight_scale, L_max
 
 
 class ParallelBeamModel(TomographyModel):
@@ -51,9 +86,11 @@ class ParallelBeamModel(TomographyModel):
         >>> model = mbirtorch.ParallelBeamModel((180, 256, 10), angles)
     """
 
-    def __init__(self, sinogram_shape, angles, device='auto', view_batch_size=64):
+    def __init__(self, sinogram_shape, angles, device='auto', view_batch_size=64,
+                 compile_mode='auto'):
         angles = np.asarray(angles, dtype=np.float32)
         super().__init__(sinogram_shape, device=device, view_batch_size=view_batch_size,
+                         compile_mode=compile_mode,
                          geometry_type='parallel', view_params_name='angles',
                          angles=angles)
 
@@ -158,28 +195,11 @@ class ParallelBeamModel(TomographyModel):
             self.get_params(gp_names)
         num_channels = self.get_params('sinogram_shape')[2]
         recon_shape = self.get_params('recon_shape')
-        num_rows, num_cols = recon_shape[0], recon_shape[1]
         delta_voxel_row = voxel_row_aspect * delta_voxel
-
-        row_index = (pixel_indices // num_cols).to(_F32)
-        col_index = (pixel_indices % num_cols).to(_F32)
-        y_tilde = delta_voxel_row * (row_index - (num_rows - 1) / 2.0)
-        x_tilde = delta_voxel * (col_index - (num_cols - 1) / 2.0)
-
-        cosine = torch.cos(angles_batch)[:, None]
-        sine = torch.sin(angles_batch)[:, None]
-        x = cosine * x_tilde[None, :] - sine * y_tilde[None, :]
-
-        det_center_channel = (num_channels - 1) / 2.0
-        n_p = (x + det_channel_offset) / delta_det_channel + det_center_channel
-
-        footprint_xy = torch.maximum(cosine.abs() * delta_voxel,
-                                     sine.abs() * delta_voxel_row)
-        W_p_c = footprint_xy / delta_det_channel
-        weight_scale = (delta_voxel_row * delta_voxel) / footprint_xy
-        L_max = torch.clamp(W_p_c, max=1.0)
-        centers = torch.round(n_p).to(torch.int64)
-        return n_p, centers, W_p_c, weight_scale, L_max
+        fn = maybe_compile(_parallel_hfan_math, self.compile_enabled)
+        return fn(pixel_indices, angles_batch, recon_shape[0], recon_shape[1],
+                  num_channels, delta_det_channel, det_channel_offset,
+                  delta_voxel, delta_voxel_row)
 
     # ── direct recon ──────────────────────────────────────────────────────────
     def fbp_filter(self, sinogram, filter_name="ramp", output_sharded=False):

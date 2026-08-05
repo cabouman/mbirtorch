@@ -10,7 +10,6 @@ learned-prior pipeline can insert the physics operator like any layer.
 
 import torch
 
-from .vcd_utils import gen_full_indices
 
 
 class _ForwardProjectFunction(torch.autograd.Function):
@@ -48,6 +47,13 @@ class _BackProjectFunction(torch.autograd.Function):
 def forward_project_differentiable(model, volume):
     """Differentiable full-volume forward projection.
 
+    The input may live on any device and dtype: it is moved to the model's
+    device as float32 through a DIFFERENTIABLE ``.to`` (autograd then returns
+    the gradient on the input's own device and dtype -- without this, a CPU or
+    float64 leaf against a CUDA/MPS model failed at forward or, worse, only at
+    backward; panel finding).  The ROR indices come from the model's per-shape
+    cache rather than being rebuilt and re-uploaded per call.
+
     Args:
         model: a TomographyModel (e.g. ParallelBeamModel).
         volume: (num_rows, num_cols, num_slices) tensor; may require grad.
@@ -57,18 +63,18 @@ def forward_project_differentiable(model, volume):
         back to ``volume`` (the gather into cylinders is differentiable, and
         the projector pair supplies the operator's gradient).
     """
-    recon_shape, use_ror_mask = model.get_params(['recon_shape', 'use_ror_mask'])
-    indices = torch.as_tensor(gen_full_indices(recon_shape, use_ror_mask=use_ror_mask),
-                              dtype=torch.int64, device=model.torch_device)
+    volume = volume.to(device=model.torch_device, dtype=torch.float32)
+    indices = model.full_indices_device()
     voxel_values = volume.reshape(-1, volume.shape[-1])[indices]
     return _ForwardProjectFunction.apply(voxel_values, model, indices)
 
 
 def back_project_differentiable(model, sinogram):
-    """Differentiable full-volume back projection (adjoint of the above)."""
-    recon_shape, use_ror_mask = model.get_params(['recon_shape', 'use_ror_mask'])
-    indices = torch.as_tensor(gen_full_indices(recon_shape, use_ror_mask=use_ror_mask),
-                              dtype=torch.int64, device=model.torch_device)
+    """Differentiable full-volume back projection (adjoint of the above; the
+    same device/dtype normalization and index caching apply)."""
+    recon_shape = model.get_params('recon_shape')
+    sinogram = sinogram.to(device=model.torch_device, dtype=torch.float32)
+    indices = model.full_indices_device()
     cylinders = _BackProjectFunction.apply(sinogram, model, indices)
     volume = torch.zeros(recon_shape[0] * recon_shape[1], cylinders.shape[-1],
                          dtype=cylinders.dtype, device=cylinders.device)
