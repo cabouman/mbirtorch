@@ -122,6 +122,27 @@ class TestConstruction:
                              slice_axis=[0, 2])
         assert not viewer.sync_axes and len(viewer.axis_radios) == 2
 
+    def test_tooltips_constructed_exactly_once(self, make_viewer):
+        # The mbirjax viewer built tooltips twice (_draw_images and
+        # _connect_events), orphaning the first set; here the annotation
+        # exists exactly once per panel.
+        from mbirtorch.viewer import TOOLTIP_TEXT
+        viewer = make_viewer(make_volume((8, 8, 4)), make_volume((8, 8, 4)))
+        assert len(viewer.tooltips) == 2
+        for ax in viewer.axes:
+            matches = [t for t in ax.texts if t.get_text() == TOOLTIP_TEXT]
+            assert len(matches) == 1
+
+    def test_titles_show_per_volume_perms(self, make_viewer):
+        # The mbirjax _update_axis wrote axes_perms[0] into every title;
+        # each panel must report its own permutation.
+        viewer = make_viewer(make_volume((8, 10, 12), 1),
+                             make_volume((8, 10, 12), 2))
+        viewer._toggle_couple_axes()  # decouple
+        viewer.axis_radios[1].set_active(0)
+        assert 'Axes: [0 1 2]' in viewer.axes[0].get_title()
+        assert 'Axes: [1 2 0]' in viewer.axes[1].get_title()
+
 
 # ---------------------------------------------------------------------------
 # ROI interaction through synthesized events

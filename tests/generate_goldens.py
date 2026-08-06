@@ -117,6 +117,60 @@ def main():
                                        stop_threshold_change_pct=0.0)
     cone_rp = cone_dict['recon_params']
 
+    # Helical cone golden: same cell and distances, flat detector, z-shifts
+    # spanning a travel of +-8 ALU (detector half-height at iso is 12, so the
+    # shifted views keep partial coverage -- the helical z-weight is nontrivial).
+    # Includes a seeded 3-iteration recon: the z-shift path runs through the
+    # FDK init (z-weight) and the per-view vertical fans in the engine.
+    chel_shifts = np.linspace(-8.0, 8.0, cone_cell[0]).astype(np.float32)
+    chel = mbirjax.ConeBeamModel(cone_cell, cone_angles,
+                                 source_detector_dist=4 * cone_cell[2],
+                                 source_iso_dist=2 * cone_cell[2],
+                                 helical_z_shifts=chel_shifts)
+    chel.set_params(no_warning=True, verbose=0)
+    chel_recon_shape = tuple(int(x) for x in chel.get_params('recon_shape'))
+    chel_phantom = np.asarray(
+        mbirjax.generate_3d_shepp_logan_low_dynamic_range(chel_recon_shape))
+    chel_sino = np.asarray(chel.forward_project(chel_phantom))
+    chel_weights = np.asarray(mbirjax.gen_weights(chel_sino / max(1e-6, chel_sino.max()),
+                                                  weight_type='transmission_root'))
+    chel_full = np.asarray(mbirjax.gen_full_indices(
+        chel_recon_shape, use_ror_mask=chel.get_params('use_ror_mask')))
+    chel_subset = np.sort(np.random.RandomState(SEED).choice(
+        chel_full, size=min(400, len(chel_full)), replace=False))
+    chel_vals = np.random.RandomState(SEED + 1).rand(
+        len(chel_subset), chel_recon_shape[2]).astype(np.float32)
+    chel_sp_fwd = np.asarray(chel.sparse_forward_project(chel_vals, chel_subset))
+    chel_sp_back = np.asarray(chel.sparse_back_project(chel_sino, chel_subset))
+    chel_fdk = np.asarray(chel.fdk_recon(chel_sino))
+    np.random.seed(RECON_SEED)
+    chel_recon, chel_dict = chel.recon(chel_sino, weights=chel_weights,
+                                       max_iterations=3,
+                                       stop_threshold_change_pct=0.0)
+    chel_rp = chel_dict['recon_params']
+
+    # Curved-detector cone golden: circular scan, curved detector (the
+    # horizontal fan's theta = u/sdd branch, no cos correction).  Single-op
+    # coverage: the engine is identical given the operators.
+    ccurv = mbirjax.ConeBeamModel(cone_cell, cone_angles,
+                                  source_detector_dist=4 * cone_cell[2],
+                                  source_iso_dist=2 * cone_cell[2],
+                                  use_curved_detector=True)
+    ccurv.set_params(no_warning=True, verbose=0)
+    ccurv_recon_shape = tuple(int(x) for x in ccurv.get_params('recon_shape'))
+    ccurv_phantom = np.asarray(
+        mbirjax.generate_3d_shepp_logan_low_dynamic_range(ccurv_recon_shape))
+    ccurv_sino = np.asarray(ccurv.forward_project(ccurv_phantom))
+    ccurv_full = np.asarray(mbirjax.gen_full_indices(
+        ccurv_recon_shape, use_ror_mask=ccurv.get_params('use_ror_mask')))
+    ccurv_subset = np.sort(np.random.RandomState(SEED).choice(
+        ccurv_full, size=min(400, len(ccurv_full)), replace=False))
+    ccurv_vals = np.random.RandomState(SEED + 1).rand(
+        len(ccurv_subset), ccurv_recon_shape[2]).astype(np.float32)
+    ccurv_sp_fwd = np.asarray(ccurv.sparse_forward_project(ccurv_vals, ccurv_subset))
+    ccurv_sp_back = np.asarray(ccurv.sparse_back_project(ccurv_sino, ccurv_subset))
+    ccurv_fdk = np.asarray(ccurv.fdk_recon(ccurv_sino))
+
     out = os.path.join(OUT_DIR, f"golden_{'x'.join(map(str, CELL))}.npz")
     np.savez_compressed(
         out,
@@ -159,6 +213,25 @@ def main():
         cone_alpha=np.array(cone_rp['alpha_values']),
         cone_fm_rmse=np.array(cone_rp['fm_rmse']),
         cone_nmae_pct=np.array(cone_rp['stop_threshold_change_pct']),
+        chel_shifts=chel_shifts,
+        chel_recon_shape=np.array(chel_recon_shape),
+        chel_phantom=chel_phantom.astype(np.float32),
+        chel_sino=chel_sino.astype(np.float32),
+        chel_weights=chel_weights.astype(np.float32),
+        chel_subset=chel_subset, chel_vals=chel_vals,
+        chel_sp_fwd=chel_sp_fwd.astype(np.float32),
+        chel_sp_back=chel_sp_back.astype(np.float32),
+        chel_fdk=chel_fdk.astype(np.float32),
+        chel_recon=np.asarray(chel_recon, dtype=np.float32),
+        chel_alpha=np.array(chel_rp['alpha_values']),
+        chel_fm_rmse=np.array(chel_rp['fm_rmse']),
+        ccurv_recon_shape=np.array(ccurv_recon_shape),
+        ccurv_phantom=ccurv_phantom.astype(np.float32),
+        ccurv_sino=ccurv_sino.astype(np.float32),
+        ccurv_subset=ccurv_subset, ccurv_vals=ccurv_vals,
+        ccurv_sp_fwd=ccurv_sp_fwd.astype(np.float32),
+        ccurv_sp_back=ccurv_sp_back.astype(np.float32),
+        ccurv_fdk=ccurv_fdk.astype(np.float32),
     )
     print('wrote', out)
 
