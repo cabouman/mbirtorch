@@ -44,6 +44,15 @@ class _BackProjectFunction(torch.autograd.Function):
         return grad_sinogram, None, None
 
 
+def _require_single_device(model):
+    if not model.sino_placement.is_trivial:
+        raise NotImplementedError(
+            'The differentiable wrappers support single-device models only: '
+            'under a multi-device configuration the projector outputs are '
+            'shard containers, which would silently detach gradients.  '
+            'configure_devices(1) for training.')
+
+
 def forward_project_differentiable(model, volume):
     """Differentiable full-volume forward projection.
 
@@ -63,6 +72,7 @@ def forward_project_differentiable(model, volume):
         back to ``volume`` (the gather into cylinders is differentiable, and
         the projector pair supplies the operator's gradient).
     """
+    _require_single_device(model)
     volume = volume.to(device=model.torch_device, dtype=torch.float32)
     indices = model.full_indices_device()
     voxel_values = volume.reshape(-1, volume.shape[-1])[indices]
@@ -72,6 +82,7 @@ def forward_project_differentiable(model, volume):
 def back_project_differentiable(model, sinogram):
     """Differentiable full-volume back projection (adjoint of the above; the
     same device/dtype normalization and index caching apply)."""
+    _require_single_device(model)
     recon_shape = model.get_params('recon_shape')
     sinogram = sinogram.to(device=model.torch_device, dtype=torch.float32)
     indices = model.full_indices_device()

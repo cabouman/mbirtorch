@@ -1,16 +1,16 @@
-"""ConeBeamModel, ported from mbirjax.cone_beam (flat and curved detectors,
-circular and helical scans; the multi-device banding and DC-damping layers are
-not ported).
+"""ConeBeamModel, ported from mbirjax.cone_beam: flat and curved detectors,
+circular and helical scans, the multi-device banding seams, and DC damping.
 
 Structure: cone projection is two separable fans.  The HORIZONTAL fan maps a
 voxel to detector channels exactly as in parallel beam, except the projected
 coordinate, width, and weight are magnification-dependent PER PIXEL.  The
 VERTICAL fan maps each slice of a voxel cylinder to a RANGE of detector rows
-(the cone angle).  The forward vertical fan is formulated from the DETECTOR
-side (for each detector row, which voxels project onto it), matching the back
-projector by construction so the pair stays exactly adjoint; the back vertical
-fan gathers each pixel's detector column onto the recon slices with the
-weight rule
+(the cone angle); both directions derive that row map from the single affine
+pair (m0, W_p_r) of :func:`_cone_vertical_affine`.  The forward vertical fan
+is formulated from the DETECTOR side (for each detector row, which voxels
+project onto it), matching the back projector by construction so the pair
+stays exactly adjoint; the back vertical fan gathers each pixel's detector
+column onto the recon slices with the weight rule
 
     A = clip((W_p_r + 1) / 2 - |m_p - m|, 0, min(1, W_p_r)) / cos_phi
 
@@ -26,7 +26,8 @@ import numpy as np
 import torch
 import warnings
 
-from .projectors import Projectors, maybe_compile, tap_weights
+from .horizontal_fan import fan_back_batch, fan_forward_batch
+from .projectors import maybe_compile
 from .tomography_model import TomographyModel
 from .vcd_utils import get_support_radius
 
@@ -78,8 +79,9 @@ def _cone_horizontal_data(pixel_indices, angles, num_rows, num_cols, num_channel
                           det_channel_offset, magnification, source_detector_dist,
                           use_curved_detector):
     """The horizontal fan's inputs for a view batch (compute_horizontal_data +
-    the wrapper's center rounding).  All per-PIXEL: n_p, centers, W_p_c,
-    weight_scale, L_max are (Vb, P); pixel_mag is returned for the vertical fan.
+    the wrapper's center rounding).  All per-PIXEL: n_p, centers (int32),
+    W_p_c, weight_scale are (Vb, P) -- the hfan contract (horizontal_fan.py)
+    -- and pixel_mag is returned for the vertical fan.
     """
     x, y, pixel_mag = _cone_pixel_xy_mag(pixel_indices, angles, num_rows, num_cols,
                                          delta_voxel, delta_voxel_row,
@@ -104,21 +106,81 @@ def _cone_horizontal_data(pixel_indices, angles, num_rows, num_cols, num_channel
     else:
         W_p_c = pixel_mag * (footprint_xy / delta_det_channel)
     weight_scale = (delta_voxel_row * delta_voxel) / footprint_xy
-    L_max = torch.clamp(W_p_c, max=1.0)
-    centers = torch.round(n_p).to(torch.int64)
-    return n_p, centers, W_p_c, weight_scale, L_max, pixel_mag
+    centers = torch.round(n_p).to(torch.int32)
+    return n_p, centers, W_p_c, weight_scale, pixel_mag
 
 
-def _cone_forward_view_batch(values, pixel_indices, angles, z_shifts, num_rows_r,
-                             num_channels, num_recon_rows, num_recon_cols,
-                             num_slices, delta_voxel, delta_voxel_row,
-                             delta_voxel_slice, delta_det_channel, delta_det_row,
+def _cone_vertical_affine(pixel_mag, z_shifts, num_slices, delta_voxel_slice,
+                          delta_det_row, det_row_offset, recon_slice_offset,
+                          num_rows_r):
+    """The vertical fan's affine map from GLOBAL slice index to detector row.
+
+    Each (view, pixel) cylinder projects onto the detector rows through the
+    affine map
+
+        m(v, p, l) = m0 + W_p_r * l
+
+    with ``l`` the GLOBAL slice index (band-independent by construction: m0 is
+    anchored at global slice 0, so a slice band just restricts the range of
+    ``l``).  The two projection directions consume the two algebraic forms of
+    the SAME map -- the back body evaluates it directly (slice -> row), the
+    forward body inverts it (row -> slice, ``k_m = (m - m0) / W_p_r``) -- so
+    deriving both from this one pair keeps them consistent by construction
+    instead of by parallel edits.
+
+    THE (m0, W_p_r) PAIR IS THE SANCTIONED GEOMETRY BRIDGE: a fused kernel
+    consumes exactly this pair (plus the hfan data contract of
+    horizontal_fan.py) and needs nothing else of the cone vertical geometry.
+    Extending the vertical fan means extending this function, not the bodies.
+
+    Args:
+        pixel_mag: per-(view, pixel) magnification, (Vb, P).
+        z_shifts: per-view helical z shift, (Vb,).
+        num_slices (int): the FULL recon slice count (the z anchor stays on it
+            whatever band is requested).
+        delta_voxel_slice, delta_det_row, det_row_offset, recon_slice_offset:
+            the vertical geometry scalars.
+        num_rows_r (int): detector row count.
+
+    Returns:
+        (m0, W_p_r, z_offset): the row-center anchor at global slice 0 (Vb, P),
+        the rows-per-slice slope (Vb, P), and the per-view z offset (Vb,) that
+        both bodies' cone-angle chains share.
+    """
+    z_offset = recon_slice_offset - z_shifts                     # (Vb,)
+    det_center_row = (num_rows_r - 1) / 2.0
+    W_p_r = pixel_mag * delta_voxel_slice / delta_det_row        # (Vb, P)
+    z_at_slice_0 = z_offset[:, None] - delta_voxel_slice * (num_slices - 1) / 2.0
+    m0 = (pixel_mag * z_at_slice_0 + det_row_offset) / delta_det_row \
+        + det_center_row                                         # (Vb, P)
+    return m0, W_p_r, z_offset
+
+
+def _cone_forward_view_batch(values, pixel_indices, view_params_batch,
+                             num_rows_r, num_channels, num_recon_rows,
+                             num_recon_cols, num_slices, delta_voxel,
+                             delta_voxel_row, delta_voxel_slice,
+                             delta_det_channel, delta_det_row,
                              det_channel_offset, det_row_offset, recon_slice_offset,
                              magnification, source_detector_dist,
-                             use_curved_detector, psf_radius, bp_psf_radius):
+                             use_curved_detector, psf_radius, bp_psf_radius,
+                             slice_start=0, plan=None):
     """Cone forward for one view batch: the detector-side vertical fan, then the
-    per-pixel horizontal fan scatter.  Returns (Vb, R, C)."""
-    n_p, centers, W_p_c, weight_scale, L_max, pixel_mag = _cone_horizontal_data(
+    per-pixel horizontal fan scatter.  Returns (Vb, R, C).
+
+    ``slice_start`` supports the banded sharded forward: ``values`` may be a
+    slice BAND (P, L) whose global slice indices are [slice_start,
+    slice_start + L); the z geometry stays anchored on the FULL num_slices
+    center, gathers use band-local storage indices, and taps outside the band
+    contribute zero -- so summing the per-band outputs over a tiling of the
+    slice axis reproduces the unbanded projection exactly.  The default 0
+    with L == num_slices is the unbanded case, bit-identical to before.
+
+    ``plan`` is the memoization slot for a future sorted/CSR stream variant
+    (per pixel-subset x view-range); unused today."""
+    angles = view_params_batch[:, 0]
+    z_shifts = view_params_batch[:, 1]
+    n_p, centers, W_p_c, weight_scale, pixel_mag = _cone_horizontal_data(
         pixel_indices, angles, num_recon_rows, num_recon_cols, num_channels,
         delta_voxel, delta_voxel_row, delta_det_channel, det_channel_offset,
         magnification, source_detector_dist, use_curved_detector)
@@ -126,27 +188,28 @@ def _cone_forward_view_batch(values, pixel_indices, angles, z_shifts, num_rows_r
     dev = values.device
 
     # ── vertical fan (detector side; forward_vertical_fan_one_pixel) ─────────
+    m0, W_p_r, z_offset = _cone_vertical_affine(
+        pixel_mag, z_shifts, num_slices, delta_voxel_slice, delta_det_row,
+        det_row_offset, recon_slice_offset, num_rows_r)
+
     # Scale the cylinder values by 1/cos(phi): phi is the vertical cone angle of
     # each (pixel, slice) voxel; 1/cos is the projection length through a voxel.
-    z_offset = recon_slice_offset - z_shifts                     # (Vb,)
-    k = torch.arange(num_slices, dtype=_F32, device=dev)
+    band_len = values.shape[1]
+    k = torch.arange(slice_start, slice_start + band_len, dtype=_F32, device=dev)
     z = (delta_voxel_slice * (k - (num_slices - 1) / 2.0))[None, None, :] \
-        + z_offset[:, None, None]                                # (Vb, 1, S)
-    v_slices = pixel_mag.unsqueeze(-1) * z                       # (Vb, P, S)
+        + z_offset[:, None, None]                                # (Vb, 1, L)
+    v_slices = pixel_mag.unsqueeze(-1) * z                       # (Vb, P, L)
     cos_phi = torch.cos(torch.atan2(v_slices, torch.as_tensor(
         source_detector_dist, dtype=_F32, device=dev)))
     scaled_values = values[None, :, :] / cos_phi                 # (Vb, P, S)
 
-    # Detector rows -> voxel fractional indices (the map the back projector
-    # inverts): k_m is affine in the row index with slope 1/W_p_r.
-    det_center_row = (num_rows_r - 1) / 2.0
+    # Detector rows -> voxel fractional indices: the INVERSE of the shared
+    # affine map (the back body below evaluates the direct form), so k_m is
+    # affine in the row index with slope 1/W_p_r.
     m = torch.arange(num_rows_r, dtype=_F32, device=dev)         # (R,)
-    v_m = (m - det_center_row) * delta_det_row - det_row_offset  # (R,)
-    z_m = v_m[None, None, :] / pixel_mag.unsqueeze(-1)           # (Vb, P, R)
-    k_m = (z_m - z_offset[:, None, None]) / delta_voxel_slice + (num_slices - 1) / 2.0
+    k_m = (m[None, None, :] - m0.unsqueeze(-1)) / W_p_r.unsqueeze(-1)
     k_center = torch.round(k_m).to(torch.int64)                  # (Vb, P, R)
 
-    W_p_r = pixel_mag * delta_voxel_slice / delta_det_row        # (Vb, P): slope
     slope = W_p_r.unsqueeze(-1)
     L_max_r = torch.clamp(W_p_r, max=1.0).unsqueeze(-1)
     m_p = slope * (k_center.to(_F32) - k_m)                      # projection offset
@@ -156,68 +219,74 @@ def _cone_forward_view_batch(values, pixel_indices, angles, z_shifts, num_rows_r
         k_ind = k_center + k_off
         A = torch.clamp((slope + 1.0) / 2.0 - (m_p + slope * k_off).abs(), min=0.0)
         A = torch.minimum(A, L_max_r)
-        A = A * ((k_ind >= 0) & (k_ind < num_slices)).to(_F32)
-        g = torch.gather(scaled_values, 2, k_ind.clamp(0, num_slices - 1))
+        A = A * ((k_ind >= slice_start)
+                 & (k_ind < slice_start + band_len)).to(_F32)
+        g = torch.gather(scaled_values, 2,
+                         (k_ind - slice_start).clamp(0, band_len - 1))
         det_col = det_col + A * g
 
-    # ── horizontal fan scatter (per-pixel weights) ───────────────────────────
-    acc = torch.zeros((vb * num_channels, num_rows_r), dtype=_F32, device=dev)
-    row_base = torch.arange(vb, device=dev)[:, None] * num_channels
-    for offset in range(-psf_radius, psf_radius + 1):
-        A, n = tap_weights(n_p, centers + offset, W_p_c, weight_scale, L_max,
-                           num_channels)
-        idx = (row_base + n).reshape(-1)
-        src = (A.unsqueeze(-1) * det_col).reshape(-1, num_rows_r)
-        acc.index_add_(0, idx, src)
-    return acc.view(vb, num_channels, num_rows_r).permute(0, 2, 1)
+    # ── horizontal fan scatter (the shared kernel; per-view values) ──────────
+    acc = fan_forward_batch((n_p, centers, W_p_c, weight_scale), det_col,
+                            num_channels, psf_radius)
+    return acc.permute(0, 2, 1)
 
 
-def _cone_back_view_batch(sino_batch, pixel_indices, angles, z_shifts, num_rows_r,
-                          num_channels, num_recon_rows, num_recon_cols, num_slices,
-                          delta_voxel, delta_voxel_row, delta_voxel_slice,
+def _cone_back_view_batch(sino_batch, pixel_indices, view_params_batch,
+                          num_rows_r, num_channels, num_recon_rows,
+                          num_recon_cols, num_slices, delta_voxel,
+                          delta_voxel_row, delta_voxel_slice,
                           delta_det_channel, delta_det_row, det_channel_offset,
                           det_row_offset, recon_slice_offset, magnification,
                           source_detector_dist, use_curved_detector, psf_radius,
-                          bp_psf_radius, coeff_power):
+                          bp_psf_radius, coeff_power=1, slice_start=0,
+                          band_slices=None, plan=None):
     """Cone back projection for one view batch, summed over the batch's views:
     horizontal fan gather -> per-pixel detector columns -> vertical fan gather
-    onto the slices.  Returns (P, S)."""
-    n_p, centers, W_p_c, weight_scale, L_max, pixel_mag = _cone_horizontal_data(
+    onto the slices.  Returns (P, S) -- or (P, band_slices) when a slice BAND
+    [slice_start, slice_start + band_slices) is requested (the banded sharded
+    back); the z geometry stays anchored on the full num_slices center, and
+    the default (0, None) is the unbanded case, bit-identical to before.
+
+    ``plan`` is the memoization slot for a future sorted/CSR stream variant
+    (per pixel-subset x view-range); unused today."""
+    angles = view_params_batch[:, 0]
+    z_shifts = view_params_batch[:, 1]
+    n_p, centers, W_p_c, weight_scale, pixel_mag = _cone_horizontal_data(
         pixel_indices, angles, num_recon_rows, num_recon_cols, num_channels,
         delta_voxel, delta_voxel_row, delta_det_channel, det_channel_offset,
         magnification, source_detector_dist, use_curved_detector)
     vb, num_pixels = n_p.shape
     dev = sino_batch.device
 
-    # ── horizontal fan gather (adjoint of the forward scatter) ───────────────
+    # ── horizontal fan gather (the shared kernel, view axis kept) ────────────
     sino_T = sino_batch.permute(0, 2, 1).contiguous()            # (Vb, C, R)
-    v_idx = torch.arange(vb, device=dev)[:, None]
-    det_col = torch.zeros((vb, num_pixels, num_rows_r), dtype=_F32, device=dev)
-    for offset in range(-psf_radius, psf_radius + 1):
-        A, n = tap_weights(n_p, centers + offset, W_p_c, weight_scale, L_max,
-                           num_channels)
-        if coeff_power != 1:
-            A = A ** coeff_power
-        det_col = det_col + A.unsqueeze(-1) * sino_T[v_idx, n]
+    det_col = fan_back_batch(sino_T, (n_p, centers, W_p_c, weight_scale),
+                             num_channels, psf_radius,
+                             coeff_power=coeff_power, reduce_views=False)
 
     # ── vertical fan gather (compute_vertical_data + vertical_fan_band_gather)
-    z_offset = recon_slice_offset - z_shifts
-    k = torch.arange(num_slices, dtype=_F32, device=dev)
+    m0, W_p_r, z_offset = _cone_vertical_affine(
+        pixel_mag, z_shifts, num_slices, delta_voxel_slice, delta_det_row,
+        det_row_offset, recon_slice_offset, num_rows_r)
+
+    band_len = num_slices if band_slices is None else band_slices
+    k = torch.arange(slice_start, slice_start + band_len, dtype=_F32, device=dev)
     z = (delta_voxel_slice * (k - (num_slices - 1) / 2.0))[None, None, :] \
         + z_offset[:, None, None]
     v_slices = pixel_mag.unsqueeze(-1) * z                       # (Vb, P, S)
     sdd_t = torch.as_tensor(source_detector_dist, dtype=_F32, device=dev)
     cos_phi = torch.cos(torch.atan2(v_slices, sdd_t))
-    det_center_row = (num_rows_r - 1) / 2.0
-    m_p = (v_slices + det_row_offset) / delta_det_row + det_center_row
+    # Slice -> detector row: the DIRECT form of the shared affine map (the
+    # forward body above inverts it).
+    slope = W_p_r.unsqueeze(-1)
+    m_p = m0.unsqueeze(-1) + slope * k[None, None, :]            # (Vb, P, S)
     m_center = torch.round(m_p).to(torch.int64)
-    W_p_r = (pixel_mag * delta_voxel_slice / delta_det_row).unsqueeze(-1)
-    L_max_r = torch.clamp(W_p_r, max=1.0)
+    L_max_r = torch.clamp(slope, max=1.0)
 
-    out = torch.zeros((num_pixels, num_slices), dtype=_F32, device=dev)
+    out = torch.zeros((num_pixels, band_len), dtype=_F32, device=dev)
     for m_off in range(-psf_radius, psf_radius + 1):
         mm = m_center + m_off
-        L = torch.clamp((W_p_r + 1.0) / 2.0 - (m_p - mm.to(_F32)).abs(), min=0.0)
+        L = torch.clamp((slope + 1.0) / 2.0 - (m_p - mm.to(_F32)).abs(), min=0.0)
         A = torch.minimum(L, L_max_r) / cos_phi
         A = A * ((mm >= 0) & (mm < num_rows_r)).to(_F32)
         if coeff_power != 1:
@@ -225,69 +294,6 @@ def _cone_back_view_batch(sino_batch, pixel_indices, angles, z_shifts, num_rows_
         g = torch.gather(det_col, 2, mm.clamp(0, num_rows_r - 1))
         out = out + torch.einsum("vps,vps->ps", A, g)
     return out
-
-
-class ConeProjectors(Projectors):
-    """Cone drivers: the same view-batched loop as the base class, with the
-    cone view-batch bodies (which carry the vertical fan)."""
-
-    def __init__(self, model):
-        super().__init__(model)
-        self._fwd_body = maybe_compile(_cone_forward_view_batch, model.compile_enabled)
-        self._back_body = maybe_compile(_cone_back_view_batch, model.compile_enabled)
-
-    def _geom_args(self, m):
-        gp_names = ['delta_det_row', 'delta_det_channel', 'det_row_offset',
-                    'det_channel_offset', 'source_detector_dist', 'delta_voxel',
-                    'voxel_row_aspect', 'voxel_slice_aspect', 'recon_slice_offset',
-                    'use_curved_detector']
-        (ddr, ddc, dro, dco, sdd, dv, vra, vsa, rso, curved) = m.get_params(gp_names)
-        recon_shape = m.get_params('recon_shape')
-        return dict(num_recon_rows=recon_shape[0], num_recon_cols=recon_shape[1],
-                    num_slices=recon_shape[2], delta_voxel=dv,
-                    delta_voxel_row=vra * dv, delta_voxel_slice=vsa * dv,
-                    delta_det_channel=ddc, delta_det_row=ddr,
-                    det_channel_offset=dco, det_row_offset=dro,
-                    recon_slice_offset=rso, magnification=m.get_magnification(),
-                    source_detector_dist=sdd, use_curved_detector=curved,
-                    psf_radius=m.get_psf_radius(), bp_psf_radius=m.bp_psf_radius)
-
-    def sparse_forward_project(self, voxel_values, pixel_indices):
-        m = self.model
-        dev = m.torch_device
-        num_views, num_rows, num_channels = m.get_params('sinogram_shape')
-        voxel_values = torch.as_tensor(voxel_values, dtype=_F32, device=dev)
-        pixel_indices = torch.as_tensor(pixel_indices, dtype=torch.int64, device=dev)
-        args = self._geom_args(m)
-        # The dominant transients are (Vb, P, S) and (Vb, P, R).
-        vb_size = self._effective_view_batch(pixel_indices.shape[0],
-                                             max(args['num_slices'], num_rows))
-        sinogram = torch.empty((num_views, num_rows, num_channels), dtype=_F32,
-                               device=dev)
-        for v0 in range(0, num_views, vb_size):
-            vp = self.view_params_array[v0:v0 + vb_size]
-            block = self._fwd_body(voxel_values, pixel_indices, vp[:, 0], vp[:, 1],
-                                   num_rows, num_channels, **args)
-            sinogram[v0:v0 + vp.shape[0]] = block
-        return sinogram
-
-    def sparse_back_project(self, sinogram, pixel_indices, coeff_power=1):
-        m = self.model
-        dev = m.torch_device
-        num_views, num_rows, num_channels = m.get_params('sinogram_shape')
-        sinogram = torch.as_tensor(sinogram, dtype=_F32, device=dev)
-        pixel_indices = torch.as_tensor(pixel_indices, dtype=torch.int64, device=dev)
-        args = self._geom_args(m)
-        vb_size = self._effective_view_batch(pixel_indices.shape[0],
-                                             max(args['num_slices'], num_rows))
-        out = torch.zeros((pixel_indices.shape[0], args['num_slices']), dtype=_F32,
-                          device=dev)
-        for v0 in range(0, num_views, vb_size):
-            vp = self.view_params_array[v0:v0 + vb_size]
-            out = out + self._back_body(sinogram[v0:v0 + vp.shape[0]], pixel_indices,
-                                        vp[:, 0], vp[:, 1], num_rows, num_channels,
-                                        coeff_power=coeff_power, **args)
-        return out
 
 
 class ConeBeamModel(TomographyModel):
@@ -310,7 +316,6 @@ class ConeBeamModel(TomographyModel):
     def __init__(self, sinogram_shape, angles, source_detector_dist, source_iso_dist,
                  helical_z_shifts=None, use_curved_detector=False, device='auto',
                  view_batch_size=64, compile_mode='auto'):
-        self.bp_psf_radius = 1
         angles = np.asarray(angles, dtype=np.float32).flatten()
         if helical_z_shifts is None:
             helical_z_shifts = np.zeros_like(angles)
@@ -332,12 +337,56 @@ class ConeBeamModel(TomographyModel):
     _dc_damping = _DC_DAMPING_DEFAULT
 
     def create_projectors(self):
-        self.projector_functions = ConeProjectors(self)
+        super().create_projectors()
+        # Warm the DC-damping profile and its per-device compiled instances
+        # EAGERLY (params- and layout-dependent): built lazily it raced the
+        # per-device worker threads on the first subset.
+        self._dc_damping_slice_profile()
+
+    def _view_batch_bodies(self):
+        return _cone_forward_view_batch, _cone_back_view_batch
+
+    def _view_batch_args(self):
+        gp_names = ['delta_det_row', 'delta_det_channel', 'det_row_offset',
+                    'det_channel_offset', 'source_detector_dist', 'delta_voxel',
+                    'voxel_row_aspect', 'voxel_slice_aspect', 'recon_slice_offset',
+                    'use_curved_detector']
+        (ddr, ddc, dro, dco, sdd, dv, vra, vsa, rso, curved) = self.get_params(gp_names)
+        sinogram_shape = self.get_params('sinogram_shape')
+        recon_shape = self.get_params('recon_shape')
+        psf_radius, bp_psf_radius = self.get_psf_radii()
+        return dict(num_rows_r=sinogram_shape[1], num_channels=sinogram_shape[2],
+                    num_recon_rows=recon_shape[0], num_recon_cols=recon_shape[1],
+                    num_slices=recon_shape[2], delta_voxel=dv,
+                    delta_voxel_row=vra * dv, delta_voxel_slice=vsa * dv,
+                    delta_det_channel=ddc, delta_det_row=ddr,
+                    det_channel_offset=dco, det_row_offset=dro,
+                    recon_slice_offset=rso, magnification=self.get_magnification(),
+                    source_detector_dist=sdd, use_curved_detector=curved,
+                    psf_radius=psf_radius, bp_psf_radius=bp_psf_radius)
+
+    def _transient_cols(self, band_cols):
+        # The cone bodies hold (Vb, P, S) and (Vb, P, R) transients whatever
+        # the requested band, so the budget width is params-derived (the
+        # calibrated rule; see the base hook's docstring).
+        sinogram_shape, recon_shape = self.get_params(['sinogram_shape',
+                                                       'recon_shape'])
+        return max(int(recon_shape[2]), int(sinogram_shape[1]))
 
     def _dc_damping_slice_profile(self):
-        """Per-slice damping vector s_k on the model device, or None if
+        """The per-slice damping vectors s_k, split per device, or None if
         disabled.  Circular: s_k from t_k = L |z_k| / (R dz); helical:
-        view-averaged.  Cached against the parameters it depends on."""
+        view-averaged.  The full profile is computed on the host, any padded
+        slice tail is filled with 1.0 (no damping -- inert, matching the
+        forced-zero padded slices), and each device gets its own slice band
+        plus its own compiled damping instance (per-device instances, like
+        the subset updater's other compiled units).  Cached against the parameters
+        and the device layout; _invalidate_device_caches drops it.
+
+        Returns:
+            (profiles, fns): per-device (local_slices,) tensors and compiled
+            direction helpers, in device order; or None when disabled.
+        """
         cfg = self._dc_damping
         if cfg is None:
             return None
@@ -346,8 +395,10 @@ class ConeBeamModel(TomographyModel):
             ['delta_voxel', 'voxel_slice_aspect', 'recon_slice_offset'])
         R = self.get_params('source_iso_dist')
         z_shifts = np.asarray(self.get_params('view_params_array'))[:, 1]
+        rp = self.recon_placement
         key = (tuple(cfg), tuple(recon_shape), dv, slice_aspect, oz, R,
-               float(z_shifts.min()), float(z_shifts.max()), str(self.torch_device))
+               float(z_shifts.min()), float(z_shifts.max()),
+               tuple(str(d) for d in rp.devices), rp.padded_size)
         cache = getattr(self, '_dc_damping_cache', None)
         if cache is not None and cache[0] == key:
             return cache[1]
@@ -366,26 +417,37 @@ class ConeBeamModel(TomographyModel):
         else:
             t = L * np.abs(z[:, None] - z_shifts[None, :]) / (R * dz)
             s_prof = profile(t).mean(axis=1)
-        s_t = torch.as_tensor(s_prof.astype(np.float32), device=self.torch_device)
-        self._dc_damping_cache = (key, s_t)
-        return s_t
+        total = rp.padded_size if rp.padded_size is not None else nz
+        if total > nz:
+            s_prof = np.concatenate([s_prof, np.ones(total - nz)])
+        profiles, fns = [], []
+        for i, (dev, (s0, s1)) in enumerate(rp.shard_ranges(total)):
+            profiles.append(torch.as_tensor(
+                s_prof[s0:s1].astype(np.float32), device=dev))
+            fns.append(maybe_compile(_dc_damped_update_direction,
+                                     self.compile_enabled, instance_key=i))
+        self._dc_damping_cache = (key, (profiles, fns))
+        return profiles, fns
 
     def _get_update_direction(self, forward_grad, prior_grad, forward_hess,
-                              prior_hess, pixel_indices):
-        # DC damping of each slice's update (qGGMRF and prox paths alike).
-        s_row = self._dc_damping_slice_profile()
-        if s_row is None:
+                              prior_hess, pixel_indices, dev_index=0):
+        # DC damping of each slice's update (qGGMRF and prox paths alike),
+        # applied per shard: the slice means inside the damping formula are
+        # shard-local, which is exactly right under slice sharding (every
+        # slice lives on one shard).
+        prof = self._dc_damping_slice_profile()
+        if prof is None:
             return super()._get_update_direction(forward_grad, prior_grad,
                                                  forward_hess, prior_hess,
-                                                 pixel_indices)
+                                                 pixel_indices,
+                                                 dev_index=dev_index)
+        profiles, fns = prof
         prior_hess_t = (prior_hess if torch.is_tensor(prior_hess)
                         else torch.as_tensor(prior_hess, dtype=_F32,
                                              device=forward_grad.device))
-        fn = maybe_compile(_dc_damped_update_direction, self.compile_enabled)
-        return fn(forward_grad, prior_grad, forward_hess, prior_hess_t, s_row)
+        return fns[dev_index](forward_grad, prior_grad, forward_hess,
+                              prior_hess_t, profiles[dev_index])
 
-    def compute_hfan_data_batched(self, pixel_indices, view_params_batch):
-        raise NotImplementedError('cone uses its own drivers (ConeProjectors)')
 
     def get_magnification(self):
         """magnification = source_detector_dist / source_iso_dist (1 at inf)."""
@@ -418,10 +480,18 @@ class ConeBeamModel(TomographyModel):
             warnings.warn('Cone angle is more than 45 degrees.  This will likely '
                           'produce recon artifacts.')
 
-    def get_psf_radius(self):
-        """Integer radius of the channel psf, from the maximum magnification;
-        also sets ``bp_psf_radius`` (the back/vertical voxel-per-detector radius)
-        as a side effect, as in mbirjax."""
+    def get_psf_radii(self):
+        """The two integer psf radii, PURE (no attribute side effects): the
+        channel radius from the maximum magnification (the forward horizontal
+        tap radius and the back vertical tap radius) and the back/vertical
+        voxel-per-detector radius (the forward vertical tap radius).  The
+        directions deliberately use DIFFERENT vertical radii -- forward
+        gathers voxels per detector row (bp radius), back gathers rows per
+        voxel (psf radius) -- inherited from mbirjax.
+
+        Returns:
+            (psf_radius, bp_psf_radius) ints.
+        """
         (delta_det_row, delta_det_channel, source_detector_dist, recon_shape,
          delta_voxel, voxel_row_aspect, voxel_slice_aspect) = self.get_params(
             ['delta_det_row', 'delta_det_channel', 'source_detector_dist',
@@ -445,8 +515,12 @@ class ConeBeamModel(TomographyModel):
         psf_radius = int(np.ceil(np.ceil(max_voxel_pitch * max_magnification / delta_det) / 2))
         min_voxel_pitch = min(delta_voxel, delta_voxel_row, delta_voxel_slice)
         max_voxels_per_detector = delta_det / (min_magnification * min_voxel_pitch)
-        self.bp_psf_radius = int(np.ceil(np.ceil(max_voxels_per_detector) / 2))
-        return psf_radius
+        bp_psf_radius = int(np.ceil(np.ceil(max_voxels_per_detector) / 2))
+        return psf_radius, bp_psf_radius
+
+    def get_psf_radius(self):
+        """Integer radius of the channel psf (see :meth:`get_psf_radii`)."""
+        return self.get_psf_radii()[0]
 
     @staticmethod
     def detector_mn_to_uv(m, n, delta_det_channel, delta_det_row, det_channel_offset,
@@ -541,7 +615,10 @@ class ConeBeamModel(TomographyModel):
         """FDK filtering: the shared row filter with the FDK cosine pre-weight
         per detector element and the voxel-size scale alpha."""
         sinogram = self._shard_sinogram(sinogram)
-        num_rows, num_channels = sinogram.shape[1], sinogram.shape[2]
+        # Dims from the params, not the array: the sinogram may be a Shards
+        # container under a multi-device configuration.
+        _, num_rows, num_channels = (int(x) for x in
+                                     self.get_params('sinogram_shape'))
         source_detector_dist = self.get_params('source_detector_dist')
         (delta_voxel, delta_det_row, delta_det_channel, voxel_row_aspect,
          voxel_slice_aspect) = self.get_params(
@@ -582,6 +659,18 @@ class ConeBeamModel(TomographyModel):
         M_0 = self.get_magnification()
         delta_voxel_slice = voxel_slice_aspect * delta_voxel
 
+        from . import _sharding
+        if isinstance(recon, _sharding.Shards):
+            # Per-shard weighting in GLOBAL slice coordinates: each shard
+            # scales its own slices with its slice-range of the weight.
+            w_full = self._helical_z_weight_row(sinogram)
+            rp = recon.placement
+            tensors = []
+            for i, (dev, (s0, s1)) in enumerate(
+                    rp.shard_ranges(int(recon_shape[2]))):
+                w = torch.as_tensor(w_full[s0:s1].astype(np.float32), device=dev)
+                tensors.append(recon.tensors[i] * w[None, None, :])
+            return _sharding.Shards(tensors, rp)
         num_real_slices = recon_shape[2]
         k = np.arange(recon.shape[2])
         z_k = delta_voxel_slice * (k - (num_real_slices - 1) / 2.0) + recon_slice_offset
@@ -595,6 +684,28 @@ class ConeBeamModel(TomographyModel):
         z_weight = np.where(k < num_real_slices, z_weight, 0.0)
         w = torch.as_tensor(z_weight.astype(np.float32), device=recon.device)
         return recon * w[None, None, :]
+
+    def _helical_z_weight_row(self, sinogram):
+        """The full (num_real_slices,) helical z-weight row in global slice
+        coordinates (the shared math of helical_fdk_z_weight, from params
+        only, host numpy)."""
+        num_views, num_rows, _ = self.get_params('sinogram_shape')
+        helical_z_shifts = np.asarray(self.get_params('view_params_array'))[:, 1]
+        (delta_voxel, voxel_slice_aspect, recon_shape, recon_slice_offset,
+         delta_det_row) = self.get_params(
+            ['delta_voxel', 'voxel_slice_aspect', 'recon_shape',
+             'recon_slice_offset', 'delta_det_row'])
+        M_0 = self.get_magnification()
+        delta_voxel_slice = voxel_slice_aspect * delta_voxel
+        num_real_slices = recon_shape[2]
+        k = np.arange(num_real_slices)
+        z_k = delta_voxel_slice * (k - (num_real_slices - 1) / 2.0) \
+            + recon_slice_offset
+        det_half_height_iso = 0.5 * num_rows * delta_det_row / M_0
+        visible = np.abs(z_k[:, None] - helical_z_shifts[None, :]) \
+            <= det_half_height_iso
+        coverage = np.sum(visible, axis=1)
+        return np.where(coverage > 0, num_views / np.maximum(coverage, 1), 0.0)
 
     def fdk_recon(self, sinogram, filter_name="ramp", output_sharded=False):
         """

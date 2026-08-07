@@ -220,8 +220,8 @@ def gen_weights(sinogram, weight_type, ct_model=None):
             - 'transmission_root': Use square-root decay, `exp(-sinogram / 2)`.
             - 'emission': Use reciprocal decay, `1 / (abs(sinogram) + 0.1)`.
         ct_model (TomographyModel, optional): if given, the sinogram is first
-            placed in the model's device form (the ``_shard_sinogram``
-            chokepoint), so the weights are built on the model device -- and,
+            placed in the model's device form (``_shard_sinogram``), so the
+            weights are built on the model device -- and,
             under a future sharding port, per shard.  Default None leaves the
             input where it is.
 

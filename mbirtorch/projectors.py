@@ -1,41 +1,25 @@
-"""Shared horizontal-fan projector kernels (portable forms) and the batched drivers.
+"""The geometry-agnostic projection driver and the torch.compile plumbing.
 
-Ported from mbirjax.projectors in the PORTABLE forms: the per-tap scatter-add
-forward and per-tap gather back only -- no sorted channel reduction, no
-stacked gather, no tile policy (those are the jax perf layer; their torch
-analogs belong with the future Triton kernel work).
+The division of labor (panel-reviewed design, plans repo
+projector_layer_design.md): this module owns ITERATION and MEMORY -- the
+view-batch loops, the transient budget, per-device compiled-instance
+management, and the compile lock.  The shared horizontal-fan math and the
+hfan data contract live in horizontal_fan.py; each geometry model owns its
+geometry chains and its per-view-batch bodies.  No sorted channel
+reduction, no stacked gather, no tile policy here (the jax perf layer;
+their torch analogs belong with the future Triton kernel work).
 
-Every geometry's horizontal fan applies the same trapezoid rule; the geometry
-enters ONLY through (n_p, n_p_center, W_p_c) -- the continuous projected
-channel coordinate, its rounded center, and the projected voxel width in
-channel units -- plus a per-geometry weight scale.  The weight rule (identical
-across geometries): tap n = n_p_center + offset receives
-
-    A = weight_scale * clip((W_p_c + 1) / 2 - |n_p - n|, 0, min(1, W_p_c))
-
--- the trapezoid overlap of the projected voxel with detector cell n -- zeroed
-outside the detector.  Values match mbirjax's kernels by construction
-(validated cross-framework at <= 1.6e-6 rel-max on the goldens).
-
-Torch semantics note: jax DROPS out-of-bounds
-scatter indices and CLAMPS out-of-bounds gathers, and mbirjax's per-tap loops
-rely on both.  Torch index ops assert on out-of-bounds instead, so every tap
-here uses the clip-plus-zero-weight pattern (the same pattern mbirjax's sorted
-branch already used): the weight is zeroed where the unclipped tap fell
-outside the detector, then the index is clamped in range.
-
-Layout note (from mbirjax): the forward fan produces CHANNEL-MAJOR partial
-views, (channels, cols), so the scatter writes contiguous rows rather than
-strided columns; the drivers transpose to the sinogram's (rows, channels)
-layout on write.  The back fan likewise gathers from channel-major views (the
-drivers transpose each view batch up front).
-
-The drivers batch over VIEWS with a plain python loop; the eager transient is
-(view_batch, num_pixels, S) floats, so ``view_batch_size`` is the single
-memory/speed knob; the bodies are torch.compiled (see maybe_compile below).
+The drivers batch over VIEWS with a plain python loop; the eager transient
+is (view_batch, num_pixels, cols) floats, so ``view_batch_size`` is the
+single memory/speed knob; the bodies are torch.compiled (see maybe_compile
+below).
 """
 
+import threading
+
 import torch
+
+from . import _sharding
 
 _F32 = torch.float32
 
@@ -44,18 +28,45 @@ _F32 = torch.float32
 # (CUDA), with the fan chain's peak-memory transients collapsing 6-41x.  The
 # compiled callables are cached per FUNCTION at
 # module level: torch.compile handles multiple input shapes itself (one
-# specialization per shape guard), and the engine's shape set is small (one
+# specialization per shape guard), and the VCD loop's shape set is small (one
 # subset size per partition granularity, plus the full-index size).  A compile
 # failure falls back to eager silently-but-recorded, so exotic
 # backends/toolchains keep working (the same availability philosophy as
 # mbirjax's pallas gate).
 _COMPILE_CACHE = {}
 _COMPILE_ERRORS = {}
+# Serializes COMPILE EVENTS process-wide: triton/inductor compilation is not
+# thread-safe (measured on A100, torch 2.13: two per-device threads cold-compiling
+# concurrently crash in static_triton_launcher EVEN WITH separate compiled
+# instances).  Each wrapper takes this lock only for input-shape keys it has
+# not completed before, so steady-state threaded execution stays lock-free.
+_GLOBAL_COMPILE_LOCK = threading.Lock()
 
 
-def maybe_compile(fn, enabled):
-    """Return a compiled form of ``fn`` (cached per function) when enabled,
-    else ``fn`` itself.
+def _shape_key(args, kwargs):
+    parts = []
+    for a in list(args) + [kwargs[k] for k in sorted(kwargs)]:
+        if torch.is_tensor(a):
+            parts.append(('T', str(a.device)) + tuple(a.shape))
+        elif isinstance(a, tuple):
+            for t in a:
+                parts.append(((('T', str(t.device)) + tuple(t.shape))
+                              if torch.is_tensor(t) else ('o', str(t)[:32])))
+        else:
+            parts.append(('o', str(a)[:32]))
+    return tuple(parts)
+
+
+def maybe_compile(fn, enabled, instance_key=None):
+    """Return a compiled form of ``fn`` (cached per (function, instance_key))
+    when enabled, else ``fn`` itself.  ``instance_key`` names a distinct
+    compiled instance -- the per-device threads of the VCD loop pass their
+    device index, because compiled artifacts carry triton-launcher state
+    that must not be shared across concurrently executing threads (a shared
+    instance crashed under concurrent cold compiles; the process-wide lock
+    below serializes the COMPILE events, the per-instance split isolates the
+    launcher state).  Instances are cached at module level, so rebuilding a
+    model's projectors reuses them instead of re-tracing devices 1..n-1.
 
     torch.compile is LAZY: the wrapper it returns compiles at the first
     invocation, so a broken backend (no C++ toolchain, a broken triton) would
@@ -71,130 +82,71 @@ def maybe_compile(fn, enabled):
     """
     if not enabled:
         return fn
-    if fn in _COMPILE_CACHE:
-        return _COMPILE_CACHE[fn]
+    cache_key = fn if instance_key is None else (fn, instance_key)
+    if cache_key in _COMPILE_CACHE:
+        return _COMPILE_CACHE[cache_key]
     compiled = torch.compile(fn)
-    state = {"impl": compiled, "validated": False}
+    state = {"impl": compiled}
+    seen_keys = set()
 
     def guarded(*args, **kwargs):
-        if state["validated"]:
+        key = _shape_key(args, kwargs)
+        if key in seen_keys:
             return state["impl"](*args, **kwargs)
-        try:
-            out = state["impl"](*args, **kwargs)
-            state["validated"] = True
-            return out
-        except Exception as e:                                # noqa: BLE001
-            # Retry eagerly: if the failure was the compile backend, this
-            # succeeds and we fall back for good; a real input error re-raises.
-            out = fn(*args, **kwargs)
-            _COMPILE_ERRORS[fn.__name__] = f"{type(e).__name__}: {e}"[:400]
-            state["impl"] = fn
-            state["validated"] = True
+        # First sight of this shape: the call may trigger dynamo/inductor
+        # compilation, which must not run concurrently with any other
+        # compile in the process (see _GLOBAL_COMPILE_LOCK).
+        with _GLOBAL_COMPILE_LOCK:
+            try:
+                out = state["impl"](*args, **kwargs)
+            except Exception as e:                            # noqa: BLE001
+                # Retry eagerly: if the failure was the compile backend, this
+                # succeeds and we fall back for good; a real input error
+                # re-raises.
+                out = fn(*args, **kwargs)
+                _COMPILE_ERRORS[f"{fn.__module__}.{fn.__name__}"] = \
+                    f"{type(e).__name__}: {e}"[:400]
+                state["impl"] = fn
+            seen_keys.add(key)
             return out
 
     guarded.__name__ = f"compiled_{fn.__name__}"
-    _COMPILE_CACHE[fn] = guarded
+    _COMPILE_CACHE[cache_key] = guarded
     return guarded
 
 
-def tap_weights(n_p, n, W_p_c, weight_scale, L_max, num_channels):
-    """The shared trapezoid weight for tap ``n``, with torch-safe OOB handling.
+def compile_serialized():
+    """The process-wide compile lock, as a context manager -- for HAND-WRITTEN
+    kernel paths only::
 
-    Args:
-        n_p: continuous projected channel coordinate, (Vb, P).
-        n: integer tap channel (center + offset), (Vb, P) int64.
-        W_p_c: projected voxel width in channel units, (Vb, 1) (or broadcastable).
-        weight_scale: geometry weight scale (scalar or per-view; e.g. in-plane
-            voxel area / footprint length), (Vb, 1) (or broadcastable).
-        L_max: precomputed min(1, W_p_c), same shape as W_p_c.
-        num_channels (int): detector channel count.
+        with compile_serialized():
+            my_triton_kernel[grid](...)     # first launch: jit / autotune
 
-    Returns:
-        (A, n_clamped): weight (Vb, P) float32, zeroed where the unclipped tap
-        was out of range, and the in-range index (Vb, P) int64.
+    torch.compile paths need this nowhere: ``maybe_compile``'s wrapper already
+    takes the same lock around every call that can trigger a compile.  A
+    triton.jit or triton.autotune path compiles OUTSIDE torch.compile, at its
+    first launch (and again per autotune configuration), and races the same
+    launcher/compiler state the lock exists for, so it must borrow the lock
+    rather than introduce a second one.
+
+    Wrap only the compiling launches: as a decorator on the launching function
+    this would take the lock on EVERY call and serialize execution, not just
+    compilation.
     """
-    A = torch.clamp((W_p_c + 1.0) / 2.0 - (n_p - n.to(_F32)).abs(), min=0.0)
-    A = torch.minimum(A, L_max) * weight_scale
-    A = A * ((n >= 0) & (n < num_channels)).to(_F32)
-    return A, n.clamp(0, num_channels - 1)
+    return _GLOBAL_COMPILE_LOCK
 
 
-def fan_forward_batch(hfan_data, values, num_channels, psf_radius):
-    """Forward horizontal fan for one view batch: bin weighted per-pixel rows
-    into their detector channels (the per-tap scatter-add loop, mbirjax's
-    portable/CPU formulation).
-
-    Args:
-        hfan_data: (n_p, centers, W_p_c, weight_scale, L_max) for this view
-            batch -- n_p/centers are (Vb, P); the per-view scalars are (Vb, 1).
-        values: (P, num_cols) rows to weight and bin (voxel cylinders;
-            num_cols = slices for parallel beam).
-        num_channels (int, static): number of detector channels.
-        psf_radius (int, static): tap radius (psf_width = 2*psf_radius + 1 taps).
-
-    Returns:
-        (Vb, num_channels, num_cols) CHANNEL-MAJOR partial views (contiguous
-        scatter rows; the caller transposes to the sinogram layout).
-    """
-    n_p, centers, W_p_c, weight_scale, L_max = hfan_data
-    vb, num_pixels = n_p.shape
-    num_cols = values.shape[1]
-    dev = values.device
-    # One flat (Vb*C, num_cols) accumulator so a single index_add_ covers the
-    # whole batch: row v*C + n receives pixel p's contribution to view v,
-    # channel n.
-    acc = torch.zeros((vb * num_channels, num_cols), dtype=_F32, device=dev)
-    row_base = torch.arange(vb, device=dev)[:, None] * num_channels
-    for offset in range(-psf_radius, psf_radius + 1):
-        A, n = tap_weights(n_p, centers + offset, W_p_c, weight_scale, L_max,
-                           num_channels)
-        idx = (row_base + n).reshape(-1)
-        src = (A.unsqueeze(-1) * values).reshape(-1, num_cols)
-        acc.index_add_(0, idx, src)
-    return acc.view(vb, num_channels, num_cols)
-
-
-def fan_back_batch(sino_batch_T, hfan_data, num_channels, psf_radius, coeff_power=1):
-    """Back (adjoint) horizontal fan for one view batch: gather each pixel's
-    weighted channel rows (the per-tap gather + multiply-accumulate loop),
-    summed over the batch's views.
-
-    Args:
-        sino_batch_T: (Vb, num_channels, num_rows) CHANNEL-MAJOR views (the
-            caller transposes up front so the per-pixel gather reads contiguous
-            rows -- the adjoint of the forward fan's channel-major scatter).
-        hfan_data: as in :func:`fan_forward_batch`.
-        num_channels (int, static): number of detector channels.
-        psf_radius (int, static): tap radius.
-        coeff_power (int, static): weights raised to this power (2 = the
-            Hessian diagonal).
-
-    Returns:
-        (P, num_rows): this batch's contribution (the caller accumulates
-        batches; summing over views here keeps the transient bounded).
-    """
-    n_p, centers, W_p_c, weight_scale, L_max = hfan_data
-    vb, num_pixels = n_p.shape
-    dev = sino_batch_T.device
-    v_idx = torch.arange(vb, device=dev)[:, None]
-    out = torch.zeros((num_pixels, sino_batch_T.shape[2]), dtype=_F32, device=dev)
-    for offset in range(-psf_radius, psf_radius + 1):
-        A, n = tap_weights(n_p, centers + offset, W_p_c, weight_scale, L_max,
-                           num_channels)
-        if coeff_power != 1:
-            A = A ** coeff_power
-        gathered = sino_batch_T[v_idx, n]                    # (Vb, P, num_rows)
-        out += torch.einsum("vp,vpr->pr", A, gathered)
-    return out
 
 
 class Projectors:
-    """The batched sparse projector drivers for one model.
+    """The batched sparse projection driver for one model: geometry-agnostic
+    iteration and memory.
 
-    Holds the runtime view-parameter array (angles for parallel beam) and calls
-    back into the model for the per-view-batch fan geometry
-    (``model.compute_hfan_data_batched``), so the drivers stay geometry-agnostic
-    -- the mbirjax structure, minus its jit/static-argument machinery.
+    The geometry enters ONLY through the model's per-view-batch bodies
+    (``_view_batch_bodies`` / ``_view_batch_args``): the driver slices view
+    parameters, applies the transient budget, calls the compiled body, and
+    assembles outputs sized lazily from the first block.  One geometry class
+    therefore never subclasses this driver.
 
     Center-consistency contract (adapted from mbirjax's rounding-fix design):
     forward and back consume the SAME deterministic center computation for each
@@ -220,8 +172,8 @@ class Projectors:
     # already 0.4-0.6x of jax's, and the small batches the scaled budget
     # implies were measured slower there (the measured CPU optimum is a large
     # batch).
-    # TODO(sharding/tuning): revisit this budget when multi-device lands.
-    # Known limits of the current form (measured 2026-08-05, MPS 256^3):
+    # TODO(tuning): known limits of the current form (measured 2026-08-05,
+    # MPS 256^3), to be resolved with the fused-kernel work:
     #   - The accounting is per-SLAB nominal, and the kernels hold several
     #     slab-scale tensors at once (forward: product + accumulator; back:
     #     transpose copy + gather), so the actual per-view transient is a small
@@ -236,6 +188,12 @@ class Projectors:
     #     growing as N^3 (3.2 GB at 1024^3, 26 GB at 2048^3): past ~1400^3 the
     #     knob no longer protects at all -- needs pixel-axis chunking or the
     #     planned fused (Triton) kernels that never materialize the gather.
+    #     Detector growth makes this NEAR-TERM, not hypothetical: panels are
+    #     heading to ~6K x 10K (2026 estimate), where ONE view's slab against
+    #     a 512-class pixel set is ~6 GB -- the view axis alone cannot bound
+    #     it.  The driver loop is shaped as a two-axis tile walk with an
+    #     accumulating forward precisely so the pixel loop drops in without
+    #     touching the geometry contract.
     #     Pixel chunking here means mbirjax's TWO-axis tiling (its
     #     _sparse_forward/_back_project drivers): forward sums partial
     #     sinograms over PIXEL batches around the view loop
@@ -245,12 +203,6 @@ class Projectors:
     #     views only; the joint tile choice needs a 2-D budget rule and gate
     #     measurement (tile shape moved mbirjax kernels several-fold in its
     #     campaign), so it belongs with the Phase 5 kernel work.
-    #   - Under sharding/banding the budget must derive from the PER-DEVICE
-    #     shard shapes (this reads the GLOBAL sinogram_shape: 8x the global
-    #     sino overshoots a view-shard's share by the device count), and any
-    #     adaptive value must keep being derived per call from current params
-    #     -- never frozen at Projectors construction (the mbirjax stale-bind
-    #     lesson).
     VIEW_BATCH_TRANSIENT_BUDGET_BYTES = 2 * 2**30
     VIEW_BATCH_TRANSIENT_FLOOR_BYTES = 256 * 2**20
     VIEW_BATCH_SINO_MULTIPLE = 8
@@ -259,84 +211,182 @@ class Projectors:
         if self.model.torch_device.type == 'cpu':
             return self.VIEW_BATCH_TRANSIENT_BUDGET_BYTES
         num_views, num_rows, num_channels = self.model.get_params('sinogram_shape')
-        sino_bytes = num_views * num_rows * num_channels * 4
+        # Under view sharding each device projects only its share of the
+        # views, so the size-scaled budget derives from the PER-DEVICE shard
+        # (the global sinogram would overshoot each device's transient by the
+        # device count).  Derived per call from the current params and
+        # placement -- never frozen at construction (the stale-bind lesson).
+        n_dev = self.model.sino_placement.n_devices
+        local_views = -(-int(num_views) // n_dev)
+        sino_bytes = local_views * num_rows * num_channels * 4
         return max(self.VIEW_BATCH_TRANSIENT_FLOOR_BYTES,
                    min(self.VIEW_BATCH_TRANSIENT_BUDGET_BYTES,
                        self.VIEW_BATCH_SINO_MULTIPLE * sino_bytes))
 
     def __init__(self, model):
+        # The geometry supplies its per-view-batch bodies (module-level pure
+        # functions -- never bound methods, which would pin the model in the
+        # module-level compile cache) and the driver binds one compiled
+        # instance per device (see maybe_compile).  Index 0 serves the
+        # single-device path.
         self.model = model
-        view_params_name = model.get_params('view_params_name')
-        self.view_params_array = torch.as_tensor(
-            model.get_params(view_params_name), dtype=_F32, device=model.torch_device)
-        # Bind the (possibly compiled) kernel bodies once per projector build.
+        fwd_body, back_body = model._view_batch_bodies()
         use_compile = model.compile_enabled
-        self._fan_forward = maybe_compile(fan_forward_batch, use_compile)
-        self._fan_back = maybe_compile(fan_back_batch, use_compile)
+        n_dev = model.sino_placement.n_devices
+        self._fwd_body_per_dev = [
+            maybe_compile(fwd_body, use_compile, instance_key=i)
+            for i in range(n_dev)]
+        self._back_body_per_dev = [
+            maybe_compile(back_body, use_compile, instance_key=i)
+            for i in range(n_dev)]
+        # View parameters, read from the CURRENT params at every projector
+        # build (create_projectors re-runs on reconfigure/recompile, closing
+        # the stale-bind class) and PRE-PLACED once per device through the
+        # probed transfer primitive -- the per-band `.to(dev)` copies this
+        # replaces bypassed the dev2dev-safe policy.
+        view_params_name = model.get_params('view_params_name')
+        view_params = torch.as_tensor(model.get_params(view_params_name),
+                                      dtype=_F32, device=model.torch_device)
+        self._view_params_per_dev = [
+            _sharding.move_shard(view_params, dev, model.dev2dev_safe)
+            for dev in model.sino_placement.devices]
+        self.view_params_array = self._view_params_per_dev[0]
 
-    def _effective_view_batch(self, num_pixels, num_cols):
-        """The model's view_batch_size, capped so one batch's (Vb, P, cols)
-        transient stays within the budget above."""
-        cap = self._transient_budget_bytes() // max(1, num_pixels * num_cols * 4)
+    def _effective_view_batch(self, num_pixels, band_cols):
+        """The model's view_batch_size, capped so one batch's transient stays
+        within the budget above.  The column count is a GEOMETRY hook
+        (_transient_cols): parallel's transient tracks the runtime band
+        length, cone's tracks max(num_slices, num_rows) from the params --
+        unifying them naively would silently change each geometry's batch
+        size, float summation order, and calibrated peak memory."""
+        cols = self.model._transient_cols(band_cols)
+        cap = self._transient_budget_bytes() // max(1, num_pixels * cols * 4)
         return max(1, min(self.model.view_batch_size, int(cap)))
 
-    def sparse_forward_project(self, voxel_values, pixel_indices):
-        """Forward project the given voxel cylinders into a full sinogram.
+    def sparse_forward_project_view_range(self, band_values, pixel_indices,
+                                          view_range, slice_start=0,
+                                          dev_index=0, plan=None):
+        """Forward-project voxel values into ONE view-owner's sinogram block:
+        the single forward loop -- the full-range public form is the adapter
+        below over (0, num_views).  The geometry body owns all geometry,
+        layout, and output orientation; this loop owns view slicing, the
+        transient budget, and assembly (output sized lazily from the first
+        block, so the driver never derives geometry-specific shapes).
 
         Args:
-            voxel_values: (P, num_recon_slices) tensor (or array-like) of voxel
-                values, where voxel_values[i, j] is the value of the voxel in
-                slice j at the location determined by pixel_indices[i].
-            pixel_indices: (P,) indices into the flattened array of size
-                num_rows x num_cols.
+            band_values: (P, cols) voxel cylinders (or a slice band), on this
+                owner's device.
+            pixel_indices: (P,) int64 on the same device.
+            view_range: (v0, v1) half-open GLOBAL view range this owner owns
+                (the banded drivers' contract: one contiguous real-view span
+                per owner).
+            slice_start (int): global slice anchor of a slice BAND (two-fan
+                geometries); a row-aligned geometry's body asserts 0.
+            dev_index (int): which per-device compiled instance to use.
+            plan: the memoization slot for a future sorted/CSR stream variant
+                (per pixel-subset x view-range); unused today.
 
         Returns:
-            (num_views, num_det_rows, num_det_channels) tensor.
+            (v1 - v0, rows_or_band, num_channels) on the input's device.
         """
         m = self.model
-        dev = m.torch_device
-        num_views, num_rows, num_channels = m.get_params('sinogram_shape')
-        voxel_values = torch.as_tensor(voxel_values, dtype=_F32, device=dev)
-        pixel_indices = torch.as_tensor(pixel_indices, dtype=torch.int64, device=dev)
-        psf_radius = m.get_psf_radius()
+        v0, v1 = view_range
+        args = m._view_batch_args()
         vb_size = self._effective_view_batch(pixel_indices.shape[0],
-                                             voxel_values.shape[1])
-        sinogram = torch.empty((num_views, num_rows, num_channels), dtype=_F32,
-                               device=dev)
-        for v0 in range(0, num_views, vb_size):
-            params_batch = self.view_params_array[v0:v0 + vb_size]
-            hfan = m.compute_hfan_data_batched(pixel_indices, params_batch)
-            block = self._fan_forward(hfan, voxel_values, num_channels, psf_radius)
-            # channel-major (Vb, C, S) -> the sinogram's (Vb, rows=S, C) layout.
-            sinogram[v0:v0 + params_batch.shape[0]] = block.permute(0, 2, 1)
-        return sinogram
+                                             band_values.shape[-1])
+        view_params = self._view_params_per_dev[dev_index]
+        out = None
+        for v in range(v0, v1, vb_size):
+            view_params_batch = view_params[v:min(v + vb_size, v1)]
+            block = self._fwd_body_per_dev[dev_index](
+                band_values, pixel_indices, view_params_batch,
+                slice_start=slice_start, plan=plan, **args)
+            if out is None:
+                out = torch.empty((v1 - v0,) + tuple(block.shape[1:]),
+                                  dtype=block.dtype, device=block.device)
+            out[v - v0:v - v0 + block.shape[0]] = block
+        return out
+
+    def sparse_back_project_view_range(self, local_sino, pixel_indices,
+                                       view_range, coeff_power=1,
+                                       slice_start=0, band_slices=None,
+                                       dev_index=0, plan=None):
+        """Back-project ONE view-owner's local sinogram onto voxel cylinders
+        (the adjoint of :meth:`sparse_forward_project_view_range`): the
+        single back loop, accumulating lazily from the first block so the
+        output shape comes from the geometry body, not the driver.
+
+        Args:
+            local_sino: this owner's views -- (v1 - v0, rows, channels) (a
+                row band for a row-aligned geometry; the full local block for
+                a two-fan geometry).
+            pixel_indices: (P,) int64 on the same device.
+            view_range: (v0, v1) half-open GLOBAL view range.
+            coeff_power (int): 1, or 2 for the Hessian diagonal.
+            slice_start (int) / band_slices (int or None): the slice-band
+                request for two-fan geometries; a row-aligned geometry's body
+                asserts the defaults.
+            dev_index (int): which per-device compiled instance to use.
+            plan: the memoization slot for a future sorted/CSR stream variant
+                (per pixel-subset x view-range); unused today.
+
+        Returns:
+            (P, slices_or_band) on the input's device.
+        """
+        m = self.model
+        v0, v1 = view_range
+        args = m._view_batch_args()
+        vb_size = self._effective_view_batch(pixel_indices.shape[0],
+                                             local_sino.shape[1])
+        view_params = self._view_params_per_dev[dev_index]
+        out = None
+        for v in range(v0, v1, vb_size):
+            view_params_batch = view_params[v:min(v + vb_size, v1)]
+            block = self._back_body_per_dev[dev_index](
+                local_sino[v - v0:v - v0 + view_params_batch.shape[0]],
+                pixel_indices, view_params_batch, coeff_power=coeff_power,
+                slice_start=slice_start, band_slices=band_slices, plan=plan,
+                **args)
+            if out is None:
+                out = block
+            else:
+                out.add_(block)
+        return out
+
+    def sparse_forward_project(self, voxel_values, pixel_indices):
+        """Forward project voxel cylinders into a full sinogram: the public
+        adapter over the view-range loop at (0, num_views) on device 0,
+        coercing array-likes to placed tensors first.  For a row-aligned
+        geometry the output row count equals the input column count -- the
+        rows==slices invariant its verify_valid_params enforces."""
+        m = self.model
+        num_views = int(m.get_params('sinogram_shape')[0])
+        voxel_values = torch.as_tensor(voxel_values, dtype=_F32,
+                                       device=m.torch_device)
+        pixel_indices = torch.as_tensor(pixel_indices, dtype=torch.int64,
+                                        device=m.torch_device)
+        return self.sparse_forward_project_view_range(
+            voxel_values, pixel_indices, (0, num_views), dev_index=0)
 
     def sparse_back_project(self, sinogram, pixel_indices, coeff_power=1):
-        """Back project the sinogram onto the voxel cylinders at ``pixel_indices``.
+        """Back project a full sinogram onto the voxel cylinders at
+        ``pixel_indices``: the public adapter over the view-range loop at
+        (0, num_views) on device 0.
 
         Args:
             sinogram: (num_views, num_det_rows, num_det_channels).
-            pixel_indices: (P,) indices into the flattened array of size
-                num_rows x num_cols.
-            coeff_power (int): backproject using the coefficients of
-                (A_ij ** coeff_power).  Normally 1, but 2 when computing the
+            pixel_indices: (P,) indices into the flattened (rows, cols) grid.
+            coeff_power (int): backproject (A_ij ** coeff_power); 2 for the
                 Hessian diagonal.
 
         Returns:
-            (P, num_det_rows) tensor of per-pixel cylinders.
+            (P, num_slices) tensor of per-pixel cylinders.
         """
         m = self.model
-        dev = m.torch_device
-        num_views, num_rows, num_channels = m.get_params('sinogram_shape')
-        sinogram = torch.as_tensor(sinogram, dtype=_F32, device=dev)
-        pixel_indices = torch.as_tensor(pixel_indices, dtype=torch.int64, device=dev)
-        psf_radius = m.get_psf_radius()
-        vb_size = self._effective_view_batch(pixel_indices.shape[0], num_rows)
-        out = torch.zeros((pixel_indices.shape[0], num_rows), dtype=_F32, device=dev)
-        for v0 in range(0, num_views, vb_size):
-            params_batch = self.view_params_array[v0:v0 + vb_size]
-            hfan = m.compute_hfan_data_batched(pixel_indices, params_batch)
-            sino_T = sinogram[v0:v0 + params_batch.shape[0]].permute(0, 2, 1).contiguous()
-            out += self._fan_back(sino_T, hfan, num_channels, psf_radius,
-                                  coeff_power=coeff_power)
-        return out
+        num_views = int(m.get_params('sinogram_shape')[0])
+        sinogram = torch.as_tensor(sinogram, dtype=_F32, device=m.torch_device)
+        pixel_indices = torch.as_tensor(pixel_indices, dtype=torch.int64,
+                                        device=m.torch_device)
+        return self.sparse_back_project_view_range(
+            sinogram, pixel_indices, (0, num_views), coeff_power=coeff_power,
+            dev_index=0)

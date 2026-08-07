@@ -1,6 +1,6 @@
 """Parameter storage and access, ported (lean) from mbirjax.parameter_handler.
 
-The public surface the engine and users rely on is kept: ``get_params`` (one
+The public surface the reconstruction methods and users rely on is kept: ``get_params`` (one
 name or a list), ``set_params(**kwargs)`` with mbirjax's recompile and
 auto-regularization semantics, ``verify_valid_params``, ``print_params``, and
 the shared geometry-params namedtuple cache.  Not yet ported: YAML save/load
@@ -125,11 +125,18 @@ class ParameterHandler:
                                   'disabled')
 
         if recompile and not no_compile:
-            self.create_projectors()
+            self.refresh_device_bindings()
 
     # ── hooks implemented by TomographyModel / geometry classes ──────────────
     def create_projectors(self):
         raise NotImplementedError
+
+    def refresh_device_bindings(self):
+        # TomographyModel overrides: rebuilds the device placements from the
+        # CURRENT shapes before recreating the projectors, so a
+        # geometry-changing set_params can never leave a stale placement
+        # silently truncating sharded arrays.
+        self.create_projectors()
 
     def verify_valid_params(self):
         """Check parameter consistency; geometry classes extend this.  Called at

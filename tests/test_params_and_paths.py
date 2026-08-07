@@ -1,4 +1,4 @@
-"""Regression tests: set_params semantics, engine paths, and the
+"""Regression tests: set_params semantics, VCD-loop paths, and the
 compile/eager and weights equivalences the suite previously never asserted."""
 
 import warnings
@@ -89,7 +89,7 @@ def test_prox_input_shape_validated():
         model.prox_map(bad, sinogram, max_iterations=1)
 
 
-# ── engine paths ─────────────────────────────────────────────────────────────
+# ── VCD-loop paths ─────────────────────────────────────────────────────────────
 def test_positivity_path(device):
     model = _small_model(device)
     model.set_params(no_warning=True, positivity_flag=True)
@@ -249,9 +249,9 @@ def test_vcd_iteration_stats_real_size_normalization():
         assert float(p) == pytest.approx(float(r), rel=1e-6)
 
 
-def test_placement_chokepoints_validate_and_place():
-    # The _shard_*/_gather_* seams (single-device forms of the mbirjax
-    # chokepoints): numpy in -> float32 tensor on the model device, with the
+def test_placement_functions_validate_and_place():
+    # _shard_sinogram / _shard_recon and the matching gathers: numpy in ->
+    # float32 tensor on the model device, with the
     # future sharded axis checked; gathers return host numpy.
     model = _small_model()
     sino_shape = tuple(model.get_params('sinogram_shape'))
@@ -439,6 +439,47 @@ def test_vcd_verbose2_memory_dump_runs():
     np.random.seed(1)
     recon, _ = model.vcd_recon(sinogram, partitions, seq, 0.0, init_recon=0)
     assert np.all(np.isfinite(recon.cpu().numpy()))
+
+
+# ── hand-written kernel availability probe ───────────────────────────────────
+def test_triton_probe_kill_switch(monkeypatch):
+    # The kill switch must force the fallback answer on ANY hardware, so the
+    # gate is bisectable on a node where the kernels do work.
+    from mbirtorch import kernel_availability
+
+    monkeypatch.setenv(kernel_availability.DISABLE_ENV_VAR, '1')
+    kernel_availability._reset_probe_cache()
+    try:
+        usable, reason = kernel_availability.triton_available()
+    finally:
+        kernel_availability._reset_probe_cache()
+    assert usable is False
+    assert kernel_availability.DISABLE_ENV_VAR in reason
+
+
+def test_triton_probe_is_a_cached_pair(monkeypatch):
+    # (bool, str) whatever this machine has, probed at most once per process.
+    from mbirtorch import kernel_availability
+
+    monkeypatch.delenv(kernel_availability.DISABLE_ENV_VAR, raising=False)
+    kernel_availability._reset_probe_cache()
+    try:
+        first = kernel_availability.triton_available()
+        assert isinstance(first, tuple) and len(first) == 2
+        usable, reason = first
+        assert isinstance(usable, bool)
+        assert isinstance(reason, str) and reason
+
+        # Cached: a second call must not re-probe (a probe that now raises
+        # would surface as an error rather than the cached pair).
+        def _exploding_probe():
+            raise AssertionError('probe re-ran despite the cache')
+
+        monkeypatch.setattr(kernel_availability, '_probe_triton',
+                            _exploding_probe)
+        assert kernel_availability.triton_available() is first
+    finally:
+        kernel_availability._reset_probe_cache()
 
 
 def test_apply_update_functional_no_copy():

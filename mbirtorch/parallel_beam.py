@@ -10,18 +10,19 @@ footprint length).
 import numpy as np
 import torch
 
-from .projectors import maybe_compile
+from .horizontal_fan import fan_back_batch, fan_forward_batch
 from .tomography_model import TomographyModel
 
 _F32 = torch.float32
 
 
-def _parallel_hfan_math(pixel_indices, angles_batch, num_rows, num_cols,
+def _parallel_hfan_math(pixel_indices, view_params_batch, num_rows, num_cols,
                         num_channels, delta_det_channel, det_channel_offset,
                         delta_voxel, delta_voxel_row):
-    """The pure geometry chain of compute_hfan_data_batched, split out so it
-    can be torch.compiled (the scalar parameters specialize as constants; they
-    are fixed per model)."""
+    """The parallel geometry chain producing the hfan data contract (see
+    horizontal_fan.py); the view parameters are the view angles here.  Pure,
+    fused into the view-batch bodies below by torch.compile (the scalar
+    parameters specialize as constants; they are fixed per model)."""
     row_index = (pixel_indices // num_cols).to(_F32)
     col_index = (pixel_indices % num_cols).to(_F32)
     # Compute the un-rotated coordinates relative to iso.  Note the change in
@@ -31,8 +32,8 @@ def _parallel_hfan_math(pixel_indices, angles_batch, num_rows, num_cols,
 
     # Precompute cosine and sine of the view angles, then do the rotation; only
     # the x coordinate is needed for the channel projection.
-    cosine = torch.cos(angles_batch)[:, None]
-    sine = torch.sin(angles_batch)[:, None]
+    cosine = torch.cos(view_params_batch)[:, None]
+    sine = torch.sin(view_params_batch)[:, None]
     x = cosine * x_tilde[None, :] - sine * y_tilde[None, :]
 
     # Calculate indices on the detector grid.
@@ -45,9 +46,49 @@ def _parallel_hfan_math(pixel_indices, angles_batch, num_rows, num_cols,
                                  sine.abs() * delta_voxel_row)
     W_p_c = footprint_xy / delta_det_channel
     weight_scale = (delta_voxel_row * delta_voxel) / footprint_xy
-    L_max = torch.clamp(W_p_c, max=1.0)
-    centers = torch.round(n_p).to(torch.int64)
-    return n_p, centers, W_p_c, weight_scale, L_max
+    centers = torch.round(n_p).to(torch.int32)
+    return n_p, centers, W_p_c, weight_scale
+
+
+def _parallel_forward_view_batch(values, pixel_indices, view_params_batch,
+                                 num_rows, num_cols, num_channels,
+                                 delta_det_channel, det_channel_offset,
+                                 delta_voxel, delta_voxel_row, psf_radius,
+                                 slice_start=0, plan=None):
+    """Parallel forward for one view batch: the geometry chain fused with
+    the shared horizontal fan in ONE compiled body (detector row r is recon
+    slice r, so the slice axis rides through the fan as the column axis and
+    a slice band IS a row band -- banding needs no z anchor).
+
+    ``plan`` is the memoization slot for a future sorted/CSR stream variant
+    (per pixel-subset x view-range); unused today."""
+    assert slice_start == 0
+    hfan_data = _parallel_hfan_math(
+        pixel_indices, view_params_batch, num_rows, num_cols, num_channels,
+        delta_det_channel, det_channel_offset, delta_voxel, delta_voxel_row)
+    block = fan_forward_batch(hfan_data, values, num_channels, psf_radius)
+    return block.permute(0, 2, 1)
+
+
+def _parallel_back_view_batch(sino_batch, pixel_indices, view_params_batch,
+                              num_rows, num_cols, num_channels,
+                              delta_det_channel, det_channel_offset,
+                              delta_voxel, delta_voxel_row, psf_radius,
+                              coeff_power=1, slice_start=0, band_slices=None,
+                              plan=None):
+    """Parallel back for one view batch, summed over the batch's views (the
+    adjoint of :func:`_parallel_forward_view_batch`); rows==slices, so the
+    input's row band is already the output's slice band.
+
+    ``plan`` is the memoization slot for a future sorted/CSR stream variant
+    (per pixel-subset x view-range); unused today."""
+    assert slice_start == 0 and band_slices is None
+    hfan_data = _parallel_hfan_math(
+        pixel_indices, view_params_batch, num_rows, num_cols, num_channels,
+        delta_det_channel, det_channel_offset, delta_voxel, delta_voxel_row)
+    sino_T = sino_batch.permute(0, 2, 1).contiguous()
+    return fan_back_batch(sino_T, hfan_data, num_channels, psf_radius,
+                          coeff_power=coeff_power, reduce_views=True)
 
 
 class ParallelBeamModel(TomographyModel):
@@ -104,6 +145,11 @@ class ParallelBeamModel(TomographyModel):
             (float): magnification
         """
         return 1.0
+
+    # Parallel beam ties detector row r to recon slice r 1:1 (see the base
+    # attribute): the banded drivers take the row-aligned path and a padded
+    # slice axis pads the detector-row axis with it.
+    rows_track_slices = True
 
     def get_psf_radius(self):
         """Computes the integer radius of the PSF kernel for parallel beam
@@ -167,39 +213,23 @@ class ParallelBeamModel(TomographyModel):
                              f'rows. \nGot {recon_shape} for recon_shape and '
                              f'{sinogram_shape} for sinogram_shape')
 
-    def compute_hfan_data_batched(self, pixel_indices, angles_batch):
-        """Compute the quantities needed for horizontal projection, for a batch
-        of views (the batched form of mbirjax's compute_proj_data plus the
-        wrapper's center rounding).
+    def _view_batch_bodies(self):
+        return _parallel_forward_view_batch, _parallel_back_view_batch
 
-        Parallel-beam mapping: the voxel cylinders are assumed to have slices
-        aligned with detector rows, so a parallel beam maps a cylinder slice to
-        a detector row and the fan mixes CHANNELS only.  n_p is the continuous
-        projected channel coordinate; its rounded value is the fans' integer
-        scatter/gather center, computed ONCE per (view, pixel) so forward and
-        back stay consistent (see the Projectors class note).  The weight scale
-        is the in-plane voxel area over the footprint length, a per-view scalar.
-
-        Args:
-            pixel_indices: (P,) int64 tensor of indices into the flattened
-                (rows, cols) grid, on the model device.
-            angles_batch: (Vb,) float32 tensor of view angles in radians.
-
-        Returns:
-            (n_p, centers, W_p_c, weight_scale, L_max): n_p/centers (Vb, P);
-            the per-view scalars (Vb, 1).
-        """
+    def _view_batch_args(self):
         gp_names = ['delta_det_channel', 'det_channel_offset', 'delta_voxel',
                     'voxel_row_aspect']
         delta_det_channel, det_channel_offset, delta_voxel, voxel_row_aspect = \
             self.get_params(gp_names)
         num_channels = self.get_params('sinogram_shape')[2]
         recon_shape = self.get_params('recon_shape')
-        delta_voxel_row = voxel_row_aspect * delta_voxel
-        fn = maybe_compile(_parallel_hfan_math, self.compile_enabled)
-        return fn(pixel_indices, angles_batch, recon_shape[0], recon_shape[1],
-                  num_channels, delta_det_channel, det_channel_offset,
-                  delta_voxel, delta_voxel_row)
+        return dict(num_rows=recon_shape[0], num_cols=recon_shape[1],
+                    num_channels=num_channels,
+                    delta_det_channel=delta_det_channel,
+                    det_channel_offset=det_channel_offset,
+                    delta_voxel=delta_voxel,
+                    delta_voxel_row=voxel_row_aspect * delta_voxel,
+                    psf_radius=self.get_psf_radius())
 
     # ── direct recon ──────────────────────────────────────────────────────────
     def fbp_filter(self, sinogram, filter_name="ramp", output_sharded=False):

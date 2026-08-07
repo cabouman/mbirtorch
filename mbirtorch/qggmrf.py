@@ -74,7 +74,8 @@ def get_2_b_tilde(delta, b_for_delta, qggmrf_params):
 
 
 def qggmrf_gradient_and_hessian_at_indices(flat_recon, recon_shape, pixel_indices,
-                                           qggmrf_params):
+                                           qggmrf_params, left_halo=None,
+                                           right_halo=None, interface_mask=None):
     """
     Calculate the gradient and hessian at each index location in a reconstructed
     image using the surrogate function for the qGGMRF prior.
@@ -82,18 +83,40 @@ def qggmrf_gradient_and_hessian_at_indices(flat_recon, recon_shape, pixel_indice
 
     Args:
         flat_recon (tensor): 2D reconstructed image array with shape
-            (num_recon_rows x num_recon_cols, num_recon_slices).
+            (num_recon_rows x num_recon_cols, num_recon_slices).  When
+            operating on a single slice-shard, num_recon_slices is the local
+            (per-shard) slice count.
         recon_shape (tuple of ints): shape of the original recon:
-            (num_recon_rows, num_recon_cols, num_recon_slices).
+            (num_recon_rows, num_recon_cols, num_recon_slices).  Only the
+            in-slice term uses recon_shape, and it ignores the slice count,
+            so the slice entry need not match a shard's local count.
         pixel_indices (int tensor): 1D array of shape (N_indices,) holding indices
             into the flattened (num_recon_rows x num_recon_cols) grid of voxel
             cylinders to be updated.
         qggmrf_params (tuple): The parameters b, sigma_x, p, q, T, with b the
             6-entry direction tuple from :func:`get_b_from_nbr_wts`.
+        left_halo (tensor or None): 1D array of shape (num_rows x num_cols,)
+            holding the slice immediately BEFORE this shard (global slice
+            index -1 relative to the local block), used for the inter-slice
+            term at the shard's left boundary.  None (a true left edge or a
+            single device) mirrors the local boundary slice -- the reflected
+            boundary condition, reproducing the single-device result exactly.
+        right_halo (tensor or None): as left_halo for the slice immediately
+            AFTER this shard.
+        interface_mask (tensor or None): optional (num_local_slices + 1,)
+            float mask multiplying the slice-to-slice differences; entry j is
+            the interface between local slices j-1 and j (0 and n are the
+            boundary interfaces).  A 0 entry decouples the two slices it
+            joins exactly as the reflected boundary does at a true edge (the
+            Hessian keeps its b_tilde(0) term).  Used when the slice axis is
+            padded for sharding: zeroing every interface whose higher-index
+            GLOBAL slice is padded reproduces the reflected boundary at the
+            last REAL slice and keeps the padded slices' gradient exactly
+            zero.  None (the default) applies no masking.
 
     Returns:
         tuple of two tensors (first_derivative, second_derivative), each of shape
-        (N_indices, num_recon_slices) representing the gradient and Hessian
+        (N_indices, num_local_slices) representing the gradient and Hessian
         values at the specified indices.
     """
     # Neighborhood weight order is [row+1, row-1, col+1, col-1, slice+1, slice-1]
@@ -103,15 +126,24 @@ def qggmrf_gradient_and_hessian_at_indices(flat_recon, recon_shape, pixel_indice
 
     # ── cylinder (slice-axis) term ────────────────────────────────────────────
     # Build delta[j] = v[j] - v[j-1] for interior positions, with explicit
-    # boundary deltas at each end.  The jax version passes the boundary values
-    # themselves (left_val = v[0], right_val = v[-1]) so both boundary deltas
-    # are zero -- the reflected boundary condition; here the zero edges are
-    # written directly.  Result per cylinder is
-    #   0, v[1]-v[0], v[2]-v[1], ..., v[n-1]-v[n-2], 0.
+    # boundary deltas at each end derived from the neighbor values.  With no
+    # halo the boundary value is the local edge slice itself, so the boundary
+    # delta is exactly zero -- the reflected boundary condition (bit-identical
+    # to the previous literal zero edge); a halo (a shard-interior boundary)
+    # gives the true cross-boundary delta instead.
     cylinders = flat_recon[pixel_indices]                     # (N, S)
-    zero_edge = torch.zeros_like(cylinders[:, :1])
-    delta = torch.cat((zero_edge, cylinders[:, 1:] - cylinders[:, :-1], zero_edge),
-                      dim=1)                                  # (N, S+1)
+    left_val = (left_halo[pixel_indices][:, None] if left_halo is not None
+                else cylinders[:, :1])
+    right_val = (right_halo[pixel_indices][:, None] if right_halo is not None
+                 else cylinders[:, -1:])
+    delta = torch.cat((cylinders[:, :1] - left_val,
+                       cylinders[:, 1:] - cylinders[:, :-1],
+                       right_val - cylinders[:, -1:]), dim=1)  # (N, S+1)
+    if interface_mask is not None:
+        # Reflected BC at a true edge IS a zero boundary delta, so this is
+        # the same condition applied at an arbitrary interface; the Hessian
+        # still receives the b_tilde(0) term from a masked interface.
+        delta = delta * interface_mask
 
     # Compute the primary quantity used for the gradient and Hessian.
     # Use b_for_delta = 1 here and scale by the slice-direction b below.

@@ -6,7 +6,7 @@ of the error sinogram), so no projectors exist and the VCD subset update
 reduces to the closed-form below.  The mbirjax jit/fori_loop machinery is
 replaced by a plain python loop over the (sequential, unshuffled) subsets of
 ONE fixed partition -- the mbirjax denoiser iterates subsets in order, unlike
-the recon engine's per-iteration shuffle, so a seeded partition makes the
+vcd_recon's per-iteration shuffle, so a seeded partition makes the
 whole sweep deterministic.  The multi-device sharded path is not ported.
 """
 

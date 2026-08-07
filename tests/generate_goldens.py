@@ -121,7 +121,7 @@ def main():
     # spanning a travel of +-8 ALU (detector half-height at iso is 12, so the
     # shifted views keep partial coverage -- the helical z-weight is nontrivial).
     # Includes a seeded 3-iteration recon: the z-shift path runs through the
-    # FDK init (z-weight) and the per-view vertical fans in the engine.
+    # FDK init (z-weight) and the per-view vertical fans in the VCD loop.
     chel_shifts = np.linspace(-8.0, 8.0, cone_cell[0]).astype(np.float32)
     chel = mbirjax.ConeBeamModel(cone_cell, cone_angles,
                                  source_detector_dist=4 * cone_cell[2],
@@ -151,7 +151,7 @@ def main():
 
     # Curved-detector cone golden: circular scan, curved detector (the
     # horizontal fan's theta = u/sdd branch, no cos correction).  Single-op
-    # coverage: the engine is identical given the operators.
+    # coverage: the VCD loop is identical given the operators.
     ccurv = mbirjax.ConeBeamModel(cone_cell, cone_angles,
                                   source_detector_dist=4 * cone_cell[2],
                                   source_iso_dist=2 * cone_cell[2],
