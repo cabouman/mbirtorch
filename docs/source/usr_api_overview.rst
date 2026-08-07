@@ -1,0 +1,139 @@
+.. _UserAPIOverviewDocs:
+
+=================
+User API Overview
+=================
+
+Most functions can be accessed by importing mbirtorch and creating a model or through mbirtorch directly.  Most
+commonly used functions are described below.  See :ref:`DemosFAQs` for examples.  Navigate individual pages under :ref:`UserAPIDocs` for more details.
+
+.. DIVERGENCE(automodule members): see the note on the same directive in usr_api.rst --
+   the ":members: :undoc-members: :show-inheritance:" options are dropped so this page
+   renders what mbirjax's does.  Narrowing __all__ does not substitute for dropping them.
+
+.. automodule:: mbirtorch
+   :no-index:
+
+Geometry Models
+---------------
+
+The first step is to create an instance with a specific geometry. This is done by initializing one of the following geometry classes:
+
+.. autosummary::
+
+   ParallelBeamModel
+   ConeBeamModel
+
+.. PENDING(TranslationModel): add ``TranslationModel`` to the autosummary above when
+   translation_model is ported to mbirtorch.
+
+Reconstruction and Projection
+-----------------------------
+
+Each geometry class is derived from :ref:`TomographyModelDocs`, which includes a number of powerful methods listed below for manipulating sinograms and reconstructions.
+Detailed documentation for each geometry class is provided in :ref:`ParallelBeamModelDocs` and :ref:`ConeBeamModelDocs`.
+
+Note that :ref:`ParallelBeamModelDocs` also includes ``fbp_recon`` and :ref:`ConeBeamModelDocs` includes ``fdk_recon``
+for direct (non-iterative) reconstruction in the case of many views and low-noise data.
+
+.. autosummary::
+
+   TomographyModel.recon
+   TomographyModel.scale_recon_shape
+   TomographyModel.prox_map
+   TomographyModel.forward_project
+   TomographyModel.back_project
+
+Denoising
+---------
+
+See :ref:`DenoisingDocs` for details on Denoising Functions.
+These include functions for computing the MAP denoiser using the qGGMRF prior.
+
+.. autosummary::
+
+   QGGMRFDenoiser.denoise
+
+.. PENDING(median_filter3d): restore the following text and autosummary, and add "and a 3D
+   median filter" back to the sentence above, when median_filter3d is ported.
+
+   The median filter is implemented using a fixed 3x3x3 neighborhood with replicated edges at the boundary.
+
+   .. autosummary::
+
+      median_filter3d
+
+Differentiable Projectors
+-------------------------
+
+See :ref:`AutogradDocs` for the projectors exposed as differentiable PyTorch operations, for
+use inside a deep-learning pipeline.  This section has no MBIRJAX counterpart.
+
+.. autosummary::
+
+   autograd.forward_project_differentiable
+   autograd.back_project_differentiable
+   autograd.TorchProjector
+
+Parameter Handling
+------------------
+
+See :ref:`Primary Parameters <ParametersDocs>` page for a description of the primary parameters.
+Users can set, get, and printout parameters using the following primary methods.
+
+.. autosummary::
+
+   TomographyModel.set_params
+   parameter_handler.ParameterHandler.get_params
+   parameter_handler.ParameterHandler.print_params
+
+
+.. PENDING(save_load_hdf5): restore the section below when save_recon_hdf5 and
+   load_recon_hdf5 are ported.  It references the _SaveLoadDocs label defined in the
+   matching PENDING block in usr_tomography_model.rst -- restore both together.
+
+   Saving and Loading
+   ------------------
+
+   * Saving and loading of the data and the dict of parameters/logs returned from :meth:`~mbirtorch.TomographyModel.recon` are implemented in :meth:`~mbirtorch.TomographyModel.save_recon_hdf5` and :meth:`~mbirtorch.TomographyModel.load_recon_hdf5`.
+
+   .. autosummary::
+
+      TomographyModel.save_recon_hdf5
+      TomographyModel.load_recon_hdf5
+
+
+Utilities
+---------
+
+See :ref:`Utilities` for details on Utility Functions.
+These include functions for viewing, generating weights, generating synthetic data, and
+clearing the on-disk compile cache.
+
+.. autosummary::
+
+   view_utils.slice_viewer
+   vcd_utils.gen_weights
+   utilities.generate_3d_shepp_logan_low_dynamic_range
+   utilities.clear_cache
+
+.. PENDING(utility_autosummary): restore these entries to the autosummary above when their
+   functions are ported: utilities.download_and_extract, utilities.export_recon_hdf5, and
+   utilities.import_recon_hdf5 (all on the roadmap), plus vcd_utils.gen_weights_mar
+   (blocked on the MAR module).
+
+
+.. PENDING(preprocessing): restore the section below when mbirtorch.preprocess is ported.
+   Its page is staged in source/_pending/ -- see source/_pending/README.rst.
+
+   Preprocessing
+   -------------
+
+   See :ref:`PreprocessDocs` for details on Preprocessing Functions.
+   These functions various methods to compute and correct the sinogram data as needed.
+   The following are functions specific to NSI scanners.  See `demo_nsi.py <https://github.com/cabouman/mbirjax_applications/tree/main/nsi>`__ in the
+   `mbirjax_applications <https://github.com/cabouman/mbirjax_applications>`__ repo.
+
+   It also includes functions for processing cone beam and parallel beam data to remove artifacts from metal, detector defects.
+
+   It also includes functions for optimal view selection.

@@ -1,0 +1,92 @@
+.. _Utilities:
+
+=========
+Utilities
+=========
+
+MBIRTorch contains utilities for viewing, generating synthetic data, and managing the
+on-disk compile cache.
+
+.. PENDING(save_load_hdf5): restore this line when save_recon_hdf5 / load_recon_hdf5 are
+   ported.  It references the _SaveLoadDocs label, which lives in the matching PENDING
+   block in usr_tomography_model.rst -- restore both together.
+
+   Saving and loading models and reconstructions is handled through TomographyModel: :ref:`SaveLoadDocs`.
+
+
+3D Data Viewer
+--------------
+
+.. autofunction:: mbirtorch.view_utils.slice_viewer
+
+Here is an example showing views of a modified Shepp-Logan phantom, with changing intensity window and displayed slice:
+
+.. image:: https://www.math.purdue.edu/~buzzard/images/slice_viewer_demo.gif
+   :alt: An animated image of the slice viewer.
+
+
+.. PENDING(general_purpose_utils): restore this section when stitch_arrays, get_ct_model,
+   copy_ct_model, and build_model are ported to mbirtorch.
+
+   General Purpose
+   ---------------
+
+   .. autofunction:: mbirtorch.utilities.stitch_arrays
+   .. autofunction:: mbirtorch.utilities.get_ct_model
+   .. autofunction:: mbirtorch.utilities.copy_ct_model
+   .. autofunction:: mbirtorch.utilities.build_model
+
+
+Weight Generation
+-----------------
+
+.. autofunction:: mbirtorch.vcd_utils.gen_weights
+
+.. PENDING(gen_weights_mar): blocked on the MAR (metal artifact reduction) module, which
+   is not ported.  Restore this directive when that module lands.
+
+   .. autofunction:: mbirtorch.vcd_utils.gen_weights_mar
+
+
+.. PENDING(io_functions): restore this section when the file IO helpers
+   (download_and_extract, save_data_hdf5, load_data_hdf5, export_recon_hdf5,
+   import_recon_hdf5) are ported to mbirtorch.
+
+   IO Functions
+   ------------
+
+   As noted above, saving and loading models and reconstructions is handled through TomographyModel: :ref:`SaveLoadDocs`.
+
+   The functions here are for direct interactions with files.
+
+   .. autofunction:: mbirtorch.utilities.download_and_extract
+   .. autofunction:: mbirtorch.utilities.save_data_hdf5
+   .. autofunction:: mbirtorch.utilities.load_data_hdf5
+   .. autofunction:: mbirtorch.utilities.export_recon_hdf5
+   .. autofunction:: mbirtorch.utilities.import_recon_hdf5
+
+
+.. _synthetic-data-generation:
+
+Synthetic Data Generation
+-------------------------
+
+.. autofunction:: mbirtorch.utilities.generate_3d_shepp_logan_low_dynamic_range
+
+.. PENDING(synthetic_data): generate_demo_data and generate_3d_shepp_logan_reference are
+   on the port roadmap.  gen_translation_phantom is additionally blocked on the
+   translation geometry, whose page is staged in source/_pending/.
+
+   .. autofunction:: mbirtorch.utilities.generate_demo_data
+   .. autofunction:: mbirtorch.utilities.generate_3d_shepp_logan_reference
+   .. autofunction:: mbirtorch.utilities.gen_translation_phantom
+
+
+Cache Management
+----------------
+
+MBIRTorch keeps one on-disk cache, of compiled ``torch.compile`` artifacts, so that a fresh
+process reuses prior compilations instead of recompiling.  This section has no MBIRJAX
+counterpart; the MBIRJAX analog is its JAX compilation cache.
+
+.. autofunction:: mbirtorch.utilities.clear_cache

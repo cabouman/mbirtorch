@@ -147,9 +147,29 @@ class ParameterHandler:
                              f'got {sinogram_shape}')
 
     def print_params(self):
+        """
+        Print the current parameter values in the model.
+
+        This method prints all parameters stored in the model's internal
+        dictionary.  If the model's verbosity level is less than 3, the view
+        parameter array (e.g. the angles) is summarized rather than printed
+        in full.
+
+        Example:
+            >>> ct_model = mbirtorch.ParallelBeamModel(sinogram_shape, angles)
+            >>> ct_model.set_params(sharpness=0.7)
+            >>> ct_model.print_params()
+        """
+        verbose, view_params_name = self.get_params(['verbose',
+                                                     'view_params_name'])
         print('----')
         for key, entry in self.params.items():
-            print(f'{key} = {entry.val}')
+            if verbose < 3 and key == view_params_name:
+                val = np.asarray(entry.val)
+                print(f'{key} = array(shape={val.shape}, '
+                      f'dtype={val.dtype})')
+            else:
+                print(f'{key} = {entry.val}')
         print('----')
 
     # ── shared geometry-params namedtuple cache ───────────────────────────────

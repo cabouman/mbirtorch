@@ -762,6 +762,9 @@ class ConeBeamModel(TomographyModel):
         return recon if output_sharded else self._gather_recon(recon)
 
     def direct_recon(self, sinogram, filter_name="ramp", output_sharded=False):
+        """Direct reconstruction by the FDK algorithm; equivalent to
+        :meth:`fdk_recon`.  See :meth:`TomographyModel.direct_recon` for the
+        argument and return conventions."""
         return self.fdk_recon(sinogram, filter_name=filter_name,
                               output_sharded=output_sharded)
 

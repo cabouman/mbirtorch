@@ -40,15 +40,17 @@ from .qggmrf import (qggmrf_gradient_and_hessian_at_indices, get_b_from_nbr_wts,
 from .utilities import generate_3d_shepp_logan_low_dynamic_range, clear_cache
 from .memory_stats import get_memory_stats
 
+# __all__ is the DECLARED public surface, and autodoc honors it: every name here is
+# documented by ``automodule:: mbirtorch :members:``.  It is deliberately narrower than
+# the import list above -- the VCD and qGGMRF helpers stay importable as attributes
+# (mbirtorch.gen_full_indices still works, and the tests use that spelling) but are not
+# promised as public API, matching the surface mbirjax documents.
 __all__ = [
-    "ParallelBeamModel", "ConeBeamModel", "TomographyModel", "QGGMRFDenoiser", "TorchProjector",
-    "forward_project_differentiable", "back_project_differentiable",
-    "gen_weights", "gen_full_indices", "gen_pixel_partition",
-    "gen_set_of_pixel_partitions", "gen_partition_sequence", "get_2d_ror_mask",
-    "qggmrf_gradient_and_hessian_at_indices", "get_b_from_nbr_wts",
-    "b_tilde_by_definition", "qggmrf_loss", "generate_3d_shepp_logan_low_dynamic_range",
-    "clear_cache", "get_memory_stats",
-    "SliceViewer", "VolumeStack", "slice_viewer",
+    "ParallelBeamModel", "ConeBeamModel", "TomographyModel", "QGGMRFDenoiser",
+    "TorchProjector", "forward_project_differentiable",
+    "back_project_differentiable", "gen_weights",
+    "generate_3d_shepp_logan_low_dynamic_range", "clear_cache",
+    "get_memory_stats", "SliceViewer", "VolumeStack", "slice_viewer",
 ]
 
 # ── slice viewer: lazy export (PEP 562) ──────────────────────────────────────

@@ -14,13 +14,21 @@ pair -- because a broken optional path must never break a caller who only
 wanted to know whether it was there.
 
 The probe answers "can this node run a triton kernel at all".  The second gate
-is per KERNEL and per DEVICE: :func:`cone_back_kernel_usable` and
-:func:`cone_forward_kernel_usable` each run one kernel-vs-torch-body
+is per KERNEL and per DEVICE: :func:`cone_back_kernel_usable`,
+:func:`cone_forward_kernel_usable`, :func:`parallel_back_kernel_usable` and
+:func:`parallel_forward_kernel_usable` each run one kernel-vs-torch-body
 comparison at a tiny shape on the device that will run it (milliseconds) and
-fall back on a tolerance breach.  This is the guard the Phase 5 design puts on
+fall back on a tolerance breach.  This is the guard the kernel design puts on
 the correct axis -- probe the hardware you are on, never trust a vendor list
 -- so the kernels may default on wherever both gates pass, on any
 architecture, and a miscompiling toolchain is caught even on a swept one.
+
+Capability is not policy.  Every gate here answers only whether a kernel
+REPRODUCES its torch body on this device; whether it is actually selected is
+decided in the geometry's ``_view_batch_bodies``, where a kernel awaiting its
+composed performance gate stays behind an opt-in environment variable (the
+names live here, beside the kill switch, so one module carries the whole
+switchboard).
 """
 
 import os
@@ -32,39 +40,46 @@ import torch
 # real kernels).
 DISABLE_ENV_VAR = 'MBIRTORCH_DISABLE_TRITON'
 
-# Opt-in switch for the cone FORWARD kernel (increment K3): it is selected
-# only when this is 1.  The design's protocol is that each kernel is opt-in
-# until ITS OWN composed performance gate passes and then defaults on wherever
-# the availability gates pass -- the cone back kernel went through this same
-# switch and lost it at the K2 gate.  DISABLE_ENV_VAR remains the permanent
-# kill switch for every kernel either way.
-# RETIRED (the forward kernel's composed gate passed 2026-08-07 and its
-# default flipped to probe+self-check selection); kept defined so any
-# script still exporting it stays harmless.  MBIRTORCH_DISABLE_TRITON
-# is the kill switch for both kernels.
+# RETIRED opt-in switches.  The selection protocol is that each kernel is
+# opt-in through its own environment variable until ITS OWN composed
+# performance gate passes, and then defaults on wherever the availability
+# gates pass.  All four kernels have now passed their gates (cone 2026-08-07,
+# parallel later the same day), so every switch below is retired and no
+# selection reads them; they stay defined so any script still exporting one
+# is harmless.  MBIRTORCH_DISABLE_TRITON is the kill switch for all kernels.
 ENABLE_FWD_ENV_VAR = 'MBIRTORCH_ENABLE_TRITON_FWD'
+ENABLE_PBACK_ENV_VAR = 'MBIRTORCH_ENABLE_TRITON_PBACK'
+ENABLE_PFWD_ENV_VAR = 'MBIRTORCH_ENABLE_TRITON_PFWD'
 
 # Relative tolerance of the value self-checks, at the design's Hessian-path
-# figure: the kernels reproduce the torch bodies only up to the documented
+# figure: the cone kernels reproduce the torch bodies only up to the documented
 # rounding carve-out (the sqrt-vs-atan2 divisor and the floor-vs-round tie),
-# and the self-check runs coeff_power 2, where that gap is squared.
+# and the self-check runs coeff_power 2, where that gap is squared.  The
+# parallel kernels carry no such carve-out (no vertical fan, so no divisor and
+# no center rounding) and differ from their bodies by float summation order
+# alone; they share the figure rather than a tighter one of their own, because
+# what a self-check must catch is a miscompile, not a ULP.
 SELF_CHECK_REL_TOL = 1e-4
 
 # Module-level cache of the single probe result: compiling even a trivial
 # kernel costs real time, and the answer cannot change within a process.
 _PROBE_RESULT = None
 
-# Per-device caches of the two cone self-checks, keyed by device string: each
+# Per-device caches of the four self-checks, keyed by device string: each
 # check builds a model, compiles a kernel, and runs both bodies, so it must
 # happen once per process -- and its answer is a property of the DEVICE and
 # its toolchain, not of the calling model.
 _CONE_BACK_RESULTS = {}
 _CONE_FWD_RESULTS = {}
+_PARALLEL_BACK_RESULTS = {}
+_PARALLEL_FWD_RESULTS = {}
 
-# Re-entrancy flag: a self-check builds its own tiny ConeBeamModel, whose
+# Re-entrancy flag: a self-check builds its own tiny model, whose
 # create_projectors asks this same module which bodies to use.  While ANY
-# check runs, both answers must be "the torch body" -- otherwise the probe
-# model would recurse into the check it is part of.
+# check runs, every answer must be "the torch body" -- otherwise the probe
+# model would recurse into the check it is part of.  One flag covers all four
+# checks because the recursion it blocks is not per geometry: the flag is read
+# by every gate, so a parallel check's model cannot trip a cone gate either.
 _SELF_CHECK_ACTIVE = False
 
 
@@ -154,11 +169,43 @@ def cone_forward_kernel_usable(model):
     return _kernel_usable(model, _CONE_FWD_RESULTS, _cone_forward_self_check)
 
 
+def parallel_back_kernel_usable(model):
+    """(usable, reason): whether the Triton parallel back body may replace the
+    torch one for ``model``, on ``model.torch_device``.
+
+    The same two gates in the same order as :func:`cone_back_kernel_usable`,
+    with the parallel back body's own value comparison at coefficient powers 1
+    and 2 -- run both unbanded and on an interior ROW band, which is how a
+    row-aligned geometry bands (the band rides in the sinogram's row axis, not
+    in a band keyword).  Cached per device string and exception-safe.
+
+    This answers CAPABILITY only; selection is policy, and while the parallel
+    kernels are opt-in (see :data:`ENABLE_PBACK_ENV_VAR`) a process that has
+    not opted in never calls this and never pays for the check.
+    """
+    return _kernel_usable(model, _PARALLEL_BACK_RESULTS,
+                          _parallel_back_self_check)
+
+
+def parallel_forward_kernel_usable(model):
+    """(usable, reason): whether the Triton parallel forward body may replace
+    the torch one for ``model``, on ``model.torch_device``.
+
+    The same two gates in the same order, with the parallel forward body's own
+    value comparison -- unbanded and on a row band, which the forward carries
+    in the COLUMN count of its values (rows track slices, so a slice band is a
+    row band).  Cached per device string and exception-safe; capability only,
+    as above.
+    """
+    return _kernel_usable(model, _PARALLEL_FWD_RESULTS,
+                          _parallel_forward_self_check)
+
+
 def _kernel_usable(model, cache, self_check):
-    """The shape both gates above share: the re-entrancy guard, the
+    """The shape all four gates above share: the re-entrancy guard, the
     process-wide probe, then this device's cached value self-check."""
     if _SELF_CHECK_ACTIVE:
-        result = (False, 'cone self-check in progress (its own probe model '
+        result = (False, 'kernel self-check in progress (its own probe model '
                          'uses the torch bodies)')
     else:
         probe_usable, probe_reason = triton_available()
@@ -172,9 +219,9 @@ def _kernel_usable(model, cache, self_check):
     return result
 
 
-def _self_check_cell(device_key):
-    """The tiny cone problem both self-checks run on: (model, pixel_indices,
-    view_params, body kwargs).
+def _cone_self_check_cell(device_key):
+    """The tiny cone problem both cone self-checks run on: (model,
+    pixel_indices, view_params, body kwargs).
 
     Small enough to cost milliseconds and shaped to reach every branch of the
     kernels: four views (so the back kernel's view reduction runs), a real cone
@@ -200,6 +247,31 @@ def _self_check_cell(device_key):
     return model, pixel_indices, view_params, model._view_batch_args()
 
 
+def _parallel_self_check_cell(device_key):
+    """The tiny parallel problem both parallel self-checks run on: (model,
+    pixel_indices, view_params, body kwargs) -- the cone cell's twin, at the
+    same size and with the same padded last pixel block, over a half turn of
+    real angles so the projected footprint varies from view to view (W_p_c and
+    weight_scale are per-view under parallel beam, so a single angle would
+    exercise one value of each)."""
+    import numpy as np
+
+    from .parallel_beam import ParallelBeamModel
+    from .vcd_utils import gen_full_indices
+
+    cell = (4, 10, 10)
+    angles = np.linspace(0, np.pi, cell[0], endpoint=False)
+    model = ParallelBeamModel(cell, angles, device=device_key,
+                              compile_mode='off')
+    device = model.torch_device
+    pixel_indices = torch.as_tensor(
+        gen_full_indices(model.get_params('recon_shape')),
+        dtype=torch.int64, device=device)[:-1]
+    view_params = torch.as_tensor(model.get_params('angles'),
+                                  dtype=torch.float32, device=device)
+    return model, pixel_indices, view_params, model._view_batch_args()
+
+
 def _rel_diff(kernel_out, reference):
     """Max relative difference of a kernel output against its torch body."""
     return (float((kernel_out - reference).abs().max())
@@ -215,7 +287,8 @@ def _cone_back_self_check(device_key):
         from .cone_beam import _cone_back_view_batch
         from .triton_cone import _cone_back_view_batch_triton
 
-        model, pixel_indices, view_params, args = _self_check_cell(device_key)
+        model, pixel_indices, view_params, args = _cone_self_check_cell(
+            device_key)
         # A private generator: the seeded recon gates depend on the global RNG
         # streams, and an availability check must not advance them.
         generator = torch.Generator().manual_seed(0)
@@ -249,7 +322,8 @@ def _cone_forward_self_check(device_key):
         from .cone_beam import _cone_forward_view_batch
         from .triton_cone import _cone_forward_view_batch_triton
 
-        model, pixel_indices, view_params, args = _self_check_cell(device_key)
+        model, pixel_indices, view_params, args = _cone_self_check_cell(
+            device_key)
         num_slices = int(args['num_slices'])
         generator = torch.Generator().manual_seed(0)
         values = torch.rand((int(pixel_indices.shape[0]), num_slices),
@@ -274,6 +348,89 @@ def _cone_forward_self_check(device_key):
         result = _self_check_verdict('cone forward', device_key, worst_rel)
     except Exception as e:                                        # noqa: BLE001
         result = (False, f'cone forward self-check failed to run: '
+                         f'{type(e).__name__}: {e}')
+    finally:
+        _SELF_CHECK_ACTIVE = False
+    return result
+
+
+def _parallel_back_self_check(device_key):
+    """Run the parallel back kernel-vs-torch-body comparison once on one device
+    (see :func:`parallel_back_kernel_usable`); never raises."""
+    global _SELF_CHECK_ACTIVE
+    _SELF_CHECK_ACTIVE = True
+    try:
+        from .parallel_beam import _parallel_back_view_batch
+        from .triton_parallel import _parallel_back_view_batch_triton
+
+        model, pixel_indices, view_params, args = _parallel_self_check_cell(
+            device_key)
+        # A private generator: the seeded recon gates depend on the global RNG
+        # streams, and an availability check must not advance them.
+        generator = torch.Generator().manual_seed(0)
+        sinogram = torch.rand(tuple(model.get_params('sinogram_shape')),
+                              generator=generator).to(model.torch_device)
+
+        worst_rel = 0.0
+        # Every row, then an interior row band: a row-aligned geometry bands in
+        # the SINOGRAM's row axis (rows track slices), so slicing the input is
+        # the whole of the banded seam and the output band comes back with it.
+        num_rows = int(sinogram.shape[1])
+        interior = max(1, num_rows // 3)
+        bands = ((0, num_rows), (interior, num_rows - 2 * interior))
+        for coeff_power in (1, 2):
+            for row_start, band_rows in bands:
+                band = sinogram[:, row_start:row_start + band_rows]
+                reference = _parallel_back_view_batch(
+                    band, pixel_indices, view_params,
+                    coeff_power=coeff_power, **args)
+                kernel_out = _parallel_back_view_batch_triton(
+                    band, pixel_indices, view_params,
+                    coeff_power=coeff_power, **args)
+                worst_rel = max(worst_rel, _rel_diff(kernel_out, reference))
+        result = _self_check_verdict('parallel back', device_key, worst_rel)
+    except Exception as e:                                        # noqa: BLE001
+        result = (False, f'parallel back self-check failed to run: '
+                         f'{type(e).__name__}: {e}')
+    finally:
+        _SELF_CHECK_ACTIVE = False
+    return result
+
+
+def _parallel_forward_self_check(device_key):
+    """Run the parallel forward kernel-vs-torch-body comparison once on one
+    device (see :func:`parallel_forward_kernel_usable`); never raises."""
+    global _SELF_CHECK_ACTIVE
+    _SELF_CHECK_ACTIVE = True
+    try:
+        from .parallel_beam import _parallel_forward_view_batch
+        from .triton_parallel import _parallel_forward_view_batch_triton
+
+        model, pixel_indices, view_params, args = _parallel_self_check_cell(
+            device_key)
+        num_slices = int(model.get_params('recon_shape')[2])
+        generator = torch.Generator().manual_seed(0)
+        values = torch.rand((int(pixel_indices.shape[0]), num_slices),
+                            generator=generator).to(model.torch_device)
+
+        worst_rel = 0.0
+        # The whole volume, then an interior band: the forward carries its band
+        # in the COLUMN count of the values, and each band produces the
+        # matching detector rows rather than a partial of the whole sinogram
+        # (the row-aligned form's difference from the cone forward's).
+        interior = max(1, num_slices // 3)
+        bands = ((0, num_slices), (interior, num_slices - 2 * interior))
+        for slice_start, band_len in bands:
+            band_values = values[:, slice_start:slice_start + band_len]
+            reference = _parallel_forward_view_batch(band_values,
+                                                     pixel_indices,
+                                                     view_params, **args)
+            kernel_out = _parallel_forward_view_batch_triton(
+                band_values, pixel_indices, view_params, **args)
+            worst_rel = max(worst_rel, _rel_diff(kernel_out, reference))
+        result = _self_check_verdict('parallel forward', device_key, worst_rel)
+    except Exception as e:                                        # noqa: BLE001
+        result = (False, f'parallel forward self-check failed to run: '
                          f'{type(e).__name__}: {e}')
     finally:
         _SELF_CHECK_ACTIVE = False
@@ -306,3 +463,5 @@ def _reset_self_check_cache():
     and the probe cache are read inside the gates above)."""
     _CONE_BACK_RESULTS.clear()
     _CONE_FWD_RESULTS.clear()
+    _PARALLEL_BACK_RESULTS.clear()
+    _PARALLEL_FWD_RESULTS.clear()

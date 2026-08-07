@@ -1,0 +1,48 @@
+.. _DenoisingDocs:
+
+=========
+Denoising
+=========
+
+MBIRTorch includes a Bayesian MAP denoising using the qGGMRF prior.
+
+++++++++++++++
+QGGMRFDenoiser
+++++++++++++++
+
+The ``QGGMRFDenoiser`` class implements a 3D volume denoiser for additive white Gaussian denoising.
+More specifically, it computes the MAP assuming additive white Gaussian noise and a qGGMRF prior distribution.
+Using :math:`H(x)` to denote the denoising function, the denoiser is
+
+        .. math::
+
+            H(x) = \arg\min_v \left\{ \frac{1}{2 \sigma_{noise}^2}\|x - v\|^{2} + h(v) \right\}.
+
+The denoiser will automatically estimate the noise level in the image, or the can directly set the value of
+noise standard deviation through the parameter `sigma_noise`.  Larger values of `sigma_noise` lead to smoother images.
+Alternatively, the amount of denoising can be adjusted using parameter `sharpness` (a float, default=0.0).
+This class inherits many of the behaviors and attributes of the :ref:`TomographyModelDocs`.
+
+Constructor
+-----------
+
+.. autoclass:: mbirtorch.QGGMRFDenoiser
+   :show-inheritance:
+
+Denoise
+-------
+
+.. automethod:: mbirtorch.QGGMRFDenoiser.denoise
+
+
+.. PENDING(median_filter3d): restore the section below, and add "and a 3D median filter"
+   back to the page intro above, when median_filter3d is ported to mbirtorch.
+
+   +++++++++++++
+   Median Filter
+   +++++++++++++
+
+   MBIRTorch also includes a 3x3x3 median filter, which can be used as a simple denoiser.  The median filter can
+   optionally also return the min and max in 3x3x3 neighborhoods.
+
+   .. autofunction:: mbirtorch.median_filter3d

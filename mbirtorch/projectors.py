@@ -212,7 +212,7 @@ class Projectors:
     #     jointly chosen (view_batch, pixel_batch) tile.  These drivers tile
     #     views only; the joint tile choice needs a 2-D budget rule and gate
     #     measurement (tile shape moved mbirjax kernels several-fold in its
-    #     campaign), so it belongs with the Phase 5 kernel work.
+    #     campaign), so it belongs with the kernel work.
     VIEW_BATCH_TRANSIENT_BUDGET_BYTES = 2 * 2**30
     VIEW_BATCH_TRANSIENT_FLOOR_BYTES = 256 * 2**20
     VIEW_BATCH_SINO_MULTIPLE = 8
