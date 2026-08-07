@@ -214,6 +214,35 @@ def main():
                                mbirjax.median_filter3d(med_in, max_block_gb=0.0001,
                                                        return_min_max=True))
 
+    # Vendor-loader conversion math on shared synthetic geometry dicts (no scan data needed).
+    def _nsi_geom():
+        sid, sdd = 100.0, 200.0
+        nrows, nchan, dr, dc = 64, 80, 0.2, 0.2
+        r_n = np.array([0., 1., 0.]); r_h = np.array([1., 0., 0.]); r_a = np.array([0., 0., -1.])
+        r_s = np.array([0., -sid, 0.])
+        r_v = np.cross(r_n, r_h)
+        r_r = np.array([0., sdd - sid, 0.]) - (nchan / 2.0) * dc * r_h - (nrows / 2.0) * dr * r_v
+        return dict(r_a=r_a, r_n=r_n, r_h=r_h, r_s=r_s, r_r=r_r,
+                    delta_det_channel=dc, delta_det_row=dr,
+                    num_det_channels=nchan, num_det_rows=nrows,
+                    angles=np.linspace(0, 2 * np.pi, 20, endpoint=False))
+
+    from mbirjax.preprocess.nsi import convert_nsi_to_mbirjax_params as nsi_conv
+    nsi_cb, nsi_op = nsi_conv(_nsi_geom(), (2, 2), 3, 5, 5)
+    nsi_convert = np.array([nsi_cb['sinogram_shape'][1], nsi_cb['sinogram_shape'][2],
+                            nsi_cb['source_detector_dist'], nsi_cb['source_iso_dist'],
+                            nsi_op['det_row_offset'], nsi_op['det_channel_offset'],
+                            nsi_op['recon_slice_offset'], nsi_op['delta_det_row'],
+                            nsi_op['delta_det_channel'], nsi_op['delta_voxel'],
+                            nsi_op['det_rotation']], dtype=np.float64)
+
+    # pymbir beam-hardening linearization on shared inputs.
+    from mbirjax.preprocess.pymbir import apply_bh_correction, find_linearization_fit
+    bhcn_params = [0.6, 1.0, 4.0, 20.0]
+    bhcn_sino = (3.0 * rng.rand(6, 8, 10)).astype(np.float32)
+    bhcn_out = np.asarray(apply_bh_correction(bhcn_sino.copy(), bhcn_params))
+    bhcn_poly = np.asarray(find_linearization_fit(0.6, 1.0, 4.0, max_thick=20.0))
+
     # HDF5 family: mbirjax-written files pin the on-disk formats.
     h5_vol = rng.rand(10, 12, 14).astype(np.float32)
     h5_attrs = {'scan_id': 'sample1', 'notes': 'golden', 'nested': {'a': 1, 'b': 'two'}}
@@ -285,6 +314,8 @@ def main():
         med_in=med_in, med_out=med_out.astype(np.float32),
         med_min=med_min.astype(np.float32), med_max=med_max.astype(np.float32),
         h5_vol=h5_vol,
+        nsi_convert=nsi_convert,
+        bhcn_sino=bhcn_sino, bhcn_out=bhcn_out.astype(np.float64), bhcn_poly=bhcn_poly,
     )
     print('wrote', out)
     print('wrote', h5_path)

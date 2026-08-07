@@ -307,6 +307,366 @@ def export_recon_hdf5(file_path, recon, recon_dict=None, remove_flash=False, rad
                           produce_slab, recon_dict)
 
 
+def _resolve_geometry_class(geometry_type):
+    """Resolve a model class from a ``geometry_type`` string (the class-identity entry recorded by
+    ``get_all_params`` and the scan readers)."""
+    import mbirtorch
+    geometry_type = str(geometry_type)
+    for name in ('ConeBeamModel', 'ParallelBeamModel', 'TranslationModel'):
+        if name in geometry_type:
+            model_class = getattr(mbirtorch, name, None)
+            if model_class is None:
+                raise ValueError(f"The geometry class {name} is not available in mbirtorch yet.")
+            return model_class
+    raise ValueError(f"Cannot resolve a model class for geometry_type {geometry_type!r}.")
+
+
+def build_model(required_params, optional_params=None, regularization=None):
+    """
+    Construct a model from parameter dicts and compute its reconstruction geometry.
+
+    The single place the ``construct -> set_params -> auto_set_recon_geometry`` sequence lives, so a
+    caller never forgets the final ``auto_set_recon_geometry`` (which would leave the reconstruction
+    grid sized with default detector pitches).  Because ``required_params`` carries ``geometry_type``
+    (see :meth:`~mbirtorch.TomographyModel.get_all_params`), the correct model class is resolved here
+    and ``(required_params, optional_params)`` is a self-contained model description -- calling this
+    reads like calling the constructor through the new interface.
+
+    Args:
+        required_params (dict): The model constructor's arguments, including ``geometry_type`` (as
+            returned in the first element of ``get_all_params``).
+        optional_params (dict, optional): Additional parameters applied with ``set_params`` (detector
+            pitches, offsets, ``delta_voxel``, ``recon_shape``, ...).  Defaults to None.
+        regularization (dict, optional): Recon-time regularization parameters applied with
+            ``set_params``.  Defaults to None (the model's default regularization).
+
+    Returns:
+        TomographyModel: the constructed model, with ``auto_set_recon_geometry`` applied.
+    """
+    required_params = dict(required_params)
+    model_class = _resolve_geometry_class(required_params.pop('geometry_type'))
+    model = model_class(**required_params)
+
+    optional_params = dict(optional_params) if optional_params else {}
+    # A pinned recon_shape must be applied AFTER auto_set_recon_geometry, or the automatic pass would
+    # overwrite it (the translation reader pins recon_shape; a faithful save/load round-trip relies
+    # on this ordering).
+    pinned_recon_shape = optional_params.pop('recon_shape', None)
+    # Apply the structural/optional params WITH name validation, so a typo'd key still raises; then
+    # apply the regularization knobs with no_warning to suppress the "directly setting regularization"
+    # advisory (this is a faithful rebuild, not a user hand-setting sigma_x).
+    if optional_params:
+        model.set_params(**optional_params)
+    if regularization:
+        model.set_params(no_warning=True, **regularization)
+    model.auto_set_recon_geometry()
+    if pinned_recon_shape is not None:
+        model.set_params(no_warning=True, recon_shape=pinned_recon_shape)
+    return model
+
+
+def download_and_extract(download_url, save_dir):
+    """
+    Download or copy a file from a URL or local file path. If the file is a tarball (.tar, .tar.gz, etc.), extract it
+    into the specified directory. Supports Google Drive links, standard HTTP/HTTPS URLs, and local paths.
+
+    If the file already exists in the save directory, it will not be re-downloaded or copied.
+
+    Args:
+        download_url (str): URL or local file path to the file. Supported formats include:
+            - Google Drive shared links
+            - HTTP/HTTPS URLs
+            - Local file paths
+        save_dir (str): Directory where the file will be saved and extracted (if applicable).
+
+    Returns:
+        str:
+            - For tar files: Path to the extracted top-level directory.
+            - For other files: Path to the downloaded or copied file.
+
+    Raises:
+        RuntimeError: If the file cannot be downloaded, copied, or extracted.
+        ValueError: If the Google Drive URL is invalid or tar file has no top-level directory.
+
+    Examples:
+        >>> extracted_dir = download_and_extract("https://example.com/data.tar.gz", "./data")
+        >>> file_path = download_and_extract("https://drive.google.com/file/d/1ABC123/view", "./data")
+        >>> result = download_and_extract("/path/to/local/data.tar.gz", "./data")
+    """
+    import re
+    import subprocess
+    import tarfile
+    import urllib.error
+    import urllib.request
+    from urllib.parse import urlparse
+
+    def is_google_drive_url(url):
+        """Check if URL is a Google Drive link"""
+        return "drive.google.com" in url
+
+    def is_tar_file(filename):
+        """Check if file is a tar archive based on extension"""
+        tar_extensions = ['.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz2', '.tar.xz', '.txz']
+        return any(filename.lower().endswith(ext) for ext in tar_extensions)
+
+    def extract_google_drive_id(url):
+        """Extract Google Drive file ID from URL"""
+        pattern = r"(?:https?:\/\/)?(?:www\.)?drive\.google\.com\/(?:file\/d\/|open\?id=)([a-zA-Z0-9_-]+)"
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+        else:
+            raise ValueError("Invalid Google Drive URL format")
+
+    parsed = urlparse(download_url)
+    is_url = parsed.scheme in ('http', 'https')
+    is_google_drive = is_url and is_google_drive_url(download_url)
+
+    if is_google_drive:
+        file_id = extract_google_drive_id(download_url)
+        marker_file = os.path.join(save_dir, f".gdrive_{file_id}")
+
+        if os.path.exists(marker_file):
+            with open(marker_file, 'r') as f:
+                actual_filename = f.read().strip()
+            file_path = os.path.join(save_dir, actual_filename)
+            filename = actual_filename
+
+            if os.path.exists(file_path):
+                is_download = False
+            else:
+                is_download = True
+
+        else:
+            filename = f"gdrive_{file_id}"
+            is_download = True
+    else:
+        filename = os.path.basename(parsed.path if is_url else download_url)
+        file_path = os.path.join(save_dir, filename)
+        if os.path.exists(file_path):
+            is_download = False
+        else:
+            is_download = True
+
+    if is_download:
+        os.makedirs(save_dir, exist_ok=True)
+
+        if is_url:
+            if is_google_drive:
+                print("Downloading file from Google Drive...")
+                import gdown
+                try:
+                    gdrive_url = f"https://drive.google.com/uc?id={file_id}"
+
+                    downloaded_path = gdown.download(gdrive_url, output=None, quiet=False)
+                    if downloaded_path and os.path.isfile(downloaded_path):
+                        actual_filename = os.path.basename(downloaded_path)
+                        target_path = os.path.join(save_dir, actual_filename)
+                        shutil.move(downloaded_path, target_path)
+                        file_path = target_path
+                        filename = actual_filename
+
+                        with open(marker_file, 'w') as f:
+                            f.write(actual_filename)
+                    else:
+                        raise RuntimeError("Google Drive download failed or returned invalid path")
+
+                    print(f"Download successful! File saved to {file_path}")
+                except Exception as e:
+                    raise RuntimeError(f"Google Drive download failed: {str(e)}")
+            else:
+                print("Downloading file...")
+                try:
+                    urllib.request.urlretrieve(download_url, file_path)
+                except urllib.error.HTTPError as e:
+                    if e.code == 401:
+                        raise RuntimeError(f'HTTP {e.code}: authentication failed!')
+                    elif e.code == 403:
+                        raise RuntimeError(f'HTTP {e.code}: URL forbidden!')
+                    elif e.code == 404:
+                        raise RuntimeError(f'HTTP {e.code}: URL not found!')
+                    else:
+                        raise RuntimeError(f'HTTP {e.code}: {e.reason}')
+                except urllib.error.URLError as e:
+                    res = subprocess.run(
+                        ["curl", "-L", "--fail", "-o", file_path, download_url],
+                        capture_output=True, text=True
+                    )
+                    if res.returncode != 0:
+                        raise RuntimeError(f"Download failed with curl: {res.stderr.strip() or res.stdout.strip()}")
+                print(f"Download successful! File saved to {file_path}")
+        else:
+            print(f"Copying local file from {download_url} to {file_path}...")
+            if not os.path.isfile(download_url):
+                raise RuntimeError(f"Provided file path does not exist: {download_url}")
+            shutil.copy2(download_url, file_path)
+            print(f"Copy successful! File saved to {file_path}")
+
+        if is_tar_file(filename):
+            print(f"Extracting tarball file to {save_dir}...")
+            try:
+                with tarfile.open(file_path, 'r') as tar_file:
+                    tar_file.extractall(save_dir)
+                print(f"Extraction successful!")
+
+                top_level_dir = get_top_level_tar_dir(file_path)
+                extracted_path = os.path.join(save_dir, top_level_dir)
+                return extracted_path
+            except Exception as e:
+                raise RuntimeError(f"Failed to extract tar file: {str(e)}")
+        else:
+            return file_path
+
+    if is_google_drive and not is_download:
+        try:
+            with open(marker_file, 'r') as f:
+                actual_filename = f.read().strip()
+            file_path = os.path.join(save_dir, actual_filename)
+            filename = actual_filename
+        except:
+            file_path = os.path.join(save_dir, filename)
+
+    if is_tar_file(filename):
+        top_level_dir = get_top_level_tar_dir(file_path)
+        file_path = os.path.join(save_dir, top_level_dir)
+
+    return file_path
+
+
+def get_top_level_tar_dir(tar_path, max_entries=1):
+    """
+    Determine the top-level directory inside a tarball file by sampling up to max_entries members.
+
+    Parameters
+    ----------
+    tar_path : str
+        Path to the tarball file.
+    max_entries : int
+        Maximum number of entries to sample.
+
+    Returns
+    -------
+    dir_name : str
+        The name of the top-level directory.
+    """
+    import tarfile
+    top_levels = set()
+
+    with tarfile.open(tar_path, 'r') as tar:
+        for i, member in enumerate(tar):
+            if not member.name.strip():
+                continue
+            top_dir = member.name.split('/')[0]
+            top_levels.add(top_dir)
+
+            if len(top_levels) > 1 or i + 1 >= max_entries:
+                break
+    if len(top_levels) == 1:
+        dir_name = top_levels.pop()
+    else:
+        raise ValueError("No top level directory found in {}".format(tar_path))
+    return dir_name
+
+
+def calc_tct_recon_params(source_det_dist, source_iso_dist, delta_det_row, delta_det_channel, sinogram_shape, translation_vectors, voxel_row_aspect=1.0, voxel_slice_aspect=1.0):
+    """
+    Calculate the translation geometry parameters: recon_shape, delta_voxel, voxel_row_aspect
+
+    Args:
+        source_det_dist (float): distance from the X-ray source to the detector (in ALU)
+        source_iso_dist (float): distance from the X-ray source to the isocenter (in ALU)
+        delta_det_row (float): the spacing between detector rows (in ALU)
+        delta_det_channel (float): the spacing between detector channels (in ALU)
+        sinogram_shape (tuple): Shape of the sinogram as (num_views, num_det_rows, num_det_channels)
+        translation_vectors (numpy array): A (num_views, 3) array of translations (x, y, z) in ALU
+        voxel_row_aspect (float): the aspect ratio between delta_voxel_row and delta_voxel. Defaults to 1.0
+        voxel_slice_aspect (float): the aspect ratio between delta_voxel_slice and delta_voxel. Defaults to 1.0
+
+    Returns:
+        recon_shape (tuple): Shape of the reconstruction shape as (num_recon_rows, num_recon_cols, num_recon_slices)
+        delta_voxel (float): the voxel pitch at isocenter (in ALU)
+        voxel_row_aspect (float): the aspect ratio between delta_voxel_row and delta_voxel
+    """
+    # Get parameters
+    num_views, num_det_rows, num_det_channels = sinogram_shape
+
+    # Calculate magnification
+    magnification = source_det_dist / source_iso_dist
+
+    # Calculate the width and height of the detector in ALU
+    detect_box = np.array([delta_det_channel * num_det_channels, delta_det_row * num_det_rows])
+
+    # Compute avg_view_slope = tan(cone_angle/2) along the x and z directions
+    # This is the average slope of a view that a pixel at iso sees.
+    # detect_box/4 = distance from the (center of the detector) to (halfway to the edge of the detector).
+    # Using the average seems to be better than using the maximum.
+    avg_view_slope = (detect_box / 4) / source_det_dist
+
+    # Compute detector pixel pitch at iso
+    # Note that this may differ from delta_voxel
+    # However, we will use det_pixel_pitch_iso to calculate both the number rows and their pitch
+    det_pixel_pitch_iso_vec = np.array([delta_det_row, delta_det_channel]) / magnification
+    det_pixel_pitch_iso = np.max(det_pixel_pitch_iso_vec)
+
+    # Set delta_voxel
+    delta_voxel = float(det_pixel_pitch_iso)
+
+    # Compute delta_voxel in slice dimension
+    delta_voxel_slice = voxel_slice_aspect * delta_voxel
+
+    ######### Compute the row pitch based on a heuristic #########
+    # The following code will result in an isotropic voxel when the avg_view_slope > 76 deg.
+    nominal_row_pitch = 4.0 * det_pixel_pitch_iso_vec / avg_view_slope
+    nominal_row_pitch = np.max(nominal_row_pitch)  # Take the maximum of the nominal pitches along x and z
+    delta_recon_row = np.maximum(nominal_row_pitch, det_pixel_pitch_iso)  # Ensure that the row resolution is not higher than the (x,z) detector resolution
+    delta_recon_row = float(delta_recon_row)
+
+    ##### Compute voxel row aspect
+    # In translation geometry, anisotropic row spacing is usually needed for good reconstruction results.
+    #
+    # If voxel_row_aspect == 1.0 (default value), assume the user did not explicitly specify
+    # a row aspect ratio, and automatically compute it using the current TCT row-pitch heuristic.
+    #
+    # Otherwise, use the user-defined voxel_row_aspect to determine delta_recon_row.
+    if voxel_row_aspect == 1.0:
+        voxel_row_aspect = delta_recon_row / delta_voxel
+    else:
+        delta_recon_row = voxel_row_aspect * delta_voxel
+
+    # Compute cube = (width, depth, height) of the scanned region in ALU
+    max_translation = np.amax(translation_vectors, axis=0)  # Translate object right/up when positive
+    min_translation = np.amin(translation_vectors, axis=0)  # Translate object left/down when negative
+    cube = max_translation - min_translation
+
+    # Compute recon_box = (num_recon_cols, num_recon_slices) of the reconstruction volume.
+    # The reconstruction box size is determined using:
+    #   delta_voxel for the column direction
+    #   delta_voxel_slice for the slice direction
+    recon_box = np.ceil(np.array([cube[0], cube[2]]) / np.array([delta_voxel, delta_voxel_slice]))
+
+    # ************ Use a heuristic to determine a reasonable number of rows *************
+    # Compute the number of unknown pixels per view
+    num_pixels_per_view = ((recon_box[0] + num_det_rows) * (recon_box[1] + num_det_channels)) / num_views
+    num_measurements_per_view = num_det_channels * num_det_rows
+    # Select the number of rows so that (number of unknowns) = 2*(the number of measurements)
+    num_recon_rows = 2 * np.ceil(num_measurements_per_view / num_pixels_per_view)
+
+    # Make sure the object extends no further than halfway to the source
+    max_recon_rows = np.floor((source_iso_dist - cube[1]) / delta_recon_row)
+    if max_recon_rows < 1:
+        print(f"[Error] Computed max_recon_rows = {max_recon_rows} < 1. This suggests the object extends beyond the source.")
+    num_recon_rows = np.minimum(num_recon_rows, max_recon_rows)
+
+    # Set the parameters to their computed values
+    num_recon_cols, num_recon_slices = recon_box
+    num_recon_cols = int(num_recon_cols)
+    num_recon_rows = int(num_recon_rows)
+    num_recon_slices = int(num_recon_slices)
+    recon_shape = (num_recon_rows, num_recon_cols, num_recon_slices)
+
+    return recon_shape, delta_voxel, voxel_row_aspect
+
+
 def import_recon_hdf5(file_path):
     """
     Import a 3D reconstruction volume from an HDF5 file.
