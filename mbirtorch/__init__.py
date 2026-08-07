@@ -38,6 +38,7 @@ from .vcd_utils import (gen_weights, gen_full_indices, gen_pixel_partition,
 from .qggmrf import (qggmrf_gradient_and_hessian_at_indices, get_b_from_nbr_wts,
                      b_tilde_by_definition, qggmrf_loss)
 from .utilities import generate_3d_shepp_logan_low_dynamic_range, clear_cache
+from . import preprocess
 from .memory_stats import get_memory_stats
 
 # __all__ is the DECLARED public surface, and autodoc honors it: every name here is
