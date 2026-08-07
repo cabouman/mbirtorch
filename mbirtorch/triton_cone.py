@@ -1,5 +1,5 @@
-"""The hand-written Triton cone-beam kernels: increments K1 and K3 of the
-Phase 5 kernel plan -- the cone BACK and FORWARD projections as alternative
+"""The hand-written Triton cone-beam kernels -- the cone BACK and FORWARD
+projections as alternative
 view-batch bodies.
 
 A kernel here is an ALTERNATIVE BODY, never a new driver.  Each wrapper below
@@ -134,7 +134,7 @@ _tl_sqrt = _tl_builtin('sqrt')
 # is a constexpr and the bounds are therefore IR constants.
 _tap_range = _tl_builtin('static_range') or range
 
-# ── H100 starting constants (the K2 sweep axes) ──────────────────────────────
+# ── H100 starting constants (the back sweep axes) ──────────────────────────────
 # The pallas cone back kernel ran one PIXEL per program with a 128-slice
 # register tile (CONE_LC=128, num_warps=1).  Triton programs are tiles in both
 # axes, so the same accumulator budget buys a (pixel, slice) rectangle instead,
@@ -143,8 +143,8 @@ _tap_range = _tl_builtin('static_range') or range
 # the row centers, the row weight, the row partial, the gathered values), so
 # 32x64 at 4 warps is ~96 registers per thread -- the largest tile that stays
 # clear of spilling by inspection.  64x128 (the design's "BLOCK_P 64ish, LC
-# 128" reading) is ~8x that and would spill hard; K2 measures the rectangle
-# rather than reasoning about it.  Sweep axes for K2: BLOCK_P, BLOCK_L,
+# 128" reading) is ~8x that and would spill hard; the sweep measures the
+# rectangle rather than reasoning about it.  Sweep axes: BLOCK_P, BLOCK_L,
 # NUM_WARPS, NUM_STAGES, and the driver's view batch.
 CONE_BACK_BLOCK_P = 16
 CONE_BACK_BLOCK_L = 64
@@ -157,7 +157,7 @@ CONE_BACK_NUM_STAGES = 1
 # rather than shrinking further.
 CONE_BACK_MIN_TILE = 8
 
-# ── H100 starting constants for the FORWARD kernel (the K4-era sweep axes) ───
+# ── H100 starting constants for the FORWARD kernel (the forward sweep axes) ───
 # Deliberately conservative, and deliberately the back kernel's rectangle: the
 # forward program holds the same class of live tiles at (BLOCK_P, BLOCK_R) --
 # the detector-column accumulator plus ~5 companions (k_m, the slice center,

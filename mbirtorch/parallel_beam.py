@@ -214,7 +214,36 @@ class ParallelBeamModel(TomographyModel):
                              f'{sinogram_shape} for sinogram_shape')
 
     def _view_batch_bodies(self):
-        return _parallel_forward_view_batch, _parallel_back_view_batch
+        # The hand-written kernels are alternative BODIES: same signatures, so
+        # nothing downstream of this hook changes.  Each is available wherever
+        # BOTH availability gates pass -- the triton probe and the first-use
+        # value self-check on the actual device (the probe-the-hardware
+        # protocol; MBIRTORCH_DISABLE_TRITON=1 is the kill switch inside the
+        # probe) -- and both kernels passed their composed performance gate,
+        # so both are ON by default, gates alone (the cone protocol).
+        #
+        # Composed five-arm gate on H100, warm seeded vcd, pinned constants:
+        # with BOTH kernels the 512 cell runs at 1.21x of jax's time and the
+        # 1024 cell at 1.90x, at 0.63x of jax's memory -- the replacement
+        # rule passes at both parallel gate cells (the compiled torch bodies
+        # stood at 2.98x and 5.56x).  The forward kernel loses its ISOLATED
+        # full-pixel-set bench at the 1024 cell (0.78x of the compiled body)
+        # yet wins composition by 19-24% (the both-kernels arm vs the
+        # back-only arm): vcd calls the forward on pixel subsets, where the
+        # body pays transients and per-shape recompiles the kernel does not.
+        from .kernel_availability import (parallel_back_kernel_usable,
+                                          parallel_forward_kernel_usable)
+        if parallel_back_kernel_usable(self)[0]:
+            from .triton_parallel import _parallel_back_view_batch_triton
+            back_body = _parallel_back_view_batch_triton
+        else:
+            back_body = _parallel_back_view_batch
+        if parallel_forward_kernel_usable(self)[0]:
+            from .triton_parallel import _parallel_forward_view_batch_triton
+            fwd_body = _parallel_forward_view_batch_triton
+        else:
+            fwd_body = _parallel_forward_view_batch
+        return fwd_body, back_body
 
     def _view_batch_args(self):
         gp_names = ['delta_det_channel', 'det_channel_offset', 'delta_voxel',
@@ -303,6 +332,9 @@ class ParallelBeamModel(TomographyModel):
         return recon if output_sharded else self._gather_recon(recon)
 
     def direct_recon(self, sinogram, filter_name="ramp", output_sharded=False):
+        """Direct reconstruction by filtered backprojection (FBP); equivalent
+        to :meth:`fbp_recon`.  See :meth:`TomographyModel.direct_recon` for
+        the argument and return conventions."""
         return self.fbp_recon(sinogram, filter_name=filter_name,
                               output_sharded=output_sharded)
 

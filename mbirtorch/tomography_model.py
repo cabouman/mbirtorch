@@ -155,12 +155,29 @@ class TomographyModel(ParameterHandler):
         self.projector_functions = Projectors(self)
 
     def get_magnification(self):
+        """Return the magnification for this geometry.  Each geometry model
+        defines this; parallel beam returns 1.0."""
         raise NotImplementedError
 
     def get_psf_radius(self):
         raise NotImplementedError
 
     def auto_set_recon_geometry(self, no_compile=False, no_warning=False):
+        """
+        Set the automatic value of the recon shape and voxel pitch using the
+        geometry parameters and sinogram shape.  Each geometry model defines
+        this.
+
+        Note: This function should be run after changing geometry parameters
+        such as ``delta_det_channel``.  It will set reconstruction parameters
+        such as ``recon_shape`` and ``delta_voxel`` to reasonable values.
+
+        Args:
+            no_compile (bool, optional): If True, do not rebuild the
+                projectors.  Defaults to False.
+            no_warning (bool, optional): If True, do not issue warnings.
+                Defaults to False.
+        """
         raise NotImplementedError
 
     def _view_batch_bodies(self):
@@ -190,6 +207,25 @@ class TomographyModel(ParameterHandler):
         return band_cols
 
     def direct_recon(self, sinogram, filter_name=None, output_sharded=False):
+        """
+        Do a direct (non-iterative) reconstruction, typically using a form of
+        filtered backprojection.  The implementation details are geometry
+        specific, and direct_recon may not be available for all geometries.
+
+        Args:
+            sinogram (numpy or tensor): 3D sinogram data with shape
+                (num_views, num_det_rows, num_det_channels).
+            filter_name (string or None, optional): The name of the filter to
+                use.  Defaults to None, in which case the geometry-specific
+                method chooses a default, typically 'ramp'.
+            output_sharded (bool, optional): If False (default), return a
+                numpy array.  If True, return the internal device form
+                (slice shards on a multi-device model; on a single-device
+                model the output is the same tensor either way).
+
+        Returns:
+            recon (numpy or tensor): The reconstructed volume.
+        """
         raise NotImplementedError
 
     # ── projection wrappers (numpy at the public boundary) ────────────────────
@@ -1051,7 +1087,7 @@ class TomographyModel(ParameterHandler):
         """
         Perform a full forward projection at all voxels in the region of
         reconstruction (the pixels selected by the ROR mask; see
-        :func:`vcd_utils.get_2d_ror_mask`).
+        ``vcd_utils.get_2d_ror_mask``).
 
         Args:
             recon (numpy or tensor): 3D volume with shape

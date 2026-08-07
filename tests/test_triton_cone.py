@@ -1,5 +1,4 @@
-"""Value gates for the Triton cone kernels (Phase 5, increments K1 and K3:
-the back and forward bodies).
+"""Value gates for the Triton cone kernels (the back and forward bodies).
 
 Each kernel is an alternative view-batch BODY, so every gate here compares it
 against the torch body it replaces at the same inputs: parity across the
@@ -183,7 +182,7 @@ def test_cone_back_kernel_pixel_padding(num_pixels):
 
 @requires_cuda
 def test_cone_back_kernel_selection_and_end_to_end(monkeypatch):
-    # The selection contract AFTER the K2 gate: the back kernel is ON with no
+    # The selection contract after the composed gate: the back kernel is ON with no
     # env var at all, wherever the probe and the self-check pass, and the kill
     # switch still forces the torch body.  A model built that way reproduces
     # the torch projector end to end THROUGH the driver (view batching, lazy
