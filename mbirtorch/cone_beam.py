@@ -22,6 +22,8 @@ transients are (view_batch, P, S) and (view_batch, P, R), so the effective
 view batch shrinks under the same transient budget.
 """
 
+import os
+
 import numpy as np
 import torch
 import warnings
@@ -344,7 +346,35 @@ class ConeBeamModel(TomographyModel):
         self._dc_damping_slice_profile()
 
     def _view_batch_bodies(self):
-        return _cone_forward_view_batch, _cone_back_view_batch
+        # The hand-written kernels are alternative BODIES: same signatures, so
+        # nothing downstream of this hook changes.  Each is available wherever
+        # BOTH availability gates pass -- the triton probe and the first-use
+        # value self-check on the actual device (the probe-the-hardware
+        # protocol; MBIRTORCH_DISABLE_TRITON=1 is the kill switch inside the
+        # probe) -- but the SELECTION protocol is per kernel, and a kernel
+        # earns its default-on at its own composed performance gate.
+        #
+        # Back: ON by default, gates alone.  Composed gate on H100: 1.90-1.91x
+        # over the compiled torch body at the 512 and 1024 cells, values
+        # within 2.8e-4 of it, memory 0.29-0.71x.
+        # Forward: ON by default, gates alone (same protocol).  Its
+        # five-arm composed gate on H100: with BOTH kernels the 512 cell
+        # runs at jax parity (3.09 vs 3.08 s) and the 1024 cell at 1.18x of
+        # jax, at 0.56-0.60x of jax's memory -- the cone replacement rule
+        # passes at every gate cell.
+        from .kernel_availability import (cone_back_kernel_usable,
+                                          cone_forward_kernel_usable)
+        if cone_back_kernel_usable(self)[0]:
+            from .triton_cone import _cone_back_view_batch_triton
+            back_body = _cone_back_view_batch_triton
+        else:
+            back_body = _cone_back_view_batch
+        if cone_forward_kernel_usable(self)[0]:
+            from .triton_cone import _cone_forward_view_batch_triton
+            fwd_body = _cone_forward_view_batch_triton
+        else:
+            fwd_body = _cone_forward_view_batch
+        return fwd_body, back_body
 
     def _view_batch_args(self):
         gp_names = ['delta_det_row', 'delta_det_channel', 'det_row_offset',

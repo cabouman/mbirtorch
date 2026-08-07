@@ -59,7 +59,17 @@ def _shape_key(args, kwargs):
 
 def maybe_compile(fn, enabled, instance_key=None):
     """Return a compiled form of ``fn`` (cached per (function, instance_key))
-    when enabled, else ``fn`` itself.  ``instance_key`` names a distinct
+    when enabled, else ``fn`` itself.
+
+    A function carrying ``_mbirtorch_no_compile`` is returned as it is,
+    whatever ``enabled`` says: that marker is how a HAND-WRITTEN kernel body
+    (triton_cone.py) declares that it launches its own kernel and must stay
+    eager.  The marker is needed because ``torch.compiler.disable`` alone does
+    not survive an explicit compile -- ``torch.compile`` unwraps the disable
+    decorator (``innermost_fn``) and traces the original function, launch and
+    all -- so the opt-out has to be honored at the call site that compiles.
+
+    ``instance_key`` names a distinct
     compiled instance -- the per-device threads of the VCD loop pass their
     device index, because compiled artifacts carry triton-launcher state
     that must not be shared across concurrently executing threads (a shared
@@ -80,7 +90,7 @@ def maybe_compile(fn, enabled, instance_key=None):
     (A LATER per-shape recompile could still fail on a broken toolchain; in
     practice the first call exercises the backend end to end.)
     """
-    if not enabled:
+    if not enabled or getattr(fn, '_mbirtorch_no_compile', False):
         return fn
     cache_key = fn if instance_key is None else (fn, instance_key)
     if cache_key in _COMPILE_CACHE:
