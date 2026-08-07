@@ -121,6 +121,34 @@ def main():
     uv = mjp.unit_vector(np.array([3.0, 4.0, 12.0]))
     pv = mjp.project_vector_to_vector(np.array([1.0, 2.0, 2.0]), np.array([0.0, 3.0, 4.0]))
 
+    # Stripe removal: a sinogram with injected full/partial/unresponsive stripes.
+    stripe_sino = (1.0 + 0.15 * rng.rand(48, 5, 40)).astype(np.float32)
+    ramp = np.abs(np.linspace(-1, 1, 40, dtype=np.float32))
+    stripe_sino += 0.5 * (1 - ramp)[None, None, :]          # object-like channel profile
+    stripe_sino[:, :, 13] *= 1.6                            # full stripe
+    stripe_sino[10:35, :, 27] *= 0.6                        # partial stripe
+    stripe_sino[:, :, 33] = 0.05                            # unresponsive column
+    stripe_all = np.asarray(mjp.remove_all_stripe(stripe_sino.copy(), snr=3,
+                                                  large_filter_size=11, small_filter_size=5))
+    stripe_fw = np.asarray(mjp.remove_stripe_fw(jax.numpy.array(stripe_sino)))
+    offset_in = stripe_sino + np.linspace(0, 0.8, 48).astype(np.float32)[:, None, None]
+    offset_out = np.asarray(mjp.remove_sino_offset(offset_in.copy()))
+
+    # Segmentation: Otsu thresholds (exact-match gate) and plastic/metal masks.
+    otsu_img = np.concatenate([0.1 * rng.rand(3000), 0.5 + 0.1 * rng.rand(2000),
+                               2.0 + 0.2 * rng.rand(800), 5.0 + 0.3 * rng.rand(300)]).astype(np.float32)
+    otsu_3 = np.array(mjp.multi_threshold_otsu(otsu_img, classes=3), dtype=np.float64)
+    otsu_4 = np.array(mjp.multi_threshold_otsu(otsu_img, classes=4), dtype=np.float64)
+    otsu_mask = otsu_img < 4.0
+    otsu_masked = np.array(mjp.multi_threshold_otsu(otsu_img, classes=3, valid_mask=otsu_mask),
+                           dtype=np.float64)
+
+    seg_vol = np.zeros((40, 40, 30), dtype=np.float32)
+    seg_vol[8:32, 8:32, 5:25] = 0.4 + 0.05 * rng.rand(24, 24, 20).astype(np.float32)
+    seg_vol[15:25, 15:25, 10:20] = 3.0 + 0.1 * rng.rand(10, 10, 10).astype(np.float32)
+    seg_vol[18:22, 18:22, 13:17] = 7.0 + 0.2 * rng.rand(4, 4, 4).astype(np.float32)
+    seg_pm, seg_mm, seg_ps, seg_ms = mjp.segment_plastic_metal(seg_vol.copy(), num_metal=2)
+
     # mbirjax-written cone-preprocessing save: pins the on-disk format.
     h5_path = os.path.join(OUT_DIR, 'preprocess_goldens_cone_save.h5')
     mjp.save_cone_preprocessing(
@@ -156,6 +184,14 @@ def main():
         scaling_factor=np.float64(scaling_factor),
         pis_in=pis_in, pis_indices=pis_indices, pis_out=pis_out,
         alu=np.float64(alu), uv=uv, pv=pv,
+        stripe_sino=stripe_sino, stripe_all=stripe_all.astype(np.float32),
+        stripe_fw=stripe_fw.astype(np.float32),
+        offset_in=offset_in.astype(np.float32), offset_out=offset_out.astype(np.float32),
+        otsu_img=otsu_img, otsu_3=otsu_3, otsu_4=otsu_4,
+        otsu_mask=otsu_mask, otsu_masked=otsu_masked,
+        seg_vol=seg_vol, seg_pm=np.asarray(seg_pm, dtype=np.float32),
+        seg_mm=np.stack([np.asarray(m, dtype=np.float32) for m in seg_mm]),
+        seg_ps=np.float64(seg_ps), seg_ms=np.array(seg_ms, dtype=np.float64),
     )
     print('wrote', out)
     print('wrote', h5_path)
