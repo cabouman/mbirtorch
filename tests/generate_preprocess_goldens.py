@@ -149,6 +149,71 @@ def main():
     seg_vol[18:22, 18:22, 13:17] = 7.0 + 0.2 * rng.rand(4, 4, 4).astype(np.float32)
     seg_pm, seg_mm, seg_ps, seg_ms = mjp.segment_plastic_metal(seg_vol.copy(), num_metal=2)
 
+    # MAR: shared cone case.  The direct recon is saved as the SHARED input to the correction so the
+    # theta / corrected-sinogram parity does not depend on recon parity.
+    mar_cell = (24, 24, 24)
+    mar_angles = np.linspace(0, 2 * np.pi, mar_cell[0], endpoint=False)
+    mar_model = mbirjax.ConeBeamModel(mar_cell, mar_angles,
+                                      source_detector_dist=4 * mar_cell[2],
+                                      source_iso_dist=2 * mar_cell[2])
+    mar_model.set_params(no_warning=True, verbose=0)
+    mar_rshape = tuple(int(v) for v in mar_model.get_params('recon_shape'))
+    mar_phantom = np.zeros(mar_rshape, dtype=np.float32)
+    mar_phantom[6:18, 6:18, 6:18] = 0.02
+    mar_phantom[10:14, 10:14, 10:14] = 0.2
+    mar_sino = np.asarray(mar_model.forward_project(mar_phantom))
+    mar_weights = np.asarray(mbirjax.gen_weights(mar_sino / mar_sino.max(),
+                                                 weight_type='transmission_root'))
+    mar_recon_input = np.asarray(mar_model.direct_recon(mar_sino))
+
+    # Huber weights and BH_correction.
+    hub_w = (0.5 + rng.rand(6, 8, 10)).astype(np.float32)
+    hub_e = rng.randn(6, 8, 10).astype(np.float32)
+    hub_out = np.asarray(mjp.gen_huber_weights(hub_w, hub_e, T=1.0, delta=0.7))
+    bhc_alpha = [1.0, 0.2, 0.05]
+    bhc_out = np.asarray(mjp.BH_correction(mar_sino, bhc_alpha, batch_size=7))
+
+    # gen_weights_mar, both paths.
+    gwm_sino_path = np.asarray(mbirjax.gen_weights_mar(mar_model, mar_sino))
+    gwm_recon_path = np.asarray(mbirjax.gen_weights_mar(mar_model, mar_sino,
+                                                        init_recon=mar_recon_input))
+
+    # Fitted theta via the same internal chain the correction uses, on the shared recon input.
+    import mbirjax.preprocess.mar as mjmar
+    num_metal, order = 1, 3
+    metal_exp = mjmar._generate_metal_exponent_list(num_metal, order)
+    cross_exp = mjmar._generate_metal_exponent_list(num_metal, order - 1)
+    H_exp = ([(1,) + (0,) * num_metal] + [(1, *t) for t in cross_exp] + [(0, *t) for t in metal_exp])
+    p_est, m_est = mjmar._est_plastic_metal_sinos_from_recon(mar_recon_input, num_metal, mar_model)
+    p_scale = float(jax.numpy.max(jax.numpy.abs(p_est)))
+    m_scales = [float(jax.numpy.max(jax.numpy.abs(m))) for m in m_est]
+    p_est_n = p_est / p_scale
+    m_est_n = [m / s for m, s in zip(m_est, m_scales)]
+    mar_theta = np.asarray(mjmar._estimate_BH_model_params(
+        p_est_n, m_est_n, mar_model.prepare_sino_for_devices(mar_sino), H_exp, len(cross_exp),
+        alpha=1, beta=0.002))
+
+    # Corrected sinogram from the public entry point on the shared recon input.
+    mar_corrected = np.asarray(mjp.correct_sino_plastic_metal(
+        mar_model, mar_sino, mar_recon_input, num_metal=1, order=3))
+
+    # One-BH-pass recon (seeded); parity is measured loosely (recon in the loop).
+    np.random.seed(11)
+    mar_recon_out = np.asarray(mjp.recon_plastic_metal(
+        mar_model, mar_sino, mar_weights, num_BH_iterations=1, max_iterations=5,
+        num_metal=1, verbose=0, logfile_path=None))
+
+    # Alignment trio on the shared inputs.
+    align_shifts = np.asarray(mjp.estimate_sino_view_offset(mar_model, mar_sino, mar_recon_input))
+    align_out = np.asarray(mjp.align_sino_views(mar_model, mar_sino, mar_recon_input))
+
+    # median_filter3d with min/max.
+    med_in = rng.rand(20, 12, 14).astype(np.float32)
+    med_out = np.asarray(mbirjax.median_filter3d(med_in, max_block_gb=0.0001))
+    med_m, med_min, med_max = (np.asarray(a) for a in
+                               mbirjax.median_filter3d(med_in, max_block_gb=0.0001,
+                                                       return_min_max=True))
+
     # mbirjax-written cone-preprocessing save: pins the on-disk format.
     h5_path = os.path.join(OUT_DIR, 'preprocess_goldens_cone_save.h5')
     mjp.save_cone_preprocessing(
@@ -192,6 +257,22 @@ def main():
         seg_vol=seg_vol, seg_pm=np.asarray(seg_pm, dtype=np.float32),
         seg_mm=np.stack([np.asarray(m, dtype=np.float32) for m in seg_mm]),
         seg_ps=np.float64(seg_ps), seg_ms=np.array(seg_ms, dtype=np.float64),
+        mar_cell=np.array(mar_cell), mar_angles=mar_angles,
+        mar_sdd=np.float64(4 * mar_cell[2]), mar_sid=np.float64(2 * mar_cell[2]),
+        mar_phantom=mar_phantom, mar_sino=mar_sino.astype(np.float32),
+        mar_weights=mar_weights.astype(np.float32),
+        mar_recon_input=mar_recon_input.astype(np.float32),
+        mar_theta=mar_theta.astype(np.float64),
+        mar_corrected=mar_corrected.astype(np.float32),
+        mar_recon_out=mar_recon_out.astype(np.float32),
+        hub_w=hub_w, hub_e=hub_e, hub_out=hub_out.astype(np.float32),
+        bhc_alpha=np.array(bhc_alpha), bhc_out=bhc_out.astype(np.float32),
+        gwm_sino_path=gwm_sino_path.astype(np.float32),
+        gwm_recon_path=gwm_recon_path.astype(np.float32),
+        align_shifts=align_shifts.astype(np.float64),
+        align_out=align_out.astype(np.float32),
+        med_in=med_in, med_out=med_out.astype(np.float32),
+        med_min=med_min.astype(np.float32), med_max=med_max.astype(np.float32),
     )
     print('wrote', out)
     print('wrote', h5_path)

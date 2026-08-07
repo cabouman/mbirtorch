@@ -298,3 +298,60 @@ def estimate_background_cluster_boundaries(sinogram):
         right_boundary_idx += 1
 
     return centers[left_boundary_idx], centers[right_boundary_idx]
+
+
+def gen_weights_mar(ct_model, sinogram, init_recon=None, metal_threshold=None, beta=1.0, gamma=3.0):
+    """
+    Generates the weights used for reducing metal artifacts in MBIR reconstruction.
+
+    This function computes sinogram weights that help to reduce metal artifacts.
+    More specifically, it computes weights with the form:
+
+        weights = exp( -(sinogram/beta) * ( 1 + gamma * delta(metal) ) )
+
+    delta(metal) denotes a binary mask indicating the sino entries that contain projections of metal.
+    Providing ``init_recon`` yields better metal artifact reduction.
+    If not provided, the metal segmentation is generated directly from the sinogram.
+
+    Args:
+        sinogram (ndarray): 3D array containing sinogram with shape (num_views, num_det_rows, num_det_channels).
+        init_recon (ndarray, optional): An initial reconstruction used to identify metal voxels. If not provided, Otsu's method is used to directly segment sinogram into metal regions.
+        metal_threshold (float, optional): Values in ``init_recon`` above ``metal_threshold`` are classified as metal. If not provided, Otsu's method is used to segment ``init_recon``.
+        beta (float, optional): Scalar value in range :math:`>0`.
+            A larger ``beta`` improves the noise uniformity, but too large a value may increase the overall noise level.
+        gamma (float, optional): Scalar value in range :math:`>=0`.
+            A larger ``gamma`` reduces the weight of sinogram entries with metal, but too large a value may reduce image quality inside the metal regions.
+
+    Returns:
+        (ndarray): Weights used in reconstruction, with the same array shape as ``sinogram``
+    """
+    import mbirtorch.preprocess as mtp
+
+    # If init_recon is not provided, then identify the distorted sino entries with Otsu's thresholding method.
+    if init_recon is None:
+        print("init_recon is not provided. Automatically determine distorted sinogram entries with Otsu's method.")
+        # assuming three categories: metal, non_metal, and background.
+        [bk_thresh_sino, metal_thresh_sino] = mtp.multi_threshold_otsu(sinogram, classes=3)
+        print("Distorted sinogram threshold = ", metal_thresh_sino)
+        delta_metal = (np.asarray(sinogram) > metal_thresh_sino).astype(np.float32)
+
+    # If init_recon is provided, identify the distorted sino entries by forward projecting init_recon.
+    else:
+        if metal_threshold is None:
+            print("Metal_threshold calculated with Otsu's method.")
+            # assuming three categories: metal, non_metal, and background.
+            [bk_threshold, metal_threshold] = mtp.multi_threshold_otsu(init_recon, classes=3)
+
+        print("metal_threshold = ", metal_threshold)
+        # Identify metal voxels
+        metal_mask = (np.asarray(init_recon) > metal_threshold).astype(np.float32)
+        # Forward project metal mask to generate a sinogram mask
+        metal_mask_projected = ct_model.forward_project(metal_mask)
+
+        # metal mask in the sinogram domain, where 1 means a distorted sino entry, and 0 else.
+        delta_metal = (np.asarray(metal_mask_projected) > 0.0).astype(np.float32)
+
+    # weights for undistorted sino entries
+    weights = np.exp(-np.asarray(sinogram) * (1 + gamma * delta_metal) / beta)
+
+    return weights

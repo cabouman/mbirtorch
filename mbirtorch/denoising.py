@@ -279,3 +279,89 @@ class QGGMRFDenoiser(TomographyModel):
                          'model_params': {k: v.val for k, v in self.params.items()}}
         denoised = flat_image.reshape(tuple(image_shape))
         return (denoised if output_sharded else self._gather_recon(denoised)), denoiser_dict
+
+
+def median_filter3d(x, max_block_gb=4.0, return_min_max=False):
+    """
+    Apply a 27‑point (3x3x3) median filter to a 3‑D array using replicated
+    (edge) boundary conditions.  Optionally return the min and max in each 27 point neighborhood.
+
+    The volume is processed in d0‑blocks to limit peak device memory.  Each block is padded with
+    a one‑voxel halo; halos duplicate the nearest edge voxel so that the result
+    matches NumPy's `"edge"` mode.
+
+    Args:
+        x (ndarray or tensor): Input array.
+        max_block_gb (float. optional): A rough upper bound on the amount of memory in GB to use for the filtering.  Defaults to 4.0.
+        return_min_max (bool, optional): If true, the output is a tuple of median, min, max.
+
+    Returns:
+
+        ndarray or tensor (or tuple of 3): An array of the same shape and dtype as *x* containing the
+        median‑filtered result, on the same array module as the input.
+
+    Notes
+    -----
+    * The function automatically splits the 0‑dimension into blocks so that at
+      most roughly ``max_block_gb`` of temporary data are materialised.
+      If the array is large and the 0 dimension is small relative to another dimension, it may be more memory efficient
+      to swap axis 0 with the long axis before applying median_filter3d.
+    * Within each block the filter is computed by rolling the data in all 26
+      neighbour directions, stacking the 27 volumes, and taking
+      the median along the new axis.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> import mbirtorch
+    >>> vol = np.arange(27.).reshape(3, 3, 3)
+    >>> mbirtorch.median_filter3d(vol)
+    """
+    import torch.nn.functional as F
+    from .tomography_model import _resolve_device
+
+    was_numpy = not isinstance(x, torch.Tensor)
+    if was_numpy:
+        xt = torch.as_tensor(np.asarray(x), device=_resolve_device('auto'))
+    else:
+        xt = x
+    d0, d1, d2 = xt.shape
+    x_gb = xt.numel() * 4 / (1024**3)
+    num_blocks = int(np.ceil(27 * x_gb / max_block_gb))
+    block_size = max(d0 // max(num_blocks, 1), 1)
+
+    # 1) Pad every dim by 1 for the edge‐replicated halo
+    xp = F.pad(xt[None, None], (1, 1, 1, 1, 1, 1), mode='replicate')[0, 0]   # (d0+2, d1+2, d2+2)
+
+    # 2) Pad d0 *further* up to a multiple of block_size, only at the end so fixed-size blocks tile it
+    n_blocks = (d0 + block_size - 1) // block_size
+    padded_Z = n_blocks * block_size
+    pad_extra = padded_Z - d0
+    if pad_extra > 0:
+        xp = F.pad(xp[None, None], (0, 0, 0, 0, 0, pad_extra), mode='replicate')[0, 0]
+
+    med_blocks, min_blocks, max_blocks = [], [], []
+    with torch.no_grad():
+        for i in range(n_blocks):
+            z0 = i * block_size
+            block = xp[z0:z0 + block_size + 2]
+
+            # the 27‐roll → stack → median recipe on this small block
+            patches = [
+                torch.roll(block, shifts=(dz, dy, dx), dims=(0, 1, 2))
+                for dz in (-1, 0, 1) for dy in (-1, 0, 1) for dx in (-1, 0, 1)
+            ]
+            stacked = torch.stack(patches, dim=0)          # (27, blkZ+2, d1+2, d2+2)
+            filtered = torch.median(stacked, dim=0).values
+            med_blocks.append(filtered[1:-1, 1:-1, 1:-1])
+            if return_min_max:
+                min_blocks.append(torch.min(stacked, dim=0).values[1:-1, 1:-1, 1:-1])
+                max_blocks.append(torch.max(stacked, dim=0).values[1:-1, 1:-1, 1:-1])
+
+    def stitch(blocks):
+        out = torch.cat(blocks, dim=0)[:d0]
+        return out.cpu().numpy() if was_numpy else out
+
+    if return_min_max:
+        return stitch(med_blocks), stitch(min_blocks), stitch(max_blocks)
+    return stitch(med_blocks)

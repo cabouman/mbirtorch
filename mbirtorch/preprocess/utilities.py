@@ -638,8 +638,10 @@ def compute_scaling_factor(target_vect, vect_to_scale) -> float:
         >>> u = np.array([0.5, 1.0, 1.5])
         >>> alpha = compute_scaling_factor(v,u)
     """
-    target_vect = torch.as_tensor(np.asarray(target_vect))
-    vect_to_scale = torch.as_tensor(np.asarray(vect_to_scale))
+    if not isinstance(target_vect, torch.Tensor):
+        target_vect = torch.as_tensor(np.asarray(target_vect))
+    if not isinstance(vect_to_scale, torch.Tensor):
+        vect_to_scale = torch.as_tensor(np.asarray(vect_to_scale), device=target_vect.device)
 
     numerator = torch.sum(vect_to_scale * target_vect)
     denominator = torch.sum(vect_to_scale * vect_to_scale)
@@ -949,6 +951,165 @@ def finalize_model(sino, required_params, optional_params, *, auto_crop=False, s
         sino, required_params, optional_params = _auto_crop_sino(sino, required_params, optional_params, safety_buffer)
     model = mt.build_model(required_params, optional_params)
     return sino, model
+
+
+def estimate_sino_view_offset(ct_model, sino, direct_recon):
+    """
+    Estimate per-view 2D shifts for a sinogram.
+
+    This function estimate the shifts in three steps:
+    1. Forward project the preliminary reconstruction using the CT model.
+    2. Apply high-pass filtering to both the sinogram and the
+        forward projection of the preliminary reconstruction.
+    3. For each view, estimate a 2D shift that aligns the sinogram view
+        to the corresponding forward-projected view using an image alignment method from OpenCV
+
+    Args:
+        ct_model (mt.TomographyModel): A CT model object that defined the CT geometry.
+        sino (numpy array or tensor): 3D sinogram data with shape (num_views, num_det_rows, num_det_channels).
+        direct_recon (numpy array or tensor): A preliminary 3D reconstruction of the sinogram.
+
+    Returns:
+        estimated_shifts (numpy.array): A (num_views, 2) array of per-view shift (y, x) in pixels.
+            Each shift specified how much the corresponding sinogram slice should be shifted to match forward projection.
+            Positive x shifts the view right. Positive y shifts the view down.
+    """
+    import cv2
+
+    # Verify the input recon shape
+    recon_shape = ct_model.get_params('recon_shape')
+    if tuple(direct_recon.shape) != tuple(recon_shape):
+        raise ValueError("Input recon shape does not match ct_model's recon shape.")
+
+    # Forward project the reconstruction
+    sino_from_recon = ct_model.forward_project(direct_recon)
+
+    # Apply a high-pass filter to sinogram and forward projection of the reconstruction
+    filtered_sino = sino_high_pass_filtering(sino)
+    filtered_sino_from_recon = sino_high_pass_filtering(sino_from_recon)
+
+    # Estimate the shift between original sinogram and forward projected recon
+    num_slices, num_rows, num_channels = sino.shape
+    estimated_shifts = np.zeros((num_slices, 2))
+
+    warp_matrix = np.eye(2, 3, dtype=np.float32)
+    for slice_index in range(num_slices):
+        sino_from_recon_view = np.asarray(filtered_sino_from_recon[slice_index, :, :], dtype=np.float32)
+        sino_view = np.asarray(filtered_sino[slice_index, :, :], dtype=np.float32)
+        cc, warp_matrix = cv2.findTransformECC(sino_from_recon_view, sino_view, warp_matrix,
+                                               cv2.MOTION_TRANSLATION)
+        estimated_shifts[slice_index, 0] = -warp_matrix[1, 2]
+        estimated_shifts[slice_index, 1] = -warp_matrix[0, 2]
+
+    return estimated_shifts
+
+
+def sino_high_pass_filtering(sino, sigma_row=3.0, sigma_col=15.0, subtract_view_mean=True):
+    """
+    High-pass filter for 3D cone-beam sinogram.
+
+    Args:
+        sino (numpy array or tensor): 3D sinogram data with shape (num_views, num_det_rows, num_det_channels).
+        sigma_row (float, optional): Gaussian sigma along detector rows (vertical). Use smaller value than sigma_col.
+        Defaults to 3.0.
+        sigma_col (float, optional): Gaussian sigma along detector channels (horizontal). Defaults to 15.0.
+        subtract_view_mean (bool, optional): If True, subtract per-view mean (DC offset removal). Defaults to True.
+
+    Returns:
+        filtered_sino (numpy array): High-pass filtered sinogram, same shape as input.
+    """
+    import cv2
+
+    if isinstance(sino, torch.Tensor):
+        sino = sino.detach().cpu().numpy()
+    sino_np = np.asarray(sino)
+    if sino_np.ndim != 3:
+        raise ValueError(f"Expected shape (num_views, num_det_rows, num_det_channels), got {sino_np.shape}")
+
+    num_views, num_det_rows, num_det_channels = sino_np.shape
+    filtered_sino = np.empty_like(sino_np)
+
+    for view in range(num_views):
+        single_view = sino_np[view]
+
+        # Subtract per-view mean
+        if subtract_view_mean:
+            single_view = single_view - single_view.mean()
+
+        # Estimate low frequency component for each view
+        loss_pass_estimate = cv2.GaussianBlur(
+            single_view,
+            ksize=(0, 0),
+            sigmaX=sigma_col,
+            sigmaY=sigma_row,
+            borderType=cv2.BORDER_REFLECT,
+        )
+
+        filtered_sino[view] = single_view - loss_pass_estimate
+
+    return filtered_sino
+
+
+def _translate_views_bilinear(sino, shifts):
+    """Shift each view of a sinogram by its own (dy, dx) with bilinear interpolation, zero outside.
+
+    Matches a linear scale-and-translate with unit scale: output(i, j) samples the input at
+    (i - dy, j - dx); samples outside the view are zero.
+    """
+    sino = torch.as_tensor(np.asarray(sino))
+    shifts = np.asarray(shifts, dtype=np.float64)
+    num_views, num_rows, num_cols = sino.shape
+    dtype = sino.dtype
+    grid_i, grid_j = torch.meshgrid(torch.arange(num_rows, dtype=dtype),
+                                    torch.arange(num_cols, dtype=dtype), indexing='ij')
+    out = torch.empty_like(sino)
+    for v in range(num_views):
+        dy, dx = float(shifts[v, 0]), float(shifts[v, 1])
+        src_row = grid_i - dy
+        src_col = grid_j - dx
+        lower_row = torch.floor(src_row)
+        lower_col = torch.floor(src_col)
+        frac_row = src_row - lower_row
+        frac_col = src_col - lower_col
+        r0 = torch.clamp(lower_row.to(torch.int64), 0, num_rows - 1)
+        r1 = torch.clamp(torch.ceil(src_row).to(torch.int64), 0, num_rows - 1)
+        c0 = torch.clamp(lower_col.to(torch.int64), 0, num_cols - 1)
+        c1 = torch.clamp(torch.ceil(src_col).to(torch.int64), 0, num_cols - 1)
+        view = sino[v]
+        shifted = (((1.0 - frac_row) * (1.0 - frac_col)) * view[r0, c0]
+                   + ((1.0 - frac_row) * frac_col) * view[r0, c1]
+                   + (frac_row * (1.0 - frac_col)) * view[r1, c0]
+                   + (frac_row * frac_col) * view[r1, c1])
+        in_bounds = ((src_row >= 0) & (src_row <= num_rows - 1)
+                     & (src_col >= 0) & (src_col <= num_cols - 1)).to(dtype)
+        out[v] = shifted * in_bounds
+    return out
+
+
+def align_sino_views(ct_model, sino, direct_recon):
+    """
+    Align each sinogram view using estimated per-view shifts.
+
+    This function performs sinogram alignment in two steps:
+    1. Estimate a 2D shift for each sinogram view.
+    2. Align each sinogram view using the estimated shift with the forward projected reconstruction.
+
+    The alignment helps correct small per-view misalignments between the
+    measured sinogram and the forward projection of a preliminary reconstruction.
+
+    Args:
+        ct_model (mt.TomographyModel): A CT model object that defined the CT geometry.
+        sino (numpy array or tensor): 3D sinogram data with shape (num_views, num_det_rows, num_det_channels).
+        direct_recon (numpy array or tensor): A preliminary 3D reconstruction of the sinogram.
+
+    Returns:
+        numpy array: Aligned sinogram with the same shape as the input sinogram (num_views, num_det_rows, num_det_channels).
+    """
+    # Estimate per-view shift of the sinogram
+    estimated_shifts = estimate_sino_view_offset(ct_model, sino, direct_recon)
+
+    # Align each view of the sinogram using estimated shifts
+    return _translate_views_bilinear(sino, estimated_shifts).cpu().numpy()
 
 
 # Conversion of a length unit to micrometers; 1 ALU is defined as 1 unit of the caller's alu_unit.
