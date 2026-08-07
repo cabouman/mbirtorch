@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mbirtorch"
 version = "0.0.1"
-description = "High-performance tomographic reconstruction (PyTorch port of mbirjax; Phase 0 scaffold)"
+description = "High-performance tomographic reconstruction using PyTorch"
 keywords = ["tomography", "tomographic reconstruction", "computed tomography"]
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [
-    { name = "MBIRJAX development team", email = "buzzard@purdue.edu" }
+    { name = "MBIRTORCH development team", email = "buzzard@purdue.edu" }
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -20,23 +20,32 @@ classifiers = [
 ]
 requires-python = ">=3.11"
 dependencies = [
-    # Pinning style follows mbirjax's pyproject: a FLOOR that advances deliberately, plus
-    # known-bad exclusions as they are found (none yet).  The floor is the torch recorded at
-    # Phase 0 start (port_plan.md section 9); re-test on each torch bump via the metrics
+    # Pinning style: a FLOOR that advances deliberately, plus
+    # known-bad exclusions as they are found (none yet).
+    # Re-test on each torch bump via the metrics
     # harness backend cells before advancing it.
-    "torch>=2.13",  # the Phase 0 recorded version (2.13.0, 2026-08-04)
+    "torch>=2.13",
     "numpy",
     # The slice viewer (mbirtorch/viewer.py) needs matplotlib always and h5py
     # for HDF5 load/save (imported lazily, but required for full function).
     # Both unversioned, matching mbirjax's pyproject.
     "matplotlib",
     "h5py",
-    # get_memory_stats reads host RSS/USS via psutil (mbirjax parity).
+    # get_memory_stats reads host RSS/USS via psutil.
     "psutil",
 ]
 
 [project.optional-dependencies]
-test = ["pytest"]
+
+test = ["pytest", "pytest-xdist"]
+docs = [
+     "sphinx",
+     "sphinxcontrib-bibtex",
+     "sphinx-book-theme>=1.0.1",
+     "sphinx-design",
+     "sphinx-copybutton"
+]
+
 
 [tool.setuptools.packages]
 # Restrict discovery to the mbirtorch package (same rationale as mbirjax: the TOML `find`
