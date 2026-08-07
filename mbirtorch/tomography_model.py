@@ -2583,3 +2583,175 @@ class TomographyModel(ParameterHandler):
     def reshape_recon(self, recon):
         recon_shape = self.get_params('recon_shape')
         return recon.reshape(recon_shape)
+
+    # ── model description and HDF5 persistence ────────────────────────────────
+
+    def get_all_params(self):
+        """
+        Return this model's parameters as ``(required_params, optional_params, regularization)``.
+
+        This is the single source of truth for reading a model's parameters back out.  The three
+        dicts partition the parameters so a caller can reconstruct or serialize the model and choose
+        which parts to apply:
+
+        * **required_params** -- the arguments the model constructor takes (from its ``__init__``
+          signature), with the view-dependent arguments reconstructed from storage (e.g. cone's
+          ``angles`` and ``helical_z_shifts`` are unpacked from the stored ``view_params_array``),
+          plus a ``geometry_type`` entry so the model class can be resolved.
+        * **optional_params** -- the remaining geometry/detector parameters that are applied with
+          ``set_params`` (detector pitches, offsets, ``delta_voxel``, ``recon_shape``, voxel aspects).
+        * **regularization** -- the recon-time regularization knobs (``sigma_y``, ``sigma_x``,
+          ``sigma_prox``, ``snr_db``, ``sharpness``, ``auto_regularize_flag``), separated so a
+          consumer such as ``save_cone_preprocessing`` can drop them and let them be re-chosen at
+          reconstruction time.
+
+        Returns:
+            tuple: ``(required_params, optional_params, regularization)`` -- three dicts of values.
+        """
+        import inspect
+
+        regularization_names = _AUTO_REGULARIZATION_PARAM_NAMES + (
+            'snr_db', 'sharpness', 'auto_regularize_flag')
+        # Internal bookkeeping params that are re-derived at construction: geometry_type is moved
+        # into required_params (as the class identity); the rest are set by the geometry
+        # constructors.
+        construction_derived_names = ('geometry_type', 'view_params_name', 'file_format',
+                                      'version', 'use_gpu')
+        # Execution-environment constructor arguments; not model parameters.
+        environment_args = ('self', 'device', 'view_batch_size', 'compile_mode')
+
+        ctor_names = [n for n in inspect.signature(type(self).__init__).parameters
+                      if n not in environment_args]
+        view_params_name = self.get_params('view_params_name')
+        view_array = np.asarray(self.get_params(view_params_name))
+
+        required_params = {}
+        for name in ctor_names:
+            if name in self.params:
+                required_params[name] = self.get_params(name)
+            elif name == 'angles':
+                required_params[name] = view_array[:, 0] if view_array.ndim == 2 else view_array
+            elif name == 'helical_z_shifts' and view_array.ndim == 2:
+                required_params[name] = view_array[:, 1]
+
+        optional_params = {}
+        for key in self.params:
+            if (key in ctor_names or key == view_params_name
+                    or key in construction_derived_names or key in regularization_names):
+                continue
+            optional_params[key] = self.get_params(key)
+
+        required_params['geometry_type'] = str(type(self))
+
+        regularization = {name: self.get_params(name)
+                          for name in regularization_names if name in self.params}
+
+        return required_params, optional_params, regularization
+
+    def get_recon_dict(self, recon_params=None, notes=None, save_log=True, save_model=True, str_format=False):
+        """
+        Encapsulate the recon parameters, logs, notes, and optionally all model parameters to a text-based dict
+        with entries 'recon_params', 'recon_log', 'notes', and optionally 'model_params'.  This dict can be used with
+        :func:`mbirtorch.slice_viewer` and :meth:`TomographyModel.save_recon_hdf5`.
+
+        Args:
+            recon_params (dict, optional): dict of reconstruction parameters. Defaults to None.
+            notes (str, optional): User-supplied notes to attach to the dataset. Defaults to None.
+            save_log (bool, optional): If True, saves the internal log buffer (if available). Defaults to True.
+            save_model (bool, optional): If True, saves the model parameters. Defaults to True.
+            str_format (bool, optional): If True, then each top level entry is serialized to a string.
+
+        Returns:
+            dict: A dict with entries
+                 - 'recon_params'
+                 - 'notes'
+                 - 'recon_log'
+                 - 'model_params'.
+
+        Example:
+            >>> recon, recon_dict = ct_model.recon(sinogram)
+            >>> print(recon_dict['recon_log'])
+        """
+        recon_dict = dict()
+        if recon_params is None:
+            recon_dict['recon_params'] = "# Recon params not saved."
+        else:
+            recon_dict['recon_params'] = recon_params
+
+        log_buffer = getattr(self, 'log_buffer', None)
+        if log_buffer is None or not save_log:
+            recon_dict['recon_log'] = "# Log info not saved."
+        else:
+            recon_dict['recon_log'] = log_buffer.getvalue()
+
+        if notes is None:
+            notes = '# No notes saved'
+        recon_dict['notes'] = notes
+
+        if save_model:
+            recon_dict['model_params'] = {k: v.val for k, v in self.params.items()}
+        else:
+            recon_dict['model_params'] = '# Model not saved'
+
+        if str_format:
+            from .view_utils import convert_subdicts_to_strings
+            recon_dict = convert_subdicts_to_strings(recon_dict)
+
+        return recon_dict
+
+    def save_recon_hdf5(self, filepath, recon, recon_dict=None):
+        """
+        Save the reconstruction array and optionally the recon_dict from :meth:`~mbirtorch.TomographyModel.recon`.
+
+        This method creates a file that contains a single dataset named 'recon', with the entries in recon_dict
+        serialized to strings and saved as hdf5 dataset attributes.
+
+        The resulting file can be loaded with :meth:`load_recon_hdf5` or :func:`mbirtorch.slice_viewer`.
+
+        Args:
+            filepath (str or Path): Path to the output HDF5 file. Should typically end with a .h5 extension.
+            recon (array-like): The reconstruction volume as a NumPy array or torch tensor.
+            recon_dict (dict or None, optional): The dictionary of recon attributes from :meth:`get_recon_dict`
+
+        Raises:
+            Exception: If saving the file or directory creation fails.
+
+        Example:
+            >>> recon, recon_dict = ct_model.recon(sinogram)
+            >>> recon_dict['notes'] += 'Test scan'
+            >>> ct_model.save_recon_hdf5("output/my_recon.h5", recon, recon_dict=recon_dict)
+        """
+        from .utilities import save_data_hdf5, _to_host
+        arr = _to_host(recon)
+        save_data_hdf5(filepath, arr, 'recon', recon_dict)
+
+        # Log the save
+        if self.logger:
+            self.logger.info(f"Saved reconstruction and params to '{filepath}'")
+
+    @staticmethod
+    def load_recon_hdf5(filepath):
+        """
+        This function loads a numpy array stored in an HDF5 file created by :meth:`~mbirtorch.TomographyModel.save_recon_hdf5`.
+        It also loads any associated attribute dict.
+
+        Args:
+            filepath (str): Path to the HDF5 file containing the reconstructed volume.
+
+        Returns:
+            (recon, recon_dict)
+                - recon (ndarray): The array saved by save_recon_hdf5()
+                - recon_dict (dict): A dict with the attributes for the data array as in :meth:`get_recon_dict`
+
+        Raises:
+            FileNotFoundError: If the file does not exist.
+            ValueError: If more than one dataset is found in the file.
+
+        Example:
+            >>> recon, recon_dict = ct_model.load_recon_hdf5("output/recon_volume.h5")
+            >>> recon.shape
+            (64, 256, 256)
+        """
+        from .utilities import load_data_hdf5
+        recon, recon_dict = load_data_hdf5(filepath)
+        return recon, recon_dict
