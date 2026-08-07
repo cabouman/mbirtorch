@@ -42,6 +42,10 @@ dependencies = [
     # opencv-python provides the view-alignment ECC estimator and Gaussian filtering.
     "osqp",
     "opencv-python",
+    # Vendor loaders: olefile parses Zeiss/Xradia OLE containers; gdown fetches
+    # Google Drive-hosted demo datasets in download_and_extract.
+    "olefile",
+    "gdown",
     # get_memory_stats reads host RSS/USS via psutil.
     "psutil",
 ]
