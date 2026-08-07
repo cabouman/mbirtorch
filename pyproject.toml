@@ -31,6 +31,13 @@ dependencies = [
     # Both unversioned, matching mbirjax's pyproject.
     "matplotlib",
     "h5py",
+    # The preprocess package needs scipy (filters, fitting), tifffile (scan
+    # readers), tqdm (batch progress), and pywavelets (wavelet-FFT stripe
+    # removal).  All unversioned, matching mbirjax's pyproject.
+    "scipy",
+    "tifffile",
+    "tqdm",
+    "pywavelets",
     # get_memory_stats reads host RSS/USS via psutil.
     "psutil",
 ]
