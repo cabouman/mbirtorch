@@ -105,6 +105,14 @@ PARALLEL_BACK_NUM_STAGES = 1
 # The smallest tile worth launching: a row band or pixel subset below this pads
 # rather than shrinking further.
 PARALLEL_BACK_MIN_TILE = 8
+# The driver's nominal view chunk for this kernel's batches: the batch this
+# body asks for when the model's view_batch_size is None (automatic).  The
+# batching rule rides on the body (see _parallel_back_view_batch_cost and
+# Projectors._effective_view_batch), because the torch bodies' gather-slab
+# charge would force view batch 1 at large cells for a kernel that holds no
+# such slab.  Swept beside the tile constants; the driver's transient budget
+# may cap the realized batch below it.
+PARALLEL_BACK_VIEW_CHUNK = 128
 
 # The forward pin is the cone-seeded config, confirmed by its own sweep: best
 # at the 1024 cell outright and within 3.5 percent of best at 512, where the
@@ -118,6 +126,8 @@ PARALLEL_FWD_NUM_WARPS = 8
 # 1 stage: the tap loop is atomic-bound rather than dot-bound.
 PARALLEL_FWD_NUM_STAGES = 1
 PARALLEL_FWD_MIN_TILE = 8
+# The forward's nominal view chunk (see PARALLEL_BACK_VIEW_CHUNK).
+PARALLEL_FWD_VIEW_CHUNK = 128
 
 
 @_jit
@@ -278,6 +288,31 @@ def _parallel_back_view_batch_triton(sino_batch, pixel_indices,
 _parallel_back_view_batch_triton._mbirtorch_no_compile = True
 
 
+def _parallel_back_view_batch_cost(num_pixels, band_rows, args):
+    """Charged bytes resident per view in one back-kernel batch, and this
+    kernel's nominal view chunk -- the driver's batching rule for this body,
+    read through the ``_view_batch_cost`` attribute in
+    ``Projectors._effective_view_batch``.
+
+    One view of a batch holds the hfan contract at 16 bytes per
+    (view, pixel): ``n_p`` (f32) and ``centers`` (i32) held, plus the
+    builder's live intermediate and an expression temporary of the same
+    footprint (``W_p_c`` and ``weight_scale`` ride as per-view scalars).  It
+    also holds the channel-major copy of its sinogram plane (``sino_t``
+    above).  Call-fixed tensors -- the (P, rows) output partial -- exist at
+    any batch size, so the batch choice cannot control them and they are not
+    charged, exactly as the torch-body budget never charged its own fixed
+    outputs.  The charge is a counted estimate that protects the budget
+    boundary; the chunk constant is the swept performance chooser, and the
+    composed gates re-measure the real peaks."""
+    plane_bytes = 4 * int(args['num_channels']) * int(band_rows)
+    return 16 * int(num_pixels) + plane_bytes, PARALLEL_BACK_VIEW_CHUNK
+
+
+_parallel_back_view_batch_triton._view_batch_cost = \
+    _parallel_back_view_batch_cost
+
+
 @_jit
 def _parallel_forward_kernel(n_p_ptr, centers_ptr, w_p_c_ptr,
                              weight_scale_ptr, values_ptr, out_ptr,
@@ -430,3 +465,16 @@ def _parallel_forward_view_batch_triton(values, pixel_indices,
 # See the back wrapper's docstring: the driver reads this marker in
 # maybe_compile.
 _parallel_forward_view_batch_triton._mbirtorch_no_compile = True
+
+
+def _parallel_forward_view_batch_cost(num_pixels, num_value_cols, args):
+    """The forward twin of :func:`_parallel_back_view_batch_cost`: one view
+    holds the same 16-byte-per-(view, pixel) hfan contract and its zeroed
+    channel-major output plane (the atomics' target).  ``values`` is
+    call-fixed and not charged."""
+    plane_bytes = 4 * int(args['num_channels']) * int(num_value_cols)
+    return 16 * int(num_pixels) + plane_bytes, PARALLEL_FWD_VIEW_CHUNK
+
+
+_parallel_forward_view_batch_triton._view_batch_cost = \
+    _parallel_forward_view_batch_cost

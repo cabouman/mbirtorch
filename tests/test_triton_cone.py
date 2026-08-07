@@ -355,6 +355,93 @@ def test_cone_forward_kernel_repeat_consistency():
 
 
 @requires_cuda
+def test_cone_kernel_batching_binds_the_cost_model():
+    # The driver must batch a SELECTED kernel body by the kernel's own cost
+    # model (the _view_batch_cost attribute riding on the wrapper), never by
+    # the geometry's max(num_slices, num_rows) charge.  Readings through a
+    # real default-selection driver: the bound bodies carry the cost
+    # functions; their realized batch at this cell is the kernel chunk while
+    # a torch body's is the 64 default; and at a fabricated large-cell charge
+    # (pure arithmetic -- nothing is allocated) each body's batch matches its
+    # own formula.  The full-cell arithmetic where the torch charge collapses
+    # to view batch 1 is pinned in test_view_batching.py.
+    from mbirtorch.triton_cone import (CONE_BACK_VIEW_CHUNK,
+                                       _cone_back_view_batch_cost,
+                                       _cone_forward_view_batch_cost)
+
+    model = _cone_model(compile_mode='auto')
+    usable, reason = kernel_availability.cone_back_kernel_usable(model)
+    assert usable, reason
+    usable, reason = kernel_availability.cone_forward_kernel_usable(model)
+    assert usable, reason
+    model.create_projectors()
+    pf = model.projector_functions
+    fwd, back = pf._fwd_body_per_dev[0], pf._back_body_per_dev[0]
+    assert fwd._view_batch_cost is _cone_forward_view_batch_cost
+    assert back._view_batch_cost is _cone_back_view_batch_cost
+
+    args = model._view_batch_args()
+    rows = int(model.get_params('sinogram_shape')[1])
+    assert (pf._effective_view_batch(back, 100, rows, args)
+            == CONE_BACK_VIEW_CHUNK)
+    assert pf._effective_view_batch(_cone_back_view_batch, 100, rows,
+                                    args) == 64
+
+    # At this tiny cell the two charges COINCIDE numerically -- transient_cols
+    # is 12, so the torch charge is P * 12 * 4 = 48 * P, the kernel's contract
+    # coefficient -- so the dispatch proof is the 128-vs-64 pair above; here
+    # each body's batch is checked against its own formula alone.
+    num_pixels, big_rows = 772_882, 1008
+    budget = pf._transient_budget_bytes()
+    kernel_vb = pf._effective_view_batch(back, num_pixels, big_rows, args)
+    torch_vb = pf._effective_view_batch(_cone_back_view_batch, num_pixels,
+                                        big_rows, args)
+    bytes_pv, chunk = _cone_back_view_batch_cost(num_pixels, big_rows, args)
+    assert kernel_vb == max(1, min(chunk, budget // bytes_pv))
+    torch_bytes = num_pixels * model._transient_cols(big_rows) * 4
+    assert torch_vb == max(1, min(64, budget // torch_bytes))
+
+
+@requires_cuda
+def test_cone_kernel_view_range_loop_chunked_parity():
+    # The view-range loop's chunk seams with the kernel bodies bound: an
+    # explicit view_batch_size (which caps kernel batches exactly as it caps
+    # torch ones) forces several batches, and the assembled/accumulated
+    # results must match a single all-views kernel call.  The back path adds
+    # partials across batches and the forward reorders its atomics, so both
+    # comparisons read at the float-summation tolerance.
+    model = _cone_model()
+    usable, reason = kernel_availability.cone_back_kernel_usable(model)
+    assert usable, reason
+    usable, reason = kernel_availability.cone_forward_kernel_usable(model)
+    assert usable, reason
+    model.create_projectors()
+    pf = model.projector_functions
+    assert pf._fwd_body_per_dev[0] is _cone_forward_view_batch_triton
+    assert pf._back_body_per_dev[0] is _cone_back_view_batch_triton
+
+    sinogram, pixel_indices, view_params, args = _body_inputs(model)
+    values = _voxel_values(model, pixel_indices)
+    num_views = int(view_params.shape[0])
+    model.view_batch_size = 2
+    assert pf._effective_view_batch(pf._fwd_body_per_dev[0],
+                                    int(pixel_indices.shape[0]),
+                                    int(values.shape[1]), args) == 2
+
+    chunked_fwd = pf.sparse_forward_project_view_range(values, pixel_indices,
+                                                       (0, num_views))
+    one_call_fwd = _cone_forward_view_batch_triton(values, pixel_indices,
+                                                   view_params, **args)
+    assert _rel_max(chunked_fwd, one_call_fwd) <= 1e-5
+
+    chunked_back = pf.sparse_back_project_view_range(sinogram, pixel_indices,
+                                                     (0, num_views))
+    one_call_back = _cone_back_view_batch_triton(sinogram, pixel_indices,
+                                                 view_params, **args)
+    assert _rel_max(chunked_back, one_call_back) <= 1e-5
+
+
+@requires_cuda
 def test_cone_forward_kernel_selection_and_end_to_end(monkeypatch):
     # The forward selection contract: OPT-IN, so the torch body stays selected
     # without the env var and the kernel is selected with it when the

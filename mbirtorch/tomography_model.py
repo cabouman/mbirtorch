@@ -96,10 +96,16 @@ class TomographyModel(ParameterHandler):
     and the auto recon geometry; this class owns the projection wrappers and
     the VCD loop."""
 
-    def __init__(self, sinogram_shape, device='auto', view_batch_size=64,
+    def __init__(self, sinogram_shape, device='auto', view_batch_size=None,
                  compile_mode='auto', **kwargs):
         super().__init__()
         self.torch_device = _resolve_device(device)
+        # Views per body call in the batched drivers.  None means automatic:
+        # a torch body uses the long-standing default of 64, and a
+        # hand-written kernel body uses its own swept view chunk.  An
+        # explicit integer is the nominal for every body; the driver's
+        # transient budget may cap the realized batch below it either way
+        # (see Projectors._effective_view_batch).
         self.view_batch_size = view_batch_size
         # torch.compile of the hot chains.  'auto' compiles on every backend
         # (torch 2.13 supports CPU, CUDA, and MPS); 'off' keeps pure eager (debugging, or a backend where compile

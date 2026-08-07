@@ -118,8 +118,13 @@ class ParallelBeamModel(TomographyModel):
         device (str): 'auto' (cuda > mps > cpu), or an explicit torch device
             string.  Device selection is an execution-environment choice, not a
             saved model parameter (the mbirjax configure_devices rationale).
-        view_batch_size (int): views per eager kernel batch (the single
-            memory/speed knob of the batched drivers).
+        view_batch_size (int or None): views per body call in the batched
+            drivers (the single memory/speed knob).  None (default) means
+            automatic: 64 for the torch bodies -- the long-standing default
+            -- and the swept view chunk of a hand-written Triton kernel body
+            where one is selected.  An explicit integer applies to every
+            body, and the driver's transient budget may cap the realized
+            batch below it either way.
 
     Example:
         >>> import numpy as np, mbirtorch
@@ -127,8 +132,8 @@ class ParallelBeamModel(TomographyModel):
         >>> model = mbirtorch.ParallelBeamModel((180, 256, 10), angles)
     """
 
-    def __init__(self, sinogram_shape, angles, device='auto', view_batch_size=64,
-                 compile_mode='auto'):
+    def __init__(self, sinogram_shape, angles, device='auto',
+                 view_batch_size=None, compile_mode='auto'):
         angles = np.asarray(angles, dtype=np.float32)
         super().__init__(sinogram_shape, device=device, view_batch_size=view_batch_size,
                          compile_mode=compile_mode,

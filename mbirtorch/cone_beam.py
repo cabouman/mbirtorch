@@ -317,7 +317,7 @@ class ConeBeamModel(TomographyModel):
 
     def __init__(self, sinogram_shape, angles, source_detector_dist, source_iso_dist,
                  helical_z_shifts=None, use_curved_detector=False, device='auto',
-                 view_batch_size=64, compile_mode='auto'):
+                 view_batch_size=None, compile_mode='auto'):
         angles = np.asarray(angles, dtype=np.float32).flatten()
         if helical_z_shifts is None:
             helical_z_shifts = np.zeros_like(angles)

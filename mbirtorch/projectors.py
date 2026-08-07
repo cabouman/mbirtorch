@@ -9,10 +9,12 @@ geometry chains and its per-view-batch bodies.  No sorted channel
 reduction, no stacked gather, no tile policy here (the jax perf layer;
 their torch analogs belong with the future Triton kernel work).
 
-The drivers batch over VIEWS with a plain python loop; the eager transient
-is (view_batch, num_pixels, cols) floats, so ``view_batch_size`` is the
-single memory/speed knob; the bodies are torch.compiled (see maybe_compile
-below).
+The drivers batch over VIEWS with a plain python loop.  For the torch
+bodies the eager transient is (view_batch, num_pixels, cols) floats and
+``view_batch_size`` is the single memory/speed knob; a hand-written kernel
+body declares its own, much smaller, per-view cost through its
+``_view_batch_cost`` attribute (see _effective_view_batch).  The torch
+bodies are torch.compiled (see maybe_compile below).
 """
 
 import threading
@@ -173,6 +175,10 @@ class Projectors:
     # batch of 64 wants ~13 GB).  The batch size never changes values beyond
     # float summation order, so capping it is a pure memory knob.
     #
+    # The BUDGET below applies to every body; WHAT one view is charged is the
+    # body's own model (see _effective_view_batch): the torch bodies' gather
+    # slab here, or a hand-written kernel body's _view_batch_cost.
+    #
     # On the DEVICE backends the budget also scales DOWN with the problem: a
     # flat 2 GiB let a 200-class cell hold a gather transient ~12x jax's whole
     # peak (the CUDA gate readout's back/vcd memory breaches).  Scaling by the
@@ -216,6 +222,11 @@ class Projectors:
     VIEW_BATCH_TRANSIENT_BUDGET_BYTES = 2 * 2**30
     VIEW_BATCH_TRANSIENT_FLOOR_BYTES = 256 * 2**20
     VIEW_BATCH_SINO_MULTIPLE = 8
+    # The torch bodies' nominal view batch when the model's view_batch_size
+    # is None (automatic) -- the value the constructor default has always
+    # been.  A kernel body's automatic nominal is its own swept view chunk,
+    # returned by its _view_batch_cost (see _effective_view_batch).
+    VIEW_BATCH_BODY_DEFAULT = 64
 
     def _transient_budget_bytes(self):
         if self.model.torch_device.type == 'cpu':
@@ -262,16 +273,46 @@ class Projectors:
             for dev in model.sino_placement.devices]
         self.view_params_array = self._view_params_per_dev[0]
 
-    def _effective_view_batch(self, num_pixels, band_cols):
-        """The model's view_batch_size, capped so one batch's transient stays
-        within the budget above.  The column count is a GEOMETRY hook
-        (_transient_cols): parallel's transient tracks the runtime band
-        length, cone's tracks max(num_slices, num_rows) from the params --
-        unifying them naively would silently change each geometry's batch
-        size, float summation order, and calibrated peak memory."""
-        cols = self.model._transient_cols(band_cols)
-        cap = self._transient_budget_bytes() // max(1, num_pixels * cols * 4)
-        return max(1, min(self.model.view_batch_size, int(cap)))
+    def _effective_view_batch(self, body, num_pixels, band_cols, args):
+        """The view batch for one call of ``body``: the nominal batch, capped
+        so one batch's transient stays within the budget above.
+
+        The batching rule follows the BODY actually bound, never the
+        geometry.  A hand-written kernel body carries a ``_view_batch_cost``
+        attribute (attached in its own module, e.g. triton_cone.py) returning
+        ``(bytes_per_view, view_chunk)`` from ``(num_pixels, band_cols,
+        args)``: its real charged residency and its swept nominal chunk.  The
+        torch bodies' gather-transient model below would charge such a kernel
+        a transient it never materializes -- at large cells that mischarge
+        forces view batch 1 and a per-view contract rebuild per launch.  The
+        forward and back bodies are consulted separately, so a mixed
+        selection (kernel one way, torch body the other, including a
+        self-check fallback at create_projectors time) batches each direction
+        by its own model.
+
+        Torch-body path (any body without the attribute, compiled or eager):
+        unchanged.  The column count is a GEOMETRY hook (_transient_cols):
+        parallel's transient tracks the runtime band length, cone's tracks
+        max(num_slices, num_rows) from the params -- unifying them naively
+        would silently change each geometry's batch size, float summation
+        order, and calibrated peak memory.
+
+        ``model.view_batch_size`` is the user's nominal for every body; None
+        means automatic (VIEW_BATCH_BODY_DEFAULT for a torch body, the
+        kernel's own chunk for a kernel body)."""
+        nominal = self.model.view_batch_size
+        cost = getattr(body, '_view_batch_cost', None)
+        if cost is None:
+            cols = self.model._transient_cols(band_cols)
+            bytes_per_view = num_pixels * cols * 4
+            if nominal is None:
+                nominal = self.VIEW_BATCH_BODY_DEFAULT
+        else:
+            bytes_per_view, view_chunk = cost(num_pixels, band_cols, args)
+            if nominal is None:
+                nominal = view_chunk
+        cap = self._transient_budget_bytes() // max(1, int(bytes_per_view))
+        return max(1, min(int(nominal), int(cap)))
 
     def sparse_forward_project_view_range(self, band_values, pixel_indices,
                                           view_range, slice_start=0,
@@ -302,13 +343,14 @@ class Projectors:
         m = self.model
         v0, v1 = view_range
         args = m._view_batch_args()
-        vb_size = self._effective_view_batch(pixel_indices.shape[0],
-                                             band_values.shape[-1])
+        fwd_body = self._fwd_body_per_dev[dev_index]
+        vb_size = self._effective_view_batch(fwd_body, pixel_indices.shape[0],
+                                             band_values.shape[-1], args)
         view_params = self._view_params_per_dev[dev_index]
         out = None
         for v in range(v0, v1, vb_size):
             view_params_batch = view_params[v:min(v + vb_size, v1)]
-            block = self._fwd_body_per_dev[dev_index](
+            block = fwd_body(
                 band_values, pixel_indices, view_params_batch,
                 slice_start=slice_start, plan=plan, **args)
             if out is None:
@@ -346,13 +388,14 @@ class Projectors:
         m = self.model
         v0, v1 = view_range
         args = m._view_batch_args()
-        vb_size = self._effective_view_batch(pixel_indices.shape[0],
-                                             local_sino.shape[1])
+        back_body = self._back_body_per_dev[dev_index]
+        vb_size = self._effective_view_batch(back_body, pixel_indices.shape[0],
+                                             local_sino.shape[1], args)
         view_params = self._view_params_per_dev[dev_index]
         out = None
         for v in range(v0, v1, vb_size):
             view_params_batch = view_params[v:min(v + vb_size, v1)]
-            block = self._back_body_per_dev[dev_index](
+            block = back_body(
                 local_sino[v - v0:v - v0 + view_params_batch.shape[0]],
                 pixel_indices, view_params_batch, coeff_power=coeff_power,
                 slice_start=slice_start, band_slices=band_slices, plan=plan,

@@ -156,6 +156,14 @@ CONE_BACK_NUM_STAGES = 1
 # The smallest tile worth launching: a band or pixel subset below this pads
 # rather than shrinking further.
 CONE_BACK_MIN_TILE = 8
+# The driver's nominal view chunk for this kernel's batches: the batch this
+# body asks for when the model's view_batch_size is None (automatic).  The
+# batching rule rides on the body (see _cone_back_view_batch_cost and
+# Projectors._effective_view_batch), because the torch bodies' gather-slab
+# charge would force view batch 1 at large cells for a kernel that holds no
+# such slab.  Swept beside the tile constants; the driver's transient budget
+# may cap the realized batch below it.
+CONE_BACK_VIEW_CHUNK = 128
 
 # ── H100 starting constants for the FORWARD kernel (the forward sweep axes) ───
 # Deliberately conservative, and deliberately the back kernel's rectangle: the
@@ -176,6 +184,8 @@ CONE_FWD_NUM_WARPS = 8
 # register pressure.
 CONE_FWD_NUM_STAGES = 1
 CONE_FWD_MIN_TILE = 8
+# The forward's nominal view chunk (see CONE_BACK_VIEW_CHUNK).
+CONE_FWD_VIEW_CHUNK = 128
 
 # Launch keys whose triton compilation has already completed in this process.
 # The compile lock must cover the FIRST launch of each configuration (triton
@@ -408,6 +418,33 @@ def _cone_back_view_batch_triton(sino_batch, pixel_indices, view_params_batch,
 _cone_back_view_batch_triton._mbirtorch_no_compile = True
 
 
+def _cone_back_view_batch_cost(num_pixels, num_band_rows, args):
+    """Charged bytes resident per view in one back-kernel batch, and this
+    kernel's nominal view chunk -- the driver's batching rule for this body,
+    read through the ``_view_batch_cost`` attribute in
+    ``Projectors._effective_view_batch``.
+
+    One view of a batch holds the two eager precomputes at 48 bytes per
+    (view, pixel): the hfan contract and the vertical affine pair held
+    (``n_p``, ``W_p_c``, ``weight_scale``, ``pixel_mag``, ``m0``, ``W_p_r``
+    as f32 and ``centers`` as i32, 28 bytes), plus the builders' live
+    intermediates and expression temporaries (x, y, u, theta and company,
+    charged at 20 more).  It also holds the channel-major copy of its
+    sinogram plane (``sino_t`` above); the second argument is the sinogram's
+    row count at this call site, so the plane term follows the input
+    directly.  Call-fixed tensors -- the (P, band) output partial -- exist at
+    any batch size, so the batch choice cannot control them and they are not
+    charged, exactly as the torch-body budget never charged its own fixed
+    outputs.  The charge is a counted estimate that protects the budget
+    boundary; the chunk constant is the swept performance chooser, and the
+    composed gates re-measure the real peaks."""
+    plane_bytes = 4 * int(args['num_channels']) * int(num_band_rows)
+    return 48 * int(num_pixels) + plane_bytes, CONE_BACK_VIEW_CHUNK
+
+
+_cone_back_view_batch_triton._view_batch_cost = _cone_back_view_batch_cost
+
+
 @_jit
 def _cone_forward_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
                          m0_ptr, w_p_r_ptr, pixel_mag_ptr, z_offset_ptr,
@@ -626,3 +663,18 @@ def _cone_forward_view_batch_triton(values, pixel_indices, view_params_batch,
 # See the back wrapper's docstring: the driver reads this marker in
 # maybe_compile.
 _cone_forward_view_batch_triton._mbirtorch_no_compile = True
+
+
+def _cone_forward_view_batch_cost(num_pixels, band_len, args):
+    """The forward twin of :func:`_cone_back_view_batch_cost`: one view holds
+    the same 48-byte-per-(view, pixel) precomputes and its zeroed
+    channel-major output plane (the atomics' target).  The output plane spans
+    the FULL detector rows whatever slice band the values carry, so the plane
+    term reads ``num_rows_r`` from the args rather than the band length.
+    ``values`` is call-fixed and not charged."""
+    plane_bytes = 4 * int(args['num_channels']) * int(args['num_rows_r'])
+    return 48 * int(num_pixels) + plane_bytes, CONE_FWD_VIEW_CHUNK
+
+
+_cone_forward_view_batch_triton._view_batch_cost = \
+    _cone_forward_view_batch_cost
