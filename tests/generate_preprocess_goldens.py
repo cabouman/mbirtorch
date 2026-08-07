@@ -214,6 +214,17 @@ def main():
                                mbirjax.median_filter3d(med_in, max_block_gb=0.0001,
                                                        return_min_max=True))
 
+    # HDF5 family: mbirjax-written files pin the on-disk formats.
+    h5_vol = rng.rand(10, 12, 14).astype(np.float32)
+    h5_attrs = {'scan_id': 'sample1', 'notes': 'golden', 'nested': {'a': 1, 'b': 'two'}}
+    mbirjax.save_data_hdf5(os.path.join(OUT_DIR, 'preprocess_goldens_data.h5'),
+                           h5_vol, array_name='volume', attributes_dict=h5_attrs)
+    mbirjax.export_recon_hdf5(os.path.join(OUT_DIR, 'preprocess_goldens_export.h5'),
+                              h5_vol, recon_dict={'scan_id': 'sample1'})
+    mbirjax.export_recon_hdf5(os.path.join(OUT_DIR, 'preprocess_goldens_export_flash.h5'),
+                              h5_vol, recon_dict={'scan_id': 'sample1'}, remove_flash=True,
+                              radial_margin=2, top_margin=2, bottom_margin=3)
+
     # mbirjax-written cone-preprocessing save: pins the on-disk format.
     h5_path = os.path.join(OUT_DIR, 'preprocess_goldens_cone_save.h5')
     mjp.save_cone_preprocessing(
@@ -273,6 +284,7 @@ def main():
         align_out=align_out.astype(np.float32),
         med_in=med_in, med_out=med_out.astype(np.float32),
         med_min=med_min.astype(np.float32), med_max=med_max.astype(np.float32),
+        h5_vol=h5_vol,
     )
     print('wrote', out)
     print('wrote', h5_path)
