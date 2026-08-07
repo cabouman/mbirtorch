@@ -38,6 +38,10 @@ dependencies = [
     "tifffile",
     "tqdm",
     "pywavelets",
+    # Metal artifact reduction: osqp solves the constrained beam-hardening fit;
+    # opencv-python provides the view-alignment ECC estimator and Gaussian filtering.
+    "osqp",
+    "opencv-python",
     # get_memory_stats reads host RSS/USS via psutil.
     "psutil",
 ]
