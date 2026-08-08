@@ -20,8 +20,8 @@ def _transmission_kernel(obj_batch, blank_minus_dark, dark_scan_mean, flat_indic
     precomputed by the caller (it does not vary across batches).
     """
     device = obj_batch.device
-    blank_minus_dark = torch.as_tensor(np.asarray(blank_minus_dark), device=device)
-    dark_scan_mean = torch.as_tensor(np.asarray(dark_scan_mean), device=device)
+    blank_minus_dark = torch.as_tensor(np.asarray(blank_minus_dark, dtype=np.float32), device=device)
+    dark_scan_mean = torch.as_tensor(np.asarray(dark_scan_mean, dtype=np.float32), device=device)
     obj_batch = torch.abs(obj_batch - dark_scan_mean)
     # NaN for non-positive ratios so the neighborhood fill later removes them along with defective pixels.
     ratio = obj_batch / blank_minus_dark
@@ -643,8 +643,21 @@ def compute_scaling_factor(target_vect, vect_to_scale) -> float:
     if not isinstance(vect_to_scale, torch.Tensor):
         vect_to_scale = torch.as_tensor(np.asarray(vect_to_scale), device=target_vect.device)
 
-    numerator = torch.sum(vect_to_scale * target_vect)
-    denominator = torch.sum(vect_to_scale * vect_to_scale)
+    # Chunked inner products along the leading axis: a whole-array elementwise product would
+    # allocate a full-size temporary (tens of GB for a production recon on one device).
+    numerator = 0.0
+    denominator = 0.0
+    if target_vect.ndim == 0:
+        numerator = float(vect_to_scale * target_vect)
+        denominator = float(vect_to_scale * vect_to_scale)
+    else:
+        per_row = max(1, int(np.prod(target_vect.shape[1:], dtype=np.int64)))
+        step = max(1, (1 << 27) // per_row)
+        for i in range(0, target_vect.shape[0], step):
+            t = target_vect[i:i + step]
+            v = vect_to_scale[i:i + step]
+            numerator += float(torch.sum(v * t))
+            denominator += float(torch.sum(v * v))
     epsilon = 1e-8
     return float(numerator / (denominator + epsilon))
 
