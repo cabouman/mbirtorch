@@ -266,12 +266,16 @@ def _parallel_back_view_batch_triton(sino_batch, pixel_indices,
     block_r = _tile_size(PARALLEL_BACK_BLOCK_R, num_band_rows,
                          PARALLEL_BACK_MIN_TILE)
     grid = (-(-num_pixels // block_p), -(-num_band_rows // block_r))
-    launch_key = ('pback', int(psf_radius), int(coeff_power), block_p, block_r,
+    launch_key = ('pback', sino_batch.device.index, int(psf_radius),
+                  int(coeff_power), block_p, block_r,
                   int(num_views), int(num_pixels), int(num_channels),
                   num_band_rows)
     first_launch = launch_key not in _COMPILED_LAUNCH_KEYS
     guard = compile_serialized() if first_launch else contextlib.nullcontext()
-    with guard:
+    # The launch must be bracketed on the tensors' device, and the device
+    # leads the launch key -- see _cone_back_view_batch_triton (triton_cone),
+    # whose comment carries the measured basis.
+    with torch.cuda.device(sino_batch.device), guard:
         _parallel_back_kernel[grid](
             *contract, sino_t, out,
             int(num_views), int(num_pixels), int(num_channels), num_band_rows,
@@ -446,11 +450,15 @@ def _parallel_forward_view_batch_triton(values, pixel_indices,
                          PARALLEL_FWD_MIN_TILE)
     grid = (-(-num_pixels // block_p), -(-num_value_cols // block_r),
             num_views)
-    launch_key = ('pfwd', int(psf_radius), block_p, block_r, int(num_views),
+    launch_key = ('pfwd', values.device.index, int(psf_radius), block_p,
+                  block_r, int(num_views),
                   int(num_pixels), int(num_channels), num_value_cols)
     first_launch = launch_key not in _COMPILED_LAUNCH_KEYS
     guard = compile_serialized() if first_launch else contextlib.nullcontext()
-    with guard:
+    # The launch must be bracketed on the tensors' device, and the device
+    # leads the launch key -- see _cone_back_view_batch_triton (triton_cone),
+    # whose comment carries the measured basis.
+    with torch.cuda.device(values.device), guard:
         _parallel_forward_kernel[grid](
             *contract, values, out,
             int(num_pixels), int(num_channels), num_value_cols,

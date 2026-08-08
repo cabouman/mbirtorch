@@ -577,17 +577,26 @@ def test_the_policy_builds_no_ledger_for_a_cpu_model():
     assert model._build_memory_ledger() is not None
 
 
-def test_only_an_unindexed_cuda_model_is_eligible_for_the_automatic_count():
-    """CPU and MPS models are never widened, and naming a device index is as
-    explicit as calling configure_devices."""
+def test_only_an_unconfigured_model_is_eligible_for_the_automatic_count():
+    """Automatic means NO configure_devices call has been made.
+
+    The constructor amendment collapsed eligibility to that one bit: there
+    is no device string to parse, so EVERY call is explicit, including an
+    unindexed ``devices=['cuda']``.  This test's earlier form asserted the
+    pre-amendment rule (unindexed cuda stays automatic) and was gated on
+    CUDA, so it first ran, and failed, on the first full-suite H100 run
+    after the amendment.
+    """
     angles = np.linspace(0, np.pi, 8, endpoint=False)
+    untouched = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
+    assert untouched.device_layout_is_automatic is True
     cpu = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
     cpu.configure_devices(devices=['cpu'])
     assert cpu.device_layout_is_automatic is False
     if torch.cuda.is_available():
         plain = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
         plain.configure_devices(devices=['cuda'])
-        assert plain.device_layout_is_automatic is True
+        assert plain.device_layout_is_automatic is False
         indexed = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
         indexed.configure_devices(devices=['cuda:0'])
         assert indexed.device_layout_is_automatic is False

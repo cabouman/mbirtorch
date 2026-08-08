@@ -691,14 +691,15 @@ def test_cone_forward_kernel_selects_by_default(monkeypatch):
         kernel_availability._reset_self_check_cache()
 
 
-def test_cone_forward_kernel_is_withheld_from_a_sharded_layout():
-    """The interim selection rule.
+def test_cone_kernel_selection_is_layout_independent():
+    """The restored selection contract: the layout plays no part.
 
-    The forward kernels disagree with the torch forward bodies by order one
-    under the banded multi-device drivers, so the kernel forward binds only
-    on a trivial placement.  The BACK kernel is unaffected: its arms
-    reproduce the pure-torch arms to four significant figures at every
-    device count, so it stays selected everywhere.
+    An interim rule once withheld the forward kernel from sharded layouts.
+    The defect behind it was the launch context, not the kernel, and the
+    wrappers now bracket their launches on the tensors' device (the
+    kernel-sharding findings in the plans repo).  Selection therefore
+    consults the availability gates alone, and a layout change must neither
+    drop a kernel nor latch a stale choice.
 
     This test runs on CPU by forcing the gates, so the RULE is pinned on any
     machine.  Whether a real kernel is usable is a separate question that
@@ -715,14 +716,15 @@ def test_cone_forward_kernel_is_withheld_from_a_sharded_layout():
         fwd, back = model._view_batch_bodies()
         assert fwd is _cone_forward_view_batch_triton
         assert back is _cone_back_view_batch_triton
-        # Non-trivial placement: the forward falls back, the back does not.
+        # Non-trivial placement: the same selection.
         model.configure_devices(devices=['cpu', 'cpu'])
         fwd, back = model._view_batch_bodies()
-        assert fwd is _cone_forward_view_batch
+        assert fwd is _cone_forward_view_batch_triton
         assert back is _cone_back_view_batch_triton
-        # And back again, so the rule follows the layout rather than latching.
+        # And back again, so a rebuilt layout re-selects rather than latching.
         model.configure_devices(devices=['cpu'])
         fwd, back = model._view_batch_bodies()
         assert fwd is _cone_forward_view_batch_triton
+        assert back is _cone_back_view_batch_triton
     finally:
         monkeypatch.undo()

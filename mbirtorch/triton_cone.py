@@ -394,12 +394,25 @@ def _cone_back_view_batch_triton(sino_batch, pixel_indices, view_params_batch,
     grid = (-(-num_pixels // block_p), -(-band_len // block_l))
     inv_sdd = (0.0 if math.isinf(float(source_detector_dist))
                else 1.0 / float(source_detector_dist))
-    launch_key = ('back', int(psf_radius), int(coeff_power), block_p, block_l,
+    launch_key = ('back', sino_batch.device.index, int(psf_radius),
+                  int(coeff_power), block_p, block_l,
                   int(num_views), int(num_pixels), int(num_channels),
                   int(num_rows_r), band_len, int(slice_start))
     first_launch = launch_key not in _COMPILED_LAUNCH_KEYS
     guard = compile_serialized() if first_launch else contextlib.nullcontext()
-    with guard:
+    # The device context is CORRECTNESS, not hygiene.  A Triton launch targets
+    # the launching THREAD's current CUDA device and that device's current
+    # stream (triton binds get_current_device to torch.cuda.current_device),
+    # while every torch op here targets the TENSOR's device.  The banded
+    # multi-device drivers call this wrapper from per-device worker threads
+    # whose current device is 0, so an unbracketed launch lands on device 0's
+    # stream and the shard's own producers and consumers race the kernel --
+    # measured as order-1 non-reproducible forward errors, repaired by this
+    # bracket alone (the kernel-sharding findings in the plans repo).  The
+    # device also keys triton's per-device kernel cache, which is why it
+    # leads the launch key: each device's first compile of a shape must take
+    # the serializing lock.
+    with torch.cuda.device(sino_batch.device), guard:
         _cone_back_kernel[grid](
             *contract, sino_t, out,
             int(num_views), int(num_pixels), int(num_channels),
@@ -641,12 +654,16 @@ def _cone_forward_view_batch_triton(values, pixel_indices, view_params_batch,
     bp = int(bp_psf_radius)
     k_center_lo = float(int(slice_start) - bp - 1)
     k_center_hi = float(int(slice_start) + band_len + bp)
-    launch_key = ('fwd', int(psf_radius), bp, block_p, block_r, int(num_views),
+    launch_key = ('fwd', values.device.index, int(psf_radius), bp, block_p,
+                  block_r, int(num_views),
                   int(num_pixels), int(num_channels), int(num_rows_r),
                   band_len, int(slice_start))
     first_launch = launch_key not in _COMPILED_LAUNCH_KEYS
     guard = compile_serialized() if first_launch else contextlib.nullcontext()
-    with guard:
+    # The launch must be bracketed on the tensors' device, and the device
+    # leads the launch key -- see _cone_back_view_batch_triton, whose comment
+    # carries the measured basis.
+    with torch.cuda.device(values.device), guard:
         _cone_forward_kernel[grid](
             *contract, values, out,
             int(num_pixels), int(num_channels), int(num_rows_r), band_len,

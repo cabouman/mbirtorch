@@ -276,8 +276,14 @@ def device_pool(n):
 def run_per_device(devices, worker_fn, executor=None):
     """Run worker_fn once per device, each in its own thread.
 
-    Unlike jax, torch needs no thread-local default device: tensors carry
-    their device, so the worker simply operates on its device's tensors.
+    Torch ops need no thread-local default device: tensors carry their
+    device, so a torch op dispatches correctly from any thread.  A RAW
+    kernel launch does not.  A Triton launch targets the launching thread's
+    current CUDA device and that device's current stream, and a fresh
+    thread's current device is 0, so a kernel body called from these workers
+    must bracket its own launch in ``with torch.cuda.device(...)`` (the
+    wrappers in triton_cone.py and triton_parallel.py do; the measured
+    defect is in the kernel-sharding findings in the plans repo).
     Results are returned in DEVICE order (result[i] corresponds to
     devices[i]), not completion order.  No synchronization is performed --
     callers that need values materialized (before assembling or reading)

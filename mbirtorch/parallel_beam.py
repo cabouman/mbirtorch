@@ -240,25 +240,19 @@ class ParallelBeamModel(TomographyModel):
             back_body = _parallel_back_view_batch_triton
         else:
             back_body = _parallel_back_view_batch
-        # THE FORWARD KERNEL IS WITHHELD FROM A SHARDED LAYOUT.  Under the
-        # banded multi-device drivers the forward kernels disagree with the
-        # torch forward bodies by order one, in both geometries and at two
-        # and four devices, and the disagreement is not even reproducible run
-        # to run.  An isolation matrix in the plans repo separated the two
-        # directions cleanly: with the torch forward bound, the back-kernel
-        # arms reproduce the pure-torch arms to four significant figures at
-        # every device count, so the BACK kernel keeps its default-on status
-        # everywhere.  A single device never runs the banded drivers -- the
-        # trivial placement short-circuits to the plain projectors -- which
-        # is why the composed n=1 gates could not see this and why the
-        # kernel forward stays selected there.
-        #
-        # This is an interim, not the repair.  It retires when the forward
-        # kernels honor the banded contract and the standing
-        # kernel-times-sharding gate shows their arms rejoining the torch
-        # arms at the multi-device float floor.
-        sharded = not self.sino_placement.is_trivial
-        if parallel_forward_kernel_usable(self)[0] and not sharded:
+        # Selection is layout-independent.  An interim rule once withheld the
+        # forward kernel from sharded layouts: under the banded multi-device
+        # drivers it disagreed with the torch forward by order one,
+        # non-reproducibly, in both geometries.  The defect was the LAUNCH,
+        # not the kernel: a Triton launch targets the launching thread's
+        # current device, the per-device workers launch from threads whose
+        # current device is 0, and the shard's consumers raced the misplaced
+        # kernel.  The wrappers now bracket their launches on the tensors'
+        # device, the repair is measured at the kernel-parity class on two
+        # GPUs, and the standing kernel-times-sharding gate
+        # (tests/test_kernels_sharded.py) holds the contract (the
+        # kernel-sharding findings in the plans repo).
+        if parallel_forward_kernel_usable(self)[0]:
             from .triton_parallel import _parallel_forward_view_batch_triton
             fwd_body = _parallel_forward_view_batch_triton
         else:
