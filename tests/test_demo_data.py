@@ -91,11 +91,20 @@ def test_generate_demo_data_matches_golden(golden, tag, kwargs):
     assert err < 1e-3
 
 
+def test_gen_cube_phantom_is_float32():
+    """mbirjax's jnp.array downcasts to float32; torch.as_tensor keeps
+    numpy's float64, which doubles the memory and mps cannot hold at all."""
+    import torch
+    phantom = mbirtorch.gen_cube_phantom((8, 8, 4))
+    assert phantom.dtype == torch.float32
+
+
 def test_generate_demo_data_cube():
     phantom, sino, params = mbirtorch.generate_demo_data(
         model_type='cone', object_type='cube', num_views=12,
         num_det_rows=24, num_det_channels=32)
-    phantom = np.asarray(phantom)
+    # Host numpy float32 for either object type, as the docstring promises.
+    assert isinstance(phantom, np.ndarray) and phantom.dtype == np.float32
     assert phantom.max() > 0 and np.isfinite(np.asarray(sino)).all()
 
 

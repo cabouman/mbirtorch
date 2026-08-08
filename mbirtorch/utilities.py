@@ -1056,8 +1056,12 @@ def gen_cube_phantom(recon_shape, device=None):
     phantom_rows = num_recon_rows // 4  # Phantom height
     phantom_cols = num_recon_cols // 4  # Phantom width
 
-    # Allocate phantom memory
-    phantom = np.zeros((num_recon_rows, num_recon_cols, num_recon_slices))
+    # Allocate phantom memory.  float32 explicitly: mbirjax's jnp.array does
+    # this downcast for free (jax defaults to 32-bit), torch.as_tensor keeps
+    # whatever numpy gave it, and float64 both doubles the memory and is
+    # unsupported on mps.
+    phantom = np.zeros((num_recon_rows, num_recon_cols, num_recon_slices),
+                       dtype=np.float32)
 
     # Compute start and end locations
     start_rows = (num_recon_rows - phantom_rows) // 2
@@ -1207,6 +1211,7 @@ def generate_demo_data(
     Returns:
         tuple: (object, sinogram, params)
             - object: the phantom volume, shape recon_shape = (num_rows, num_cols, num_slices).
+              A host numpy float32 array, for either object type.
             - sinogram: shape (num_views, num_det_rows, num_det_channels).
             - params (dict): contains 'angles' and, for 'cone', also 'source_detector_dist' and 'source_iso_dist'.
 
@@ -1348,7 +1353,10 @@ def generate_demo_data(
         phantom_core = generate_3d_shepp_logan_low_dynamic_range(
             phantom_shape, target_max_attenuation=target_max_attenuation)
     elif object_type == ObjectType.CUBE:
-        phantom_core = gen_cube_phantom(phantom_shape)
+        # gen_cube_phantom returns a tensor, as its mbirjax counterpart returns
+        # a jax array.  This function promises host numpy for both object
+        # types, so convert here rather than hand back two different things.
+        phantom_core = gen_cube_phantom(phantom_shape).cpu().numpy()
     else:
         raise ValueError(f'Invalid object type. Expected one of {[o.value for o in ObjectType]}, got {object_type}')
     if model_type == ModelType.CONE and use_helical:
