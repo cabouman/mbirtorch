@@ -98,7 +98,8 @@ def test_read_mbirjax_export_files(golden):
 def cone_model():
     angles = np.linspace(0, 2 * np.pi, 8, endpoint=False)
     model = mbirtorch.ConeBeamModel((8, 10, 12), angles, source_detector_dist=100.0,
-                                    source_iso_dist=50.0, device='cpu')
+                                    source_iso_dist=50.0)
+    model.configure_devices(devices=['cpu'])
     model.set_params(no_warning=True, verbose=0, sharpness=1.5, det_channel_offset=0.25)
     return model
 
@@ -122,7 +123,8 @@ def test_get_all_params_constructor_round_trip(cone_model):
     required, optional, regularization = cone_model.get_all_params()
     required = dict(required)
     required.pop('geometry_type')
-    rebuilt = mbirtorch.ConeBeamModel(**required, device='cpu')
+    rebuilt = mbirtorch.ConeBeamModel(**required)
+    rebuilt.configure_devices(devices=['cpu'])
     rebuilt.set_params(no_warning=True, **optional)
     rebuilt.set_params(no_warning=True, **regularization)
     req2, opt2, reg2 = rebuilt.get_all_params()

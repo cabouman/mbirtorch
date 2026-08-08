@@ -63,8 +63,9 @@ VARIANTS = {"square": {},
 def _parallel_model(cell=(6, 12, 12), row_aspect=1.0, det_offset=0.0,
                     device="cuda", compile_mode="off"):
     angles = np.linspace(0, np.pi, cell[0], endpoint=False)
-    model = mbirtorch.ParallelBeamModel(cell, angles, device=device,
+    model = mbirtorch.ParallelBeamModel(cell, angles, 
                                         compile_mode=compile_mode)
+    model.configure_devices(devices=[device])
     model.set_params(no_warning=True, verbose=0)
     if row_aspect != 1.0 or det_offset != 0.0:
         model.set_params(no_warning=True, voxel_row_aspect=row_aspect,
@@ -714,3 +715,40 @@ def test_parallel_kernels_select_by_default(gate_name, index, torch_body,
     finally:
         kernel_availability._reset_probe_cache()
         kernel_availability._reset_self_check_cache()
+
+
+def test_parallel_forward_kernel_is_withheld_from_a_sharded_layout():
+    """The interim selection rule.
+
+    The forward kernels disagree with the torch forward bodies by order one
+    under the banded multi-device drivers, so the kernel forward binds only
+    on a trivial placement.  The BACK kernel is unaffected: its arms
+    reproduce the pure-torch arms to four significant figures at every
+    device count, so it stays selected everywhere.
+
+    This test runs on CPU by forcing the gates, so the RULE is pinned on any
+    machine.  Whether a real kernel is usable is a separate question that
+    the availability gates own.
+    """
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(kernel_availability, 'parallel_forward_kernel_usable',
+                            lambda model: (True, 'forced'))
+        monkeypatch.setattr(kernel_availability, 'parallel_back_kernel_usable',
+                            lambda model: (True, 'forced'))
+        model = _parallel_model(device='cpu')
+        # Trivial placement: both kernels bind.
+        fwd, back = model._view_batch_bodies()
+        assert fwd is _parallel_forward_view_batch_triton
+        assert back is _parallel_back_view_batch_triton
+        # Non-trivial placement: the forward falls back, the back does not.
+        model.configure_devices(devices=['cpu', 'cpu'])
+        fwd, back = model._view_batch_bodies()
+        assert fwd is _parallel_forward_view_batch
+        assert back is _parallel_back_view_batch_triton
+        # And back again, so the rule follows the layout rather than latching.
+        model.configure_devices(devices=['cpu'])
+        fwd, back = model._view_batch_bodies()
+        assert fwd is _parallel_forward_view_batch_triton
+    finally:
+        monkeypatch.undo()

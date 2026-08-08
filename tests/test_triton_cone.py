@@ -44,8 +44,9 @@ def _cone_model(curved=False, helical=False, cell=(6, 12, 12), device="cuda",
                                     source_detector_dist=4 * cell[2],
                                     source_iso_dist=2 * cell[2],
                                     helical_z_shifts=z_shifts,
-                                    use_curved_detector=curved, device=device,
+                                    use_curved_detector=curved, 
                                     compile_mode=compile_mode)
+    model.configure_devices(devices=[device])
     model.set_params(no_warning=True, verbose=0)
     return model
 
@@ -676,14 +677,52 @@ def test_cone_forward_kernel_selects_by_default(monkeypatch):
     monkeypatch.setattr(kernel_availability, 'cone_forward_kernel_usable', _spy)
     try:
         model = _cone_model(device='cpu')
+        # Construction consults NOTHING.  The projectors, and with them the
+        # availability gate, are built on first use, so a caller who only
+        # inspects a model pays for no probe.
+        assert not calls
         # Default-on contract (post composed-gate): the gate is consulted
-        # with no opt-in -- already during the build above -- and its
-        # verdict alone selects the body.
-        assert len(calls) >= 1
-        calls.clear()
+        # with no opt-in, and its verdict alone selects the body.
         assert (model._view_batch_bodies()[0]
                 is _cone_forward_view_batch_triton)
         assert len(calls) == 1
     finally:
         kernel_availability._reset_probe_cache()
         kernel_availability._reset_self_check_cache()
+
+
+def test_cone_forward_kernel_is_withheld_from_a_sharded_layout():
+    """The interim selection rule.
+
+    The forward kernels disagree with the torch forward bodies by order one
+    under the banded multi-device drivers, so the kernel forward binds only
+    on a trivial placement.  The BACK kernel is unaffected: its arms
+    reproduce the pure-torch arms to four significant figures at every
+    device count, so it stays selected everywhere.
+
+    This test runs on CPU by forcing the gates, so the RULE is pinned on any
+    machine.  Whether a real kernel is usable is a separate question that
+    the availability gates own.
+    """
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        monkeypatch.setattr(kernel_availability, 'cone_forward_kernel_usable',
+                            lambda model: (True, 'forced'))
+        monkeypatch.setattr(kernel_availability, 'cone_back_kernel_usable',
+                            lambda model: (True, 'forced'))
+        model = _cone_model(device='cpu')
+        # Trivial placement: both kernels bind.
+        fwd, back = model._view_batch_bodies()
+        assert fwd is _cone_forward_view_batch_triton
+        assert back is _cone_back_view_batch_triton
+        # Non-trivial placement: the forward falls back, the back does not.
+        model.configure_devices(devices=['cpu', 'cpu'])
+        fwd, back = model._view_batch_bodies()
+        assert fwd is _cone_forward_view_batch
+        assert back is _cone_back_view_batch_triton
+        # And back again, so the rule follows the layout rather than latching.
+        model.configure_devices(devices=['cpu'])
+        fwd, back = model._view_batch_bodies()
+        assert fwd is _cone_forward_view_batch_triton
+    finally:
+        monkeypatch.undo()

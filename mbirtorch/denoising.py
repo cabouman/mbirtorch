@@ -77,13 +77,20 @@ class QGGMRFDenoiser(TomographyModel):
     With default settings, and with X a clean image and W equal to AWGN of
     standard deviation sigma_noise, the result of :meth:`denoise` applied to
     X + W is the MAP estimate of the denoised image using the qGGMRF prior.
+
+    This model is SINGLE-DEVICE.  :meth:`denoise` runs its own loop over one
+    fixed partition with an identity forward model, so it never reaches the
+    reconstruction path where a CUDA model spreads across devices, and the
+    automatic device count therefore never applies to it.  Calling
+    ``configure_devices`` with more than one device on a denoiser raises when
+    ``denoise`` runs.
     """
 
-    def __init__(self, image_shape, device='auto', compile_mode='auto'):
+    def __init__(self, image_shape, compile_mode='auto'):
         if len(image_shape) != 3:
             raise ValueError('image_shape must be 3-dimensional. Got image_shape={}. '
                              'To denoise a 2D image, use shape (1, m, n).'.format(image_shape))
-        super().__init__(image_shape, device=device, compile_mode=compile_mode,
+        super().__init__(image_shape, compile_mode=compile_mode,
                          view_params_name='None', sigma_noise=None)
         self.set_params(use_ror_mask=False)
         self.set_params(sharpness=0)   # the denoiser's default sharpness level

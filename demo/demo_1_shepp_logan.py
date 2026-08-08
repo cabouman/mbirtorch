@@ -20,7 +20,10 @@ MODEL_TYPE = "cone"              # 'parallel' or 'cone'
 SINOGRAM_SHAPE = (80, 100, 128)     # (num_views, num_det_rows, num_det_channels)
 MAX_ITERATIONS = 15
 SHARPNESS = 1.0
-DEVICE = "auto"                      # 'auto' -> cuda > mps > cpu
+# Devices are not named here.  The model resolves cuda > mps > cpu on its
+# own, and on a machine with several CUDA devices it spreads the
+# reconstruction across the ones that can hold their share.  To pin it, call
+# model.configure_devices(num_devices=1) or configure_devices(devices=['cpu']).
 SEED = 0
 SHOW_SLICES = True
 # ──────────────────────────────────────────────────────────────────────────────
@@ -33,13 +36,14 @@ def build_model():
         # distances in the goldens' convention (magnification 2).  The auto
         # recon geometry sets the recon shape, including the axial padding.
         angles = np.linspace(0, 2 * np.pi, n_views, endpoint=False)
-        return mbirtorch.ConeBeamModel(
+        _model = mbirtorch.ConeBeamModel(
             SINOGRAM_SHAPE, angles,
             source_detector_dist=4 * num_channels,
-            source_iso_dist=2 * num_channels, device=DEVICE)
+            source_iso_dist=2 * num_channels)
+        return _model
     if MODEL_TYPE == "parallel":
         angles = np.linspace(0, np.pi, n_views, endpoint=False)
-        return mbirtorch.ParallelBeamModel(SINOGRAM_SHAPE, angles, device=DEVICE)
+        return mbirtorch.ParallelBeamModel(SINOGRAM_SHAPE, angles)
     raise ValueError(f"MODEL_TYPE must be 'parallel' or 'cone', got {MODEL_TYPE!r}")
 
 

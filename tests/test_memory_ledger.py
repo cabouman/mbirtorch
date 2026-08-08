@@ -322,7 +322,8 @@ def test_masked_hessian_agrees_with_the_full_grid_at_the_masked_indices():
     run holds zeros instead of computed-but-never-read values.
     """
     angles = np.linspace(0, np.pi, 12, endpoint=False)
-    model = mbirtorch.ParallelBeamModel((12, 8, 10), angles, device='cpu')
+    model = mbirtorch.ParallelBeamModel((12, 8, 10), angles)
+    model.configure_devices(devices=['cpu'])
     model.set_params(no_warning=True, verbose=0)
     weights = np.abs(np.random.RandomState(0).randn(12, 8, 10)).astype(np.float32) + 0.5
 
@@ -345,7 +346,8 @@ def test_masked_hessian_agrees_with_the_full_grid_at_the_masked_indices():
 def test_masked_hessian_leaves_the_public_method_unchanged():
     """`indices=None` must keep today's behavior bit for bit."""
     angles = np.linspace(0, np.pi, 12, endpoint=False)
-    model = mbirtorch.ParallelBeamModel((12, 8, 10), angles, device='cpu')
+    model = mbirtorch.ParallelBeamModel((12, 8, 10), angles)
+    model.configure_devices(devices=['cpu'])
     model.set_params(no_warning=True, verbose=0)
     a = model.compute_hessian_diagonal()
     b = model.compute_hessian_diagonal(indices=None)
@@ -362,7 +364,8 @@ def test_every_index_the_loop_reads_is_inside_the_mask():
     returns.
     """
     angles = np.linspace(0, np.pi, 12, endpoint=False)
-    model = mbirtorch.ParallelBeamModel((12, 8, 10), angles, device='cpu')
+    model = mbirtorch.ParallelBeamModel((12, 8, 10), angles)
+    model.configure_devices(devices=['cpu'])
     model.set_params(no_warning=True, verbose=0)
     sinogram = np.zeros((12, 8, 10), dtype=np.float32)
     sinogram[:, 4, 5] = 1.0
@@ -392,8 +395,9 @@ def test_recon_is_bitwise_identical_with_the_masked_hessian():
     and the loop reads nowhere else.
     """
     angles = np.linspace(0, np.pi, 12, endpoint=False)
-    model = mbirtorch.ParallelBeamModel((12, 8, 10), angles, device='cpu',
+    model = mbirtorch.ParallelBeamModel((12, 8, 10), angles, 
                                         compile_mode='off')
+    model.configure_devices(devices=['cpu'])
     model.set_params(no_warning=True, verbose=0)
     sinogram = np.zeros((12, 8, 10), dtype=np.float32)
     sinogram[:, 4, 5] = 1.0
@@ -455,7 +459,8 @@ def test_view_batch_charge_matches_the_driver_batch():
     """One cost model, two consumers: the number the ledger prices must be the
     number the driver would actually run."""
     angles = np.linspace(0, np.pi, 8, endpoint=False)
-    model = mbirtorch.ParallelBeamModel((8, 6, 8), angles, device='cpu')
+    model = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
+    model.configure_devices(devices=['cpu'])
     fwd_body, back_body = model._view_batch_bodies()
     args = model._view_batch_args()
     for body in (fwd_body, back_body):
@@ -469,7 +474,8 @@ def test_view_batch_charge_matches_the_driver_batch():
 def test_view_batch_charge_prices_a_hypothetical_device_count():
     """The ledger must be able to price a layout the model is not in."""
     angles = np.linspace(0, np.pi, 512, endpoint=False)
-    model = mbirtorch.ParallelBeamModel((512, 64, 64), angles, device='cpu')
+    model = mbirtorch.ParallelBeamModel((512, 64, 64), angles)
+    model.configure_devices(devices=['cpu'])
     fwd_body, _back = model._view_batch_bodies()
     args = model._view_batch_args()
     live = model.projector_functions.view_batch_charge(fwd_body, 400, 64, args)
@@ -534,7 +540,8 @@ def test_calibration_band_verdicts():
 # ── the model-facing plan ────────────────────────────────────────────────────
 def test_plan_from_model_reads_the_current_params_and_a_candidate_layout():
     angles = np.linspace(0, np.pi, 8, endpoint=False)
-    model = mbirtorch.ParallelBeamModel((8, 6, 8), angles, device='cpu')
+    model = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
+    model.configure_devices(devices=['cpu'])
     plan = _memory_ledger.plan_from_model(model, ['cpu', 'cpu'])
     assert plan.n_devices == 2
     assert model.sino_placement.n_devices == 1       # the model is untouched
@@ -549,30 +556,56 @@ def test_plan_from_model_reads_the_current_params_and_a_candidate_layout():
 
 def test_full_index_count_matches_the_index_array_and_caches():
     angles = np.linspace(0, np.pi, 8, endpoint=False)
-    model = mbirtorch.ParallelBeamModel((8, 6, 8), angles, device='cpu')
+    model = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
+    model.configure_devices(devices=['cpu'])
     assert model.full_index_count() == model._full_indices().shape[0]
     assert model.full_index_count() == model.full_index_count()
 
 
-def test_ledger_is_not_built_for_a_cpu_model():
+def test_the_policy_builds_no_ledger_for_a_cpu_model():
     """The ledger's production job is choosing a CUDA device count, so a CPU
-    or MPS model never builds one and never pays for it."""
+    or MPS model never consults one and never pays for it.
+
+    The MATH is device-agnostic and can be built for any backend, which is
+    what lets these tests run.  Refusing to consult it is the policy's
+    decision, so that is where the contract is asserted.
+    """
     angles = np.linspace(0, np.pi, 8, endpoint=False)
-    model = mbirtorch.ParallelBeamModel((8, 6, 8), angles, device='cpu')
-    assert model._build_memory_ledger() is None
+    model = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
+    model.configure_devices(devices=['cpu'])
+    assert model._apply_device_policy() is None
+    assert model._build_memory_ledger() is not None
+
+
+def test_only_an_unindexed_cuda_model_is_eligible_for_the_automatic_count():
+    """CPU and MPS models are never widened, and naming a device index is as
+    explicit as calling configure_devices."""
+    angles = np.linspace(0, np.pi, 8, endpoint=False)
+    cpu = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
+    cpu.configure_devices(devices=['cpu'])
+    assert cpu.device_layout_is_automatic is False
+    if torch.cuda.is_available():
+        plain = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
+        plain.configure_devices(devices=['cuda'])
+        assert plain.device_layout_is_automatic is True
+        indexed = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
+        indexed.configure_devices(devices=['cuda:0'])
+        assert indexed.device_layout_is_automatic is False
 
 
 def test_configure_devices_takes_the_layout_out_of_automatic_mode():
     angles = np.linspace(0, np.pi, 8, endpoint=False)
-    model = mbirtorch.ParallelBeamModel((8, 6, 8), angles, device='cpu')
-    assert model.device_layout_is_automatic is True
+    model = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
+    model.configure_devices(devices=['cpu'])
+    model.device_layout_is_automatic = True          # as a CUDA model would be
     model.configure_devices(devices=['cpu', 'cpu'])
     assert model.device_layout_is_automatic is False
 
 
 def test_preflight_knobs_have_their_documented_defaults():
     angles = np.linspace(0, np.pi, 8, endpoint=False)
-    model = mbirtorch.ParallelBeamModel((8, 6, 8), angles, device='cpu')
+    model = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
+    model.configure_devices(devices=['cpu'])
     assert model.skip_memory_preflight is False
     assert model.memory_preflight_margin == 0.15
 
@@ -580,7 +613,8 @@ def test_preflight_knobs_have_their_documented_defaults():
 def test_recon_is_unaffected_on_a_cpu_model():
     """The n=1 path must be untouched: no ledger, no preflight, same result."""
     angles = np.linspace(0, np.pi, 8, endpoint=False)
-    model = mbirtorch.ParallelBeamModel((8, 6, 8), angles, device='cpu')
+    model = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
+    model.configure_devices(devices=['cpu'])
     model.set_params(no_warning=True, verbose=0)
     sinogram = np.zeros((8, 6, 8), dtype=np.float32)
     sinogram[:, 3, 4] = 1.0

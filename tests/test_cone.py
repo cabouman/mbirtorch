@@ -26,7 +26,8 @@ def _small_cone(device="cpu"):
     cell = (24, 16, 16)
     angles = np.linspace(0, 2 * np.pi, cell[0], endpoint=False)
     m = mbirtorch.ConeBeamModel(cell, angles, source_detector_dist=4 * cell[2],
-                                source_iso_dist=2 * cell[2], device=device)
+                                source_iso_dist=2 * cell[2])
+    m.configure_devices(devices=[device])
     m.set_params(no_warning=True, verbose=0)
     return m
 
@@ -70,8 +71,8 @@ def cone_model(golden):
     cell = tuple(int(x) for x in golden["cone_cell"])
     m = mbirtorch.ConeBeamModel(cell, golden["cone_angles"],
                                 source_detector_dist=float(golden["cone_sdd"]),
-                                source_iso_dist=float(golden["cone_sid"]),
-                                device="cpu")
+                                source_iso_dist=float(golden["cone_sid"]))
+    m.configure_devices(devices=["cpu"])
     m.set_params(no_warning=True, verbose=0)
     return m
 
@@ -155,7 +156,8 @@ def test_helical_z_weight_zeroes_padded_slices():
     z_shifts = np.linspace(-4.0, 4.0, cell[0]).astype(np.float32)
     m = mbirtorch.ConeBeamModel(cell, angles, source_detector_dist=4 * cell[2],
                                 source_iso_dist=2 * cell[2],
-                                helical_z_shifts=z_shifts, device="cpu")
+                                helical_z_shifts=z_shifts)
+    m.configure_devices(devices=["cpu"])
     m.set_params(no_warning=True, verbose=0)
     rs = tuple(m.get_params('recon_shape'))
     sino = torch.zeros(tuple(m.get_params('sinogram_shape')))
@@ -183,8 +185,8 @@ def helical_model(golden):
     m = mbirtorch.ConeBeamModel(cell, golden["cone_angles"],
                                 source_detector_dist=float(golden["cone_sdd"]),
                                 source_iso_dist=float(golden["cone_sid"]),
-                                helical_z_shifts=golden["chel_shifts"],
-                                device="cpu")
+                                helical_z_shifts=golden["chel_shifts"])
+    m.configure_devices(devices=["cpu"])
     m.set_params(no_warning=True, verbose=0)
     return m
 
@@ -195,8 +197,8 @@ def curved_model(golden):
     m = mbirtorch.ConeBeamModel(cell, golden["cone_angles"],
                                 source_detector_dist=float(golden["cone_sdd"]),
                                 source_iso_dist=float(golden["cone_sid"]),
-                                use_curved_detector=True,
-                                device="cpu")
+                                use_curved_detector=True)
+    m.configure_devices(devices=["cpu"])
     m.set_params(no_warning=True, verbose=0)
     return m
 

@@ -236,8 +236,9 @@ def _cone_self_check_cell(device_key):
     cell = (4, 10, 10)
     angles = np.linspace(0, 2 * np.pi, cell[0], endpoint=False)
     model = ConeBeamModel(cell, angles, source_detector_dist=4 * cell[2],
-                          source_iso_dist=2 * cell[2], device=device_key,
+                          source_iso_dist=2 * cell[2], 
                           compile_mode='off')
+    model.configure_devices(devices=[device_key])
     device = model.torch_device
     pixel_indices = torch.as_tensor(
         gen_full_indices(model.get_params('recon_shape')),
@@ -261,8 +262,9 @@ def _parallel_self_check_cell(device_key):
 
     cell = (4, 10, 10)
     angles = np.linspace(0, np.pi, cell[0], endpoint=False)
-    model = ParallelBeamModel(cell, angles, device=device_key,
+    model = ParallelBeamModel(cell, angles, 
                               compile_mode='off')
+    model.configure_devices(devices=[device_key])
     device = model.torch_device
     pixel_indices = torch.as_tensor(
         gen_full_indices(model.get_params('recon_shape')),

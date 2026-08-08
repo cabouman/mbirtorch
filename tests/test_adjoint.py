@@ -15,7 +15,8 @@ def test_projector_adjointness(device):
     torch.manual_seed(0)
     sino_shape = (48, 40, 32)
     angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
-    model = mbirtorch.ParallelBeamModel(sino_shape, angles, device=device)
+    model = mbirtorch.ParallelBeamModel(sino_shape, angles)
+    model.configure_devices(devices=[device])
     recon_shape = model.get_params('recon_shape')
 
     indices = torch.as_tensor(
@@ -36,7 +37,8 @@ def test_differentiable_wrapper_gradients(device):
     torch.manual_seed(0)
     sino_shape = (24, 16, 16)
     angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
-    model = mbirtorch.ParallelBeamModel(sino_shape, angles, device=device)
+    model = mbirtorch.ParallelBeamModel(sino_shape, angles)
+    model.configure_devices(devices=[device])
     recon_shape = model.get_params('recon_shape')
 
     volume = torch.rand(tuple(recon_shape), device=model.torch_device,
@@ -57,7 +59,8 @@ def test_differentiable_wrapper_gradients(device):
 def test_torch_projector_module(device):
     sino_shape = (12, 8, 8)
     angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
-    model = mbirtorch.ParallelBeamModel(sino_shape, angles, device=device)
+    model = mbirtorch.ParallelBeamModel(sino_shape, angles)
+    model.configure_devices(devices=[device])
     projector = mbirtorch.TorchProjector(model)
     recon_shape = model.get_params('recon_shape')
     volume = torch.rand(tuple(recon_shape), device=model.torch_device)

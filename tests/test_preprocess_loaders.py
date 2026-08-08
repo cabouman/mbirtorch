@@ -131,7 +131,8 @@ def test_auto_crop_sino_consistent_and_survives_build_model():
     # of the same name for the full rationale).
     angles = np.linspace(0, np.pi, 12, endpoint=False)
     model = mbirtorch.ConeBeamModel((12, 80, 100), angles, source_detector_dist=200,
-                                    source_iso_dist=100, device='cpu')
+                                    source_iso_dist=100)
+    model.configure_devices(devices=['cpu'])
     model.set_params(no_warning=True, delta_det_row=0.5, delta_det_channel=0.5)
     required, optional, regularization = model.get_all_params()
     optional.pop('recon_shape', None)          # reader flow: let auto size the recon from the crop
@@ -158,7 +159,8 @@ def test_auto_crop_sino_consistent_and_survives_build_model():
     rebuilt = mbirtorch.build_model(required, optional, regularization)
     assert tuple(rebuilt.get_params('sinogram_shape')) == sino.shape        # survives build
     reference = mbirtorch.ConeBeamModel(
-        **{k: v for k, v in required.items() if k != 'geometry_type'}, device='cpu')
+        **{k: v for k, v in required.items() if k != 'geometry_type'})
+    reference.configure_devices(devices=['cpu'])
     reference.set_params(**{k: v for k, v in optional.items() if k != 'recon_slice_offset'})
     reference.auto_set_recon_geometry()
     derived = float(rebuilt.get_params('recon_slice_offset'))

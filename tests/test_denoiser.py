@@ -24,7 +24,8 @@ def _rel_max(out, ref):
 def test_denoiser_matches_golden():
     golden = np.load(_paths[0])
     shape = tuple(int(x) for x in golden["recon_shape"])
-    denoiser = mbirtorch.QGGMRFDenoiser(shape, device="cpu")
+    denoiser = mbirtorch.QGGMRFDenoiser(shape)
+    denoiser.configure_devices(devices=["cpu"])
     denoiser.set_params(no_warning=True, verbose=0)
 
     sigma_est = float(denoiser.estimate_image_noise_std(golden["den_noisy"]))
@@ -55,7 +56,8 @@ def test_denoise_reduces_noise(device):
     clean = np.zeros(shape, dtype=np.float32)
     clean[8:-8, 8:-8, 8:-8] = 1.0
     noisy = clean + 0.1 * np.random.RandomState(2).randn(*shape).astype(np.float32)
-    denoiser = mbirtorch.QGGMRFDenoiser(shape, device=device)
+    denoiser = mbirtorch.QGGMRFDenoiser(shape)
+    denoiser.configure_devices(devices=[device])
     denoiser.set_params(no_warning=True, verbose=0)
     np.random.seed(0)
     denoised, _ = denoiser.denoise(noisy, sigma_noise=0.1, max_iterations=5,

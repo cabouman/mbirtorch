@@ -40,10 +40,14 @@ def _make_single_view_sibling(ct_model):
     for name, value in list(required.items()):
         if isinstance(value, np.ndarray) and value.ndim >= 1 and value.shape[0] == num_views:
             required[name] = value[0:1]
-    required['device'] = ct_model.torch_device
     optional = dict(optional)
     optional['recon_shape'] = tuple(ct_model.get_params('recon_shape'))
     sibling = mt.build_model(required, optional, regularization)
+    # The sibling must live where its parent lives, and the constructors take
+    # no device argument, so the layout is set explicitly.  The parent's LEAD
+    # device is the right target: the sibling projects one view at a time and
+    # is never sharded.
+    sibling.configure_devices(devices=[ct_model.torch_device])
     return sibling
 
 

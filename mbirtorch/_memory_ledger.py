@@ -81,6 +81,12 @@ APPLY_CYLINDERS = 2
 FIXED_DEVICE_OVERHEAD_BYTES = 64 * 2 ** 20
 
 CALIBRATION_ENV_VAR = 'MBIRTORCH_MEMORY_CALIBRATION'
+# A process-wide pin on the automatic device count.  It exists so that a test
+# suite, a nightly, or a measurement script can be deterministic on a machine
+# whose GPU count it does not control.  Setting it is as explicit as calling
+# configure_devices: the count is not searched and is never reduced, while the
+# empty-shard validation and the preflight still apply.
+DEVICE_COUNT_ENV_VAR = 'MBIRTORCH_NUM_DEVICES'
 # The band the modeled peak must land in against the measured peak.  The
 # lower bound is the one that matters: a ledger that under-predicts would let
 # a doomed run start, which is the failure this module exists to prevent.
@@ -778,9 +784,14 @@ def layout_fits(ledger, budgets, credits=None, margin=0.15):
     return fits, rows
 
 
-def format_shortfall(ledger, rows, num_devices_tried):
+def format_shortfall(ledger, rows, num_devices_tried, closest_count=None,
+                     remedies=None):
     """The one readable error: what did not fit, which phase dominates it,
-    and which knob moves that phase."""
+    and which knob moves that phase.
+
+    ``rows`` describes the CLOSEST layout tried, not the last one, so the
+    remedies are aimed at the shortfall a user can actually close.
+    """
     lines = ['this reconstruction needs more memory than the available '
              'CUDA devices have free.', '']
     header = f'{"device":>10}{"modeled need":>16}{"available":>14}{"shortfall":>14}'
@@ -804,9 +815,14 @@ def format_shortfall(ledger, rows, num_devices_tried):
     if top:
         named = ', '.join(f'{name} {_gb(value)}' for name, value in top)
         lines.append(f'Its largest terms are: {named}.')
+    tried = (', '.join(str(c) for c in num_devices_tried)
+             if isinstance(num_devices_tried, (list, tuple))
+             else str(num_devices_tried))
+    closest = ('' if closest_count is None
+               else f'  The closest was {closest_count}, shown above.')
     lines += [
-        '', f'Device counts tried, largest first, down to 1: '
-            f'{num_devices_tried}.  None fit.',
+        '', f'Device counts tried, largest first: {tried}.  None fit.'
+            + closest,
         '', 'Remedies, most effective first:',
         '  model.back_project_slice_band = <slices>   '
         '# the band reduce barely shrinks with more',
@@ -820,13 +836,35 @@ def format_shortfall(ledger, rows, num_devices_tried):
         '# per-subset transients',
         '  CUDA_VISIBLE_DEVICES=...                   '
         '# exclude a device another process is using',
-        '',
-        'To run anyway: model.skip_memory_preflight = True',
     ]
+    lines += list(remedies or [])
+    lines += ['', 'To run anyway: model.skip_memory_preflight = True']
     return '\n'.join(lines)
 
 
 # ── calibration ──────────────────────────────────────────────────────────────
+def pinned_device_count():
+    """The device count pinned by the environment, or None.
+
+    A value that is not a positive integer is refused rather than ignored: a
+    typo in a nightly's environment must not silently restore the automatic
+    behavior the pin was set to prevent.
+    """
+    raw = os.environ.get(DEVICE_COUNT_ENV_VAR, '').strip()
+    if not raw:
+        return None
+    try:
+        count = int(raw)
+    except ValueError:
+        count = 0
+    if count < 1:
+        raise ValueError(
+            f'{DEVICE_COUNT_ENV_VAR}={raw!r} is not a positive integer.  '
+            'Unset it for the automatic device count, or set it to the '
+            'number of devices to pin.')
+    return count
+
+
 def calibration_enabled():
     return os.environ.get(CALIBRATION_ENV_VAR, '') not in ('', '0', 'false')
 

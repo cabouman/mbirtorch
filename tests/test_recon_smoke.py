@@ -9,7 +9,8 @@ import mbirtorch
 def test_recon_reduces_loss(device):
     sino_shape = (40, 32, 32)
     angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
-    model = mbirtorch.ParallelBeamModel(sino_shape, angles, device=device)
+    model = mbirtorch.ParallelBeamModel(sino_shape, angles)
+    model.configure_devices(devices=[device])
     model.set_params(no_warning=True, verbose=0)
     recon_shape = model.get_params('recon_shape')
 

@@ -91,7 +91,8 @@ def test_model_shard_and_gather_roundtrip():
     from mbirtorch._sharding import Shards
     sino_shape = (10, 6, 8)                      # 10 views over 2 devices
     angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
-    m = mbirtorch.ParallelBeamModel(sino_shape, angles, device="cpu")
+    m = mbirtorch.ParallelBeamModel(sino_shape, angles)
+    m.configure_devices(devices=["cpu"])
     m.set_params(no_warning=True, verbose=0)
     m.configure_devices(devices=["cpu", "cpu"])
 
@@ -109,7 +110,8 @@ def test_model_shard_and_gather_roundtrip():
     # slice axis 6 -> 3+3, and a NON-dividing case (7 detector rows -> 7
     # recon slices over 2 devices) pads with inert zeros:
     m2 = mbirtorch.ParallelBeamModel((10, 7, 8), np.linspace(0, np.pi, 10,
-                                     endpoint=False), device="cpu")
+                                     endpoint=False))
+    m2.configure_devices(devices=["cpu"])
     m2.set_params(no_warning=True, verbose=0)
     m2.configure_devices(devices=["cpu", "cpu"])
     r9 = np.random.RandomState(2).rand(*tuple(m2.get_params('recon_shape'))
@@ -129,7 +131,8 @@ def test_model_shard_and_gather_roundtrip():
 def _banded_case(devices, sino_shape=(8, 6, 8)):
     import mbirtorch
     angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
-    m = mbirtorch.ParallelBeamModel(sino_shape, angles, device="cpu")
+    m = mbirtorch.ParallelBeamModel(sino_shape, angles)
+    m.configure_devices(devices=["cpu"])
     m.set_params(no_warning=True, verbose=0)
     rs = tuple(m.get_params('recon_shape'))
     rng = np.random.RandomState(3)
@@ -183,7 +186,8 @@ def _cone_banded_case(devices, cell=(8, 8, 8)):
     import mbirtorch
     angles = np.linspace(0, 2 * np.pi, cell[0], endpoint=False)
     m = mbirtorch.ConeBeamModel(cell, angles, source_detector_dist=4 * cell[2],
-                                source_iso_dist=2 * cell[2], device="cpu")
+                                source_iso_dist=2 * cell[2])
+    m.configure_devices(devices=["cpu"])
     m.set_params(no_warning=True, verbose=0)
     rs = tuple(m.get_params('recon_shape'))
     rng = np.random.RandomState(5)
@@ -267,7 +271,8 @@ def test_sharded_vcd_recon_matches_single_device():
     angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
 
     def build():
-        m = mbirtorch.ParallelBeamModel(sino_shape, angles, device="cpu")
+        m = mbirtorch.ParallelBeamModel(sino_shape, angles)
+        m.configure_devices(devices=["cpu"])
         m.set_params(no_warning=True, verbose=0)
         return m
 
@@ -315,7 +320,8 @@ def test_placements_refresh_on_geometry_change():
     # from the current shapes.
     import mbirtorch
     m = mbirtorch.ParallelBeamModel((8, 6, 8), np.linspace(0, np.pi, 8,
-                                    endpoint=False), device="cpu")
+                                    endpoint=False))
+    m.configure_devices(devices=["cpu"])
     m.set_params(no_warning=True, verbose=0)
     m.configure_devices(devices=["cpu", "cpu"])
     m.set_params(sinogram_shape=(12, 10, 8),
@@ -338,7 +344,8 @@ def test_cone_sharded_fdk_matches_single_device():
     for shifts in (None, np.linspace(-2.0, 2.0, cell[0]).astype(np.float32)):
         m = mbirtorch.ConeBeamModel(cell, angles, source_detector_dist=32,
                                     source_iso_dist=16,
-                                    helical_z_shifts=shifts, device="cpu")
+                                    helical_z_shifts=shifts)
+        m.configure_devices(devices=["cpu"])
         m.set_params(no_warning=True, verbose=0)
         sino = np.random.RandomState(1).rand(*cell).astype(np.float32)
         ref = m.fdk_recon(sino)
@@ -356,7 +363,8 @@ def test_padded_placement_roundtrip_with_row_pad():
     import mbirtorch
     sino_shape = (9, 7, 8)
     angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
-    m = mbirtorch.ParallelBeamModel(sino_shape, angles, device="cpu")
+    m = mbirtorch.ParallelBeamModel(sino_shape, angles)
+    m.configure_devices(devices=["cpu"])
     m.set_params(no_warning=True, verbose=0)
     m.configure_devices(devices=["cpu", "cpu"])
     assert m.sino_placement.is_padded and m.recon_placement.is_padded
@@ -396,7 +404,8 @@ def test_padded_banded_projectors_match_single_device():
     angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
 
     def build(n):
-        m = mbirtorch.ParallelBeamModel(sino_shape, angles, device="cpu")
+        m = mbirtorch.ParallelBeamModel(sino_shape, angles)
+        m.configure_devices(devices=["cpu"])
         m.set_params(no_warning=True, verbose=0)
         if n > 1:
             m.configure_devices(devices=["cpu"] * n)
@@ -431,7 +440,8 @@ def test_padded_sharded_vcd_recon_matches_single_device():
     angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
 
     def build():
-        m = mbirtorch.ParallelBeamModel(sino_shape, angles, device="cpu")
+        m = mbirtorch.ParallelBeamModel(sino_shape, angles)
+        m.configure_devices(devices=["cpu"])
         m.set_params(no_warning=True, verbose=0)
         return m
 
@@ -480,14 +490,15 @@ def test_fully_idle_device_refused():
     import mbirtorch
     sino_shape = (5, 8, 8)
     angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
-    m = mbirtorch.ParallelBeamModel(sino_shape, angles, device="cpu")
+    m = mbirtorch.ParallelBeamModel(sino_shape, angles)
+    m.configure_devices(devices=["cpu"])
     m.set_params(no_warning=True, verbose=0)
     m.configure_devices(devices=["cpu"] * 4)   # empty VIEW shard: allowed
     assert m.sino_placement.padded_shard_ranges()[-1][2] == 0
 
     m2 = mbirtorch.ParallelBeamModel((3, 3, 8),
-                                     np.linspace(0, np.pi, 3, endpoint=False),
-                                     device="cpu")
+                                     np.linspace(0, np.pi, 3, endpoint=False))
+    m2.configure_devices(devices=["cpu"])
     m2.set_params(no_warning=True, verbose=0)
     try:
         m2.configure_devices(devices=["cpu"] * 8)
@@ -507,7 +518,8 @@ def test_cone_sharded_vcd_recon_matches_single_device():
 
         def build():
             m = mbirtorch.ConeBeamModel(cell, angles, source_detector_dist=32,
-                                        source_iso_dist=16, device="cpu")
+                                        source_iso_dist=16)
+            m.configure_devices(devices=["cpu"])
             m.set_params(no_warning=True, verbose=0)
             return m
 
@@ -538,7 +550,8 @@ def test_sub_band_streaming_matches_unstreamed():
     import mbirtorch
     sino_shape = (9, 7, 8)
     angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
-    m1 = mbirtorch.ParallelBeamModel(sino_shape, angles, device="cpu")
+    m1 = mbirtorch.ParallelBeamModel(sino_shape, angles)
+    m1.configure_devices(devices=["cpu"])
     m1.set_params(no_warning=True, verbose=0)
     rs = tuple(m1.get_params('recon_shape'))
     rng = np.random.default_rng(9)
@@ -547,7 +560,8 @@ def test_sub_band_streaming_matches_unstreamed():
     fwd_ref = m1.forward_project(vol)
     bp_ref = m1.back_project(sino)
 
-    m2 = mbirtorch.ParallelBeamModel(sino_shape, angles, device="cpu")
+    m2 = mbirtorch.ParallelBeamModel(sino_shape, angles)
+    m2.configure_devices(devices=["cpu"])
     m2.set_params(no_warning=True, verbose=0)
     m2.configure_devices(devices=["cpu", "cpu"])
     m2.forward_project_slice_band = 2
@@ -560,7 +574,8 @@ def test_sub_band_streaming_matches_unstreamed():
     cell = (8, 8, 8)
     cangles = np.linspace(0, 2 * np.pi, cell[0], endpoint=False)
     c1 = mbirtorch.ConeBeamModel(cell, cangles, source_detector_dist=32,
-                                 source_iso_dist=16, device="cpu")
+                                 source_iso_dist=16)
+    c1.configure_devices(devices=["cpu"])
     c1.set_params(no_warning=True, verbose=0)
     crs = tuple(c1.get_params('recon_shape'))
     cvol = rng.standard_normal(crs).astype(np.float32)
@@ -568,7 +583,8 @@ def test_sub_band_streaming_matches_unstreamed():
     cfwd_ref = c1.forward_project(cvol)
     cbp_ref = c1.back_project(csino)
     c2 = mbirtorch.ConeBeamModel(cell, cangles, source_detector_dist=32,
-                                 source_iso_dist=16, device="cpu")
+                                 source_iso_dist=16)
+    c2.configure_devices(devices=["cpu"])
     c2.set_params(no_warning=True, verbose=0)
     c2.configure_devices(devices=["cpu", "cpu"])
     c2.forward_project_slice_band = 2
@@ -607,7 +623,8 @@ def test_thin_volume_more_devices_than_slices():
     angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
 
     def build():
-        m = mbirtorch.ParallelBeamModel(sino_shape, angles, device="cpu")
+        m = mbirtorch.ParallelBeamModel(sino_shape, angles)
+        m.configure_devices(devices=["cpu"])
         m.set_params(no_warning=True, verbose=0)
         return m
 
@@ -642,7 +659,8 @@ def test_thin_volume_more_devices_than_slices():
 
     def cbuild():
         m = mbirtorch.ConeBeamModel(cell, cangles, source_detector_dist=32,
-                                    source_iso_dist=16, device="cpu")
+                                    source_iso_dist=16)
+        m.configure_devices(devices=["cpu"])
         m.set_params(no_warning=True, verbose=0)
         return m
 
@@ -674,7 +692,8 @@ def test_sparse_view_more_devices_than_views():
     angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
 
     def build():
-        m = mbirtorch.ParallelBeamModel(sino_shape, angles, device="cpu")
+        m = mbirtorch.ParallelBeamModel(sino_shape, angles)
+        m.configure_devices(devices=["cpu"])
         m.set_params(no_warning=True, verbose=0)
         return m
 
@@ -712,7 +731,8 @@ def test_sparse_view_more_devices_than_views():
 
     def cbuild():
         m = mbirtorch.ConeBeamModel(cell, cangles, source_detector_dist=32,
-                                    source_iso_dist=16, device="cpu")
+                                    source_iso_dist=16)
+        m.configure_devices(devices=["cpu"])
         m.set_params(no_warning=True, verbose=0)
         return m
 

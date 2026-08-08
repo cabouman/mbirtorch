@@ -312,11 +312,11 @@ class ConeBeamModel(TomographyModel):
             scans; None (default) is a circular scan.
         use_curved_detector (bool): False (default) = flat panel; True = a
             cylindrical detector of radius source_detector_dist.
-        device, view_batch_size, compile_mode: as in ParallelBeamModel.
+        view_batch_size, compile_mode: as in ParallelBeamModel.
     """
 
     def __init__(self, sinogram_shape, angles, source_detector_dist, source_iso_dist,
-                 helical_z_shifts=None, use_curved_detector=False, device='auto',
+                 helical_z_shifts=None, use_curved_detector=False,
                  view_batch_size=None, compile_mode='auto'):
         angles = np.asarray(angles, dtype=np.float32).flatten()
         if helical_z_shifts is None:
@@ -327,7 +327,7 @@ class ConeBeamModel(TomographyModel):
             raise ValueError("Incompatible view dependent vector lengths: all "
                              "view-dependent vectors must have the same length.")
         view_params_array = np.stack([angles, helical_z_shifts], axis=1)
-        super().__init__(sinogram_shape, device=device,
+        super().__init__(sinogram_shape,
                          view_batch_size=view_batch_size, compile_mode=compile_mode,
                          geometry_type='cone', view_params_name='view_params_array',
                          view_params_array=view_params_array,
@@ -369,7 +369,25 @@ class ConeBeamModel(TomographyModel):
             back_body = _cone_back_view_batch_triton
         else:
             back_body = _cone_back_view_batch
-        if cone_forward_kernel_usable(self)[0]:
+        # THE FORWARD KERNEL IS WITHHELD FROM A SHARDED LAYOUT.  Under the
+        # banded multi-device drivers the forward kernels disagree with the
+        # torch forward bodies by order one, in both geometries and at two
+        # and four devices, and the disagreement is not even reproducible run
+        # to run.  An isolation matrix in the plans repo separated the two
+        # directions cleanly: with the torch forward bound, the back-kernel
+        # arms reproduce the pure-torch arms to four significant figures at
+        # every device count, so the BACK kernel keeps its default-on status
+        # everywhere.  A single device never runs the banded drivers -- the
+        # trivial placement short-circuits to the plain projectors -- which
+        # is why the composed n=1 gates could not see this and why the
+        # kernel forward stays selected there.
+        #
+        # This is an interim, not the repair.  It retires when the forward
+        # kernels honor the banded contract and the standing
+        # kernel-times-sharding gate shows their arms rejoining the torch
+        # arms at the multi-device float floor.
+        sharded = not self.sino_placement.is_trivial
+        if cone_forward_kernel_usable(self)[0] and not sharded:
             from .triton_cone import _cone_forward_view_batch_triton
             fwd_body = _cone_forward_view_batch_triton
         else:

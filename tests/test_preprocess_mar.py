@@ -42,8 +42,8 @@ def mar_model(golden):
     cell = tuple(int(v) for v in golden["mar_cell"])
     model = mbirtorch.ConeBeamModel(cell, golden["mar_angles"],
                                     source_detector_dist=float(golden["mar_sdd"]),
-                                    source_iso_dist=float(golden["mar_sid"]),
-                                    device="cpu")
+                                    source_iso_dist=float(golden["mar_sid"]))
+    model.configure_devices(devices=["cpu"])
     model.set_params(no_warning=True, verbose=0)
     return model
 

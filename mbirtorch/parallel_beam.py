@@ -115,9 +115,6 @@ class ParallelBeamModel(TomographyModel):
         angles (ndarray):
             A 1D array of projection angles, in radians, specifying the angle of
             each projection relative to the origin.
-        device (str): 'auto' (cuda > mps > cpu), or an explicit torch device
-            string.  Device selection is an execution-environment choice, not a
-            saved model parameter (the mbirjax configure_devices rationale).
         view_batch_size (int or None): views per body call in the batched
             drivers (the single memory/speed knob).  None (default) means
             automatic: 64 for the torch bodies -- the long-standing default
@@ -132,10 +129,10 @@ class ParallelBeamModel(TomographyModel):
         >>> model = mbirtorch.ParallelBeamModel((180, 256, 10), angles)
     """
 
-    def __init__(self, sinogram_shape, angles, device='auto',
+    def __init__(self, sinogram_shape, angles,
                  view_batch_size=None, compile_mode='auto'):
         angles = np.asarray(angles, dtype=np.float32)
-        super().__init__(sinogram_shape, device=device, view_batch_size=view_batch_size,
+        super().__init__(sinogram_shape, view_batch_size=view_batch_size,
                          compile_mode=compile_mode,
                          geometry_type='parallel', view_params_name='angles',
                          angles=angles)
@@ -243,7 +240,25 @@ class ParallelBeamModel(TomographyModel):
             back_body = _parallel_back_view_batch_triton
         else:
             back_body = _parallel_back_view_batch
-        if parallel_forward_kernel_usable(self)[0]:
+        # THE FORWARD KERNEL IS WITHHELD FROM A SHARDED LAYOUT.  Under the
+        # banded multi-device drivers the forward kernels disagree with the
+        # torch forward bodies by order one, in both geometries and at two
+        # and four devices, and the disagreement is not even reproducible run
+        # to run.  An isolation matrix in the plans repo separated the two
+        # directions cleanly: with the torch forward bound, the back-kernel
+        # arms reproduce the pure-torch arms to four significant figures at
+        # every device count, so the BACK kernel keeps its default-on status
+        # everywhere.  A single device never runs the banded drivers -- the
+        # trivial placement short-circuits to the plain projectors -- which
+        # is why the composed n=1 gates could not see this and why the
+        # kernel forward stays selected there.
+        #
+        # This is an interim, not the repair.  It retires when the forward
+        # kernels honor the banded contract and the standing
+        # kernel-times-sharding gate shows their arms rejoining the torch
+        # arms at the multi-device float floor.
+        sharded = not self.sino_placement.is_trivial
+        if parallel_forward_kernel_usable(self)[0] and not sharded:
             from .triton_parallel import _parallel_forward_view_batch_triton
             fwd_body = _parallel_forward_view_batch_triton
         else:

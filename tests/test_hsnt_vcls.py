@@ -96,7 +96,8 @@ def test_hsnt_hdf5_round_trip(tmp_path, golden):
 
 
 def test_get_opt_views_seeded_golden(golden):
-    model = mbirtorch.ParallelBeamModel((24, 8, 32), golden["vcls_angles"], device='cpu')
+    model = mbirtorch.ParallelBeamModel((24, 8, 32), golden["vcls_angles"])
+    model.configure_devices(devices=['cpu'])
     model.set_params(no_warning=True, verbose=0)
     inds, vcl = mbirtorch.get_opt_views(model, golden["vcls_ref"].copy(), num_selected_views=5,
                                         r_1=0.05, seed=3)

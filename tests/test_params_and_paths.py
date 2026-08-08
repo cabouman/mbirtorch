@@ -13,7 +13,8 @@ import mbirtorch
 def _small_model(device="cpu", **kwargs):
     sino_shape = (24, 16, 16)
     angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
-    m = mbirtorch.ParallelBeamModel(sino_shape, angles, device=device, **kwargs)
+    m = mbirtorch.ParallelBeamModel(sino_shape, angles, **kwargs)
+    m.configure_devices(devices=[device])
     m.set_params(no_warning=True, verbose=0)
     return m
 

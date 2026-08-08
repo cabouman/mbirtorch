@@ -97,10 +97,19 @@ class TomographyModel(ParameterHandler):
     and the auto recon geometry; this class owns the projection wrappers and
     the VCD loop."""
 
-    def __init__(self, sinogram_shape, device='auto', view_batch_size=None,
+    def __init__(self, sinogram_shape, view_batch_size=None,
                  compile_mode='auto', **kwargs):
         super().__init__()
-        self.torch_device = _resolve_device(device)
+        # The device and the placements resolve LAZILY, on first use.  Two
+        # things follow.  A caller who only inspects a model, or who is about
+        # to call configure_devices, never pays CUDA context initialization
+        # for a device they did not choose.  And the projectors are built
+        # once, against the layout actually in force, instead of being built
+        # at construction and rebuilt by the first configure_devices call.
+        self._torch_device = None
+        self._sino_placement = None
+        self._recon_placement = None
+        self._projector_functions = None
         # Views per body call in the batched drivers.  None means automatic:
         # a torch body uses the long-standing default of 64, and a
         # hand-written kernel body uses its own swept view chunk.  An
@@ -120,18 +129,12 @@ class TomographyModel(ParameterHandler):
         # Device-layout caches (see _invalidate_device_caches).
         self._qggmrf_interface_masks_cache = None
         self._dc_damping_cache = None
-        # Device layout.  recon_placement / sino_placement are the single
-        # source of truth for how the two array types are distributed (the
-        # mbirjax structure): sino-like arrays shard by VIEW (axis 0),
-        # recon-like arrays by SLICE (the last axis).  Construction gives the
-        # trivial single-device placements; configure_devices() widens them.
-        self.sino_placement = _sharding.Placement([self.torch_device], axis=0)
-        self.recon_placement = _sharding.Placement([self.torch_device], axis=-1)
         self.dev2dev_safe = True     # probed for real in configure_devices
-        # Whether the device layout is still the library's to choose.  An
-        # explicit configure_devices call sets this False permanently: an
-        # explicitly requested device count is the caller's to request, and
-        # nothing here second-guesses it.
+        # Whether the device layout is still the library's to choose.  It is
+        # one bit: an explicit configure_devices call sets it False
+        # permanently, because a layout the caller chose is the caller's.
+        # With no such call the model resolves 'auto' and, on CUDA with two
+        # or more visible devices, takes the automatic widening path.
         self.device_layout_is_automatic = True
         # Memory-preflight knobs, beside the other memory knobs
         # (view_batch_size above, and the slice-band attributes the banded
@@ -168,12 +171,70 @@ class TomographyModel(ParameterHandler):
         # Geometry-derived defaults (recon_shape, delta_voxel), then the
         # projectors, then a validity check -- the mbirjax construction order.
         self.auto_set_recon_geometry(no_compile=True, no_warning=True)
-        self.create_projectors()
         self.verify_valid_params()
 
     @property
     def compile_enabled(self):
         return self.compile_mode != 'off'
+
+    # ── lazily resolved device state ──────────────────────────────────────────
+    # Each of these resolves on first read and is plain-assignable, so
+    # configure_devices and the automatic widening keep setting them directly.
+    @property
+    def torch_device(self):
+        """The model's lead device, resolved on first use.
+
+        Resolution is 'auto': cuda if available, else mps, else cpu.  A
+        caller who wants something else calls
+        ``configure_devices(devices=[...])``, which sets this before anything
+        reads it, so no device is ever touched that the caller did not ask
+        for."""
+        if self._torch_device is None:
+            self._torch_device = _resolve_device('auto')
+        return self._torch_device
+
+    @torch_device.setter
+    def torch_device(self, value):
+        self._torch_device = torch.device(value)
+
+    # recon_placement / sino_placement are the single source of truth for how
+    # the two array types are distributed (the mbirjax structure): sino-like
+    # arrays shard by VIEW (axis 0), recon-like arrays by SLICE (the last
+    # axis).  Unset, they are the trivial single-device placements;
+    # configure_devices and the automatic widening replace them.
+    @property
+    def sino_placement(self):
+        if self._sino_placement is None:
+            self._sino_placement = _sharding.Placement([self.torch_device],
+                                                       axis=0)
+        return self._sino_placement
+
+    @sino_placement.setter
+    def sino_placement(self, value):
+        self._sino_placement = value
+
+    @property
+    def recon_placement(self):
+        if self._recon_placement is None:
+            self._recon_placement = _sharding.Placement([self.torch_device],
+                                                        axis=-1)
+        return self._recon_placement
+
+    @recon_placement.setter
+    def recon_placement(self, value):
+        self._recon_placement = value
+
+    @property
+    def projector_functions(self):
+        """The projection driver, built on first use against the layout then
+        in force."""
+        if self._projector_functions is None:
+            self.create_projectors()
+        return self._projector_functions
+
+    @projector_functions.setter
+    def projector_functions(self, value):
+        self._projector_functions = value
 
     # ── hooks for geometry subclasses ─────────────────────────────────────────
     def create_projectors(self):
@@ -606,7 +667,8 @@ class TomographyModel(ParameterHandler):
                 devices, axis=-1, real_size=int(recon_shape[2]))
             self._check_no_empty_shard()
         self._invalidate_device_caches()
-        self.create_projectors()
+        if self._projector_functions is not None:
+            self.create_projectors()
 
     def _check_no_empty_shard(self):
         """Refuse a device layout that would leave a device idle on BOTH
@@ -688,9 +750,26 @@ class TomographyModel(ParameterHandler):
 
     # ── device configuration (the mbirjax configure_devices seam) ─────────────
     def configure_devices(self, num_devices=1, devices=None):
-        """Set the device layout: rebuild the sino (view-axis) and recon
-        (slice-axis) placements over ``num_devices`` CUDA devices, or an
-        explicit device list.
+        """Set the device layout, and take it out of the library's hands.
+
+        This is the ONE place a device choice is expressed.  The model
+        constructors take no device argument, so every explicit choice comes
+        through here: a count (``num_devices=n``), or a list
+        (``devices=['cpu']``, ``['mps']``, ``['cuda:1']``, or several CUDA
+        devices).
+
+        Without a call to this method, the model resolves its device lazily,
+        preferring cuda, then mps, then cpu.  On CUDA with two or more visible
+        devices it then spreads a reconstruction across the devices that can
+        hold their share, judged by a memory check that runs before the first
+        large allocation.  ``configure_devices(num_devices=1)`` is the
+        reproducibility pin, and the ``MBIRTORCH_NUM_DEVICES`` environment
+        variable pins the count process-wide for a suite or a nightly.
+        Results can differ slightly with the device count, and the difference
+        decays as iterations proceed.
+
+        It rebuilds the sino (view-axis) and recon (slice-axis) placements
+        over ``num_devices`` CUDA devices, or over the explicit device list.
 
         The placements' real sizes come from the CURRENT params
         (sinogram_shape / recon_shape), so call this after any geometry
@@ -701,8 +780,13 @@ class TomographyModel(ParameterHandler):
         the unchanged n=1 path.
 
         Calling this at all takes the layout out of the library's hands: the
-        count given here is the count used, and the automatic device-count
-        choice never runs again on this model.
+        count given here is the count used, the memory preflight no longer
+        second-guesses it, and the automatic device-count choice never runs
+        again on this model.  ``num_devices=1`` is therefore the way to pin a
+        run to one device for reproducibility.
+
+        Without such a call, a CUDA model spreads a reconstruction across the
+        devices that can hold their share; see :meth:`recon`.
         """
         self.device_layout_is_automatic = False
         if devices is None:
@@ -716,6 +800,16 @@ class TomographyModel(ParameterHandler):
                         f"CUDA devices; found "
                         f"{torch.cuda.device_count() if torch.cuda.is_available() else 0}.")
                 devices = [torch.device(f"cuda:{i}") for i in range(num_devices)]
+        self._install_device_layout(devices)
+
+    def _install_device_layout(self, devices):
+        """Rebuild the placements over ``devices``: the shared body of
+        :meth:`configure_devices` and of the automatic device-count choice.
+
+        This carries no policy.  It does not touch
+        ``device_layout_is_automatic``, so the automatic path can install a
+        layout without pretending the caller asked for one.
+        """
         devices = [torch.device(d) for d in devices]
         self.torch_device = devices[0]
         sinogram_shape, recon_shape = self.get_params(['sinogram_shape', 'recon_shape'])
@@ -728,36 +822,162 @@ class TomographyModel(ParameterHandler):
         # route transfers through host memory if a direct copy ever corrupts.
         self.dev2dev_safe = _sharding.is_dev2dev_safe(devices)
         self._invalidate_device_caches()
-        self.create_projectors()
+        if self._projector_functions is not None:
+            self.create_projectors()
 
-    # ── the memory ledger (the device-count criterion) ────────────────────────
+    # ── the memory ledger and the automatic device count ──────────────────────
     def _build_memory_ledger(self, devices=None, **call_arrays):
-        """The modeled per-device peak for the reconstruction about to run.
+        """The modeled per-device peak for one candidate device list.
 
-        Returns None when there is nothing to model against: the ledger's
-        production job is choosing a device count, so it is CUDA-only, and it
-        is built here only when the automatic path will consult it or when the
-        calibration mode asks for it.  The calibration mode asks at ANY device
-        count, including one, because the modeled-against-measured comparison
-        needs the single-device cells too.
+        ``devices`` prices a CANDIDATE list rather than the model's current
+        one, which is what lets the automatic choice evaluate a layout the
+        model is not in.  None means the current placement.
 
-        ``devices`` prices a CANDIDATE device list rather than the model's
-        current one; None means the current placement.
+        The ledger math is device-agnostic, so this builds one for any
+        backend.  WHETHER to consult one is the policy's decision, not this
+        function's, which is also what lets the rule be tested on CPU.
         """
         devices = list(self.sino_placement.devices if devices is None
                        else devices)
-        if not any(torch.device(d).type == 'cuda' for d in devices):
-            return None
-        automatic = (self.device_layout_is_automatic
-                     and not self.skip_memory_preflight
-                     and len(devices) > 1)
-        if not (automatic or _memory_ledger.calibration_enabled()):
-            return None
-        ledger = _memory_ledger.estimate_peak_device_bytes(
+        return _memory_ledger.estimate_peak_device_bytes(
             _memory_ledger.plan_from_model(self, devices, **call_arrays))
-        self.last_memory_ledger = ledger
+
+    def _candidate_devices(self, num_devices):
+        return [torch.device(f'cuda:{i}') for i in range(num_devices)]
+
+    def _apply_device_policy(self, **call_arrays):
+        """Settle the device layout for the reconstruction about to run, and
+        return the ledger for the layout settled on.
+
+        This is the one site where the automatic device count is chosen, and
+        it is deliberately not model construction.  Three reasons, in order of
+        weight.  A construction-time choice would give ``QGGMRFDenoiser`` a
+        multi-device layout its own loop cannot run.  The ledger needs a free
+        memory reading, and that is only knowable when the reconstruction is
+        about to start; a reading taken at construction would be trusted while
+        stale.  And a developer calling a projector directly has not asked for
+        a layout change, so the reconstruction entries are the right scope.
+
+        The choice is re-evaluated on every entry while the layout is still
+        automatic, because a long-lived model in a Plug-and-Play loop can
+        outlive the conditions its first choice was made under.  The
+        placements are rebuilt only when the chosen count differs from the
+        current one, so an unchanged count costs a closed-form pass and one
+        free-memory query per device.
+        """
+        calibrating = _memory_ledger.calibration_enabled()
+        if not self.device_layout_is_automatic:
+            # An explicit layout is the caller's; the ledger runs only when
+            # the calibration mode asks for it.
+            ledger = self._build_memory_ledger(**call_arrays) if calibrating \
+                else None
+            return self._arm_calibration(ledger)
+
+        pinned = _memory_ledger.pinned_device_count()
+        visible = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        if visible < 2:
+            # A single visible device has no layout to choose, so there is
+            # nothing for the ledger to decide and it does not run.  Torch's
+            # caching allocator already raises a fast, readable error on a
+            # single-device overflow, which is the job the preflight exists to
+            # do where the allocator cannot.  This also keeps the n=1 path free
+            # of any new per-reconstruction cost.
+            return self._arm_calibration(None)
+
+        if pinned is not None:
+            # A process-wide pin is as explicit as a configure_devices call:
+            # the count is not searched and never reduced.  The empty-shard
+            # validation and the preflight still apply to it.
+            candidates = [min(pinned, visible)]
+        else:
+            candidates = list(range(visible, 0, -1))
+
+        rejected, best = [], None
+        for count in candidates:
+            devices = (self._candidate_devices(count) if count > 1
+                       else [self.torch_device])
+            if not self._layout_is_valid(devices):
+                rejected.append((count, 'a device would own no real data'))
+                continue
+            ledger = self._build_memory_ledger(devices=devices, **call_arrays)
+            if ledger is None or self.skip_memory_preflight:
+                # Nothing to check against, or the caller has forced the run.
+                return self._settle(devices, ledger, rejected)
+            budgets = [_memory_ledger.device_budget_bytes(d) for d in devices]
+            credits = _memory_ledger.resident_credits(
+                devices, list(call_arrays.values()))
+            fits, rows = _memory_ledger.layout_fits(
+                ledger, budgets, credits, margin=self.memory_preflight_margin)
+            if fits:
+                return self._settle(devices, ledger, rejected)
+            shortfall = max((d - b) for _dev, d, b in rows if b is not None)
+            rejected.append((count, f'{shortfall / 2 ** 30:.2f} GB short'))
+            if best is None or shortfall < best[0]:
+                best = (shortfall, ledger, rows, count)
+
+        # Nothing fits, including a single device.  The answer to "which
+        # count" is "none", so fail here with the dominant phase named rather
+        # than launch a reconstruction that is known not to fit.
+        if best is None:
+            raise _memory_ledger.MemoryPreflightError(
+                'no device layout is valid for this geometry: '
+                + '; '.join(f'{c} devices ({why})' for c, why in rejected))
+        _shortfall, ledger, rows, count = best
+        raise _memory_ledger.MemoryPreflightError(
+            _memory_ledger.format_shortfall(
+                ledger, rows, num_devices_tried=candidates,
+                closest_count=count, remedies=self._memory_remedies()))
+
+    def _memory_remedies(self):
+        """Extra remedy lines for this geometry's preflight message."""
+        if hasattr(self, 'split_sino_recon'):
+            return ['  model.split_sino_recon(...)                '
+                    '# reconstructs in halves; nearly doubles the',
+                    '                                             '
+                    '# feasible size at a fixed device count']
+        return []
+
+    def _layout_is_valid(self, devices):
+        """Whether ``devices`` passes the empty-shard rules, without mutating
+        anything: the same predicate :meth:`_check_no_empty_shard` applies,
+        evaluated on candidate placements."""
+        sinogram_shape, recon_shape = self.get_params(['sinogram_shape',
+                                                       'recon_shape'])
+        sino = _sharding.Placement(devices, axis=0,
+                                   real_size=int(sinogram_shape[0]))
+        recon = _sharding.Placement(devices, axis=-1,
+                                    real_size=int(recon_shape[2]))
+        return not any(sv <= 0 and rv <= 0 for sv, rv in zip(
+            [n for _d, _r, n in sino.padded_shard_ranges()],
+            [n for _d, _r, n in recon.padded_shard_ranges()]))
+
+    def _settle(self, devices, ledger, rejected):
+        """Install the chosen layout when it differs from the current one, log
+        the choice, and arm the calibration mode."""
+        chosen, current = len(devices), self.sino_placement.n_devices
+        if chosen != current:
+            self.logger.info(
+                f'Using {chosen} CUDA device(s) for this reconstruction '
+                f'(was {current}).  configure_devices(num_devices=n) pins it.')
+            self._install_device_layout(devices)
+            # The ledger priced the layout we just installed, but the view
+            # batch it charged came from the same candidate count, so it
+            # stays valid.
+        if rejected and self.get_params('verbose') >= 2:
+            for count, why in rejected:
+                self.logger.debug(f'  device count {count} rejected: {why}')
+        return self._arm_calibration(ledger)
+
+    def _arm_calibration(self, ledger):
+        """Record the ledger and, under the calibration mode, take ownership
+        of the peak counter it is about to compare against."""
+        if ledger is not None:
+            self.last_memory_ledger = ledger
         if _memory_ledger.calibration_enabled():
-            _memory_ledger.calibration_start(devices)
+            if ledger is None:
+                ledger = self._build_memory_ledger()
+                self.last_memory_ledger = ledger
+            _memory_ledger.calibration_start(self.sino_placement.devices)
         return ledger
 
     # ── array placement (entry) and gathering (exit) ──────────────────────────
@@ -2184,11 +2404,14 @@ class TomographyModel(ParameterHandler):
                              f'Expected {tuple(sinogram_shape)}, got '
                              f'{tuple(sinogram.shape)}.')
 
-        # The memory ledger, computed BEFORE the first large allocation of the
-        # reconstruction.  It is the criterion the automatic device-count
-        # choice uses, and it is what the calibration mode compares against
-        # the measured peak.
-        memory_ledger = self._build_memory_ledger(
+        # Settle the device layout BEFORE the first large allocation.  On a
+        # CUDA model whose layout the caller has not fixed, this is where the
+        # reconstruction spreads across the devices that can hold their share;
+        # everywhere else it is a no-op that only the calibration mode
+        # observes.  The ledger it returns is the model of the layout settled
+        # on, and it is what the calibration mode compares against the
+        # measured peak.
+        memory_ledger = self._apply_device_policy(
             partition_sequence=partition_sequence, weights=weights,
             init_recon=init_recon, fm_hessian=fm_hessian,
             prox_input=prox_input, init_error_sinogram=init_error_sinogram)
@@ -2508,10 +2731,21 @@ class TomographyModel(ParameterHandler):
         init_recon to the output of the previous recon; this continues the
         partition sequence from where the previous recon left off.
 
+        Device use: on CUDA this spreads the reconstruction across the
+        available devices, using every device that can hold its share.  The
+        share is judged by a memory check that runs before the first large
+        allocation, so a layout that cannot fit is refused in seconds rather
+        than part way through.  Nothing needs to change in a calling script.
+        ``configure_devices(num_devices=n)`` fixes the count instead, and
+        ``configure_devices(num_devices=1)`` is the reproducibility pin.  The
+        environment variable ``MBIRTORCH_NUM_DEVICES`` pins it process-wide,
+        which is what a test suite or a nightly should use.
+
         Reproducibility note: the pixel partitions are drawn from numpy's
         global random number generator, so reconstructions vary slightly from
         run to run.  For a reproducible result, call ``np.random.seed(seed)``
-        before calling this method.
+        before calling this method.  Results also differ slightly with the
+        device count, and that difference decays as iterations proceed.
 
         Args:
             sinogram (numpy or tensor): 3D sinogram data with shape
@@ -2767,7 +3001,10 @@ class TomographyModel(ParameterHandler):
         construction_derived_names = ('geometry_type', 'view_params_name', 'file_format',
                                       'version', 'use_gpu')
         # Execution-environment constructor arguments; not model parameters.
-        environment_args = ('self', 'device', 'view_batch_size', 'compile_mode')
+        # 'device' was one until the constructors dropped it; the device
+        # layout now travels through configure_devices alone and is never a
+        # saved parameter.
+        environment_args = ('self', 'view_batch_size', 'compile_mode')
 
         ctor_names = [n for n in inspect.signature(type(self).__init__).parameters
                       if n not in environment_args]

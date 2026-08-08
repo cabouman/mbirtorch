@@ -37,8 +37,9 @@ from mbirtorch import triton_cone, triton_parallel
 
 def _parallel_model(cell=(6, 12, 12), **kwargs):
     angles = np.linspace(0, np.pi, cell[0], endpoint=False)
-    model = mbirtorch.ParallelBeamModel(cell, angles, device='cpu',
+    model = mbirtorch.ParallelBeamModel(cell, angles, 
                                         compile_mode='off', **kwargs)
+    model.configure_devices(devices=['cpu'])
     model.set_params(no_warning=True, verbose=0)
     return model
 
@@ -47,8 +48,9 @@ def _cone_model(cell=(6, 12, 12), **kwargs):
     angles = np.linspace(0, 2 * np.pi, cell[0], endpoint=False)
     model = mbirtorch.ConeBeamModel(cell, angles,
                                     source_detector_dist=4 * cell[2],
-                                    source_iso_dist=2 * cell[2], device='cpu',
+                                    source_iso_dist=2 * cell[2], 
                                     compile_mode='off', **kwargs)
+    model.configure_devices(devices=['cpu'])
     model.set_params(no_warning=True, verbose=0)
     return model
 

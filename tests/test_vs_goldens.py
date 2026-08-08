@@ -33,7 +33,9 @@ def golden():
 @pytest.fixture(scope="module")
 def model(golden):
     cell = tuple(int(x) for x in golden["cell"])
-    return mbirtorch.ParallelBeamModel(cell, golden["angles"], device="cpu")
+    _model = mbirtorch.ParallelBeamModel(cell, golden["angles"])
+    _model.configure_devices(devices=["cpu"])
+    return _model
 
 
 def _rel_max(out, ref):

@@ -25,7 +25,8 @@ def _small_cone_case():
     cell = (32, 32, 32)
     angles = np.linspace(0, 2 * np.pi, cell[0], endpoint=False)
     model = mbirtorch.ConeBeamModel(cell, angles, source_detector_dist=4 * cell[2],
-                                    source_iso_dist=2 * cell[2], device='cpu')
+                                    source_iso_dist=2 * cell[2])
+    model.configure_devices(devices=['cpu'])
     model.set_params(no_warning=True, verbose=0)
     rshape = tuple(model.get_params('recon_shape'))
     phantom = mbirtorch.generate_3d_shepp_logan_low_dynamic_range(rshape)
@@ -71,7 +72,8 @@ def test_split_preserves_device_layout():
 
 def test_split_fallback_warns_and_recons():
     tiny = mbirtorch.ConeBeamModel((8, 6, 12), np.linspace(0, 2 * np.pi, 8, endpoint=False),
-                                   source_detector_dist=48.0, source_iso_dist=24.0, device='cpu')
+                                   source_detector_dist=48.0, source_iso_dist=24.0)
+    tiny.configure_devices(devices=['cpu'])
     tiny.set_params(no_warning=True, verbose=0)
     tsino = np.ones((8, 6, 12), dtype=np.float32)
     with warnings.catch_warnings(record=True) as w:
@@ -97,7 +99,8 @@ def test_split_golden_parity():
     cell = tuple(int(v) for v in golden["mar_cell"])
     model = mbirtorch.ConeBeamModel(cell, golden["mar_angles"],
                                     source_detector_dist=float(golden["mar_sdd"]),
-                                    source_iso_dist=float(golden["mar_sid"]), device='cpu')
+                                    source_iso_dist=float(golden["mar_sid"]))
+    model.configure_devices(devices=['cpu'])
     model.set_params(no_warning=True, verbose=0)
     np.random.seed(19)
     recon, split_dict = model.split_sino_recon(golden["mar_sino"].copy(),
