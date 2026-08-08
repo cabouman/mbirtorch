@@ -15,6 +15,17 @@ import torch
 from ..tomography_model import _resolve_device
 
 
+def _stage_batch(batch, device):
+    """Stage one host batch onto the device: contiguous (a flipped/strided source view, e.g. the
+    NSI reader's np.flip, cannot be wrapped as a tensor) and floating point (integer scans, e.g.
+    the Zeiss reader's uint16, promote to float32 as the kernels' arithmetic expects).  The copy
+    is one batch, not the full array."""
+    batch = np.ascontiguousarray(batch)
+    if not np.issubdtype(batch.dtype, np.floating):
+        batch = batch.astype(np.float32)
+    return torch.as_tensor(batch, device=device)
+
+
 def _fill_view_batches(array, kernel, output, batch_size, device, lo, hi, desc=None):
     """Run ``kernel`` over views ``[lo, hi)`` of ``array`` in ``batch_size`` chunks on ``device``,
     writing each batch's host result directly into ``output[j:...]`` (a pre-allocated host array).
@@ -30,9 +41,7 @@ def _fill_view_batches(array, kernel, output, batch_size, device, lo, hi, desc=N
     with torch.no_grad():
         for j in steps:
             end = min(j + batch_size, hi)
-            # ascontiguousarray: a flipped/strided source view (e.g. the NSI reader's np.flip)
-            # cannot be wrapped as a tensor; the copy is one batch, not the full array.
-            batch = torch.as_tensor(np.ascontiguousarray(array[j:end]), device=device)
+            batch = _stage_batch(array[j:end], device)
             output[j:end] = kernel(batch).cpu().numpy()
 
 
@@ -73,8 +82,7 @@ def map_view_batches(array, kernel, batch_size, desc=None, devices=None):
     # on the host.  Writing in place bounds the host footprint to input + output (~2x).
     probe_hi = min(batch_size, num_views)
     with torch.no_grad():
-        probe = kernel(torch.as_tensor(np.ascontiguousarray(array[0:probe_hi]),
-                                       device=device)).cpu().numpy()
+        probe = kernel(_stage_batch(array[0:probe_hi], device)).cpu().numpy()
     output = np.empty((num_views,) + probe.shape[1:], dtype=probe.dtype)
     output[0:probe_hi] = probe
     del probe
