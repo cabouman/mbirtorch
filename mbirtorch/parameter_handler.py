@@ -91,12 +91,19 @@ class ParameterHandler:
         self.logger = logger
 
     def _log_run_header(self, first_iteration, logfile_path, print_logs):
-        """Set up the run logger (on the first iteration, or whenever none exists) and log the
+        """Set up the run logger (on the first iteration, or whenever none has been set up) and log the
         MBIRTorch version and the device layout.
 
         Shared by recon and prox_map so both report the version and which devices the run uses.
         """
-        if first_iteration == 0 or self.logger is None:
+        # log_buffer, not logger, is what says "setup_logger has never run".
+        # mbirjax tests self.logger here, which works there because its logger
+        # stays None until setup.  TomographyModel fills that slot at
+        # construction with a console-only logger for messages that happen
+        # before a recon starts, so testing it would skip setup on every
+        # resumed run (first_iteration > 0) and drop the log entirely.  Only
+        # setup_logger ever creates the buffer.
+        if first_iteration == 0 or self.log_buffer is None:
             self.setup_logger(logfile_path=logfile_path, print_logs=print_logs)
         from . import __version__
         self.logger.info('MBIRTorch Version = {}'.format(__version__))

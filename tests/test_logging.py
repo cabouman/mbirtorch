@@ -62,6 +62,33 @@ def test_recon_writes_log_file_and_recon_log(tmp_path, small_parallel_case):
     assert 'Reconstruction completed' in recon_dict['notes']
 
 
+def test_resumed_recon_sets_up_the_log(tmp_path, small_parallel_case):
+    """A run started at a nonzero iteration, on a model that has not logged
+    yet, still gets its log file and its recon_log."""
+    model, sino = small_parallel_case
+    logpath = os.path.join(str(tmp_path), 'resume.log')
+    init = mbirtorch.generate_3d_shepp_logan_low_dynamic_range(
+        tuple(model.get_params('recon_shape')))
+    _, recon_dict = model.recon(sino, init_recon=init, max_iterations=2,
+                                first_iteration=1, logfile_path=logpath)
+
+    assert os.path.exists(logpath)
+    assert 'After iteration' in open(logpath).read()
+    assert 'After iteration' in recon_dict['recon_log']
+
+
+def test_continuing_run_keeps_one_log(tmp_path, small_parallel_case):
+    """A second call in the same session continuing the same run appends to
+    the log it already set up, rather than starting a new one."""
+    model, sino = small_parallel_case
+    logpath = os.path.join(str(tmp_path), 'run.log')
+    recon, _ = model.recon(sino, max_iterations=1, logfile_path=logpath)
+    _, recon_dict = model.recon(sino, init_recon=recon, max_iterations=1,
+                                first_iteration=1, logfile_path=logpath)
+    # Both passes are in the one log; the second call did not truncate it.
+    assert recon_dict['recon_log'].count('MBIRTorch Version') == 2
+
+
 def test_recon_logfile_none_writes_no_file(tmp_path, small_parallel_case, monkeypatch):
     model, sino = small_parallel_case
     monkeypatch.chdir(str(tmp_path))
