@@ -230,19 +230,25 @@ def test_unweighted_run_has_no_weights_array_before_the_hessian():
     assert dict(_named(ledger, 'subset prior').terms)['weights'][0] == sino_bytes
 
 
-def test_single_device_error_state_holds_the_weighted_projection():
-    """`weighted_fwd = weights * fwd` is bound and never released before the
-    error sinogram is formed.  The sharded branch has no such array, because
-    it fuses the weights into per-shard dots whose locals die on return."""
+def test_weighted_projection_is_released_before_the_error_assignment():
+    """`weighted_fwd` lives only across its two dot products.
+
+    It is charged in the dot-product sub-phase and NOT in the error sinogram
+    assignment, which is what the release in `_initial_error_state` buys.
+    """
     one = estimate_peak_device_bytes(make_plan(n_devices=1, weights_supplied=True))
-    two = estimate_peak_device_bytes(make_plan(n_devices=2, weights_supplied=True))
-    assert dict(_named(one, 'error sinogram formation').terms)[
+    assert dict(_named(one, 'initial dot products').terms)[
         'weighted forward projection'][0] > 0
-    assert dict(_named(two, 'error sinogram formation').terms)[
+    assert 'weighted forward projection' not in dict(
+        _named(one, 'error sinogram formation').terms)
+    # The sharded branch never had the array, because it fuses the weights
+    # into per-shard dots whose locals die on worker return.
+    two = estimate_peak_device_bytes(make_plan(n_devices=2, weights_supplied=True))
+    assert dict(_named(two, 'initial dot products').terms)[
         'weighted forward projection'][0] == 0
     # Constant weights materialize no product at all.
     plain = estimate_peak_device_bytes(make_plan(n_devices=1))
-    assert dict(_named(plain, 'error sinogram formation').terms)[
+    assert dict(_named(plain, 'initial dot products').terms)[
         'weighted forward projection'][0] == 0
 
 
@@ -284,6 +290,93 @@ def test_sub_phase_selection_is_per_device():
         loop = _named(ledger, 'direct recon (back loop)').per_device[i]
         scatter = _named(ledger, 'direct recon (scatter)').per_device[i]
         assert ledger.peak_bytes(i) >= max(loop, scatter)
+
+
+# ── the masked hessian ───────────────────────────────────────────────────────
+def test_masked_hessian_agrees_with_the_full_grid_at_the_masked_indices():
+    """The only places the engine ever reads the hessian.
+
+    Back projection is independent per pixel, so a masked run must reproduce
+    the dense run exactly at every masked index.  Outside the mask the masked
+    run holds zeros instead of computed-but-never-read values.
+    """
+    angles = np.linspace(0, np.pi, 12, endpoint=False)
+    model = mbirtorch.ParallelBeamModel((12, 8, 10), angles, device='cpu')
+    model.set_params(no_warning=True, verbose=0)
+    weights = np.abs(np.random.RandomState(0).randn(12, 8, 10)).astype(np.float32) + 0.5
+
+    dense = model.compute_hessian_diagonal(weights=weights)
+    indices = model.full_indices_device()
+    masked = model.compute_hessian_diagonal(weights=weights, indices=indices)
+
+    shape = tuple(model.get_params('recon_shape'))
+    flat_dense = dense.reshape(-1, shape[2])
+    flat_masked = masked.reshape(-1, shape[2])
+    idx = indices.cpu().numpy()
+    np.testing.assert_array_equal(flat_masked[idx], flat_dense[idx])
+    # Outside the mask the masked form is exactly zero.
+    outside = np.setdiff1d(np.arange(shape[0] * shape[1]), idx)
+    if outside.size:
+        assert np.all(flat_masked[outside] == 0)
+        assert np.any(flat_dense[outside] != 0)
+
+
+def test_masked_hessian_leaves_the_public_method_unchanged():
+    """`indices=None` must keep today's behavior bit for bit."""
+    angles = np.linspace(0, np.pi, 12, endpoint=False)
+    model = mbirtorch.ParallelBeamModel((12, 8, 10), angles, device='cpu')
+    model.set_params(no_warning=True, verbose=0)
+    a = model.compute_hessian_diagonal()
+    b = model.compute_hessian_diagonal(indices=None)
+    np.testing.assert_array_equal(a, b)
+
+
+def test_recon_is_bitwise_identical_with_the_masked_hessian():
+    """The internal call-site change must not move a single bit of the recon.
+
+    The two runs differ in ONE variable: where the hessian came from.  The
+    control supplies one computed the dense way, which bypasses the internal
+    masked call; the comparison run lets vcd_recon compute it at the masked
+    indices.  Both consume the same partitions and the same seed.
+    """
+    angles = np.linspace(0, np.pi, 12, endpoint=False)
+    model = mbirtorch.ParallelBeamModel((12, 8, 10), angles, device='cpu')
+    model.set_params(no_warning=True, verbose=0)
+    sinogram = np.zeros((12, 8, 10), dtype=np.float32)
+    sinogram[:, 4, 5] = 1.0
+    weights = np.full((12, 8, 10), 0.75, dtype=np.float32)
+
+    # One set of partitions, shared, so the only difference is the hessian.
+    (_s, _w, _i, partitions, sequence, _g,
+     _r) = model.initialize_recon(sinogram, weights, None, 3, 0)
+    dense_hessian = model.compute_hessian_diagonal(weights=weights,
+                                                   output_sharded=True)
+
+    np.random.seed(7)
+    control, _losses = model.vcd_recon(sinogram, partitions, sequence, 0.0,
+                                       weights=weights,
+                                       fm_hessian=dense_hessian.clone())
+    np.random.seed(7)
+    masked, _losses = model.vcd_recon(sinogram, partitions, sequence, 0.0,
+                                      weights=weights)
+    np.testing.assert_array_equal(control.cpu().numpy(), masked.cpu().numpy())
+
+
+def test_ledger_charges_the_masked_hessian_and_its_scatter():
+    dense = estimate_peak_device_bytes(make_plan(
+        recon=(64, 64, 32), num_pixels_full=3000, hessian_masked=False))
+    masked = estimate_peak_device_bytes(make_plan(
+        recon=(64, 64, 32), num_pixels_full=3000, hessian_masked=True))
+    # The loop's cylinders follow the masked count, not the grid.
+    assert dict(_named(masked, 'hessian diagonal').terms)['back output'][0] \
+        == 3 * 3000 * 32 * 4
+    assert dict(_named(dense, 'hessian diagonal').terms)['back output'][0] \
+        == 3 * (64 * 64) * 32 * 4
+    # The scatter exists only on the masked path, and stays below the loop.
+    assert not _has(dense, 'hessian scatter')
+    scatter = _named(masked, 'hessian scatter').per_device[0]
+    assert scatter < _named(masked, 'hessian diagonal').per_device[0]
+    assert masked.peak_bytes(0) < dense.peak_bytes(0)
 
 
 # ── the projector cost model ─────────────────────────────────────────────────

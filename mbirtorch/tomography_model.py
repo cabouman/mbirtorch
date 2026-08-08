@@ -1046,6 +1046,16 @@ class TomographyModel(ParameterHandler):
                          / wtd_err_sino_norm).item()
             else:
                 alpha = 1
+            # The weights product is dead once alpha is known, and holding it
+            # through the error formation below made THIS function the peak of
+            # a weighted reconstruction (the memory ledger's calibration).
+            # Dropping the reference frees a full sinogram before the two
+            # sinogram-sized allocations of the next line.  Under constant
+            # weights the name aliases fwd, so this frees nothing and costs
+            # nothing.  The sharded branch above never had the array: it fuses
+            # the weights into per-shard dot products whose locals die on
+            # worker return.
+            weighted_fwd = None
             error_sinogram = sinogram - alpha * fwd
             fwd = None
             init_recon = alpha * init_recon
@@ -1228,7 +1238,8 @@ class TomographyModel(ParameterHandler):
             recon = recon.reshape(tuple(recon_shape[:2]) + (cylinders.shape[-1],))
         return recon if output_sharded else self._gather_recon(recon)
 
-    def compute_hessian_diagonal(self, weights=None, output_sharded=False):
+    def compute_hessian_diagonal(self, weights=None, output_sharded=False,
+                                 indices=None):
         """
         Computes the diagonal of the Hessian matrix, which is computed by doing
         a backprojection of the weight matrix except using the square of the
@@ -1236,14 +1247,26 @@ class TomographyModel(ParameterHandler):
         None, it must be an array with the same shape as the sinogram; if None,
         constant weights of 1 are used.
 
-        The indices cover ALL pixels of the grid (matching mbirjax's arange over
-        the full grid, not the ROR-masked set).
+        By default the indices cover ALL pixels of the grid (matching mbirjax's
+        arange over the full grid, not the ROR-masked set).
 
         Args:
             weights (numpy or tensor, optional): 3D positive weights with the
                 same shape as the sinogram.  Defaults to all 1s.
             output_sharded (bool, optional): If False (default), return numpy;
                 if True, return the device tensor.
+            indices (tensor, optional): back-project at these flat pixel
+                indices only, scattering the result into a zero-filled volume.
+                The entries outside the index set are ZERO rather than
+                computed.  None (the default) keeps the full-grid behavior
+                exactly, so the public contract is unchanged.
+
+                The reconstruction loop passes its ROR-masked index set here.
+                Every index the loop ever reads is inside that set, and the
+                back projection is independent per pixel, so the values it
+                reads are bitwise identical either way.  The saving is the
+                masked set's smaller cylinder arrays; a square grid's mask
+                drops about 21 percent of the pixels.
 
         Returns:
             Diagonal of the Hessian matrix with the same shape as the recon.
@@ -1260,16 +1283,38 @@ class TomographyModel(ParameterHandler):
                              f'sinogram.shape = {tuple(sinogram_shape)}')
         else:
             weights = self._shard_sinogram(weights)
-        indices = torch.arange(recon_shape[0] * recon_shape[1], dtype=torch.int64,
-                               device=self.torch_device)
+        num_grid = int(recon_shape[0] * recon_shape[1])
+        dense = indices is None
+        if dense:
+            indices = torch.arange(num_grid, dtype=torch.int64,
+                                   device=self.torch_device)
+        else:
+            indices = torch.as_tensor(indices, dtype=torch.int64,
+                                      device=self.torch_device)
         hessian = self.sparse_back_project(weights, indices, coeff_power=2)
+
+        # The dense back projection IS the flat volume, so it reshapes.  A
+        # masked one returns only its own rows, so it scatters into a
+        # zero-filled volume first.  An explicit index set always scatters,
+        # even at full length: assuming a given set is the identity
+        # permutation would silently mis-place a reordered one.
+        def to_volume(cylinders, device):
+            if dense:
+                return cylinders.reshape((recon_shape[0], recon_shape[1],
+                                          cylinders.shape[-1]))
+            volume = torch.zeros((num_grid, cylinders.shape[-1]),
+                                 dtype=cylinders.dtype, device=device)
+            volume.index_copy_(0, indices.to(device), cylinders)
+            return volume.reshape((recon_shape[0], recon_shape[1],
+                                   cylinders.shape[-1]))
+
         if isinstance(hessian, _sharding.Shards):
             hessian = _sharding.Shards(
-                [t.reshape((recon_shape[0], recon_shape[1], t.shape[-1]))
-                 for t in hessian.tensors], hessian.placement)
+                [to_volume(t, d) for t, d in zip(hessian.tensors,
+                                                 hessian.placement.devices)],
+                hessian.placement)
         else:
-            hessian = hessian.reshape((recon_shape[0], recon_shape[1],
-                                       hessian.shape[-1]))
+            hessian = to_volume(hessian, hessian.device)
         return hessian if output_sharded else self._gather_recon(hessian)
 
     def get_voxels_at_indices(self, recon, indices):
@@ -2250,8 +2295,17 @@ class TomographyModel(ParameterHandler):
             else:
                 hess_weights = weights
             self.logger.info('Computing Hessian diagonal')
+            # Back-project only at the ROR-masked pixels.  The loop reads the
+            # Hessian exclusively at partition indices, and those come from
+            # the same mask, so every value it reads is bitwise unchanged
+            # while the transient cylinder arrays shrink with the mask.  An
+            # unmasked model has nothing to gain, so it keeps the dense path
+            # and its single reshape.
+            hess_indices = (None if self.get_params('use_ror_mask') is False
+                            else self.full_indices_device())
             fm_hessian = self.compute_hessian_diagonal(weights=hess_weights,
-                                                       output_sharded=True)
+                                                       output_sharded=True,
+                                                       indices=hess_indices)
         else:
             self.logger.info('Using precomputed Hessian diagonal')
             fm_hessian = self._shard_recon(fm_hessian)

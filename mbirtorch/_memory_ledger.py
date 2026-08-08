@@ -171,6 +171,10 @@ class LedgerPlan:
     prox: bool = False
     positivity: bool = False
     helical: bool = False
+    # Whether the hessian back-projects at the ROR-masked index set rather
+    # than the full grid.  vcd_recon does; a direct call to the public method
+    # does not, and neither does an unmasked model.
+    hessian_masked: bool = False
     # ── knobs and model choices ──────────────────────────────────────────────
     forward_band: int = None
     back_band: int = None
@@ -424,20 +428,27 @@ def estimate_peak_device_bytes(plan):
         # The error sinogram is formed while the sinogram and the projection
         # are both live; the projection is then freed and the initial volume
         # is briefly doubled by its scaling.
-        # The single-device branch binds `weighted_fwd = weights * fwd` and
-        # never releases it, so on a weighted run it is still resident when
-        # the error sinogram is formed.  The sharded branch has no such array:
-        # it fuses the weights into per-shard dot products whose locals die on
-        # worker return.  This term is therefore n=1 only, and it is what made
-        # the initial error state -- not the subset step -- the dominant phase
-        # at the weighted gate cells.
+        # The single-device branch binds `weighted_fwd = weights * fwd` for
+        # its two dot products and now releases it before the error sinogram
+        # is formed.  While it is alive it is co-live with the product
+        # temporary of `torch.sum(weighted_fwd * fwd)`, which is its own
+        # sub-peak and is modelled below.  The sharded branch has neither
+        # array: it fuses the weights into per-shard dot products whose
+        # locals die on worker return.
         weighted_fwd = per_dev(
             lambda i: sino_dev(i) if (n == 1 and plan.weights_supplied) else 0)
-        error_terms = [
+        dot_terms = [
             ('sinogram', per_dev(sino_dev)),
             ('weights', per_dev(supplied_weights_term)),
             ('forward projection', per_dev(sino_dev)),
             ('weighted forward projection', weighted_fwd),
+            ('dot product temporary', per_dev(sino_dev)),
+            ('init recon', per_dev(recon_dev)),
+        ]
+        error_terms = [
+            ('sinogram', per_dev(sino_dev)),
+            ('weights', per_dev(supplied_weights_term)),
+            ('forward projection', per_dev(sino_dev)),
             # `error = sinogram - alpha * fwd` allocates the scaled projection
             # and then the difference, so both are live at the assignment.
             ('alpha-scaled projection', per_dev(sino_dev)),
@@ -447,10 +458,11 @@ def estimate_peak_device_bytes(plan):
         scale_terms = [
             ('sinogram', per_dev(sino_dev)),
             ('weights', per_dev(supplied_weights_term)),
-            ('weighted forward projection', weighted_fwd),
             ('error sinogram', per_dev(sino_dev)),
             ('init recon (x2, scaling)', per_dev(lambda i: 2 * recon_dev(i))),
         ]
+        phases.append(_phase('initial dot products', dot_terms, n,
+                             base=constant_base, base_terms=constant_terms))
         phases.append(_phase('error sinogram formation', error_terms, n,
                              base=constant_base, base_terms=constant_terms))
         phases.append(_phase('init recon scaling', scale_terms, n,
@@ -460,18 +472,41 @@ def estimate_peak_device_bytes(plan):
     # Charged at the UNMASKED grid count, which is the one place the ledger
     # does not use the ROR-masked set.
     if not plan.fm_hessian_supplied:
-        p_grid = plan.num_pixels_grid
+        # The masked path back-projects the ROR set and scatters it into a
+        # zero-filled volume; the dense path back-projects the whole grid and
+        # reshapes.  The two differ in the pixel count AND in whether the
+        # scatter's co-residency exists at all.
+        p_hess = (plan.num_pixels_full if plan.hessian_masked
+                  else plan.num_pixels_grid)
         terms = [
             ('error sinogram', per_dev(sino_dev)),
             ('hessian weights', per_dev(weights_term)),
             ('init recon', per_dev(recon_dev)),
-            ('back output', per_dev(lambda i: back_fixed(i, p_grid))),
-            ('band reduce', per_dev(lambda i: band_reduce(i, p_grid))),
-            ('back batch', per_dev(lambda i: back_batch(i, p_grid))),
+            ('back output', per_dev(lambda i: back_fixed(i, p_hess))),
+            ('band reduce', per_dev(lambda i: band_reduce(i, p_hess))),
+            ('back batch', per_dev(lambda i: back_batch(i, p_hess))),
         ]
         phases.append(_phase('hessian diagonal', terms, n,
                              base=constant_base,
                              base_terms=constant_terms))
+        if plan.hessian_masked:
+            # The scatter holds the masked cylinders and the zero-filled
+            # volume at once.  It is a separate sub-peak from the back loop,
+            # and it must stay below it: the loop's three cylinders at the
+            # masked count exceed one cylinder plus one volume whenever the
+            # mask keeps more than half the grid, which an inscribed ellipse
+            # does.  The per-device maximum over phases enforces this rather
+            # than assuming it.
+            scatter_terms = [
+                ('error sinogram', per_dev(sino_dev)),
+                ('hessian weights', per_dev(weights_term)),
+                ('init recon', per_dev(recon_dev)),
+                ('hessian cylinders', per_dev(lambda i: cyl(i, p_hess))),
+                ('hessian scatter volume', per_dev(recon_dev)),
+            ]
+            phases.append(_phase('hessian scatter', scatter_terms, n,
+                                 base=constant_base,
+                                 base_terms=constant_terms))
 
     # ── phase E: the subset step, per granularity in the sequence ────────────
     prior_cylinders = PROX_CYLINDERS if plan.prox else plan.qggmrf_cylinders
@@ -614,6 +649,7 @@ def plan_from_model(model, devices, partition_sequence=None, weights=None,
         prox=prox_input is not None,
         positivity=bool(model.get_params('positivity_flag')),
         helical=_is_helical(model),
+        hessian_masked=model.get_params('use_ror_mask') is not False,
         forward_band=getattr(model, 'forward_project_slice_band', None),
         back_band=getattr(model, 'back_project_slice_band', None),
         qggmrf_cylinders=qggmrf_cylinder_count(model),
