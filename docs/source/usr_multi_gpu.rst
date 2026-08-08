@@ -8,29 +8,38 @@ GPU, across CPU devices).  This **increases the available memory**, so you can r
 larger volumes than fit on one GPU, and on large problems it **reduces reconstruction
 time**.  It works for the parallel-beam and cone-beam geometries.
 
-Turning it on
--------------
+The default: spread across the visible GPUs
+-------------------------------------------
 
-Multi-device reconstruction is **opt-in**.  A model uses a single device until you widen it
-with :meth:`~mbirtorch.TomographyModel.configure_devices`::
+As in MBIRJAX, multi-device reconstruction is **automatic**.  On a machine with two or more
+CUDA devices, a reconstruction spreads across them with no change to your script::
 
-    model.configure_devices(num_devices=2)   # use the first 2 CUDA devices
-    recon, recon_params = model.recon(sinogram)
+    recon, recon_params = model.recon(sinogram)   # uses the GPUs that fit
 
-This differs from MBIRJAX, which divides a reconstruction across all visible GPUs
-automatically.  MBIRTorch asks you to choose, for three reasons.  Device placement is
-explicit state in the engine: ``configure_devices`` is the single entry point that validates
-a layout and rebuilds the per-device projectors, and a silent default would hide that step.
-Multi-device runs also produce compiled-variant float differences within a documented
-envelope, so changing the device count changes values slightly; that trade should be chosen
-rather than inherited.  Finally, automatic widening on a shared or heterogeneous machine
-risks out-of-memory failures, and the admission check that would catch them does not exist
-yet.
+Before the first large allocation, MBIRTorch estimates the memory each candidate layout
+would need and picks the largest device count whose per-device share fits, with a safety
+margin.  If no layout fits, the reconstruction fails immediately with the shortfall named,
+rather than failing mid-run with an out-of-memory error.  Two model attributes tune this
+check: ``model.skip_memory_preflight = True`` runs without it, and
+``model.memory_preflight_margin`` (default 0.15) is the fraction of device memory held back
+as slack.
+
+Results can differ slightly with the device count, and the difference decays as iterations
+proceed (measured to fall from 6.1e-3 at 3 iterations to 8.8e-4 at 10).  To pin a run to one
+device for exact reproducibility::
+
+    model.configure_devices(num_devices=1)
+
+The environment variable ``MBIRTORCH_NUM_DEVICES`` pins the device count process-wide,
+which is convenient for a test suite or a batch queue.
 
 Choosing the devices
 --------------------
 
-``configure_devices`` takes either a count or an explicit device list.  Use
+To take the layout out of the library's hands, call
+:meth:`~mbirtorch.TomographyModel.configure_devices`.  A layout set this way is final: the
+automatic choice never runs again on that model, and the memory check no longer
+second-guesses the count you gave.  It takes either a count or an explicit device list.  Use
 ``torch.cuda.device_count()`` to see how many CUDA devices are visible::
 
     import torch
@@ -53,8 +62,8 @@ would do no work at all.  Layouts where a device is idle on only one axis are al
 useful.  With fewer slices than devices, the extra devices still project their views; with
 fewer views than devices, they still hold slice shards and run the prior.
 
-There is no ``use_gpu`` parameter.  To run on the CPU when a GPU is present, construct the
-model on the CPU or pass CPU entries in ``devices``.
+There is no ``use_gpu`` parameter.  To run on the CPU when a GPU is present, call
+``model.configure_devices(devices=['cpu'])``.
 
 Tips for efficiency
 -------------------
@@ -112,6 +121,6 @@ Behind the scenes
 Internally MBIRTorch uses *sharding*: the sinogram is split across the devices by view and the
 reconstruction volume by slice, and the two are combined with a small amount of banded
 communication between devices.  When a count does not divide evenly, the data is zero-padded
-to equal shares and the padding is kept exactly inert, so the result is independent of the
-number of devices.  A reconstruction runs within a single process; multi-node execution is
+to equal shares and the padding is kept exactly inert, so the padding never changes the
+result.  A reconstruction runs within a single process; multi-node execution is
 out of scope.  For the developer-facing architecture, see :doc:`dev_sharding_overview`.

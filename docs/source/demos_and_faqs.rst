@@ -104,10 +104,9 @@ So you should find a fast GPU with the largest possible memory. These days that 
 The GPU will be hosted on a CPU, and it is best if that CPU also has even a larger amount of memory, ideally greater than 200GB.
 
 Note that a 2K x 2K x 2K reconstruction occupies 32GB of memory, not counting the sinogram or memory needed for processing.
-If your machine has multiple GPUs, MBIRTorch can divide the reconstruction across them, which grows the memory
-available for the problem roughly in proportion to the number of GPUs.  This is opt-in: call
-``model.configure_devices(num_devices=n)`` before reconstructing.  Large reconstructions typically get faster as
-well, but small ones do not; see :doc:`usr_multi_gpu` for the measured behavior and the details.
+If your machine has multiple GPUs, MBIRTorch automatically divides the reconstruction across them: the memory
+available for the problem grows roughly in proportion to the number of GPUs.  Large reconstructions typically get
+faster as well, but small ones do not; see :doc:`usr_multi_gpu` for the measured behavior and the details.
 If you have no GPU, all processing is done on the CPU.
 
 If your reconstruction is still too large, then for a parallel beam system you can select a subset of rows of your

@@ -47,9 +47,9 @@ Below are tips on important and useful features:
     outside the detector field of view and generates a warning.
     In this case, consider using ``model.scale_recon_shape(s, s)`` with ``s >= 1.1`` to improve image quality.
 
-  - For tall volumes that do not fit in memory even after tuning the padding, spread the
-    reconstruction across devices with ``model.configure_devices(num_devices=n)``.  The
-    recon is sharded by slice, so peak memory per device falls roughly as 1/n.
+  - For tall volumes that do not fit in memory on one GPU, MBIRTorch spreads the
+    reconstruction across the visible GPUs automatically.  The recon is sharded by slice,
+    so peak memory per device falls roughly as 1/n.
 
   - For tall volumes that do not fit in memory even after tuning the padding, see
     :meth:`~mbirtorch.ConeBeamModel.split_sino_recon`, which reconstructs the volume in two
@@ -82,8 +82,7 @@ Below are tips on important and useful features:
 
 - **Use Multiple GPUs:**
 
-  On a machine with more than one GPU, MBIRTorch can spread a reconstruction across them to
-  increase the available memory and reduce reconstruction time.  Unlike MBIRJAX, this is
-  opt-in rather than automatic: call ``model.configure_devices(num_devices=n)``, or pass an
-  explicit ``devices`` list, before reconstructing.  See :doc:`usr_multi_gpu` for how this
-  works and how to choose the devices.
+  On a machine with more than one GPU, MBIRTorch automatically spreads a reconstruction
+  across them to increase the available memory and reduce reconstruction time.  To choose
+  the devices yourself, call ``model.configure_devices(num_devices=n)`` or pass an explicit
+  ``devices`` list.  See :doc:`usr_multi_gpu` for how this works.
