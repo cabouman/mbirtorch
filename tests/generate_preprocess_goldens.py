@@ -257,7 +257,10 @@ def main():
                                   np.ones(40) * 1.5])).astype(np.float64)
     hsnt_data, hsnt_angles, hsnt_gt = mbirjax.hsnt.generate_hyper_data(
         hsnt_basis, num_angles=2, detector_rows=24, detector_columns=24, verbose=0)
-    hsnt_dehydrated = mbirjax.dehydrate(hsnt_data.copy(), num_materials=3, verbose=0)
+    # random_state must match the seed in tests/test_hsnt_vcls.py: NMF factorizations are not
+    # unique, so an unseeded call here makes the factors an arbitrary local optimum and the parity
+    # gate a coin flip (it failed ~35% of runs).  Seeded on both sides the factors agree exactly.
+    hsnt_dehydrated = mbirjax.dehydrate(hsnt_data.copy(), num_materials=3, random_state=52, verbose=0)
     hsnt_rehydrated = mbirjax.rehydrate(hsnt_dehydrated)
     hsnt_md = mbirjax.hsnt.create_hsnt_metadata(dataset_name='golden', dataset_type='attenuation',
                                                 angles=np.rad2deg(hsnt_angles))

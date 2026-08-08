@@ -31,8 +31,13 @@ def golden():
 
 def test_dehydrate_rehydrate_parity(golden):
     # Shared input data (the golden carries the seeded simulated scan); the NMF path is the same
-    # numpy/sklearn code in both packages.
-    dehydrated = mbirtorch.dehydrate(golden["hsnt_data"].copy(), num_materials=3, verbose=0)
+    # numpy/sklearn code in both packages.  random_state MUST match the seed the golden was written
+    # with (tests/generate_preprocess_goldens.py): it pins sklearn's nndsvd initialization, which
+    # otherwise draws from the global RNG.  Unseeded, the factors are a different NMF local optimum
+    # every run and this test failed ~35% of the time (over 500 unseeded runs: err_d p50 1.4e-3 /
+    # p99 9.7e-3, err_r p50 9.1e-5 / p99 7.8e-4 -- even the product gate flaked, ~2% of runs).
+    dehydrated = mbirtorch.dehydrate(golden["hsnt_data"].copy(), num_materials=3, random_state=52,
+                                     verbose=0)
     sub_data, sub_basis, dataset_type = dehydrated
     assert dataset_type == 'attenuation'
     assert sub_data.shape == golden["hsnt_sub_data"].shape
@@ -45,10 +50,14 @@ def test_dehydrate_rehydrate_parity(golden):
     err_r = float(np.max(np.abs(rehydrated - golden["hsnt_rehydrated"])) /
                   max(np.max(np.abs(golden["hsnt_rehydrated"])), 1e-30))
     print(f"hsnt rel_max = {err_d:.2e} (sub_data), {err_b:.2e} (basis), {err_r:.2e} (rehydrated)")
-    # NMF factorizations are not unique, so the factors drift more across BLAS/numpy builds
-    # (measured ~5e-4) than their product, the rehydrated data (measured ~7e-5) -- the gates
-    # follow the measured floors.
-    assert err_d < 2e-3 and err_b < 2e-3 and err_r < 5e-4
+    # With both sides seeded alike this is a bit-exactness check, not a tolerance check: hsnt is
+    # shared numpy/sklearn code, so the same seed reaches the same NMF optimum in both packages.
+    # Measured 0.0 / 0.0 / 0.0 here, and bit-identical across the two conda envs (numpy 2.5.1 +
+    # scipy 1.18 vs 2.4.6 + 1.17).  The gate stays at 1e-6 rather than asserting equality because
+    # both of those are arm64 miniforge builds on one machine -- a different platform or BLAS could
+    # still perturb the last bits.  A blown gate here means the shared NMF path diverged, NOT that
+    # the tolerance needs raising; loosening it back to the old 2e-3 would only re-hide that.
+    assert err_d < 1e-6 and err_b < 1e-6 and err_r < 1e-6
 
 
 def test_rehydrate_of_golden_dehydration_is_exact(golden):
