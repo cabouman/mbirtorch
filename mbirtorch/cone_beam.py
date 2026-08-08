@@ -817,9 +817,9 @@ class ConeBeamModel(TomographyModel):
             first_iteration (int, optional): Same as in the TomographyModel.recon() method.
             compute_prior_loss (bool, optional): Accepted for interface compatibility; not
                 currently used by the mbirtorch recon.
-            logfile_path (str, optional): Accepted for interface compatibility; per-half log files
-                are not currently written.
-            print_logs (bool, optional): Accepted for interface compatibility.
+            logfile_path (str, optional): Same as in the TomographyModel.recon() method.  The two
+                halves' logs are merged into this single file, each under a section header.
+            print_logs (bool, optional): Same as in the TomographyModel.recon() method.
             align_split_grid (bool, optional): If True, align the recon split slice with the
                 sinogram cut row: first by choosing the cut row (effective only when rho != 1,
                 where the row and slice grids are incommensurate), then by shifting the whole
@@ -850,7 +850,7 @@ class ConeBeamModel(TomographyModel):
             ...                                 source_iso_dist=500.0)
             >>> recon, recon_info = model.split_sino_recon(sino, half_overlap=4)
         """
-        from .utilities import copy_ct_model, stitch_arrays
+        from .utilities import copy_ct_model, stitch_arrays, merge_log_files
 
         # -------- Basic validation --------
         if half_overlap < 2:
@@ -984,6 +984,8 @@ class ConeBeamModel(TomographyModel):
                 max_iterations=max_iterations,
                 stop_threshold_change_pct=stop_threshold_change_pct,
                 first_iteration=first_iteration,
+                logfile_path=logfile_path,
+                print_logs=print_logs,
             )
 
         # -------- Per-half scalar parameters (cheap; the heavy arrays + models are built one half at a
@@ -1006,7 +1008,7 @@ class ConeBeamModel(TomographyModel):
         # configuration is preserved (copy_ct_model does not carry the layout).
         parent_devices = list(self.sino_placement.devices)
 
-        def _recon_one_half(lo, hi, recon_shape, recon_slice_offset, is_top):
+        def _recon_one_half(lo, hi, recon_shape, recon_slice_offset, is_top, half_logfile_path):
             """Reconstruct one detector-row half on the host; return (host_recon, recon_dict).
 
             Builds the half's model, sinogram slice, and weights, runs recon, and gathers the result to
@@ -1046,7 +1048,9 @@ class ConeBeamModel(TomographyModel):
             recon_half, recon_dict = model.recon(sino_half, weights=weights_half, init_recon=half_init,
                                                  max_iterations=max_iterations,
                                                  stop_threshold_change_pct=stop_threshold_change_pct,
-                                                 first_iteration=first_iteration)
+                                                 first_iteration=first_iteration,
+                                                 logfile_path=half_logfile_path,
+                                                 print_logs=print_logs)
             # recon() already returns a host NumPy array (its output_sharded=False gather), so the
             # half is on the host here.
             return recon_half, recon_dict
@@ -1054,10 +1058,24 @@ class ConeBeamModel(TomographyModel):
         # -------- Reconstruct the halves ONE AT A TIME (the top half is built, recon'd, gathered to the
         # host, and freed before the bottom half is built), so only one half's sino/weights/model and one
         # half's device recon are resident at any moment. --------
-        recon_top_half, recon_top_dict = _recon_one_half(top_lo, top_hi, top_recon_shape,
-                                                         top_recon_slice_offset, is_top=True)
-        recon_bot_half, recon_bot_dict = _recon_one_half(bot_lo, bot_hi, bot_recon_shape,
-                                                         bot_recon_slice_offset, is_top=False)
+        # Each half logs to its own temp file; the two are merged into logfile_path afterward
+        # (in finally, so any half logs written before a failure are preserved).
+        if logfile_path:
+            log_path = os.path.expanduser(logfile_path)
+            half_log_paths = (log_path + '.top', log_path + '.bot')
+        else:
+            log_path, half_log_paths = None, (None, None)
+        try:
+            recon_top_half, recon_top_dict = _recon_one_half(top_lo, top_hi, top_recon_shape,
+                                                             top_recon_slice_offset, is_top=True,
+                                                             half_logfile_path=half_log_paths[0])
+            recon_bot_half, recon_bot_dict = _recon_one_half(bot_lo, bot_hi, bot_recon_shape,
+                                                             bot_recon_slice_offset, is_top=False,
+                                                             half_logfile_path=half_log_paths[1])
+        finally:
+            if log_path:
+                merge_log_files(log_path, zip(('split_sino_recon: top half', 'split_sino_recon: bottom half'),
+                                              half_log_paths))
 
         # -------- Stitch together top and bottom reconstructions --------
         # Both halves are host arrays, so stitch_arrays (host-preserving) assembles the full volume ON

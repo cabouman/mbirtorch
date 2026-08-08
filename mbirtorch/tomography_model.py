@@ -16,9 +16,11 @@ iteration for iteration (the convergence-parity gate in tests/test_vs_goldens).
 """
 
 import contextlib
+import datetime
 import io
 import logging
 import math
+import os
 import warnings
 
 import numpy as np
@@ -2720,6 +2722,7 @@ class TomographyModel(ParameterHandler):
 
     def recon(self, sinogram, weights=None, init_recon=None, max_iterations=15,
               stop_threshold_change_pct=0.2, first_iteration=0,
+              logfile_path='~/.mbirtorch/logs/recon.log', print_logs=True,
               output_sharded=False):
         """
         Perform MBIR reconstruction using the Multi-Granular Vector Coordinate
@@ -2761,15 +2764,21 @@ class TomographyModel(ParameterHandler):
                 max_iterations.
             first_iteration (int, optional): the number of iterations previously
                 completed when restarting a recon.  Defaults to 0.
+            logfile_path (str, optional): Path to the output log file ('~' expands to the
+                user's home directory).  If None or empty, no log file is written.
+                Defaults to '~/.mbirtorch/logs/recon.log'.
+            print_logs (bool, optional): If true then print logs to console.  Defaults to True.
             output_sharded (bool, optional): If False (default), return a numpy
                 array; if True, return the device tensor (the mbirjax argument
                 name, kept for API compatibility).
 
         Returns:
             (recon, recon_dict): the reconstruction volume, and a dict
-            with entries 'recon_params' (per-iteration traces and settings) and
+            with entries 'recon_params' (per-iteration traces and settings),
+            'recon_log' (the run's log text), 'notes', and
             'model_params' (a snapshot of the model parameters).
         """
+        self._log_run_header(first_iteration, logfile_path, print_logs)
         (sinogram, weights, init_recon, partitions, partition_sequence, granularity,
          regularization_params) = self.initialize_recon(
             sinogram, weights, init_recon, max_iterations, first_iteration)
@@ -2797,8 +2806,15 @@ class TomographyModel(ParameterHandler):
                                 [num_iterations, granularity, partition_sequence,
                                  fm_rmse, prior_loss, regularization_params,
                                  stop_pct, alpha_values, delta_norm_per_slice]))
-        recon_dict = {'recon_params': recon_params,
-                      'model_params': {k: v.val for k, v in self.params.items()}}
+
+        if logfile_path:
+            self.logger.info('Logs written to {}'.format(
+                os.path.abspath(os.path.expanduser(logfile_path))))
+        for h in list(self.logger.handlers):  # Make sure the log files are up to date
+            h.flush()
+
+        notes = 'Reconstruction completed: {}\n\n'.format(datetime.datetime.now())
+        recon_dict = self.get_recon_dict(recon_params, notes=notes)
         # output_sharded keeps the device tensor (the mbirjax parameter; here
         # it means "skip the numpy exit").
         return (recon if output_sharded else self._gather_recon(recon)), recon_dict
@@ -2854,7 +2870,9 @@ class TomographyModel(ParameterHandler):
     def prox_map(self, prox_input, sinogram, sigma_prox=None, weights=None,
                  init_recon=None, do_initialization=True,
                  stop_threshold_change_pct=0.2, max_iterations=3,
-                 first_iteration=0, output_sharded=False):
+                 first_iteration=0,
+                 logfile_path='~/.mbirtorch/logs/prox.log', print_logs=True,
+                 output_sharded=False):
         """
         Proximal Map function for use in Plug-and-Play applications.  This
         function is similar to recon, but it essentially uses a prior with a
@@ -2889,6 +2907,7 @@ class TomographyModel(ParameterHandler):
             (recon, recon_dict): the numpy reconstruction volume and the recon
             parameters dict.
         """
+        self._log_run_header(first_iteration, logfile_path, print_logs)
         prior_loss = [0]
         if do_initialization or self.prox_data is None:
             (sinogram, weights, init_recon, partitions, partition_sequence,
@@ -2926,8 +2945,15 @@ class TomographyModel(ParameterHandler):
                                  fm_rmse, prior_loss, regularization_params,
                                  stop_pct, alpha_values, delta_norm_per_slice]))
         self.set_params(no_warning=True, sigma_prox=self_sigma_prox)
-        recon_dict = {'recon_params': recon_params,
-                      'model_params': {k: v.val for k, v in self.params.items()}}
+
+        if logfile_path:
+            self.logger.info('Logs written to {}'.format(
+                os.path.abspath(os.path.expanduser(logfile_path))))
+        for h in list(self.logger.handlers):  # Make sure the log files are up to date
+            h.flush()
+
+        notes = 'Proximal map completed: {}\n\n'.format(datetime.datetime.now())
+        recon_dict = self.get_recon_dict(recon_params, notes=notes)
         # output_sharded keeps the device tensor (the mbirjax parameter; here
         # it means "skip the numpy exit").
         return (recon if output_sharded else self._gather_recon(recon)), recon_dict

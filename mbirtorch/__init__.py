@@ -45,7 +45,8 @@ from .utilities import (generate_3d_shepp_logan_low_dynamic_range, clear_cache,
                         copy_ct_model, stitch_arrays,
                         get_ct_model, generate_demo_data,
                         generate_3d_shepp_logan_reference, gen_cube_phantom,
-                        gen_translation_vectors, ObjectType, ModelType)
+                        gen_translation_vectors, ObjectType, ModelType,
+                        merge_log_files)
 from .memory_stats import get_memory_stats
 
 # __all__ is the DECLARED public surface, and autodoc honors it: every name here is

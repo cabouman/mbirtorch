@@ -7,6 +7,9 @@ the shared geometry-params namedtuple cache.  Not yet ported: YAML save/load
 and the ParamNames Literal typing machinery.
 """
 
+import io
+import logging
+import os
 import warnings
 from collections import namedtuple
 
@@ -20,6 +23,89 @@ class ParameterHandler:
 
     def __init__(self):
         self.params = _utils.get_default_params()
+        self.logger = None
+        self.log_buffer = None
+
+    def setup_logger(self, *, logfile_path: str = "~/.mbirtorch/logs/recon.log", print_logs: bool = True):
+        """
+        Initialize self.logger and self.log_buffer.
+        The logging level comes from the model's 'verbose' parameter (0 -> WARNING, 1 -> INFO, 2+ -> DEBUG).
+
+        Args:
+            logfile_path: Path to the log file ('~' is expanded to the user's home, so the
+                default lands in the per-user mbirtorch directory rather than littering the
+                current working directory). If None or empty, file logging is skipped.
+            print_logs: If True, emit logs to console.
+
+        Raises:
+            Exception: If logfile_path directory cannot be created.
+        """
+        if logfile_path:
+            logfile_path = os.path.expanduser(logfile_path)
+        # Map verbosity to logging level
+        verbose = self.get_params('verbose')
+        if verbose < 1:
+            level = logging.WARNING
+        elif verbose < 2:
+            level = logging.INFO
+        else:
+            level = logging.DEBUG
+
+        # Configure logger
+        logger = logging.getLogger(self.__class__.__name__)
+        logger.setLevel(level)
+        # Close and remove any existing handlers to prevent leaked file descriptors
+        for h in list(logger.handlers):
+            try:
+                h.flush()
+            finally:
+                h.close()
+                logger.removeHandler(h)
+
+        # In-memory buffer handler (always enabled)
+        self.log_buffer = io.StringIO()
+        buffer_handler = logging.StreamHandler(self.log_buffer)
+        buffer_handler.setLevel(level)
+        buffer_formatter = logging.Formatter('%(message)s')
+        buffer_handler.setFormatter(buffer_formatter)
+        logger.addHandler(buffer_handler)
+
+        # Console handler
+        if print_logs:
+            console_handler = logging.StreamHandler()
+            console_handler.setLevel(level)
+            console_formatter = logging.Formatter('%(message)s')
+            console_handler.setFormatter(console_formatter)
+            logger.addHandler(console_handler)
+
+        # File handler (optional)
+        if logfile_path:
+            from .utilities import makedirs
+            makedirs(logfile_path)
+            file_handler = logging.FileHandler(logfile_path, mode='w')
+            file_handler.setLevel(level)
+            file_formatter = logging.Formatter('%(message)s')
+            file_handler.setFormatter(file_formatter)
+            logger.addHandler(file_handler)
+
+        self.logger = logger
+
+    def _log_run_header(self, first_iteration, logfile_path, print_logs):
+        """Set up the run logger (on the first iteration, or whenever none exists) and log the
+        MBIRTorch version and the device layout.
+
+        Shared by recon and prox_map so both report the version and which devices the run uses.
+        """
+        if first_iteration == 0 or self.logger is None:
+            self.setup_logger(logfile_path=logfile_path, print_logs=print_logs)
+        from . import __version__
+        self.logger.info('MBIRTorch Version = {}'.format(__version__))
+        self.logger.info('Reconstruction devices: {}'.format(self._device_report()))
+
+    def _device_report(self):
+        """A short 'N x platform' summary of the recon devices, for the recon log."""
+        devices = self.recon_placement.devices
+        return '{} x {}'.format(len(devices), devices[0].type)
 
     # ── access ────────────────────────────────────────────────────────────────
     def get_params(self, parameter_names):
