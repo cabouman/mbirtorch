@@ -1,0 +1,223 @@
+.. _DemosFAQs:
+
+==============
+Demos and FAQs
+==============
+
+.. PENDING(demos): restore the Demos section below when the mbirtorch demo set exists.
+   mbirtorch currently ships one demo, demo/demo_1_shepp_logan.py, against mbirjax's
+   notebook-plus-scripts set, and there is no mbirtorch_applications repo yet.  The
+   section also cross-references :ref:`InstallationDocs`, which install.rst defines and
+   which is not written yet, so restore it after that page lands.
+
+   Demos
+   -----
+
+   The basic demo below illustrates some of the features of MBIRTorch:
+
+   * **Basic Demo:** `Python script <https://github.com/cabouman/mbirtorch/blob/main/demo/demo_1_shepp_logan.py>`__
+
+   Follow the installation instructions at :ref:`InstallationDocs` and run the script directly.
+
+   Then adjust some of the parameters to better understand how the code works.
+   If you have a GPU, you can increase the problem size by changing ``num_views``, ``num_det_rows``, and ``num_det_channels``.
+
+   There are more demos here: `MBIRTorch demos <https://github.com/cabouman/mbirtorch/blob/main/demo/>`__
+
+
+.. PENDING(generate_demo_data): restore the Data Generation section below when
+   generate_demo_data is ported.  The function does not exist in mbirtorch, so every code
+   line in the section would fail today.  The section also references
+   :ref:`synthetic-data-generation`, which usr_utilities.rst already defines.
+
+   Data Generation
+   ---------------
+
+   Most demos start from synthetic data created with :func:`~mbirtorch.utilities.generate_demo_data`.  It builds a 3D
+   phantom (a simplified Shepp-Logan head or a cube) and the corresponding simulated sinogram for a chosen
+   geometry, so you can try MBIRTorch without a real dataset:
+
+   .. code-block:: python
+
+       import mbirtorch
+       phantom, sinogram, params = mbirtorch.generate_demo_data(object_type='shepp-logan', model_type='cone',
+                                                                num_views=64, num_det_rows=128, num_det_channels=128)
+       angles = params['angles']
+       ct_model = mbirtorch.ConeBeamModel(sinogram.shape, angles,
+                                          source_detector_dist=params['source_detector_dist'],
+                                          source_iso_dist=params['source_iso_dist'])
+       recon, recon_dict = ct_model.recon(sinogram)
+
+   Key options:
+
+   * ``object_type`` -- ``'shepp-logan'`` or ``'cube'``.
+   * ``model_type`` -- ``'parallel'`` or ``'cone'``; ``params`` returns the matching
+     geometry parameters (always the view ``angles``, plus the source distances for cone beam).
+   * ``num_views``, ``num_det_rows``, ``num_det_channels`` -- the sinogram size; increase these (with a GPU)
+     to make a larger problem.
+   * ``target_max_attenuation`` -- scales the phantom so its sinogram has a realistic peak attenuation
+     regardless of the array size (without it, the sinogram values grow with the volume size).
+
+   The phantom and sinogram are always returned as host NumPy arrays, ready to pass to a reconstruction.
+   The phantom is a reference object; the sinogram is the input you would normally reconstruct.  See
+   :ref:`synthetic-data-generation` for the full list of options and the related phantom generators.
+
+
+FAQs
+----
+
+Q: Why is there a bright ring around my reconstruction?
++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+A: If the object does not project completely inside the detector, then MBIR will produce a bright ring
+around the edge of the reconstruction to account for the portion of the object that projects to the detector in only some views.
+You can improve the reconstruction by increasing recon_shape:
+
+.. code-block:: python
+
+        ct_model.scale_recon_shape(row_scale=1.2, col_scale=1.2)
+
+Note that the scale factor need only be large enough to give some padding around the region of valid projection --
+it does not need to match the size of the true object.  Larger scale factors will lead to increased time and memory.
+
+.. PENDING(demos): mbirjax adds "See Demo 2: Large Object for an example of this." after the
+   first paragraph above.  Restore that sentence when a matching mbirtorch demo exists.
+
+Q: Why is my reconstruction blurry?
++++++++++++++++++++++++++++++++++++
+
+A:  If your reconstruction is blurry, the first thing to try is to increase the sharpness parameter.  Values of
+``sharpness=1.0`` or ``sharpness=1.5`` are typical, but larger values can further improve sharpness.
+You can also increase the assumed SNR by setting the parameter ``snr_db=35`` or ``snr_db=40``. This is similar to increasing sharpness but will also create higher contrast edges in the reconstruction.
+
+If the reconstruction remains blurry, it is often the case that some geometry parameter is incorrectly set for your data.
+Typical problems include an incorrect center of rotation (change ``det_channel_offset``), incorrect rotation direction
+(reverse the angles using ``angles[::-1]``), or an incorrect ``source_detector_dist`` or  ``source_iso_dist`` for
+cone beam reconstructions.
+
+Q: How can I do larger reconstructions?
++++++++++++++++++++++++++++++++++++++++
+
+A: MBIRTorch runs on both CPU and GPU computers, but we strongly recommend the use of GPUs for large reconstructions since they are much faster.
+On a GPU, the size of the reconstruction is typically limited by the amount of GPU memory.
+So you should find a fast GPU with the largest possible memory. These days that is typically 40GB to 80GB of GPU memory.
+The GPU will be hosted on a CPU, and it is best if that CPU also has even a larger amount of memory, ideally greater than 200GB.
+
+Note that a 2K x 2K x 2K reconstruction occupies 32GB of memory, not counting the sinogram or memory needed for processing.
+If your machine has multiple GPUs, MBIRTorch can divide the reconstruction across them, which grows the memory
+available for the problem roughly in proportion to the number of GPUs.  This is opt-in: call
+``model.configure_devices(num_devices=n)`` before reconstructing.  Large reconstructions typically get faster as
+well, but small ones do not; see :doc:`usr_multi_gpu` for the measured behavior and the details.
+If you have no GPU, all processing is done on the CPU.
+
+If your reconstruction is still too large, then for a parallel beam system you can select a subset of rows of your
+sinogram, reconstruct them separately, and then concatenate them at the end.  If you have a cone beam system, you can
+reconstruct a subset of the central slices.  For cone beam you can
+also make sure axial padding is disabled (``axial_pad_fraction=0``, the default -- see
+:ref:`ConeBeamModelDocs`) if that padding is what pushes you over the memory limit.
+
+We continue to improve the time and memory efficiency of MBIRTorch.
+
+.. PENDING(split_sino_recon): mbirjax offers ":meth:`~mbirtorch.ConeBeamModel.split_sino_recon`"
+   as a third option in the paragraph above, after reconstructing a subset of central slices.
+   A full-logic port is chartered; restore the mention when it lands.
+
+.. PENDING(demos): mbirjax closes that paragraph with "In either case, you can do a center
+   cropped reconstruction as in Demo 3: Cropped Center, although as seen in that demo, this
+   can introduce an intensity shift and other artifacts."  Restore when a matching demo exists.
+
+
+Q: Why does my reconstruction have artifacts?
++++++++++++++++++++++++++++++++++++++++++++++
+
+There are many reasons that a reconstruction may have artifacts including noise, blurring, streaks, cupping, etc.
+
+First, make sure you are using the geometry (parallel or cone) that matches your data.
+Parallel beam geometry is faster and could be used for cone beam data, but it may not be accurate if the source is too
+close to the object.
+
+For transmission tomography, it is critically important to preprocess the raw photon measurements by normalizing by an air-scan and taking the negative log of the ratio.
+We provide simple preprocessing utilities in ``mbirtorch.preprocess`` for doing this, and we plan to provide more utilities for specific instruments in the future.
+
+In conebeam scans, it is sometimes the case that the rotation direction is reversed.
+This can cause the reconstruction to look blurry or distorted.
+You can correct this by simply taking the negative of your view angles.
+
+A common artifact is rings near the center of the reconstruction that are generated when the center-of-rotation is
+not in the center of the detector.  This can be corrected by setting the parameter ``det_channel_offset`` to reposition
+the center-of-rotation.
+
+If your reconstruction is blurry, see the FAQ above.
+
+If the reconstruction is too noisy, you might try reducing the value of the ``sharpness`` or ``snr_db`` parameters (discussed
+more in the FAQ above on blurry reconstructions).
+You can also improve reconstruction quality by using the ``weights`` array that can be generated using the ``gen_weights()`` method.
+The weights provide information on the reliability of the sinogram values, with larger weights indicating higher reliability.
+
+Streaks are often caused by metal in the object being scanned.
+One advantage of MBIR is that it generally has fewer metal artifacts, but some artifacts typically remain.
+Using weights will reduce metal artifacts, and the function ``gen_weights_mar()`` can be used to generate weights that further reduce metal artifacts.
+
+Cupping is typically caused by beam hardening with polychromatic X-ray sources.
+This can be partially corrected with a low order polynomial correction.
+The preprocessing utilities include ``BH_correction`` for this, together with
+``fit_beam_hardening_curve`` and ``apply_beam_hardening_curve`` for fitting and applying a
+correction curve directly.
+
+Ring artifacts away from the center of reconstruction are typically caused by detector nonuniformity.
+Detector nonuniformity results from the variation in detector sensitivity from pixel to pixel.
+This variation is taken out to some degree by air scan normalization, but some variation may remain.
+These variations will lead to concentric rings in the reconstruction.
+The preprocessing utilities include ``remove_all_stripe`` and ``remove_stripe_fw`` for the
+sinogram stripes that produce these rings, plus ``interpolate_defective_pixels`` for isolated
+bad detector pixels and ``remove_sino_offset`` for a residual sinogram offset.
+
+A bright ring at the outer *boundary* of the reconstruction -- typically accompanied by the
+"Lateral FoV truncation detected" warning -- means the object extends past the field of view; see the next FAQ.
+
+.. PENDING(demos): mbirjax adds "See Demo 3: Wrong Rotation Direction above for an example of
+   what can happen if the rotation direction is incorrect." to the rotation-direction
+   paragraph.  Restore when a matching mbirtorch demo exists.
+
+
+Q: What does the "Lateral FoV truncation detected" warning mean?
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+A: The object extends beyond the detector's lateral field of view: at every view angle, material outside
+the field of view contributes to the measurements, but no reconstruction voxel is available to explain it.
+The result is a bright ring at the reconstruction boundary, a bias across the whole interior, and slowed
+convergence.
+
+Image quality can often be improved in this case by padding the region of reconstruction using the
+``model.scale_recon_shape(s, s)`` method with ``s >= 1.1``.
+
+For the *axial* (slice) direction in cone beam, the automatic geometry can pad the slice
+axis via the ``axial_pad_fraction`` parameter (default 0 = no padding, 1 = full padding --
+see :ref:`ConeBeamModelDocs`).
+
+
+Q: How can I shift region-of-reconstruction up or down for a conebeam reconstruction?
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+A: You can shift the region of reconstruction up or down using ``ct_model.set_params(recon_slice_offset=offset)``
+before calling recon.
+Positive values of ``offset`` will shift the region down relative to the detector.
+This is useful if you would like to reconstruct the top or bottom half of a conebeam reconstruction in order to save memory.
+
+
+Q: What are the differences between (iterative) recon and fbp_recon/fdk_recon?
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+A: The primary reconstruction method in MBIRTorch is iterative reconstruction (``mbirtorch.TomographyModel.recon``)
+using a Bayesian formulation that balances a data-fitting loss function with a prior function on the reconstruction that
+reduces noise while maintaining sharp edges. This approach updates the reconstruction multiple times in order to
+minimize the sum of these two loss functions.
+
+In contrast, FBP (``mbirtorch.ParallelBeamModel.fbp_recon``) and FDK (``mbirtorch.ConeBeamModel.fdk_recon``) are direct
+methods, in which the sinograms are filtered and then backprojected once to form the reconstruction. In this case,
+there is no prior information and no attempt to denoise the sinogram or the reconstruction.
+
+In general, FBP and FDK work well when the number of views is large (at least as large as the number of channels in the
+detector) and the sinograms have little noise.  Iterative reconstruction typically works better when there are
+relatively few views and/or the sinograms are noisy.  Iterative reconstruction takes more time and memory than
+FBP/FDK but can produce significantly better reconstructions when the collected data is less than ideal.
