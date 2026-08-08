@@ -30,7 +30,9 @@ def _fill_view_batches(array, kernel, output, batch_size, device, lo, hi, desc=N
     with torch.no_grad():
         for j in steps:
             end = min(j + batch_size, hi)
-            batch = torch.as_tensor(np.asarray(array[j:end]), device=device)
+            # ascontiguousarray: a flipped/strided source view (e.g. the NSI reader's np.flip)
+            # cannot be wrapped as a tensor; the copy is one batch, not the full array.
+            batch = torch.as_tensor(np.ascontiguousarray(array[j:end]), device=device)
             output[j:end] = kernel(batch).cpu().numpy()
 
 
@@ -71,7 +73,8 @@ def map_view_batches(array, kernel, batch_size, desc=None, devices=None):
     # on the host.  Writing in place bounds the host footprint to input + output (~2x).
     probe_hi = min(batch_size, num_views)
     with torch.no_grad():
-        probe = kernel(torch.as_tensor(np.asarray(array[0:probe_hi]), device=device)).cpu().numpy()
+        probe = kernel(torch.as_tensor(np.ascontiguousarray(array[0:probe_hi]),
+                                       device=device)).cpu().numpy()
     output = np.empty((num_views,) + probe.shape[1:], dtype=probe.dtype)
     output[0:probe_hi] = probe
     del probe
