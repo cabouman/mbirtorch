@@ -1014,8 +1014,12 @@ class ConeBeamModel(TomographyModel):
             model.set_params(no_warning=True, auto_regularize_flag=False)
             model.set_params(recon_shape=recon_shape)
             model.set_params(recon_slice_offset=recon_slice_offset)
-            if len(parent_devices) > 1:
-                model.configure_devices(devices=parent_devices)
+            # Pin UNCONDITIONALLY, not only for multi-device parents: an explicit
+            # configure_devices call is what keeps a half model out of any automatic
+            # device-count path, so a parent pinned to one device gets halves pinned to
+            # that same device rather than halves free to widen on their own.  At one
+            # device this rebuilds the same trivial placement it would have had.
+            model.configure_devices(devices=parent_devices)
 
             # Sinogram and weight slices are host VIEWS (nothing mutates them; weights=None passes
             # through so the half recon uses its constant-weight path with no ones array built).
