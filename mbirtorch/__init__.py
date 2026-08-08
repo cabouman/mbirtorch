@@ -41,7 +41,8 @@ from .qggmrf import (qggmrf_gradient_and_hessian_at_indices, get_b_from_nbr_wts,
 from .utilities import (generate_3d_shepp_logan_low_dynamic_range, clear_cache,
                         makedirs, load_data_hdf5, save_data_hdf5,
                         export_recon_hdf5, import_recon_hdf5,
-                        build_model, download_and_extract)
+                        build_model, download_and_extract,
+                        copy_ct_model, stitch_arrays)
 from .memory_stats import get_memory_stats
 
 # __all__ is the DECLARED public surface, and autodoc honors it: every name here is
@@ -63,25 +64,49 @@ __all__ = [
 # ── lazy exports (PEP 562) ───────────────────────────────────────────────────
 # The viewer names resolve on first attribute access so that a headless
 # `import mbirtorch` never imports matplotlib; most mbirtorch runs (batch
-# recons, tests) never open a viewer.  The preprocess subpackage resolves the
-# same way, so `import mbirtorch` never pays for its dependency stack (osqp
-# pulls scipy.sparse, plus cv2, tifffile, and the loaders -- about a third of
-# the package's cold import before this).  `mbirtorch.preprocess` and the
-# direct form `import mbirtorch.preprocess` both keep working; only WHEN the
-# subpackage loads changes.  mbirjax imports its preprocess eagerly, so this
-# is a deliberate, behavior-preserving improvement over the mirror.
+# recons, tests) never open a viewer.  The preprocess, hsnt, and vcls
+# modules resolve the same way, so `import mbirtorch` never pays for their
+# dependency stacks (preprocess: osqp pulls scipy.sparse, plus cv2 and
+# tifffile; hsnt: scikit-learn, scipy, matplotlib; vcls: the model layer and
+# tqdm).  Both spellings keep working -- `mbirtorch.hsnt` resolves here, and
+# `import mbirtorch.hsnt` is an ordinary submodule import -- and the
+# star-exported FUNCTION names (mbirtorch.dehydrate, mbirtorch.get_opt_views,
+# ...) resolve through _LAZY_NAMES, so the public surface matches mbirjax's
+# eager star imports exactly; only WHEN each module loads changes.
 _VIEWER_EXPORTS = ("SliceViewer", "VolumeStack", "slice_viewer")
+
+_LAZY_MODULES = ("preprocess", "hsnt", "vcls")
+
+# The names mbirjax exposes at package level via `from .hsnt import *` and
+# `from .vcls import *`, mapped to their owning module (neither module
+# declares __all__, so this is their full public def list; a new public
+# function in either module gets a line here).
+_LAZY_NAMES = {
+    'hyper_denoise': 'hsnt', 'dehydrate': 'hsnt', 'rehydrate': 'hsnt',
+    'import_hsnt_data_hdf5': 'hsnt', 'create_hsnt_metadata': 'hsnt',
+    'export_hsnt_data_hdf5': 'hsnt', 'generate_hyper_data': 'hsnt',
+    'subsample_R_gamma': 'vcls', 'max_abs_neighbor_diff': 'vcls',
+    'get_opt_views': 'vcls', 'compute_view_basis_functions': 'vcls',
+    'compute_cov_matrix': 'vcls', 'compute_vcl': 'vcls',
+    'compute_opt_angle_subset': 'vcls', 'get_2d_subsampling_indices': 'vcls',
+    'show_image_with_projection_rays': 'vcls', 'reorder_by_priority': 'vcls',
+}
 
 
 def __getattr__(name):
+    import importlib
     if name in _VIEWER_EXPORTS:
         from . import view_utils
         value = getattr(view_utils, name)
         globals()[name] = value  # cache: later accesses skip this hook
         return value
-    if name == 'preprocess':
-        import importlib
-        value = importlib.import_module('.preprocess', __name__)
+    if name in _LAZY_MODULES:
+        value = importlib.import_module('.' + name, __name__)
+        globals()[name] = value
+        return value
+    if name in _LAZY_NAMES:
+        module = importlib.import_module('.' + _LAZY_NAMES[name], __name__)
+        value = getattr(module, name)
         globals()[name] = value
         return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

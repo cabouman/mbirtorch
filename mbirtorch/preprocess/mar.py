@@ -781,10 +781,12 @@ def recon_plastic_metal(ct_model, sino, weights, num_BH_iterations=3, num_constr
     else:
         recon_function = functools.partial(ct_model.recon, output_sharded=True)
 
-    # Deliver the user-requested output form: _shard_recon / _gather_recon are each a no-op when the
-    # loop's final recon is already in that form.
+    # Deliver the user-requested output form (a host recon, e.g. from split_sino_recon, is already
+    # in the gathered form).
     def to_output_form(r):
-        return ct_model._shard_recon(r) if output_sharded else ct_model._gather_recon(r)
+        if output_sharded:
+            return ct_model._shard_recon(r)
+        return r if isinstance(r, np.ndarray) else ct_model._gather_recon(r)
 
     # Do a regular recon if num_metal == 0
     if num_metal == 0:

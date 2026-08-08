@@ -46,6 +46,8 @@ dependencies = [
     # Google Drive-hosted demo datasets in download_and_extract.
     "olefile",
     "gdown",
+    # hsnt hyperspectral denoising: NMF and randomized SVD.
+    "scikit-learn",
     # get_memory_stats reads host RSS/USS via psutil.
     "psutil",
 ]

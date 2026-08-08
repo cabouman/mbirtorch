@@ -331,34 +331,66 @@ def test_masked_hessian_leaves_the_public_method_unchanged():
     np.testing.assert_array_equal(a, b)
 
 
-def test_recon_is_bitwise_identical_with_the_masked_hessian():
-    """The internal call-site change must not move a single bit of the recon.
+def test_every_index_the_loop_reads_is_inside_the_mask():
+    """The precondition the masked hessian rests on, asserted directly.
 
-    The two runs differ in ONE variable: where the hessian came from.  The
-    control supplies one computed the dense way, which bypasses the internal
-    masked call; the comparison run lets vcd_recon compute it at the masked
-    indices.  Both consume the same partitions and the same seed.
+    The masked hessian is zero outside the ROR set, so the change is
+    value-preserving only if the loop never reads there.  The loop reads the
+    hessian at partition indices and nowhere else, so this test pins that
+    every partition index is inside the same mask that `full_indices_device`
+    returns.
     """
     angles = np.linspace(0, np.pi, 12, endpoint=False)
     model = mbirtorch.ParallelBeamModel((12, 8, 10), angles, device='cpu')
     model.set_params(no_warning=True, verbose=0)
     sinogram = np.zeros((12, 8, 10), dtype=np.float32)
     sinogram[:, 4, 5] = 1.0
+    (_s, _w, _i, partitions, _seq, _g,
+     _r) = model.initialize_recon(sinogram, None, None, 3, 0)
+    masked = set(model.full_indices_device().cpu().numpy().tolist())
+    for partition in partitions:
+        outside = set(partition.cpu().numpy().ravel().tolist()) - masked
+        assert not outside, f'{len(outside)} partition indices outside the mask'
+
+
+def test_recon_is_bitwise_identical_with_the_masked_hessian():
+    """The whole-recon parity, in eager.
+
+    The two runs differ in ONE variable: where the hessian came from.  The
+    control supplies one computed the dense way, which bypasses the internal
+    masked call; the comparison run lets vcd_recon compute it at the masked
+    indices.
+
+    Compilation is OFF deliberately, and not to hide a difference.  The two
+    arms necessarily back-project at different pixel counts, so they compile
+    different shapes, and dynamo's shape specialization then perturbs the
+    float realization of kernels that have nothing to do with the hessian.
+    A compiled whole-recon comparison therefore measures the compiler rather
+    than this change.  The change's own value claim is proved directly by
+    the two tests above: the hessian is bitwise equal at every masked index,
+    and the loop reads nowhere else.
+    """
+    angles = np.linspace(0, np.pi, 12, endpoint=False)
+    model = mbirtorch.ParallelBeamModel((12, 8, 10), angles, device='cpu',
+                                        compile_mode='off')
+    model.set_params(no_warning=True, verbose=0)
+    sinogram = np.zeros((12, 8, 10), dtype=np.float32)
+    sinogram[:, 4, 5] = 1.0
     weights = np.full((12, 8, 10), 0.75, dtype=np.float32)
 
-    # One set of partitions, shared, so the only difference is the hessian.
+    # One set of partitions, shared, so the hessian is the only difference.
     (_s, _w, _i, partitions, sequence, _g,
      _r) = model.initialize_recon(sinogram, weights, None, 3, 0)
     dense_hessian = model.compute_hessian_diagonal(weights=weights,
                                                    output_sharded=True)
 
     np.random.seed(7)
-    control, _losses = model.vcd_recon(sinogram, partitions, sequence, 0.0,
-                                       weights=weights,
+    control, _losses = model.vcd_recon(sinogram.copy(), partitions, sequence,
+                                       0.0, weights=weights,
                                        fm_hessian=dense_hessian.clone())
     np.random.seed(7)
-    masked, _losses = model.vcd_recon(sinogram, partitions, sequence, 0.0,
-                                      weights=weights)
+    masked, _losses = model.vcd_recon(sinogram.copy(), partitions, sequence,
+                                      0.0, weights=weights)
     np.testing.assert_array_equal(control.cpu().numpy(), masked.cpu().numpy())
 
 
