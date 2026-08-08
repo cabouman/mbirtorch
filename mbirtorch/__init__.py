@@ -41,7 +41,8 @@ from .qggmrf import (qggmrf_gradient_and_hessian_at_indices, get_b_from_nbr_wts,
 from .utilities import (generate_3d_shepp_logan_low_dynamic_range, clear_cache,
                         makedirs, load_data_hdf5, save_data_hdf5,
                         export_recon_hdf5, import_recon_hdf5,
-                        build_model, download_and_extract)
+                        build_model, download_and_extract,
+                        copy_ct_model, stitch_arrays)
 from .vcls import *
 from .hsnt import *
 from . import vcls

@@ -203,6 +203,13 @@ def main():
         mar_model, mar_sino, mar_weights, num_BH_iterations=1, max_iterations=5,
         num_metal=1, verbose=0, logfile_path=None))
 
+    # split_sino_recon on the shared cone case (seeded; recon in the loop, so parity is loose).
+    np.random.seed(19)
+    split_recon, split_dict = mar_model.split_sino_recon(mar_sino.copy(), weights=mar_weights.copy(),
+                                                         half_overlap=4, max_iterations=5,
+                                                         logfile_path=None)
+    split_params = split_dict['split_params']
+
     # Alignment trio on the shared inputs.
     align_shifts = np.asarray(mjp.estimate_sino_view_offset(mar_model, mar_sino, mar_recon_input))
     align_out = np.asarray(mjp.align_sino_views(mar_model, mar_sino, mar_recon_input))
@@ -346,6 +353,9 @@ def main():
         hsnt_rehydrated=hsnt_rehydrated.astype(np.float64),
         vcls_ref=vcls_ref, vcls_angles=vcls_angles,
         vcls_inds=np.asarray(vcls_inds, dtype=np.int64), vcls_value=np.float64(vcls_value),
+        split_recon=np.asarray(split_recon, dtype=np.float32),
+        split_overlap_sino=np.int64(split_params['half_overlap_sino']),
+        split_overlap_recon=np.int64(split_params['half_overlap_recon']),
     )
     print('wrote', out)
     print('wrote', h5_path)

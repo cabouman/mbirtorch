@@ -771,3 +771,309 @@ class ConeBeamModel(TomographyModel):
     def direct_filter(self, sinogram, filter_name="ramp", output_sharded=False):
         return self.fdk_filter(sinogram, filter_name=filter_name,
                                output_sharded=output_sharded)
+
+    def split_sino_recon(self, sino, weights=None, half_overlap=5, init_recon=None, max_iterations=15, stop_threshold_change_pct=0.2,
+                         first_iteration=0, compute_prior_loss=False, logfile_path='~/.mbirtorch/logs/recon.log', print_logs=True,
+                         align_split_grid=False):
+        """
+        This function reduces memory usage for cone beam MBIR reconstruction by approximately a factor of 2
+        by splitting the detector rows into two overlapping halves, reconstructing each half separately,
+        and stitching the reconstructions together.
+
+        The function can be called with the same arguments as TomographyModel.recon(), and it should return a
+        reconstruction which is approximately equal to the reconstruction returned by TomographyModel.recon().
+
+        Each half keeps ``half_overlap`` detector rows past the iso row, and its reconstruction
+        extends ``half_overlap_recon`` slices past the split, where half_overlap_recon =
+        ceil(half_overlap_sino * (1 + R/SID) * rho) + 2 with rho = delta_det_row/(magnification *
+        delta_voxel_slice) and R the recon-support radius.  The (1 + R/SID) factor makes every
+        slice the kept rows can SEE representable (the cone-divergence bound of
+        auto_set_recon_geometry, evaluated at the iso ray); without it each half is axially
+        truncated at its extension end, which shows up as alternating stripes at the stitch seam
+        on real scans.
+
+        Args:
+            sino (ndarray): Full sinogram of shape (num_views, num_rows, num_cols).
+            weights (ndarray, optional): Optional sinogram weights with the same shape as `sino`.
+            half_overlap (int): Number of overlapping detector rows past the iso row per half (when
+                recon slices are coarser than the iso-mapped rows, the row overlap is scaled up so
+                it still spans ``half_overlap`` slices).  The recon overlap is derived from it by
+                the geometry formula above.
+            init_recon (optional): Same as in the recon method.
+            max_iterations (int, optional): Same as in the recon method.
+            stop_threshold_change_pct (float, optional): Same as in the recon method.
+            first_iteration (int, optional): Same as in the TomographyModel.recon() method.
+            compute_prior_loss (bool, optional): Accepted for interface compatibility; not
+                currently used by the mbirtorch recon.
+            logfile_path (str, optional): Accepted for interface compatibility; per-half log files
+                are not currently written.
+            print_logs (bool, optional): Accepted for interface compatibility.
+            align_split_grid (bool, optional): If True, align the recon split slice with the
+                sinogram cut row: first by choosing the cut row (effective only when rho != 1,
+                where the row and slice grids are incommensurate), then by shifting the whole
+                recon grid by the sub-slice residual (at most half a slice).  Alignment removes
+                the seam-stripe driver outright, but the shifted output samples the object at
+                z-positions up to delta_voxel_slice/2 away from what recon() would use -- an
+                equally valid reconstruction that is NOT registration-identical to recon(), which
+                is why it is opt-in.  The applied shift is reported in the returned dictionary
+                under 'split_params'.  Defaults to False.
+
+        Returns:
+            Tuple[np.ndarray, dict]: the reconstructed volume (numpy array), and a
+                metadata dictionary containing recon and model parameters for each
+                half, plus 'split_params' (the overlaps and any alignment shift used).
+
+        Raises:
+            ValueError: If inputs are missing or shapes are inconsistent, if half_overlap < 2,
+                or if the geometry has nonzero helical z-shifts.
+            AssertionError: If array dimensions are invalid.
+
+        Example:
+            >>> import numpy as np
+            >>> import mbirtorch
+            >>> sino = np.ones((180, 64, 64), dtype=np.float32)  # (views, rows, cols)
+            >>> model = mbirtorch.ConeBeamModel(sinogram_shape=sino.shape,
+            ...                                 angles=np.linspace(0, np.pi, 180),
+            ...                                 source_detector_dist=1000.0,
+            ...                                 source_iso_dist=500.0)
+            >>> recon, recon_info = model.split_sino_recon(sino, half_overlap=4)
+        """
+        from .utilities import copy_ct_model, stitch_arrays
+
+        # -------- Basic validation --------
+        if half_overlap < 2:
+            raise ValueError('half_overlap must be >= 2.')
+        helical_z_shifts = self.get_params('view_params_array')[:, 1]
+        if any(helical_z_shifts != 0):
+            raise ValueError('helical_z_shifts must be zero.')
+        if sino is None:
+            raise ValueError("sino must be provided.")
+        if not (hasattr(sino, "ndim") and sino.ndim == 3):
+            raise AssertionError("sino must be a 3D array shaped (num_views, num_rows, num_cols).")
+        if weights is not None and getattr(weights, "shape", None) != sino.shape:
+            raise AssertionError("weights, if provided, must have the same shape as sino.")
+
+        # Operate on the host: split here and let each half's recon re-shard its own half, so the full
+        # sinogram is never on the devices at once (the memory saving).  The per-half slices below are
+        # then cheap host views.
+        if isinstance(sino, torch.Tensor):
+            sino = sino.detach().cpu().numpy()
+        sino = np.asarray(sino)
+        if weights is not None:
+            if isinstance(weights, torch.Tensor):
+                weights = weights.detach().cpu().numpy()
+            weights = np.asarray(weights)
+        if init_recon is not None and isinstance(init_recon, torch.Tensor):
+            # Same host-side treatment as sino/weights: host slicing keeps only one half's arrays
+            # device-resident at a time, and _gather_recon crops any zero-padded slices of a
+            # device-form volume so the bottom-half slice picks up real slices, not padding.
+            init_recon = self._gather_recon(init_recon)
+
+        # Get parameters for later use
+        num_views, full_num_rows, num_cols = sino.shape
+
+        # -------- parameters needed to create top and bottom models --------
+        delta_det_row = self.get_params('delta_det_row')
+        full_det_row_offset = self.get_params('det_row_offset')
+        delta_voxel = self.get_params('delta_voxel')
+        voxel_slice_aspect, voxel_row_aspect = self.get_params(['voxel_slice_aspect', 'voxel_row_aspect'])
+        delta_voxel_slice = voxel_slice_aspect * delta_voxel
+        full_recon_shape = self.get_params('recon_shape')
+        full_recon_slice_offset = self.get_params('recon_slice_offset')
+        source_iso_dist, use_ror_mask = self.get_params(['source_iso_dist', 'use_ror_mask'])
+        magnification = self.get_magnification()
+
+        # Get recon shape parameters
+        full_recon_rows, full_recon_cols, full_recon_slices = full_recon_shape
+
+        # -------- Overlaps: detector rows kept past the cut, recon slices kept past the split --------
+        # Sino overlap: when recon slices are coarser than the iso-mapped rows, scale the row
+        # overlap up so it still spans about half_overlap slices (the knob keeps its meaning in
+        # both unit systems).
+        delta_detector_row_at_iso = max(delta_det_row / magnification, 1e-12)
+        ratio_pixel_to_sino_pitch = delta_voxel_slice / delta_detector_row_at_iso
+        if ratio_pixel_to_sino_pitch > 1:
+            half_overlap_sino = int(round(half_overlap * ratio_pixel_to_sino_pitch))
+        else:
+            half_overlap_sino = half_overlap
+        # Recon overlap from geometry (see docstring): every slice the kept rows can SEE must be
+        # representable, or each half is axially truncated at its extension end and the seam
+        # stripes.  rho = slices seen per kept row at the iso ray; (1 + R/SID) is the
+        # cone-divergence bound evaluated at the far side of the support; +2 covers the voxel
+        # footprint and the worst-case half-slice cut/split misalignment.
+        rho = 1.0 / ratio_pixel_to_sino_pitch
+        support_radius = get_support_radius(full_recon_shape, voxel_row_aspect * delta_voxel,
+                                            delta_voxel, use_ror_mask=use_ror_mask)
+        half_overlap_recon = int(np.ceil(
+            half_overlap_sino * (1.0 + support_radius / float(source_iso_dist)) * rho)) + 2
+
+        # -------- Choose the detector row nearest to iso (the cut row) --------
+        det_iso_row_float = ((full_num_rows - 1) / 2.0) + (full_det_row_offset / delta_det_row)
+        det_iso_row_index = int(round(det_iso_row_float))
+
+        # Validate iso-row index is inside (0, num_rows)
+        if not (0 < det_iso_row_index < full_num_rows):
+            raise ValueError(
+                f"Computed det_iso_row_index={det_iso_row_index} is out of valid range (0, {full_num_rows-1}). "
+            )
+
+        # -------- Optional cut/split alignment (align_split_grid) --------
+        # The seam-stripe driver is the SUB-SLICE misalignment eps between the cut row's
+        # iso-mapped plane and the split slice, eps = wrap(split_offset - cut_offset_rows * rho)
+        # with both round-off terms in [-1/2, 1/2].  Two mechanisms remove it: choosing a
+        # different cut row changes eps by rho per row (effective only when rho != 1; at rho == 1
+        # the row and slice grids are commensurate and eps is invariant under every index
+        # choice), and a sub-slice shift of the whole recon grid removes the residual exactly.
+        # The shift moves the OUTPUT grid by up to half a slice -- an equally valid sampling that
+        # is not registration-identical to recon(), which is why this is opt-in.
+        grid_shift_alu = 0.0
+        if align_split_grid:
+            def _wrap_half(x):
+                return (x + 0.5) % 1.0 - 0.5
+            iso_float_unshifted = (full_recon_slices - 1) / 2.0 - full_recon_slice_offset / delta_voxel_slice
+            split_off_unshifted = round(iso_float_unshifted) - iso_float_unshifted
+            candidates = [c for c in range(det_iso_row_index - 2, det_iso_row_index + 3)
+                          if 0 < c < full_num_rows]
+            eps_by_cut = {c: _wrap_half(split_off_unshifted - (c - det_iso_row_float) * rho)
+                          for c in candidates}
+            det_iso_row_index = min(eps_by_cut, key=lambda c: abs(eps_by_cut[c]))
+            grid_shift_alu = -float(eps_by_cut[det_iso_row_index]) * delta_voxel_slice
+            full_recon_slice_offset = full_recon_slice_offset + grid_shift_alu
+
+        # -------- Compute the recon slice nearest to iso (the split slice) --------
+        full_recon_iso_slice_index_float = (full_recon_slices - 1) / 2.0 - full_recon_slice_offset / delta_voxel_slice
+        split_index = int(round(full_recon_iso_slice_index_float))
+        top_num_slices = split_index + 1
+
+        # Compute the offset of the split from iso.
+        # This will be used to slightly shift the slices so that they align with a standard reconstruction.
+        split_offset = split_index - full_recon_iso_slice_index_float
+
+        # Residual sub-slice cut/split misalignment, for the returned split_params (0 up to float
+        # noise when align_split_grid=True; the +2 overlap margin absorbs it when False).
+        split_cut_mismatch = float((split_offset - (det_iso_row_index - det_iso_row_float) * rho
+                                    + 0.5) % 1.0 - 0.5)
+
+        # Fallback: if the split leaves either half too thin -- an empty half sinogram, or fewer
+        # kept slices than the recon overlap (the stitch spans 2 * half_overlap_recon slices) --
+        # then warn and do a normal MBIR recon.
+        if (split_index < 1 or split_index > full_recon_slices - 2
+                or top_num_slices < half_overlap_recon
+                or full_recon_slices - top_num_slices < half_overlap_recon):
+            warnings.warn(
+                "split_index is too close to the volume boundary for the recon overlap; "
+                "falling back to standard MBIR reconstruction.",
+                UserWarning,
+            )
+            return self.recon(
+                sino,
+                weights=weights,
+                init_recon=init_recon,
+                max_iterations=max_iterations,
+                stop_threshold_change_pct=stop_threshold_change_pct,
+                first_iteration=first_iteration,
+            )
+
+        # -------- Per-half scalar parameters (cheap; the heavy arrays + models are built one half at a
+        # time in _recon_one_half below, so only ONE half's inputs are resident at once) --------
+        top_lo, top_hi = 0, min(det_iso_row_index + half_overlap_sino, full_num_rows)
+        bot_lo, bot_hi = max(det_iso_row_index - half_overlap_sino, 0), full_num_rows
+
+        top_recon_shape = (full_recon_shape[0], full_recon_shape[1], top_num_slices + half_overlap_recon)
+        bot_recon_shape = (full_recon_shape[0], full_recon_shape[1], (full_recon_shape[2] - top_num_slices) + half_overlap_recon)
+        top_recon_slice_offset = (+half_overlap_recon - (top_recon_shape[2]-1)/2 + 0 + split_offset) * delta_voxel_slice
+        bot_recon_slice_offset = (-half_overlap_recon + (bot_recon_shape[2]-1)/2 + 1 + split_offset) * delta_voxel_slice
+
+        full_det_center = (full_num_rows - 1) / 2.0
+
+        # Regularization params come from the FULL sinogram; the halves copy them and set
+        # auto_regularize_flag=False so they do not re-derive from their partial sinograms.
+        self.auto_set_regularization_params(sino)
+
+        # The parent's device layout, carried to each half model so an explicit multi-GPU
+        # configuration is preserved (copy_ct_model does not carry the layout).
+        parent_devices = list(self.sino_placement.devices)
+
+        def _recon_one_half(lo, hi, recon_shape, recon_slice_offset, is_top):
+            """Reconstruct one detector-row half on the host; return (host_recon, recon_dict).
+
+            Builds the half's model, sinogram slice, and weights, runs recon, and gathers the result to
+            the host.  All the heavy state (the half model, the device recon) is local, so it is
+            released when this returns -- only ONE half's inputs are resident at a time, which is
+            the point of doing half a recon at a time.  The returned reconstruction is a host array.
+            """
+            num_rows = hi - lo
+            det_center = (num_rows - 1) / 2.0
+            det_row_offset = full_det_row_offset + (full_det_center - (det_center + lo)) * delta_det_row
+
+            # Half model: copy the parent's parameters, set this half's detector/recon geometry, then
+            # pin to the parent's devices.  configure_devices rebuilds the placement for THIS half's
+            # recon shape; a non-dividing slice axis pads inertly.
+            model = copy_ct_model(self, new_num_det_rows=num_rows)
+            model.set_params(det_row_offset=det_row_offset)
+            model.set_params(no_warning=True, auto_regularize_flag=False)
+            model.set_params(recon_shape=recon_shape)
+            model.set_params(recon_slice_offset=recon_slice_offset)
+            if len(parent_devices) > 1:
+                model.configure_devices(devices=parent_devices)
+
+            # Sinogram and weight slices are host VIEWS (nothing mutates them; weights=None passes
+            # through so the half recon uses its constant-weight path with no ones array built).
+            sino_half = sino[:, lo:hi, :]
+            weights_half = None if weights is None else weights[:, lo:hi, :]
+
+            # init_recon slice: the top half takes the first recon_shape[2] slices, the bottom the last.
+            half_init = None
+            if init_recon is not None:
+                half_init = init_recon[:, :, :recon_shape[2]] if is_top else init_recon[:, :, -recon_shape[2]:]
+
+            recon_half, recon_dict = model.recon(sino_half, weights=weights_half, init_recon=half_init,
+                                                 max_iterations=max_iterations,
+                                                 stop_threshold_change_pct=stop_threshold_change_pct,
+                                                 first_iteration=first_iteration)
+            # recon() already returns a host NumPy array (its output_sharded=False gather), so the
+            # half is on the host here.
+            return recon_half, recon_dict
+
+        # -------- Reconstruct the halves ONE AT A TIME (the top half is built, recon'd, gathered to the
+        # host, and freed before the bottom half is built), so only one half's sino/weights/model and one
+        # half's device recon are resident at any moment. --------
+        recon_top_half, recon_top_dict = _recon_one_half(top_lo, top_hi, top_recon_shape,
+                                                         top_recon_slice_offset, is_top=True)
+        recon_bot_half, recon_bot_dict = _recon_one_half(bot_lo, bot_hi, bot_recon_shape,
+                                                         bot_recon_slice_offset, is_top=False)
+
+        # -------- Stitch together top and bottom reconstructions --------
+        # Both halves are host arrays, so stitch_arrays (host-preserving) assembles the full volume ON
+        # THE HOST -- the full recon is never rebuilt on a single device, which would defeat the
+        # half-at-a-time memory saving (and OOM for a recon too large to fit whole on the GPUs).
+        # half_overlap_recon is used on both sides of the seam, so total overlap is 2 * half_overlap_recon.
+        # ramp_overlap determines which slices are blended, which is usually less than 2 * half_overlap_recon
+        # to avoid possible boundary effects.  ramp_overlap should be even so that it applies equally to
+        # slices on either side of the seam.
+        ramp_overlap = 4
+        ramp_overlap = min(ramp_overlap, half_overlap_recon)
+        ramp_overlap -= ramp_overlap % 2  # ensure even
+        recon_full = stitch_arrays([recon_top_half, recon_bot_half], axis=2,
+                                   overlap=2 * half_overlap_recon, ramp_overlap=ramp_overlap)
+
+        # -------- Construct full reconstruction dictionary --------
+        recon_full_dict = {'recon_params_top': recon_top_dict.get('recon_params'),
+                           'recon_params_bottom': recon_bot_dict.get('recon_params'),
+                           'recon_log_top': recon_top_dict.get('recon_log', '# Log info not saved.'),
+                           'recon_log_bottom': recon_bot_dict.get('recon_log', '# Log info not saved.'),
+                           'notes_top': recon_top_dict.get('notes', '# No notes saved'),
+                           'notes_bottom': recon_bot_dict.get('notes', '# No notes saved'),
+                           'model_params_top': recon_top_dict.get('model_params'),
+                           'model_params_bottom': recon_bot_dict.get('model_params'),
+                           # The overlaps actually used, the residual sub-slice cut/split
+                           # misalignment, and any align_split_grid shift of the OUTPUT grid
+                           # (in ALU; the returned volume samples a grid whose
+                           # recon_slice_offset differs from the model's by this amount).
+                           'split_params': {'half_overlap_sino': int(half_overlap_sino),
+                                            'half_overlap_recon': int(half_overlap_recon),
+                                            'align_split_grid': bool(align_split_grid),
+                                            'grid_shift_alu': float(grid_shift_alu),
+                                            'split_cut_mismatch_slices': split_cut_mismatch}, }
+
+        return recon_full, recon_full_dict

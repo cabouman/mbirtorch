@@ -568,6 +568,185 @@ def get_top_level_tar_dir(tar_path, max_entries=1):
     return dir_name
 
 
+def stitch_arrays(array_list, overlap, axis=2, ramp_overlap=None):
+    """
+    Concatenate arrays along one axis while linearly blending a fixed overlap
+    between adjacent arrays.
+
+    This behaves like a concatenate except that for each adjacent pair, the
+    first `overlap_length` elements of the second array and the last
+    `overlap_length` elements of the current result are combined by a piece-wise linear cross‑fade.
+
+    All non‑`axis` dimensions must match across inputs.
+
+    Args:
+        array_list (list of ndarray or tensor): Sequence of 2+ arrays to stitch.  The result is
+            built on the inputs' own array module, so host (NumPy) inputs stitch on the host (no
+            gather to a single device) and device tensors stitch on-device.
+        overlap (int): Number of elements overlapped between arrays.
+            Must be `>= 1` and not exceed the length of any input along `axis`.
+        axis (int, optional): Axis along which to stitch. Defaults to 2.
+        ramp_overlap (int, optional): Target number of blended (0 < w < 1) elements. Defaults to None.
+
+    Returns:
+        ndarray or tensor: Stitched array, on the inputs' own array module (host NumPy in -> host
+        out, tensor in -> on-device out). Its shape equals the input shape with the
+        length along `axis` equal to:
+
+            sum(len_k) - (len(array_list) - 1) * overlap_length
+
+        where `len_k` are the lengths of each input along `axis`.
+
+    Raises:
+        ValueError: If fewer than two arrays are provided, if non‑`axis`
+            dimensions differ, or if any array is shorter than
+            `overlap_length` along `axis`.
+
+    Example:
+        >>> import numpy as np
+        >>> a0 = np.arange(2*2*5.).reshape(2, 2, 5)
+        >>> a1 = np.arange(2*2*6.).reshape(2, 2, 6)
+        >>> out = stitch_arrays([a0, a1], overlap=3, axis=2)
+        >>> out.shape
+        (2, 2, 8)
+
+        # 8 comes from 5 + 6 - 3 (one overlap between two arrays).
+    """
+    import torch
+
+    # Check for valid input
+    if not isinstance(array_list, list) or len(array_list) < 2:
+        raise ValueError('array_list must be a list of 2 or more arrays.')
+    for dim in range(array_list[0].ndim):
+        lengths = [array.shape[dim] for array in array_list]
+        if dim != axis:
+            if np.amax(lengths) != np.amin(lengths):
+                raise ValueError('The shapes of the arrays in array_list must be the same except in the dimension specified by axis.')
+        if dim == axis:
+            if np.amin(lengths) < overlap:
+                raise ValueError('Each array must have length at least overlap in the dimension specified by axis.')
+
+    # Create weights for blending two arrays
+    # ramp_overlap is the target number of blended (0 < w < 1) pixels
+    # However, if ramp_overlap and overlap have different parities, then ramp_overlap is decremented to match parity.
+    if ramp_overlap is None:
+        ramp_overlap = overlap // 2  # default: ramp over ~half the overlap
+    ramp_overlap = min(ramp_overlap, overlap)
+    ramp_overlap -= (overlap - ramp_overlap) % 2  # match overlap's parity -> symmetric plateaus
+    ramp_overlap = max(ramp_overlap, overlap % 2)  # floor at 0 (even overlap) or 1 (odd overlap)
+    flat_pad = (overlap - ramp_overlap) // 2  # equal plateau on each side
+
+    # Build the blend weights and assemble on the inputs' OWN array module so the result stays where
+    # the inputs live: host (NumPy) arrays stitch on the HOST (no gather to a single device), device
+    # tensors stitch on-device.  split_sino_recon relies on this -- it passes host halves, so the full
+    # volume is never reassembled on one GPU (which would defeat the half-at-a-time memory saving and
+    # OOM for a recon too large to fit whole).  float32 weights avoid upcasting a float32 recon to f64.
+    is_torch = any(isinstance(a, torch.Tensor) for a in array_list)
+    if is_torch:
+        device = next(a.device for a in array_list if isinstance(a, torch.Tensor))
+        ramp = (torch.arange(ramp_overlap, dtype=torch.float32, device=device) + 1) / (ramp_overlap + 1)
+        weights = torch.cat([torch.zeros(flat_pad, dtype=torch.float32, device=device), ramp,
+                             torch.ones(flat_pad, dtype=torch.float32, device=device)])
+        swap, cat = torch.swapaxes, torch.cat
+        array_list = [torch.as_tensor(a, device=device) for a in array_list]
+    else:
+        ramp = (np.arange(ramp_overlap, dtype=np.float32) + 1) / (ramp_overlap + 1)  # strictly between 0 and 1
+        weights = np.concatenate([np.zeros(flat_pad, dtype=np.float32), ramp,
+                                  np.ones(flat_pad, dtype=np.float32)])
+        swap, cat = np.swapaxes, np.concatenate
+
+    # Broadcast weights to match array dimensions
+    weights_shape = [1] * array_list[0].ndim
+    weights_shape[0] = len(weights)
+    weights = weights.reshape(weights_shape)
+
+    # Start with the first array in the list
+    stitched = swap(array_list[0], 0, axis)
+
+    # Iterate through each subsequent array in the list
+    for next_array in array_list[1:]:
+        # Extract the overlap from the current end of the stitched array and the beginning of the next array
+        overlap_current = stitched[-overlap:]
+        next_array = swap(next_array, 0, axis)
+        overlap_next = next_array[:overlap]
+
+        # Weighted average for the overlapping part
+        weighted_overlap = (1 - weights) * overlap_current + weights * overlap_next
+
+        # Replace the overlap in the stitched array
+        stitched = cat([stitched[:-overlap], weighted_overlap], 0)
+
+        # Append the non-overlapping remainder of the next array
+        stitched = cat([stitched, next_array[overlap:]], 0)
+
+    return swap(stitched, 0, axis)
+
+
+def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_det_rows=None, new_num_det_cols=None):
+    """
+    Create a TomographyModel with the same type and parameters as the given ct_model except with the new input angles
+    and a corresponding sinogram shape.  Restricted to ParallelBeam and ConeBeam models.
+
+    Args:
+        ct_model (TomographyModel): The model to copy.
+        new_angles (ndarray of float, optional): 1D vector of projection angles in radians.
+            If None, then use the angles in ct_model. Defaults to None.
+        new_helical_z_shifts (ndarray of float, optional): 1D vector of per-view axial shifts in ALU for ConeBeamModel.
+            Defaults to None.
+        new_num_det_rows (int, optional): Number of detector rows in the new model.
+            If None, then use the num_det_rows in ct_model. Defaults to None.
+        new_num_det_cols (int, optional): Number of detector columns in the new model.
+            If None, then use the num_det_cols in ct_model. Defaults to None.
+
+    Returns:
+        An instance of ConeBeamModel or ParallelBeam model
+    """
+    if str(type(ct_model)).find('ConeBeamModel') > 0:
+        is_cone = True
+    elif str(type(ct_model)).find('ParallelBeamModel') > 0:
+        is_cone = False
+    else:
+        raise TypeError('copy_ct_model() is restricted to ConeBeam and ParallelBeam Models')
+
+    # get_all_params is the single source of truth for reading the params back out: it gives the
+    # constructor args with the view components already unpacked (angles + helical_z_shifts for cone)
+    # and geometry_type in required, so build_model can reconstruct the class.
+    required, optional, regularization = ct_model.get_all_params()
+
+    old_angles = required['angles']
+    new_shape = list(required['sinogram_shape'])
+
+    if is_cone:
+        old_helical_z_shifts = required['helical_z_shifts']
+        if new_angles is None and new_helical_z_shifts is None:
+            new_helical_z_shifts = old_helical_z_shifts
+        elif new_angles is not None and new_helical_z_shifts is None:
+            if np.any(np.asarray(old_helical_z_shifts) != 0):
+                raise ValueError('copy_ct_model: new_helical_z_shifts must be specified when changing angles for a helical scan.')
+            new_helical_z_shifts = np.zeros_like(new_angles)
+        elif new_angles is not None and new_helical_z_shifts is not None:
+            if len(new_angles) != len(new_helical_z_shifts):
+                raise ValueError('copy_ct_model: new_angles and new_helical_z_shifts must have the same length.')
+        elif new_angles is None and new_helical_z_shifts is not None:
+            if len(old_helical_z_shifts) != len(new_helical_z_shifts):
+                raise ValueError('copy_ct_model: new_helical_z_shifts must have the same length as the existing angles.')
+        required['helical_z_shifts'] = new_helical_z_shifts
+
+    if new_angles is None:
+        new_angles = old_angles
+    new_shape[0] = len(new_angles)
+    if new_num_det_rows is not None:
+        new_shape[1] = new_num_det_rows
+    if new_num_det_cols is not None:
+        new_shape[2] = new_num_det_cols
+    required['angles'] = new_angles
+    required['sinogram_shape'] = tuple(new_shape)
+
+    # The sinogram shape changed, so drop recon_shape and let build_model's auto pass recompute it.
+    optional.pop('recon_shape', None)
+    return build_model(required, optional, regularization)
+
+
 def calc_tct_recon_params(source_det_dist, source_iso_dist, delta_det_row, delta_det_channel, sinogram_shape, translation_vectors, voxel_row_aspect=1.0, voxel_slice_aspect=1.0):
     """
     Calculate the translation geometry parameters: recon_shape, delta_voxel, voxel_row_aspect
