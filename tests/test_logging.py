@@ -89,6 +89,27 @@ def test_continuing_run_keeps_one_log(tmp_path, small_parallel_case):
     assert recon_dict['recon_log'].count('MBIRTorch Version') == 2
 
 
+def test_prox_map_loop_keeps_one_growing_log(tmp_path, small_parallel_case):
+    """A Plug-and-Play loop reuses its initialization after the first pass,
+    so all its passes land in one log instead of each erasing the last."""
+    model, sino = small_parallel_case
+    logpath = os.path.join(str(tmp_path), 'prox.log')
+    prox_input = np.zeros(tuple(model.get_params('recon_shape')),
+                          dtype=np.float32)
+    _, first = model.prox_map(prox_input, sino, max_iterations=1,
+                              logfile_path=logpath, do_initialization=True)
+    for _ in range(2):
+        prox_input, last = model.prox_map(prox_input, sino, max_iterations=1,
+                                          logfile_path=logpath,
+                                          do_initialization=False)
+
+    # One run header for the whole loop, and every pass is still in the log.
+    assert last['recon_log'].count('MBIRTorch Version') == 1
+    assert last['recon_log'].count('After iteration') > \
+        first['recon_log'].count('After iteration')
+    assert 'After iteration' in open(logpath).read()
+
+
 def test_recon_logfile_none_writes_no_file(tmp_path, small_parallel_case, monkeypatch):
     model, sino = small_parallel_case
     monkeypatch.chdir(str(tmp_path))

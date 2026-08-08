@@ -2675,7 +2675,9 @@ class TomographyModel(ParameterHandler):
         return recon_3d, losses
 
     def initialize_recon(self, sinogram, weights=None, init_recon=None,
-                         max_iterations=15, first_iteration=0):
+                         max_iterations=15, first_iteration=0,
+                         logfile_path='~/.mbirtorch/logs/recon.log',
+                         print_logs=True):
         """
         Do the parameter initialization needed for recon: generate the set of
         voxel partitions and the partition sequence, validate the inputs, and
@@ -2688,6 +2690,12 @@ class TomographyModel(ParameterHandler):
             sinogram, weights, init_recon, partitions, partition_sequence,
             granularity, regularization_params
         """
+        # The run logger is set up here, as in mbirjax, so that it is set up
+        # exactly when a run is initialized.  A Plug-and-Play loop calls
+        # prox_map with do_initialization=False after the first pass, which
+        # skips this method, and so keeps writing to the one log rather than
+        # starting a new one on every pass.
+        self._log_run_header(first_iteration, logfile_path, print_logs)
         recon_shape, granularity, use_ror_mask = self.get_params(
             ['recon_shape', 'granularity', 'use_ror_mask'])
         partitions = vcd_utils.gen_set_of_pixel_partitions(
@@ -2778,10 +2786,10 @@ class TomographyModel(ParameterHandler):
             'recon_log' (the run's log text), 'notes', and
             'model_params' (a snapshot of the model parameters).
         """
-        self._log_run_header(first_iteration, logfile_path, print_logs)
         (sinogram, weights, init_recon, partitions, partition_sequence, granularity,
          regularization_params) = self.initialize_recon(
-            sinogram, weights, init_recon, max_iterations, first_iteration)
+            sinogram, weights, init_recon, max_iterations, first_iteration,
+            logfile_path=logfile_path, print_logs=print_logs)
 
         # no_grad, not inference_mode: the VCD loop needs autograd off (it never
         # differentiates), but torch.compile's guard machinery (torch 2.13)
@@ -2907,12 +2915,12 @@ class TomographyModel(ParameterHandler):
             (recon, recon_dict): the numpy reconstruction volume and the recon
             parameters dict.
         """
-        self._log_run_header(first_iteration, logfile_path, print_logs)
         prior_loss = [0]
         if do_initialization or self.prox_data is None:
             (sinogram, weights, init_recon, partitions, partition_sequence,
              granularity, regularization_params) = self.initialize_recon(
-                sinogram, weights, init_recon, max_iterations, first_iteration)
+                sinogram, weights, init_recon, max_iterations, first_iteration,
+                logfile_path=logfile_path, print_logs=print_logs)
             self.prox_data = (partitions, partition_sequence, granularity,
                               regularization_params)
         else:
