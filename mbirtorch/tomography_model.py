@@ -24,6 +24,7 @@ import warnings
 import numpy as np
 import torch
 
+from . import _memory_ledger
 from . import _sharding
 from . import qggmrf as _qggmrf
 from . import tomography_utils, vcd_utils
@@ -127,6 +128,24 @@ class TomographyModel(ParameterHandler):
         self.sino_placement = _sharding.Placement([self.torch_device], axis=0)
         self.recon_placement = _sharding.Placement([self.torch_device], axis=-1)
         self.dev2dev_safe = True     # probed for real in configure_devices
+        # Whether the device layout is still the library's to choose.  An
+        # explicit configure_devices call sets this False permanently: an
+        # explicitly requested device count is the caller's to request, and
+        # nothing here second-guesses it.
+        self.device_layout_is_automatic = True
+        # Memory-preflight knobs, beside the other memory knobs
+        # (view_batch_size above, and the slice-band attributes the banded
+        # drivers read).  The margin covers what the closed-form ledger cannot
+        # see: allocator fragmentation, and library workspaces CUDA allocates
+        # outside torch's allocator.
+        self.skip_memory_preflight = False
+        self.memory_preflight_margin = 0.15
+        # The last ledger built, and the last calibration comparison, for a
+        # harness to read.  Inspection surfaces only: nothing in the library
+        # reads them back, and the calibration entry stays None unless the
+        # calibration mode is on.
+        self.last_memory_ledger = None
+        self.last_memory_calibration = None
         # A per-device thread pool reused across the recon loop's many
         # fan-outs (vcd_recon owns its lifetime); None outside a recon, where
         # each fan-out makes a private pool.  Never created on one device.
@@ -526,6 +545,25 @@ class TomographyModel(ParameterHandler):
         recon_shape, use_ror_mask = self.get_params(['recon_shape', 'use_ror_mask'])
         return vcd_utils.gen_full_indices(recon_shape, use_ror_mask=use_ror_mask)
 
+    def full_index_count(self):
+        """How many pixels the ROR mask keeps, cached per (recon_shape,
+        use_ror_mask).
+
+        The memory ledger reads this once per candidate device layout, and
+        rebuilding the mask each time would repeat a full-grid numpy pass per
+        candidate.  Only the COUNT is cached here; the indices themselves have
+        their own device-resident cache in :meth:`full_indices_device`."""
+        recon_shape, use_ror_mask = self.get_params(['recon_shape', 'use_ror_mask'])
+        key = (tuple(recon_shape),
+               use_ror_mask if isinstance(use_ror_mask, bool) else None)
+        cache = getattr(self, '_full_index_count_cache', None)
+        if key[1] is None or cache is None or cache[0] != key:
+            count = int(np.shape(self._full_indices())[0])
+            if key[1] is None:
+                return count
+            self._full_index_count_cache = (key, count)
+        return self._full_index_count_cache[1]
+
     def full_indices_device(self):
         """The ROR-masked full pixel indices as an int64 tensor on the model
         device, cached per (recon_shape, use_ror_mask) -- the hot consumers
@@ -661,7 +699,12 @@ class TomographyModel(ParameterHandler):
 
         A single device (the default) restores the trivial placements and
         the unchanged n=1 path.
+
+        Calling this at all takes the layout out of the library's hands: the
+        count given here is the count used, and the automatic device-count
+        choice never runs again on this model.
         """
+        self.device_layout_is_automatic = False
         if devices is None:
             if num_devices == 1:
                 devices = [self.torch_device]
@@ -686,6 +729,36 @@ class TomographyModel(ParameterHandler):
         self.dev2dev_safe = _sharding.is_dev2dev_safe(devices)
         self._invalidate_device_caches()
         self.create_projectors()
+
+    # ── the memory ledger (the device-count criterion) ────────────────────────
+    def _build_memory_ledger(self, devices=None, **call_arrays):
+        """The modeled per-device peak for the reconstruction about to run.
+
+        Returns None when there is nothing to model against: the ledger's
+        production job is choosing a device count, so it is CUDA-only, and it
+        is built here only when the automatic path will consult it or when the
+        calibration mode asks for it.  The calibration mode asks at ANY device
+        count, including one, because the modeled-against-measured comparison
+        needs the single-device cells too.
+
+        ``devices`` prices a CANDIDATE device list rather than the model's
+        current one; None means the current placement.
+        """
+        devices = list(self.sino_placement.devices if devices is None
+                       else devices)
+        if not any(torch.device(d).type == 'cuda' for d in devices):
+            return None
+        automatic = (self.device_layout_is_automatic
+                     and not self.skip_memory_preflight
+                     and len(devices) > 1)
+        if not (automatic or _memory_ledger.calibration_enabled()):
+            return None
+        ledger = _memory_ledger.estimate_peak_device_bytes(
+            _memory_ledger.plan_from_model(self, devices, **call_arrays))
+        self.last_memory_ledger = ledger
+        if _memory_ledger.calibration_enabled():
+            _memory_ledger.calibration_start(devices)
+        return ledger
 
     # ── array placement (entry) and gathering (exit) ──────────────────────────
     # Every sinogram-like placement routes through _shard_sinogram and every
@@ -2066,6 +2139,15 @@ class TomographyModel(ParameterHandler):
                              f'Expected {tuple(sinogram_shape)}, got '
                              f'{tuple(sinogram.shape)}.')
 
+        # The memory ledger, computed BEFORE the first large allocation of the
+        # reconstruction.  It is the criterion the automatic device-count
+        # choice uses, and it is what the calibration mode compares against
+        # the measured peak.
+        memory_ledger = self._build_memory_ledger(
+            partition_sequence=partition_sequence, weights=weights,
+            init_recon=init_recon, fm_hessian=fm_hessian,
+            prox_input=prox_input, init_error_sinogram=init_error_sinogram)
+
         # Placement: recon-like arrays route through _shard_recon and
         # sino-like arrays through _shard_sinogram (a single device is the trivial
         # 1-shard case), keeping the rest of the loop placement-agnostic.
@@ -2194,6 +2276,10 @@ class TomographyModel(ParameterHandler):
 
         self.logger.info('Starting VCD iterations')
         if verbose >= 2:
+            if memory_ledger is not None:
+                self.logger.debug('Modeled peak device memory by phase:')
+                self.logger.debug(memory_ledger.format_table())
+                self.logger.debug('--------')
             output = io.StringIO()
             get_memory_stats(file=output)
             self.logger.debug(output.getvalue())
@@ -2286,6 +2372,15 @@ class TomographyModel(ParameterHandler):
             if self._per_device_pool is not None:
                 self._per_device_pool.shutdown(wait=True)
                 self._per_device_pool = None
+
+        # The calibration comparison, before the loop's state is released, so
+        # the measured high-water mark still reflects the reconstruction.
+        if memory_ledger is not None and _memory_ledger.calibration_enabled():
+            rows = _memory_ledger.calibration_report(
+                memory_ledger, self.sino_placement.devices)
+            self.last_memory_calibration = rows
+            if rows:
+                self.logger.warning(_memory_ledger.format_calibration(rows))
 
         # Loop exit: back to the public/device forms -- plain tensors on a
         # single device (the same objects the loop mutated, so the checkpoint
@@ -2652,7 +2747,7 @@ class TomographyModel(ParameterHandler):
         """
         Encapsulate the recon parameters, logs, notes, and optionally all model parameters to a text-based dict
         with entries 'recon_params', 'recon_log', 'notes', and optionally 'model_params'.  This dict can be used with
-        :func:`mbirtorch.slice_viewer` and :meth:`TomographyModel.save_recon_hdf5`.
+        :func:`mbirtorch.view_utils.slice_viewer` and :meth:`TomographyModel.save_recon_hdf5`.
 
         Args:
             recon_params (dict, optional): dict of reconstruction parameters. Defaults to None.
@@ -2706,7 +2801,7 @@ class TomographyModel(ParameterHandler):
         This method creates a file that contains a single dataset named 'recon', with the entries in recon_dict
         serialized to strings and saved as hdf5 dataset attributes.
 
-        The resulting file can be loaded with :meth:`load_recon_hdf5` or :func:`mbirtorch.slice_viewer`.
+        The resulting file can be loaded with :meth:`load_recon_hdf5` or :func:`mbirtorch.view_utils.slice_viewer`.
 
         Args:
             filepath (str or Path): Path to the output HDF5 file. Should typically end with a .h5 extension.
