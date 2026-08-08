@@ -91,10 +91,12 @@ class ParameterHandler:
         self.logger = logger
 
     def _log_run_header(self, first_iteration, logfile_path, print_logs):
-        """Set up the run logger (on the first iteration, or whenever none has been set up) and log the
-        MBIRTorch version and the device layout.
+        """Set up the run logger (on the first iteration, or whenever none has been set up) and log
+        the MBIRTorch version.
 
-        Shared by recon and prox_map so both report the version and which devices the run uses.
+        Shared by recon and prox_map.  The devices are logged separately, by
+        :meth:`_log_device_report`, because mbirtorch chooses the device layout
+        only once the reconstruction is about to start; see that method.
         """
         # log_buffer, not logger, is what says "setup_logger has never run".
         # mbirjax tests self.logger here, which works there because its logger
@@ -107,12 +109,46 @@ class ParameterHandler:
             self.setup_logger(logfile_path=logfile_path, print_logs=print_logs)
         from . import __version__
         self.logger.info('MBIRTorch Version = {}'.format(__version__))
-        self.logger.info('Reconstruction devices: {}'.format(self._device_report()))
+
+    def _log_device_report(self):
+        """Log the devices the reconstruction will actually use.
+
+        Called once the device layout is final.  mbirjax logs this in the run
+        header, which it can do because its layout is fixed when the model is
+        built.  Here the automatic layout is chosen when a reconstruction
+        starts, so a header-time report would name the placement the run was
+        about to leave, and a widened run would log '1 x CUDA'.
+        """
+        self.logger.info('Reconstruction devices: {}'.format(
+            self._device_report()))
 
     def _device_report(self):
-        """A short 'N x platform' summary of the recon devices, for the recon log."""
+        """An 'N x PLATFORM (sharded)' summary of the recon devices, for the
+        recon log, noting any padding of the sharded axes.
+
+        Padding is invisible in the results (it is kept exactly inert), so the
+        log says so rather than leaving the device-form shapes a surprise.
+        """
         devices = self.recon_placement.devices
-        return '{} x {}'.format(len(devices), devices[0].type)
+        report = '{} x {} (sharded)'.format(len(devices),
+                                            devices[0].type.upper())
+        if self.sino_placement is not None and self.sino_placement.is_padded:
+            report += ' (views padded {}->{})'.format(
+                self.sino_placement.real_size, self.sino_placement.padded_size)
+        if self.recon_placement.is_padded:
+            report += ' (slices padded {}->{})'.format(
+                self.recon_placement.real_size,
+                self.recon_placement.padded_size)
+        # Automatic selection that used fewer than the visible GPUs: say which
+        # counts were turned down and why, so idle hardware is never silent.
+        rejected = getattr(self, 'device_choice_rejections', None)
+        if rejected:
+            visible = max([count for count, _why in rejected] + [len(devices)])
+            report += ' (using {} of {} GPUs: {})'.format(
+                len(devices), visible,
+                '; '.join('{} rejected, {}'.format(count, why)
+                          for count, why in rejected))
+        return report
 
     # ── access ────────────────────────────────────────────────────────────────
     def get_params(self, parameter_names):

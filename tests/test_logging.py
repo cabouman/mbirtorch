@@ -110,6 +110,47 @@ def test_prox_map_loop_keeps_one_growing_log(tmp_path, small_parallel_case):
     assert 'After iteration' in open(logpath).read()
 
 
+def test_device_report_names_the_settled_layout():
+    """The device line reports the layout the run actually uses, in the
+    'N x PLATFORM (sharded)' form, and says when an axis is padded."""
+    angles = np.linspace(0, np.pi, 8, endpoint=False)
+    model = mbirtorch.ParallelBeamModel((8, 11, 16), angles)
+    model.configure_devices(devices=['cpu', 'cpu'])
+    model.set_params(no_warning=True, verbose=1)
+    phantom = mbirtorch.generate_3d_shepp_logan_low_dynamic_range(
+        tuple(model.get_params('recon_shape')))
+    sino = model.forward_project(phantom)
+    _, recon_dict = model.recon(sino, max_iterations=1, logfile_path=None)
+
+    # 11 slices over 2 devices pads the slice axis to 12.
+    assert ('Reconstruction devices: 2 x CPU (sharded) (slices padded 11->12)'
+            in recon_dict['recon_log'])
+
+
+def test_device_line_reflects_a_layout_chosen_during_the_run(monkeypatch):
+    """A run that widens its layout reports the widened one.
+
+    This is the multi-GPU case, where the automatic choice spreads the run
+    across devices after it starts; standing in for it here on CPU.
+    """
+    angles = np.linspace(0, np.pi, 8, endpoint=False)
+    model = mbirtorch.ParallelBeamModel((8, 12, 16), angles)
+    model.set_params(no_warning=True, verbose=1)
+    phantom = mbirtorch.generate_3d_shepp_logan_low_dynamic_range(
+        tuple(model.get_params('recon_shape')))
+    sino = model.forward_project(phantom)
+
+    def widen(**call_arrays):
+        model._install_device_layout(['cpu', 'cpu'])
+        return None
+
+    monkeypatch.setattr(model, '_apply_device_policy', widen)
+    _, recon_dict = model.recon(sino, max_iterations=1, logfile_path=None)
+
+    assert 'Reconstruction devices: 2 x CPU' in recon_dict['recon_log']
+    assert '1 x CPU' not in recon_dict['recon_log']
+
+
 def test_recon_logfile_none_writes_no_file(tmp_path, small_parallel_case, monkeypatch):
     model, sino = small_parallel_case
     monkeypatch.chdir(str(tmp_path))

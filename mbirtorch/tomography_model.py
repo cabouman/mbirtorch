@@ -138,6 +138,9 @@ class TomographyModel(ParameterHandler):
         # With no such call the model resolves 'auto' and, on CUDA with two
         # or more visible devices, takes the automatic widening path.
         self.device_layout_is_automatic = True
+        # Device counts the automatic choice turned down, and why, for the run
+        # log's device line.  Empty when the layout was never searched.
+        self.device_choice_rejections = []
         # Memory-preflight knobs, beside the other memory knobs
         # (view_batch_size above, and the slice-band attributes the banded
         # drivers read).  The margin covers what the closed-form ledger cannot
@@ -956,6 +959,9 @@ class TomographyModel(ParameterHandler):
     def _settle(self, devices, ledger, rejected):
         """Install the chosen layout when it differs from the current one, log
         the choice, and arm the calibration mode."""
+        # Kept for the run log's device line, which explains any GPUs the
+        # automatic choice left idle (see ParameterHandler._device_report).
+        self.device_choice_rejections = list(rejected)
         chosen, current = len(devices), self.sino_placement.n_devices
         if chosen != current:
             self.logger.info(
@@ -2417,6 +2423,9 @@ class TomographyModel(ParameterHandler):
             partition_sequence=partition_sequence, weights=weights,
             init_recon=init_recon, fm_hessian=fm_hessian,
             prox_input=prox_input, init_error_sinogram=init_error_sinogram)
+        # The layout is final here, so this is where the log can name the
+        # devices the run will actually use.
+        self._log_device_report()
 
         # Placement: recon-like arrays route through _shard_recon and
         # sino-like arrays through _shard_sinogram (a single device is the trivial
