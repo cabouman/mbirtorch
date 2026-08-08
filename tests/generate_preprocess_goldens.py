@@ -243,6 +243,30 @@ def main():
     bhcn_out = np.asarray(apply_bh_correction(bhcn_sino.copy(), bhcn_params))
     bhcn_poly = np.asarray(find_linearization_fit(0.6, 1.0, 4.0, max_thick=20.0))
 
+    # hsnt: seeded simulate -> dehydrate -> rehydrate on shared inputs, plus an mbirjax-written
+    # hsnt HDF5 file pinning that format.
+    np.random.seed(42)
+    hsnt_basis = np.abs(np.stack([np.linspace(1, 2, 40) ** 2, np.sqrt(np.linspace(1, 3, 40)),
+                                  np.ones(40) * 1.5])).astype(np.float64)
+    hsnt_data, hsnt_angles, hsnt_gt = mbirjax.hsnt.generate_hyper_data(
+        hsnt_basis, num_angles=2, detector_rows=24, detector_columns=24, verbose=0)
+    hsnt_dehydrated = mbirjax.dehydrate(hsnt_data.copy(), num_materials=3, verbose=0)
+    hsnt_rehydrated = mbirjax.rehydrate(hsnt_dehydrated)
+    hsnt_md = mbirjax.hsnt.create_hsnt_metadata(dataset_name='golden', dataset_type='attenuation',
+                                                angles=np.rad2deg(hsnt_angles))
+    mbirjax.export_hsnt_data_hdf5(os.path.join(OUT_DIR, 'preprocess_goldens_hsnt.h5'),
+                                  hsnt_dehydrated, hsnt_md)
+
+    # vcls: seeded get_opt_views on a small parallel model.
+    vcls_angles = np.linspace(0, np.pi, 24, endpoint=False)
+    vcls_model = mbirjax.ParallelBeamModel((24, 8, 32), vcls_angles)
+    vcls_model.set_params(no_warning=True, verbose=0)
+    vcls_rshape = tuple(int(v) for v in vcls_model.get_params('recon_shape'))
+    vcls_ref = np.zeros(vcls_rshape, dtype=np.float32)
+    vcls_ref[10:22, 10:22, 2:6] = 1.0
+    vcls_inds, vcls_value = mbirjax.get_opt_views(vcls_model, vcls_ref, num_selected_views=5,
+                                                  r_1=0.05, seed=3)
+
     # HDF5 family: mbirjax-written files pin the on-disk formats.
     h5_vol = rng.rand(10, 12, 14).astype(np.float32)
     h5_attrs = {'scan_id': 'sample1', 'notes': 'golden', 'nested': {'a': 1, 'b': 'two'}}
@@ -316,6 +340,12 @@ def main():
         h5_vol=h5_vol,
         nsi_convert=nsi_convert,
         bhcn_sino=bhcn_sino, bhcn_out=bhcn_out.astype(np.float64), bhcn_poly=bhcn_poly,
+        hsnt_basis=hsnt_basis, hsnt_data=hsnt_data.astype(np.float64),
+        hsnt_gt=hsnt_gt.astype(np.float64),
+        hsnt_sub_data=np.asarray(hsnt_dehydrated[0]), hsnt_sub_basis=np.asarray(hsnt_dehydrated[1]),
+        hsnt_rehydrated=hsnt_rehydrated.astype(np.float64),
+        vcls_ref=vcls_ref, vcls_angles=vcls_angles,
+        vcls_inds=np.asarray(vcls_inds, dtype=np.int64), vcls_value=np.float64(vcls_value),
     )
     print('wrote', out)
     print('wrote', h5_path)

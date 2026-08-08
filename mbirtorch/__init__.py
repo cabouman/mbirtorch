@@ -42,6 +42,10 @@ from .utilities import (generate_3d_shepp_logan_low_dynamic_range, clear_cache,
                         makedirs, load_data_hdf5, save_data_hdf5,
                         export_recon_hdf5, import_recon_hdf5,
                         build_model, download_and_extract)
+from .vcls import *
+from .hsnt import *
+from . import vcls
+from . import hsnt
 from . import preprocess
 from .memory_stats import get_memory_stats
 
