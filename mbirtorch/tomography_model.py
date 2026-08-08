@@ -2919,10 +2919,22 @@ class TomographyModel(ParameterHandler):
             max_iterations (int, optional): maximum VCD iterations.  Defaults to 3.
             first_iteration (int, optional): partition-sequence offset for
                 restarts.  Defaults to 0.
+            logfile_path (str, optional): Path to the output log file ('~' expands to the
+                user's home directory).  If None or empty, no log file is written.
+                Defaults to '~/.mbirtorch/logs/prox.log'.  A Plug-and-Play loop
+                that passes do_initialization=False after its first call keeps
+                writing to the log that call opened, so the whole loop lands in
+                one file.
+            print_logs (bool, optional): If true then print logs to console.  Defaults to True.
+            output_sharded (bool, optional): If False (default), return a numpy
+                array; if True, return the device tensor (the mbirjax argument
+                name, kept for API compatibility).
 
         Returns:
-            (recon, recon_dict): the numpy reconstruction volume and the recon
-            parameters dict.
+            (recon, recon_dict): the reconstruction volume, and a dict
+            with entries 'recon_params' (per-iteration traces and settings),
+            'recon_log' (the run's log text), 'notes', and
+            'model_params' (a snapshot of the model parameters).
         """
         prior_loss = [0]
         if do_initialization or self.prox_data is None:
