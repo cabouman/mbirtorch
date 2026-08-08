@@ -4,63 +4,55 @@
 Demos and FAQs
 ==============
 
-.. PENDING(demos): restore the Demos section below when the mbirtorch demo set exists.
-   mbirtorch currently ships one demo, demo/demo_1_shepp_logan.py, against mbirjax's
-   notebook-plus-scripts set, and there is no mbirtorch_applications repo yet.  The
-   section also cross-references :ref:`InstallationDocs`, which install.rst defines and
-   which is not written yet, so restore it after that page lands.
+Demos
+-----
 
-   Demos
-   -----
+The basic demo below illustrates some of the features of MBIRTorch:
 
-   The basic demo below illustrates some of the features of MBIRTorch:
+* **Basic Demo:** `Python script <https://github.com/cabouman/mbirtorch/blob/main/demo/demo_1_shepp_logan.py>`__
 
-   * **Basic Demo:** `Python script <https://github.com/cabouman/mbirtorch/blob/main/demo/demo_1_shepp_logan.py>`__
+Follow the installation instructions in the
+`README <https://github.com/cabouman/mbirtorch/blob/main/README.md>`__ and run the script directly.
 
-   Follow the installation instructions at :ref:`InstallationDocs` and run the script directly.
+.. PENDING(install): point the sentence above at :ref:`InstallationDocs` when install.rst lands.
 
-   Then adjust some of the parameters to better understand how the code works.
-   If you have a GPU, you can increase the problem size by changing ``num_views``, ``num_det_rows``, and ``num_det_channels``.
+Then adjust some of the parameters to better understand how the code works.
+If you have a GPU, you can increase the problem size by changing ``num_views``, ``num_det_rows``, and ``num_det_channels``.
 
-   There are more demos here: `MBIRTorch demos <https://github.com/cabouman/mbirtorch/blob/main/demo/>`__
+There are more demos here: `MBIRTorch demos <https://github.com/cabouman/mbirtorch/blob/main/demo/>`__
 
 
-.. PENDING(generate_demo_data): restore the Data Generation section below when
-   generate_demo_data is ported.  The function does not exist in mbirtorch, so every code
-   line in the section would fail today.  The section also references
-   :ref:`synthetic-data-generation`, which usr_utilities.rst already defines.
+Data Generation
+---------------
 
-   Data Generation
-   ---------------
+Most demos start from synthetic data created with :func:`~mbirtorch.utilities.generate_demo_data`.  It builds a 3D
+phantom (a simplified Shepp-Logan head or a cube) and the corresponding simulated sinogram for a chosen
+geometry, so you can try MBIRTorch without a real dataset:
 
-   Most demos start from synthetic data created with :func:`~mbirtorch.utilities.generate_demo_data`.  It builds a 3D
-   phantom (a simplified Shepp-Logan head or a cube) and the corresponding simulated sinogram for a chosen
-   geometry, so you can try MBIRTorch without a real dataset:
+.. code-block:: python
 
-   .. code-block:: python
+    import mbirtorch
+    phantom, sinogram, params = mbirtorch.generate_demo_data(object_type='shepp-logan', model_type='cone',
+                                                             num_views=64, num_det_rows=128, num_det_channels=128)
+    angles = params['angles']
+    ct_model = mbirtorch.ConeBeamModel(sinogram.shape, angles,
+                                       source_detector_dist=params['source_detector_dist'],
+                                       source_iso_dist=params['source_iso_dist'])
+    recon, recon_dict = ct_model.recon(sinogram)
 
-       import mbirtorch
-       phantom, sinogram, params = mbirtorch.generate_demo_data(object_type='shepp-logan', model_type='cone',
-                                                                num_views=64, num_det_rows=128, num_det_channels=128)
-       angles = params['angles']
-       ct_model = mbirtorch.ConeBeamModel(sinogram.shape, angles,
-                                          source_detector_dist=params['source_detector_dist'],
-                                          source_iso_dist=params['source_iso_dist'])
-       recon, recon_dict = ct_model.recon(sinogram)
+Key options:
 
-   Key options:
+* ``object_type`` -- ``'shepp-logan'`` or ``'cube'``.
+* ``model_type`` -- ``'parallel'`` or ``'cone'``; ``params`` returns the matching
+  geometry parameters (always the view ``angles``, plus the source distances for cone beam).
+* ``num_views``, ``num_det_rows``, ``num_det_channels`` -- the sinogram size; increase these (with a GPU)
+  to make a larger problem.
+* ``target_max_attenuation`` -- scales the phantom so its sinogram has a realistic peak attenuation
+  regardless of the array size (without it, the sinogram values grow with the volume size).
 
-   * ``object_type`` -- ``'shepp-logan'`` or ``'cube'``.
-   * ``model_type`` -- ``'parallel'`` or ``'cone'``; ``params`` returns the matching
-     geometry parameters (always the view ``angles``, plus the source distances for cone beam).
-   * ``num_views``, ``num_det_rows``, ``num_det_channels`` -- the sinogram size; increase these (with a GPU)
-     to make a larger problem.
-   * ``target_max_attenuation`` -- scales the phantom so its sinogram has a realistic peak attenuation
-     regardless of the array size (without it, the sinogram values grow with the volume size).
-
-   The phantom and sinogram are always returned as host NumPy arrays, ready to pass to a reconstruction.
-   The phantom is a reference object; the sinogram is the input you would normally reconstruct.  See
-   :ref:`synthetic-data-generation` for the full list of options and the related phantom generators.
+The phantom and sinogram are always returned as host NumPy arrays, ready to pass to a reconstruction.
+The phantom is a reference object; the sinogram is the input you would normally reconstruct.  See
+:ref:`synthetic-data-generation` for the full list of options and the related phantom generators.
 
 
 FAQs
