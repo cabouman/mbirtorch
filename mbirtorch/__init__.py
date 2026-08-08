@@ -42,7 +42,10 @@ from .utilities import (generate_3d_shepp_logan_low_dynamic_range, clear_cache,
                         makedirs, load_data_hdf5, save_data_hdf5,
                         export_recon_hdf5, import_recon_hdf5,
                         build_model, download_and_extract,
-                        copy_ct_model, stitch_arrays)
+                        copy_ct_model, stitch_arrays,
+                        get_ct_model, generate_demo_data,
+                        generate_3d_shepp_logan_reference, gen_cube_phantom,
+                        gen_translation_vectors, ObjectType, ModelType)
 from .memory_stats import get_memory_stats
 
 # __all__ is the DECLARED public surface, and autodoc honors it: every name here is

@@ -277,6 +277,30 @@ def main():
     vcls_inds, vcls_value = mbirjax.get_opt_views(vcls_model, vcls_ref, num_selected_views=5,
                                                   r_1=0.05, seed=3)
 
+    # Demo-data utilities: the reference phantom on a non-cubic shape, demo data for the
+    # parallel, cone, and helical-cone paths, and the recon shapes get_ct_model produces.
+    ref_phantom = mbirjax.generate_3d_shepp_logan_reference((32, 30, 28))
+
+    demo_cases = {}
+    for tag, kwargs in [('par', dict(model_type='parallel')),
+                        ('cone', dict(model_type='cone')),
+                        ('hel', dict(model_type='cone', use_helical=True,
+                                     helical_pitch=0.5, helical_z_range=16.0))]:
+        ph, sino, dd_params = mbirjax.generate_demo_data(
+            num_views=12, num_det_rows=24, num_det_channels=32, **kwargs)
+        demo_cases['demo_' + tag + '_phantom'] = np.asarray(ph, dtype=np.float32)
+        demo_cases['demo_' + tag + '_sino'] = np.asarray(sino, dtype=np.float32)
+        demo_cases['demo_' + tag + '_angles'] = np.asarray(dd_params['angles'], dtype=np.float64)
+    demo_cases['demo_hel_z_shifts'] = np.asarray(dd_params['helical_z_shifts'], dtype=np.float64)
+
+    gcm_par = mbirjax.get_ct_model('parallel', (8, 10, 12),
+                                   np.linspace(0, np.pi, 8, endpoint=False))
+    gcm_cone = mbirjax.get_ct_model('cone', (8, 10, 12),
+                                    np.linspace(0, 2 * np.pi, 8, endpoint=False),
+                                    source_detector_dist=100.0, source_iso_dist=50.0)
+    gcm_shapes = np.array([gcm_par.get_params('recon_shape'),
+                           gcm_cone.get_params('recon_shape')], dtype=np.int64)
+
     # HDF5 family: mbirjax-written files pin the on-disk formats.
     h5_vol = rng.rand(10, 12, 14).astype(np.float32)
     h5_attrs = {'scan_id': 'sample1', 'notes': 'golden', 'nested': {'a': 1, 'b': 'two'}}
@@ -359,6 +383,9 @@ def main():
         split_recon=np.asarray(split_recon, dtype=np.float32),
         split_overlap_sino=np.int64(split_params['half_overlap_sino']),
         split_overlap_recon=np.int64(split_params['half_overlap_recon']),
+        ref_phantom=ref_phantom.astype(np.float64),
+        gcm_shapes=gcm_shapes,
+        **demo_cases,
     )
     print('wrote', out)
     print('wrote', h5_path)
