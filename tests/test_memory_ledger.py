@@ -96,8 +96,13 @@ def test_resume_drops_the_initialization_phases_entirely():
         resume=True, init_recon_supplied=True, fm_hessian_supplied=True))
     names = [p.name for p in resumed.phases]
     assert not any('direct recon' in n or 'initial forward' in n
+                   or 'error sinogram formation' in n or 'hessian' in n
                    for n in names)
-    assert all('subset' in n for n in names)
+    # What survives is the loop: the subset steps and the per-iteration
+    # statistics, which run on every iteration however the state was reached.
+    assert all('subset' in n or n == 'per-iteration statistics'
+               for n in names)
+    assert 'per-iteration statistics' in names
 
 
 def test_hessian_phase_uses_the_unmasked_grid_count():
@@ -290,6 +295,22 @@ def test_sub_phase_selection_is_per_device():
         loop = _named(ledger, 'direct recon (back loop)').per_device[i]
         scatter = _named(ledger, 'direct recon (scatter)').per_device[i]
         assert ledger.peak_bytes(i) >= max(loop, scatter)
+
+
+def test_per_iteration_statistics_are_charged():
+    """Charged as zero by the first ledger, and measured as the peak of an
+    unweighted run once the residency fixes shrank the other phases.
+
+    The transient is two sinogram-shaped squared-error products.  The recon
+    L1 fuses into its own reduction and materializes nothing.
+    """
+    sino_bytes = 64 * 32 * 32 * 4
+    ledger = estimate_peak_device_bytes(make_plan())
+    stats = _named(ledger, 'per-iteration statistics')
+    assert dict(stats.terms)['squared-error products'][0] == 2 * sino_bytes
+    # It carries the persistent set, like every other in-loop phase.
+    assert dict(stats.terms)['error sinogram'][0] == sino_bytes
+    assert dict(stats.terms)['flat recon'][0] > 0
 
 
 # ── the masked hessian ───────────────────────────────────────────────────────

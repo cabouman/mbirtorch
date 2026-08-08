@@ -508,6 +508,19 @@ def estimate_peak_device_bytes(plan):
                                  base=constant_base,
                                  base_terms=constant_terms))
 
+    # ── the per-iteration statistics ─────────────────────────────────────────
+    # Charged as ZERO by the first version of this ledger, on the grounds that
+    # the other phases dominate it.  The two residency fixes shrank those
+    # phases and falsified the assumption: on an unweighted run this phase is
+    # now the peak.  Its transient measured EXACTLY two sinogram-shaped arrays
+    # at the 1024 cells, which is the two squared-error products; the recon L1
+    # fuses into its own reduction and materializes nothing.
+    phases.append(_phase(
+        'per-iteration statistics',
+        [('squared-error products', per_dev(lambda i: 2 * sino_dev(i)))],
+        n, base=persistent_total,
+        base_terms=constant_terms + list(persistent.items())))
+
     # ── phase E: the subset step, per granularity in the sequence ────────────
     prior_cylinders = PROX_CYLINDERS if plan.prox else plan.qggmrf_cylinders
     for granularity in plan.granularities:
