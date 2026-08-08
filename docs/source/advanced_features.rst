@@ -51,9 +51,14 @@ Below are tips on important and useful features:
     reconstruction across devices with ``model.configure_devices(num_devices=n)``.  The
     recon is sharded by slice, so peak memory per device falls roughly as 1/n.
 
-  .. REPLACED(split_sino_recon): the bullet above replaces MBIRJAX's, which points at
-     ConeBeamModel.split_sino_recon (two overlapping halves).  The multi-device engine
-     subsumes that method, and it will not be ported.
+  .. PENDING(split_sino_recon): restore the bullet below, alongside the multi-device bullet
+     above, when ConeBeamModel.split_sino_recon is ported.  A full-logic port is chartered:
+     the nsi split-sinogram demo calls it directly, and it nearly doubles the feasible cone
+     recon size at a fixed GPU count.
+
+     - For tall volumes that do not fit in memory even after tuning the padding, see
+       :meth:`~mbirtorch.ConeBeamModel.split_sino_recon`, which reconstructs the volume in two
+       overlapping halves.
 
 - **Set Sinogram Weights:**
 
@@ -66,15 +71,11 @@ Below are tips on important and useful features:
   The weights array has the same shape as the sinogram, and it represents the assumed inverse noise variance for each sinogram entry.
   If you use the transmission options, it is critical that the sinogram be properly scaled to -log attenuation units, or you will get crazy results.
 
-  .. PENDING(gen_weights_mar): blocked on the MAR (metal artifact reduction) module, which
-     is not ported.  Restore the following text, which continues the bullet above, when
-     that module lands.
+  There is also a method to generate weights to reduce metal artifacts, particularly for objects with some dense metal components and other components with much less attenuation:
 
-     There is also a method to generate weights to reduce metal artifacts, particularly for objects with some dense metal components and other components with much less attenuation:
+  - ``weights = model.gen_weights_mar(sinogram, init_recon=None)``
 
-     - ``weights = model.gen_weights_mar(sinogram, init_recon=None)``
-
-     Supplying an initial recon gives a better estimate of the metal decomposition, but this is optional.
+  Supplying an initial recon gives a better estimate of the metal decomposition, but this is optional.
 
 - **Calibrate and Control Model:**
 

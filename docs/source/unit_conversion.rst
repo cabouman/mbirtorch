@@ -22,25 +22,20 @@ However, this can be converted to conventional units of :math:`\mbox{mm}^{-1}` w
     \mbox{(recon in units of mm$^{-1}$)} = \frac{ \mbox{recon in units of ALU$^{-1}$} }{ 0.25 \mbox{mm} / \mbox{ALU}} = \mbox{4.0*recon}
 
 
-.. PENDING(preprocess): restore the NSI and Zeiss examples below when
-   mbirtorch.preprocess is ported.  Both describe instrument-specific
-   preprocessing functions that set the ALU units, and both cross-reference
-   :ref:`PreprocessDocs`, whose page is staged in source/_pending/.
+**NSI Reconstruction Example:** The NSI preprocessing functions in :ref:`PreprocessDocs` set all the parameters to the
+units used by NSI which are in mm.
+In this case, ``1 ALU = 1 mm`` and the reconstructions will have units of :math:`\mbox{mm}^{-1}`.
 
-   **NSI Reconstruction Example:** The NSI preprocessing functions in :ref:`PreprocessDocs` set all the parameters to the
-   units used by NSI which are in mm.
-   In this case, ``1 ALU = 1 mm`` and the reconstructions will have units of :math:`\mbox{mm}^{-1}`.
+In order to convert to units of :math:`\mbox{cm}^{-1}`, we use the following scaling:
 
-   In order to convert to units of :math:`\mbox{cm}^{-1}`, we use the following scaling:
+.. math::
 
-   .. math::
-
-       \mbox{(recon in units of cm$^{-1}$)} = \frac{ \mbox{recon in units of ALU$^{-1}$} }{ \mbox{1 cm} / \mbox{10 mm}} = \mbox{10 *recon}
+    \mbox{(recon in units of cm$^{-1}$)} = \frac{ \mbox{recon in units of ALU$^{-1}$} }{ \mbox{1 cm} / \mbox{10 mm}} = \mbox{10 *recon}
 
 
-   **Zeiss Reconstruction Example:** The Zeiss Versa preprocessing functions in :ref:`PreprocessDocs` allow the user
-   to select units of either "um", "mm", "cm", or "m", with the default being "mm".
-   In this default case, ``1 ALU = 1 mm`` and reconstructions will have units of :math:`\mbox{mm}^{-1}`.
+**Zeiss Reconstruction Example:** The Zeiss Versa preprocessing functions in :ref:`PreprocessDocs` allow the user
+to select units of either "um", "mm", "cm", or "m", with the default being "mm".
+In this default case, ``1 ALU = 1 mm`` and reconstructions will have units of :math:`\mbox{mm}^{-1}`.
 
 
 **Emission CT Example:** Once again, we assume that the channel spacing in the detector is 0.25 mm,

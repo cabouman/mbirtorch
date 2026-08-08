@@ -6,7 +6,6 @@ import mbirtorch as mt
 import mbirtorch.preprocess as mtp
 import pprint
 import olefile
-from scipy.ndimage import binary_erosion
 from . import _xradia_ole
 from ._xradia_ole import (_check_read, _get_ole_data_type, _log_imported_data, _read_ole_struct,
                           _read_ole_value, _read_ole_arr, _read_ole_image, _read_ole_str,
@@ -608,6 +607,9 @@ def compute_weight(blank_scan, obj_scan, dark_region_ratio=0.6, safety_buffer=20
     # Add a safety buffer around dark boundary regions
     if safety_buffer > 0:
         padded_mask = np.pad(weight_mask_2d, safety_buffer, mode='constant', constant_values=True)
+        # scipy.ndimage is imported at its one use site: it costs ~0.1 s to import
+        # and most preprocess callers never touch this loader's mask erosion.
+        from scipy.ndimage import binary_erosion
         padded_mask = binary_erosion(padded_mask, iterations=safety_buffer)
         weight_mask_2d = padded_mask[safety_buffer:-safety_buffer, safety_buffer:-safety_buffer]
 

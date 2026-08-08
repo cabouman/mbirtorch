@@ -4,7 +4,7 @@
 Denoising
 =========
 
-MBIRTorch includes a Bayesian MAP denoising using the qGGMRF prior.
+MBIRTorch includes a Bayesian MAP denoising using the qGGMRF prior and a 3D median filter.
 
 ++++++++++++++
 QGGMRFDenoiser
@@ -35,14 +35,11 @@ Denoise
 .. automethod:: mbirtorch.QGGMRFDenoiser.denoise
 
 
-.. PENDING(median_filter3d): restore the section below, and add "and a 3D median filter"
-   back to the page intro above, when median_filter3d is ported to mbirtorch.
++++++++++++++
+Median Filter
++++++++++++++
 
-   +++++++++++++
-   Median Filter
-   +++++++++++++
+MBIRTorch also includes a 3x3x3 median filter, which can be used as a simple denoiser.  The median filter can
+optionally also return the min and max in 3x3x3 neighborhoods.
 
-   MBIRTorch also includes a 3x3x3 median filter, which can be used as a simple denoiser.  The median filter can
-   optionally also return the min and max in 3x3x3 neighborhoods.
-
-   .. autofunction:: mbirtorch.median_filter3d
+.. autofunction:: mbirtorch.median_filter3d

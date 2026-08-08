@@ -22,7 +22,11 @@ Each supported scanner allows one-call preprocessing with the scanner's ``get_si
 The call selects the correct geometry class for the scanner (for example, the Zeiss reader picks
 ``ParallelBeamModel`` for an Ultra scan and ``ConeBeamModel`` for a Versa scan) and computes the
 reconstruction geometry from the real detector parameters, so the returned model is ready to be used.
-Reconstruction weights can be generated with :func:`mbirtorch.gen_weights`.
+Reconstruction weights can be generated with :func:`mbirtorch.vcd_utils.gen_weights`.
+
+.. DIVERGENCE(gen_weights ref): mbirjax writes this role as :func:`mbirjax.gen_weights`,
+   which is the single warning its own docs build reports -- gen_weights is documented
+   under its module path, not the package path.  Fixed here rather than inherited.
 
 
 NorthStar Instrument (NSI) reader

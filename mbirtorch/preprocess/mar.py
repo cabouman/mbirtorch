@@ -5,8 +5,6 @@ import warnings
 import mbirtorch as mt
 import mbirtorch.preprocess as mtp
 from . import pipeline
-from scipy.sparse import csc_matrix
-import osqp
 
 def gen_huber_weights(weights, sino_error, T=1.0, delta=1.0, epsilon=1e-6):
     """
@@ -375,6 +373,11 @@ def _estimate_BH_model_params_using_OSQP(P, q, A, u):
         return np.asarray(theta, dtype=np.float32)
 
     # Convert arrays as required by OSQP. These matrices are small.
+    # osqp (which pulls scipy.sparse) is imported here, at its one use site, so that
+    # importing the preprocess package stays fast for the many callers that never fit
+    # a beam-hardening model.
+    from scipy.sparse import csc_matrix
+    import osqp
     A_numpy = np.asarray(A, dtype=np.float64)
     u_numpy = np.asarray(u, dtype=np.float64)
 

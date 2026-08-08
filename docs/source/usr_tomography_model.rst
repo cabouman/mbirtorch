@@ -44,12 +44,9 @@ cross-reference target that ``:show-inheritance:`` needs on every model class.
 
 .. automethod:: mbirtorch.parameter_handler.ParameterHandler.print_params
 
-.. PENDING(param_accessors): restore these two directives when get_all_params and
-   get_recon_dict are ported to mbirtorch.
+.. automethod:: mbirtorch.TomographyModel.get_all_params
 
-   .. automethod:: mbirtorch.TomographyModel.get_all_params
-
-   .. automethod:: mbirtorch.TomographyModel.get_recon_dict
+.. automethod:: mbirtorch.TomographyModel.get_recon_dict
 
 
 Recon Shape and Voxel Spacing
@@ -82,19 +79,14 @@ See :doc:`usr_multi_gpu` for a full discussion.
    ``get_memory_stats`` covers the per-device reporting.  The property will not be ported.
 
 
-.. PENDING(save_load_hdf5): restore the section below when save_recon_hdf5 and
-   load_recon_hdf5 are ported to mbirtorch.  NOTE: the _SaveLoadDocs label lives here, and
-   usr_utilities.rst and usr_api_overview.rst both reference it -- their matching PENDING
-   blocks must be restored at the same time.
+.. _SaveLoadDocs:
 
-   .. _SaveLoadDocs:
+Saving and Loading
+------------------
 
-   Saving and Loading
-   ------------------
+.. automethod:: mbirtorch.TomographyModel.save_recon_hdf5
 
-   .. automethod:: mbirtorch.TomographyModel.save_recon_hdf5
-
-   .. automethod:: mbirtorch.TomographyModel.load_recon_hdf5
+.. automethod:: mbirtorch.TomographyModel.load_recon_hdf5
 
 
 .. _detailed-parameter-docs:

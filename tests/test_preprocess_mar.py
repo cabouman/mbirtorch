@@ -21,6 +21,7 @@ import torch
 
 import mbirtorch
 import mbirtorch.preprocess as mtp
+import mbirtorch.preprocess.utilities as mtpu
 import mbirtorch.preprocess.mar as mtmar
 
 GOLDEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "goldens")
@@ -126,15 +127,32 @@ def test_mar_recon_measured(golden, mar_model):
 
 
 def test_align_sino_views(golden, mar_model):
+    # The two stages gate SEPARATELY, because the end-to-end tolerance is set by the
+    # estimator, not the port.  The shift estimator is iterative and model-coupled, so
+    # cross-framework projector differences reach it and a few e-3 px of spread is
+    # legitimate (measured 3.3e-3 px here).  The aligned output then differs by about
+    # shift difference times the local edge gradient, so a coupled output gate tighter
+    # than the shift gate would fail on estimator spread the shift gate itself permits.
     shifts = mtp.estimate_sino_view_offset(mar_model, golden["mar_sino"].copy(),
                                            golden["mar_recon_input"].copy())
     max_shift_diff = float(np.max(np.abs(shifts - golden["align_shifts"])))
+
+    # Stage 2 in isolation: the torch interpolator fed mbirjax's OWN golden shifts must
+    # reproduce mbirjax's aligned output at float precision (measured 1.0e-7).  This is
+    # the sharp assertion on the shifting convention.
+    interp_only = mtpu._translate_views_bilinear(
+        golden["mar_sino"].copy(), golden["align_shifts"].copy()).cpu().numpy()
+    interp_err = _rel_max(interp_only, golden["align_out"])
+
+    # End to end, as a sanity bound consistent with the shift gate.
     out = mtp.align_sino_views(mar_model, golden["mar_sino"].copy(),
                                golden["mar_recon_input"].copy())
-    err = _rel_max(out, golden["align_out"])
-    print(f"align shifts max diff = {max_shift_diff:.2e} px; aligned sino rel_max = {err:.2e}")
+    coupled_err = _rel_max(out, golden["align_out"])
+    print(f"align shifts max diff = {max_shift_diff:.2e} px; interp-only rel_max = "
+          f"{interp_err:.2e}; coupled rel_max = {coupled_err:.2e}")
     assert max_shift_diff < 1e-2
-    assert err < 1e-3
+    assert interp_err < 1e-5
+    assert coupled_err < 1e-2
 
 
 def test_median_filter3d(golden):

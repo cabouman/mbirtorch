@@ -45,11 +45,18 @@ is ``REPLACED(...)`` instead, and it names the replacement::
 
     grep -rn "REPLACED(" docs/source
 
-There are four today: ``use_gpu`` and ``device_summary`` (replaced by
-``configure_devices`` and ``get_memory_stats``), ``split_sino_recon`` (subsumed by
-the multi-device engine), and the ``split_sino_recon`` bullet in
-``advanced_features.rst``.  Those blocks are kept as a record of the divergence, not
-as work to do.
+There are two today: ``use_gpu``, replaced by ``configure_devices``, and
+``device_summary``, replaced by ``get_memory_stats``.  Those blocks are kept as a
+record of the divergence, not as work to do.
+
+Declared and documented move together
+-------------------------------------
+
+``mbirtorch/__init__.py`` declares ``__all__`` as the public surface, and the
+invariant is **documented if and only if declared**.  When a ``PENDING`` block
+restores a module-level function, add that function's name to ``__all__`` in the
+same change.  Methods and the ``preprocess`` subpackage are not ``__all__``
+entries; only module-level names are.
 
 Contents
 --------
@@ -61,9 +68,6 @@ Contents
    * - Page
      - Module it documents
      - Parent page to add it to
-   * - ``usr_preprocess.rst``
-     - ``mbirtorch.preprocess``
-     - ``usr_api.rst``
    * - ``usr_vcls.rst``
      - ``mbirtorch.vcls``
      - ``usr_api.rst``

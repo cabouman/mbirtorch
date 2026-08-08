@@ -42,7 +42,6 @@ from .utilities import (generate_3d_shepp_logan_low_dynamic_range, clear_cache,
                         makedirs, load_data_hdf5, save_data_hdf5,
                         export_recon_hdf5, import_recon_hdf5,
                         build_model, download_and_extract)
-from . import preprocess
 from .memory_stats import get_memory_stats
 
 # __all__ is the DECLARED public surface, and autodoc honors it: every name here is
@@ -53,15 +52,24 @@ from .memory_stats import get_memory_stats
 __all__ = [
     "ParallelBeamModel", "ConeBeamModel", "TomographyModel", "QGGMRFDenoiser",
     "TorchProjector", "forward_project_differentiable",
-    "back_project_differentiable", "gen_weights",
+    "back_project_differentiable", "gen_weights", "gen_weights_mar",
+    "median_filter3d", "download_and_extract", "build_model",
+    "save_data_hdf5", "load_data_hdf5", "export_recon_hdf5",
+    "import_recon_hdf5",
     "generate_3d_shepp_logan_low_dynamic_range", "clear_cache",
     "get_memory_stats", "SliceViewer", "VolumeStack", "slice_viewer",
 ]
 
-# ── slice viewer: lazy export (PEP 562) ──────────────────────────────────────
+# ── lazy exports (PEP 562) ───────────────────────────────────────────────────
 # The viewer names resolve on first attribute access so that a headless
 # `import mbirtorch` never imports matplotlib; most mbirtorch runs (batch
-# recons, tests) never open a viewer.
+# recons, tests) never open a viewer.  The preprocess subpackage resolves the
+# same way, so `import mbirtorch` never pays for its dependency stack (osqp
+# pulls scipy.sparse, plus cv2, tifffile, and the loaders -- about a third of
+# the package's cold import before this).  `mbirtorch.preprocess` and the
+# direct form `import mbirtorch.preprocess` both keep working; only WHEN the
+# subpackage loads changes.  mbirjax imports its preprocess eagerly, so this
+# is a deliberate, behavior-preserving improvement over the mirror.
 _VIEWER_EXPORTS = ("SliceViewer", "VolumeStack", "slice_viewer")
 
 
@@ -70,5 +78,10 @@ def __getattr__(name):
         from . import view_utils
         value = getattr(view_utils, name)
         globals()[name] = value  # cache: later accesses skip this hook
+        return value
+    if name == 'preprocess':
+        import importlib
+        value = importlib.import_module('.preprocess', __name__)
+        globals()[name] = value
         return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

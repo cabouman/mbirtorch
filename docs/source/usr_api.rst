@@ -13,13 +13,13 @@ individual pages for more detail. See :ref:`DemosFAQs` for examples.
 * :ref:`GeometryModelsDocs`
 * :ref:`DenoisingDocs`
 * :ref:`AutogradDocs`
+* :ref:`PreprocessDocs`
 * :ref:`Utilities`
 
 .. PENDING(user_pages): restore these bullets, and the matching toctree entries below,
-   when preprocess, vcls, and hsnt are ported.  Their pages are staged in
-   source/_pending/ -- see source/_pending/README.rst.
+   when vcls and hsnt are ported.  Their pages are staged in source/_pending/ --
+   see source/_pending/README.rst.
 
-   * :ref:`PreprocessDocs`
    * :ref:`VCLSDocs`
    * :ref:`HSNTDocs`
 
@@ -56,4 +56,5 @@ individual pages for more detail. See :ref:`DemosFAQs` for examples.
    usr_geometry_models
    usr_denoising
    usr_autograd
+   usr_preprocess
    usr_utilities

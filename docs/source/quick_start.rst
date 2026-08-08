@@ -37,13 +37,7 @@ Below are simple instructions on how to do your first reconstruction:
   Note that each row of sinogram data is assumed to be perpendicular to the rotation axis and each view is assumed to be in conventional raster order (i.e., left-to-right, top-to-bottom) looking through the object from the source to the detector.
 
 
-  For transmission tomography, it is critically important to preprocess the raw photon measurements by normalizing by an air-scan and taking the negative log of the ratio.
-
-  .. PENDING(preprocess): restore the following sentence, which completes the paragraph
-     above, when mbirtorch.preprocess is ported.  See source/_pending/README.rst.
-
-     We provide simple preprocessing utilities in ``mbirtorch.preprocess`` for doing this,
-     and we plan to provide more utilities for specific instruments in the future.
+  For transmission tomography, it is critically important to preprocess the raw photon measurements by normalizing by an air-scan and taking the negative log of the ratio.  We provide simple preprocessing utilities in ``mbirtorch.preprocess`` for doing this, and we plan to provide more utilities for specific instruments in the future.
 
 - **Initialize a model:**
 

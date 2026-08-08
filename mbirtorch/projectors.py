@@ -228,7 +228,7 @@ class Projectors:
     # returned by its _view_batch_cost (see _effective_view_batch).
     VIEW_BATCH_BODY_DEFAULT = 64
 
-    def _transient_budget_bytes(self):
+    def _transient_budget_bytes(self, n_devices=None):
         if self.model.torch_device.type == 'cpu':
             return self.VIEW_BATCH_TRANSIENT_BUDGET_BYTES
         num_views, num_rows, num_channels = self.model.get_params('sinogram_shape')
@@ -237,7 +237,11 @@ class Projectors:
         # (the global sinogram would overshoot each device's transient by the
         # device count).  Derived per call from the current params and
         # placement -- never frozen at construction (the stale-bind lesson).
-        n_dev = self.model.sino_placement.n_devices
+        # ``n_devices`` overrides the live placement for a HYPOTHETICAL layout
+        # (the memory ledger pricing a candidate device count); None means the
+        # model's current placement, which is every production call site.
+        n_dev = (self.model.sino_placement.n_devices if n_devices is None
+                 else int(n_devices))
         local_views = -(-int(num_views) // n_dev)
         sino_bytes = local_views * num_rows * num_channels * 4
         return max(self.VIEW_BATCH_TRANSIENT_FLOOR_BYTES,
@@ -300,6 +304,36 @@ class Projectors:
         ``model.view_batch_size`` is the user's nominal for every body; None
         means automatic (VIEW_BATCH_BODY_DEFAULT for a torch body, the
         kernel's own chunk for a kernel body)."""
+        return self.view_batch_charge(body, num_pixels, band_cols, args)[0]
+
+    def view_batch_charge(self, body, num_pixels, band_cols, args,
+                          n_devices=None):
+        """``(view_batch, bytes_per_view)`` for one call of ``body``: the
+        single per-view cost model, with TWO consumers.
+
+        The driver consumes the batch (through :meth:`_effective_view_batch`)
+        to decide how many views one body call takes.  The memory ledger
+        (``_memory_ledger``) consumes both numbers, because the batch alone
+        does not say how many bytes that batch holds.  Keeping one function
+        means the batch chooser and the ledger cannot drift apart.
+
+        The charge EXCLUDES the call-fixed tensors -- the assembled output
+        and the accumulated partial -- exactly as each body's own
+        ``_view_batch_cost`` docstring states.  Those exist at any batch
+        size, so the batch choice cannot control them.  The ledger adds them
+        itself, per phase.
+
+        Args:
+            body: the projection body actually bound (kernel or torch).
+            num_pixels (int): P, the pixel subset this call projects.
+            band_cols (int): the call's column count -- the forward's voxel
+                columns, or the back's local sinogram row count.
+            args (dict): the geometry's per-call argument dict.
+            n_devices (int, optional): price the budget for a HYPOTHETICAL
+                device count instead of the model's current placement.  Used
+                only by the ledger when it evaluates a candidate layout;
+                None (the default) is every production call site.
+        """
         nominal = self.model.view_batch_size
         cost = getattr(body, '_view_batch_cost', None)
         if cost is None:
@@ -311,8 +345,9 @@ class Projectors:
             bytes_per_view, view_chunk = cost(num_pixels, band_cols, args)
             if nominal is None:
                 nominal = view_chunk
-        cap = self._transient_budget_bytes() // max(1, int(bytes_per_view))
-        return max(1, min(int(nominal), int(cap)))
+        budget = self._transient_budget_bytes(n_devices=n_devices)
+        cap = budget // max(1, int(bytes_per_view))
+        return max(1, min(int(nominal), int(cap))), int(bytes_per_view)
 
     def sparse_forward_project_view_range(self, band_values, pixel_indices,
                                           view_range, slice_start=0,
