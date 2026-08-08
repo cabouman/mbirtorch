@@ -129,7 +129,4 @@ The ``preprocess`` subpackage loads lazily: ``import mbirtorch`` does not pull i
 dependency stack, and ``import mbirtorch.preprocess`` or the first attribute access loads
 it.  This is a deliberate improvement over MBIRJAX, which imports its preprocess eagerly.
 
-.. PENDING(vcls): restore the sentence below when vcls is ported.  Its page is staged in
-   source/_pending/ -- see source/_pending/README.rst.
-
-   It also includes functions for optimal view selection.
+It also includes functions for optimal view selection.

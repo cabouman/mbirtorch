@@ -15,13 +15,8 @@ individual pages for more detail. See :ref:`DemosFAQs` for examples.
 * :ref:`AutogradDocs`
 * :ref:`PreprocessDocs`
 * :ref:`Utilities`
-
-.. PENDING(user_pages): restore these bullets, and the matching toctree entries below,
-   when vcls and hsnt are ported.  Their pages are staged in source/_pending/ --
-   see source/_pending/README.rst.
-
-   * :ref:`VCLSDocs`
-   * :ref:`HSNTDocs`
+* :ref:`VCLSDocs`
+* :ref:`HSNTDocs`
 
 
 .. DIVERGENCE(automodule members): mbirjax's copy of this directive carries
@@ -58,3 +53,5 @@ individual pages for more detail. See :ref:`DemosFAQs` for examples.
    usr_autograd
    usr_preprocess
    usr_utilities
+   usr_vcls
+   usr_hsnt

@@ -68,12 +68,6 @@ Contents
    * - Page
      - Module it documents
      - Parent page to add it to
-   * - ``usr_vcls.rst``
-     - ``mbirtorch.vcls``
-     - ``usr_api.rst``
-   * - ``usr_hsnt.rst``
-     - ``mbirtorch.hsnt``
-     - ``usr_api.rst``
    * - ``usr_translation_model.rst``
      - ``mbirtorch.translation_model``
      - ``usr_geometry_models.rst``

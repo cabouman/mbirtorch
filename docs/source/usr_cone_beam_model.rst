@@ -29,9 +29,4 @@ Alternative Reconstruction
 
 .. automethod:: mbirtorch.ConeBeamModel.fdk_recon
 
-.. PENDING(split_sino_recon): restore the directive below when
-   ConeBeamModel.split_sino_recon is ported.  A full-logic port is chartered: the nsi
-   split-sinogram demo calls it directly, and it nearly doubles the feasible cone recon
-   size at a fixed GPU count.
-
-   .. automethod:: mbirtorch.ConeBeamModel.split_sino_recon
+.. automethod:: mbirtorch.ConeBeamModel.split_sino_recon

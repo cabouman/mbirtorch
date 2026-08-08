@@ -51,14 +51,9 @@ Below are tips on important and useful features:
     reconstruction across devices with ``model.configure_devices(num_devices=n)``.  The
     recon is sharded by slice, so peak memory per device falls roughly as 1/n.
 
-  .. PENDING(split_sino_recon): restore the bullet below, alongside the multi-device bullet
-     above, when ConeBeamModel.split_sino_recon is ported.  A full-logic port is chartered:
-     the nsi split-sinogram demo calls it directly, and it nearly doubles the feasible cone
-     recon size at a fixed GPU count.
-
-     - For tall volumes that do not fit in memory even after tuning the padding, see
-       :meth:`~mbirtorch.ConeBeamModel.split_sino_recon`, which reconstructs the volume in two
-       overlapping halves.
+  - For tall volumes that do not fit in memory even after tuning the padding, see
+    :meth:`~mbirtorch.ConeBeamModel.split_sino_recon`, which reconstructs the volume in two
+    overlapping halves.
 
 - **Set Sinogram Weights:**
 

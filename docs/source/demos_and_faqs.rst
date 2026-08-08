@@ -112,15 +112,11 @@ If you have no GPU, all processing is done on the CPU.
 
 If your reconstruction is still too large, then for a parallel beam system you can select a subset of rows of your
 sinogram, reconstruct them separately, and then concatenate them at the end.  If you have a cone beam system, you can
-reconstruct a subset of the central slices.  For cone beam you can
+reconstruct a subset of the central slices or use :meth:`~mbirtorch.ConeBeamModel.split_sino_recon`.  For cone beam you can
 also make sure axial padding is disabled (``axial_pad_fraction=0``, the default -- see
 :ref:`ConeBeamModelDocs`) if that padding is what pushes you over the memory limit.
 
 We continue to improve the time and memory efficiency of MBIRTorch.
-
-.. PENDING(split_sino_recon): mbirjax offers ":meth:`~mbirtorch.ConeBeamModel.split_sino_recon`"
-   as a third option in the paragraph above, after reconstructing a subset of central slices.
-   A full-logic port is chartered; restore the mention when it lands.
 
 .. PENDING(demos): mbirjax closes that paragraph with "In either case, you can do a center
    cropped reconstruction as in Demo 3: Cropped Center, although as seen in that demo, this
