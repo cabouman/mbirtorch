@@ -264,6 +264,8 @@ def test_merge_log_files(tmp_path):
     assert '======== first ========' in content and 'alpha' in content
     assert '======== second ========' in content and 'beta' in content
     assert 'missing' not in content
+    # The closing line names the merged file, not the removed temps.
+    assert content.rstrip().endswith('Merged logs written to ' + merged)
     # The temp files are removed after the merge.
     assert not os.path.exists(a) and not os.path.exists(b)
 

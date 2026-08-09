@@ -887,7 +887,9 @@ def import_recon_hdf5(file_path):
 def merge_log_files(merged_path, labeled_paths):
     """Merge temp log files into one file, each under a section header, and remove the temps.
 
-    Missing temps are skipped; if none exist, no file is written.
+    Missing temps are skipped; if none exist, no file is written.  A closing line names
+    the merged file, since the per-part 'Logs written to' lines name temps that no
+    longer exist.
 
     Args:
         merged_path (str): Path of the merged output file.
@@ -903,6 +905,8 @@ def merge_log_files(merged_path, labeled_paths):
             with open(path, 'r') as f:
                 merged.write(f.read())
             os.remove(path)
+        merged.write('Merged logs written to {}\n'.format(
+            os.path.abspath(merged_path)))
 
 
 def get_ct_model(geometry_type, sinogram_shape, angles, source_detector_dist=None, source_iso_dist=None, helical_z_shifts=None):

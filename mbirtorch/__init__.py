@@ -103,6 +103,8 @@ _LAZY_NAMES = {
     'compute_cov_matrix': 'vcls', 'compute_vcl': 'vcls',
     'compute_opt_angle_subset': 'vcls', 'get_2d_subsampling_indices': 'vcls',
     'show_image_with_projection_rays': 'vcls', 'reorder_by_priority': 'vcls',
+    # The blue-noise pattern (a 382 KB array literal), loaded on first use.
+    'bn256': 'bn256',
 }
 
 
