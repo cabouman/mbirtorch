@@ -24,14 +24,10 @@ Here is an example showing views of a modified Shepp-Logan phantom, with changin
 General Purpose
 ---------------
 
+.. autofunction:: mbirtorch.utilities.stitch_arrays
+.. autofunction:: mbirtorch.utilities.get_ct_model
+.. autofunction:: mbirtorch.utilities.copy_ct_model
 .. autofunction:: mbirtorch.utilities.build_model
-
-.. PENDING(general_purpose_utils): restore these three directives, in the order below and
-   ahead of build_model, when stitch_arrays, get_ct_model, and copy_ct_model are ported.
-
-   .. autofunction:: mbirtorch.utilities.stitch_arrays
-   .. autofunction:: mbirtorch.utilities.get_ct_model
-   .. autofunction:: mbirtorch.utilities.copy_ct_model
 
 
 Weight Generation
@@ -60,15 +56,14 @@ The functions here are for direct interactions with files.
 Synthetic Data Generation
 -------------------------
 
+.. autofunction:: mbirtorch.utilities.generate_demo_data
+.. autofunction:: mbirtorch.utilities.generate_3d_shepp_logan_reference
 .. autofunction:: mbirtorch.utilities.generate_3d_shepp_logan_low_dynamic_range
 
-.. PENDING(synthetic_data): generate_demo_data and generate_3d_shepp_logan_reference are
-   on the port roadmap.  gen_translation_phantom is additionally blocked on the
-   translation geometry, whose page is staged in source/_pending/.  Restore these three
-   directives ahead of generate_3d_shepp_logan_low_dynamic_range, matching mbirjax's order.
+.. PENDING(synthetic_data): gen_translation_phantom is blocked on the translation
+   geometry, whose page is staged in source/_pending/.  Restore this directive last in
+   this section, matching mbirjax's order.
 
-   .. autofunction:: mbirtorch.utilities.generate_demo_data
-   .. autofunction:: mbirtorch.utilities.generate_3d_shepp_logan_reference
    .. autofunction:: mbirtorch.utilities.gen_translation_phantom
 
 

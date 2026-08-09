@@ -42,7 +42,11 @@ from .utilities import (generate_3d_shepp_logan_low_dynamic_range, clear_cache,
                         makedirs, load_data_hdf5, save_data_hdf5,
                         export_recon_hdf5, import_recon_hdf5,
                         build_model, download_and_extract,
-                        copy_ct_model, stitch_arrays)
+                        copy_ct_model, stitch_arrays,
+                        get_ct_model, generate_demo_data,
+                        generate_3d_shepp_logan_reference, gen_cube_phantom,
+                        gen_translation_vectors, ObjectType, ModelType,
+                        merge_log_files)
 from .memory_stats import get_memory_stats
 
 # __all__ is the DECLARED public surface, and autodoc honors it: every name here is
@@ -59,6 +63,12 @@ __all__ = [
     "import_recon_hdf5",
     "generate_3d_shepp_logan_low_dynamic_range", "clear_cache",
     "get_memory_stats", "SliceViewer", "VolumeStack", "slice_viewer",
+    "stitch_arrays", "get_ct_model", "copy_ct_model",
+    "generate_demo_data", "generate_3d_shepp_logan_reference",
+    # Documented hsnt and vcls names; these resolve lazily through __getattr__.
+    "hyper_denoise", "dehydrate", "rehydrate", "import_hsnt_data_hdf5",
+    "create_hsnt_metadata", "export_hsnt_data_hdf5", "generate_hyper_data",
+    "get_opt_views", "show_image_with_projection_rays",
 ]
 
 # ── lazy exports (PEP 562) ───────────────────────────────────────────────────

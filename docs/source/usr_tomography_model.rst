@@ -62,11 +62,11 @@ Recon Shape and Voxel Spacing
 Device Configuration
 --------------------
 
-On a machine with multiple GPUs, MBIRTorch can divide a reconstruction across them to
-increase the available memory and reduce reconstruction time, for every geometry.  Unlike
-MBIRJAX, this is opt-in rather than automatic: a model uses a single device until
-``configure_devices`` widens it.  The methods below give explicit control over which devices
-are used.  Per-device memory use is reported by ``mbirtorch.get_memory_stats()``.
+On a machine with multiple GPUs, MBIRTorch automatically divides a reconstruction across
+them to increase the available memory and reduce reconstruction time -- with no change to
+your script, and for every geometry.  A memory check before each reconstruction picks the
+largest device count whose shares fit.  The methods below give explicit control over which
+devices are used.  Per-device memory use is reported by ``mbirtorch.get_memory_stats()``.
 See :doc:`usr_multi_gpu` for a full discussion.
 
 .. automethod:: mbirtorch.TomographyModel.configure_devices

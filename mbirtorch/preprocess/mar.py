@@ -1,7 +1,9 @@
+import functools
+import os
+import warnings
+
 import numpy as np
 import torch
-import functools
-import warnings
 import mbirtorch as mt
 import mbirtorch.preprocess as mtp
 from . import pipeline
@@ -746,8 +748,8 @@ def recon_plastic_metal(ct_model, sino, weights, num_BH_iterations=3, num_constr
             (default), return an ordinary host NumPy array.  If True, return the device tensor for a
             following on-device step.
         max_iterations (int, optional): Maximum MBIR iterations per reconstruction pass. Defaults to 15.
-        logfile_path (str, optional): Accepted for interface compatibility; per-pass log files are not
-            currently written.
+        logfile_path (str, optional): Same as in the TomographyModel.recon() method.  The BH passes'
+            logs are merged into this single file, each under a section header.
         radial_margin, top_margin, bottom_margin (int or None, optional): Segmentation mask margins
             used when classifying plastic/metal; None (default) = size-relative
             (see segment_plastic_metal).
@@ -791,7 +793,8 @@ def recon_plastic_metal(ct_model, sino, weights, num_BH_iterations=3, num_constr
     # Do a regular recon if num_metal == 0
     if num_metal == 0:
         recon, _ = recon_function(sino, weights=weights, max_iterations=max_iterations,
-                                  stop_threshold_change_pct=stop_threshold_change_pct)
+                                  stop_threshold_change_pct=stop_threshold_change_pct,
+                                  logfile_path=logfile_path)
         return to_output_form(recon)
 
     # Continue with beam hardening and segmentation
@@ -799,28 +802,41 @@ def recon_plastic_metal(ct_model, sino, weights, num_BH_iterations=3, num_constr
         print("\n************ Perform initial FDK reconstruction  **************")
     recon = ct_model.direct_recon(sino, output_sharded=True)
 
-    for i in range(num_BH_iterations):
-        # Estimate Corrected Sinogram
-        if verbose >= 1:
-            print(f"\n************ Correct sino plastic metal {i + 1}  **************")
-        corrected_sinogram = correct_sino_plastic_metal(ct_model, sino, recon, num_metal=num_metal, order=order, alpha=alpha, beta=beta, gamma=gamma, num_constraint_update_iter=num_constraint_update_iter,
-                                                        radial_margin=radial_margin, top_margin=top_margin, bottom_margin=bottom_margin)
+    # Each BH pass logs to its own temp file; merged into logfile_path afterward
+    # (in finally, so any pass logs written before a failure are preserved).
+    if logfile_path:
+        log_path = os.path.expanduser(logfile_path)
+        pass_log_paths = [log_path + '.pass{}'.format(i + 1) for i in range(num_BH_iterations)]
+    else:
+        log_path, pass_log_paths = None, [None] * num_BH_iterations
+    try:
+        for i in range(num_BH_iterations):
+            # Estimate Corrected Sinogram
+            if verbose >= 1:
+                print(f"\n************ Correct sino plastic metal {i + 1}  **************")
+            corrected_sinogram = correct_sino_plastic_metal(ct_model, sino, recon, num_metal=num_metal, order=order, alpha=alpha, beta=beta, gamma=gamma, num_constraint_update_iter=num_constraint_update_iter,
+                                                            radial_margin=radial_margin, top_margin=top_margin, bottom_margin=bottom_margin)
 
-        # Reconstruct Corrected Sinogram
-        if verbose >= 1:
-            print(f"\n************ Perform MBIR reconstruction {i + 1} **************")
-        recon, _ = recon_function(corrected_sinogram, weights=weights, init_recon=recon,
-                                  max_iterations=max_iterations,
-                                  stop_threshold_change_pct=stop_threshold_change_pct)
+            # Reconstruct Corrected Sinogram
+            if verbose >= 1:
+                print(f"\n************ Perform MBIR reconstruction {i + 1} **************")
+            recon, _ = recon_function(corrected_sinogram, weights=weights, init_recon=recon,
+                                      max_iterations=max_iterations,
+                                      stop_threshold_change_pct=stop_threshold_change_pct,
+                                      logfile_path=pass_log_paths[i])
 
-        if verbose >= 2:
-            print(f"\n************ BH Iteration {i + 1}: Display plastic and metal mask **************")
-            plastic_mask, metal_masks, plastic_scale, metal_scales = mtp.segment_plastic_metal(
-                recon, num_metal, radial_margin=radial_margin, top_margin=top_margin,
-                bottom_margin=bottom_margin)
-            labels = ['Plastic Mask'] + [f'Metal {j + 1} Mask' for j in range(len(metal_masks))]
-            mt.slice_viewer(plastic_mask, *metal_masks, vmin=0, vmax=1.0,
-                            slice_label=labels,
-                            title=f'Iteration {i + 1}: Comparison of Plastic and Metal Masks')
+            if verbose >= 2:
+                print(f"\n************ BH Iteration {i + 1}: Display plastic and metal mask **************")
+                plastic_mask, metal_masks, plastic_scale, metal_scales = mtp.segment_plastic_metal(
+                    recon, num_metal, radial_margin=radial_margin, top_margin=top_margin,
+                    bottom_margin=bottom_margin)
+                labels = ['Plastic Mask'] + [f'Metal {j + 1} Mask' for j in range(len(metal_masks))]
+                mt.slice_viewer(plastic_mask, *metal_masks, vmin=0, vmax=1.0,
+                                slice_label=labels,
+                                title=f'Iteration {i + 1}: Comparison of Plastic and Metal Masks')
+    finally:
+        if log_path:
+            labels = ['recon_plastic_metal: BH pass {}'.format(i + 1) for i in range(num_BH_iterations)]
+            mt.merge_log_files(log_path, zip(labels, pass_log_paths))
 
     return to_output_form(recon)
