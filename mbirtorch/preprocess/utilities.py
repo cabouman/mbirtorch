@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 import h5py
 import mbirtorch as mt
+from mbirtorch import _sharding
 import scipy
 
 from . import pipeline
@@ -638,28 +639,45 @@ def compute_scaling_factor(target_vect, vect_to_scale) -> float:
         >>> u = np.array([0.5, 1.0, 1.5])
         >>> alpha = compute_scaling_factor(v,u)
     """
+    # Sharded inputs: the two sums decompose over the shards, so sum each
+    # shard on its own device and combine on the host.
+    if isinstance(target_vect, _sharding.Shards):
+        numerator = 0.0
+        denominator = 0.0
+        for t, v in zip(target_vect.tensors, vect_to_scale.tensors):
+            n, d = _dot_sums(t, v)
+            numerator += n
+            denominator += d
+        return float(numerator / (denominator + 1e-8))
+
     if not isinstance(target_vect, torch.Tensor):
         target_vect = torch.as_tensor(np.asarray(target_vect))
     if not isinstance(vect_to_scale, torch.Tensor):
         vect_to_scale = torch.as_tensor(np.asarray(vect_to_scale), device=target_vect.device)
 
-    # Chunked inner products along the leading axis: a whole-array elementwise product would
-    # allocate a full-size temporary (tens of GB for a production recon on one device).
-    numerator = 0.0
-    denominator = 0.0
     if target_vect.ndim == 0:
         numerator = float(vect_to_scale * target_vect)
         denominator = float(vect_to_scale * vect_to_scale)
     else:
-        per_row = max(1, int(np.prod(target_vect.shape[1:], dtype=np.int64)))
-        step = max(1, (1 << 27) // per_row)
-        for i in range(0, target_vect.shape[0], step):
-            t = target_vect[i:i + step]
-            v = vect_to_scale[i:i + step]
-            numerator += float(torch.sum(v * t))
-            denominator += float(torch.sum(v * v))
+        numerator, denominator = _dot_sums(target_vect, vect_to_scale)
     epsilon = 1e-8
     return float(numerator / (denominator + epsilon))
+
+
+def _dot_sums(target_vect, vect_to_scale):
+    """The two inner products <v,t> and <v,v>, chunked along the leading axis:
+    a whole-array elementwise product would allocate a full-size temporary
+    (tens of GB for a production recon on one device)."""
+    numerator = 0.0
+    denominator = 0.0
+    per_row = max(1, int(np.prod(target_vect.shape[1:], dtype=np.int64)))
+    step = max(1, (1 << 27) // per_row)
+    for i in range(0, target_vect.shape[0], step):
+        t = target_vect[i:i + step]
+        v = vect_to_scale[i:i + step]
+        numerator += float(torch.sum(v * t))
+        denominator += float(torch.sum(v * v))
+    return numerator, denominator
 
 
 def put_in_slice(array, flat_indices, value):
@@ -733,6 +751,27 @@ def apply_cylindrical_mask(recon, radial_margin=0, top_margin=0, bottom_margin=0
         >>> masked_vol.shape
         (128, 128, 64)
     """
+    # A sharded volume is masked shard by shard on its own devices.  The
+    # circular mask is the same for every slice; the top/bottom margins are
+    # global slice ranges, so each shard zeroes its own overlap with them.
+    if isinstance(recon, _sharding.Shards):
+        pl = recon.placement
+        num_real = pl.real_size if num_real_slices is None else num_real_slices
+        out = []
+        for t, (_dev, (s0, s1)) in zip(recon.tensors,
+                                       pl.shard_ranges(pl.padded_size)):
+            masked = apply_cylindrical_mask(t, radial_margin=radial_margin)
+            lo = max(s0, 0)
+            hi = min(s1, top_margin)
+            if hi > lo:
+                masked[:, :, lo - s0:hi - s0] = 0
+            lo = max(s0, num_real - bottom_margin)
+            hi = min(s1, num_real)
+            if hi > lo:
+                masked[:, :, lo - s0:hi - s0] = 0
+            out.append(masked)
+        return _sharding.Shards(out, pl)
+
     is_torch = isinstance(recon, torch.Tensor)
 
     num_recon_rows, num_recon_cols, num_slices = recon.shape

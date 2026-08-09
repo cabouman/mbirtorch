@@ -1,6 +1,98 @@
 import numpy as np
 import torch
 import mbirtorch.preprocess as mtp
+from mbirtorch import _sharding
+
+# Chunk bound for the per-shard histogram passes, in elements: keeps each
+# temporary well under a GB and each chunk's counts exact in int64.
+_HISTOGRAM_CHUNK_ELEMENTS = 1 << 24
+
+
+def _shard_valid_masks(valid_mask, placement, ndim):
+    """Split a broadcastable host mask into per-shard pieces: the placement's
+    axis is sliced to each shard's range; size-1 (broadcast) axes stay whole.
+    Returns a list of numpy arrays, or Nones when there is no mask."""
+    if valid_mask is None:
+        return [None] * placement.n_devices
+    mask = np.asarray(valid_mask)
+    axis = placement.axis % ndim
+    pieces = []
+    for _dev, (s0, s1) in placement.shard_ranges(placement.padded_size):
+        if mask.shape[axis] == 1:
+            pieces.append(mask)
+        else:
+            sel = [slice(None)] * ndim
+            sel[axis] = slice(s0, s1)
+            pieces.append(mask[tuple(sel)])
+    return pieces
+
+
+def _shard_chunks(tensor, mask_piece):
+    """Yield (chunk, mask_chunk) pairs over the leading axis, each chunk at
+    most _HISTOGRAM_CHUNK_ELEMENTS elements.  The mask chunk is a torch bool
+    tensor broadcast to the chunk's shape, or None."""
+    per_row = max(1, int(np.prod(tensor.shape[1:], dtype=np.int64)))
+    step = max(1, _HISTOGRAM_CHUNK_ELEMENTS // per_row)
+    m = None
+    if mask_piece is not None:
+        m = torch.as_tensor(np.asarray(mask_piece), dtype=torch.bool,
+                            device=tensor.device)
+    for i in range(0, tensor.shape[0], step):
+        chunk = tensor[i:i + step]
+        if m is None:
+            yield chunk, None
+        else:
+            mc = m if m.shape[0] == 1 else m[i:i + step]
+            yield chunk, mc.expand(chunk.shape)
+
+
+def _sharded_masked_histogram(shards, valid_mask, num_bins):
+    """Histogram of the valid entries of a sharded volume, computed shard by
+    shard on each shard's own device.  Only the small per-shard count tables
+    ever leave a device; the volume is never gathered.
+
+    A histogram is a sum of counts, so summing the per-shard tables gives
+    exactly the histogram of the whole volume (counts are exact integers).
+    The range is the masked min/max, combined across shards on the host.
+
+    Returns:
+        (hist, bin_edges): host numpy arrays, matching the single-array path
+        (int64 counts; edges computed by np.histogram's own edge arithmetic).
+    """
+    masks = _shard_valid_masks(valid_mask, shards.placement,
+                               shards.tensors[0].ndim)
+
+    # Pass 1: masked min and max per chunk, combined on the host.
+    lo, hi = np.inf, -np.inf
+    for t, mp in zip(shards.tensors, masks):
+        for chunk, mc in _shard_chunks(t, mp):
+            vals = chunk.reshape(-1) if mc is None else chunk[mc]
+            if vals.numel() == 0:
+                continue          # a shard that is entirely padding
+            lo = min(lo, float(vals.min()))
+            hi = max(hi, float(vals.max()))
+
+    # Pass 2: count per chunk into num_bins buckets (exact int64 on device),
+    # summed on the host.  Values are mapped to buckets by the same linear
+    # map np.histogram uses; hi lands in the last (closed) bin.
+    hist = np.zeros(num_bins, dtype=np.int64)
+    scale = num_bins / (hi - lo) if hi > lo else 0.0
+    for t, mp in zip(shards.tensors, masks):
+        for chunk, mc in _shard_chunks(t, mp):
+            vals = chunk.reshape(-1) if mc is None else chunk[mc]
+            vals = vals[(vals >= lo) & (vals <= hi)]
+            if vals.numel() == 0:
+                continue
+            idx = torch.clamp(((vals - lo) * scale).to(torch.int64),
+                              max=num_bins - 1)
+            hist += torch.bincount(idx, minlength=num_bins).cpu().numpy()
+
+    # Edges from np.histogram itself (on an empty array), so both paths use
+    # numpy's exact edge arithmetic.
+    edges_dtype = shards.dtype
+    empty = np.empty(0, dtype=str(edges_dtype).replace('torch.', ''))
+    _, bin_edges = np.histogram(empty, bins=num_bins, range=(float(lo), float(hi)))
+    return hist, bin_edges
 
 
 def _masked_histogram(image, valid_mask, num_bins, xp):
@@ -67,7 +159,10 @@ def multi_threshold_otsu(image, classes=2, num_bins=1024, valid_mask=None):
         valid_mask = valid_mask.detach().cpu().numpy()
 
     # Compute the histogram of the valid entries.
-    if valid_mask is not None:
+    if isinstance(image, _sharding.Shards):
+        # Sharded volume: histogram shard by shard on each shard's device.
+        hist, bin_edges = _sharded_masked_histogram(image, valid_mask, num_bins)
+    elif valid_mask is not None:
         hist, bin_edges = _masked_histogram(image, np.asarray(valid_mask), num_bins, np)
     else:
         # Python-float range endpoints for the same reason as in _masked_histogram (edge consistency).
@@ -174,14 +269,17 @@ def segment_plastic_metal(recon, num_metal, radial_margin=None, top_margin=None,
     """
     Segment a reconstruction into plastic and multiple metal masks using multi-threshold Otsu.
 
-    ``recon`` may be a host numpy array or a torch tensor; the class masks are returned on the same
-    array module as the input.  For a volume whose slice axis is zero-padded, pass ``valid_mask`` /
-    ``num_real_slices`` so the padded slices are excluded from the histogram, the bottom margin lands
-    on the real bottom slices, and the class masks are zero on padding (otherwise a threshold interval
-    spanning 0 would include the padded voxels and bias the scaling factors).
+    ``recon`` may be a host numpy array, a torch tensor, or a sharded volume (a ``Shards``
+    container); the class masks are returned in the same form as the input, on the same
+    devices.  A sharded volume is processed shard by shard where it sits: only the small
+    histogram tables travel, never the volume.  For a volume whose slice axis is
+    zero-padded, pass ``valid_mask`` / ``num_real_slices`` so the padded slices are
+    excluded from the histogram, the bottom margin lands on the real bottom slices, and
+    the class masks are zero on padding (otherwise a threshold interval spanning 0 would
+    include the padded voxels and bias the scaling factors).
 
     Args:
-        recon (np.ndarray or torch.Tensor): Reconstructed volume array.
+        recon (np.ndarray, torch.Tensor, or Shards): Reconstructed volume.
         num_metal (int): Number of metal materials to segment.
         radial_margin (int or None, optional): Margin in pixels to subtract from the cylindrical mask
             radius.  None (default) uses a size-relative margin, max(2, min(10, min(rows, cols) // 25)):
@@ -204,11 +302,27 @@ def segment_plastic_metal(recon, num_metal, radial_margin=None, top_margin=None,
     if num_metal <= 0:
         raise ValueError("num_metal must be positive")
 
+    is_shards = isinstance(recon, _sharding.Shards)
+    if is_shards and recon.placement.is_trivial:
+        # One shard: compute through the tensor path, return in the form given.
+        pl = recon.placement
+        plastic_mask, metal_masks, plastic_scale, metal_scales = segment_plastic_metal(
+            recon.tensors[0], num_metal, radial_margin=radial_margin,
+            top_margin=top_margin, bottom_margin=bottom_margin,
+            valid_mask=valid_mask, num_real_slices=num_real_slices)
+        return (_sharding.Shards([plastic_mask], pl),
+                [_sharding.Shards([m], pl) for m in metal_masks],
+                plastic_scale, metal_scales)
+
     # Size-relative default margins: the former fixed 10 at production sizes, smaller for small
     # volumes so the mask never carves off a large fraction of the field of view.
-    num_slices = num_real_slices if num_real_slices is not None else recon.shape[2]
+    shape = recon.tensors[0].shape if is_shards else recon.shape
+    if num_real_slices is not None:
+        num_slices = num_real_slices
+    else:
+        num_slices = recon.placement.real_size if is_shards else recon.shape[2]
     if radial_margin is None:
-        radial_margin = max(2, min(10, min(recon.shape[0], recon.shape[1]) // 25))
+        radial_margin = max(2, min(10, min(shape[0], shape[1]) // 25))
     if top_margin is None:
         top_margin = max(2, min(10, num_slices // 25))
     if bottom_margin is None:
@@ -222,6 +336,9 @@ def segment_plastic_metal(recon, num_metal, radial_margin=None, top_margin=None,
     thresholds = multi_threshold_otsu(recon, classes=num_metal + 2, valid_mask=valid_mask)
 
     is_torch = isinstance(recon, torch.Tensor)
+    if is_shards:
+        shard_masks = _shard_valid_masks(valid_mask, recon.placement,
+                                         recon.tensors[0].ndim)
 
     # Plastic: lowest class
     plastic_low_threshold = thresholds[0]
@@ -229,15 +346,27 @@ def segment_plastic_metal(recon, num_metal, radial_margin=None, top_margin=None,
 
     # Masks are 1 inside the class interval AND on a real voxel: padded voxels are exactly 0, so a class
     # interval spanning 0 would otherwise mark them, biasing compute_scaling_factor's denominator.
+    def _tensor_class_mask(vol, lower, upper, mask):
+        in_class = (vol > lower) & (vol <= upper)
+        if mask is not None:
+            if not isinstance(mask, torch.Tensor):
+                mask = torch.as_tensor(np.asarray(mask), device=vol.device)
+            in_class = in_class & mask.bool()
+        return in_class.to(vol.dtype)
+
     def class_mask(lower, upper):
+        if is_shards:
+            # Shard by shard, each on its own device; the mask comes back
+            # sharded the same way as the volume.
+            return _sharding.Shards(
+                [_tensor_class_mask(t, lower, upper, mp)
+                 for t, mp in zip(recon.tensors, shard_masks)],
+                recon.placement)
+        if is_torch:
+            return _tensor_class_mask(recon, lower, upper, valid_mask)
         in_class = (recon > lower) & (recon <= upper)
         if valid_mask is not None:
-            mask = valid_mask
-            if is_torch and not isinstance(mask, torch.Tensor):
-                mask = torch.as_tensor(np.asarray(mask), device=recon.device)
-            in_class = in_class & (mask.bool() if is_torch else mask.astype(bool))
-        if is_torch:
-            return in_class.to(recon.dtype)
+            in_class = in_class & np.asarray(valid_mask).astype(bool)
         return np.where(in_class, np.float32(1.0), np.float32(0.0)).astype(recon.dtype)
 
     plastic_mask = class_mask(plastic_low_threshold, plastic_metal_threshold)

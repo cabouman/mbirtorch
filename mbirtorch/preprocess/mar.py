@@ -6,7 +6,16 @@ import numpy as np
 import torch
 import mbirtorch as mt
 import mbirtorch.preprocess as mtp
+from mbirtorch import _sharding
 from . import pipeline
+
+
+def _per_shard(fn, x):
+    """Apply an elementwise function to a volume in either form: directly to
+    a tensor, or shard by shard to a Shards container."""
+    if isinstance(x, _sharding.Shards):
+        return _sharding.Shards([fn(t) for t in x.tensors], x.placement)
+    return fn(x)
 
 def gen_huber_weights(weights, sino_error, T=1.0, delta=1.0, epsilon=1e-6):
     """
@@ -172,7 +181,8 @@ def _est_plastic_metal_sinos_from_recon(recon, num_metal, ct_model,
     # Slice-padding info: valid_mask (True on real slices; None when unpadded) and num_real_slices
     # let the segmentation exclude any padded slices from its statistics and masks.
     pl = ct_model.recon_placement
-    valid_mask = pl.real_mask(recon.ndim)
+    ndim = recon.tensors[0].ndim if isinstance(recon, _sharding.Shards) else recon.ndim
+    valid_mask = pl.real_mask(ndim)
 
     # --- Segment plastic and metal regions in the reconstruction ---
     # plastic_mask: Mask for plastic regions.
@@ -186,12 +196,16 @@ def _est_plastic_metal_sinos_from_recon(recon, num_metal, ct_model,
     # --- Forward project and scale plastic ---
     # Keep the OUTPUT on-device (output_sharded=True): the whole correction below runs on these
     # device sinograms.
-    plastic_sino_est = plastic_scale * ct_model.forward_project(plastic_mask, output_sharded=True)
+    plastic_sino_est = _per_shard(lambda t: plastic_scale * t,
+                                  ct_model.forward_project(plastic_mask, output_sharded=True))
 
     # --- Forward project the masked out metal regions ---
     metal_sino_est = []
     for mask in metal_masks:
-        m = ct_model.forward_project(mask * recon, output_sharded=True)
+        masked = (_sharding.Shards([mk * t for mk, t in zip(mask.tensors, recon.tensors)],
+                                   recon.placement)
+                  if isinstance(recon, _sharding.Shards) else mask * recon)
+        m = ct_model.forward_project(masked, output_sharded=True)
         metal_sino_est.append(m)
 
     return plastic_sino_est, metal_sino_est
