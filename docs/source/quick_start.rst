@@ -10,7 +10,7 @@ in the shape (views, rows, channels) from a parallel beam projection, you can cr
 
     import mbirtorch
     ct_model = mbirtorch.ParallelBeamModel(sinogram.shape, angles)
-    recon, recon_params = ct_model.recon(sinogram)
+    recon, recon_dict = ct_model.recon(sinogram)
     mbirtorch.slice_viewer(recon, title='MBIRTorch Recon')
 
 Demos
@@ -48,7 +48,7 @@ Below are simple instructions on how to do your first reconstruction:
 
 - **Reconstruct and visualize:**
 
-  - Run ``recon, recon_params = model.recon(sinogram)`` to reconstruct a volume in  ``(rows, columns, slices)`` format using MBIR.
+  - Run ``recon, recon_dict = model.recon(sinogram)`` to reconstruct a volume in  ``(rows, columns, slices)`` format using MBIR.
   - Call ``mbirtorch.slice_viewer(recon, title='MBIRTorch reconstruction')``
 
 Even the default parameter settings will usually produce a good quality reconstruction.

@@ -14,15 +14,15 @@ The default: spread across the visible GPUs
 As in MBIRJAX, multi-device reconstruction is **automatic**.  On a machine with two or more
 CUDA devices, a reconstruction spreads across them with no change to your script::
 
-    recon, recon_params = model.recon(sinogram)   # uses the GPUs that fit
+    recon, recon_dict = model.recon(sinogram)   # uses the GPUs that fit
 
 Before the first large allocation, MBIRTorch estimates the memory each candidate layout
 would need and picks the largest device count whose per-device share fits, with a safety
 margin.  If no layout fits, the reconstruction fails immediately with the shortfall named,
 rather than failing mid-run with an out-of-memory error.  Two model attributes tune this
 check: ``model.skip_memory_preflight = True`` runs without it, and
-``model.memory_preflight_margin`` (default 0.15) is the fraction of device memory held back
-as slack.
+``model.memory_preflight_margin`` (default 0.15) is the fraction by which the estimate is
+padded before it is compared with the free memory.
 
 Results can differ slightly with the device count, and the difference decays as iterations
 proceed (measured to fall from 6.1e-3 at 3 iterations to 8.8e-4 at 10).  To pin a run to one

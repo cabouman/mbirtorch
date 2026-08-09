@@ -54,6 +54,12 @@ class ParameterHandler:
         # Configure logger
         logger = logging.getLogger(self.__class__.__name__)
         logger.setLevel(level)
+        # The handlers attached below are the complete set of intended outputs:
+        # the in-memory buffer, the console when print_logs is on, and the file
+        # when a path is given.  Without this, records also reach whatever the
+        # application configured on the root logger, so print_logs=False would
+        # still print the whole run log through a caller's logging.basicConfig.
+        logger.propagate = False
         # Close and remove any existing handlers to prevent leaked file descriptors
         for h in list(logger.handlers):
             try:
@@ -130,8 +136,8 @@ class ParameterHandler:
         log says so rather than leaving the device-form shapes a surprise.
         """
         devices = self.recon_placement.devices
-        report = '{} x {} (sharded)'.format(len(devices),
-                                            devices[0].type.upper())
+        platform = devices[0].type.upper()
+        report = '{} x {} (sharded)'.format(len(devices), platform)
         if self.sino_placement is not None and self.sino_placement.is_padded:
             report += ' (views padded {}->{})'.format(
                 self.sino_placement.real_size, self.sino_placement.padded_size)
@@ -139,13 +145,17 @@ class ParameterHandler:
             report += ' (slices padded {}->{})'.format(
                 self.recon_placement.real_size,
                 self.recon_placement.padded_size)
-        # Automatic selection that used fewer than the visible GPUs: say which
-        # counts were turned down and why, so idle hardware is never silent.
+        # Automatic selection that used fewer than the visible devices: say
+        # which counts were turned down and why, so idle hardware is never
+        # silent.  Only a layout the library chose can have a search to
+        # explain, so an explicitly configured layout never carries this
+        # clause -- an explicit call also clears the recorded rejections.
         rejected = getattr(self, 'device_choice_rejections', None)
-        if rejected:
+        automatic = getattr(self, 'device_layout_is_automatic', False)
+        if rejected and automatic:
             visible = max([count for count, _why in rejected] + [len(devices)])
-            report += ' (using {} of {} GPUs: {})'.format(
-                len(devices), visible,
+            report += ' (using {} of {} {} devices: {})'.format(
+                len(devices), visible, platform,
                 '; '.join('{} rejected, {}'.format(count, why)
                           for count, why in rejected))
         return report

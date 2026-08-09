@@ -49,7 +49,8 @@ Below are tips on important and useful features:
 
   - For tall volumes that do not fit in memory on one GPU, MBIRTorch spreads the
     reconstruction across the visible GPUs automatically.  The recon is sharded by slice,
-    so peak memory per device falls roughly as 1/n.
+    so peak memory per device falls roughly in inverse proportion to the number of
+    devices used.
 
   - For tall volumes that do not fit in memory even after tuning the padding, see
     :meth:`~mbirtorch.ConeBeamModel.split_sino_recon`, which reconstructs the volume in two

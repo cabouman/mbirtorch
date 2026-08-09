@@ -128,7 +128,7 @@ the kernels are still safe to use but their speed is unmeasured.
 Selection happens in each geometry's ``_view_batch_bodies``: if a kernel's gates
 pass it is chosen, otherwise the torch body is.  All four kernels are on by default,
 each having passed a composed performance gate -- a full reconstruction comparison
-against the kill-switch arm -- before earning that default.
+against the kill-switch variant -- before earning that default.
 
 **One multi-GPU subtlety, fixed and guarded.**  A Triton launch targets the
 launching thread's current device, and the per-device worker threads launch from

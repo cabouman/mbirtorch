@@ -74,9 +74,9 @@ See :doc:`usr_multi_gpu` for a full discussion.
 .. automethod:: mbirtorch.TomographyModel.prepare_sino_for_devices
 
 .. REPLACED(device_summary): MBIRJAX documents a ``device_summary`` property here, which
-   reports the devices its automatic selection chose.  MBIRTorch has no automatic
-   selection to report, since ``configure_devices`` sets the layout explicitly, and
-   ``get_memory_stats`` covers the per-device reporting.  The property will not be ported.
+   reports the devices its automatic selection chose.  MBIRTorch reports the layout a run
+   settled on in the run log's device line, and ``get_memory_stats`` covers the per-device
+   reporting, so the property will not be ported.
 
 
 .. _SaveLoadDocs:

@@ -801,6 +801,10 @@ class TomographyModel(ParameterHandler):
         devices that can hold their share; see :meth:`recon`.
         """
         self.device_layout_is_automatic = False
+        # An earlier automatic settle may have left rejected counts behind.
+        # They explain a search this layout did not come from, so the run log
+        # must not carry them into a run the caller placed by hand.
+        self.device_choice_rejections = []
         if devices is None:
             if num_devices == 1:
                 devices = [self.torch_device]

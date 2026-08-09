@@ -16,7 +16,7 @@ Here are the reasons to use MBIRTorch:
   MBIRTorch is fast (for MBIR) because:
 
   - **GPU power:**
-    Uses PyTorch to harness the power of GPUs and CPUs, and can spread a single
+    Uses PyTorch to harness the power of GPUs and CPUs, and automatically spreads a single
     reconstruction across multiple GPUs for more memory and speed (see :doc:`usr_multi_gpu`).
 
   - **VCD algorithm:**

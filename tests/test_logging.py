@@ -3,15 +3,23 @@ recon_dict, console silencing, and the merged logs of the composite runs
 (split_sino_recon and recon_plastic_metal).  The behavior matches mbirjax.
 """
 
-import io
 import logging
 import os
+import re
 
 import numpy as np
 import pytest
 
 import mbirtorch
 import mbirtorch.preprocess as mtp
+
+
+def _device_line(recon_log):
+    """The one line of a run log that reports the devices."""
+    lines = [line for line in recon_log.splitlines()
+             if line.startswith('Reconstruction devices:')]
+    assert len(lines) == 1, lines
+    return lines[0]
 
 
 @pytest.fixture()
@@ -38,13 +46,6 @@ def small_cone_case():
         tuple(model.get_params('recon_shape')))
     sino = model.forward_project(phantom)
     return model, sino
-
-
-def _console_lines(model):
-    """Capture what the model's logger sends to the console during a call."""
-    stream = io.StringIO()
-    handler = logging.StreamHandler(stream)
-    return stream, handler
 
 
 def test_recon_writes_log_file_and_recon_log(tmp_path, small_parallel_case):
@@ -122,9 +123,12 @@ def test_device_report_names_the_settled_layout():
     sino = model.forward_project(phantom)
     _, recon_dict = model.recon(sino, max_iterations=1, logfile_path=None)
 
-    # 11 slices over 2 devices pads the slice axis to 12.
-    assert ('Reconstruction devices: 2 x CPU (sharded) (slices padded 11->12)'
-            in recon_dict['recon_log'])
+    # 11 slices over 2 devices pads the slice axis to 12.  The pieces are
+    # asserted rather than the whole sentence, so rewording the line does not
+    # fail a test that is about what the line reports.
+    line = _device_line(recon_dict['recon_log'])
+    assert '2 x CPU' in line
+    assert re.search(r'\b11\b.*\b12\b', line)
 
 
 def test_device_line_reflects_a_layout_chosen_during_the_run(monkeypatch):
@@ -151,6 +155,44 @@ def test_device_line_reflects_a_layout_chosen_during_the_run(monkeypatch):
     assert '1 x CPU' not in recon_dict['recon_log']
 
 
+def test_explicit_devices_drop_an_earlier_automatic_search(monkeypatch):
+    """A layout the caller placed is not explained as a search result.
+
+    The automatic path records the device counts it turned down, for the
+    device line.  Once configure_devices places the model by hand, that
+    record describes a layout the run is no longer in.
+    """
+    angles = np.linspace(0, np.pi, 8, endpoint=False)
+    model = mbirtorch.ParallelBeamModel((8, 12, 16), angles)
+    model.set_params(no_warning=True, verbose=1)
+    phantom = mbirtorch.generate_3d_shepp_logan_low_dynamic_range(
+        tuple(model.get_params('recon_shape')))
+    sino = model.forward_project(phantom)
+
+    def settle_with_a_rejection(**call_arrays):
+        # What the automatic path does when a wider count does not fit:
+        # keep the current devices and record the count turned down.
+        return model._settle([model.torch_device], None,
+                             [(2, 'needs more memory than is free')])
+
+    monkeypatch.setattr(model, '_apply_device_policy', settle_with_a_rejection)
+    _, automatic = model.recon(sino, max_iterations=1, logfile_path=None)
+    assert 'rejected' in _device_line(automatic['recon_log'])
+
+    monkeypatch.undo()
+    model.configure_devices(devices=['cpu'])
+    # The record is dropped when the caller takes the layout over ...
+    assert model.device_choice_rejections == []
+    _, explicit = model.recon(sino, max_iterations=1, logfile_path=None)
+    assert 'rejected' not in _device_line(explicit['recon_log'])
+
+    # ... and a record that reached the line some other way still would not be
+    # reported, because this layout did not come from a search.
+    model.device_choice_rejections = [(2, 'needs more memory than is free')]
+    _, still_explicit = model.recon(sino, max_iterations=1, logfile_path=None)
+    assert 'rejected' not in _device_line(still_explicit['recon_log'])
+
+
 def test_recon_logfile_none_writes_no_file(tmp_path, small_parallel_case, monkeypatch):
     model, sino = small_parallel_case
     monkeypatch.chdir(str(tmp_path))
@@ -166,6 +208,39 @@ def test_print_logs_false_silences_the_logger(small_parallel_case, capsys):
     captured = capsys.readouterr()
     assert 'After iteration' not in captured.out
     assert 'After iteration' not in captured.err
+
+
+def test_the_run_log_does_not_reach_the_root_logger(small_parallel_case):
+    """An application's own logging setup does not undo print_logs=False.
+
+    The buffer, console, and file handlers are the whole intended output, so
+    a caller that ran logging.basicConfig does not get the run log too.
+    """
+    model, sino = small_parallel_case
+    collected = []
+
+    class _Collector(logging.Handler):
+        def emit(self, record):
+            collected.append(record)
+
+    # A fresh logger propagates, which is the state the model's setup has to
+    # change; assert against that rather than against whatever an earlier
+    # test left on this process-wide logger.
+    logging.getLogger(type(model).__name__).propagate = True
+    root = logging.getLogger()
+    handler = _Collector()
+    root.addHandler(handler)
+    previous_level = root.level
+    root.setLevel(logging.DEBUG)
+    try:
+        model.recon(sino, max_iterations=1, logfile_path=None, print_logs=False)
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(previous_level)
+
+    from_model = [r.getMessage() for r in collected
+                  if r.name == type(model).__name__]
+    assert from_model == []
 
 
 def test_saved_recon_carries_the_log(tmp_path, small_parallel_case):

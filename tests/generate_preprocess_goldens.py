@@ -13,9 +13,12 @@ and the mbirjax outputs of the scan-to-sinogram chain -- transmission,
 defective-pixel interpolation, detector rotation, background offset,
 downsampling, the fused scan_to_sino, zinger correction, blank-margin
 detection, the crop/geometry helpers, the cylindrical mask, the beam-hardening
-curve family, and the small helpers.  The HDF5 file is an mbirjax-written
-save_cone_preprocessing output, pinning the on-disk format as shared between
-the two packages.
+curve family, and the small helpers.  It also carries the demo-data utilities:
+the reference Shepp-Logan phantom on a non-cubic shape, the phantom, sinogram
+and view geometry that generate_demo_data produces for the parallel, cone, and
+helical-cone cases, and the recon shapes get_ct_model builds.  The HDF5 file is
+an mbirjax-written save_cone_preprocessing output, pinning the on-disk format as
+shared between the two packages.
 """
 
 import os
@@ -291,7 +294,9 @@ def main():
         demo_cases['demo_' + tag + '_phantom'] = np.asarray(ph, dtype=np.float32)
         demo_cases['demo_' + tag + '_sino'] = np.asarray(sino, dtype=np.float32)
         demo_cases['demo_' + tag + '_angles'] = np.asarray(dd_params['angles'], dtype=np.float64)
-    demo_cases['demo_hel_z_shifts'] = np.asarray(dd_params['helical_z_shifts'], dtype=np.float64)
+        if tag == 'hel':
+            demo_cases['demo_hel_z_shifts'] = np.asarray(dd_params['helical_z_shifts'],
+                                                         dtype=np.float64)
 
     gcm_par = mbirjax.get_ct_model('parallel', (8, 10, 12),
                                    np.linspace(0, np.pi, 8, endpoint=False))

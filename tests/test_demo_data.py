@@ -16,15 +16,37 @@ import mbirtorch
 
 GOLDEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "goldens")
 _npz_path = os.path.join(GOLDEN_DIR, "preprocess_goldens.npz")
+_REGENERATE = "run tests/generate_preprocess_goldens.py in the mbirjax env"
 
-pytestmark = pytest.mark.skipif(
-    not os.path.exists(_npz_path),
-    reason="no preprocess goldens: run tests/generate_preprocess_goldens.py in the mbirjax env")
+
+class _Archive:
+    """The golden archive, read one key at a time.
+
+    An archive written before a golden was added is missing that key, which
+    is the same situation as having no archive at all, so a lookup that
+    misses skips with the regeneration message rather than raising KeyError.
+    """
+
+    def __init__(self, npz):
+        self._npz = npz
+
+    def __getitem__(self, key):
+        if key not in self._npz:
+            pytest.skip(f"golden '{key}' predates this archive: {_REGENERATE}")
+        return self._npz[key]
 
 
 @pytest.fixture(scope="module")
 def golden():
-    return np.load(_npz_path)
+    """The archive, for the tests that gate against mbirjax.
+
+    Requesting this fixture is what makes a test need the archive; the tests
+    below that check mbirtorch against itself take no golden and run
+    whether or not one has been generated.
+    """
+    if not os.path.exists(_npz_path):
+        pytest.skip(f"no preprocess goldens: {_REGENERATE}")
+    return _Archive(np.load(_npz_path))
 
 
 def _rel_max(out, ref):
@@ -76,8 +98,12 @@ def test_generate_demo_data_matches_golden(golden, tag, kwargs):
     ref_sino = golden[f"demo_{tag}_sino"]
     assert tuple(phantom.shape) == tuple(ref_phantom.shape)
     assert tuple(sino.shape) == tuple(ref_sino.shape)
-    # mbirjax builds angles in float32; match at that precision.
-    assert np.allclose(params['angles'], golden[f"demo_{tag}_angles"], atol=1e-6)
+    # mbirjax builds angles in float32, so the two sets differ by the float32
+    # rounding of the same linspace: the largest measured gap is 1.21e-6, for
+    # the helical case.  An absolute gate alone holds that, with no rtol term
+    # to let a large angle through on a relative allowance.
+    assert np.allclose(params['angles'], golden[f"demo_{tag}_angles"],
+                       rtol=0, atol=5e-6)
     if tag == "hel":
         assert np.allclose(params['helical_z_shifts'], golden["demo_hel_z_shifts"], atol=1e-5)
 
@@ -108,9 +134,10 @@ def test_generate_demo_data_cube():
     assert phantom.max() > 0 and np.isfinite(np.asarray(sino)).all()
 
 
-def test_generate_demo_data_translation_needs_translation_model():
-    # The translation path is written against TranslationModel, which is not ported yet.
-    with pytest.raises(AttributeError):
+def test_generate_demo_data_translation_is_not_available():
+    # The translation path is written against TranslationModel, which is not ported
+    # yet, so the request is turned down by name rather than failing deeper in.
+    with pytest.raises(NotImplementedError, match='translation'):
         mbirtorch.generate_demo_data(model_type='translation',
                                      num_det_rows=24, num_det_channels=32)
 

@@ -70,9 +70,10 @@ verbose
 Larger values produce more status information. Change to 0 for silent operation or 2 or 3 for more detailed output.
 
 .. REPLACED(use_gpu): MBIRJAX documents a ``use_gpu`` parameter here.  MBIRTorch has no
-   such parameter, and will not: device selection is explicit rather than requested, so
+   such parameter, and will not: the device is chosen automatically, and
    :meth:`TomographyModel.configure_devices()
-   <mbirtorch.TomographyModel.configure_devices>` replaces it outright.  See
+   <mbirtorch.TomographyModel.configure_devices>` names the devices when you want to
+   choose them yourself, which replaces the parameter outright.  See
    :doc:`usr_multi_gpu`.
 
 

@@ -45,7 +45,8 @@ from .utilities import (generate_3d_shepp_logan_low_dynamic_range, clear_cache,
                         copy_ct_model, stitch_arrays,
                         get_ct_model, generate_demo_data,
                         generate_3d_shepp_logan_reference, gen_cube_phantom,
-                        gen_translation_vectors, ObjectType, ModelType,
+                        gen_translation_vectors,
+                        get_helical_half_rotation_slice_range,
                         merge_log_files)
 from .memory_stats import get_memory_stats
 
@@ -53,7 +54,9 @@ from .memory_stats import get_memory_stats
 # documented by ``automodule:: mbirtorch :members:``.  It is deliberately narrower than
 # the import list above -- the VCD and qGGMRF helpers stay importable as attributes
 # (mbirtorch.gen_full_indices still works, and the tests use that spelling) but are not
-# promised as public API, matching the surface mbirjax documents.
+# promised as public API, matching the surface mbirjax documents.  The same goes for
+# gen_cube_phantom and get_helical_half_rotation_slice_range: mbirjax's star imports put
+# them on the package, and its tests call them there, but its docs do not carry them.
 __all__ = [
     "ParallelBeamModel", "ConeBeamModel", "TomographyModel", "QGGMRFDenoiser",
     "TorchProjector", "forward_project_differentiable",

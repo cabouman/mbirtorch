@@ -1184,7 +1184,9 @@ def generate_demo_data(
 
     Args:
         object_type (str, optional): One of 'shepp-logan' or 'cube'.  Defaults to 'shepp-logan'.
-        model_type (str, optional): One of 'parallel', 'cone', or 'translation'.  Defaults to 'cone'.
+        model_type (str, optional): One of 'parallel' or 'cone'.  Defaults to 'cone'.  The
+            translation geometry is not available yet, and asking for it raises
+            NotImplementedError.
         num_views (int, optional):  Number of views in the output sinogram.  Defaults to 64. Ignored when model_type is 'translation'
         num_det_rows (int, optional): Number of rows (vertical) in the output sinogram.  Defaults to 96.
         num_det_channels (int, optional): Number of channels (horizontal) in the output sinogram.  Defaults to 128.
@@ -1215,8 +1217,7 @@ def generate_demo_data(
             - sinogram: shape (num_views, num_det_rows, num_det_channels).
             - params (dict): contains 'angles' and, for 'cone', also 'source_detector_dist' and 'source_iso_dist'.
 
-        sinogram is always a host NumPy array (what ``recon`` prefers).  object is host NumPy for
-        'shepp-logan' but a tensor for 'cube'.
+        sinogram is always a host NumPy array (what ``recon`` prefers).
     """
     import mbirtorch
 
@@ -1315,6 +1316,14 @@ def generate_demo_data(
                 'voxel_slice_aspect': voxel_slice_aspect
             }
     elif model_type == ModelType.TRANSLATION:
+        # The lines below are the translation path carried over from mbirjax.  They are
+        # kept so that porting TranslationModel is a deletion of this raise, and they
+        # cannot run until then: without the raise the branch dies partway through on a
+        # missing attribute, which says nothing about what is actually unavailable.
+        raise NotImplementedError(
+            "generate_demo_data does not support model_type='translation': the "
+            "translation geometry (TranslationModel) is not ported to mbirtorch yet.  "
+            "Use 'parallel' or 'cone'.")
         source_iso_dist = min(num_det_rows, num_det_channels) / 2
         source_detector_dist = source_iso_dist
         translation_vectors = gen_translation_vectors(num_x_translations, num_z_translations, x_spacing, z_spacing)

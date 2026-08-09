@@ -19,6 +19,42 @@ def device(request):
 
 
 @pytest.fixture(autouse=True, scope="session")
+def redirect_default_log_location(tmp_path_factory):
+    """Send the default '~/.mbirtorch' paths into the pytest tmp tree.
+
+    recon and prox_map default logfile_path to '~/.mbirtorch/logs/recon.log'
+    (prox.log), so every test that takes the default would otherwise leave a
+    real file in the user's home.  On a cluster that home is quota'd, and a
+    job that fills it fails with an empty log.
+
+    Two things narrow the redirect.  It maps only paths at or under
+    '~/.mbirtorch' and hands every other path to the real expanduser, so
+    HOME itself is untouched and torch's caches -- expensive to rebuild --
+    stay where they are.  And it patches the expansion rather than the
+    logging setup, because the composite runs (split_sino_recon,
+    recon_plastic_metal) expand the path themselves to name their per-part
+    temp files; one patch covers every site that turns a '~' into a real
+    directory.
+    """
+    base = tmp_path_factory.mktemp("mbirtorch_home")
+    real_expanduser = os.path.expanduser
+    prefix = os.path.join("~", ".mbirtorch")
+
+    def expanduser(path):
+        redirected = (isinstance(path, str)
+                      and (path == prefix or path.startswith(prefix + os.sep)))
+        if redirected:
+            expanded = os.path.join(str(base), path[2:])
+        else:
+            expanded = real_expanduser(path)
+        return expanded
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(os.path, "expanduser", expanduser)
+        yield base
+
+
+@pytest.fixture(autouse=True, scope="session")
 def pin_device_count():
     """Pin the automatic device count to 1 for the whole suite.
 

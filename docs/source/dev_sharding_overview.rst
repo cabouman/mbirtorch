@@ -12,11 +12,16 @@ control it), see :doc:`usr_multi_gpu`.
 
 **Scope.**  Sharding runs within a single process across the chosen devices
 (multiple GPUs, or CPU devices).  It works for the parallel-beam and cone-beam
-geometries.  A key invariant is that the **result is independent of the number of
-devices**: when a count does not divide evenly the data is zero-padded to equal
-shares and the padding is kept exactly inert.  Multi-node execution is out of
-scope.  Unlike MBIRJAX, the device layout is never chosen automatically; see
-:meth:`~mbirtorch.TomographyModel.configure_devices`.
+geometries.  A key invariant is that **the padding never changes the result**:
+when a count does not divide evenly the data is zero-padded to equal shares and
+the padding is kept exactly inert.  Results can still differ slightly with the
+device count, and the difference decays as iterations proceed.  Multi-node
+execution is out of scope.
+As in MBIRJAX, the device layout is chosen automatically -- on CUDA with two or
+more visible devices, a reconstruction spreads across the devices that can hold
+their share.  :meth:`~mbirtorch.TomographyModel.configure_devices` is the
+explicit door out of that choice, and ``configure_devices(num_devices=1)`` is
+the reproducibility pin.
 
 
 The two shardings

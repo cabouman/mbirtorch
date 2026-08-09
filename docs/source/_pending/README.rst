@@ -33,11 +33,10 @@ pages, each marked with a ``PENDING(<topic>)`` comment.  To find them all::
 
     grep -rn "PENDING(" docs/source
 
-Restore those fragments at the same time as the corresponding code.  Two of them
-are coupled: the ``_SaveLoadDocs`` label is defined in the ``PENDING(save_load_hdf5)``
-block in ``usr_tomography_model.rst``, and ``usr_utilities.rst`` and
-``usr_api_overview.rst`` each reference it from their own blocks, so all three must
-be restored together or the build will report an undefined label.
+Restore those fragments at the same time as the corresponding code.  Blocks can be
+coupled: when a commented-out block defines a ``:ref:`` label, every block that
+references that label has to come back with it, or the build reports an undefined
+label.  Before restoring one block on its own, grep for the labels it defines.
 
 A ``PENDING(...)`` marker means the content is expected back.  Where mbirjax
 documents something that mbirtorch has replaced and will **not** port, the marker
