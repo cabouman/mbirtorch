@@ -84,3 +84,43 @@ def test_export_recon_hdf5_accepts_shards(tmp_path):
     out, _ = mbirtorch.load_data_hdf5(out_path)
     assert out.shape == ref.shape          # padding cropped: 12 -> 11 slices
     assert np.array_equal(out, ref)
+
+
+def _small_mar_case(devices):
+    """A small cone model with a plastic cube and one metal insert."""
+    cell = (16, 16, 16)
+    angles = np.linspace(0, 2 * np.pi, cell[0], endpoint=False)
+    model = mbirtorch.ConeBeamModel(cell, angles, source_detector_dist=64,
+                                    source_iso_dist=32)
+    model.configure_devices(devices=devices)
+    model.set_params(no_warning=True, verbose=0)
+    shape = tuple(model.get_params('recon_shape'))
+    vol = np.zeros(shape, dtype=np.float32)
+    vol[4:12, 4:12, 4:12] = 0.02
+    vol[6:9, 6:9, 6:9] = 0.2
+    sino = np.asarray(model.forward_project(vol))
+    return model, sino, vol
+
+
+def test_sharded_bh_correction_matches_single_device():
+    """correct_sino_plastic_metal on 2 CPU shards vs 1 device.  Greg's A7
+    gates: the maxima are order-invariant (exact by construction); the fit
+    sums combine as per-shard doubles on the host, so the corrected sinogram
+    gates at the full-pipeline tolerance (discrete constraint selection can
+    amplify float differences)."""
+    ref_model, sino, vol = _small_mar_case(['cpu'])
+    np.random.seed(0)          # the VCD pixel orderings come from the global RNG
+    ref = mtp.recon_plastic_metal(ref_model, sino, None, num_metal=1,
+                                  num_BH_iterations=2, max_iterations=2,
+                                  verbose=0, logfile_path=None)
+
+    sh_model, _, _ = _small_mar_case(['cpu', 'cpu'])
+    np.random.seed(0)
+    out = mtp.recon_plastic_metal(sh_model, sino, None, num_metal=1,
+                                  num_BH_iterations=2, max_iterations=2,
+                                  verbose=0, logfile_path=None)
+
+    assert out.shape == ref.shape
+    rel = float(np.max(np.abs(out - ref)) / np.max(np.abs(ref)))
+    print(f"sharded vs single MAR recon rel_max = {rel:.2e}")
+    assert rel < 1e-3
