@@ -19,6 +19,7 @@ def _rel_max(out, ref):
     return float(np.max(np.abs(out - ref)) / np.max(np.abs(ref)))
 
 
+@pytest.mark.goldens
 @pytest.mark.skipif(not _paths or "den_out" not in np.load(_paths[0]).files,
                     reason="no denoiser goldens: rerun tests/generate_goldens.py")
 def test_denoiser_matches_golden():

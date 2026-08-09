@@ -64,6 +64,15 @@ docs = [
 ]
 
 
+[tool.pytest.ini_options]
+markers = [
+    # Cross-framework golden tests: they read tests/goldens artifacts generated
+    # from the mbirjax env, so they gate development checkouts and releases.
+    # The nightly runs on fresh clones without the artifacts and deselects them
+    # with -m 'not goldens', keeping its skip count meaningful.
+    "goldens: needs tests/goldens artifacts generated from the mbirjax env",
+]
+
 [tool.setuptools.packages]
 # Restrict discovery to the mbirtorch package (same rationale as mbirjax: the TOML `find`
 # defaults to namespaces=true, which would sweep __init__.py-less top-level dirs into the

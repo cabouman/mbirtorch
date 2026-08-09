@@ -27,9 +27,9 @@ GOLDEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "goldens")
 _npz_path = os.path.join(GOLDEN_DIR, "preprocess_goldens.npz")
 _h5_path = os.path.join(GOLDEN_DIR, "preprocess_goldens_cone_save.h5")
 
-pytestmark = pytest.mark.skipif(
+pytestmark = [pytest.mark.goldens, pytest.mark.skipif(
     not os.path.exists(_npz_path),
-    reason="no preprocess goldens: run tests/generate_preprocess_goldens.py in the mbirjax env")
+    reason="no preprocess goldens: run tests/generate_preprocess_goldens.py in the mbirjax env")]
 
 
 @pytest.fixture(scope="module")

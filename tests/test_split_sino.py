@@ -93,6 +93,7 @@ def test_split_rejects_bad_inputs():
         model.split_sino_recon(sino, weights=weights[:, :4, :])
 
 
+@pytest.mark.goldens
 @pytest.mark.skipif(not os.path.exists(_npz_path), reason="no preprocess goldens")
 def test_split_golden_parity():
     golden = np.load(_npz_path)

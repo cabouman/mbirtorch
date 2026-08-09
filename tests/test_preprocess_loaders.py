@@ -169,6 +169,7 @@ def test_auto_crop_sino_consistent_and_survives_build_model():
     assert tuple(rebuilt.get_params('recon_shape')) == tuple(reference.get_params('recon_shape'))
 
 
+@pytest.mark.goldens
 @pytest.mark.skipif(not os.path.exists(_npz_path), reason="no preprocess goldens")
 def test_nsi_convert_golden_parity():
     golden = np.load(_npz_path)
@@ -182,6 +183,7 @@ def test_nsi_convert_golden_parity():
     assert np.allclose(out, golden['nsi_convert'], rtol=1e-10, atol=1e-12)
 
 
+@pytest.mark.goldens
 @pytest.mark.skipif(not os.path.exists(_npz_path), reason="no preprocess goldens")
 def test_pymbir_bh_correction_golden_parity():
     golden = np.load(_npz_path)

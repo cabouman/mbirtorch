@@ -77,6 +77,7 @@ def cone_model(golden):
     return m
 
 
+@pytest.mark.goldens
 @cone_golden
 def test_cone_auto_geometry(golden, cone_model):
     assert tuple(cone_model.get_params('recon_shape')) == \
@@ -86,6 +87,7 @@ def test_cone_auto_geometry(golden, cone_model):
     assert rel < 1e-6
 
 
+@pytest.mark.goldens
 @cone_golden
 def test_cone_sparse_forward(golden, cone_model):
     out = cone_model.sparse_forward_project(golden["cone_vals"], golden["cone_subset"])
@@ -94,6 +96,7 @@ def test_cone_sparse_forward(golden, cone_model):
     assert err < 1e-4
 
 
+@pytest.mark.goldens
 @cone_golden
 def test_cone_sparse_back(golden, cone_model):
     out = cone_model.sparse_back_project(golden["cone_sino"], golden["cone_subset"])
@@ -102,6 +105,7 @@ def test_cone_sparse_back(golden, cone_model):
     assert err < 1e-4
 
 
+@pytest.mark.goldens
 @cone_golden
 def test_cone_full_forward(golden, cone_model):
     out = cone_model.forward_project(golden["cone_phantom"])
@@ -110,6 +114,7 @@ def test_cone_full_forward(golden, cone_model):
     assert err < 1e-4
 
 
+@pytest.mark.goldens
 @cone_golden
 def test_cone_hessian(golden, cone_model):
     out = cone_model.compute_hessian_diagonal(
@@ -119,6 +124,7 @@ def test_cone_hessian(golden, cone_model):
     assert err < 1e-4
 
 
+@pytest.mark.goldens
 @cone_golden
 def test_cone_fdk(golden, cone_model):
     out = cone_model.fdk_recon(golden["cone_sino"])
@@ -127,6 +133,7 @@ def test_cone_fdk(golden, cone_model):
     assert err < 1e-3
 
 
+@pytest.mark.goldens
 @cone_golden
 def test_cone_recon_convergence_parity(golden, cone_model):
     np.random.seed(int(golden["recon_seed"]))

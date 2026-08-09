@@ -21,8 +21,8 @@ import mbirtorch
 GOLDEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "goldens")
 _paths = sorted(glob.glob(os.path.join(GOLDEN_DIR, "golden_*.npz")))
 
-pytestmark = pytest.mark.skipif(
-    not _paths, reason="no goldens: run tests/generate_goldens.py in the mbirjax env")
+pytestmark = [pytest.mark.goldens, pytest.mark.skipif(
+    not _paths, reason="no goldens: run tests/generate_goldens.py in the mbirjax env")]
 
 
 @pytest.fixture(scope="module")

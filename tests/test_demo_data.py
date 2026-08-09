@@ -55,11 +55,13 @@ def _rel_max(out, ref):
     return float(np.max(np.abs(out - ref)) / max(np.max(np.abs(ref)), 1e-30))
 
 
+@pytest.mark.goldens
 def test_reference_phantom_matches_exactly(golden):
     out = mbirtorch.generate_3d_shepp_logan_reference((32, 30, 28))
     assert np.array_equal(out, golden["ref_phantom"])
 
 
+@pytest.mark.goldens
 def test_get_ct_model_classes_and_shapes(golden):
     par = mbirtorch.get_ct_model('parallel', (8, 10, 12),
                                  np.linspace(0, np.pi, 8, endpoint=False))
@@ -91,6 +93,7 @@ def test_get_ct_model_warns_on_parallel_z_shifts():
     ("hel", dict(model_type='cone', use_helical=True, helical_pitch=0.5,
                  helical_z_range=16.0)),
 ])
+@pytest.mark.goldens
 def test_generate_demo_data_matches_golden(golden, tag, kwargs):
     phantom, sino, params = mbirtorch.generate_demo_data(
         num_views=12, num_det_rows=24, num_det_channels=32, **kwargs)
