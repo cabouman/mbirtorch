@@ -66,3 +66,21 @@ def test_one_shard_input_returns_one_shard_output():
         shards, num_metal=1, valid_mask=valid_mask, num_real_slices=num_real)
     assert isinstance(p, _sharding.Shards) and p.placement.n_devices == 1
     assert isinstance(m[0], _sharding.Shards)
+
+
+def test_export_recon_hdf5_accepts_shards(tmp_path):
+    """Exporting a sharded volume writes the same file as exporting it whole:
+    gathered at the file boundary, padding cropped."""
+    import os
+    vol = _test_volume()
+    shards, _mask, _nreal = _as_shards(vol, 2)
+
+    ref_path = os.path.join(str(tmp_path), 'ref.h5')
+    out_path = os.path.join(str(tmp_path), 'sharded.h5')
+    mbirtorch.export_recon_hdf5(ref_path, vol)
+    mbirtorch.export_recon_hdf5(out_path, shards)
+
+    ref, _ = mbirtorch.load_data_hdf5(ref_path)
+    out, _ = mbirtorch.load_data_hdf5(out_path)
+    assert out.shape == ref.shape          # padding cropped: 12 -> 11 slices
+    assert np.array_equal(out, ref)

@@ -18,6 +18,7 @@ import warnings
 from enum import Enum
 
 import numpy as np
+from . import _sharding
 
 
 def clear_cache(_root=None):
@@ -156,7 +157,19 @@ def makedirs(file_path):
 
 
 def _to_host(array):
-    """Move a numpy array or torch tensor (any device) to a host numpy array."""
+    """Move a numpy array, torch tensor (any device), or sharded volume to a
+    host numpy array.  A sharded volume is concatenated on the host and any
+    zero-padding of its sharded axis is cropped, so the result equals the
+    single-device volume."""
+    if isinstance(array, _sharding.Shards):
+        # gather() already returns numpy; do not convert it again.
+        out = array.gather()
+        pl = array.placement
+        if pl.real_size is not None and pl.padded_size > pl.real_size:
+            sel = [slice(None)] * out.ndim
+            sel[pl.axis % out.ndim] = slice(0, pl.real_size)
+            out = out[tuple(sel)]
+        return out
     if hasattr(array, 'detach'):
         return array.detach().cpu().numpy()
     return np.asarray(array)
@@ -253,7 +266,9 @@ def save_data_hdf5(file_path, array, array_name='array', attributes_dict=None):
         >>> file_path = './output/test_part_038.h5'
         >>> mbirtorch.save_data_hdf5(file_path, recon, recon_info)
     """
-    array = _to_host(array) if hasattr(array, 'detach') else array
+    array = (_to_host(array)
+             if (hasattr(array, 'detach') or isinstance(array, _sharding.Shards))
+             else array)
 
     # Stream the array to disk slab-by-slab (no full contiguous copy, even for a strided view).
     def produce_slab(i0, i1):
@@ -266,13 +281,15 @@ def export_recon_hdf5(file_path, recon, recon_dict=None, remove_flash=False, rad
     """
     Export a 3D reconstruction volume to an HDF5 file with optional post-processing.
 
-    This function works with either numpy arrays or torch tensors.
+    This function works with numpy arrays, torch tensors, and sharded volumes (a ``Shards``
+    container): a sharded volume is gathered to the host at this file boundary and any
+    zero-padding of its slice axis is cropped, so the file equals the single-device export.
     The function also transposes the reconstruction to right-hand coordinates (slice, col, row),
     and writes the reconstruction and optional metadata to an HDF5 file.
 
     Args:
         file_path (str): Full path to the output HDF5 file. Parent directories will be created if they do not exist.
-        recon (ndarray or tensor): 3D volume in (row, col, slice) order. Will be converted to NumPy before writing.
+        recon (ndarray, tensor, or Shards): 3D volume in (row, col, slice) order. Will be converted to NumPy before writing.
         recon_dict (dict, optional): Dictionary of attributes to store as metadata in the dataset.
         remove_flash (bool, optional): Whether to apply a cylindrical mask to remove peripheral and top/bottom slices. Defaults to False.
         radial_margin (int, optional): Margin in pixels to subtract from the cylinder radius. Defaults to 10.
