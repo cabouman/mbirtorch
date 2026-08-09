@@ -416,7 +416,7 @@ def scan_to_sino(obj_scan, blank_scan, dark_scan, defective_pixel_array=(),
     Compute the sinogram from the object, blank, and dark scans, with optional down-sampling and
     detector rotation.
 
-    The steps run as one fused kernel per view batch.
+    The steps run as one fused kernel per view batch, view-sharded across devices.
 
     Args:
         obj_scan, blank_scan, dark_scan (ndarray): cropped scans (object batched along axis 0).
@@ -424,12 +424,15 @@ def scan_to_sino(obj_scan, blank_scan, dark_scan, defective_pixel_array=(),
         downsample_factor (tuple[int, int]): detector row/channel downsample; (1, 1) skips downsampling.
         det_rotation (float): detector rotation in radians; 0 skips the rotation.
         batch_size (int): number of views per on-device batch.
-        devices (sequence or None): accepted for interface compatibility; the views run on a single
-            device.
+        devices (sequence or None): devices to spread the views over.  None (default) uses all
+            visible CUDA devices, or the default device when there are none.
 
     Returns:
         numpy.ndarray: the sinogram, shape (num_views, num_det_rows, num_det_channels).
     """
+    if devices is None:
+        n = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        devices = [f'cuda:{i}' for i in range(n)] if n > 0 else None
     obj_flat_indices = new_size1 = new_size2 = block_shape = None
     do_downsample = downsample_factor[0] * downsample_factor[1] > 1
     if do_downsample:
