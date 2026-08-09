@@ -668,16 +668,17 @@ class TomographyModel(ParameterHandler):
         Without this, a geometry-changing set_params after configure_devices
         left the placements' real sizes stale, and the placement functions
         sliced with stale ranges -- silently truncating sharded arrays (the
-        mbirjax counterpart re-runs its device setup on every recompile)."""
-        if not self.sino_placement.is_trivial:
-            devices = self.sino_placement.devices
-            sinogram_shape, recon_shape = self.get_params(
-                ['sinogram_shape', 'recon_shape'])
-            self.sino_placement = _sharding.Placement(
-                devices, axis=0, real_size=int(sinogram_shape[0]))
-            self.recon_placement = _sharding.Placement(
-                devices, axis=-1, real_size=int(recon_shape[2]))
-            self._check_no_empty_shard()
+        mbirjax counterpart re-runs its device setup on every recompile).
+        Single-device placements are rebuilt too: their real sizes feed the
+        same consumers (e.g. the cone DC-damping profile)."""
+        devices = self.sino_placement.devices
+        sinogram_shape, recon_shape = self.get_params(
+            ['sinogram_shape', 'recon_shape'])
+        self.sino_placement = _sharding.Placement(
+            devices, axis=0, real_size=int(sinogram_shape[0]))
+        self.recon_placement = _sharding.Placement(
+            devices, axis=-1, real_size=int(recon_shape[2]))
+        self._check_no_empty_shard()
         self._invalidate_device_caches()
         if self._projector_functions is not None:
             self.create_projectors()
