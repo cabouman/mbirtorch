@@ -316,22 +316,29 @@ class TomographyModel(ParameterHandler):
 
     # ── projection wrappers (numpy at the public boundary) ────────────────────
     def sparse_forward_project(self, voxel_values, pixel_indices):
-        """Cylinders at ``pixel_indices`` -> full sinogram (tensor, or view
-        shards under a multi-device configuration)."""
+        """Cylinders at ``pixel_indices`` -> full sinogram.  This is the ONE
+        funnel for sparse forward projection: the recon engine, the dense
+        wrappers, and external callers all route here, so the surface the
+        metrics harness measures is the surface the engine runs.  The output
+        matches the input form: a plain tensor in, a tensor out (single
+        device); ``Shards`` in, or a multi-device placement, view shards out."""
         voxel_values = self._shard_recon(voxel_values)
         if isinstance(voxel_values, _sharding.Shards):
             return self._sparse_forward_project_sharded(voxel_values, pixel_indices)
-        return self.projector_functions.sparse_forward_project(voxel_values, pixel_indices)
+        return self.projector_functions._sparse_forward_project_single_device(
+            voxel_values, pixel_indices)
 
     def sparse_back_project(self, sinogram, pixel_indices, coeff_power=1):
-        """Sinogram -> cylinders at ``pixel_indices`` (tensor, or slice shards
-        under a multi-device configuration)."""
+        """Sinogram -> cylinders at ``pixel_indices``.  The one funnel for
+        sparse back projection (see :meth:`sparse_forward_project`); the
+        output matches the input form: tensor in, tensor out; ``Shards`` in,
+        or a multi-device placement, slice shards out."""
         sinogram = self._shard_sinogram(sinogram)
         if isinstance(sinogram, _sharding.Shards):
             return self._sparse_back_project_sharded(sinogram, pixel_indices,
                                                      coeff_power=coeff_power)
-        return self.projector_functions.sparse_back_project(sinogram, pixel_indices,
-                                                            coeff_power=coeff_power)
+        return self.projector_functions._sparse_back_project_single_device(
+            sinogram, pixel_indices, coeff_power=coeff_power)
 
     def _band_pool(self, n):
         """The thread pool for a banded projection's per-band fan-outs:
@@ -425,7 +432,7 @@ class TomographyModel(ParameterHandler):
         assembly, keeping the device form inert end to end."""
         if voxel_shards.placement.is_trivial:
             return _sharding.Shards(
-                [self.projector_functions.sparse_forward_project(
+                [self.projector_functions._sparse_forward_project_single_device(
                     voxel_shards.tensors[0], pixel_indices)],
                 self.sino_placement)
         sp, rp, view_spans, band_ranges, idx_per = self._banded_setup(pixel_indices)
@@ -535,7 +542,7 @@ class TomographyModel(ParameterHandler):
         invariant the prior and the stats rely on."""
         if sino_shards.placement.is_trivial:
             return _sharding.Shards(
-                [self.projector_functions.sparse_back_project(
+                [self.projector_functions._sparse_back_project_single_device(
                     sino_shards.tensors[0], pixel_indices,
                     coeff_power=coeff_power)],
                 self.recon_placement)
@@ -1416,7 +1423,7 @@ class TomographyModel(ParameterHandler):
             flat = _sharding.Shards(
                 [t.reshape(-1, t.shape[-1])[indices.to(t.device)]
                  for t in recon.tensors], recon.placement)
-            sinogram = self._sparse_forward_project_sharded(flat, indices)
+            sinogram = self.sparse_forward_project(flat, indices)
         else:
             voxel_values = recon.reshape(-1, recon.shape[-1])[indices]
             sinogram = self.sparse_forward_project(voxel_values, indices)
@@ -2153,7 +2160,7 @@ class TomographyModel(ParameterHandler):
                         executor=self._per_device_pool), sino_placement)
 
             # Back project to get the gradient; note fm_constant = 1/sigma_y^2.
-            back_projected_error = self._sparse_back_project_sharded(weighted_error_sinogram, pixel_indices)
+            back_projected_error = self.sparse_back_project(weighted_error_sinogram, pixel_indices)
             if not const_weights:
                 # The weighted product (a sinogram-sized transient) is dead
                 # here: the non-constant line-search terms fuse the weights
@@ -2199,7 +2206,7 @@ class TomographyModel(ParameterHandler):
             del prior_terms, back_projected_error, direction_results
 
             # Compute the update direction in the sinogram domain.
-            delta_sinogram = self._sparse_forward_project_sharded(
+            delta_sinogram = self.sparse_forward_project(
                 _sharding.Shards(delta_recon_per_device, recon_placement), pixel_indices)
 
             # Forward line-search reductions per view-shard.
@@ -2239,7 +2246,7 @@ class TomographyModel(ParameterHandler):
                                          delta_recon_per_device[i])
                 delta_recon_per_device[:] = _sharding.run_per_device(
                     devices, positivity_worker, executor=self._per_device_pool)
-                delta_sinogram = self._sparse_forward_project_sharded(
+                delta_sinogram = self.sparse_forward_project(
                     _sharding.Shards(delta_recon_per_device, recon_placement), pixel_indices)
 
             # Perform sparse updates at the index locations, IN PLACE, each

@@ -353,8 +353,8 @@ class Projectors:
                                           view_range, slice_start=0,
                                           dev_index=0, plan=None):
         """Forward-project voxel values into ONE view-owner's sinogram block:
-        the single forward loop -- the full-range public form is the adapter
-        below over (0, num_views).  The geometry body owns all geometry,
+        the single forward loop -- the single-device full-range form is the
+        adapter below over (0, num_views).  The geometry body owns all geometry,
         layout, and output orientation; this loop owns view slicing, the
         transient budget, and assembly (output sized lazily from the first
         block, so the driver never derives geometry-specific shapes).
@@ -441,11 +441,14 @@ class Projectors:
                 out.add_(block)
         return out
 
-    def sparse_forward_project(self, voxel_values, pixel_indices):
-        """Forward project voxel cylinders into a full sinogram: the public
-        adapter over the view-range loop at (0, num_views) on device 0,
-        coercing array-likes to placed tensors first.  For a row-aligned
-        geometry the output row count equals the input column count -- the
+    def _sparse_forward_project_single_device(self, voxel_values, pixel_indices):
+        """Forward project voxel cylinders into a full sinogram on ONE device:
+        the view-range loop at (0, num_views) on device 0, coercing
+        array-likes to placed tensors first.  This is the trivial-placement
+        form only -- both of its callers are the trivial branches in
+        TomographyModel, and every external call funnels through
+        TomographyModel.sparse_forward_project.  For a row-aligned geometry
+        the output row count equals the input column count -- the
         rows==slices invariant its verify_valid_params enforces."""
         m = self.model
         num_views = int(m.get_params('sinogram_shape')[0])
@@ -456,10 +459,13 @@ class Projectors:
         return self.sparse_forward_project_view_range(
             voxel_values, pixel_indices, (0, num_views), dev_index=0)
 
-    def sparse_back_project(self, sinogram, pixel_indices, coeff_power=1):
+    def _sparse_back_project_single_device(self, sinogram, pixel_indices,
+                                           coeff_power=1):
         """Back project a full sinogram onto the voxel cylinders at
-        ``pixel_indices``: the public adapter over the view-range loop at
-        (0, num_views) on device 0.
+        ``pixel_indices`` on ONE device: the view-range loop at
+        (0, num_views) on device 0.  The trivial-placement form only (see
+        :meth:`_sparse_forward_project_single_device`); every external call
+        funnels through TomographyModel.sparse_back_project.
 
         Args:
             sinogram: (num_views, num_det_rows, num_det_channels).
