@@ -689,6 +689,9 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
     Create a TomographyModel with the same type and parameters as the given ct_model except with the new input angles
     and a corresponding sinogram shape.  Restricted to ParallelBeam and ConeBeam models.
 
+    If the user explicitly set the devices on ct_model with configure_devices, the copy
+    gets the same devices.  Otherwise the copy chooses its own devices when it is used.
+
     Args:
         ct_model (TomographyModel): The model to copy.
         new_angles (ndarray of float, optional): 1D vector of projection angles in radians.
@@ -746,7 +749,11 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
 
     # The sinogram shape changed, so drop recon_shape and let build_model's auto pass recompute it.
     optional.pop('recon_shape', None)
-    return build_model(required, optional, regularization)
+    new_model = build_model(required, optional, regularization)
+    # If the user explicitly set the devices, the copy inherits them.
+    if not ct_model.device_layout_is_automatic:
+        new_model.configure_devices(devices=list(ct_model.sino_placement.devices))
+    return new_model
 
 
 def calc_tct_recon_params(source_det_dist, source_iso_dist, delta_det_row, delta_det_channel, sinogram_shape, translation_vectors, voxel_row_aspect=1.0, voxel_slice_aspect=1.0):

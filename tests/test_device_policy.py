@@ -389,3 +389,22 @@ def test_a_cone_model_names_split_sino_recon_as_a_remedy():
     assert any('split_sino_recon' in line
                for line in cone._memory_remedies())
     assert not parallel._memory_remedies()
+
+
+# ── device inheritance through copy_ct_model ─────────────────────────────────
+def test_copy_ct_model_inherits_an_explicit_device_choice():
+    """A copy of a model whose devices the user set gets the same devices."""
+    angles = np.linspace(0, np.pi, 8, endpoint=False)
+    model = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
+    model.configure_devices(devices=['cpu', 'cpu'])
+    copy = mbirtorch.copy_ct_model(model, new_num_det_rows=4)
+    assert copy.device_layout_is_automatic is False
+    assert copy.sino_placement.devices == model.sino_placement.devices
+
+
+def test_copy_ct_model_leaves_an_automatic_model_automatic():
+    """A copy of a model with no explicit device choice chooses for itself."""
+    angles = np.linspace(0, np.pi, 8, endpoint=False)
+    model = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
+    copy = mbirtorch.copy_ct_model(model, new_num_det_rows=4)
+    assert copy.device_layout_is_automatic is True

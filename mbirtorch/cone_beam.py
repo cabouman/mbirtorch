@@ -1004,11 +1004,6 @@ class ConeBeamModel(TomographyModel):
         # auto_regularize_flag=False so they do not re-derive from their partial sinograms.
         self.auto_set_regularization_params(sino)
 
-        # The user's device choice, if any, to pass on to the half models
-        # (copy_ct_model does not carry it over).
-        parent_devices = (list(self.sino_placement.devices)
-                          if not self.device_layout_is_automatic else None)
-
         def _recon_one_half(lo, hi, recon_shape, recon_slice_offset, is_top, half_logfile_path):
             """Reconstruct one detector-row half on the host; return (host_recon, recon_dict).
 
@@ -1021,18 +1016,13 @@ class ConeBeamModel(TomographyModel):
             det_center = (num_rows - 1) / 2.0
             det_row_offset = full_det_row_offset + (full_det_center - (det_center + lo)) * delta_det_row
 
-            # Half model: copy the parent's parameters, set this half's detector/recon geometry, then
-            # pin to the parent's devices.  configure_devices rebuilds the placement for THIS half's
-            # recon shape; a non-dividing slice axis pads inertly.
+            # Half model: copy the parent's parameters (including any explicit device
+            # choice; see copy_ct_model), then set this half's detector/recon geometry.
             model = copy_ct_model(self, new_num_det_rows=num_rows)
             model.set_params(det_row_offset=det_row_offset)
             model.set_params(no_warning=True, auto_regularize_flag=False)
             model.set_params(recon_shape=recon_shape)
             model.set_params(recon_slice_offset=recon_slice_offset)
-            # If the user explicitly set the devices, pass them to the half models.
-            # Otherwise, let each half choose its own when it reconstructs.
-            if not self.device_layout_is_automatic:
-                model.configure_devices(devices=parent_devices)
 
             # Sinogram and weight slices are host VIEWS (nothing mutates them; weights=None passes
             # through so the half recon uses its constant-weight path with no ones array built).
