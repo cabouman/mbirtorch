@@ -22,6 +22,12 @@ fi
 # PATH ordering.
 # -ra: print the short test-summary block (incl. `FAILED <nodeid>` lines) so the regression
 # harness can capture WHICH tests failed for the dashboard, not just the count.
-python -m pytest -ra -n "$NPROC" ../tests
+# The cross-framework golden tests are opt-in (pyproject addopts deselects the
+# `goldens` marker).  RUN_GOLDENS=1 opts this run in, overriding that default.
+if [ "${RUN_GOLDENS:-0}" = "1" ]; then
+  python -m pytest -ra -n "$NPROC" -m "goldens or not goldens" ../tests
+else
+  python -m pytest -ra -n "$NPROC" ../tests
+fi
 
 

@@ -65,12 +65,16 @@ docs = [
 
 
 [tool.pytest.ini_options]
+# The cross-framework golden tests are OPT-IN: addopts deselects them, so a
+# plain `pytest tests` runs the self-contained suite only.  They pin mbirtorch
+# to mbirjax and will retire once mbirjax freezes and intentional
+# non-backward-compatible changes begin, so they must not sit in every run's
+# path.  Opt in with `-m goldens` (parity tests alone) or
+# `-m "goldens or not goldens"` (the full suite, e.g. the release gate) -- a
+# -m on the command line overrides this default.
+addopts = "-m 'not goldens'"
 markers = [
-    # Cross-framework golden tests: they read tests/goldens artifacts generated
-    # from the mbirjax env, so they gate development checkouts and releases.
-    # The nightly runs on fresh clones without the artifacts and deselects them
-    # with -m 'not goldens', keeping its skip count meaningful.
-    "goldens: needs tests/goldens artifacts generated from the mbirjax env",
+    "goldens: opt-in cross-framework parity tests; need tests/goldens artifacts generated from the mbirjax env",
 ]
 
 [tool.setuptools.packages]
