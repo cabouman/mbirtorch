@@ -66,3 +66,36 @@ def test_denoise_reduces_noise(device):
     err_noisy = np.linalg.norm(noisy - clean)
     err_den = np.linalg.norm(denoised - clean)
     assert err_den < 0.6 * err_noisy, (err_den, err_noisy)
+
+
+def test_sharded_denoise_matches_single_device():
+    """Two CPU shards vs one device on the same seeded problem.  The sharded
+    path stages halos once per pass and combines the step-size sums on the
+    host, so agreement is at float level, not bitwise (gate per the measured
+    iterated-comparison floor)."""
+    shape = (24, 24, 21)   # 2 shards pad the slice axis 21 -> 22
+    clean = np.zeros(shape, dtype=np.float32)
+    clean[6:-6, 6:-6, 5:-5] = 1.0
+    noisy = clean + 0.1 * np.random.RandomState(4).randn(*shape).astype(np.float32)
+
+    ref_den = mbirtorch.QGGMRFDenoiser(shape)
+    ref_den.configure_devices(devices=['cpu'])
+    ref_den.set_params(no_warning=True, verbose=0)
+    np.random.seed(0)
+    ref, ref_dict = ref_den.denoise(noisy, sigma_noise=0.1, max_iterations=5,
+                                    stop_threshold_change_pct=0.0, logfile_path=None)
+
+    sh_den = mbirtorch.QGGMRFDenoiser(shape)
+    sh_den.configure_devices(devices=['cpu', 'cpu'])
+    sh_den.set_params(no_warning=True, verbose=0)
+    np.random.seed(0)
+    out, out_dict = sh_den.denoise(noisy, sigma_noise=0.1, max_iterations=5,
+                                   stop_threshold_change_pct=0.0, logfile_path=None)
+
+    assert out.shape == ref.shape
+    rel = float(np.max(np.abs(out - ref)) / np.max(np.abs(ref)))
+    print(f"sharded vs single denoise rel_max = {rel:.2e}")
+    assert rel < 1e-4
+    # The denoiser dict now carries the run log and notes, like recon's.
+    # (verbose=0 logs no iteration lines, so only the keys are checked.)
+    assert 'recon_log' in out_dict and 'notes' in out_dict
