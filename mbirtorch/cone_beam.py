@@ -1004,9 +1004,10 @@ class ConeBeamModel(TomographyModel):
         # auto_regularize_flag=False so they do not re-derive from their partial sinograms.
         self.auto_set_regularization_params(sino)
 
-        # The parent's device layout, carried to each half model so an explicit multi-GPU
-        # configuration is preserved (copy_ct_model does not carry the layout).
-        parent_devices = list(self.sino_placement.devices)
+        # The user's device choice, if any, to pass on to the half models
+        # (copy_ct_model does not carry it over).
+        parent_devices = (list(self.sino_placement.devices)
+                          if not self.device_layout_is_automatic else None)
 
         def _recon_one_half(lo, hi, recon_shape, recon_slice_offset, is_top, half_logfile_path):
             """Reconstruct one detector-row half on the host; return (host_recon, recon_dict).
@@ -1028,12 +1029,10 @@ class ConeBeamModel(TomographyModel):
             model.set_params(no_warning=True, auto_regularize_flag=False)
             model.set_params(recon_shape=recon_shape)
             model.set_params(recon_slice_offset=recon_slice_offset)
-            # Pin UNCONDITIONALLY, not only for multi-device parents: an explicit
-            # configure_devices call is what keeps a half model out of any automatic
-            # device-count path, so a parent pinned to one device gets halves pinned to
-            # that same device rather than halves free to widen on their own.  At one
-            # device this rebuilds the same trivial placement it would have had.
-            model.configure_devices(devices=parent_devices)
+            # If the user explicitly set the devices, pass them to the half models.
+            # Otherwise, let each half choose its own when it reconstructs.
+            if not self.device_layout_is_automatic:
+                model.configure_devices(devices=parent_devices)
 
             # Sinogram and weight slices are host VIEWS (nothing mutates them; weights=None passes
             # through so the half recon uses its constant-weight path with no ones array built).
