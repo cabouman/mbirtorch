@@ -209,3 +209,40 @@ def test_sharded_bh_correction_matches_single_device():
     rel = float(np.max(np.abs(out - ref)) / np.max(np.abs(ref)))
     print(f"sharded vs single MAR recon rel_max = {rel:.2e}")
     assert rel < 1e-3
+
+
+def test_sharded_save_and_export_stream_by_slab(tmp_path, monkeypatch):
+    """Sharded saves gather one slab at a time (never the whole volume) and
+    still write byte-identical files.  The slab size is shrunk so several
+    slabs are written; both sharding axes are covered (views: axis 0;
+    recon slices: last axis, padded 11 -> 12)."""
+    import os
+    from mbirtorch import _sharding, utilities
+    monkeypatch.setattr(utilities, '_HDF5_SLAB_BYTES', 256)
+
+    def as_shards(vol, axis, n):
+        pl = _sharding.Placement(['cpu'] * n, axis=axis, real_size=vol.shape[axis])
+        pad = list(vol.shape)
+        pad[axis] = pl.padded_size
+        padded = np.zeros(pad, dtype=vol.dtype)
+        sel = [slice(None)] * vol.ndim
+        sel[axis] = slice(0, vol.shape[axis])
+        padded[tuple(sel)] = vol
+        tensors = []
+        for _d, (s0, s1) in pl.shard_ranges(pl.padded_size):
+            cut = [slice(None)] * vol.ndim
+            cut[axis] = slice(s0, s1)
+            tensors.append(torch.as_tensor(padded[tuple(cut)]))
+        return _sharding.Shards(tensors, pl)
+
+    vol = np.random.RandomState(8).rand(9, 7, 11).astype(np.float32)
+
+    p1 = os.path.join(str(tmp_path), 'axis0.h5')
+    mbirtorch.save_data_hdf5(p1, as_shards(vol, 0, 2), array_name='volume')
+    out, _ = mbirtorch.load_data_hdf5(p1)
+    assert np.array_equal(out, vol)
+
+    p2 = os.path.join(str(tmp_path), 'slices.h5')
+    mbirtorch.export_recon_hdf5(p2, as_shards(vol, 2, 2))
+    out, _ = mbirtorch.import_recon_hdf5(p2)
+    assert np.array_equal(out, vol)

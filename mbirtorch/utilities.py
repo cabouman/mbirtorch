@@ -214,6 +214,53 @@ def load_data_hdf5(file_path):
         return array, data_dict
 
 
+def _shard_axis_block(shards, i0, i1):
+    """Host copy of the global range [i0, i1) of a sharded volume's SHARDED
+    axis (real coordinates; padding never included), all other axes full.
+    Only this block leaves the devices, so a caller that walks the axis in
+    slabs never holds the whole volume on the host.
+
+    Shard extents are read off the TENSORS rather than the placement, and the
+    dtype off an empty slice -- the rule :func:`_sharded_slab_source` uses --
+    so this holds whether or not ``real_size`` was supplied (a placement built
+    without it has ``padded_size is None``, which the placement-derived form
+    turns into a None-length axis).
+    """
+    pl = shards.placement
+    ndim = shards.tensors[0].ndim
+    axis = pl.axis % ndim
+    sizes = [int(t.shape[axis]) for t in shards.tensors]
+    starts = np.cumsum([0] + sizes)
+    real_end = int(pl.real_size) if pl.real_size is not None else int(starts[-1])
+    pieces = []
+    for t, s0, s1 in zip(shards.tensors, starts[:-1], starts[1:]):
+        lo, hi = max(i0, int(s0)), min(i1, min(int(s1), real_end))
+        if lo < hi:
+            sel = [slice(None)] * ndim
+            sel[axis] = slice(lo - int(s0), hi - int(s0))
+            pieces.append(t[tuple(sel)].detach().cpu().numpy())
+    return pieces[0] if len(pieces) == 1 else np.concatenate(pieces, axis=axis)
+
+
+def _sharded_host_shape_dtype(shards):
+    """The shape and numpy dtype of a sharded volume's host form (sharded
+    axis at its real size), computed without gathering anything.  Same extent
+    and dtype rules as :func:`_shard_axis_block`."""
+    pl = shards.placement
+    ndim = shards.tensors[0].ndim
+    axis = pl.axis % ndim
+    shape = [int(v) for v in shards.tensors[0].shape]
+    total = sum(int(t.shape[axis]) for t in shards.tensors)
+    shape[axis] = int(pl.real_size) if pl.real_size is not None else total
+    np_dtype = shards.tensors[0][:0].detach().cpu().numpy().dtype
+    return tuple(shape), np_dtype
+
+
+# Bytes per streamed HDF5 write; a module constant so tests can shrink it to
+# exercise the multi-slab path on small arrays.
+_HDF5_SLAB_BYTES = 1 << 30
+
+
 def _write_hdf5_streaming(file_path, array_name, out_shape, dtype, produce_slab, attributes_dict=None):
     """Create an HDF5 dataset of out_shape/dtype and fill it slab-by-slab along axis 0.
 
@@ -229,7 +276,7 @@ def _write_hdf5_streaming(file_path, array_name, out_shape, dtype, produce_slab,
             dset[...] = produce_slab(0, 0)
         else:
             row_bytes = np.dtype(dtype).itemsize * int(np.prod(out_shape[1:], dtype=np.int64))
-            slab = max(1, (1 << 30) // max(row_bytes, 1))   # ~1 GiB per write
+            slab = max(1, _HDF5_SLAB_BYTES // max(row_bytes, 1))
             for i in range(0, out_shape[0], slab):
                 dset[i:i + slab] = produce_slab(i, min(i + slab, out_shape[0]))
         if isinstance(attributes_dict, dict):
@@ -366,28 +413,41 @@ def export_recon_hdf5(file_path, recon, recon_dict=None, remove_flash=False, rad
         >>> recon = np.ones((128, 128, 64))  # (row, col, slice) order
         >>> export_recon_hdf5("output/recon_volume.h5", recon, recon_dict={"scan_id": "sample1"})
     """
-    # Move the input to the host (NumPy) first so numpy and device tensors collapse to one host case.
-    recon = _to_host(recon)
+    # A 3-D slice-sharded volume streams slab by slab straight from the devices;
+    # anything else (numpy, tensor, an unusually-sharded container, a flat
+    # (num_pixels, num_slices) form) collapses to one host array first.  The rank
+    # is checked as well as the axis, so a 2-D container cannot reach the
+    # three-way shape unpacking below.
+    if (isinstance(recon, _sharding.Shards) and recon.tensors[0].ndim == 3
+            and recon.placement.axis % 3 == 2):
+        (num_rows, num_cols, num_slices), np_dtype = _sharded_host_shape_dtype(recon)
 
-    if not remove_flash:
-        # Transposed view; save_data_hdf5 streams it slab-by-slab, so no full copy is made.
-        save_data_hdf5(file_path, np.transpose(recon, (2, 1, 0)), 'recon', recon_dict)
-        return
+        def get_block(s0, s1):
+            return _shard_axis_block(recon, s0, s1)          # (R, C, ds) on the host
+    else:
+        recon = _to_host(recon)
+        num_rows, num_cols, num_slices = recon.shape
+        np_dtype = recon.dtype
 
-    # remove_flash: mask + transpose + write one slab at a time, so no full masked volume is built.
-    # Slabbing along the slice axis keeps full (rows, cols), so apply_cylindrical_mask gives the
-    # identical circular mask per slab; we just map the global top/bottom margins to each slab.
+        def get_block(s0, s1):
+            return recon[:, :, s0:s1]
+
+    # Mask (optionally) + transpose + write one slab at a time, so no full transposed or masked
+    # volume is built.  Slabbing along the slice axis keeps full (rows, cols), so
+    # apply_cylindrical_mask gives the identical circular mask per slab; we just map the global
+    # top/bottom margins to each slab.
     from . import preprocess
-    num_rows, num_cols, num_slices = recon.shape
 
     def produce_slab(s0, s1):
-        ds = s1 - s0
-        local_top = min(max(top_margin - s0, 0), ds)                       # global top slices in this slab
-        local_bottom = min(max(s1 - (num_slices - bottom_margin), 0), ds)  # global bottom slices in this slab
-        block = preprocess.apply_cylindrical_mask(recon[:, :, s0:s1], radial_margin, local_top, local_bottom)
-        return np.ascontiguousarray(np.transpose(block, (2, 1, 0)))        # (ds, C, R)
+        block = get_block(s0, s1)
+        if remove_flash:
+            ds = s1 - s0
+            local_top = min(max(top_margin - s0, 0), ds)                       # global top slices in this slab
+            local_bottom = min(max(s1 - (num_slices - bottom_margin), 0), ds)  # global bottom slices in this slab
+            block = preprocess.apply_cylindrical_mask(block, radial_margin, local_top, local_bottom)
+        return np.ascontiguousarray(np.transpose(block, (2, 1, 0)))            # (ds, C, R)
 
-    _write_hdf5_streaming(file_path, 'recon', (num_slices, num_cols, num_rows), recon.dtype,
+    _write_hdf5_streaming(file_path, 'recon', (num_slices, num_cols, num_rows), np_dtype,
                           produce_slab, recon_dict)
 
 
@@ -396,7 +456,9 @@ def _resolve_geometry_class(geometry_type):
     ``get_all_params`` and the scan readers)."""
     import mbirtorch
     geometry_type = str(geometry_type)
-    for name in ('ConeBeamModel', 'ParallelBeamModel', 'TranslationModel'):
+    for name in ('ConeBeamModel', 'MultiAxisParallelBeamModel',
+                 'MultiAxisParallelModel', 'ParallelBeamModel',
+                 'TranslationModel'):
         if name in geometry_type:
             model_class = getattr(mbirtorch, name, None)
             if model_class is None:
@@ -793,7 +855,10 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
     elif str(type(ct_model)).find('ParallelBeamModel') > 0:
         is_cone = False
     else:
-        raise TypeError('copy_ct_model() is restricted to ConeBeam and ParallelBeam Models')
+        raise TypeError('copy_ct_model() supports ConeBeamModel and ParallelBeamModel only; '
+                        f'got {type(ct_model).__name__}.  TranslationModel and '
+                        'MultiAxisParallelModel are not yet supported (matching mbirjax); '
+                        'construct the new model directly.')
 
     # get_all_params is the single source of truth for reading the params back out: it gives the
     # constructor args with the view components already unpacked (angles + helical_z_shifts for cone)
@@ -1018,7 +1083,10 @@ def get_ct_model(geometry_type, sinogram_shape, angles, source_detector_dist=Non
             warnings.warn("Helical mode (helical_z_shifts) is only supported for geometry_type='cone'; ignoring z_shifts.", UserWarning)
         model = mbirtorch.ParallelBeamModel(sinogram_shape, angles)
     else:
-        raise ValueError('Invalid geometry type.  Expected cone or parallel, got {}'.format(geometry_type))
+        raise ValueError("get_ct_model() supports geometry_type 'cone' and 'parallel' only; "
+                         f"got {geometry_type!r}.  For the translation and multiaxis "
+                         "geometries (not yet supported here, matching mbirjax), construct "
+                         "TranslationModel or MultiAxisParallelModel directly.")
 
     return model
 
@@ -1107,6 +1175,186 @@ def generate_3d_shepp_logan_reference(phantom_shape):
                                gray_level=el_paras['gray_level'])
 
     return image.transpose((1, 0, 2))
+
+
+def gen_translation_phantom(recon_shape, option, text, fill_rate=0.05, font_size=20, text_row_indices=None,
+                            horizontal_offset=0, vertical_offset=0, voxel_slice_aspect=1.0):
+    """
+    Generate a synthetic ground truth phantom based on the selected option.
+
+    Args:
+        recon_shape (tuple[int, int, int]): Shape of the reconstruction volume.
+        option (str): Phantom type to generate. Options are 'dots' or 'text'.
+        text (list[str]): List of ASCII text strings to render.
+        fill_rate (float, optional): Fill rate of the reconstruction volume. Default is 0.05.
+        font_size (int, optional): Font size of the ASCII words. Default is 20.
+        text_row_indices (list[int], optional): List of row indices where each text string should be placed. Default is None.
+                                           If None, words are automatically distributed evenly across the first dimension.
+                                           Must have the same length as 'words' if provided.
+        horizontal_offset (int, optional): Horizontal offset of the text to be rendered. Positive value shifts the phantom right. Default is 0.
+        vertical_offset (int, optional): Vertical offset of the text to be rendered. Positive value shifts the phantom up. Default is 0.
+        voxel_slice_aspect (float, optional): Ratio between slice voxel spacing and column voxel spacing. Default is 1.0.
+
+    Returns:
+        np.ndarray: Generated phantom volume.
+    """
+    if option == 'dots':
+        return gen_dot_phantom(recon_shape, fill_rate)
+    elif option == 'text':
+        return gen_text_phantom(recon_shape, text, font_size, text_row_indices, horizontal_offset, vertical_offset,
+                                voxel_slice_aspect=voxel_slice_aspect)
+    else:
+        raise ValueError(f"Unsupported phantom option: {option}")
+
+
+def gen_dot_phantom(recon_shape, fill_rate):
+    """
+    Generate a synthetic ground truth reconstruction volume.
+
+    Args:
+        recon_shape (tuple[int, int, int]): Shape of the reconstruction volume.
+        fill_rate (float): Fill rate of the reconstruction volume.
+
+    Returns:
+        np.ndarray: Ground truth reconstruction volume with sparse binary features.
+    """
+    np.random.seed(42)
+    gt_recon = np.zeros(recon_shape, dtype=np.float32)
+
+    y_pad = recon_shape[0] // 6
+    central_start = y_pad
+    central_end = recon_shape[0] - y_pad
+
+    row_size = recon_shape[1] * recon_shape[2]
+    num_ones_per_row = int(row_size * fill_rate)
+
+    for row_idx in range(central_start, central_end):
+        flat_row = gt_recon[row_idx].flatten()
+        positions_ones = np.random.choice(row_size, num_ones_per_row, replace=False)
+        flat_row[positions_ones] = 1.0
+        gt_recon[row_idx] = flat_row.reshape(recon_shape[1:])
+
+    return gt_recon
+
+
+def gen_text_phantom(recon_shape, words, font_size, row_indices=None, horizontal_offset=0,
+                     vertical_offset=0, voxel_slice_aspect=1.0, font_path="DejaVuSans.ttf"):
+    """
+    Generate a 3D text phantom with binary word patterns embedded in specific slices.
+
+    Args:
+        recon_shape (tuple[int, int, int]): Shape of the phantom volume (num_rows, num_cols, num_slices).
+        words (list[str]): List of ASCII words to render.
+        font_size (int): Font size of ASCII words.
+        row_indices (list[int], optional): List of row indices where each word should be placed. Default is None.
+                                           If None, words are automatically distributed evenly across the first dimension.
+                                           Must have the same length as 'words' if provided.
+        horizontal_offset (int, optional): Horizontal offset of the text to be rendered. Positive value shifts the phantom right. Default is 0.
+        vertical_offset (int, optional): Vertical offset of the text to be rendered. Positive value shifts the phantom up. Default is 0.
+        voxel_slice_aspect (float, optional): Ratio between slice voxel spacing and column voxel spacing. The rendered
+            text is corrected so it has the same physical aspect ratio when slices are anisotropic. Default is 1.0.
+        font_path (str, optional): Path to the TrueType font file. Default is "DejaVuSans.ttf".
+
+    Returns:
+        np.ndarray: A 3D numpy array of shape `recon_shape` containing the text phantom.
+    """
+    # PIL is imported here rather than at module top so a headless
+    # `import mbirtorch` does not require Pillow.
+    from PIL import Image, ImageDraw, ImageFont
+
+    if voxel_slice_aspect <= 0:
+        raise ValueError(f"voxel_slice_aspect must be positive. Got {voxel_slice_aspect}.")
+
+    if row_indices is not None:
+        if len(row_indices) != len(words):
+            raise ValueError(
+                f"Length of row_indices ({len(row_indices)}) must match length of words ({len(words)})")
+
+        for idx in row_indices:
+            if not (0 <= idx < recon_shape[0]):
+                raise ValueError(f"Row index {idx} is out of bounds for first dimension of size {recon_shape[0]}")
+
+        positions = []
+        for row_idx in row_indices:
+            col_pos = recon_shape[1] // 2 + horizontal_offset
+            slice_pos = recon_shape[2] // 2 - vertical_offset
+            positions.append((row_idx, col_pos, slice_pos))
+    else:
+        positions = []
+        row_positions = np.linspace(0, recon_shape[0] - 1, len(words) + 2)[1:-1]
+        for r in row_positions:
+            col_pos = recon_shape[1] // 2 + horizontal_offset
+            slice_pos = recon_shape[2] // 2 - vertical_offset
+            positions.append((int(round(r)), col_pos, slice_pos))
+
+    array_size = int(np.minimum(recon_shape[1], recon_shape[2]))
+    array_num_cols = array_size
+    array_num_slices = int(round(array_size / voxel_slice_aspect))
+    array_num_slices = min(max(array_num_slices, 1), recon_shape[2])
+
+    phantom = np.zeros(recon_shape, dtype=np.float32)
+    try:
+        font = ImageFont.truetype(font_path, size=font_size)
+    except OSError:
+        from pathlib import Path
+        fallback_paths = [
+            "/System/Library/Fonts/Supplemental/Arial.ttf",  # macOS fallback
+            "/Library/Fonts/Arial.ttf",  # Additional macOS path
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",  # Linux fallback
+        ]
+        for fallback in fallback_paths:
+            if Path(fallback).exists():
+                font = ImageFont.truetype(fallback, size=font_size)
+                break
+        else:
+            raise FileNotFoundError(
+                f"Could not find a usable font. Tried the following paths:\n"
+                + "\n".join(fallback_paths)
+                + "\nPlease install one of these fonts or specify a valid font_path."
+            )
+
+    for word, (r, c, s) in zip(words, positions):
+        img = Image.new('L', (array_size, array_size), 0)
+        draw = ImageDraw.Draw(img)
+
+        text_box = draw.textbbox((0, 0), word, font=font)
+        text_width = text_box[2] - text_box[0]
+        text_height = text_box[3] - text_box[1]
+
+        x = (array_size - text_width) // 2 - text_box[0]
+        y = (array_size - text_height) // 2 - text_box[1]
+        draw.text((x, y), word, fill=1, font=font)
+
+        word_array = np.array(img.rotate(-90, expand=True).transpose(Image.FLIP_LEFT_RIGHT))
+        if array_num_slices != array_size:
+            word_img = Image.fromarray(word_array)
+            nearest_resampling = getattr(getattr(Image, 'Resampling', Image), 'NEAREST')
+            word_img = word_img.resize((array_num_slices, array_num_cols), resample=nearest_resampling)
+            word_array = np.array(word_img)
+        word_array = (word_array > 0).astype(np.float32)
+
+        # Crop or pad word_array to fit in the recon volume
+        r_start, r_end = r, r + 1
+        c_start = c - array_num_cols // 2
+        c_end = c_start + array_num_cols
+        s_start = s - array_num_slices // 2
+        s_end = s_start + array_num_slices
+
+        c_start_valid = max(c_start, 0)
+        c_end_valid = min(c_end, recon_shape[1])
+        s_start_valid = max(s_start, 0)
+        s_end_valid = min(s_end, recon_shape[2])
+
+        word_c_start = c_start_valid - c_start
+        word_c_end = word_c_start + (c_end_valid - c_start_valid)
+        word_s_start = s_start_valid - s_start
+        word_s_end = word_s_start + (s_end_valid - s_start_valid)
+
+        # Place cropped word_array into phantom
+        word_crop = word_array[word_c_start:word_c_end, word_s_start:word_s_end]
+        phantom[r_start:r_end, c_start_valid:c_end_valid, s_start_valid:s_end_valid] = word_crop
+
+    return phantom
 
 
 def gen_translation_vectors(num_x_translations, num_z_translations, x_spacing, z_spacing):
@@ -1409,14 +1657,6 @@ def generate_demo_data(
                 'voxel_slice_aspect': voxel_slice_aspect
             }
     elif model_type == ModelType.TRANSLATION:
-        # The lines below are the translation path carried over from mbirjax.  They are
-        # kept so that porting TranslationModel is a deletion of this raise, and they
-        # cannot run until then: without the raise the branch dies partway through on a
-        # missing attribute, which says nothing about what is actually unavailable.
-        raise NotImplementedError(
-            "generate_demo_data does not support model_type='translation': the "
-            "translation geometry (TranslationModel) is not ported to mbirtorch yet.  "
-            "Use 'parallel' or 'cone'.")
         source_iso_dist = min(num_det_rows, num_det_channels) / 2
         source_detector_dist = source_iso_dist
         translation_vectors = gen_translation_vectors(num_x_translations, num_z_translations, x_spacing, z_spacing)

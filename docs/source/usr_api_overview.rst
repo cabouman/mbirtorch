@@ -23,9 +23,8 @@ The first step is to create an instance with a specific geometry. This is done b
 
    ParallelBeamModel
    ConeBeamModel
-
-.. PENDING(TranslationModel): add ``TranslationModel`` to the autosummary above when
-   translation_model is ported to mbirtorch.
+   TranslationModel
+   MultiAxisParallelModel
 
 Reconstruction and Projection
 -----------------------------

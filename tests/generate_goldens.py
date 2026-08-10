@@ -171,6 +171,60 @@ def main():
     ccurv_sp_back = np.asarray(ccurv.sparse_back_project(ccurv_sino, ccurv_subset))
     ccurv_fdk = np.asarray(ccurv.fdk_recon(ccurv_sino))
 
+    # Translation (TCT) golden: a 4x4 grid of translations, dot phantom,
+    # single ops, FDK, and a seeded 3-iteration recon with traces.
+    tct_dets = (40, 32)
+    tct_tvecs = np.asarray(mbirjax.gen_translation_vectors(
+        4, 4, x_spacing=3.0, z_spacing=2.0), dtype=np.float32)
+    tct_cell = (tct_tvecs.shape[0],) + tct_dets
+    tct = mbirjax.TranslationModel(tct_cell, tct_tvecs,
+                                   source_detector_dist=4 * tct_dets[1],
+                                   source_iso_dist=tct_dets[1])
+    tct.set_params(no_warning=True, verbose=0)
+    tct_recon_shape = tuple(int(x) for x in tct.get_params('recon_shape'))
+    tct_phantom = np.asarray(mbirjax.utilities.gen_translation_phantom(
+        tct_recon_shape, 'dots', None, fill_rate=0.05))
+    tct_sino = np.asarray(tct.forward_project(tct_phantom))
+    tct_full = np.asarray(mbirjax.gen_full_indices(
+        tct_recon_shape, use_ror_mask=tct.get_params('use_ror_mask')))
+    tct_subset = np.sort(np.random.RandomState(SEED).choice(
+        tct_full, size=min(400, len(tct_full)), replace=False))
+    tct_vals = np.random.RandomState(SEED + 1).rand(
+        len(tct_subset), tct_recon_shape[2]).astype(np.float32)
+    tct_sp_fwd = np.asarray(tct.sparse_forward_project(tct_vals, tct_subset))
+    tct_sp_back = np.asarray(tct.sparse_back_project(tct_sino, tct_subset))
+    tct_fdk = np.asarray(tct.fdk_recon(tct_sino))
+    np.random.seed(RECON_SEED)
+    tct_recon, tct_dict = tct.recon(tct_sino, max_iterations=3,
+                                    stop_threshold_change_pct=0.0)
+    tct_rp = tct_dict['recon_params']
+
+    # Multiaxis parallel golden: azimuths over pi with elevations to ~23 deg,
+    # dot phantom, single ops, FBP, and a seeded 3-iteration recon with traces.
+    ma_cell = (24, 32, 28)
+    ma_az = np.linspace(0, np.pi, ma_cell[0], endpoint=False)
+    ma_el = np.linspace(-0.4, 0.4, ma_cell[0])
+    ma_angles = np.stack([ma_az, ma_el], axis=1).astype(np.float32)
+    ma = mbirjax.MultiAxisParallelModel(ma_cell, ma_angles)
+    ma.set_params(no_warning=True, verbose=0)
+    ma_recon_shape = tuple(int(x) for x in ma.get_params('recon_shape'))
+    ma_phantom = np.asarray(mbirjax.utilities.gen_translation_phantom(
+        ma_recon_shape, 'dots', None, fill_rate=0.05))
+    ma_sino = np.asarray(ma.forward_project(ma_phantom))
+    ma_full = np.asarray(mbirjax.gen_full_indices(
+        ma_recon_shape, use_ror_mask=ma.get_params('use_ror_mask')))
+    ma_subset = np.sort(np.random.RandomState(SEED).choice(
+        ma_full, size=min(400, len(ma_full)), replace=False))
+    ma_vals = np.random.RandomState(SEED + 1).rand(
+        len(ma_subset), ma_recon_shape[2]).astype(np.float32)
+    ma_sp_fwd = np.asarray(ma.sparse_forward_project(ma_vals, ma_subset))
+    ma_sp_back = np.asarray(ma.sparse_back_project(ma_sino, ma_subset))
+    ma_fbp = np.asarray(ma.fbp_recon(ma_sino))
+    np.random.seed(RECON_SEED)
+    ma_recon, ma_dict = ma.recon(ma_sino, max_iterations=3,
+                                 stop_threshold_change_pct=0.0)
+    ma_rp = ma_dict['recon_params']
+
     out = os.path.join(OUT_DIR, f"golden_{'x'.join(map(str, CELL))}.npz")
     np.savez_compressed(
         out,
@@ -232,6 +286,34 @@ def main():
         ccurv_sp_fwd=ccurv_sp_fwd.astype(np.float32),
         ccurv_sp_back=ccurv_sp_back.astype(np.float32),
         ccurv_fdk=ccurv_fdk.astype(np.float32),
+        tct_cell=np.array(tct_cell), tct_tvecs=tct_tvecs,
+        tct_sdd=np.float32(4 * tct_dets[1]), tct_sid=np.float32(tct_dets[1]),
+        tct_recon_shape=np.array(tct_recon_shape),
+        tct_delta_voxel=np.float32(tct.get_params('delta_voxel')),
+        tct_voxel_row_aspect=np.float32(tct.get_params('voxel_row_aspect')),
+        tct_phantom=tct_phantom.astype(np.float32),
+        tct_sino=tct_sino.astype(np.float32),
+        tct_subset=tct_subset, tct_vals=tct_vals,
+        tct_sp_fwd=tct_sp_fwd.astype(np.float32),
+        tct_sp_back=tct_sp_back.astype(np.float32),
+        tct_fdk=tct_fdk.astype(np.float32),
+        tct_recon=np.asarray(tct_recon, dtype=np.float32),
+        tct_alpha=np.array(tct_rp['alpha_values']),
+        tct_fm_rmse=np.array(tct_rp['fm_rmse']),
+        tct_nmae_pct=np.array(tct_rp['stop_threshold_change_pct']),
+        ma_cell=np.array(ma_cell), ma_angles=ma_angles,
+        ma_recon_shape=np.array(ma_recon_shape),
+        ma_delta_voxel=np.float32(ma.get_params('delta_voxel')),
+        ma_phantom=ma_phantom.astype(np.float32),
+        ma_sino=ma_sino.astype(np.float32),
+        ma_subset=ma_subset, ma_vals=ma_vals,
+        ma_sp_fwd=ma_sp_fwd.astype(np.float32),
+        ma_sp_back=ma_sp_back.astype(np.float32),
+        ma_fbp=ma_fbp.astype(np.float32),
+        ma_recon=np.asarray(ma_recon, dtype=np.float32),
+        ma_alpha=np.array(ma_rp['alpha_values']),
+        ma_fm_rmse=np.array(ma_rp['fm_rmse']),
+        ma_nmae_pct=np.array(ma_rp['stop_threshold_change_pct']),
     )
     print('wrote', out)
 

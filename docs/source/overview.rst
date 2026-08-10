@@ -36,7 +36,8 @@ You can install mbirtorch from source as described in :ref:`InstallationDocs`.
 
 **Geometries**
 
-MBIRTorch supports the *parallel-beam* and *cone-beam* imaging geometries shown below.
+MBIRTorch supports the *parallel-beam*, *cone-beam*, *translation*, and
+*multi-axis parallel* imaging geometries; the first two are shown below.
 However, new geometries can be added by constructing a new class with the associated sparse forward and back projection code.
 
 .. list-table::

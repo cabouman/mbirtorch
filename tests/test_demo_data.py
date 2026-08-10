@@ -137,12 +137,16 @@ def test_generate_demo_data_cube():
     assert phantom.max() > 0 and np.isfinite(np.asarray(sino)).all()
 
 
-def test_generate_demo_data_translation_is_not_available():
-    # The translation path is written against TranslationModel, which is not ported
-    # yet, so the request is turned down by name rather than failing deeper in.
-    with pytest.raises(NotImplementedError, match='translation'):
-        mbirtorch.generate_demo_data(model_type='translation',
-                                     num_det_rows=24, num_det_channels=32)
+def test_generate_demo_data_translation():
+    # Structure only: with translation's thin recon volume the generic demo
+    # phantoms are empty (mbirjax behaves identically); translation demos use
+    # gen_translation_phantom for content.
+    phantom, sino, params = mbirtorch.generate_demo_data(
+        model_type='translation', object_type='cube',
+        num_det_rows=24, num_det_channels=32)
+    assert isinstance(phantom, np.ndarray) and phantom.dtype == np.float32
+    assert sino.shape[0] == params['translation_vectors'].shape[0]
+    assert np.isfinite(np.asarray(sino)).all()
 
 
 def test_gen_translation_vectors_grid():

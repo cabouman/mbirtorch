@@ -11,8 +11,8 @@ line-by-line specification.  For the user-facing view (how to turn it on and
 control it), see :doc:`usr_multi_gpu`.
 
 **Scope.**  Sharding runs within a single process across the chosen devices
-(multiple GPUs, or CPU devices).  It works for the parallel-beam and cone-beam
-geometries.  A key invariant is that **the padding never changes the result**:
+(multiple GPUs, or CPU devices).  It works for all of the library's
+geometries: parallel-beam, cone-beam, translation, and multi-axis parallel.  A key invariant is that **the padding never changes the result**:
 when a count does not divide evenly the data is zero-padded to equal shares and
 the padding is kept exactly inert.  Results can still differ slightly with the
 device count, and the difference decays as iterations proceed.  Multi-node

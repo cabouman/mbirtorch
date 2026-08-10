@@ -60,11 +60,7 @@ Synthetic Data Generation
 .. autofunction:: mbirtorch.utilities.generate_3d_shepp_logan_reference
 .. autofunction:: mbirtorch.utilities.generate_3d_shepp_logan_low_dynamic_range
 
-.. PENDING(synthetic_data): gen_translation_phantom is blocked on the translation
-   geometry, whose page is staged in source/_pending/.  Restore this directive last in
-   this section, matching mbirjax's order.
-
-   .. autofunction:: mbirtorch.utilities.gen_translation_phantom
+.. autofunction:: mbirtorch.utilities.gen_translation_phantom
 
 
 Cache Management

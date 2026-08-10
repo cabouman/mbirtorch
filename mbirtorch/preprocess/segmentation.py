@@ -64,7 +64,10 @@ def _sharded_masked_histogram(shards, valid_mask, num_bins):
     20 000 uniform float32 samples into 1024 bins, at most 3 values per trial
     (mean 0.36) land in a different bin than the edge semantics numpy
     implements, and most of those are values sitting exactly ON an interior
-    bin edge, where the two rules break the tie differently.  Otsu's DP
+    bin edge, where the two rules break the tie differently.  (Any
+    histogram-based threshold is approximate to begin with -- an order
+    statistic of float data cannot be recovered from a fixed number of
+    bins.)  Otsu's DP
     maximizes between-class variance over bins whose counts are in the
     millions at production scale, so a handful of displaced counts is not
     expected to move a boundary -- but "expected not to" is the claim, not

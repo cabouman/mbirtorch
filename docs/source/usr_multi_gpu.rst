@@ -6,7 +6,8 @@ Multi-GPU Reconstruction
 MBIRTorch can spread a single reconstruction across multiple GPUs (or, on a machine with no
 GPU, across CPU devices).  This **increases the available memory**, so you can reconstruct
 larger volumes than fit on one GPU, and on large problems it **reduces reconstruction
-time**.  It works for the parallel-beam and cone-beam geometries.
+time**.  It works for all of the library's geometries: parallel-beam,
+cone-beam, translation, and multi-axis parallel.
 
 The default: spread across the visible GPUs
 -------------------------------------------
@@ -23,7 +24,9 @@ per-device work no longer covers the cost of splitting it, and a small reconstru
 spread over four GPUs can run several times slower than the same reconstruction on one.
 So each device count carries a measured **speed floor** -- a problem size, in sinogram
 elements, below which the automatic path does not prefer that count.  The floors are
-per-geometry, because parallel-beam and cone-beam reach the crossover at different sizes.
+per-geometry, because parallel-beam and cone-beam reach the crossover at different
+sizes.  A geometry without measured floors of its own, such as translation or
+multi-axis parallel, uses the parallel-beam floors and says so in the log.
 
 **Capacity always wins.**  A count below its floor is only set aside, never discarded.
 Before the first large allocation, MBIRTorch estimates the memory each candidate layout
