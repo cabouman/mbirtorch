@@ -702,7 +702,12 @@ def _correct_plastic_sinogram(measured_sino, plastic_sino_est, metal_sino_est, t
     # floor.  When the sinogram is zero-padded on the view axis, exclude the padded views via
     # view_mask so they don't drag the mean toward 0.
     if view_mask is None:
-        mean_plastic_coef = _ps_sum(torch.sum, Sp) / _ps_numel(Sp)
+        # Plain tensor: torch.mean, the original single-device arithmetic.
+        # Sharded: per-piece sums combined on the host, divided by the count.
+        if isinstance(Sp, torch.Tensor):
+            mean_plastic_coef = torch.mean(Sp)
+        else:
+            mean_plastic_coef = _ps_sum(torch.sum, Sp) / _ps_numel(Sp)
     else:
         mean_plastic_coef = (_ps_sum(lambda sp, vm: torch.sum(sp * vm), Sp, view_mask)
                              / float(num_real_pixels))
