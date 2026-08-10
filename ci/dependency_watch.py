@@ -224,6 +224,12 @@ def main(argv=None):
                     help="compose and print the pull request the watch would "
                          "open (branch, title, body, every edited file); "
                          "write nothing but the --state file")
+    ap.add_argument("--act", action="store_true",
+                    help="on a divergence confirmed on two consecutive "
+                         "nights: apply the edits to the working tree, write "
+                         "the pull-request body beside the state file, and "
+                         "emit branch/title/act outputs for the workflow "
+                         "steps that push and open the pull request")
     ap.add_argument("--state", default=None,
                     help="path of the two-night confirmation state file")
     ap.add_argument("--base-sha", default=None,
@@ -278,6 +284,7 @@ def main(argv=None):
     else:
         print("dependency-watch: verdict none (matrix and floors match torch)")
 
+    status = None
     if args.state:
         status = consecutive_night_status(args.state, branch_name(d))
         print(f"dependency-watch: two-night status: {status}")
@@ -298,7 +305,37 @@ def main(argv=None):
             print(f"  edited file: {path}")
             for line in content.splitlines():
                 print(f"    | {line}")
+
+    if args.act:
+        confirmed = args.state and status == "confirmed"
+        act = bool(d["any"] and confirmed)
+        if d["any"] and not confirmed:
+            print("dependency-watch: not acting (waiting for the two-night "
+                  "confirmation)")
+        if act:
+            pr = compose(d, read(vf_source), read(pp_source),
+                         base_sha=args.base_sha)
+            root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            for path, content in pr["edits"].items():
+                with open(os.path.join(root, path), "w") as f:
+                    f.write(content)
+                print(f"dependency-watch: edited {path}")
+            body_path = os.path.join(os.path.dirname(args.state), "pr-body.md")
+            with open(body_path, "w") as f:
+                f.write(pr["body"])
+            _emit_output("branch", pr["branch"])
+            _emit_output("title", pr["title"])
+            _emit_output("body_path", body_path)
+        _emit_output("act", "true" if act else "false")
     return 0
+
+
+def _emit_output(name, value):
+    """One output for the workflow's later steps (GitHub's output file)."""
+    path = os.environ.get("GITHUB_OUTPUT")
+    if path:
+        with open(path, "a") as f:
+            f.write(f"{name}={value}\n")
 
 
 if __name__ == "__main__":
