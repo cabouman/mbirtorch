@@ -324,14 +324,27 @@ class QGGMRFDenoiser(TomographyModel):
 
         Mirrors vcd_recon's sharded path: the qGGMRF halos are staged once
         per pass, each device computes its shard's prior and identity-forward
-        terms, and the four line-search sums combine on the host into one
-        step size (the same formula as vcd_subset_denoiser).
+        terms, and the four line-search sums combine ON THE LEAD DEVICE into
+        one step size (the same formula as vcd_subset_denoiser).  As in
+        vcd_recon, the step size stays a device tensor -- no host
+        synchronization per subset -- and one thread pool serves every
+        fan-out for the whole loop.
 
         Returns (flat_image shards, nmae history, alpha history, num_iters).
         """
         devices = image_sh.placement.devices
         n = len(devices)
         pl = image_sh.placement
+        dev0 = devices[0]
+
+        def combine_on_lead(parts):
+            """Sum per-shard 0-d tensor partials on the lead device: the
+            identity on one device, scalar-sized device moves otherwise."""
+            total = parts[0]
+            for part in parts[1:]:
+                total = total + _sharding.move_shard(part, dev0,
+                                                     self.dev2dev_safe)
+            return total
 
         # Flat (num_pixels, local_slices) shards; residual = image - init.
         flat_image = _sharding.Shards(
@@ -352,7 +365,10 @@ class QGGMRFDenoiser(TomographyModel):
         nmae_update = np.zeros(max_iters)
         alpha_values = np.zeros(max_iters)
         num_iters = 0
-        with torch.no_grad():
+        # One thread pool for the whole loop; every fan-out reuses it.
+        pool = _sharding.device_pool(n) if n > 1 else None
+        try:
+          with torch.no_grad():
             for i in range(max_iters):
                 # Halos once per pass, as in mbirjax's sharded denoiser.
                 halos['left'], halos['right'] = _sharding.exchange_qggmrf_halos(
@@ -373,42 +389,54 @@ class QGGMRFDenoiser(TomographyModel):
                         forward_grad = -fm_constant * cur_error
                         delta = -((forward_grad + grad) / (1.0 + hess))
                         return (delta,
-                                float(torch.sum(grad * delta)),
-                                float(torch.sum(hess * delta ** 2)),
-                                float(fm_constant * torch.sum(cur_error * delta)),
-                                float(fm_constant * torch.sum(delta * delta)))
+                                torch.sum(grad * delta),
+                                torch.sum(hess * delta ** 2),
+                                fm_constant * torch.sum(cur_error * delta),
+                                fm_constant * torch.sum(delta * delta))
 
-                    results = _sharding.run_per_device(devices, terms_worker)
+                    results = _sharding.run_per_device(devices, terms_worker,
+                                                       executor=pool)
                     deltas = [r[0] for r in results]
-                    prior_linear = sum(r[1] for r in results)
-                    prior_quadratic = sum(r[2] for r in results)
-                    forward_linear = sum(r[3] for r in results)
-                    forward_quadratic = sum(r[4] for r in results)
+                    prior_linear = combine_on_lead([r[1] for r in results])
+                    prior_quadratic = combine_on_lead([r[2] for r in results])
+                    forward_linear = combine_on_lead([r[3] for r in results])
+                    forward_quadratic = combine_on_lead([r[4] for r in results])
+                    # The step size stays a device tensor (no host sync).
                     alpha = ((forward_linear - prior_linear)
                              / (forward_quadratic + prior_quadratic + _F32_EPS))
-                    alpha = min(max(alpha, _F32_EPS), 1.5)
+                    alpha = torch.clamp(alpha, _F32_EPS, 1.5)
+                    alpha_per_device = ([alpha] if n == 1 else
+                                        [_sharding.move_shard(alpha, dev,
+                                                              self.dev2dev_safe)
+                                         for dev in devices])
 
                     def apply_worker(j, dev):
-                        step = alpha * deltas[j]
+                        step = alpha_per_device[j] * deltas[j]
                         flat_image.tensors[j].index_add_(0, idx[j], step)
                         flat_error.tensors[j].index_add_(0, idx[j], -step)
-                        return float(torch.sum(torch.abs(step)))
+                        return torch.sum(torch.abs(step))
 
-                    ell1_parts = _sharding.run_per_device(devices, apply_worker)
-                    ell1_accum += sum(ell1_parts)
-                    alpha_accum += alpha
+                    ell1_parts = _sharding.run_per_device(devices, apply_worker,
+                                                          executor=pool)
+                    ell1_accum = ell1_accum + combine_on_lead(ell1_parts)
+                    alpha_accum = alpha_accum + alpha
 
-                image_l1 = sum(float(torch.sum(torch.abs(t)))
-                               for t in flat_image.tensors)
-                nmae = ell1_accum / image_l1
+                image_l1 = combine_on_lead([torch.sum(torch.abs(t))
+                                            for t in flat_image.tensors])
+                # The only host reads: once per iteration, for the stop test
+                # and the histories.
+                nmae = float(ell1_accum) / float(image_l1)
                 nmae_update[i] = nmae
-                alpha_values[i] = alpha_accum / partition.shape[0]
+                alpha_values[i] = float(alpha_accum) / partition.shape[0]
                 num_iters += 1
                 if verbose >= 1 and (i % 5) == 0:
                     self.logger.info('After iteration {} of a max of {}: Pct change={:.4f}'
                                      .format(i + first_iteration, max_iters, 100 * nmae))
                 if nmae < stop_thresh:
                     break
+        finally:
+            if pool is not None:
+                pool.shutdown()
         return flat_image, nmae_update, alpha_values, num_iters
 
 
