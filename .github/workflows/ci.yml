@@ -1,0 +1,39 @@
+name: CI
+on:
+  pull_request:
+    branches: [prerelease, main]
+  push:
+    branches: [prerelease, main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install CPU torch first
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Install package and test extra
+        run: pip install -e ".[test]"
+      - name: Run tests
+        run: python -m pytest -n 4 tests
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install CPU torch first
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Install package and docs extra
+        run: pip install -e ".[docs]"
+      - name: Build docs
+        run: python -m sphinx -b html docs/source docs/build/html

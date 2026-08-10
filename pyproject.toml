@@ -4,7 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mbirtorch"
-version = "0.0.1"
+# The version is single-sourced from mbirtorch/__init__.py (__version__); the
+# release workflow checks the git tag against it, so bump it there only.
+dynamic = ["version"]
 description = "High-performance tomographic reconstruction using PyTorch"
 keywords = ["tomography", "tomographic reconstruction", "computed tomography"]
 readme = "README.md"
@@ -77,6 +79,12 @@ markers = [
     "goldens: opt-in cross-framework parity tests; need tests/goldens artifacts generated from the mbirjax env",
 ]
 
+[tool.setuptools.dynamic]
+# setuptools reads the attribute by PARSING the source, not importing it, so
+# the environment-variable side effects at the top of __init__.py do not run
+# at build time (the assignment must stay a plain string literal).
+version = {attr = "mbirtorch.__version__"}
+
 [tool.setuptools.packages]
 # Restrict discovery to the mbirtorch package (same rationale as mbirjax: the TOML `find`
 # defaults to namespaces=true, which would sweep __init__.py-less top-level dirs into the
@@ -84,4 +92,4 @@ markers = [
 find = {include = ["mbirtorch*"]}
 
 [project.urls]
-source = "https://github.com/cabouman/mbirjax"
+source = "https://github.com/cabouman/mbirtorch"
