@@ -1044,6 +1044,186 @@ def generate_3d_shepp_logan_reference(phantom_shape):
     return image.transpose((1, 0, 2))
 
 
+def gen_translation_phantom(recon_shape, option, text, fill_rate=0.05, font_size=20, text_row_indices=None,
+                            horizontal_offset=0, vertical_offset=0, voxel_slice_aspect=1.0):
+    """
+    Generate a synthetic ground truth phantom based on the selected option.
+
+    Args:
+        recon_shape (tuple[int, int, int]): Shape of the reconstruction volume.
+        option (str): Phantom type to generate. Options are 'dots' or 'text'.
+        text (list[str]): List of ASCII text strings to render.
+        fill_rate (float, optional): Fill rate of the reconstruction volume. Default is 0.05.
+        font_size (int, optional): Font size of the ASCII words. Default is 20.
+        text_row_indices (list[int], optional): List of row indices where each text string should be placed. Default is None.
+                                           If None, words are automatically distributed evenly across the first dimension.
+                                           Must have the same length as 'words' if provided.
+        horizontal_offset (int, optional): Horizontal offset of the text to be rendered. Positive value shifts the phantom right. Default is 0.
+        vertical_offset (int, optional): Vertical offset of the text to be rendered. Positive value shifts the phantom up. Default is 0.
+        voxel_slice_aspect (float, optional): Ratio between slice voxel spacing and column voxel spacing. Default is 1.0.
+
+    Returns:
+        np.ndarray: Generated phantom volume.
+    """
+    if option == 'dots':
+        return gen_dot_phantom(recon_shape, fill_rate)
+    elif option == 'text':
+        return gen_text_phantom(recon_shape, text, font_size, text_row_indices, horizontal_offset, vertical_offset,
+                                voxel_slice_aspect=voxel_slice_aspect)
+    else:
+        raise ValueError(f"Unsupported phantom option: {option}")
+
+
+def gen_dot_phantom(recon_shape, fill_rate):
+    """
+    Generate a synthetic ground truth reconstruction volume.
+
+    Args:
+        recon_shape (tuple[int, int, int]): Shape of the reconstruction volume.
+        fill_rate (float): Fill rate of the reconstruction volume.
+
+    Returns:
+        np.ndarray: Ground truth reconstruction volume with sparse binary features.
+    """
+    np.random.seed(42)
+    gt_recon = np.zeros(recon_shape, dtype=np.float32)
+
+    y_pad = recon_shape[0] // 6
+    central_start = y_pad
+    central_end = recon_shape[0] - y_pad
+
+    row_size = recon_shape[1] * recon_shape[2]
+    num_ones_per_row = int(row_size * fill_rate)
+
+    for row_idx in range(central_start, central_end):
+        flat_row = gt_recon[row_idx].flatten()
+        positions_ones = np.random.choice(row_size, num_ones_per_row, replace=False)
+        flat_row[positions_ones] = 1.0
+        gt_recon[row_idx] = flat_row.reshape(recon_shape[1:])
+
+    return gt_recon
+
+
+def gen_text_phantom(recon_shape, words, font_size, row_indices=None, horizontal_offset=0,
+                     vertical_offset=0, voxel_slice_aspect=1.0, font_path="DejaVuSans.ttf"):
+    """
+    Generate a 3D text phantom with binary word patterns embedded in specific slices.
+
+    Args:
+        recon_shape (tuple[int, int, int]): Shape of the phantom volume (num_rows, num_cols, num_slices).
+        words (list[str]): List of ASCII words to render.
+        font_size (int): Font size of ASCII words.
+        row_indices (list[int], optional): List of row indices where each word should be placed. Default is None.
+                                           If None, words are automatically distributed evenly across the first dimension.
+                                           Must have the same length as 'words' if provided.
+        horizontal_offset (int, optional): Horizontal offset of the text to be rendered. Positive value shifts the phantom right. Default is 0.
+        vertical_offset (int, optional): Vertical offset of the text to be rendered. Positive value shifts the phantom up. Default is 0.
+        voxel_slice_aspect (float, optional): Ratio between slice voxel spacing and column voxel spacing. The rendered
+            text is corrected so it has the same physical aspect ratio when slices are anisotropic. Default is 1.0.
+        font_path (str, optional): Path to the TrueType font file. Default is "DejaVuSans.ttf".
+
+    Returns:
+        np.ndarray: A 3D numpy array of shape `recon_shape` containing the text phantom.
+    """
+    # PIL is imported here rather than at module top so a headless
+    # `import mbirtorch` does not require Pillow.
+    from PIL import Image, ImageDraw, ImageFont
+
+    if voxel_slice_aspect <= 0:
+        raise ValueError(f"voxel_slice_aspect must be positive. Got {voxel_slice_aspect}.")
+
+    if row_indices is not None:
+        if len(row_indices) != len(words):
+            raise ValueError(
+                f"Length of row_indices ({len(row_indices)}) must match length of words ({len(words)})")
+
+        for idx in row_indices:
+            if not (0 <= idx < recon_shape[0]):
+                raise ValueError(f"Row index {idx} is out of bounds for first dimension of size {recon_shape[0]}")
+
+        positions = []
+        for row_idx in row_indices:
+            col_pos = recon_shape[1] // 2 + horizontal_offset
+            slice_pos = recon_shape[2] // 2 - vertical_offset
+            positions.append((row_idx, col_pos, slice_pos))
+    else:
+        positions = []
+        row_positions = np.linspace(0, recon_shape[0] - 1, len(words) + 2)[1:-1]
+        for r in row_positions:
+            col_pos = recon_shape[1] // 2 + horizontal_offset
+            slice_pos = recon_shape[2] // 2 - vertical_offset
+            positions.append((int(round(r)), col_pos, slice_pos))
+
+    array_size = int(np.minimum(recon_shape[1], recon_shape[2]))
+    array_num_cols = array_size
+    array_num_slices = int(round(array_size / voxel_slice_aspect))
+    array_num_slices = min(max(array_num_slices, 1), recon_shape[2])
+
+    phantom = np.zeros(recon_shape, dtype=np.float32)
+    try:
+        font = ImageFont.truetype(font_path, size=font_size)
+    except OSError:
+        from pathlib import Path
+        fallback_paths = [
+            "/System/Library/Fonts/Supplemental/Arial.ttf",  # macOS fallback
+            "/Library/Fonts/Arial.ttf",  # Additional macOS path
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",  # Linux fallback
+        ]
+        for fallback in fallback_paths:
+            if Path(fallback).exists():
+                font = ImageFont.truetype(fallback, size=font_size)
+                break
+        else:
+            raise FileNotFoundError(
+                f"Could not find a usable font. Tried the following paths:\n"
+                + "\n".join(fallback_paths)
+                + "\nPlease install one of these fonts or specify a valid font_path."
+            )
+
+    for word, (r, c, s) in zip(words, positions):
+        img = Image.new('L', (array_size, array_size), 0)
+        draw = ImageDraw.Draw(img)
+
+        text_box = draw.textbbox((0, 0), word, font=font)
+        text_width = text_box[2] - text_box[0]
+        text_height = text_box[3] - text_box[1]
+
+        x = (array_size - text_width) // 2 - text_box[0]
+        y = (array_size - text_height) // 2 - text_box[1]
+        draw.text((x, y), word, fill=1, font=font)
+
+        word_array = np.array(img.rotate(-90, expand=True).transpose(Image.FLIP_LEFT_RIGHT))
+        if array_num_slices != array_size:
+            word_img = Image.fromarray(word_array)
+            nearest_resampling = getattr(getattr(Image, 'Resampling', Image), 'NEAREST')
+            word_img = word_img.resize((array_num_slices, array_num_cols), resample=nearest_resampling)
+            word_array = np.array(word_img)
+        word_array = (word_array > 0).astype(np.float32)
+
+        # Crop or pad word_array to fit in the recon volume
+        r_start, r_end = r, r + 1
+        c_start = c - array_num_cols // 2
+        c_end = c_start + array_num_cols
+        s_start = s - array_num_slices // 2
+        s_end = s_start + array_num_slices
+
+        c_start_valid = max(c_start, 0)
+        c_end_valid = min(c_end, recon_shape[1])
+        s_start_valid = max(s_start, 0)
+        s_end_valid = min(s_end, recon_shape[2])
+
+        word_c_start = c_start_valid - c_start
+        word_c_end = word_c_start + (c_end_valid - c_start_valid)
+        word_s_start = s_start_valid - s_start
+        word_s_end = word_s_start + (s_end_valid - s_start_valid)
+
+        # Place cropped word_array into phantom
+        word_crop = word_array[word_c_start:word_c_end, word_s_start:word_s_end]
+        phantom[r_start:r_end, c_start_valid:c_end_valid, s_start_valid:s_end_valid] = word_crop
+
+    return phantom
+
+
 def gen_translation_vectors(num_x_translations, num_z_translations, x_spacing, z_spacing):
     """
     Generate translation vectors for lateral (x) and axial (z) displacements.
@@ -1344,14 +1524,6 @@ def generate_demo_data(
                 'voxel_slice_aspect': voxel_slice_aspect
             }
     elif model_type == ModelType.TRANSLATION:
-        # The lines below are the translation path carried over from mbirjax.  They are
-        # kept so that porting TranslationModel is a deletion of this raise, and they
-        # cannot run until then: without the raise the branch dies partway through on a
-        # missing attribute, which says nothing about what is actually unavailable.
-        raise NotImplementedError(
-            "generate_demo_data does not support model_type='translation': the "
-            "translation geometry (TranslationModel) is not ported to mbirtorch yet.  "
-            "Use 'parallel' or 'cone'.")
         source_iso_dist = min(num_det_rows, num_det_channels) / 2
         source_detector_dist = source_iso_dist
         translation_vectors = gen_translation_vectors(num_x_translations, num_z_translations, x_spacing, z_spacing)

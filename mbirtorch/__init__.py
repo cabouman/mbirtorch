@@ -28,6 +28,7 @@ _os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
 
 from .parallel_beam import ParallelBeamModel
 from .cone_beam import ConeBeamModel
+from .translation_model import TranslationModel
 from .denoising import QGGMRFDenoiser
 from .tomography_model import TomographyModel
 from .autograd import (TorchProjector, forward_project_differentiable,
@@ -45,7 +46,7 @@ from .utilities import (generate_3d_shepp_logan_low_dynamic_range, clear_cache,
                         copy_ct_model, stitch_arrays,
                         get_ct_model, generate_demo_data,
                         generate_3d_shepp_logan_reference, gen_cube_phantom,
-                        gen_translation_vectors,
+                        gen_translation_vectors, gen_translation_phantom,
                         get_helical_half_rotation_slice_range,
                         merge_log_files)
 from .memory_stats import get_memory_stats
@@ -58,7 +59,8 @@ from .memory_stats import get_memory_stats
 # gen_cube_phantom and get_helical_half_rotation_slice_range: mbirjax's star imports put
 # them on the package, and its tests call them there, but its docs do not carry them.
 __all__ = [
-    "ParallelBeamModel", "ConeBeamModel", "TomographyModel", "QGGMRFDenoiser",
+    "ParallelBeamModel", "ConeBeamModel", "TranslationModel",
+    "TomographyModel", "QGGMRFDenoiser",
     "TorchProjector", "forward_project_differentiable",
     "back_project_differentiable", "gen_weights", "gen_weights_mar",
     "median_filter3d", "download_and_extract", "build_model",

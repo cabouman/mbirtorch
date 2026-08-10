@@ -67,9 +67,6 @@ Contents
    * - Page
      - Module it documents
      - Parent page to add it to
-   * - ``usr_translation_model.rst``
-     - ``mbirtorch.translation_model``
-     - ``usr_geometry_models.rst``
    * - ``usr_multiaxis_parallel_beam_model.rst``
      - ``mbirtorch.multiaxis_parallel``
      - ``usr_geometry_models.rst``
