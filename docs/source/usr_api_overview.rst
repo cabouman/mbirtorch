@@ -24,6 +24,7 @@ The first step is to create an instance with a specific geometry. This is done b
    ParallelBeamModel
    ConeBeamModel
    TranslationModel
+   MultiAxisParallelModel
 
 Reconstruction and Projection
 -----------------------------

@@ -67,9 +67,9 @@ Contents
    * - Page
      - Module it documents
      - Parent page to add it to
-   * - ``usr_multiaxis_parallel_beam_model.rst``
-     - ``mbirtorch.multiaxis_parallel``
-     - ``usr_geometry_models.rst``
+   * - (none currently)
+     -
+     -
 
 The parent pages carry a comment at the removed toctree entry marking where each
 line goes back.

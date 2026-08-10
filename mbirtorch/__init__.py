@@ -29,6 +29,7 @@ _os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
 from .parallel_beam import ParallelBeamModel
 from .cone_beam import ConeBeamModel
 from .translation_model import TranslationModel
+from .multiaxis_parallel import MultiAxisParallelModel, MultiAxisParallelBeamModel
 from .denoising import QGGMRFDenoiser
 from .tomography_model import TomographyModel
 from .autograd import (TorchProjector, forward_project_differentiable,
@@ -60,7 +61,7 @@ from .memory_stats import get_memory_stats
 # them on the package, and its tests call them there, but its docs do not carry them.
 __all__ = [
     "ParallelBeamModel", "ConeBeamModel", "TranslationModel",
-    "TomographyModel", "QGGMRFDenoiser",
+    "MultiAxisParallelModel", "TomographyModel", "QGGMRFDenoiser",
     "TorchProjector", "forward_project_differentiable",
     "back_project_differentiable", "gen_weights", "gen_weights_mar",
     "median_filter3d", "download_and_extract", "build_model",

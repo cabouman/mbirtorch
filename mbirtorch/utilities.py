@@ -331,7 +331,8 @@ def _resolve_geometry_class(geometry_type):
     ``get_all_params`` and the scan readers)."""
     import mbirtorch
     geometry_type = str(geometry_type)
-    for name in ('ConeBeamModel', 'ParallelBeamModel', 'TranslationModel'):
+    for name in ('ConeBeamModel', 'MultiAxisParallelModel', 'ParallelBeamModel',
+                 'TranslationModel'):
         if name in geometry_type:
             model_class = getattr(mbirtorch, name, None)
             if model_class is None:

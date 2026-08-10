@@ -199,6 +199,32 @@ def main():
                                     stop_threshold_change_pct=0.0)
     tct_rp = tct_dict['recon_params']
 
+    # Multiaxis parallel golden: azimuths over pi with elevations to ~23 deg,
+    # dot phantom, single ops, FBP, and a seeded 3-iteration recon with traces.
+    ma_cell = (24, 32, 28)
+    ma_az = np.linspace(0, np.pi, ma_cell[0], endpoint=False)
+    ma_el = np.linspace(-0.4, 0.4, ma_cell[0])
+    ma_angles = np.stack([ma_az, ma_el], axis=1).astype(np.float32)
+    ma = mbirjax.MultiAxisParallelModel(ma_cell, ma_angles)
+    ma.set_params(no_warning=True, verbose=0)
+    ma_recon_shape = tuple(int(x) for x in ma.get_params('recon_shape'))
+    ma_phantom = np.asarray(mbirjax.utilities.gen_translation_phantom(
+        ma_recon_shape, 'dots', None, fill_rate=0.05))
+    ma_sino = np.asarray(ma.forward_project(ma_phantom))
+    ma_full = np.asarray(mbirjax.gen_full_indices(
+        ma_recon_shape, use_ror_mask=ma.get_params('use_ror_mask')))
+    ma_subset = np.sort(np.random.RandomState(SEED).choice(
+        ma_full, size=min(400, len(ma_full)), replace=False))
+    ma_vals = np.random.RandomState(SEED + 1).rand(
+        len(ma_subset), ma_recon_shape[2]).astype(np.float32)
+    ma_sp_fwd = np.asarray(ma.sparse_forward_project(ma_vals, ma_subset))
+    ma_sp_back = np.asarray(ma.sparse_back_project(ma_sino, ma_subset))
+    ma_fbp = np.asarray(ma.fbp_recon(ma_sino))
+    np.random.seed(RECON_SEED)
+    ma_recon, ma_dict = ma.recon(ma_sino, max_iterations=3,
+                                 stop_threshold_change_pct=0.0)
+    ma_rp = ma_dict['recon_params']
+
     out = os.path.join(OUT_DIR, f"golden_{'x'.join(map(str, CELL))}.npz")
     np.savez_compressed(
         out,
@@ -275,6 +301,19 @@ def main():
         tct_alpha=np.array(tct_rp['alpha_values']),
         tct_fm_rmse=np.array(tct_rp['fm_rmse']),
         tct_nmae_pct=np.array(tct_rp['stop_threshold_change_pct']),
+        ma_cell=np.array(ma_cell), ma_angles=ma_angles,
+        ma_recon_shape=np.array(ma_recon_shape),
+        ma_delta_voxel=np.float32(ma.get_params('delta_voxel')),
+        ma_phantom=ma_phantom.astype(np.float32),
+        ma_sino=ma_sino.astype(np.float32),
+        ma_subset=ma_subset, ma_vals=ma_vals,
+        ma_sp_fwd=ma_sp_fwd.astype(np.float32),
+        ma_sp_back=ma_sp_back.astype(np.float32),
+        ma_fbp=ma_fbp.astype(np.float32),
+        ma_recon=np.asarray(ma_recon, dtype=np.float32),
+        ma_alpha=np.array(ma_rp['alpha_values']),
+        ma_fm_rmse=np.array(ma_rp['fm_rmse']),
+        ma_nmae_pct=np.array(ma_rp['stop_threshold_change_pct']),
     )
     print('wrote', out)
 
