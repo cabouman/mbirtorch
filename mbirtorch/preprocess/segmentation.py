@@ -51,13 +51,19 @@ def _sharded_masked_histogram(shards, valid_mask, num_bins):
     shard on each shard's own device.  Only the small per-shard count tables
     ever leave a device; the volume is never gathered.
 
-    A histogram is a sum of counts, so summing the per-shard tables gives
-    exactly the histogram of the whole volume (counts are exact integers).
+    Summing per-shard count tables is exact (integer counts), but the result
+    is APPROXIMATE relative to the single-array path: the per-shard bucketing
+    below uses float32 multiply-and-truncate, while np.histogram bins in
+    float64 with an edge-correction pass, so a few counts per thousand can
+    land one bin over.  (Any histogram-based threshold is approximate to
+    begin with -- an order statistic of float data cannot be recovered from a
+    fixed number of bins.)  Irrelevant at Otsu's granularity; mbirjax records
+    the same divergence for its sharded histogram.
     The range is the masked min/max, combined across shards on the host.
 
     Returns:
-        (hist, bin_edges): host numpy arrays, matching the single-array path
-        (int64 counts; edges computed by np.histogram's own edge arithmetic).
+        (hist, bin_edges): host numpy arrays (int64 counts; edges computed by
+        np.histogram's own edge arithmetic).
     """
     masks = _shard_valid_masks(valid_mask, shards.placement,
                                shards.tensors[0].ndim)
@@ -72,11 +78,17 @@ def _sharded_masked_histogram(shards, valid_mask, num_bins):
             lo = min(lo, float(vals.min()))
             hi = max(hi, float(vals.max()))
 
+    # A constant volume has no thresholds to find, and the linear bucket map
+    # below would disagree with np.histogram's expanded zero-width range.
+    if not hi > lo:
+        raise ValueError('Cannot segment a constant volume: all valid voxels '
+                         f'equal {lo}.')
+
     # Pass 2: count per chunk into num_bins buckets (exact int64 on device),
     # summed on the host.  Values are mapped to buckets by the same linear
     # map np.histogram uses; hi lands in the last (closed) bin.
     hist = np.zeros(num_bins, dtype=np.int64)
-    scale = num_bins / (hi - lo) if hi > lo else 0.0
+    scale = num_bins / (hi - lo)
     for t, mp in zip(shards.tensors, masks):
         for chunk, mc in _shard_chunks(t, mp):
             vals = chunk.reshape(-1) if mc is None else chunk[mc]

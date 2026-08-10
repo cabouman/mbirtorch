@@ -1,7 +1,9 @@
 """Gate for the sharded path of segment_plastic_metal: run the same volume
 through the function whole and split into shards, and require the same
-answer.  Identical is the right bar: the histogram counts are integers, so
-the thresholds match exactly, and the masks are pure thresholding.
+answer.  Note the sharded binning is NOT exact in general (float32 bucketing
+vs np.histogram's float64 -- see _sharded_masked_histogram), but on this
+volume the two paths happen to bin identically, and the test pins that the
+thresholds and masks agree here.
 """
 
 import numpy as np
