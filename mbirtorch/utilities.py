@@ -214,6 +214,45 @@ def load_data_hdf5(file_path):
         return array, data_dict
 
 
+def _shard_axis_block(shards, i0, i1):
+    """Host copy of the global range [i0, i1) of a sharded volume's SHARDED
+    axis (real coordinates; padding never included), all other axes full.
+    Only this block leaves the devices, so a caller that walks the axis in
+    slabs never holds the whole volume on the host."""
+    import torch
+    pl = shards.placement
+    ndim = shards.tensors[0].ndim
+    axis = pl.axis % ndim
+    real_end = pl.real_size if pl.real_size is not None else pl.padded_size
+    pieces = []
+    for t, (_dev, (s0, s1)) in zip(shards.tensors,
+                                   pl.shard_ranges(pl.padded_size)):
+        lo, hi = max(i0, s0), min(i1, min(s1, real_end))
+        if lo < hi:
+            sel = [slice(None)] * ndim
+            sel[axis] = slice(lo - s0, hi - s0)
+            pieces.append(t[tuple(sel)].cpu().numpy())
+    return pieces[0] if len(pieces) == 1 else np.concatenate(pieces, axis=axis)
+
+
+def _sharded_host_shape_dtype(shards):
+    """The shape and numpy dtype of a sharded volume's host form (sharded
+    axis at its real size), computed without gathering anything."""
+    import torch
+    pl = shards.placement
+    ndim = shards.tensors[0].ndim
+    axis = pl.axis % ndim
+    shape = list(shards.tensors[0].shape)
+    shape[axis] = pl.real_size if pl.real_size is not None else pl.padded_size
+    np_dtype = torch.empty((), dtype=shards.dtype).numpy().dtype
+    return tuple(shape), np_dtype
+
+
+# Bytes per streamed HDF5 write; a module constant so tests can shrink it to
+# exercise the multi-slab path on small arrays.
+_HDF5_SLAB_BYTES = 1 << 30
+
+
 def _write_hdf5_streaming(file_path, array_name, out_shape, dtype, produce_slab, attributes_dict=None):
     """Create an HDF5 dataset of out_shape/dtype and fill it slab-by-slab along axis 0.
 
@@ -229,7 +268,7 @@ def _write_hdf5_streaming(file_path, array_name, out_shape, dtype, produce_slab,
             dset[...] = produce_slab(0, 0)
         else:
             row_bytes = np.dtype(dtype).itemsize * int(np.prod(out_shape[1:], dtype=np.int64))
-            slab = max(1, (1 << 30) // max(row_bytes, 1))   # ~1 GiB per write
+            slab = max(1, _HDF5_SLAB_BYTES // max(row_bytes, 1))
             for i in range(0, out_shape[0], slab):
                 dset[i:i + slab] = produce_slab(i, min(i + slab, out_shape[0]))
         if isinstance(attributes_dict, dict):
@@ -266,9 +305,38 @@ def save_data_hdf5(file_path, array, array_name='array', attributes_dict=None):
         >>> file_path = './output/test_part_038.h5'
         >>> mbirtorch.save_data_hdf5(file_path, recon, recon_info)
     """
-    array = (_to_host(array)
-             if (hasattr(array, 'detach') or isinstance(array, _sharding.Shards))
-             else array)
+    if isinstance(array, _sharding.Shards):
+        # Gather one slab at a time at the file boundary, so the host never
+        # holds the whole volume.
+        shape, np_dtype = _sharded_host_shape_dtype(array)
+        pl = array.placement
+        ndim = array.tensors[0].ndim
+        axis = pl.axis % ndim
+
+        if axis == 0:
+            # Sharded along the slab axis: each slab is a range of the
+            # sharded axis itself.
+            def produce_slab(i0, i1):
+                return np.ascontiguousarray(_shard_axis_block(array, i0, i1))
+        else:
+            # Sharded along another axis: take rows [i0, i1) of every shard
+            # and reassemble, cropping the sharded axis's padding.
+            real = shape[axis]
+
+            def produce_slab(i0, i1):
+                sel = [slice(None)] * ndim
+                sel[0] = slice(i0, i1)
+                pieces = [t[tuple(sel)].cpu().numpy() for t in array.tensors]
+                out = np.concatenate(pieces, axis=axis)
+                crop = [slice(None)] * ndim
+                crop[axis] = slice(0, real)
+                return np.ascontiguousarray(out[tuple(crop)])
+
+        _write_hdf5_streaming(file_path, array_name, shape, np_dtype,
+                              produce_slab, attributes_dict)
+        return
+
+    array = _to_host(array) if hasattr(array, 'detach') else array
 
     # Stream the array to disk slab-by-slab (no full contiguous copy, even for a strided view).
     def produce_slab(i0, i1):
@@ -301,28 +369,38 @@ def export_recon_hdf5(file_path, recon, recon_dict=None, remove_flash=False, rad
         >>> recon = np.ones((128, 128, 64))  # (row, col, slice) order
         >>> export_recon_hdf5("output/recon_volume.h5", recon, recon_dict={"scan_id": "sample1"})
     """
-    # Move the input to the host (NumPy) first so numpy and device tensors collapse to one host case.
-    recon = _to_host(recon)
+    # A slice-sharded volume streams slab by slab straight from the devices;
+    # anything else (numpy, tensor, an unusually-sharded container) collapses
+    # to one host array first.
+    if isinstance(recon, _sharding.Shards) and recon.placement.axis % 3 == 2:
+        (num_rows, num_cols, num_slices), np_dtype = _sharded_host_shape_dtype(recon)
 
-    if not remove_flash:
-        # Transposed view; save_data_hdf5 streams it slab-by-slab, so no full copy is made.
-        save_data_hdf5(file_path, np.transpose(recon, (2, 1, 0)), 'recon', recon_dict)
-        return
+        def get_block(s0, s1):
+            return _shard_axis_block(recon, s0, s1)          # (R, C, ds) on the host
+    else:
+        recon = _to_host(recon)
+        num_rows, num_cols, num_slices = recon.shape
+        np_dtype = recon.dtype
 
-    # remove_flash: mask + transpose + write one slab at a time, so no full masked volume is built.
-    # Slabbing along the slice axis keeps full (rows, cols), so apply_cylindrical_mask gives the
-    # identical circular mask per slab; we just map the global top/bottom margins to each slab.
+        def get_block(s0, s1):
+            return recon[:, :, s0:s1]
+
+    # Mask (optionally) + transpose + write one slab at a time, so no full transposed or masked
+    # volume is built.  Slabbing along the slice axis keeps full (rows, cols), so
+    # apply_cylindrical_mask gives the identical circular mask per slab; we just map the global
+    # top/bottom margins to each slab.
     from . import preprocess
-    num_rows, num_cols, num_slices = recon.shape
 
     def produce_slab(s0, s1):
-        ds = s1 - s0
-        local_top = min(max(top_margin - s0, 0), ds)                       # global top slices in this slab
-        local_bottom = min(max(s1 - (num_slices - bottom_margin), 0), ds)  # global bottom slices in this slab
-        block = preprocess.apply_cylindrical_mask(recon[:, :, s0:s1], radial_margin, local_top, local_bottom)
-        return np.ascontiguousarray(np.transpose(block, (2, 1, 0)))        # (ds, C, R)
+        block = get_block(s0, s1)
+        if remove_flash:
+            ds = s1 - s0
+            local_top = min(max(top_margin - s0, 0), ds)                       # global top slices in this slab
+            local_bottom = min(max(s1 - (num_slices - bottom_margin), 0), ds)  # global bottom slices in this slab
+            block = preprocess.apply_cylindrical_mask(block, radial_margin, local_top, local_bottom)
+        return np.ascontiguousarray(np.transpose(block, (2, 1, 0)))            # (ds, C, R)
 
-    _write_hdf5_streaming(file_path, 'recon', (num_slices, num_cols, num_rows), recon.dtype,
+    _write_hdf5_streaming(file_path, 'recon', (num_slices, num_cols, num_rows), np_dtype,
                           produce_slab, recon_dict)
 
 
