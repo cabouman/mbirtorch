@@ -11,10 +11,7 @@ The basic demo below illustrates some of the features of MBIRTorch:
 
 * **Basic Demo:** `Python script <https://github.com/cabouman/mbirtorch/blob/main/demo/demo_1_shepp_logan.py>`__
 
-Follow the installation instructions in the
-`README <https://github.com/cabouman/mbirtorch/blob/main/README.md>`__ and run the script directly.
-
-.. PENDING(install): point the sentence above at :ref:`InstallationDocs` when install.rst lands.
+Follow the installation instructions in :ref:`InstallationDocs` and run the script directly.
 
 Then adjust some of the parameters to better understand how the code works.
 If you have a GPU, you can increase the problem size by changing ``num_views``, ``num_det_rows``, and ``num_det_channels``.

@@ -1,0 +1,60 @@
+name: CI
+on:
+  pull_request:
+    branches: [prerelease, main]
+  push:
+    branches: [prerelease, main]
+  # Explicit dispatch exists for the dependency watch: pull requests opened
+  # with the built-in token start no workflow runs on their own, so the watch
+  # dispatches this workflow on its branch to attach check results.
+  workflow_dispatch:
+
+jobs:
+  # The tested Python versions live in .github/python-versions.json (the
+  # version file), not here: the dependency watch may only edit data files,
+  # never workflow files.  This job reads the file; the others consume it.
+  versions:
+    runs-on: ubuntu-latest
+    outputs:
+      test: ${{ steps.read.outputs.test }}
+      docs: ${{ steps.read.outputs.docs }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: read
+        run: |
+          echo "test=$(jq -c .test .github/python-versions.json)" >> "$GITHUB_OUTPUT"
+          echo "docs=$(jq -r .docs .github/python-versions.json)" >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: versions
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJSON(needs.versions.outputs.test) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install CPU torch first
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Install package and test extra
+        run: pip install -e ".[test]"
+      - name: Run tests
+        run: python -m pytest -n 4 tests ci
+
+  docs:
+    needs: versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ needs.versions.outputs.docs }}
+      - name: Install CPU torch first
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Install package and docs extra
+        run: pip install -e ".[docs]"
+      - name: Build docs
+        run: python -m sphinx -W -b html docs/source docs/build/html
