@@ -86,3 +86,54 @@ def test_no_divergence():
     d = divergence("2.13.0", ["3.11", "3.12"], ["3.11", "3.12"], "3.11", "2.13")
     assert not d["any"]
     assert branch_name(d) is None
+
+
+def test_compose_addition_edits_only_the_version_file():
+    import json
+    from dependency_watch import compose
+    d = divergence("2.13.0", ["3.11", "3.12", "3.13", "3.14"],
+                   ["3.11", "3.12"], "3.11", "2.13")
+    pr = compose(d, VERSION_FILE_JSON, PYPROJECT_TOML, base_sha="abc1234")
+    assert pr["branch"] == "nightly/python-matrix-add-3.13-3.14"
+    assert pr["title"] == "Add Python 3.13 and 3.14 to the CI test matrix"
+    assert "torch 2.13.0" in pr["body"] and "abc1234" in pr["body"]
+    assert list(pr["edits"]) == [".github/python-versions.json"]
+    data = json.loads(pr["edits"][".github/python-versions.json"])
+    assert data["test"] == ["3.11", "3.12", "3.13", "3.14"]
+    assert data["docs"] == "3.12"                       # untouched by additions
+
+
+def test_compose_removal_bumps_floor_and_moves_docs_pin():
+    from dependency_watch import compose
+    d = divergence("2.13.0", ["3.11", "3.13"], ["3.11", "3.12"], "3.11", "2.13")
+    # 3.12 removed (docs pin!), 3.13 added; floor stays 3.11 since it remains.
+    pr = compose(d, VERSION_FILE_JSON, PYPROJECT_TOML)
+    import json
+    data = json.loads(pr["edits"][".github/python-versions.json"])
+    assert data["test"] == ["3.11", "3.13"]
+    assert data["docs"] == "3.13"                       # moved off the removed pin
+    assert "REMOVAL" in pr["body"]
+    # A removal of the floor version itself bumps requires-python.
+    d2 = divergence("2.13.0", ["3.12"], ["3.11", "3.12"], "3.11", "2.13")
+    pr2 = compose(d2, VERSION_FILE_JSON, PYPROJECT_TOML)
+    assert 'requires-python = ">=3.12"' in pr2["edits"]["pyproject.toml"]
+
+
+def test_compose_torch_advance_edits_pyproject_only():
+    from dependency_watch import compose
+    d = divergence("2.14.0", ["3.11", "3.12"], ["3.11", "3.12"], "3.11", "2.13")
+    pr = compose(d, VERSION_FILE_JSON, PYPROJECT_TOML)
+    assert list(pr["edits"]) == ["pyproject.toml"]
+    assert '"torch>=2.14"' in pr["edits"]["pyproject.toml"]
+    assert "CPU suite" in pr["body"]
+    assert pr["title"] == "Advance the torch floor to 2.14"
+
+
+def test_two_night_confirmation(tmp_path):
+    from dependency_watch import consecutive_night_status
+    state = str(tmp_path / "state" / "last")
+    assert consecutive_night_status(state, "nightly/x") == "first sighting"
+    assert consecutive_night_status(state, "nightly/x") == "confirmed"
+    assert consecutive_night_status(state, "nightly/y") == "first sighting"
+    assert consecutive_night_status(state, None) == "quiet"
+    assert consecutive_night_status(state, "nightly/y") == "first sighting"

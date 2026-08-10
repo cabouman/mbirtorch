@@ -1,0 +1,49 @@
+name: Dependency watch
+# The nightly watch (plans repo: plans/torch_port/active/
+# python_matrix_nightly_check.md).  Currently in DRY-RUN mode (increment 3):
+# it composes and prints the pull request it would open, and writes nothing.
+#
+# GitHub runs scheduled workflows from the DEFAULT branch (main), so the
+# schedule takes effect when this file reaches main; until then the rehearsal
+# runs by manual dispatch.  The watch itself always reads and proposes
+# against prerelease.
+
+on:
+  schedule:
+    - cron: "13 9 * * *"    # nightly, 09:13 UTC
+  workflow_dispatch:
+
+# The three grants of the plan's design; the built-in token holds them for
+# the life of one run and cannot touch workflow files.
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: prerelease
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Restore the two-night state
+        uses: actions/cache/restore@v4
+        with:
+          path: .watch-state
+          key: dependency-watch-state-${{ github.run_id }}
+          restore-keys: dependency-watch-state-
+      - name: Run the watch (dry run)
+        run: |
+          python ci/dependency_watch.py --dry-run \
+            --state .watch-state/last-divergence \
+            --base-sha "$(git rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Save the two-night state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .watch-state
+          key: dependency-watch-state-${{ github.run_id }}

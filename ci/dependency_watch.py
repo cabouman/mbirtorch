@@ -137,11 +137,98 @@ def branch_name(d):
     return "nightly/python-matrix-" + "-".join(parts) if parts else None
 
 
+def compose(d, version_file_text, pyproject_text, base_sha=None):
+    """The pull request the watch would open for divergence ``d``: branch,
+    title, body, and the complete new content of every edited file.  Pure
+    composition; nothing is written anywhere."""
+    if not d["any"]:
+        return None
+    edits = {}
+
+    new_test = sorted((set(d["matrix"]) | set(d["additions"])) - set(d["removals"]),
+                      key=_minor)
+    data = json.loads(version_file_text)
+    if d["additions"] or d["removals"]:
+        data["test"] = new_test
+        if data["docs"] in d["removals"]:
+            data["docs"] = new_test[-1]
+        edits[VERSION_FILE] = json.dumps(data, indent=2) + "\n"
+
+    new_pyproject = pyproject_text
+    if d["removals"]:
+        new_floor = new_test[0]
+        new_pyproject = re.sub(r'(requires-python\s*=\s*")>=[\d.]+(")',
+                               rf"\g<1>>={new_floor}\g<2>", new_pyproject)
+    if d["torch_advance"]:
+        new_pyproject = re.sub(r'("torch)\s*>=\s*[\d.]+(")',
+                               rf"\g<1>>={d['torch_advance']}\g<2>", new_pyproject)
+    if new_pyproject != pyproject_text:
+        edits[PYPROJECT] = new_pyproject
+
+    def _join(vs):
+        return vs[0] if len(vs) == 1 else ", ".join(vs[:-1]) + " and " + vs[-1]
+
+    title_parts = []
+    if d["additions"]:
+        title_parts.append(f"add Python {_join(d['additions'])} to the CI test matrix")
+    if d["removals"]:
+        title_parts.append(f"drop Python {_join(d['removals'])}")
+    if d["torch_advance"]:
+        title_parts.append(f"advance the torch floor to {d['torch_advance']}")
+    title = "; ".join(title_parts)
+    title = title[0].upper() + title[1:]
+
+    body = ["Opened by the dependency watch (plans repo: "
+            "plans/torch_port/active/python_matrix_nightly_check.md).",
+            "",
+            f"Trigger: torch {d['torch_release']} publishes CPU-index Linux "
+            f"x86_64 wheels for Python {_join(d['torch_list'])}.",
+            "",
+            "Policy: mbirtorch tests the Python versions torch supports, and "
+            "advances its torch floor deliberately."]
+    if base_sha:
+        body += ["", f"Branch cut from `{base_sha}`."]
+    if d["removals"]:
+        body += ["", "This includes a REMOVAL.  CI cannot prove a removal "
+                     "correct; the reviewer must judge it."]
+    if d["torch_advance"]:
+        body += ["", "The torch floor advance's green checks cover the CPU "
+                     "suite; the Triton and CUDA paths are proven by the "
+                     "cluster nightly after the merge."]
+    return {"branch": branch_name(d), "title": title,
+            "body": "\n".join(body), "edits": edits}
+
+
+def consecutive_night_status(state_path, branch):
+    """The two-night confirmation state.  Returns 'quiet', 'first sighting',
+    or 'confirmed', and records tonight's observation in ``state_path``
+    (the only file this checker ever writes)."""
+    previous = None
+    if os.path.exists(state_path):
+        with open(state_path) as f:
+            previous = f.read().strip() or None
+    os.makedirs(os.path.dirname(state_path) or ".", exist_ok=True)
+    with open(state_path, "w") as f:
+        f.write(branch or "")
+    if branch is None:
+        return "quiet"
+    return "confirmed" if previous == branch else "first sighting"
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--remote", action="store_true",
                     help="read the version file and pyproject.toml from the "
                          "public prerelease branch instead of a local checkout")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="compose and print the pull request the watch would "
+                         "open (branch, title, body, every edited file); "
+                         "write nothing but the --state file")
+    ap.add_argument("--state", default=None,
+                    help="path of the two-night confirmation state file")
+    ap.add_argument("--base-sha", default=None,
+                    help="commit identifier the read is pinned to (recorded "
+                         "in the pull-request body)")
     ap.add_argument("--json", action="store_true", help="print the verdict as JSON")
     args = ap.parse_args(argv)
 
@@ -190,6 +277,27 @@ def main(argv=None):
                   f"{torch_floor} -> {d['torch_advance']}")
     else:
         print("dependency-watch: verdict none (matrix and floors match torch)")
+
+    if args.state:
+        status = consecutive_night_status(args.state, branch_name(d))
+        print(f"dependency-watch: two-night status: {status}")
+        if status == "first sighting":
+            print("dependency-watch: a live watch would wait for tomorrow's "
+                  "confirmation before acting")
+
+    if args.dry_run and d["any"]:
+        pr = compose(d, read(vf_source), read(pp_source), base_sha=args.base_sha)
+        print()
+        print("dependency-watch: DRY RUN -- the pull request the watch would open:")
+        print(f"  branch: {pr['branch']}")
+        print(f"  title:  {pr['title']}")
+        print("  body:")
+        for line in pr["body"].splitlines():
+            print(f"    {line}")
+        for path, content in pr["edits"].items():
+            print(f"  edited file: {path}")
+            for line in content.splitlines():
+                print(f"    | {line}")
     return 0
 
 
