@@ -1,6 +1,10 @@
 # mbirtorch
 
-A PyTorch port of [mbirjax](https://github.com/cabouman/mbirjax) (Phase 0 scaffold).
+[![CI](https://github.com/cabouman/mbirtorch/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/cabouman/mbirtorch/actions/workflows/ci.yml)
+[![Documentation Status](https://readthedocs.org/projects/mbirtorch/badge/?version=latest)](https://mbirtorch.readthedocs.io/en/latest/)
+
+A PyTorch port of [mbirjax](https://github.com/cabouman/mbirjax): high-performance
+tomographic reconstruction with multi-GPU support.
 
 This repo is the home for the port evaluated in
 `mbirjax_plans/plans/torch_port/port_plan.md` (checked out parallel to this

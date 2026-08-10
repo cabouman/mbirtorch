@@ -89,6 +89,6 @@ reset=`tput sgr0`
 
 echo " "
 echo "Use"
-echo "${red}   conda activate mbirjax   ${reset}"
+echo "${red}   conda activate mbirtorch   ${reset}"
 echo "to activate the conda environment."
 echo " "

@@ -295,7 +295,7 @@ def save_data_hdf5(file_path, array, array_name='array', attributes_dict=None):
     so the peak host footprint is one slab and not the whole volume -- which is the point of
     the streaming design and would otherwise be lost exactly where it matters most.  The file
     is byte-identical to the gather-first version: same slab order, same concatenation axis,
-    same padding crop, same dtype (see :func:`_to_host`).
+    same padding crop, same dtype (see ``_to_host``).
 
     Args:
         file_path (str): Full path to the output HDF5 file. Directories will be created if they do not exist.
