@@ -5,13 +5,17 @@ math only).  This module owns the **single** copy of the batching + host<->devic
 in-place-fill scaffolding used by ``compute_sino_transmission`` / ``downsample_view_data`` /
 ``correct_det_rotation`` and the fused ``scan_to_sino``.
 
-The host output is pre-allocated once and each batch's result is written directly into its view-slice,
+The driver supports two modes: a single-device sequential view-batch loop (the default, used by the
+legacy per-stage public functions), and a multi-device view-sharded mode (used by the fused
+``scan_to_sino``) where contiguous view shards run concurrently, one per device.  In both modes the
+host output is pre-allocated once and each batch's result is written directly into its view-slice,
 so the host footprint is the input + the single output (~2x) rather than input + per-batch gather +
 concatenate destination (~3x).
 """
 import numpy as np
 import torch
 
+from .. import _sharding
 from ..tomography_model import _resolve_device
 
 
@@ -48,32 +52,38 @@ def _fill_view_batches(array, kernel, output, batch_size, device, lo, hi, desc=N
 def map_view_batches(array, kernel, batch_size, desc=None, devices=None):
     """Apply a per-batch device kernel across the leading (view) axis.
 
-    A sequential view-batch loop: each contiguous batch of ``batch_size`` views is moved to the
-    device, passed through ``kernel`` (a pure device-tensor -> device-tensor transform), and written
-    back into the host output.  This bounds device memory to ``batch_size`` views.
+    Single device (``devices`` is None or length 1): a sequential view-batch loop -- each contiguous
+    batch of ``batch_size`` views is moved to the device, passed through ``kernel`` (a pure
+    device-tensor -> device-tensor transform), and written back into the host output.  This bounds
+    device memory to ``batch_size`` views.
+
+    Multiple devices: the views are split into contiguous, in-order shards (one per device) and each
+    shard is processed in its own thread on its own device.  Per-view kernels (no cross-view
+    reduction) make this embarrassingly parallel with no cross-device communication.  Each worker
+    writes its disjoint view-slice of the shared host output.
 
     ``kernel`` should close over HOST constants (NumPy) and move them to each batch's device
     (``torch.as_tensor(const, device=batch.device)``), NOT tensors already committed to one device.
 
     The host output is pre-allocated once (its shape/dtype probed from the first batch, since a kernel
     may change the trailing detector dims, e.g. downsampling) and filled in place, so the host footprint
-    is input + output (~2x).
+    is input + output (~2x) regardless of device count.
 
     Args:
         array (numpy array or tensor): data batched along axis 0 (views).
         kernel (callable): ``device_batch -> device_batch``; per-view, no host transfer inside.
         batch_size (int): number of views per on-device batch.
-        desc (str or None, optional): tqdm label.
-        devices (sequence or None): accepted for interface compatibility; the views run on a single
-            device (the first entry, or the default device when None).
+        desc (str or None, optional): tqdm label (single-device path only).
+        devices (sequence or None): devices to spread the views over.  None means a single device
+            (the default device) -- sharding is opt-in by passing several devices.
 
     Returns:
         numpy.ndarray: the per-batch kernel outputs assembled along axis 0 (view order).
     """
     if devices is None or len(list(devices)) == 0:
-        device = _resolve_device('auto')
+        devices = [_resolve_device('auto')]
     else:
-        device = torch.device(list(devices)[0])
+        devices = [torch.device(d) for d in devices]
     num_views = array.shape[0]
 
     # Probe the kernel's output shape/dtype on the first batch so a SINGLE host output array can be
@@ -82,10 +92,30 @@ def map_view_batches(array, kernel, batch_size, desc=None, devices=None):
     # on the host.  Writing in place bounds the host footprint to input + output (~2x).
     probe_hi = min(batch_size, num_views)
     with torch.no_grad():
-        probe = kernel(_stage_batch(array[0:probe_hi], device)).cpu().numpy()
+        probe = kernel(_stage_batch(array[0:probe_hi], devices[0])).cpu().numpy()
     output = np.empty((num_views,) + probe.shape[1:], dtype=probe.dtype)
     output[0:probe_hi] = probe
     del probe
 
-    _fill_view_batches(array, kernel, output, batch_size, device, probe_hi, num_views, desc=desc)
+    if len(devices) <= 1:
+        _fill_view_batches(array, kernel, output, batch_size, devices[0], probe_hi, num_views,
+                           desc=desc)
+        return output
+
+    # Multiple devices: contiguous, in-order view shards, one per device, each filled by its own
+    # thread (torch releases the GIL during CUDA work and transfers, so the devices genuinely
+    # overlap).  Workers write disjoint view-slices of the shared host output.
+    view_ranges = np.array_split(np.arange(num_views), len(devices))
+
+    def worker(i, device):
+        rng = view_ranges[i]
+        if len(rng) == 0:
+            return
+        lo = max(int(rng[0]), probe_hi)  # views [0:probe_hi] are already filled by the probe
+        hi = int(rng[-1]) + 1
+        if lo >= hi:
+            return
+        _fill_view_batches(array, kernel, output, batch_size, device, lo, hi)
+
+    _sharding.run_per_device(devices, worker)
     return output

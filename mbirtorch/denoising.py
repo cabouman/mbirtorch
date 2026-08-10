@@ -1,4 +1,4 @@
-"""QGGMRFDenoiser, ported from mbirjax.denoising (single-device path).
+"""QGGMRFDenoiser, ported from mbirjax.denoising.
 
 The denoiser uses the recon framework to implement a qGGMRF proximal-map
 denoiser: the forward model is the IDENTITY (the residual image plays the role
@@ -7,11 +7,21 @@ reduces to the closed-form below.  The mbirjax jit/fori_loop machinery is
 replaced by a plain python loop over the (sequential, unshuffled) subsets of
 ONE fixed partition -- the mbirjax denoiser iterates subsets in order, unlike
 vcd_recon's per-iteration shuffle, so a seeded partition makes the
-whole sweep deterministic.  The multi-device sharded path is not ported.
+whole sweep deterministic.
+
+Two paths, as in mbirjax: on one device the whole sweep runs through the
+compiled in-place update below; across several devices the image is
+slice-sharded and the sweep runs shard by shard, with the qGGMRF halos
+staged once per pass and the four line-search sums combined on the host
+into one step size.
 """
+
+import datetime
 
 import numpy as np
 import torch
+
+from . import _sharding
 
 from . import qggmrf as _qggmrf
 from . import vcd_utils
@@ -78,12 +88,13 @@ class QGGMRFDenoiser(TomographyModel):
     standard deviation sigma_noise, the result of :meth:`denoise` applied to
     X + W is the MAP estimate of the denoised image using the qGGMRF prior.
 
-    This model is SINGLE-DEVICE.  :meth:`denoise` runs its own loop over one
-    fixed partition with an identity forward model, so it never reaches the
-    reconstruction path where a CUDA model spreads across devices, and the
-    automatic device count therefore never applies to it.  Calling
-    ``configure_devices`` with more than one device on a denoiser raises when
-    ``denoise`` runs.
+    :meth:`denoise` has two paths: on a single device the whole sweep runs
+    through one compiled in-place update; across several devices (set with
+    ``configure_devices``) the image is slice-sharded and each device updates
+    its own shard, with the qGGMRF halos carrying the cross-boundary prior
+    term.  The automatic device count does not apply to the denoiser: it
+    never reaches the reconstruction path where that choice is made, so
+    multi-device denoising is explicit via ``configure_devices``.
     """
 
     def __init__(self, image_shape, compile_mode='auto'):
@@ -176,6 +187,7 @@ class QGGMRFDenoiser(TomographyModel):
 
     def denoise(self, image, sigma_noise=None, use_ror_mask=False, init_image=None,
                 max_iterations=15, stop_threshold_change_pct=0.2, first_iteration=0,
+                logfile_path='~/.mbirtorch/logs/recon.log', print_logs=True,
                 output_sharded=False):
         """
         Compute the MAP denoiser assuming AWGN and the 3D qGGMRF prior.
@@ -197,7 +209,12 @@ class QGGMRFDenoiser(TomographyModel):
                 100 * ||delta||_1 / ||image||_1 drops below this.  0 guarantees
                 exactly max_iterations.
             first_iteration (int, optional): iteration label offset for logs.
-            output_sharded (bool, optional): if True return the device tensor.
+            logfile_path (str, optional): Path to the output log file ('~' expands to the
+                user's home directory).  If None or empty, no log file is written.
+                Defaults to '~/.mbirtorch/logs/recon.log'.
+            print_logs (bool, optional): If true then print logs to console.  Defaults to True.
+            output_sharded (bool, optional): if True return the device form
+                (slice-sharded across several devices).
 
         Returns:
             (denoised_image, denoiser_dict): the denoised volume and the
@@ -207,16 +224,27 @@ class QGGMRFDenoiser(TomographyModel):
             >>> denoiser = mbirtorch.QGGMRFDenoiser(noisy_image.shape)
             >>> denoised_image, d = denoiser.denoise(noisy_image, sigma_noise=0.1)
         """
+        self._log_run_header(first_iteration, logfile_path, print_logs)
+        self._log_device_report()   # the layout is explicit or the default; final either way
+
+        # The noise and regularization estimates below index the image on the
+        # host; a sharded input supplies a host copy for them (statistics
+        # only -- the sweep itself consumes the sharded form).
+        host_image = image
+        if isinstance(image, _sharding.Shards):
+            from .utilities import _to_host
+            host_image = _to_host(image)
+
         self.set_params(no_warning=True, use_ror_mask=use_ror_mask)
         if sigma_noise is None:
-            sigma_noise = self.estimate_image_noise_std(image)
+            sigma_noise = self.estimate_image_noise_std(host_image)
         self.set_params(no_warning=True, sigma_noise=sigma_noise)
         self.logger.info('Initializing QGGMRFDenoiser')
 
         # Auto-regularization with the background-estimation warning suppressed.
         verbose = self.get_params('verbose')
         self.set_params(no_warning=True, verbose=0)
-        regularization_params = self.auto_set_regularization_params(np.asarray(image))
+        regularization_params = self.auto_set_regularization_params(np.asarray(host_image))
         self.set_params(no_warning=True, verbose=verbose)
 
         # One fixed partition (sequential subsets; no per-iteration shuffle).
@@ -229,52 +257,55 @@ class QGGMRFDenoiser(TomographyModel):
             device=self.torch_device, use_ror_mask=use_ror_mask)
         partition = partitions[0]
 
-        image_t = self._shard_recon(image)
-        if init_image is None:
-            init_t = image_t.clone()
-        else:
-            init_t = self._shard_recon(init_image).clone()
-
-        # Recon-domain flat layout: the image and the residual (the identity
-        # model's "error sinogram").
-        flat_image = init_t.reshape((-1, image_shape[2])).contiguous()
-        flat_error_image = (image_t.reshape((-1, image_shape[2]))
-                            - flat_image).contiguous()
-
         fm_constant = 1.0 / (self.get_params('sigma_y') ** 2.0)
         qggmrf_nbr_wts, sigma_x, p, q, T = self.get_params(
             ['qggmrf_nbr_wts', 'sigma_x', 'p', 'q', 'T'])
         b = _qggmrf.get_b_from_nbr_wts(qggmrf_nbr_wts)
         qggmrf_params = (b, sigma_x, p, q, T)
-
-        subset_denoiser = maybe_compile(vcd_subset_denoiser, self.compile_enabled)
         max_iters = max_iterations
         stop_thresh = stop_threshold_change_pct / 100.0
 
-        self.logger.info('Starting VCD iterations')
-        nmae_update = np.zeros(max_iters)
-        alpha_values = np.zeros(max_iters)
-        num_iters = 0
-        with torch.no_grad():
-            for i in range(max_iters):
-                ell1_accum = 0.0
-                alpha_accum = 0.0
-                for k in range(partition.shape[0]):
-                    flat_image, flat_error_image, ell1_subset, alpha_subset = \
-                        subset_denoiser(flat_image, flat_error_image, partition[k],
-                                        fm_constant, qggmrf_params, tuple(image_shape))
-                    ell1_accum = ell1_accum + ell1_subset
-                    alpha_accum = alpha_accum + alpha_subset
+        image_t = self._shard_recon(image)
+        init_t = image_t if init_image is None else self._shard_recon(init_image)
 
-                nmae = float(ell1_accum) / float(torch.sum(torch.abs(flat_image)))
-                nmae_update[i] = nmae
-                alpha_values[i] = float(alpha_accum) / partition.shape[0]
-                num_iters += 1
-                if verbose >= 1 and (i % 5) == 0:
-                    self.logger.info('After iteration {} of a max of {}: Pct change={:.4f}'
-                                     .format(i + first_iteration, max_iters, 100 * nmae))
-                if nmae < stop_thresh:
-                    break
+        self.logger.info('Starting VCD iterations')
+        if isinstance(image_t, _sharding.Shards):
+            flat_image, nmae_update, alpha_values, num_iters = self._denoise_sharded(
+                image_t, init_t, partition, fm_constant, qggmrf_params,
+                tuple(image_shape), max_iters, stop_thresh, first_iteration, verbose)
+            denoised = _sharding.Shards(
+                [t.reshape(s.shape) for t, s in zip(flat_image.tensors, image_t.tensors)],
+                flat_image.placement)
+        else:
+            # Single device: the whole sweep through one compiled in-place update.
+            flat_image = init_t.clone().reshape((-1, image_shape[2])).contiguous()
+            flat_error_image = (image_t.reshape((-1, image_shape[2]))
+                                - flat_image).contiguous()
+            subset_denoiser = maybe_compile(vcd_subset_denoiser, self.compile_enabled)
+            nmae_update = np.zeros(max_iters)
+            alpha_values = np.zeros(max_iters)
+            num_iters = 0
+            with torch.no_grad():
+                for i in range(max_iters):
+                    ell1_accum = 0.0
+                    alpha_accum = 0.0
+                    for k in range(partition.shape[0]):
+                        flat_image, flat_error_image, ell1_subset, alpha_subset = \
+                            subset_denoiser(flat_image, flat_error_image, partition[k],
+                                            fm_constant, qggmrf_params, tuple(image_shape))
+                        ell1_accum = ell1_accum + ell1_subset
+                        alpha_accum = alpha_accum + alpha_subset
+
+                    nmae = float(ell1_accum) / float(torch.sum(torch.abs(flat_image)))
+                    nmae_update[i] = nmae
+                    alpha_values[i] = float(alpha_accum) / partition.shape[0]
+                    num_iters += 1
+                    if verbose >= 1 and (i % 5) == 0:
+                        self.logger.info('After iteration {} of a max of {}: Pct change={:.4f}'
+                                         .format(i + first_iteration, max_iters, 100 * nmae))
+                    if nmae < stop_thresh:
+                        break
+            denoised = flat_image.reshape(tuple(image_shape))
 
         recon_params = dict(zip(recon_param_names,
                                 [int(num_iters), granularity, partition_sequence,
@@ -282,10 +313,103 @@ class QGGMRFDenoiser(TomographyModel):
                                  [100 * float(v) for v in nmae_update[:num_iters]],
                                  [float(v) for v in alpha_values[:num_iters]],
                                  None]))
-        denoiser_dict = {'recon_params': recon_params,
-                         'model_params': {k: v.val for k, v in self.params.items()}}
-        denoised = flat_image.reshape(tuple(image_shape))
+        notes = 'Reconstruction completed: {}\n\n'.format(datetime.datetime.now())
+        denoiser_dict = self.get_recon_dict(recon_params, notes=notes)
         return (denoised if output_sharded else self._gather_recon(denoised)), denoiser_dict
+
+    def _denoise_sharded(self, image_sh, init_sh, partition, fm_constant,
+                         qggmrf_params, image_shape, max_iters, stop_thresh,
+                         first_iteration, verbose):
+        """Run the denoising sweep across devices on slice-sharded state.
+
+        Mirrors vcd_recon's sharded path: the qGGMRF halos are staged once
+        per pass, each device computes its shard's prior and identity-forward
+        terms, and the four line-search sums combine on the host into one
+        step size (the same formula as vcd_subset_denoiser).
+
+        Returns (flat_image shards, nmae history, alpha history, num_iters).
+        """
+        devices = image_sh.placement.devices
+        n = len(devices)
+        pl = image_sh.placement
+
+        # Flat (num_pixels, local_slices) shards; residual = image - init.
+        flat_image = _sharding.Shards(
+            [t.reshape(-1, t.shape[-1]).clone().contiguous()
+             for t in init_sh.tensors], pl)
+        flat_error = _sharding.Shards(
+            [(a.reshape(-1, a.shape[-1]) - b).contiguous()
+             for a, b in zip(image_sh.tensors, flat_image.tensors)], pl)
+
+        interface_masks = self._qggmrf_interface_masks()
+        grad_hess = [maybe_compile(_qggmrf.qggmrf_gradient_and_hessian_at_indices,
+                                   self.compile_enabled, instance_key=i)
+                     for i in range(n)]
+        idx_per_dev = [[torch.as_tensor(partition[k], dtype=torch.int64).to(d)
+                        for d in devices] for k in range(partition.shape[0])]
+        halos = {'left': [None] * n, 'right': [None] * n}
+
+        nmae_update = np.zeros(max_iters)
+        alpha_values = np.zeros(max_iters)
+        num_iters = 0
+        with torch.no_grad():
+            for i in range(max_iters):
+                # Halos once per pass, as in mbirjax's sharded denoiser.
+                halos['left'], halos['right'] = _sharding.exchange_qggmrf_halos(
+                    flat_image, self.dev2dev_safe)
+                ell1_accum = 0.0
+                alpha_accum = 0.0
+                for k in range(partition.shape[0]):
+                    idx = idx_per_dev[k]
+
+                    def terms_worker(j, dev):
+                        grad, hess = grad_hess[j](
+                            flat_image.tensors[j], image_shape, idx[j],
+                            qggmrf_params, left_halo=halos['left'][j],
+                            right_halo=halos['right'][j],
+                            interface_mask=(None if interface_masks is None
+                                            else interface_masks[j]))
+                        cur_error = flat_error.tensors[j][idx[j]]
+                        forward_grad = -fm_constant * cur_error
+                        delta = -((forward_grad + grad) / (1.0 + hess))
+                        return (delta,
+                                float(torch.sum(grad * delta)),
+                                float(torch.sum(hess * delta ** 2)),
+                                float(fm_constant * torch.sum(cur_error * delta)),
+                                float(fm_constant * torch.sum(delta * delta)))
+
+                    results = _sharding.run_per_device(devices, terms_worker)
+                    deltas = [r[0] for r in results]
+                    prior_linear = sum(r[1] for r in results)
+                    prior_quadratic = sum(r[2] for r in results)
+                    forward_linear = sum(r[3] for r in results)
+                    forward_quadratic = sum(r[4] for r in results)
+                    alpha = ((forward_linear - prior_linear)
+                             / (forward_quadratic + prior_quadratic + _F32_EPS))
+                    alpha = min(max(alpha, _F32_EPS), 1.5)
+
+                    def apply_worker(j, dev):
+                        step = alpha * deltas[j]
+                        flat_image.tensors[j].index_add_(0, idx[j], step)
+                        flat_error.tensors[j].index_add_(0, idx[j], -step)
+                        return float(torch.sum(torch.abs(step)))
+
+                    ell1_parts = _sharding.run_per_device(devices, apply_worker)
+                    ell1_accum += sum(ell1_parts)
+                    alpha_accum += alpha
+
+                image_l1 = sum(float(torch.sum(torch.abs(t)))
+                               for t in flat_image.tensors)
+                nmae = ell1_accum / image_l1
+                nmae_update[i] = nmae
+                alpha_values[i] = alpha_accum / partition.shape[0]
+                num_iters += 1
+                if verbose >= 1 and (i % 5) == 0:
+                    self.logger.info('After iteration {} of a max of {}: Pct change={:.4f}'
+                                     .format(i + first_iteration, max_iters, 100 * nmae))
+                if nmae < stop_thresh:
+                    break
+        return flat_image, nmae_update, alpha_values, num_iters
 
 
 def median_filter3d(x, max_block_gb=4.0, return_min_max=False):
