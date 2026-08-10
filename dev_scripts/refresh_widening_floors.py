@@ -1,0 +1,585 @@
+"""Re-measure the multi-GPU widening speed floors and print a paste-ready table.
+
+WHY THIS EXISTS.  ``mbirtorch/_widening_floors.py`` holds a MEASUREMENT, not a
+constant: the sinogram size at which each device count starts paying for
+itself.  Change what a projection costs -- a kernel, a chunk constant, a
+transient budget, a banded driver -- and the crossovers move.
+``tests/test_widening_floors.py`` fails as soon as any of those inputs change,
+and this script is the one command that answers it.
+
+THIS SCRIPT IS THE SOLE WRITER of the three things that must move together:
+the floors, their provenance, and the blessed cost-input hashes.  It prints
+all three as one block, bound by a checksum, so greening the test by hand
+editing a hash fails a different assertion instead.
+
+THE METHOD, per cell and per device count: one cold recon, DISCARDED, then the
+warm median of 3 seeded 3-iteration reconstructions.  Every arm runs in a
+FRESH SUBPROCESS with ``MBIRTORCH_NUM_DEVICES`` pinned -- that pin fixes the
+count while keeping the model on the automatic branch, and a count changed
+inside one process would inherit the previous arm's compiled kernels and
+allocator state.  One sinogram per cell is generated once, at ONE device, and
+every arm of that cell loads it; otherwise the arms would reconstruct
+different arrays and the comparison would not be controlled.
+
+THE CROSSOVER RULE.  A count's floor is its crossover against the best smaller
+ADMITTED count, not against n=1 unconditionally: parallel n=4 must beat n=2,
+while cone n=4 must beat n=1 because cone n=2 is never admitted.  A win counts
+only when it clears 1.0x by more than that cell's warm spread, so one noisy
+cell cannot move a floor.  Where the crossover falls between two ladder cells,
+the floor takes the CONSERVATIVE end -- the larger cell.
+
+THE CELLS.  For a finite floor: the ladder cells bracketing it -- one below,
+the floor's own, one above.  For a SENTINEL: the 512-, 768- and 1024-class
+cells, hunting the admission point that has never been found.  A sentinel
+TRIPS when its count clears 1.0x by more than the measured spread, and the
+trip prints a proposed finite floor.  Sizes above a row's ``largest_tested``
+are not probed here and are reported as still unprobed.
+
+Run:
+    python dev_scripts/refresh_widening_floors.py            # a 4-GPU node
+    python dev_scripts/refresh_widening_floors.py --plan     # arms, then exit
+    python dev_scripts/refresh_widening_floors.py --smoke    # tiny, CPU, fast
+    python dev_scripts/refresh_widening_floors.py --bless    # hashes only
+    python dev_scripts/refresh_widening_floors.py --bless --accept-stale
+
+``--plan``, ``--smoke`` and ``--bless`` need no GPU.  The real run needs CUDA
+and takes roughly 30-60 minutes.
+
+Environment:
+    REFRESH_PYTHON      interpreter for the arm subprocesses (default: this one)
+    REFRESH_RESULTS     scratch directory for the staged sinograms and rows
+    REFRESH_ITERATIONS  VCD iterations per recon (default 3)
+    REFRESH_REPEATS     warm repeats after the discarded cold pass (default 3)
+"""
+
+import argparse
+import datetime
+import json
+import os
+import statistics
+import subprocess
+import sys
+import time
+import traceback
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from mbirtorch import _widening_floors as wf                      # noqa: E402
+
+# ── configuration ────────────────────────────────────────────────────────────
+TORCH_PYTHON = os.environ.get('REFRESH_PYTHON', sys.executable)
+RESULTS_DIR = os.environ.get(
+    'REFRESH_RESULTS',
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 '_widening_floor_runs'))
+ITERATIONS = int(os.environ.get('REFRESH_ITERATIONS', '3'))
+WARM_REPEATS = int(os.environ.get('REFRESH_REPEATS', '3'))
+SEED = 13
+
+#: The size ladder, one geometric family, largest last.  A floor is always one
+#: of these sizes, so a refresh reports a floor by naming a cell.
+LADDER = [(128, 112, 96), (192, 168, 144), (256, 224, 192), (384, 336, 288),
+          (512, 448, 384), (768, 672, 576), (1024, 1008, 992)]
+#: The cells a sentinel row is probed at.
+SENTINEL_PROBES = [(512, 448, 384), (768, 672, 576), (1024, 1008, 992)]
+#: Tiny stand-ins so --smoke exercises every path in seconds on a CPU.
+SMOKE_LADDER = [(8, 12, 16), (12, 12, 16), (16, 12, 16)]
+
+
+def elements(cell):
+    return int(cell[0]) * int(cell[1]) * int(cell[2])
+
+
+def cell_named(target_elements, ladder):
+    for cell in ladder:
+        if elements(cell) == target_elements:
+            return cell
+    return None
+
+
+# ── the plan ─────────────────────────────────────────────────────────────────
+def comparison_count(family, count):
+    """The best smaller ADMITTED count -- what ``count`` has to beat.
+
+    Read off the table rather than assumed, which is what makes cone n=4
+    compare against n=1: cone n=2 is a sentinel, so it is never admitted and
+    is never the count n=4 has to overtake.
+    """
+    for n in range(count - 1, 1, -1):
+        row = wf.FLOORS.get((family, n))
+        # Only a count with its OWN measured, finite row can be the
+        # comparison: a count that merely INHERITS a floor was never measured
+        # in its own right, and a sentinel row is never admitted at all.
+        if row is not None and row.elements is not None:
+            return n
+    return 1
+
+
+def build_plan(smoke=False):
+    """``[{family, count, cell, counts, role}, ...]`` in run order, plus the
+    families that have no measured rows at all."""
+    ladder = SMOKE_LADDER if smoke else LADDER
+    rows = []
+    for (family, count) in sorted(wf.FLOORS):
+        floor = wf.FLOORS[(family, count)]
+        against = comparison_count(family, count)
+        arms = sorted({1, against, count})
+        if floor.elements is None:
+            cells = (ladder[-len(SENTINEL_PROBES):] if smoke
+                     else list(SENTINEL_PROBES))
+            role = 'sentinel probe'
+        else:
+            at = cell_named(floor.elements, ladder)
+            if at is None:                       # smoke, or a moved ladder
+                at = ladder[len(ladder) // 2]
+            index = ladder.index(at)
+            cells = ladder[max(0, index - 1):index + 2]
+            role = 'bracket'
+        for cell in cells:
+            rows.append(dict(family=family, count=count, cell=list(cell),
+                             counts=arms, role=role, against=against,
+                             cell_elements=elements(cell)))
+    return rows
+
+
+def unmeasured_families():
+    """Floor families a model class declares that the table has no rows for.
+
+    A geometry added without a measurement silently inherits the parallel
+    floors; this is where that shows up as work to do rather than as a
+    surprise in someone's log.
+    """
+    import mbirtorch
+    from mbirtorch.tomography_model import TomographyModel
+
+    seen, known = {}, set(wf.families())
+    for name in dir(mbirtorch):
+        cls = getattr(mbirtorch, name)
+        family = (getattr(cls, '_floor_family', None)
+                  if isinstance(cls, type)
+                  and issubclass(cls, TomographyModel) else None)
+        if family is not None and family not in known:
+            seen.setdefault(family, []).append(name)
+    return seen
+
+
+def print_plan(plan, smoke):
+    ladder = SMOKE_LADDER if smoke else LADDER
+    print('widening-floor refresh plan ({}), interpreter {}'.format(
+        'SMOKE, CPU' if smoke else 'CUDA', TORCH_PYTHON))
+    print('  ladder: ' + ', '.join(
+        '{} ({:,})'.format(c, elements(c)) for c in ladder))
+    print()
+    header = '{:>9}{:>4}{:>9}{:>20}{:>16}{:>18}'.format(
+        'family', 'n', 'against', 'cell', 'sino elements', 'role')
+    print(header)
+    for row in plan:
+        print('{:>9}{:>4}{:>9}{:>20}{:>16,}{:>18}'.format(
+            row['family'], row['count'], row['against'], str(tuple(row['cell'])),
+            row['cell_elements'], row['role']))
+    arms = sum(len(row['counts']) for row in plan)
+    cells = {(row['family'], tuple(row['cell'])) for row in plan}
+    print('\n{} rows, {} distinct cells, {} timed arms + {} generators'.format(
+        len(plan), len(cells), arms, len(cells)))
+    top = elements(ladder[-1])
+    for (family, count) in sorted({(r['family'], r['count']) for r in plan}):
+        floor = wf.FLOORS[(family, count)]
+        if floor.elements is None:
+            print('  NOTE {} n={}: SENTINEL.  Probed at the {} cells above; '
+                  'sizes above largest_tested ({:,} sinogram elements) are '
+                  'NOT probed by this plan and remain unprobed.'.format(
+                      family, count, len(SENTINEL_PROBES),
+                      floor.largest_tested))
+        elif floor.elements >= top:
+            print('  NOTE {} n={}: its floor sits at the TOP of the ladder, '
+                  'so the bracket has no cell above it -- a refresh can '
+                  'confirm the floor but cannot lower it without a larger '
+                  'cell.'.format(family, count))
+    missing = unmeasured_families()
+    if missing:
+        for family, classes in sorted(missing.items()):
+            print('  NEEDS MEASUREMENT: floor family {!r} is declared by {} '
+                  'but has no rows; it currently inherits the {} floors.'
+                  .format(family, ', '.join(sorted(classes)),
+                          wf.DEFAULT_FAMILY))
+    else:
+        print('  every declared floor family has rows.')
+
+
+# ── the worker: one arm, one subprocess ──────────────────────────────────────
+def _build_model(family, cell, device):
+    import numpy as np
+
+    import mbirtorch
+
+    num_views, _rows, num_channels = cell
+    if family == 'cone':
+        angles = np.linspace(0, 2 * np.pi, num_views, endpoint=False)
+        model = mbirtorch.ConeBeamModel(
+            tuple(cell), angles, source_detector_dist=4.0 * num_channels,
+            source_iso_dist=2.0 * num_channels)
+    else:
+        angles = np.linspace(0, np.pi, num_views, endpoint=False)
+        model = mbirtorch.ParallelBeamModel(tuple(cell), angles)
+    if device != 'cuda':
+        # CPU/MPS only: the env pin is a CUDA mechanism (the policy
+        # short-circuits below two visible devices), so the smoke has to place
+        # the model by hand.  On CUDA nothing is configured, which keeps the
+        # model on the automatic branch the pin acts through.
+        model.configure_devices(devices=[device])
+    model.set_params(no_warning=True, verbose=0)
+    return model
+
+
+def _sino_path(family, cell):
+    return os.path.join(RESULTS_DIR, '_sino_{}_{}x{}x{}.npy'.format(
+        family, *cell))
+
+
+def generate(cfg):
+    """Stage one sinogram per cell, at ONE device, so every arm of that cell
+    reconstructs the same array."""
+    import numpy as np
+
+    import mbirtorch
+
+    model = _build_model(cfg['family'], cfg['cell'],
+                         'cpu' if cfg['device'] != 'cuda' else 'cuda')
+    recon_shape = tuple(model.get_params('recon_shape'))
+    phantom = mbirtorch.generate_3d_shepp_logan_low_dynamic_range(recon_shape)
+    sinogram = np.asarray(_to_numpy(model.forward_project(phantom)),
+                          dtype=np.float32)
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    np.save(_sino_path(cfg['family'], cfg['cell']),
+            np.ascontiguousarray(sinogram))
+    return dict(cfg, role='generator', recon_shape=list(recon_shape),
+                sino_shape=list(sinogram.shape))
+
+
+def _to_numpy(x):
+    """The one host exit.  ``Shards.gather()`` ALREADY returns numpy, so a
+    gather is never followed by ``.detach()`` -- re-detaching one is a
+    recorded way to lose every multi-device row in a run."""
+    import numpy as np
+
+    if isinstance(x, np.ndarray):
+        return x
+    if callable(getattr(x, 'gather', None)) and hasattr(x, 'placement'):
+        return x.gather()
+    return (x.detach().cpu().numpy()
+            if callable(getattr(x, 'detach', None)) else np.asarray(x))
+
+
+def measure(cfg):
+    """One arm: cold pass discarded, then the warm median of REPEATS runs."""
+    import numpy as np
+    import torch
+
+    model = _build_model(cfg['family'], cfg['cell'], cfg['device'])
+    sinogram = np.load(_sino_path(cfg['family'], cfg['cell']))
+    weights = np.exp(-sinogram / (2 * np.max(sinogram))).astype(np.float32)
+
+    def one():
+        np.random.seed(SEED)
+        recon, _info = model.recon(sinogram, weights=weights,
+                                   max_iterations=ITERATIONS,
+                                   stop_threshold_change_pct=0.0)
+        if cfg['device'] == 'cuda':
+            for device in model.sino_placement.devices:
+                torch.cuda.synchronize(device)
+        return _to_numpy(recon)
+
+    start = time.perf_counter()
+    out = one()
+    cold = time.perf_counter() - start
+    warm = []
+    for _ in range(WARM_REPEATS):
+        start = time.perf_counter()
+        out = one()
+        warm.append(time.perf_counter() - start)
+    median = statistics.median(warm)
+    return dict(cfg, role='arm', cold_s=cold, warm_all=warm, warm_s=median,
+                spread=(max(warm) - min(warm)) / median,
+                realized_devices=len(model.sino_placement.devices),
+                recon_checksum=float(np.sum(np.abs(out), dtype=np.float64)))
+
+
+# ── the runner ───────────────────────────────────────────────────────────────
+def arm_env(cfg):
+    """The environment that DEFINES an arm, set explicitly so nothing is
+    inherited from the submitting shell."""
+    env = dict(os.environ)
+    env.pop('MBIRTORCH_MEMORY_CALIBRATION', None)
+    env.pop('MBIRTORCH_NUM_DEVICES', None)
+    env.pop('MBIRTORCH_WIDENING_GUARD', None)   # the pin already bypasses it
+    env['MBIRTORCH_DISABLE_TRITON'] = '0'       # production: kernels on
+    if cfg.get('n_dev') and cfg['device'] == 'cuda':
+        env['MBIRTORCH_NUM_DEVICES'] = str(cfg['n_dev'])
+    return env
+
+
+def run_one(cfg, tag):
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    cfg_path = os.path.join(RESULTS_DIR, '_cfg_{}.json'.format(tag))
+    out_path = os.path.join(RESULTS_DIR, '_out_{}.json'.format(tag))
+    with open(cfg_path, 'w') as handle:
+        json.dump(cfg, handle)
+    if os.path.exists(out_path):
+        os.remove(out_path)
+    proc = subprocess.run([TORCH_PYTHON, '-u', os.path.abspath(__file__),
+                           '_worker', cfg_path, out_path], env=arm_env(cfg))
+    if proc.returncode != 0 and not os.path.exists(out_path):
+        return dict(cfg, error='worker exited {}'.format(proc.returncode))
+    with open(out_path) as handle:
+        return json.load(handle)
+
+
+def _worker_main(cfg_path, out_path):
+    with open(cfg_path) as handle:
+        cfg = json.load(handle)
+    try:
+        row = generate(cfg) if cfg['role'] == 'generator' else measure(cfg)
+    except Exception:                                             # noqa: BLE001
+        row = dict(cfg, error=traceback.format_exc()[-3000:])
+    with open(out_path, 'w') as handle:
+        json.dump(row, handle)
+
+
+def run_plan(plan, device):
+    """Every generator, then every arm.  Returns ``{(family, cell, n): row}``."""
+    cells = sorted({(row['family'], tuple(row['cell'])) for row in plan})
+    for family, cell in cells:
+        cfg = dict(family=family, cell=list(cell), device=device,
+                   role='generator')
+        tag = 'gen_{}_{}x{}x{}'.format(family, *cell)
+        print('  generator {} {} ...'.format(family, cell), flush=True)
+        row = run_one(cfg, tag)
+        if row.get('error'):
+            print('    ERROR: {}'.format(str(row['error'])[:400]))
+
+    measured = {}
+    arms = sorted({(row['family'], tuple(row['cell']), n)
+                   for row in plan for n in row['counts']})
+    for index, (family, cell, n_dev) in enumerate(arms):
+        cfg = dict(family=family, cell=list(cell), device=device,
+                   role='arm', n_dev=n_dev)
+        tag = 'arm_{}_{}x{}x{}_n{}'.format(family, *cell, n_dev)
+        print('  [{}/{}] {} {} n={} ...'.format(index + 1, len(arms), family,
+                                                cell, n_dev), flush=True)
+        row = run_one(cfg, tag)
+        measured[(family, cell, n_dev)] = row
+        if row.get('error'):
+            print('    ERROR: {}'.format(str(row['error'])[:400]))
+        else:
+            print('    warm {:.3f}s  spread {:.1%}  realized {} device(s)'
+                  .format(row['warm_s'], row['spread'],
+                          row['realized_devices']))
+    return measured
+
+
+# ── the analysis ─────────────────────────────────────────────────────────────
+def speedup(measured, family, cell, count, against):
+    """``against``'s warm median over ``count``'s: above 1.0 means the wider
+    count is faster."""
+    a = measured.get((family, cell, against))
+    b = measured.get((family, cell, count))
+    if not a or not b or a.get('error') or b.get('error'):
+        return None, None
+    spread = max(a['spread'], b['spread'])
+    return a['warm_s'] / b['warm_s'], spread
+
+
+def verdict(plan, measured):
+    """Per table row: the per-cell speedups, and the crossover the floor_4
+    rule reads off them.
+
+    A win counts only when it clears 1.0x by MORE than that cell's warm
+    spread, which is what keeps one noisy cell from moving a floor.
+    """
+    out = {}
+    for (family, count) in sorted(wf.FLOORS):
+        cells = [tuple(row['cell']) for row in plan
+                 if row['family'] == family and row['count'] == count]
+        against = comparison_count(family, count)
+        rows, winner = [], None
+        for cell in cells:
+            ratio, spread = speedup(measured, family, cell, count, against)
+            wins = ratio is not None and ratio - 1.0 > spread
+            rows.append((cell, ratio, spread, wins))
+            if wins and winner is None:
+                winner = cell
+        out[(family, count)] = dict(against=against, rows=rows, winner=winner)
+    return out
+
+
+def print_verdict(verdicts):
+    for (family, count), record in sorted(verdicts.items()):
+        floor = wf.FLOORS[(family, count)]
+        print('\n===== {} n={}  (crossover against n={}) ====='.format(
+            family, count, record['against']))
+        for cell, ratio, spread, wins in record['rows']:
+            if ratio is None:
+                print('  {:>20} {:>16,}   (no measurement)'.format(
+                    str(cell), elements(cell)))
+                continue
+            print('  {:>20} {:>16,}   {:.3f}x  spread {:.1%}   {}'.format(
+                str(cell), elements(cell), ratio, spread,
+                'WINS' if wins else 'loses'))
+        probed = max(elements(c) for c, _r, _s, _w in record['rows'])
+        winner = record['winner']
+        proposed = elements(winner) if winner else None
+        if winner is None and floor.elements is None:
+            print('  no admission point in these cells -> the row stays a '
+                  'SENTINEL; sizes above {:,} sinogram elements remain '
+                  'unprobed.'.format(probed))
+        elif winner is None:
+            print('  NOTHING WON: the floor is above every cell probed '
+                  '({:,} sinogram elements).  Re-run with a larger ladder; '
+                  'this run cannot place a floor.'.format(probed))
+        elif floor.elements is None:
+            print('  SENTINEL TRIPPED: n={} clears 1.0x by more than its '
+                  'spread at {}.  Proposed finite floor: {:,} sinogram '
+                  'elements.'.format(count, winner, proposed))
+        elif proposed != floor.elements:
+            print('  FLOOR MOVES: {:,} -> {:,} sinogram elements.'.format(
+                floor.elements, proposed))
+        else:
+            print('  floor unchanged at {:,} sinogram elements.'.format(
+                proposed))
+
+
+_ROW_TEMPLATE = """    ('{family}', {count}): Floor(
+        family='{family}', count={count}, elements={elements}, cell={cell},
+        against={against},
+        bracket=Bracket(losing_cell={low_cell}, losing_speedup={low_x},
+                        winning_cell={cell}, winning_speedup={win_x}),
+        spread={spread:.4g}, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='{today}', commit='{commit}',
+        largest_tested={largest},
+        note='...'),"""
+
+
+def print_table(verdicts, commit):
+    """The paste-ready replacement for FLOORS, provenance included."""
+    today = datetime.date.today().isoformat()
+    print('\n' + '=' * 78)
+    print('PASTE INTO mbirtorch/_widening_floors.py (FLOORS, then the three')
+    print('bound constants printed by --bless).  All of it, or none of it.')
+    print('=' * 78 + '\nFLOORS = {')
+    for (family, count), record in sorted(verdicts.items()):
+        winner, rows = record['winner'], record['rows']
+        found = elements(winner) if winner else None
+        # The bracket's low side is the largest cell BELOW the winner that
+        # lost.  A cell above the winner may also read under 1.0x on noise,
+        # and calling that the losing side would invert the bracket.
+        below = [(c, r) for c, r, _s, wins in rows if r and not wins
+                 and (found is None or elements(c) < found)]
+        low = below[-1] if below else (None, None)
+        win_ratio = next((r for c, r, _s, _w in rows if c == winner), None)
+        print(_ROW_TEMPLATE.format(
+            family=family, count=count, against=record['against'],
+            elements='{:_}'.format(found) if found else 'None',
+            cell=winner if winner else 'None',
+            low_cell=low[0] if low[0] else 'None',
+            low_x='{:.2f}'.format(low[1]) if low[1] else 'None',
+            win_x='{:.2f}'.format(win_ratio) if win_ratio else 'None',
+            spread=max([s for _c, _r, s, _w in rows if s is not None] or [0.0]),
+            today=today, commit=commit,
+            # THIS run's largest cell, never the old row's: claiming a size
+            # this refresh did not probe is the lie the field exists to stop.
+            largest='{:_}'.format(max(elements(c)
+                                      for c, _r, _s, _w in rows))))
+    print('}')
+    print('\nCheck MEASURED_GPU and MEASURED_CONFIG still describe this run, '
+          'and rewrite each note by hand: a note is the one field a machine '
+          'cannot fill in.')
+
+
+def head_commit():
+    try:
+        out = subprocess.run(['git', 'log', '-1', '--format=%h'],
+                             capture_output=True, text=True, timeout=10,
+                             cwd=os.path.dirname(os.path.dirname(
+                                 os.path.abspath(__file__))))
+        return out.stdout.strip() or 'unknown'
+    except Exception:                                             # noqa: BLE001
+        return 'unknown'
+
+
+def do_bless(accept_stale):
+    stale = wf.stale_cost_inputs()
+    print('projection-cost inputs that moved since the last bless: {}'.format(
+        ', '.join(name for name, _w, _g in stale) or 'none'))
+    if accept_stale:
+        stamp = datetime.date.today().isoformat()
+        print('\n--accept-stale: re-blessing the hashes WITHOUT re-measuring.')
+        print('The floors keep their old numbers and are stamped stale; every')
+        print('automatic device selection will log that debt until a real')
+        print('refresh replaces them.\n')
+    else:
+        stamp = None
+        print('\nRe-blessing after a measurement run.  If you have NOT just')
+        print('re-measured, use --bless --accept-stale instead, which records')
+        print('the debt rather than hiding it.\n')
+    print(wf.bless_lines(stale_since=stamp))
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description='re-measure the multi-GPU widening speed floors')
+    parser.add_argument('--plan', action='store_true',
+                        help='print the arm list and exit (no GPU needed)')
+    parser.add_argument('--smoke', action='store_true',
+                        help='run tiny CPU cells end to end to prove the '
+                             'plumbing (no GPU needed)')
+    parser.add_argument('--bless', action='store_true',
+                        help='recompute and print the bound hash constants '
+                             '(no GPU needed)')
+    parser.add_argument('--accept-stale', action='store_true',
+                        help='with --bless: re-bless without re-measuring and '
+                             'stamp the floors stale')
+    args = parser.parse_args(argv)
+
+    if args.bless:
+        return do_bless(args.accept_stale)
+    if args.accept_stale:
+        parser.error('--accept-stale only means something with --bless')
+
+    plan = build_plan(smoke=args.smoke)
+    if args.plan:
+        print_plan(plan, args.smoke)
+        return 0
+
+    device = 'cpu' if args.smoke else 'cuda'
+    if not args.smoke:
+        import torch
+        if not torch.cuda.is_available():
+            print('a real refresh needs CUDA; use --smoke to test the '
+                  'plumbing on this machine.')
+            return 2
+        print('{} CUDA device(s) visible'.format(torch.cuda.device_count()))
+    else:
+        print('SMOKE: tiny cells on the CPU.  The device-count pin is a CUDA '
+              'mechanism, so every arm realizes ONE device here and the '
+              'speedups are all 1.0x -- this proves the plumbing (batching, '
+              'subprocess env, analysis, table printing), not the floors.')
+
+    print_plan(plan, args.smoke)
+    print('\nrunning ...')
+    started = time.time()
+    measured = run_plan(plan, device)
+    verdicts = verdict(plan, measured)
+    print_verdict(verdicts)
+    print_table(verdicts, head_commit())
+    print('\nthen: python dev_scripts/refresh_widening_floors.py --bless')
+    print('elapsed {:.1f} min; rows under {}'.format(
+        (time.time() - started) / 60, RESULTS_DIR))
+    return 0
+
+
+if __name__ == '__main__':
+    if len(sys.argv) >= 2 and sys.argv[1] == '_worker':
+        _worker_main(sys.argv[2], sys.argv[3])
+    else:
+        sys.exit(main())

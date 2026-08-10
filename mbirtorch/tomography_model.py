@@ -523,6 +523,16 @@ class TomographyModel(ParameterHandler):
                         else:
                             for i in range(sp.n_devices):
                                 partial_shards[i].add_(partials[i])
+                        # Accumulated -- release the name (the back driver's
+                        # twin).  The next band's `partials = run_per_device(...)`
+                        # evaluates BEFORE rebinding, so an un-released list
+                        # keeps the previous band's full-row partial live on
+                        # every device through the next band's projection: one
+                        # sinogram shard per device, uncharged.  The aligned
+                        # branch above has no such release to make -- its
+                        # `row_bands` tensors are appended to `view_bands`, so
+                        # they are the OUTPUT and stay live either way.
+                        partials = None
         if aligned:
             tensors = [b[0] if len(b) == 1 else torch.cat(b, dim=1)
                        for b in view_bands]
@@ -613,6 +623,13 @@ class TomographyModel(ParameterHandler):
                     owner_parts.append(_sharding.sum_band_to_owner(
                         [p for p in partials if p is not None], odev,
                         self.dev2dev_safe))
+                    # The partials are consumed by the reduce.  Release the
+                    # name here: the next band's `partials = run_per_device(...)`
+                    # evaluates its call BEFORE rebinding, so without this the
+                    # previous band's partial stays live on every device for the
+                    # whole of the next band's projection -- one cylinder per
+                    # device, uncharged.  (The `weighted_fwd` treatment.)
+                    partials = None
                 recon_tensors.append(owner_parts[0] if len(owner_parts) == 1
                                      else torch.cat(owner_parts, dim=1))
         if rp.is_padded:

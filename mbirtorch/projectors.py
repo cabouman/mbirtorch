@@ -439,6 +439,17 @@ class Projectors:
                 out = block
             else:
                 out.add_(block)
+            # Released AFTER the accumulation, so the summation order is
+            # untouched -- this is a residency change only.  Without it the
+            # next iteration's `back_body(...)` evaluates before rebinding
+            # `block`, holding accumulator + outgoing + incoming: min(3, nb)
+            # cylinder-shards where min(2, nb) is what the loop needs.  On the
+            # first iteration `out` IS `block`, so dropping the name costs
+            # nothing there.  The gain is bounded by measurement, not by the
+            # count: mg6 read the loop's live blocks at 2.49 cylinders where
+            # this reading says 3, so the released cylinder is worth about half
+            # of one in practice.
+            block = None
         return out
 
     def _sparse_forward_project_single_device(self, voxel_values, pixel_indices):

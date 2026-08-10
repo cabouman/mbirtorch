@@ -283,24 +283,68 @@ def estimate_peak_device_bytes(plan):
         copies = n + 1 if n == 2 else n + 2
         return copies * int(num_pixels) * plan.band_length(i, 'back') * _F32_BYTES
 
+    def back_view_batches(i, num_pixels):
+        """How many batches one worker's view loop runs, or None when this
+        plan prices no batch (a hand-built plan with no cost model)."""
+        real_views = plan.view_blocks[i][1]
+        if real_views <= 0 or plan.view_charge is None:
+            return None
+        view_batch = int(plan.view_charge(
+            'back', int(num_pixels), back_cols(i))[0])
+        return max(1, -(-int(real_views) // max(1, view_batch)))
+
     def back_fixed(i, num_pixels):
-        """The back's call-fixed outputs.
+        """The back view loop's live cylinder-shards.
 
-        A single device holds THREE cylinder arrays, not two.  The driver's
-        loop is ``block = back_body(...)`` followed by ``out.add_(block)``,
-        and python evaluates the call before it rebinds the name, so the
-        PREVIOUS block is still alive while the kernel produces the next one:
-        the accumulator, the outgoing block, and the incoming block.  The
-        phase probe confirmed the third array at both gate cells; charging
-        two put the direct-recon and hessian phases 10 to 13 percent under
-        their measured peaks.
+        ``Projectors.sparse_back_project_view_range`` is ``block =
+        back_body(...)`` then ``out.add_(block)`` then ``block = None``.
+        Python evaluates the call before it rebinds, so the loop holds the
+        accumulator and the incoming block -- ``min(2, view_batches)``.  The
+        release is what makes it two: without it the outgoing block survives
+        the next kernel as well, which is the three the phase probe measured
+        at the gate cells before it landed.
 
-        A multi-device slice-owner instead accumulates its per-band parts in
-        a list and concatenates them, which is two.
+        CALIBRATED ON MEASUREMENT, not on the code reading alone.  mg6 read
+        the pre-release loop at 2.49, 0.99 and 1.97 live cylinders where the
+        reading said 3, 2 and 3 -- at 4, 2 and 5 view batches per band pass --
+        so the difference between the reading and the measurement is absorbed
+        by the ``back batch`` charge beside it, which the same rows price 30
+        to 45 percent conservative.  Charging min(2, batches) here plus that
+        batch clears every mg6 worker peak with the release applied: 1.07 at
+        parallel 1024 n=2, 1.13 at parallel 1024 n=4, 1.12 at cone 1024 n=4
+        and 1.20 at cone 512 n=2, worst device 1.07.
+
+        n == 1 stays at THREE.  The release removes the same array there, but
+        the n=1 calibration sits at 1.009 and 1.104, and dropping a full
+        cylinder from a charge that thin risks going under 1.00 if the peak
+        instant is not exactly where this reading puts it.  The ledger may
+        over-charge; it may not under-charge.  The third cylinder comes off
+        n=1 when an n=1 calibration run confirms the drop.
+
+        This is charged on every VIEW owner: the workers run wherever there
+        are views to project, not only where the bands land.
         """
-        if not is_slice_owner(i):
+        if n == 1:
+            return 3 * cyl(i, num_pixels) if is_slice_owner(i) else 0
+        if not is_view_owner(i):
             return 0
-        return (3 if n == 1 else 2) * cyl(i, num_pixels)
+        batches = back_view_batches(i, num_pixels)
+        live = 2 if batches is None else min(2, batches)
+        return live * cyl(i, num_pixels)
+
+    def back_own_band(i, num_pixels):
+        """The band this device already finished, live from its own pass on.
+
+        Each slice-owner keeps its reduced band in ``recon_tensors`` for the
+        rest of the loop, so from its own pass onward it carries one extra
+        cylinder-shard through every later pass's projection.  Real,
+        unavoidable, and uncharged before the sub-phase split; mg6 read it
+        directly as the +1 step in the band-pass entry of every device that
+        had already owned a pass.
+        """
+        if n == 1 or not is_slice_owner(i):
+            return 0
+        return cyl(i, num_pixels)
 
     def forward_fixed(i):
         """The forward's assembled output.  A multi-device owner holds the
@@ -309,6 +353,54 @@ def estimate_peak_device_bytes(plan):
         if not is_view_owner(i):
             return 0
         return sino_dev(i) if n == 1 else 2 * sino_dev(i)
+
+    def forward_band_copy(i, num_pixels):
+        """The broadcast band the forward leaves resident on every projector.
+
+        ``_sharding.broadcast_band_to_views`` copies the current slice-owner's
+        band onto every view-owner, and the copy stays live for the whole of
+        that band's projection.  One band is the whole shard by default, so
+        the copy is a full cylinder-shard on each device, on top of the
+        device's own shard.  Never charged before; it is what the whole-run
+        peak at cone 1024 with four devices needs.
+        """
+        if n == 1 or not is_view_owner(i):
+            return 0
+        return cyl(i, num_pixels)
+
+    def forward_residual(i):
+        """A MEASURED MARGIN: this ledger models released code, and every
+        measurement that exists was taken before the releases landed.
+
+        The mg2 whole-run peaks attribute exactly.  At parallel 1024 they are
+        a back-loop sub-step to within 0.001 cylinders -- the direct recon's
+        workers at two devices weighted, the hessian's workers at two devices
+        unweighted, and a band reduce at four devices, either phase.  At cone
+        1024 with four devices the peak sits 1.73 cylinders ABOVE anything in
+        either back loop, so it is a forward phase; the terms above put its
+        live set within 2.5 percent of the measurement.
+
+        Every one of those peaks holds a stale binding that this change
+        releases, so each should fall.  Charging the corrected terms alone
+        lands at 0.92 and 0.93 of the RAW measurements while clearing 1.03
+        against the same measurements less the predicted saving.  Rather than
+        rest the floor on a predicted saving, one per-device sinogram shard --
+        the largest single array either release frees -- is charged here to
+        keep the modeled peak above every measurement AS MEASURED.
+
+        It sits on the forward because that is where it costs least: the back
+        loop's correction keeps its full benefit, and the forward's own
+        attribution is the one still open (charter A).  RETIREMENT: a
+        calibration run against the released code replaces this with the raw
+        post-release numbers.  Two forward terms were identified and NOT
+        charged, being subsumed by this margin -- the view-range loop holds
+        two assembled blocks rather than one (the same evaluate-before-rebind
+        the back loop had), and a two-fan block spans the detector ROW count
+        rather than the voxel band ``forward_block`` prices.
+        """
+        if n == 1 or not is_view_owner(i):
+            return 0
+        return sino_dev(i)
 
     def forward_block(i, num_pixels, cols):
         """One assembled view block, which is not part of the batch charge.
@@ -379,6 +471,40 @@ def estimate_peak_device_bytes(plan):
 
     phases = []
 
+    def back_phases(name, resident_terms, num_pixels, base, base_terms):
+        """One sharded back projection, as its TWO consecutive sub-steps.
+
+        The workers project and the reduce gathers, and they never run at the
+        same time: the workers' locals die on return, and the reduce's copies
+        do not exist until they do.  Summing the two charged a peak that is
+        never live -- 4.2 cylinders per device above the larger sub-step at
+        parallel 1024 with four devices, which mg6 measured directly.  Both
+        sub-phases are emitted and the per-device maximum over phases picks
+        between them, exactly as the loop/scatter split does.
+
+        The sub-phase names keep the parent name as a prefix, so any consumer
+        matching on the parent (a preflight message, a calibration row, a
+        test) still finds it.  At n == 1 there is no reduce, so the phase is
+        emitted whole under the parent name and nothing about the
+        single-device ledger moves.
+        """
+        worker_terms = list(resident_terms) + [
+            ('back output', per_dev(lambda i: back_fixed(i, num_pixels))),
+            ('finished own band',
+             per_dev(lambda i: back_own_band(i, num_pixels))),
+            ('back batch', per_dev(lambda i: back_batch(i, num_pixels))),
+        ]
+        reduce_term = ('band reduce',
+                       per_dev(lambda i: band_reduce(i, num_pixels)))
+        if n == 1:
+            return [_phase(name, worker_terms + [reduce_term], n,
+                           base=base, base_terms=base_terms)]
+        reduce_terms = list(resident_terms) + [reduce_term]
+        return [_phase(f'{name} [back workers]', worker_terms, n,
+                       base=base, base_terms=base_terms),
+                _phase(f'{name} [band reduce]', reduce_terms, n,
+                       base=base, base_terms=base_terms)]
+
     # ── phase B: the direct reconstruction ───────────────────────────────────
     # Runs only when no initial reconstruction was supplied.  Its full-index
     # back projection is the largest single projection of the run.
@@ -387,13 +513,10 @@ def estimate_peak_device_bytes(plan):
         # The back LOOP and the SCATTER are consecutive, not co-live: the
         # driver's accumulator is freed into the scatter's input.  Charging
         # both together over-counted the direct recon by a recon-shaped array.
-        loop_terms = [
+        loop_residents = [
             ('sinogram', per_dev(sino_dev)),
             ('weights', per_dev(supplied_weights_term)),
             ('filtered sinogram', per_dev(sino_dev)),
-            ('back output', per_dev(lambda i: back_fixed(i, p_full))),
-            ('band reduce', per_dev(lambda i: band_reduce(i, p_full))),
-            ('back batch', per_dev(lambda i: back_batch(i, p_full))),
         ]
         scatter_terms = [
             ('sinogram', per_dev(sino_dev)),
@@ -408,8 +531,8 @@ def estimate_peak_device_bytes(plan):
         # picks between them.  Picking one whole sub-phase by its cross-device
         # total would under-charge a device where the other sub-phase is the
         # larger one, which is the direction this module may not err in.
-        phases.append(_phase('direct recon (back loop)', loop_terms, n,
-                             base=constant_base, base_terms=constant_terms))
+        phases.extend(back_phases('direct recon (back loop)', loop_residents,
+                                  p_full, constant_base, constant_terms))
         phases.append(_phase('direct recon (scatter)', scatter_terms, n,
                              base=constant_base, base_terms=constant_terms))
 
@@ -423,10 +546,12 @@ def estimate_peak_device_bytes(plan):
             ('weights', per_dev(supplied_weights_term)),
             ('init recon', per_dev(recon_dev)),
             ('voxel gather', per_dev(lambda i: cyl(i, p_full))),
+            ('broadcast band', per_dev(lambda i: forward_band_copy(i, p_full))),
             ('forward output', per_dev(forward_fixed)),
             ('forward block',
              per_dev(lambda i: forward_block(i, p_full, forward_cols(i)))),
             ('forward batch', per_dev(lambda i: forward_batch(i, p_full))),
+            ('forward margin (pre-release)', per_dev(forward_residual)),
         ]
         phases.append(_phase('initial forward projection', forward_terms,
                              n, base=constant_base,
@@ -484,17 +609,13 @@ def estimate_peak_device_bytes(plan):
         # scatter's co-residency exists at all.
         p_hess = (plan.num_pixels_full if plan.hessian_masked
                   else plan.num_pixels_grid)
-        terms = [
+        hessian_residents = [
             ('error sinogram', per_dev(sino_dev)),
             ('hessian weights', per_dev(weights_term)),
             ('init recon', per_dev(recon_dev)),
-            ('back output', per_dev(lambda i: back_fixed(i, p_hess))),
-            ('band reduce', per_dev(lambda i: band_reduce(i, p_hess))),
-            ('back batch', per_dev(lambda i: back_batch(i, p_hess))),
         ]
-        phases.append(_phase('hessian diagonal', terms, n,
-                             base=constant_base,
-                             base_terms=constant_terms))
+        phases.extend(back_phases('hessian diagonal', hessian_residents,
+                                  p_hess, constant_base, constant_terms))
         if plan.hessian_masked:
             # The scatter holds the masked cylinders and the zero-filled
             # volume at once.  It is a separate sub-peak from the back loop,
@@ -537,14 +658,13 @@ def estimate_peak_device_bytes(plan):
                 ('prior cylinders', per_dev(
                     lambda i: prior_cylinders * cyl(i, p_sub))),
             ],
+            # The back projection carries only its RESIDENTS here: the two
+            # sub-steps and their terms are built by back_phases below.
             'back projection': [
                 ('prior gradient and hessian',
                  per_dev(lambda i: 2 * cyl(i, p_sub))),
                 ('weighted error sinogram', per_dev(
                     lambda i: sino_dev(i) if plan.weights_supplied else 0)),
-                ('back output', per_dev(lambda i: back_fixed(i, p_sub))),
-                ('band reduce', per_dev(lambda i: band_reduce(i, p_sub))),
-                ('back batch', per_dev(lambda i: back_batch(i, p_sub))),
             ],
             'update direction': [
                 ('direction cylinders', per_dev(
@@ -556,9 +676,12 @@ def estimate_peak_device_bytes(plan):
                 ('delta sinogram', per_dev(sino_dev)),
                 ('forward assembly', per_dev(
                     lambda i: sino_dev(i) if n > 1 and is_view_owner(i) else 0)),
+                ('broadcast band', per_dev(
+                    lambda i: forward_band_copy(i, p_sub))),
                 ('forward block', per_dev(
                     lambda i: forward_block(i, p_sub, forward_cols(i)))),
                 ('forward batch', per_dev(lambda i: forward_batch(i, p_sub))),
+                ('forward margin (pre-release)', per_dev(forward_residual)),
             ],
             'state application': [
                 ('direction and scaled direction',
@@ -566,12 +689,17 @@ def estimate_peak_device_bytes(plan):
                 ('delta sinogram', per_dev(sino_dev)),
             ],
         }
+        loop_base_terms = constant_terms + list(persistent.items())
         for name, terms in sub_phases.items():
             all_terms = terms + [('subset indices', index_bytes)]
-            phases.append(_phase(
-                f'subset {name} (granularity {granularity})',
-                all_terms, n, base=persistent_total,
-                base_terms=constant_terms + list(persistent.items())))
+            phase_name = f'subset {name} (granularity {granularity})'
+            if name == 'back projection':
+                phases.extend(back_phases(phase_name, all_terms, p_sub,
+                                          persistent_total, loop_base_terms))
+                continue
+            phases.append(_phase(phase_name, all_terms, n,
+                                 base=persistent_total,
+                                 base_terms=loop_base_terms))
 
     # Every phase before the loop carries its own live set, which already
     # includes whatever part of the persistent set exists at that point.

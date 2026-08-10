@@ -151,7 +151,8 @@ def test_band_reduce_is_flat_in_the_device_count():
     """
     def reduce_bytes(n):
         ledger = estimate_peak_device_bytes(make_plan(n_devices=n))
-        return dict(_named(ledger, 'back projection').terms)['band reduce'][0]
+        return dict(_sub(ledger, 'subset back projection', n,
+                         'band reduce').terms)['band reduce'][0]
 
     two, four = reduce_bytes(2), reduce_bytes(4)
     assert two > 0 and four > 0
@@ -175,8 +176,11 @@ def test_empty_shard_extensions_skip_their_role_terms():
     # And with 3 slices over 4 devices, device 3 owns no real slice.
     plan = make_plan(n_devices=4, num_views=64, recon=(32, 32, 3))
     ledger = estimate_peak_device_bytes(plan)
-    back = _named(ledger, 'back projection')
-    assert dict(back.terms)['band reduce'][3] == 0
+    reduce_phase = _sub(ledger, 'subset back projection', 4, 'band reduce')
+    assert dict(reduce_phase.terms)['band reduce'][3] == 0
+    # The band it finished is charged only where a band lands, too.
+    workers = _sub(ledger, 'subset back projection', 4, 'back workers')
+    assert dict(workers.terms)['finished own band'][3] == 0
 
 
 def test_partitions_are_charged_to_the_lead_device_only():
@@ -190,8 +194,10 @@ def test_slice_band_knob_reduces_the_band_reduce():
     """The remedy the error message names first must actually work."""
     wide = estimate_peak_device_bytes(make_plan(n_devices=2))
     narrow = estimate_peak_device_bytes(make_plan(n_devices=2, back_band=4))
-    wide_reduce = dict(_named(wide, 'back projection').terms)['band reduce'][0]
-    narrow_reduce = dict(_named(narrow, 'back projection').terms)['band reduce'][0]
+    wide_reduce = dict(_sub(wide, 'subset back projection', 2,
+                            'band reduce').terms)['band reduce'][0]
+    narrow_reduce = dict(_sub(narrow, 'subset back projection', 2,
+                              'band reduce').terms)['band reduce'][0]
     assert narrow_reduce < wide_reduce
 
 
@@ -311,6 +317,156 @@ def test_per_iteration_statistics_are_charged():
     # It carries the persistent set, like every other in-loop phase.
     assert dict(stats.terms)['error sinogram'][0] == sino_bytes
     assert dict(stats.terms)['flat recon'][0] > 0
+
+
+# ── the back projection's two sub-steps ──────────────────────────────────────
+SPLIT_PARENTS = ('direct recon (back loop)', 'hessian diagonal',
+                 'subset back projection')
+
+
+def test_every_back_phase_splits_into_workers_and_reduce_at_n_above_one():
+    """The workers project and the reduce gathers, consecutively.
+
+    Charging their sum priced a peak that is never live.  Both are emitted
+    and the per-device maximum over phases picks between them, exactly as the
+    direct recon's loop/scatter split does.
+    """
+    ledger = estimate_peak_device_bytes(make_plan(n_devices=2))
+    names = [p.name for p in ledger.phases]
+    for parent in SPLIT_PARENTS:
+        workers = _sub(ledger, parent, 2, 'back workers')
+        reduce_phase = _sub(ledger, parent, 2, 'band reduce')
+        # The phase's contribution is the MAX of the two, never their sum.
+        for i in (0, 1):
+            both = max(workers.per_device[i], reduce_phase.per_device[i])
+            assert both < workers.per_device[i] + reduce_phase.per_device[i]
+            assert ledger.peak_bytes(i) >= both
+        # And the unsplit parent name is gone -- nothing charges the sum.
+        assert parent not in names
+
+
+def test_the_split_sub_phases_keep_the_parent_name_visible():
+    """The compatibility surface.
+
+    Every consumer that matches a phase by its parent name -- the preflight
+    message, a calibration row, these tests -- must still find it, so the
+    sub-step is a SUFFIX and never a rewrite.
+    """
+    ledger = estimate_peak_device_bytes(make_plan(n_devices=2))
+    for parent in SPLIT_PARENTS:
+        for step in ('back workers', 'band reduce'):
+            name = _sub(ledger, parent, 2, step).name
+            assert name.startswith(parent), name
+            assert name.endswith(f'[{step}]'), name
+    # The message the user reads still names the parent it came from.
+    _fits, rows = _memory_ledger.layout_fits(ledger, [1024, 1024])
+    message = _memory_ledger.format_shortfall(ledger, rows,
+                                              num_devices_tried=2)
+    assert ledger.dominant_phase(0).name in message
+
+
+def test_each_sub_phase_charges_only_its_own_terms():
+    """The workers hold blocks, the band they already finished, and the
+    batch; the reduce holds its gather and nothing of the loop."""
+    ledger = estimate_peak_device_bytes(make_plan(n_devices=2))
+    workers = dict(_sub(ledger, 'direct recon (back loop)', 2,
+                        'back workers').terms)
+    reduce_phase = dict(_sub(ledger, 'direct recon (back loop)', 2,
+                             'band reduce').terms)
+    for term in ('back output', 'finished own band', 'back batch'):
+        assert term in workers and term not in reduce_phase, term
+    assert 'band reduce' in reduce_phase and 'band reduce' not in workers
+    # Both carry the same residents, which is why neither can be dropped.
+    for term in ('sinogram', 'filtered sinogram', 'library workspace'):
+        assert workers[term] == reduce_phase[term], term
+
+
+def test_a_single_device_phase_is_not_split_and_does_not_move():
+    """n == 1 has no reduce to split off, so the phase stays whole under the
+    parent name and every single-device charge reads exactly as before."""
+    ledger = estimate_peak_device_bytes(make_plan(n_devices=1))
+    names = [p.name for p in ledger.phases]
+    assert 'direct recon (back loop)' in names
+    assert not any('[back workers]' in n or '[band reduce]' in n for n in names)
+    terms = dict(_named(ledger, 'direct recon (back loop)').terms)
+    assert terms['band reduce'][0] == 0          # never runs at one device
+    assert terms['finished own band'][0] == 0    # nor does the band handoff
+    assert terms['back output'][0] == 3 * 800 * 32 * 4   # still three
+
+
+def test_the_worker_block_count_follows_the_realized_view_batches():
+    """The calibrated term.
+
+    The view loop releases each block after accumulating it, so it holds the
+    accumulator plus the incoming block: min(2, view_batches).  A plan with
+    no cost model cannot count batches and charges the ceiling of two.
+    """
+    p_sub = math.ceil(800 / 4)
+
+    def blocks(batches_per_device):
+        # A charge that yields exactly `batches_per_device` batches over the
+        # 32 views each of two devices owns.
+        def charge(direction, num_pixels, band_cols):
+            return max(1, 32 // batches_per_device), 1
+        ledger = estimate_peak_device_bytes(
+            make_plan(n_devices=2, view_charge=charge))
+        terms = dict(_sub(ledger, 'subset back projection', 2,
+                          'back workers').terms)
+        return terms['back output'][0] / (p_sub * 16 * 4)
+
+    assert blocks(1) == 1                        # one batch, one block
+    assert blocks(2) == 2
+    assert blocks(8) == 2                        # capped at the accumulator + 1
+    # No cost model at all: the ceiling, which is what the docstring promises.
+    ledger = estimate_peak_device_bytes(make_plan(n_devices=2))
+    assert dict(_sub(ledger, 'subset back projection', 2,
+                     'back workers').terms)['back output'][0] == 2 * p_sub * 16 * 4
+
+
+def test_the_finished_own_band_is_one_cylinder_on_every_slice_owner():
+    """Each owner keeps its reduced band for the rest of the loop, so from
+    its own pass onward it carries one extra cylinder through every later
+    pass.  Real, unavoidable, and uncharged before the split."""
+    ledger = estimate_peak_device_bytes(make_plan(n_devices=2))
+    terms = dict(_sub(ledger, 'direct recon (back loop)', 2,
+                      'back workers').terms)
+    assert terms['finished own band'] == [800 * 16 * 4] * 2
+
+
+def test_the_forward_charges_the_broadcast_band_and_the_measured_residual():
+    """Two terms the forward phases gained with the split.
+
+    The broadcast band is named from the code: the forward copies the current
+    slice-owner's band onto every view-owner and it stays live for that
+    band's projection.  The residual is a MEASURED pad, sized at one
+    per-device sinogram shard, holding the floor at the two mg2 cells where
+    the enumerated terms fall short.  Neither exists at one device.
+    """
+    sino_dev = (64 // 2) * 32 * 32 * 4
+    two = estimate_peak_device_bytes(make_plan(n_devices=2))
+    for fragment in ('initial forward projection',
+                     'subset delta forward projection'):
+        terms = dict(_named(two, fragment).terms)
+        assert terms['broadcast band'][0] > 0, fragment
+        assert terms['forward margin (pre-release)'][0] == sino_dev, fragment
+    one = estimate_peak_device_bytes(make_plan(n_devices=1))
+    terms = dict(_named(one, 'initial forward projection').terms)
+    assert terms['broadcast band'][0] == 0
+    assert terms['forward margin (pre-release)'][0] == 0
+
+
+def test_the_split_lowers_the_multi_device_peak_and_leaves_n1_alone():
+    """The whole point: the phantom sum was the dominant over-charge at n>1,
+    and the single-device ledger is untouched by removing it."""
+    plan_kwargs = dict(recon=(64, 64, 32), num_pixels_full=3000)
+    four = estimate_peak_device_bytes(make_plan(n_devices=4, **plan_kwargs))
+    for parent in SPLIT_PARENTS:
+        workers = _sub(four, parent, 4, 'back workers').per_device[0]
+        reduce_phase = _sub(four, parent, 4, 'band reduce').per_device[0]
+        # Neither sub-step alone reaches what the sum would have charged.
+        summed = workers + reduce_phase
+        assert max(workers, reduce_phase) < summed
+        assert four.peak_bytes(0) < summed
 
 
 # ── the masked hessian ───────────────────────────────────────────────────────
@@ -638,6 +794,21 @@ def _named(ledger, fragment):
         if fragment in phase.name:
             return phase
     raise AssertionError(f'no phase matching {fragment!r} in '
+                         f'{[p.name for p in ledger.phases]}')
+
+
+def _sub(ledger, parent, n, step):
+    """One sub-step of a split back-projection phase.
+
+    At n == 1 there is no reduce, so the phase is emitted whole under the
+    parent name and that is what comes back.
+    """
+    if n == 1:
+        return _named(ledger, parent)
+    for phase in ledger.phases:
+        if parent in phase.name and f'[{step}]' in phase.name:
+            return phase
+    raise AssertionError(f'no {step!r} sub-phase of {parent!r} in '
                          f'{[p.name for p in ledger.phases]}')
 
 
