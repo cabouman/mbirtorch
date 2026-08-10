@@ -154,10 +154,16 @@ class ParameterHandler:
         automatic = getattr(self, 'device_layout_is_automatic', False)
         if rejected and automatic:
             visible = max([count for count, _why in rejected] + [len(devices)])
+            # One entry can name the count actually IN USE: the speed guard
+            # records why a count was reached before the outcome is known,
+            # and _settle rewrites that note when the search settles on it.
+            # Calling the chosen count 'rejected' would contradict the line
+            # it appears on, so it is labelled for what it is.
             report += ' (using {} of {} {} devices: {})'.format(
                 len(devices), visible, platform,
-                '; '.join('{} rejected, {}'.format(count, why)
-                          for count, why in rejected))
+                '; '.join('{} {}, {}'.format(
+                    count, 'used' if count == len(devices) else 'rejected',
+                    why) for count, why in rejected))
         return report
 
     # ── access ────────────────────────────────────────────────────────────────

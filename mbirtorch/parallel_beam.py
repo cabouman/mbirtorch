@@ -153,6 +153,10 @@ class ParallelBeamModel(TomographyModel):
     # slice axis pads the detector-row axis with it.
     rows_track_slices = True
 
+    # The measured set of widening speed floors that governs this geometry's
+    # automatic device count (see _widening_floors).
+    _floor_family = 'parallel'
+
     def get_psf_radius(self):
         """Computes the integer radius of the PSF kernel for parallel beam
         projection: the maximum number of detector channels on either side of

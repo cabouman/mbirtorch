@@ -15,10 +15,17 @@ import pytest
 import torch
 
 import mbirtorch
-from mbirtorch import _memory_ledger
+from mbirtorch import _memory_ledger, _widening_floors
 from mbirtorch._memory_ledger import MemoryPreflightError
 
 GB = 2 ** 30
+
+# The ladder sizes the speed floors are measured at, in sinogram elements.
+CELL_512 = (512, 448, 384)          #    88,080,384
+CELL_1024 = (1024, 1008, 992)       # 1,023,934,464
+CELL_128 = (128, 112, 96)           #     1,376,256
+SPARSE_VIEW_CELL = (64, 448, 384)   #    11,010,048
+THIN_VOLUME_CELL = (1024, 32, 768)  #    25,165,824
 
 
 def make_model(shape=(8, 6, 8), device='cpu', **kwargs):
@@ -27,6 +34,19 @@ def make_model(shape=(8, 6, 8), device='cpu', **kwargs):
     model.configure_devices(devices=[device])
     model.set_params(no_warning=True, verbose=0)
     return model
+
+
+@pytest.fixture
+def no_speed_guard(monkeypatch):
+    """Turn off the widening speed floors.
+
+    The floors hold small problems at one device, and the toy shapes these
+    tests use are far below every one of them.  A test whose subject is the
+    CAPACITY rule therefore has to opt out, exactly as a user would, or it
+    would be measuring two rules at once.  The floors' own effect on the
+    chosen count is tested below, at the sizes they were measured at.
+    """
+    monkeypatch.setenv('MBIRTORCH_WIDENING_GUARD', '0')
 
 
 @pytest.fixture
@@ -55,7 +75,8 @@ def as_automatic(model, num_devices):
 
 
 # ── the selection rule ───────────────────────────────────────────────────────
-def test_widening_picks_the_largest_count_that_fits(monkeypatch, unpinned):
+def test_widening_picks_the_largest_count_that_fits(monkeypatch, unpinned,
+                                                    no_speed_guard):
     model = make_model((16, 8, 16))
     as_automatic(model, 4)
     monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
@@ -68,7 +89,7 @@ def test_widening_picks_the_largest_count_that_fits(monkeypatch, unpinned):
 
 
 def test_widening_falls_back_past_a_device_another_process_is_using(
-        monkeypatch, unpinned):
+        monkeypatch, unpinned, no_speed_guard):
     """The heterogeneous case the design calls out.
 
     Per-device peaks SHRINK as the count grows, so no uniform budget can
@@ -271,7 +292,8 @@ def test_the_doomed_run_error_reaches_recon(monkeypatch, unpinned):
         model.recon(sinogram, max_iterations=1)
 
 
-def test_skip_memory_preflight_forces_a_doomed_run(monkeypatch, unpinned):
+def test_skip_memory_preflight_forces_a_doomed_run(monkeypatch, unpinned,
+                                                   no_speed_guard):
     """The escape hatch: the layout is chosen by the empty-shard rules alone
     and the budget is not consulted."""
     model = make_model((16, 8, 16))
@@ -408,3 +430,347 @@ def test_copy_ct_model_leaves_an_automatic_model_automatic():
     model = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
     copy = mbirtorch.copy_ct_model(model, new_num_det_rows=4)
     assert copy.device_layout_is_automatic is True
+
+
+# ── the widening speed floors ────────────────────────────────────────────────
+# The guard is a SPEED rule laid over the capacity rule: below a measured
+# floor, a device count is pushed behind every admitted count rather than
+# removed, so capacity still wins when nothing admitted fits.  These tests use
+# the sizes the floors were actually measured at.  They are also the guard's
+# standing regression coverage: every nightly row is env-pinned, and a pin
+# bypasses the guard, so nothing else exercises this ordering end to end.
+def make_cone_model(shape, device='cpu'):
+    angles = np.linspace(0, 2 * np.pi, shape[0], endpoint=False)
+    model = mbirtorch.ConeBeamModel(shape, angles,
+                                    source_detector_dist=4.0 * shape[2],
+                                    source_iso_dist=2.0 * shape[2])
+    model.configure_devices(devices=[device])
+    model.set_params(no_warning=True, verbose=0)
+    return model
+
+
+def with_four_visible(monkeypatch, model, budget=64 * GB):
+    """Four visible devices, every one of them with ample room, so the ONLY
+    thing that can hold the count down is the speed guard."""
+    as_automatic(model, 4)
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
+    monkeypatch.setattr(torch.cuda, 'device_count', lambda: 4)
+    monkeypatch.setattr(_memory_ledger, 'device_budget_bytes',
+                        lambda d: budget)
+    return model
+
+
+def test_a_small_parallel_problem_holds_at_one_device_however_free_the_gpus(
+        monkeypatch, unpinned):
+    """The 128-class cell, where widening to four was measured 13x slower."""
+    model = with_four_visible(monkeypatch, make_model(CELL_128))
+    model._apply_device_policy()
+    assert model.sino_placement.n_devices == 1
+
+
+def test_a_large_parallel_problem_still_takes_all_four_devices(monkeypatch,
+                                                               unpinned):
+    """The guard must not cost the case widening was built for: at the
+    1024-class cell n=4 is admitted and capacity has room."""
+    model = with_four_visible(monkeypatch, make_model(CELL_1024))
+    model._apply_device_policy()
+    assert model.sino_placement.n_devices == 4
+
+
+def test_a_sparse_view_shape_chooses_one_device_despite_its_large_volume(
+        monkeypatch, unpinned):
+    """The shape that picked the metric.
+
+    (64, 448, 384) has 11.0M sinogram elements but 66M recon voxels, so the
+    two candidate metrics disagree by a full ladder step.  Widening it to two
+    devices was measured as a 1.87x REGRESSION, which is the verdict this
+    encodes: the floors index on sinogram elements, and this shape is below
+    the n=2 floor.
+    """
+    model = with_four_visible(monkeypatch, make_model(SPARSE_VIEW_CELL))
+    model._apply_device_policy()
+    assert model.sino_placement.n_devices == 1
+
+
+def test_a_thin_volume_shape_holds_at_one_device_too(monkeypatch, unpinned):
+    """(1024, 32, 768): many views, few slices -- the shape where view-axis
+    work was expected to make widening pay early.  It did not (n=2 measured
+    1.16x slower), so the single sinogram-element metric is not too
+    conservative here either."""
+    model = with_four_visible(monkeypatch, make_model(THIN_VOLUME_CELL))
+    model._apply_device_policy()
+    assert model.sino_placement.n_devices == 1
+
+
+def test_a_large_cone_problem_admits_four_devices_but_never_two(monkeypatch,
+                                                                unpinned):
+    """Cone's floors are not parallel's.  At the 1024-class cell n=4 is
+    admitted, while n=2 is a sentinel -- no admission point was ever measured
+    for it -- so it stays behind even here."""
+    model = with_four_visible(monkeypatch, make_cone_model(CELL_1024))
+    order, held = model._speed_ordered_candidates(4)
+    assert order[0] == 4 and order[-1] == 2
+    assert set(held) == {2}
+    model._apply_device_policy()
+    assert model.sino_placement.n_devices == 4
+
+
+def test_a_cone_model_below_its_floor_holds_at_one_device(monkeypatch,
+                                                          unpinned):
+    """The 512-class cell clears parallel's n=2 floor but not cone's, which
+    is the whole reason the floors are per-geometry."""
+    parallel = with_four_visible(monkeypatch, make_model(CELL_512))
+    parallel._apply_device_policy()
+    assert parallel.sino_placement.n_devices == 2
+
+    cone = with_four_visible(monkeypatch, make_cone_model(CELL_512))
+    cone._apply_device_policy()
+    assert cone.sino_placement.n_devices == 1
+
+
+# ── what turns the guard off ─────────────────────────────────────────────────
+def test_an_explicit_configure_devices_ignores_the_speed_floors(monkeypatch,
+                                                                 unpinned):
+    """A count the caller named is not the library's to second-guess, at any
+    size."""
+    model = make_model(CELL_128)
+    model.configure_devices(devices=['cpu'] * 4)
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
+    monkeypatch.setattr(torch.cuda, 'device_count', lambda: 4)
+    model._apply_device_policy()
+    assert model.sino_placement.n_devices == 4
+
+
+def test_the_environment_pin_ignores_the_speed_floors(monkeypatch):
+    """The other pin mechanism, which reaches the policy by a different
+    branch and must bypass the guard the same way."""
+    model = with_four_visible(monkeypatch, make_model(CELL_128))
+    monkeypatch.setenv('MBIRTORCH_NUM_DEVICES', '4')
+    model._apply_device_policy()
+    assert model.sino_placement.n_devices == 4
+    assert model.device_choice_rejections == []
+
+
+def test_the_guard_env_switch_restores_the_pure_capacity_order(monkeypatch,
+                                                               unpinned):
+    """The escape hatch, at a size the guard would otherwise hold down."""
+    model = with_four_visible(monkeypatch, make_model(CELL_128))
+    order, held = model._speed_ordered_candidates(4)
+    assert order == [1, 4, 3, 2] and set(held) == {2, 3, 4}
+    monkeypatch.setenv('MBIRTORCH_WIDENING_GUARD', '0')
+    assert model._speed_ordered_candidates(4) == ([4, 3, 2, 1], {})
+    model._apply_device_policy()
+    assert model.sino_placement.n_devices == 4
+
+
+# ── capacity still wins ──────────────────────────────────────────────────────
+def test_capacity_falls_back_past_a_speed_floor_and_says_so(monkeypatch,
+                                                            unpinned):
+    """The reorder never removes a count.
+
+    Below its floor, n=4 is tried only after n=1 has been refused for lack of
+    memory -- and then it is taken, because a run that fits slowly beats a
+    run that does not fit at all.  The log says which happened.
+    """
+    model = make_model((128, 64, 128))           # 1.0M elements: below every floor
+    with_four_visible(monkeypatch, model)
+    peak1 = model._build_memory_ledger(devices=['cpu']).peak_bytes(0)
+    peak4 = model._build_memory_ledger(
+        devices=[torch.device('cpu', i) for i in range(4)]).peak_bytes(0)
+    budget = int(1.05 * peak4)
+    assert peak4 < budget < peak1                # only the wide layout fits
+    monkeypatch.setattr(_memory_ledger, 'device_budget_bytes',
+                        lambda d: budget)
+    model.memory_preflight_margin = 0.02
+    model._apply_device_policy()
+
+    assert model.sino_placement.n_devices == 4
+    reasons = dict(model.device_choice_rejections)
+    assert 1 in reasons and 'short' in reasons[1]
+    assert 'chosen past its speed floor' in reasons[4]
+    assert 'no admitted count fits' in reasons[4]
+
+
+def test_every_wider_count_the_floors_held_back_is_named_in_the_log(
+        monkeypatch, unpinned):
+    """The guard's commonest action reaches none of the counts it excluded.
+
+    Holding a 128-class problem at one device leaves three GPUs idle without
+    the search ever pricing them, so the counts are named once the choice is
+    made.  Idle hardware is never silent, and each entry carries the override
+    the user can reach for.
+    """
+    model = with_four_visible(monkeypatch, make_model(CELL_128))
+    model._apply_device_policy()
+    assert model.sino_placement.n_devices == 1
+
+    reasons = dict(model.device_choice_rejections)
+    assert sorted(reasons) == [2, 3, 4]
+    assert [count for count, _why in model.device_choice_rejections] == \
+        [4, 3, 2]                                # widest first, as elsewhere
+    for count in (2, 3, 4):
+        assert 'held by the speed floor' in reasons[count]
+        assert '1.4M sinogram elements <' in reasons[count]
+        assert 'configure_devices(num_devices={}) overrides'.format(count) \
+            in reasons[count]
+    assert 'the parallel n=2 floor' in reasons[2]
+    assert 'the parallel n=4 floor, which n=3 inherits' in reasons[3]
+    assert 'the parallel n=4 floor' in reasons[4]
+
+    line = model._device_report()
+    assert 'using 1 of 4 CPU devices' in line
+    assert '4 rejected, held by the speed floor' in line
+
+
+def test_a_held_count_narrower_than_the_chosen_one_is_not_reported(
+        monkeypatch, unpinned):
+    """A held count BELOW the count in use was outranked, not excluded.
+
+    Cone n=2 is a sentinel, so it is held even at the 1024-class cell -- but
+    the run took four devices, so reporting n=2 as turned down would explain
+    an idleness that never happened.
+    """
+    model = with_four_visible(monkeypatch, make_cone_model(CELL_1024))
+    model._apply_device_policy()
+    assert model.sino_placement.n_devices == 4
+    assert model.device_choice_rejections == []
+
+
+def test_skipping_the_memory_preflight_leaves_the_speed_floors_in_force(
+        monkeypatch, unpinned):
+    """The flag forces past the CAPACITY check; the guard is a speed rule.
+
+    With the reorder this is automatic rather than special-cased: the flag
+    settles on the first candidate, and the first candidate is now the first
+    ADMITTED count rather than the widest one.
+    """
+    model = with_four_visible(monkeypatch, make_model(CELL_128), budget=1024)
+    model.skip_memory_preflight = True
+    model._apply_device_policy()                 # does not raise
+    assert model.sino_placement.n_devices == 1
+
+
+# ── geometries the floors have never met ─────────────────────────────────────
+class _UnlistedGeometry(mbirtorch.ParallelBeamModel):
+    """A geometry that never declared a floor family, as TranslationModel and
+    any future class would arrive."""
+
+    _floor_family = None
+
+
+def test_a_model_with_no_floor_family_gets_the_parallel_floors(monkeypatch,
+                                                               unpinned):
+    def make(shape):
+        angles = np.linspace(0, np.pi, shape[0], endpoint=False)
+        model = _UnlistedGeometry(shape, angles)
+        model.configure_devices(devices=['cpu'])
+        model.set_params(no_warning=True, verbose=0)
+        return model
+
+    small = with_four_visible(monkeypatch, make(CELL_128))
+    small._apply_device_policy()
+    assert small.sino_placement.n_devices == 1
+
+    # The permissive set, not a refusal: at the parallel n=2 floor it widens.
+    at_the_floor = with_four_visible(monkeypatch, make(CELL_512))
+    at_the_floor._apply_device_policy()
+    assert at_the_floor.sino_placement.n_devices == 2
+
+
+def test_the_substituted_family_is_named_in_the_log(monkeypatch, unpinned,
+                                                    caplog):
+    """A geometry that was never measured must not have that fact hidden from
+    it, so the selection path says which floors it borrowed."""
+    angles = np.linspace(0, np.pi, CELL_128[0], endpoint=False)
+    model = _UnlistedGeometry(CELL_128, angles)
+    model.configure_devices(devices=['cpu'])
+    model.set_params(no_warning=True, verbose=2)
+    with_four_visible(monkeypatch, model)
+    with caplog.at_level('DEBUG', logger=model.logger.name):
+        model._apply_device_policy()
+    assert 'names no _floor_family' in caplog.text
+    assert 'parallel widening speed floors' in caplog.text
+
+
+# ── the split_sino_recon halves ──────────────────────────────────────────────
+def test_a_split_sino_half_model_is_governed_by_its_own_half_size(monkeypatch,
+                                                                  unpinned):
+    """split_sino_recon builds each half with copy_ct_model, and since the
+    2026-08 prerelease change a half inherits no explicit layout: it lands on
+    the automatic branch and chooses for itself.
+
+    So the floors see the HALF's sinogram, not the parent's, which is the
+    right question -- the half is the reconstruction that actually runs.
+    """
+    def automatic_cone_half(parent_shape, half_rows):
+        # No configure_devices anywhere: a parent that placed itself by hand
+        # would hand the half an EXPLICIT layout, which bypasses the guard.
+        angles = np.linspace(0, 2 * np.pi, parent_shape[0], endpoint=False)
+        parent = mbirtorch.ConeBeamModel(
+            parent_shape, angles, source_detector_dist=4.0 * parent_shape[2],
+            source_iso_dist=2.0 * parent_shape[2])
+        parent.set_params(no_warning=True, verbose=0)
+        half = mbirtorch.copy_ct_model(parent, new_num_det_rows=half_rows)
+        assert half.device_layout_is_automatic is True
+        # Place it on the CPU the way the automatic path itself does, which
+        # by design does NOT set device_layout_is_automatic: the half stays
+        # the library's to choose for, while the fabricated CUDA visibility
+        # below cannot pull real allocations onto a device this host lacks.
+        half._install_device_layout(['cpu'])
+        assert half.device_layout_is_automatic is True
+        return half
+
+    half = automatic_cone_half((128, 224, 96), 112)
+    assert tuple(half.get_params('sinogram_shape')) == CELL_128
+    with_four_visible(monkeypatch, half)
+    half._apply_device_policy()
+    assert half.sino_placement.n_devices == 1
+
+    big_half = automatic_cone_half((1024, 2016, 992), 1008)
+    assert tuple(big_half.get_params('sinogram_shape')) == CELL_1024
+    with_four_visible(monkeypatch, big_half)
+    big_half._apply_device_policy()
+    assert big_half.sino_placement.n_devices == 4
+
+    # The size the guard was asked about is the HALF's, not the parent's:
+    # the parent's sinogram is twice as large, and a floor read off it would
+    # be answering a question no reconstruction asks.
+    assert _widening_floors.sinogram_elements(
+        big_half.get_params('sinogram_shape')) == 1_023_934_464
+
+
+# ── the ordering itself ──────────────────────────────────────────────────────
+def test_the_guard_reorders_the_candidates_and_never_removes_one():
+    """The invariant the whole design rests on: every visible count is still
+    a candidate, admitted ones first, each group largest-first."""
+    for shape in (CELL_128, SPARSE_VIEW_CELL, CELL_512, CELL_1024):
+        model = make_model(shape)
+        order, held = model._speed_ordered_candidates(4)
+        assert sorted(order) == [1, 2, 3, 4], shape
+        assert set(held) <= set(order), shape
+        admitted = [n for n in order if n not in held]
+        assert order == admitted + [n for n in order if n in held], shape
+        assert admitted == sorted(admitted, reverse=True), shape
+        assert 1 in admitted, shape       # n=1 is always admitted
+
+
+def test_the_device_line_does_not_call_the_count_it_is_using_rejected(
+        monkeypatch, unpinned):
+    """The fallback note names the count actually in use, and that count
+    appears on a line whose other entries are refusals."""
+    model = make_model((128, 64, 128))
+    with_four_visible(monkeypatch, model)
+    peak1 = model._build_memory_ledger(devices=['cpu']).peak_bytes(0)
+    peak4 = model._build_memory_ledger(
+        devices=[torch.device('cpu', i) for i in range(4)]).peak_bytes(0)
+    budget = int(1.05 * peak4)
+    assert peak4 < budget < peak1
+    monkeypatch.setattr(_memory_ledger, 'device_budget_bytes',
+                        lambda d: budget)
+    model.memory_preflight_margin = 0.02
+    model._apply_device_policy()
+
+    line = model._device_report()
+    assert '4 used, chosen past its speed floor' in line
+    assert '1 rejected,' in line
+    assert '4 rejected' not in line

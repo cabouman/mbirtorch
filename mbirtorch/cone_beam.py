@@ -338,6 +338,11 @@ class ConeBeamModel(TomographyModel):
 
     _dc_damping = _DC_DAMPING_DEFAULT
 
+    # The measured set of widening speed floors that governs this geometry's
+    # automatic device count (see _widening_floors).  Cone's floors sit
+    # higher than parallel's: its n=2 has no measured admission point at all.
+    _floor_family = 'cone'
+
     def create_projectors(self):
         super().create_projectors()
         # Warm the DC-damping profile and its per-device compiled instances

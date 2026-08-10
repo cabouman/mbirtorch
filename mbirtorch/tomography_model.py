@@ -28,6 +28,7 @@ import torch
 
 from . import _memory_ledger
 from . import _sharding
+from . import _widening_floors
 from . import qggmrf as _qggmrf
 from . import tomography_utils, vcd_utils
 from .memory_stats import get_memory_stats
@@ -141,6 +142,13 @@ class TomographyModel(ParameterHandler):
         # Device counts the automatic choice turned down, and why, for the run
         # log's device line.  Empty when the layout was never searched.
         self.device_choice_rejections = []
+        # Set by the automatic search when it reaches a count the speed floors
+        # hold back, so _settle can say whether that count was merely tried or
+        # actually taken (see _speed_ordered_candidates).
+        self._speed_floor_fallback = None
+        # Every count the floors held back on this pass, so _settle can name
+        # the wider ones in the run log once the chosen count is known.
+        self._speed_floor_held = None
         # Memory-preflight knobs, beside the other memory knobs
         # (view_batch_size above, and the slice-band attributes the banded
         # drivers read).  The margin covers what the closed-form ledger cannot
@@ -881,6 +889,21 @@ class TomographyModel(ParameterHandler):
         placements are rebuilt only when the chosen count differs from the
         current one, so an unchanged count costs a closed-form pass and one
         free-memory query per device.
+
+        Capacity is not the only rule here.  On the unpinned automatic branch
+        the candidate ORDER comes from the widening speed floors
+        (:meth:`_speed_ordered_candidates`), which put the counts worth using
+        at this problem size ahead of the counts that would only run it
+        slower.  Nothing is removed, so capacity still wins whenever nothing
+        admitted fits.  Both pin branches above skip the floors by
+        construction: a count the caller named is not the library's to
+        second-guess.
+
+        Note that the halves of ``split_sino_recon`` arrive HERE.  Since the
+        2026-08 prerelease change they inherit no explicit layout from the
+        parent unless the parent had one, so each half chooses for itself --
+        at its own, smaller sinogram, which is exactly the size the floors are
+        asked about.
         """
         calibrating = _memory_ledger.calibration_enabled()
         if not self.device_layout_is_automatic:
@@ -904,13 +927,29 @@ class TomographyModel(ParameterHandler):
         if pinned is not None:
             # A process-wide pin is as explicit as a configure_devices call:
             # the count is not searched and never reduced.  The empty-shard
-            # validation and the preflight still apply to it.
-            candidates = [min(pinned, visible)]
+            # validation and the preflight still apply to it.  The speed
+            # floors do not: the pin named the count.
+            candidates, held = [min(pinned, visible)], {}
         else:
-            candidates = list(range(visible, 0, -1))
+            candidates, held = self._speed_ordered_candidates(visible)
 
         rejected, best = [], None
+        self._speed_floor_fallback = None
+        # Handed to _settle, which names every WIDER held count once the
+        # chosen count is known.  Holding a small problem at one device is the
+        # guard's commonest action, and the loop never reaches the counts it
+        # held, so without this the idle devices would go unexplained.
+        self._speed_floor_held = held
         for count in candidates:
+            if count in held:
+                # Every admitted count comes first, so reaching a held one
+                # means none of them was usable and capacity is about to
+                # override the speed rule.  Record the floor now, while the
+                # outcome is still unknown; if this count is then SETTLED on,
+                # _settle rewrites the note to say the floor was overridden.
+                held_note, taken_note = held[count]
+                rejected.append((count, held_note))
+                self._speed_floor_fallback = (count, taken_note)
             devices = (self._candidate_devices(count) if count > 1
                        else [self.torch_device])
             if not self._layout_is_valid(devices):
@@ -945,6 +984,60 @@ class TomographyModel(ParameterHandler):
                 ledger, rows, num_devices_tried=candidates,
                 closest_count=count, remedies=self._memory_remedies()))
 
+    def _speed_ordered_candidates(self, visible):
+        """The unpinned automatic branch's candidate order, and the notes for
+        the counts the widening speed floors hold back.
+
+        The floors REORDER, they never remove: admitted counts largest-first,
+        then held counts largest-first.  Two consequences are the point of
+        doing it this way.  Capacity always wins -- a held count is reached
+        only after every admitted count has been refused, so a problem that
+        genuinely needs four devices still gets them.  And
+        ``skip_memory_preflight`` does not disable the guard: that flag makes
+        the loop settle on its FIRST candidate, which this ordering has
+        already made the first ADMITTED count rather than the widest one.
+        The floors are a speed rule, so forcing past the capacity check
+        leaves them in force.
+
+        Every held count WIDER than the one finally chosen is named in the
+        run log by :meth:`_settle`, whether or not the loop reached it.  That
+        matters because the guard's commonest action -- holding a small
+        problem at one device -- reaches none of the counts it excluded.
+
+        Returns:
+            (list, dict): the candidate counts in the order to try them, and
+            ``{count: (held_note, taken_note)}`` for the held ones -- the
+            note if the count is passed over, and the note if capacity ends
+            up settling on it anyway.
+        """
+        candidates = list(range(visible, 0, -1))
+        if not _widening_floors.guard_enabled():
+            return candidates, {}
+        elements = _widening_floors.sinogram_elements(
+            self.get_params('sinogram_shape'))
+        family = self._floor_family
+        # Debt and substitution are both said out loud rather than inferred
+        # from a count that came out smaller than expected.
+        note = _widening_floors.stale_note()
+        if note is not None:
+            self.logger.info('Note: ' + note + '.')
+        if family is None and self.get_params('verbose') >= 2:
+            self.logger.debug(
+                f'  {type(self).__name__} names no _floor_family, so the '
+                f'{_widening_floors.DEFAULT_FAMILY} widening speed floors '
+                f'apply to its automatic device count.')
+        admitted, held = [], {}
+        for count in candidates:
+            ok, why = _widening_floors.admitted(family, count, elements)
+            if ok:
+                admitted.append(count)
+            else:
+                held[count] = (why, _widening_floors.fallback_reason(
+                    family, count, elements))
+        # A count of 1 is always admitted, so `admitted` is never empty and a
+        # held count always has something ahead of it.
+        return admitted + list(held), held
+
     def _memory_remedies(self):
         """Extra remedy lines for this geometry's preflight message."""
         if hasattr(self, 'split_sino_recon'):
@@ -971,10 +1064,32 @@ class TomographyModel(ParameterHandler):
     def _settle(self, devices, ledger, rejected):
         """Install the chosen layout when it differs from the current one, log
         the choice, and arm the calibration mode."""
+        chosen, current = len(devices), self.sino_placement.n_devices
+        # The search records a speed-floor note the moment it REACHES a held
+        # count, before the outcome is known.  A count it then settles on was
+        # not turned down, so that note is replaced by what actually
+        # happened: capacity found nothing admitted and went past the floor.
+        fallback = getattr(self, '_speed_floor_fallback', None)
+        if fallback is not None and fallback[0] == chosen:
+            rejected = [fallback if count == chosen else (count, why)
+                        for count, why in rejected]
+        # Now that the count is known, name every WIDER count the floors held
+        # back.  Most of them the loop never reached -- it settled on an
+        # admitted count first -- so this is the only place they can be
+        # explained, and holding a small problem down is exactly the case a
+        # user needs explained.  A held count SMALLER than the chosen one was
+        # outranked rather than excluded, so it carries no entry.
+        held = getattr(self, '_speed_floor_held', None) or {}
+        rejected = list(rejected)
+        already = {count for count, _why in rejected}
+        for count in sorted(held, reverse=True):
+            if count > chosen and count not in already:
+                rejected.append((count, held[count][0]))
+        self._speed_floor_fallback = None
+        self._speed_floor_held = None
         # Kept for the run log's device line, which explains any GPUs the
         # automatic choice left idle (see ParameterHandler._device_report).
         self.device_choice_rejections = list(rejected)
-        chosen, current = len(devices), self.sino_placement.n_devices
         if chosen != current:
             self.logger.info(
                 f'Using {chosen} CUDA device(s) for this reconstruction '
@@ -1042,6 +1157,14 @@ class TomographyModel(ParameterHandler):
     # drivers take the row-aligned fast path when this is True and would
     # silently mis-assemble a geometry that forgot to declare itself.
     rows_track_slices = False
+
+    # Which measured set of widening speed floors governs this geometry's
+    # automatic device count (see _widening_floors).  None -- the base value
+    # -- means the parallel floors, which are the more permissive measured
+    # set, so a geometry that has never been measured is slowed by the guard
+    # in no case where parallel beam would not be, and the reason string says
+    # the substitution happened.
+    _floor_family = None
 
     def _sino_row_padding(self):
         """Detector-row padding spec for the sinogram device form, or None.

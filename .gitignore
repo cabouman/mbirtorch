@@ -22,3 +22,6 @@ tests/goldens/
 
 # environments
 .venv/
+
+# scratch from dev_scripts/refresh_widening_floors.py (staged sinograms, arm rows)
+dev_scripts/_widening_floor_runs/
