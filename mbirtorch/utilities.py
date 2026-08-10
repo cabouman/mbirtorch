@@ -807,7 +807,10 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
     elif str(type(ct_model)).find('ParallelBeamModel') > 0:
         is_cone = False
     else:
-        raise TypeError('copy_ct_model() is restricted to ConeBeam and ParallelBeam Models')
+        raise TypeError('copy_ct_model() supports ConeBeamModel and ParallelBeamModel only; '
+                        f'got {type(ct_model).__name__}.  TranslationModel and '
+                        'MultiAxisParallelModel are not yet supported (matching mbirjax); '
+                        'construct the new model directly.')
 
     # get_all_params is the single source of truth for reading the params back out: it gives the
     # constructor args with the view components already unpacked (angles + helical_z_shifts for cone)
@@ -1032,7 +1035,10 @@ def get_ct_model(geometry_type, sinogram_shape, angles, source_detector_dist=Non
             warnings.warn("Helical mode (helical_z_shifts) is only supported for geometry_type='cone'; ignoring z_shifts.", UserWarning)
         model = mbirtorch.ParallelBeamModel(sinogram_shape, angles)
     else:
-        raise ValueError('Invalid geometry type.  Expected cone or parallel, got {}'.format(geometry_type))
+        raise ValueError("get_ct_model() supports geometry_type 'cone' and 'parallel' only; "
+                         f"got {geometry_type!r}.  For the translation and multiaxis "
+                         "geometries (not yet supported here, matching mbirjax), construct "
+                         "TranslationModel or MultiAxisParallelModel directly.")
 
     return model
 
