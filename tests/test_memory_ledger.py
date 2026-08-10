@@ -851,6 +851,270 @@ def test_recon_is_unaffected_on_a_cpu_model():
     assert np.all(np.isfinite(recon))
 
 
+# ── the torch-body projection charge ─────────────────────────────────────────
+# A torch body is a projection body written as general torch code, which is
+# what a geometry with no hand-written kernel runs.  It declares no per-view
+# cost, so the ledger prices its views itself.
+SLABS = _memory_ledger.TORCH_BODY_VIEW_SLABS
+
+
+def test_torch_body_directions_follow_the_bound_bodies():
+    """A body that declares its own per-view cost is priced by that
+    declaration; one that declares nothing is a torch body.  The two
+    directions are asked separately, because a model may bind a kernel one
+    way and a torch body the other."""
+    def kernel_body():
+        pass
+    kernel_body._view_batch_cost = lambda p, cols, args: (1, 1)
+
+    def torch_body():
+        pass
+
+    class FakeModel:
+        def __init__(self, fwd, back):
+            self._bodies = (fwd, back)
+
+        def _view_batch_bodies(self):
+            return self._bodies
+
+    directions = _memory_ledger.torch_body_directions
+    assert directions(FakeModel(kernel_body, kernel_body)) == ()
+    assert directions(FakeModel(torch_body, torch_body)) == ('forward', 'back')
+    assert directions(FakeModel(torch_body, kernel_body)) == ('forward',)
+    assert directions(FakeModel(kernel_body, torch_body)) == ('back',)
+
+
+def test_a_declared_per_view_cost_is_charged_exactly_as_declared():
+    """The kernel-declared path may not move: a body that states what one of
+    its views holds is charged that and nothing more."""
+    def charge(direction, num_pixels, band_cols):
+        return 8, 1024                       # 8 views at 1 KiB each
+
+    ledger = estimate_peak_device_bytes(make_plan(view_charge=charge))
+    terms = dict(_named(ledger, 'back projection').terms)
+    assert terms['back batch'][0] == 8 * 1024
+    forward = dict(_named(ledger, 'initial forward projection').terms)
+    assert forward['forward batch'][0] == 8 * 1024
+
+
+def test_a_torch_body_view_batch_is_charged_at_the_measured_slab_count():
+    """A torch body holds a loop of slabs where the driver's nominal charge
+    prices one, so the ledger charges the measured count of them.
+
+    The slab is (view batch, pixels, width) floats, with width the wider of
+    the detector rows and the slice band the call was handed -- the two axes
+    the body sweeps.  The view batch stays the driver's own choice.
+    """
+    rows, channels, slices = 32, 32, 32
+    p_sub = math.ceil(800 / 4)
+
+    def charge(direction, num_pixels, band_cols):
+        return 8, 1024                       # the driver's batch and nominal
+
+    plan_kwargs = dict(view_charge=charge, num_pixels_full=800,
+                       num_rows=rows, num_channels=channels,
+                       recon=(32, 32, slices))
+    declared = estimate_peak_device_bytes(make_plan(**plan_kwargs))
+    torch_body = estimate_peak_device_bytes(make_plan(
+        torch_body_directions=('forward', 'back'), **plan_kwargs))
+
+    # One device: the band is the whole slice axis, so width is max(32, 32).
+    width = max(rows, slices)
+    back = dict(_named(torch_body, 'back projection').terms)['back batch'][0]
+    assert back == SLABS * 8 * p_sub * width * 4
+    assert dict(_named(declared, 'back projection').terms)['back batch'][0] \
+        == 8 * 1024
+    forward = dict(_named(torch_body, 'initial forward projection')
+                   .terms)['forward batch'][0]
+    assert forward == SLABS * 8 * 800 * width * 4
+    # Every other term is untouched, so the peak moves only by the charge.
+    assert torch_body.peak_bytes(0) > declared.peak_bytes(0)
+
+
+def test_the_torch_body_slab_follows_the_wider_of_rows_and_band():
+    """The body allocates arrays at the detector-row extent AND at the slice
+    band; the wider of the two sets the slab.  Under sharding the band is one
+    owner's shard, so a tall volume's slab shrinks with the device count and a
+    wide detector's does not."""
+    def charge(direction, num_pixels, band_cols):
+        return 1, 1
+
+    def batch(rows, slices, n_devices):
+        ledger = estimate_peak_device_bytes(make_plan(
+            n_devices=n_devices, view_charge=charge,
+            torch_body_directions=('forward', 'back'),
+            num_pixels_full=800, num_rows=rows, recon=(32, 32, slices)))
+        return dict(_named(ledger, 'initial forward projection')
+                    .terms)['forward batch'][0]
+
+    # Tall volume, narrow detector: at one device the band is all 64 slices,
+    # and at four devices it is the 16-slice shard -- below the 32 rows, which
+    # then set the slab.
+    assert batch(32, 64, 1) == SLABS * 800 * 64 * 4
+    assert batch(32, 64, 4) == SLABS * 800 * 32 * 4
+    # Wide detector: the rows set the slab at every device count.
+    assert batch(128, 32, 1) == SLABS * 800 * 128 * 4
+    assert batch(128, 32, 4) == SLABS * 800 * 128 * 4
+
+
+def test_a_torch_body_pays_for_both_forward_blocks():
+    """The forward loop holds the outgoing block and the incoming one.
+
+    Against a body that declares its own cost, one of the two is already
+    inside the batch charge, because a forward kernel body's declaration
+    prices its output plane per view.  A torch body declares nothing, and
+    what the ledger charges in its place is the body's internal slab set,
+    which does not include the output plane -- so both blocks are charged.
+    """
+    rows, channels = 32, 32
+
+    def charge(direction, num_pixels, band_cols):
+        return 8, 1024                       # 4 batches over 32 views
+
+    def block(directions):
+        ledger = estimate_peak_device_bytes(make_plan(
+            n_devices=2, view_charge=charge,
+            torch_body_directions=directions))
+        return dict(_named(ledger, 'initial forward projection')
+                    .terms)['forward block'][0]
+
+    assert block(()) == 1 * 8 * rows * channels * 4
+    assert block(('forward', 'back')) == 2 * 8 * rows * channels * 4
+    # The back direction alone leaves the forward's own term where it was.
+    assert block(('back',)) == 1 * 8 * rows * channels * 4
+
+
+# One row per measured arm: (sinogram shape, recon shape, masked pixel count,
+# per-device measured peak bytes).  Measured 2026-08-10 on four H100s (job
+# mg8) -- the two geometries with no hand-written kernels, at one, two and
+# four devices, weighted, from a supplied sinogram with no initial volume.
+MEASURED_ARMS = {
+    'ma1024_n1': ((1024, 1008, 992), (992, 992, 1148), 771240,
+                  [37310451712]),
+    'ma1024_n2': ((1024, 1008, 992), (992, 992, 1148), 771240,
+                  [26138702848, 23767433216]),
+    'ma1024_n4': ((1024, 1008, 992), (992, 992, 1148), 771240,
+                  [17888278016, 17820163072, 17820163072, 16934779392]),
+    'ma512_n1': ((512, 448, 384), (384, 384, 510), 115164,
+                 [12253271552]),
+    'ma512_n2': ((512, 448, 384), (384, 384, 510), 115164,
+                 [9492893184, 9452805632]),
+    'ma512_n4': ((512, 448, 384), (384, 384, 510), 115164,
+                 [3768753664, 3757754368, 3757754368, 3757981696]),
+    'tct2k_n1': ((256, 1900, 3000), (118, 360, 240), 42480,
+                 [29262431744]),
+    'tct2k_n2': ((256, 1900, 3000), (118, 360, 240), 42480,
+                 [40081962496, 17882421760]),
+    'tct2k_n4': ((256, 1900, 3000), (118, 360, 240), 42480,
+                 [34051462656, 34081272320, 34081272320, 34081102336]),
+    'tct1k_n1': ((256, 950, 1500), (59, 180, 120), 10620,
+                 [8227791872]),
+    'tct1k_n2': ((256, 950, 1500), (59, 180, 120), 10620,
+                 [11882288128, 5844949504]),
+    'tct1k_n4': ((256, 950, 1500), (59, 180, 120), 10620,
+                 [29162906112, 29161971200, 29161972224, 29161972224]),
+}
+# The granularity list those runs used, which is the library default.
+MEASURED_GRANULARITY = (1, 2, 4, 8, 16, 32, 64, 128, 128, 128, 128)
+MEASURED_VISITED = (4, 16, 64)
+
+
+def _measured_view_charge(sinogram_shape, recon_shape, n_devices):
+    """The view batch and nominal slab the DRIVER chose in those runs.
+
+    Written out here rather than taken from a live model because the batch
+    depends on the transient budget, and that budget is scaled by the
+    per-device sinogram on CUDA and flat on CPU -- these tests run on CPU, so
+    a CPU model would choose a different batch than the measured runs did and
+    the comparison would be against the wrong arithmetic.
+    """
+    from mbirtorch.projectors import Projectors
+    views, rows, channels = sinogram_shape
+    cols = max(int(recon_shape[2]), int(rows))
+    local_views = -(-int(views) // int(n_devices))
+    budget = max(Projectors.VIEW_BATCH_TRANSIENT_FLOOR_BYTES,
+                 min(Projectors.VIEW_BATCH_TRANSIENT_BUDGET_BYTES,
+                     Projectors.VIEW_BATCH_SINO_MULTIPLE
+                     * local_views * rows * channels * 4))
+
+    def charge(direction, num_pixels, band_cols):
+        bytes_per_view = int(num_pixels) * cols * 4
+        return (max(1, min(Projectors.VIEW_BATCH_BODY_DEFAULT,
+                           budget // max(1, bytes_per_view))),
+                bytes_per_view)
+    return charge
+
+
+def _measured_arm_ledger(arm):
+    sinogram_shape, recon_shape, num_pixels, measured = MEASURED_ARMS[arm]
+    n_devices = len(measured)
+    devices = ['cpu'] * n_devices
+    sino = _sharding.Placement(devices, axis=0, real_size=sinogram_shape[0])
+    recon = _sharding.Placement(devices, axis=-1, real_size=recon_shape[2])
+    plan = LedgerPlan(
+        sinogram_shape=sinogram_shape,
+        recon_shape=recon_shape,
+        devices=devices,
+        view_blocks=[(e - s, v) for _d, (s, e), v
+                     in sino.padded_shard_ranges()],
+        slice_blocks=[(e - s, v) for _d, (s, e), v
+                      in recon.padded_shard_ranges()],
+        sino_rows=sinogram_shape[1],
+        rows_track_slices=False,
+        num_pixels_full=num_pixels,
+        num_pixels_grid=recon_shape[0] * recon_shape[1],
+        granularities=MEASURED_VISITED,
+        partition_granularities=MEASURED_GRANULARITY,
+        weights_supplied=True,
+        # The translation arms carry no cylindrical mask, so their masked set
+        # IS the whole grid and their hessian back-projects the grid directly.
+        hessian_masked=num_pixels < recon_shape[0] * recon_shape[1],
+        view_charge=_measured_view_charge(sinogram_shape, recon_shape,
+                                          n_devices),
+        torch_body_directions=('forward', 'back'))
+    return estimate_peak_device_bytes(plan), measured
+
+
+@pytest.mark.parametrize('arm', sorted(MEASURED_ARMS))
+def test_the_torch_body_ledger_covers_every_measured_peak(arm):
+    """The floor, on the runs the slab count was calibrated from.
+
+    A modeled peak below the measured one lets a doomed reconstruction start
+    and die inside the allocator, which is the failure this module exists to
+    prevent.  Every device of every measured arm must sit at or above 1.00.
+    """
+    ledger, measured = _measured_arm_ledger(arm)
+    for i, peak in enumerate(measured):
+        assert ledger.peak_bytes(i) >= peak, (
+            f'{arm} device {i}: modeled {ledger.peak_bytes(i)} < '
+            f'measured {peak}')
+
+
+def test_the_torch_body_over_charge_stays_inside_its_band():
+    """The other side of the floor: an over-charge spreads a reconstruction
+    over more devices than it needs, so the band is asserted too.  It is
+    wider than CALIBRATION_BAND because one slab count covers two geometries
+    that hold different numbers of slabs, and because two measured two-device
+    runs peaked twice as high on one device as on the other from identical
+    shards.
+    """
+    low, high = _memory_ledger.TORCH_BODY_CALIBRATION_BAND
+    assert low == _memory_ledger.CALIBRATION_BAND[0]
+    worst = 0.0
+    for arm in MEASURED_ARMS:
+        ledger, measured = _measured_arm_ledger(arm)
+        for i, peak in enumerate(measured):
+            worst = max(worst, ledger.peak_bytes(i) / peak)
+    assert low <= worst <= high
+
+
+def test_format_calibration_judges_against_the_band_it_is_given():
+    rows = [('cuda:0', 40 * GB, 10 * GB, 4.00)]
+    assert 'over' in _memory_ledger.format_calibration(rows)
+    assert 'over' not in _memory_ledger.format_calibration(
+        rows, band=_memory_ledger.TORCH_BODY_CALIBRATION_BAND)
+
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 def _named(ledger, fragment):
     for phase in ledger.phases:

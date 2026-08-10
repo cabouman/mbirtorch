@@ -28,10 +28,13 @@ ledger is computed at ANY device count, including one, and compared against
 ``torch.cuda.max_memory_allocated`` at the end of the reconstruction.  That
 mode owns the peak counter (it resets it), so it is never on by default.
 
-Two consumers share ONE per-view cost model.  The projection drivers use
+Two consumers share ONE view batch.  The projection drivers use
 ``Projectors.view_batch_charge`` to choose a view batch; the ledger calls
-the same function to price that batch's residency.  The charge excludes the
-call-fixed outputs by contract, so the ledger adds those itself, per phase.
+the same function so it prices the batch the driver would actually run.  The
+charge excludes the call-fixed outputs by contract, so the ledger adds those
+itself, per phase.  It also reprices the batch when the body is a torch body,
+because there the driver's number is a nominal slab used to bound the batch
+and not a statement of what the batch holds; see TORCH_BODY_VIEW_SLABS.
 """
 
 import math
@@ -87,10 +90,48 @@ CALIBRATION_ENV_VAR = 'MBIRTORCH_MEMORY_CALIBRATION'
 # configure_devices: the count is not searched and is never reduced, while the
 # empty-shard validation and the preflight still apply.
 DEVICE_COUNT_ENV_VAR = 'MBIRTORCH_NUM_DEVICES'
+# How many per-view slabs one view batch of a TORCH BODY holds.  A torch body
+# is a projection body written as general torch code, which is what a geometry
+# with no hand-written kernel runs.  A hand-written kernel body declares what
+# one of its views costs; a torch body declares nothing, so the driver prices
+# it at ONE nominal slab -- (view batch, pixels, columns) floats -- and that
+# single slab is what the ledger used to charge.
+#
+# A torch body holds a whole loop of those slabs at once.  It walks the
+# interpolation kernel one offset at a time, and each offset materializes an
+# integer index array, a weight array and a gathered array of the slab's
+# shape, none of which fuse away; the running output and the mapped centers
+# stay live across the whole loop beside them.
+#
+# Measured 2026-08-10 on four H100s (job mg8), over the two geometries with no
+# hand-written kernels, four problem sizes, and one, two and four devices.
+# The runs whose measured peak is set by the projection itself need 12.9
+# slabs to cover it, and no run needs more.  Charged at 14, eight percent
+# above the tightest of those readings.
+#
+# ONE count covers both projection directions and both geometries, because the
+# ledger cannot tell which body it holds: it sees only that the body declares
+# no cost.  The count is a measured multiplier and not a count of named
+# arrays: the two geometries plainly do not hold the same number of slabs --
+# the runs of one need at most 7.0 where the other needs 12.9 -- and nothing
+# in the plan distinguishes them, so the larger has to be charged to both.
+# TORCH_BODY_CALIBRATION_BAND says what that costs the smaller.
+TORCH_BODY_VIEW_SLABS = 14
+
 # The band the modeled peak must land in against the measured peak.  The
 # lower bound is the one that matters: a ledger that under-predicts would let
 # a doomed run start, which is the failure this module exists to prevent.
 CALIBRATION_BAND = (1.00, 1.30)
+# The same band for a reconstruction whose projection bodies are torch bodies.
+# It is far wider than the one above for two reasons, both measured rather
+# than assumed.  One slab count has to cover two geometries that hold
+# different numbers of slabs, since nothing in the plan distinguishes them.
+# And two of the measured two-device runs peaked twice as high on one device
+# as on the other from identical shards, which a per-device model built from
+# shapes alone cannot reproduce: it must cover the higher device, so it
+# over-charges the lower one by that factor.  The widest over-charge measured
+# is 5.74x, on the lower device of one of those two runs.
+TORCH_BODY_CALIBRATION_BAND = (1.00, 5.80)
 
 
 class MemoryPreflightError(RuntimeError):
@@ -189,6 +230,13 @@ class LedgerPlan:
     # direction in {'forward', 'back'}.  Defaults to a no-charge model so a
     # hand-built plan can exercise the state terms alone.
     view_charge: object = None
+    # Which of 'forward' and 'back' bind a torch body -- a body that declares
+    # no per-view cost of its own, so the ledger prices its views itself (see
+    # TORCH_BODY_VIEW_SLABS).  The two directions are named separately because
+    # a model may bind a hand-written kernel one way and a torch body the
+    # other.  Empty means both directions declare their own cost, which is
+    # what a hand-built plan gets: its charge reads exactly as before.
+    torch_body_directions: tuple = ()
 
     @property
     def n_devices(self):
@@ -255,14 +303,46 @@ def estimate_peak_device_bytes(plan):
         return (int(plan.recon_shape[2]) if n == 1
                 else plan.band_length(i, 'forward'))
 
+    def band_slices(i, direction):
+        """The slice extent one projection call is handed: the whole slice
+        axis at one device, this owner's slice band under sharding."""
+        if n == 1:
+            return int(plan.recon_shape[2])
+        return plan.band_length(i, direction)
+
+    def torch_body_batch(i, direction, num_pixels):
+        """What one view batch of a TORCH BODY holds.
+
+        The body sweeps two axes -- the detector rows and the slice band it
+        was handed -- and every array in its interpolation loop spans the
+        view batch, the pixels, and whichever of those two axes is wider.
+        It holds TORCH_BODY_VIEW_SLABS of them at once, where the driver's
+        nominal charge prices one.
+
+        The view batch itself stays the driver's own choice: only what that
+        batch is charged changes here, so the ledger and the driver still
+        agree on how many views one body call takes.
+        """
+        if plan.view_charge is None:
+            return 0
+        cols = back_cols(i) if direction == 'back' else forward_cols(i)
+        view_batch = int(plan.view_charge(direction, int(num_pixels), cols)[0])
+        width = max(int(plan.sino_rows), int(band_slices(i, direction)))
+        return (TORCH_BODY_VIEW_SLABS * view_batch * int(num_pixels)
+                * width * _F32_BYTES)
+
     def back_batch(i, num_pixels):
         if not is_view_owner(i):
             return 0
+        if 'back' in plan.torch_body_directions:
+            return torch_body_batch(i, 'back', num_pixels)
         return plan.batch_bytes('back', num_pixels, back_cols(i))
 
     def forward_batch(i, num_pixels):
         if not is_view_owner(i):
             return 0
+        if 'forward' in plan.torch_body_directions:
+            return torch_body_batch(i, 'forward', num_pixels)
         return plan.batch_bytes('forward', num_pixels, forward_cols(i))
 
     def band_reduce(i, num_pixels):
@@ -420,13 +500,19 @@ def estimate_peak_device_bytes(plan):
         blocks.  The back loop would hold the same two if it did not release
         its block explicitly.
 
-        ONE of those two is already inside ``forward batch``.  A forward
-        body's output plane scales with the view batch, so each body's
-        ``_view_batch_cost`` charges it per view and says so; the back body's
-        cost model does not, its output being call-fixed at any batch.  This
-        term is therefore the REMAINDER -- one block while the loop runs more
-        than a single batch, and nothing when it runs one, which is the whole
-        live set there.
+        ONE of those two is already inside ``forward batch`` when the body
+        declares its own cost.  A forward kernel body's output plane scales
+        with the view batch, so its ``_view_batch_cost`` charges it per view
+        and says so; the back body's cost model does not, its output being
+        call-fixed at any batch.  Against a declared cost this term is
+        therefore the REMAINDER -- one block while the loop runs more than a
+        single batch, and nothing when it runs one, which is the whole live
+        set there.
+
+        A TORCH BODY declares nothing, and what the ledger charges for it in
+        its place is the body's INTERNAL slab set, which does not include the
+        output plane.  Nothing is already paid for there, so both blocks are
+        charged.
 
         The batch follows the pixel count of THIS call, so the subset phases
         must pass their own subset size rather than the full index count.
@@ -435,12 +521,13 @@ def estimate_peak_device_bytes(plan):
             return 0
         batches = forward_view_batches(i, num_pixels)
         live = 2 if batches is None else min(2, batches)
+        already_paid = 0 if 'forward' in plan.torch_body_directions else 1
         view_batch = 1
         if plan.view_charge is not None:
             view_batch = plan.view_charge('forward', num_pixels,
                                           forward_cols(i))[0]
-        return ((live - 1) * int(view_batch) * forward_block_rows(i)
-                * num_channels * _F32_BYTES)
+        return ((live - already_paid) * int(view_batch)
+                * forward_block_rows(i) * num_channels * _F32_BYTES)
 
     # ── the persistent set ───────────────────────────────────────────────────
     # One sinogram-shaped weights term, never two: when the caller supplies
@@ -822,7 +909,25 @@ def plan_from_model(model, devices, partition_sequence=None, weights=None,
         back_band=getattr(model, 'back_project_slice_band', None),
         qggmrf_cylinders=qggmrf_cylinder_count(model),
         view_charge=charge,
+        torch_body_directions=torch_body_directions(model),
     )
+
+
+def torch_body_directions(model):
+    """Which projection directions this model runs as a torch body.
+
+    A hand-written kernel body carries a ``_view_batch_cost`` attribute
+    stating what one of its views holds; general torch code carries nothing,
+    and the ledger prices those views itself (see TORCH_BODY_VIEW_SLABS).
+    The two directions are asked separately, because a model may bind a
+    kernel one way and a torch body the other, and because a kernel that is
+    unavailable on this machine falls back to the torch body it replaced --
+    the charge has to follow the body that will actually run.
+    """
+    fwd_body, back_body = model._view_batch_bodies()
+    return tuple(name for name, body in (('forward', fwd_body),
+                                         ('back', back_body))
+                 if getattr(body, '_view_batch_cost', None) is None)
 
 
 def _model_view_charge(model, n_devices):
@@ -1046,8 +1151,11 @@ def calibration_report(ledger, devices):
     return rows
 
 
-def format_calibration(rows):
-    low, high = CALIBRATION_BAND
+def format_calibration(rows, band=None):
+    """The calibration table.  ``band`` defaults to CALIBRATION_BAND; a
+    reconstruction whose projection bodies are torch bodies is judged against
+    TORCH_BODY_CALIBRATION_BAND instead."""
+    low, high = band or CALIBRATION_BAND
     lines = ['memory ledger calibration (this mode owns '
              'torch.cuda.max_memory_allocated)',
              f'{"device":>10}{"modeled":>14}{"measured":>14}'

@@ -37,6 +37,25 @@ def make_model(shape=(8, 6, 8), device='cpu', **kwargs):
     return model
 
 
+@pytest.fixture(autouse=True)
+def kernel_declared_projection(monkeypatch):
+    """Price the projection the way the CUDA model these tests stand in for
+    would price it.
+
+    A CUDA parallel or cone model binds the hand-written kernel bodies, and
+    each of those declares what one of its views holds.  On CPU no kernel is
+    available, so the same model binds the general torch bodies instead, and
+    the ledger prices a torch body's views for itself at a much larger
+    residency (``_memory_ledger.TORCH_BODY_VIEW_SLABS``).  These tests are
+    about the device-count RULE, not about either residency, so they hold the
+    projection charge at the kernel-declared one; otherwise the capacity
+    arithmetic they drive would be a different model's.  The torch-body
+    charge has its own tests in test_memory_ledger.py.
+    """
+    monkeypatch.setattr(_memory_ledger, 'torch_body_directions',
+                        lambda model: ())
+
+
 @pytest.fixture
 def no_speed_guard(monkeypatch):
     """Turn off the widening speed floors.
