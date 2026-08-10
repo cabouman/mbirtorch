@@ -51,13 +51,34 @@ def _sharded_masked_histogram(shards, valid_mask, num_bins):
     shard on each shard's own device.  Only the small per-shard count tables
     ever leave a device; the volume is never gathered.
 
-    A histogram is a sum of counts, so summing the per-shard tables gives
-    exactly the histogram of the whole volume (counts are exact integers).
-    The range is the masked min/max, combined across shards on the host.
+    A histogram is a sum of counts, so summing the per-shard tables adds no
+    error of its own: the tables are exact int64 and their sum is exact.  The
+    range is the masked min/max, combined across shards on the host, and the
+    bin EDGES come from numpy itself, so both paths cut at the same places.
+
+    The per-value BINNING is not bit-for-bit numpy, and the thresholds are
+    therefore not guaranteed to equal the unsharded ones.  ``np.histogram``
+    computes each bin index in float64 and then runs a ULP correction pass
+    against the actual edges; the device-side rule below is a float32 multiply
+    truncated toward zero, with no correction.  Measured over 200 trials of
+    20 000 uniform float32 samples into 1024 bins, at most 3 values per trial
+    (mean 0.36) land in a different bin than the edge semantics numpy
+    implements, and most of those are values sitting exactly ON an interior
+    bin edge, where the two rules break the tie differently.  Otsu's DP
+    maximizes between-class variance over bins whose counts are in the
+    millions at production scale, so a handful of displaced counts is not
+    expected to move a boundary -- but "expected not to" is the claim, not
+    "cannot".  mbirjax records the same divergence in its own port and deems
+    it irrelevant at Otsu's granularity; this is at parity with that, not
+    stricter than it.
 
     Returns:
-        (hist, bin_edges): host numpy arrays, matching the single-array path
+        (hist, bin_edges): host numpy arrays in the single-array path's dtypes
         (int64 counts; edges computed by np.histogram's own edge arithmetic).
+
+    Raises:
+        ValueError: if the valid entries are empty or span a degenerate range
+            (min == max), which has no meaningful binning here.
     """
     masks = _shard_valid_masks(valid_mask, shards.placement,
                                shards.tensors[0].ndim)
@@ -72,11 +93,29 @@ def _sharded_masked_histogram(shards, valid_mask, num_bins):
             lo = min(lo, float(vals.min()))
             hi = max(hi, float(vals.max()))
 
+    # A degenerate range must raise, not bin.  numpy EXPANDS a zero-width
+    # range to (lo - 0.5, lo + 0.5) when it derives the edges, so the edges
+    # below would describe a different partition than the counts above --
+    # every value in bin 0 against edges centered on lo.  The counts and the
+    # edges would disagree and the derived thresholds would be quietly wrong,
+    # which is the one failure mode worse than stopping.
+    if not (np.isfinite(lo) and np.isfinite(hi)):
+        raise ValueError(
+            'The sharded volume has no valid entries to histogram: every '
+            'shard was empty or entirely excluded by valid_mask.')
+    if hi <= lo:
+        raise ValueError(
+            f'The valid entries span the degenerate range [{lo}, {hi}] '
+            f'(min == max), so there are no intensity classes to separate.  '
+            f'Segmentation needs a volume that takes more than one value.')
+
     # Pass 2: count per chunk into num_bins buckets (exact int64 on device),
-    # summed on the host.  Values are mapped to buckets by the same linear
-    # map np.histogram uses; hi lands in the last (closed) bin.
+    # summed on the host.  Values are mapped to buckets by the linear map
+    # np.histogram uses, in float32 and truncating rather than float64 with
+    # numpy's edge-correction pass (see the docstring); hi lands in the last
+    # (closed) bin.
     hist = np.zeros(num_bins, dtype=np.int64)
-    scale = num_bins / (hi - lo) if hi > lo else 0.0
+    scale = num_bins / (hi - lo)
     for t, mp in zip(shards.tensors, masks):
         for chunk, mc in _shard_chunks(t, mp):
             vals = chunk.reshape(-1) if mc is None else chunk[mc]
@@ -125,6 +164,11 @@ def multi_threshold_otsu(image, classes=2, num_bins=1024, valid_mask=None):
     that can be used to partition the image intensity range into `classes` distinct segments.
 
     The histogram is computed on the host; a torch tensor input is gathered to the host first.
+    A sharded volume (a ``Shards`` container) is instead histogrammed where it sits, shard by
+    shard, and only the count tables travel.  That path bins in float32 on the device rather
+    than in numpy's float64-plus-edge-correction, so its thresholds are expected to agree with
+    the unsharded ones but are not guaranteed to (see ``_sharded_masked_histogram``); it also
+    raises rather than binning a volume whose valid entries are all one value.
 
     Args:
         image (np.ndarray or torch.Tensor):

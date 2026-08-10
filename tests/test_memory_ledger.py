@@ -22,7 +22,7 @@ GB = 2 ** 30
 
 def make_plan(n_devices=1, num_views=64, num_rows=32, num_channels=32,
               recon=(32, 32, 32), num_pixels_full=800, granularities=(4,),
-              **kwargs):
+              rows_track_slices=False, **kwargs):
     """A hand-built plan: no model, no device, no CUDA."""
     devices = ['cpu'] * n_devices
     sino_placement = _sharding.Placement(devices, axis=0, real_size=num_views)
@@ -36,7 +36,7 @@ def make_plan(n_devices=1, num_views=64, num_rows=32, num_channels=32,
         slice_blocks=[(e - s, v) for _d, (s, e), v
                       in recon_placement.padded_shard_ranges()],
         sino_rows=num_rows,
-        rows_track_slices=False,
+        rows_track_slices=rows_track_slices,
         num_pixels_full=num_pixels_full,
         num_pixels_grid=recon[0] * recon[1],
         granularities=tuple(granularities),
@@ -426,38 +426,101 @@ def test_the_worker_block_count_follows_the_realized_view_batches():
 def test_the_finished_own_band_is_one_cylinder_on_every_slice_owner():
     """Each owner keeps its reduced band for the rest of the loop, so from
     its own pass onward it carries one extra cylinder through every later
-    pass.  Real, unavoidable, and uncharged before the split."""
+    pass.  Real and unavoidable, so the ledger has to charge it."""
     ledger = estimate_peak_device_bytes(make_plan(n_devices=2))
     terms = dict(_sub(ledger, 'direct recon (back loop)', 2,
                       'back workers').terms)
     assert terms['finished own band'] == [800 * 16 * 4] * 2
 
 
-def test_the_forward_charges_the_broadcast_band_and_the_measured_residual():
-    """Two terms the forward phases gained with the split.
+def test_the_forward_charges_the_broadcast_band_and_no_margin():
+    """The broadcast band is named from the code: the forward copies the
+    current slice-owner's band onto every view-owner and it stays live for
+    that band's projection.  It does not exist at one device.
 
-    The broadcast band is named from the code: the forward copies the current
-    slice-owner's band onto every view-owner and it stays live for that
-    band's projection.  The residual is a MEASURED pad, sized at one
-    per-device sinogram shard, holding the floor at the two mg2 cells where
-    the enumerated terms fall short.  Neither exists at one device.
+    The ledger used to carry a safety margin beside it -- one per-device
+    sinogram shard on every forward phase -- standing in for arrays nobody
+    had enumerated yet.  Those arrays are now charged directly and checked
+    against measurement, so NO phase may carry a margin term: every term must
+    name an array the code allocates.
     """
-    sino_dev = (64 // 2) * 32 * 32 * 4
     two = estimate_peak_device_bytes(make_plan(n_devices=2))
     for fragment in ('initial forward projection',
                      'subset delta forward projection'):
         terms = dict(_named(two, fragment).terms)
         assert terms['broadcast band'][0] > 0, fragment
-        assert terms['forward margin (pre-release)'][0] == sino_dev, fragment
     one = estimate_peak_device_bytes(make_plan(n_devices=1))
-    terms = dict(_named(one, 'initial forward projection').terms)
-    assert terms['broadcast band'][0] == 0
-    assert terms['forward margin (pre-release)'][0] == 0
+    assert dict(_named(one, 'initial forward projection')
+                .terms)['broadcast band'][0] == 0
+    for ledger in (one, two):
+        for phase in ledger.phases:
+            for name, _vals in phase.terms:
+                assert 'margin' not in name, (phase.name, name)
+
+
+def test_the_forward_block_count_follows_the_realized_view_batches():
+    """The forward counterpart of the worker block count, with one
+    difference.
+
+    The view-range loop has no release, so it holds the outgoing block and the
+    incoming one: min(2, view_batches).  One of those is already inside the
+    batch charge -- a forward body's output plane scales with the view batch,
+    so its ``_view_batch_cost`` prices it per view -- so this term charges the
+    remainder: nothing at a single batch, one block above that.
+    """
+    # make_plan defaults to a two-fan geometry: one whose detector rows are
+    # not tied 1:1 to recon slices, as in cone beam.
+    rows, channels = 32, 32
+
+    def block(batches_per_device):
+        # A charge that yields exactly `batches_per_device` batches over the
+        # 32 views each of two devices owns.
+        view_batch = max(1, 32 // batches_per_device)
+
+        def charge(direction, num_pixels, band_cols):
+            return view_batch, 1
+
+        ledger = estimate_peak_device_bytes(
+            make_plan(n_devices=2, view_charge=charge))
+        terms = dict(_named(ledger, 'initial forward projection').terms)
+        return terms['forward block'][0], view_batch
+
+    assert block(1)[0] == 0                  # one batch, one block, all priced
+    for batches in (2, 8):
+        charged, view_batch = block(batches)
+        assert charged == view_batch * rows * channels * 4
+    # No cost model at all: the ceiling of two, one of them charged here,
+    # which is what the docstring promises.
+    ledger = estimate_peak_device_bytes(make_plan(n_devices=2))
+    assert dict(_named(ledger, 'initial forward projection')
+                .terms)['forward block'][0] == 1 * rows * channels * 4
+
+
+def test_the_forward_block_spans_the_detector_rows_on_a_two_fan_geometry():
+    """A two-fan body's output plane spans the FULL detector rows whatever
+    slice band the values carry, so the block does not shrink with the band;
+    a row-aligned body's does, rows tracking slices one for one.  Charging
+    the two-fan block at the band instead under-charges the cone forward.
+    """
+    band = 32 // 2                            # one slice shard of make_plan's
+    rows, channels = 32, 32
+    for aligned, expected in ((True, band), (False, rows)):
+        ledger = estimate_peak_device_bytes(
+            make_plan(n_devices=2, rows_track_slices=aligned))
+        terms = dict(_named(ledger, 'initial forward projection').terms)
+        assert terms['forward block'][0] == expected * channels * 4, aligned
+    # At one device there is no band to differ from: the row-aligned form
+    # hands the body every slice it owns.
+    one = estimate_peak_device_bytes(make_plan(n_devices=1,
+                                               rows_track_slices=True))
+    assert dict(_named(one, 'initial forward projection')
+                .terms)['forward block'][0] == 32 * channels * 4
 
 
 def test_the_split_lowers_the_multi_device_peak_and_leaves_n1_alone():
-    """The whole point: the phantom sum was the dominant over-charge at n>1,
-    and the single-device ledger is untouched by removing it."""
+    """The whole point: summing two sub-steps that are never live together
+    was the largest over-charge at n>1, and removing it leaves the
+    single-device ledger untouched."""
     plan_kwargs = dict(recon=(64, 64, 32), num_pixels_full=3000)
     four = estimate_peak_device_bytes(make_plan(n_devices=4, **plan_kwargs))
     for parent in SPLIT_PARENTS:
@@ -542,7 +605,7 @@ def test_recon_is_bitwise_identical_with_the_masked_hessian():
     indices.
 
     Compilation is OFF deliberately, and not to hide a difference.  The two
-    arms necessarily back-project at different pixel counts, so they compile
+    runs necessarily back-project at different pixel counts, so they compile
     different shapes, and dynamo's shape specialization then perturbs the
     float realization of kernels that have nothing to do with the hessian.
     A compiled whole-recon comparison therefore measures the compiler rather

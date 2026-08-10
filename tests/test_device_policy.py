@@ -20,7 +20,8 @@ from mbirtorch._memory_ledger import MemoryPreflightError
 
 GB = 2 ** 30
 
-# The ladder sizes the speed floors are measured at, in sinogram elements.
+# Sinogram shapes the speed floors are measured at, each named for its view
+# count; the comment beside each is its sinogram element count.
 CELL_512 = (512, 448, 384)          #    88,080,384
 CELL_1024 = (1024, 1008, 992)       # 1,023,934,464
 CELL_128 = (128, 112, 96)           #     1,376,256
@@ -462,7 +463,8 @@ def with_four_visible(monkeypatch, model, budget=64 * GB):
 
 def test_a_small_parallel_problem_holds_at_one_device_however_free_the_gpus(
         monkeypatch, unpinned):
-    """The 128-class cell, where widening to four was measured 13x slower."""
+    """The 128-class shape, where widening to four was measured 13x
+    slower."""
     model = with_four_visible(monkeypatch, make_model(CELL_128))
     model._apply_device_policy()
     assert model.sino_placement.n_devices == 1
@@ -471,7 +473,7 @@ def test_a_small_parallel_problem_holds_at_one_device_however_free_the_gpus(
 def test_a_large_parallel_problem_still_takes_all_four_devices(monkeypatch,
                                                                unpinned):
     """The guard must not cost the case widening was built for: at the
-    1024-class cell n=4 is admitted and capacity has room."""
+    1024-class shape n=4 is admitted and capacity has room."""
     model = with_four_visible(monkeypatch, make_model(CELL_1024))
     model._apply_device_policy()
     assert model.sino_placement.n_devices == 4
@@ -482,10 +484,10 @@ def test_a_sparse_view_shape_chooses_one_device_despite_its_large_volume(
     """The shape that picked the metric.
 
     (64, 448, 384) has 11.0M sinogram elements but 66M recon voxels, so the
-    two candidate metrics disagree by a full ladder step.  Widening it to two
-    devices was measured as a 1.87x REGRESSION, which is the verdict this
-    encodes: the floors index on sinogram elements, and this shape is below
-    the n=2 floor.
+    two candidate size metrics point at sizes a full step apart.  Widening it
+    to two devices was measured as a 1.87x REGRESSION, which is the verdict
+    this encodes: the floors index on sinogram elements, and this shape is
+    below the n=2 floor.
     """
     model = with_four_visible(monkeypatch, make_model(SPARSE_VIEW_CELL))
     model._apply_device_policy()
@@ -502,30 +504,47 @@ def test_a_thin_volume_shape_holds_at_one_device_too(monkeypatch, unpinned):
     assert model.sino_placement.n_devices == 1
 
 
-def test_a_large_cone_problem_admits_four_devices_but_never_two(monkeypatch,
-                                                                unpinned):
-    """Cone's floors are not parallel's.  At the 1024-class cell n=4 is
-    admitted, while n=2 is a sentinel -- no admission point was ever measured
-    for it -- so it stays behind even here."""
+def test_a_large_cone_problem_admits_four_devices_and_two(monkeypatch,
+                                                          unpinned):
+    """At the 1024-class shape every cone count clears its floor.
+
+    n=2 used to be a sentinel here -- a row with no measured admission size
+    -- but the 2026-08-10 refresh found one and gave it a floor at the
+    512-class shape, so nothing is held back at this size and n=3 rides in on
+    the n=4 floor it inherits.
+    """
     model = with_four_visible(monkeypatch, make_cone_model(CELL_1024))
     order, held = model._speed_ordered_candidates(4)
-    assert order[0] == 4 and order[-1] == 2
-    assert set(held) == {2}
+    assert order == [4, 3, 2, 1] and held == {}
     model._apply_device_policy()
     assert model.sino_placement.n_devices == 4
 
+    # BETWEEN the two cone floors only the narrower one is admitted: the
+    # 512-class shape is exactly at the n=2 floor and far below the n=4 one,
+    # which n=3 inherits.
+    between = with_four_visible(monkeypatch, make_cone_model(CELL_512))
+    order, held = between._speed_ordered_candidates(4)
+    assert order == [2, 1, 4, 3]
+    assert set(held) == {3, 4}
 
-def test_a_cone_model_below_its_floor_holds_at_one_device(monkeypatch,
-                                                          unpinned):
-    """The 512-class cell clears parallel's n=2 floor but not cone's, which
-    is the whole reason the floors are per-geometry."""
+
+def test_a_cone_problem_at_its_n2_floor_chooses_two_devices(monkeypatch,
+                                                            unpinned):
+    """The 512-class shape, where the refresh put cone's first finite floor.
+
+    It is also the first case where the guard prefers a MIDDLE count: n=4 and
+    n=3 sit below their floor while every device has ample room, so capacity
+    alone would have taken four.  The count that wins is neither the widest
+    nor one.
+    """
+    cone = with_four_visible(monkeypatch, make_cone_model(CELL_512))
+    cone._apply_device_policy()
+    assert cone.sino_placement.n_devices == 2
+
+    # Parallel reads the same at this shape, as it did before the refresh.
     parallel = with_four_visible(monkeypatch, make_model(CELL_512))
     parallel._apply_device_policy()
     assert parallel.sino_placement.n_devices == 2
-
-    cone = with_four_visible(monkeypatch, make_cone_model(CELL_512))
-    cone._apply_device_policy()
-    assert cone.sino_placement.n_devices == 1
 
 
 # ── what turns the guard off ─────────────────────────────────────────────────
@@ -622,15 +641,42 @@ def test_every_wider_count_the_floors_held_back_is_named_in_the_log(
     assert '4 rejected, held by the speed floor' in line
 
 
+def with_a_sentinel_below_a_reachable_floor(monkeypatch, model):
+    """Install a synthetic floor table where n=2 is a SENTINEL -- a row with
+    no measured admission size -- while n=4 has a floor the problem clears.
+
+    No SHIPPED family can produce that shape: since the 2026-08-10 refresh
+    every measured family's floors rise with the count, so a held count is
+    always wider than an admitted one.  The reporting rule outlives the data,
+    which is why it is exercised against a table built here.
+    """
+    wide = _widening_floors.FLOORS[('cone', 4)]
+    monkeypatch.setattr(_widening_floors, 'FLOORS', {
+        ('synthetic', 2): wide._replace(
+            family='synthetic', count=2, elements=None, cell=None, against=1,
+            bracket=_widening_floors.Bracket(
+                losing_cell=CELL_1024, losing_speedup=0.92,
+                winning_cell=None, winning_speedup=None),
+            note='synthetic sentinel'),
+        ('synthetic', 4): wide._replace(family='synthetic'),
+    })
+    model._floor_family = 'synthetic'
+    return model
+
+
 def test_a_held_count_narrower_than_the_chosen_one_is_not_reported(
         monkeypatch, unpinned):
     """A held count BELOW the count in use was outranked, not excluded.
 
-    Cone n=2 is a sentinel, so it is held even at the 1024-class cell -- but
-    the run took four devices, so reporting n=2 as turned down would explain
-    an idleness that never happened.
+    The synthetic table holds n=2 as a sentinel while admitting n=4 at this
+    size.  The run takes four devices, so reporting n=2 as turned down would
+    explain an idleness that never happened.
     """
-    model = with_four_visible(monkeypatch, make_cone_model(CELL_1024))
+    model = with_a_sentinel_below_a_reachable_floor(
+        monkeypatch, with_four_visible(monkeypatch,
+                                       make_cone_model(CELL_1024)))
+    order, held = model._speed_ordered_candidates(4)
+    assert order == [4, 3, 1, 2] and set(held) == {2}
     model._apply_device_policy()
     assert model.sino_placement.n_devices == 4
     assert model.device_choice_rejections == []

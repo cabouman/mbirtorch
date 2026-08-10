@@ -242,7 +242,13 @@ def compute_view_basis_functions(ct_model, ref_object, r_1, data_store_dir, seed
     # Get number of views and angles
     num_views = ct_model.get_params('sinogram_shape')[0]
 
-    print('Creating recon bases')
+    # The sibling below is pinned to the PARENT's lead device, so the layout it
+    # runs on is the caller's only when the caller placed the parent by hand.
+    # Name which, for the same reason generate_demo_data does: this is a device
+    # set decided outside the reconstruction device policy, and without the word
+    # a library fallback and a caller's choice read alike in the run log.
+    print('Creating recon bases on the {} device'.format(
+        'default' if ct_model.device_layout_is_automatic else 'requested'))
 
     # Filter the sinogram in a single call
     filtered_sinogram = np.asarray(ct_model.direct_filter(ref_sino))

@@ -701,7 +701,21 @@ def _correct_plastic_sinogram(measured_sino, plastic_sino_est, metal_sino_est, t
     # median) is a cheap reduction; over the sinogram support the two are close, and this only sets a
     # floor.  When the sinogram is zero-padded on the view axis, exclude the padded views via
     # view_mask so they don't drag the mean toward 0.
-    if view_mask is None:
+    #
+    # The two forms below are NOT interchangeable, so the branch is on the form
+    # of Sp rather than on convenience.  One tensor keeps the pre-sharding
+    # reduction exactly: torch.mean (or the masked float32 sum), a 0-d float32
+    # Sp_floor, and torch.maximum against it.  The float32-sum / float64-divide
+    # form exists only to combine per-piece partials that cannot be reduced in
+    # one kernel, so it is reserved for the sharded branch; using it on one
+    # device would move the divide to float64 and silently change a
+    # single-device result that this port promises to leave alone.
+    if not isinstance(Sp, _sharding.Shards):
+        if view_mask is None:
+            mean_plastic_coef = torch.mean(Sp)
+        else:
+            mean_plastic_coef = torch.sum(Sp * view_mask) / float(num_real_pixels)
+    elif view_mask is None:
         mean_plastic_coef = _ps_sum(torch.sum, Sp) / _ps_numel(Sp)
     else:
         mean_plastic_coef = (_ps_sum(lambda sp, vm: torch.sum(sp * vm), Sp, view_mask)
@@ -710,13 +724,20 @@ def _correct_plastic_sinogram(measured_sino, plastic_sino_est, metal_sino_est, t
 
     # A negative mean would be non-physical and may indicate instability in the algorithm
     # In that case, issue a runtime warning to flag the potential problem
-    if mean_plastic_coef <= 0:
+    if float(mean_plastic_coef) <= 0:
         warnings.warn("Mean of Sp is negative", RuntimeWarning)
 
-    # Clamp Sp at Sp_floor to prevent division by very small or negative values
-    corrected_plastic_sino = _ps_map(
-        lambda sp, ym: p_normalization * ym / torch.clamp(sp, min=Sp_floor),
-        Sp, y_minus_Sm)
+    # Clamp Sp at Sp_floor to prevent division by very small or negative values.
+    # torch.maximum against a 0-d tensor of the piece's own dtype and device is
+    # the unsharded expression verbatim; the sharded branch's Python-float floor
+    # is materialized per piece rather than clamped as a weak scalar, so both
+    # branches run the same kernel.
+    def clamp_and_divide(sp, ym):
+        floor = (Sp_floor if torch.is_tensor(Sp_floor)
+                 else torch.as_tensor(Sp_floor, dtype=sp.dtype, device=sp.device))
+        return p_normalization * ym / torch.maximum(sp, floor)
+
+    corrected_plastic_sino = _ps_map(clamp_and_divide, Sp, y_minus_Sm)
 
     return corrected_plastic_sino
 

@@ -244,9 +244,15 @@ def save_data_hdf5(file_path, array, array_name='array', attributes_dict=None):
     The resulting structure has a single dataset with one array and associated text attributes.
     These can be retrieved using :func:`load_data_hdf5`.
 
+    A sharded volume (a ``Shards`` container) is gathered SLAB BY SLAB rather than up front,
+    so the peak host footprint is one slab and not the whole volume -- which is the point of
+    the streaming design and would otherwise be lost exactly where it matters most.  The file
+    is byte-identical to the gather-first version: same slab order, same concatenation axis,
+    same padding crop, same dtype (see :func:`_to_host`).
+
     Args:
         file_path (str): Full path to the output HDF5 file. Directories will be created if they do not exist.
-        array (ndarray or tensor): The volume data to save.
+        array (ndarray, tensor, or Shards): The volume data to save.
         array_name (str): Name of the dataset within the HDF5 file. Defaults to 'array'.
         attributes_dict (dict, optional): Dictionary of attributes to store as metadata in the dataset.
             Keys must be strings, and values should be serializable as HDF5 attributes.
@@ -266,15 +272,74 @@ def save_data_hdf5(file_path, array, array_name='array', attributes_dict=None):
         >>> file_path = './output/test_part_038.h5'
         >>> mbirtorch.save_data_hdf5(file_path, recon, recon_info)
     """
-    array = (_to_host(array)
-             if (hasattr(array, 'detach') or isinstance(array, _sharding.Shards))
-             else array)
+    if isinstance(array, _sharding.Shards):
+        out_shape, dtype, produce_slab = _sharded_slab_source(array)
+        _write_hdf5_streaming(file_path, array_name, out_shape, dtype, produce_slab, attributes_dict)
+        return
+
+    array = _to_host(array) if hasattr(array, 'detach') else array
 
     # Stream the array to disk slab-by-slab (no full contiguous copy, even for a strided view).
     def produce_slab(i0, i1):
         return np.asarray(array) if array.ndim == 0 else np.ascontiguousarray(array[i0:i1])
 
     _write_hdf5_streaming(file_path, array_name, array.shape, array.dtype, produce_slab, attributes_dict)
+
+
+def _sharded_slab_source(shards):
+    """(out_shape, numpy dtype, produce_slab) for streaming a sharded volume.
+
+    ``produce_slab(i0, i1)`` returns exactly ``_to_host(shards)[i0:i1]`` while
+    touching only the shard data that slab needs, so the streaming writer never
+    holds the whole volume on the host.  Two cases, because the sharded axis may
+    or may not be the axis the writer slabs along:
+
+    - sharded on axis 0: the slab spans one or more shards' own ranges, so each
+      contributing shard hands over just its overlap and they concatenate in
+      shard order -- the same order ``gather`` uses.  Padding rows sit past
+      ``real_size``, and the writer stops at ``out_shape[0]``, so they are never
+      requested.
+    - sharded on any other axis: every shard contributes rows ``[i0:i1]``, they
+      concatenate on the sharded axis, and the padding tail of that axis is
+      cropped per slab exactly as ``_to_host`` crops it once.
+    """
+    pl = shards.placement
+    ndim = shards.tensors[0].ndim
+    axis = pl.axis % ndim
+    # Shard extents along the sharded axis, read off the tensors rather than the
+    # placement, so this holds whether or not real_size was supplied.
+    sizes = [int(t.shape[axis]) for t in shards.tensors]
+    starts = np.cumsum([0] + sizes)
+    cropped = pl.real_size is not None and pl.padded_size > pl.real_size
+    axis_len = int(pl.real_size) if cropped else int(starts[-1])
+
+    out_shape = list(shards.tensors[0].shape)
+    out_shape[axis] = axis_len
+    out_shape = tuple(out_shape)
+    # The dtype the host copies will actually have, taken from an empty slice
+    # rather than a torch->numpy name mapping (this module imports torch only
+    # where it needs it).
+    dtype = shards.tensors[0][:0].detach().cpu().numpy().dtype
+
+    if axis == 0:
+        def produce_slab(i0, i1):
+            parts = []
+            for t, s0, s1 in zip(shards.tensors, starts[:-1], starts[1:]):
+                lo, hi = max(i0, int(s0)), min(i1, int(s1))
+                if lo < hi:
+                    parts.append(t[lo - int(s0):hi - int(s0)].detach().cpu().numpy())
+            return np.ascontiguousarray(np.concatenate(parts, axis=0))
+    else:
+        sel = [slice(None)] * ndim
+        sel[axis] = slice(0, axis_len)
+        crop = tuple(sel)
+
+        def produce_slab(i0, i1):
+            parts = [t[i0:i1].detach().cpu().numpy() for t in shards.tensors]
+            out = np.concatenate(parts, axis=axis)
+            return np.ascontiguousarray(out[crop] if cropped else out)
+
+    return out_shape, dtype, produce_slab
 
 
 def export_recon_hdf5(file_path, recon, recon_dict=None, remove_flash=False, radial_margin=10, top_margin=10, bottom_margin=10):
@@ -1367,6 +1432,12 @@ def generate_demo_data(
     # sinogram share one layout.  None leaves the automatic selection in place.
     if devices is not None:
         ct_model_for_generation.configure_devices(devices=list(devices))
+    # Name where the layout came from.  This entry decides a device set outside
+    # the reconstruction device policy, so without the word the run log cannot
+    # tell a set the caller named from the one the library fell back to -- and
+    # the two can differ from the devices the recon that consumes this sinogram
+    # goes on to use.
+    device_provenance = 'requested' if devices is not None else 'default'
 
     # Generate the phantom.  The phantom builders return host arrays, so no device layout is needed
     # here; the forward projection below handles device placement itself.
@@ -1406,7 +1477,7 @@ def generate_demo_data(
 
     # Forward project, keeping the sinogram in its device form, then gather it to a host array on a
     # separate line so the whole sinogram is never routed through a single device at large sizes.
-    print('Creating sinogram')
+    print('Creating sinogram on the {} devices'.format(device_provenance))
     sinogram_sharded = ct_model_for_generation.forward_project(phantom, output_sharded=True)
     sinogram = ct_model_for_generation._gather_sinogram(sinogram_sharded)
 

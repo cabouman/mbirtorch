@@ -1,84 +1,182 @@
-"""The widening speed floors, and the tripwire that keeps them honest.
+"""The widening speed floors, their invariants, and their staleness report.
 
 The floors are a MEASUREMENT of where each device count starts paying for
-itself.  A measurement is only as good as the code it was taken against, so
-this file's first job is to fail the moment the projection-cost code moves --
-loudly, with the one command that re-measures it.  Its second job is to hold
-the table to its own invariants: every row carries its provenance, and finite
-floors rise with the device count.
+itself, and a measurement is only as good as the code it was taken against.
+This file therefore REPORTS when the projection-cost code has moved -- and
+passes.  Out-of-date floors are work to schedule, not a breakage: the library
+detects the change live and logs it at every automatic device selection, a
+planned nightly automation owns the re-measurement, and nothing here stops a
+suite run over it.
+
+Two things still fail HARD, because neither is merely work to schedule:
+
+  * TAMPERING -- TABLE_CHECKSUM binds the floors, the recorded cost-input
+    hashes and STALE_SINCE, so hand-editing a hash to silence the note fails
+    here.
+  * PROVENANCE -- dates, brackets, and floors that rise with the device
+    count: the checks that make a row a measurement rather than an
+    assertion.
 
 The selection RULE these numbers feed is tested in test_device_policy.py.
 """
 
-import pytest
+import warnings
 
 from mbirtorch import _widening_floors as wf
 
 REFRESH = 'python dev_scripts/refresh_widening_floors.py'
 
 
-# ── the tripwire ─────────────────────────────────────────────────────────────
-def test_the_projection_cost_code_still_matches_the_measured_floors():
-    """The floors describe a version of the projection code.  When that code
-    changes, the floors are stale until someone says otherwise.
+def install_a_table_with_a_sentinel(monkeypatch):
+    """A synthetic two-row table: a finite n=2 floor and an n=4 sentinel -- a
+    row whose ``elements`` is None because no admission size was ever
+    measured for that count.
 
-    This is deliberately a hash over whole FILES for the kernels and the
+    The rule outlives the data.  No shipped row has been a sentinel since the
+    2026-08-10 refresh gave cone n=2 a finite floor, so the tests below read
+    the rule off a table built here rather than off whichever numbers happen
+    to ship.  A refresh that finds a count with no admission size puts a
+    sentinel row back, and these tests have to keep holding when it does.
+    """
+    def row(count, elements, cell, bracket, note):
+        return wf.Floor(family='synthetic', count=count, elements=elements,
+                        cell=cell, against=count // 2, bracket=bracket,
+                        spread=0.01, gpu=wf.MEASURED_GPU,
+                        config=wf.MEASURED_CONFIG, measured='2026-08-10',
+                        commit='a880d9c', largest_tested=1_023_934_464,
+                        note=note)
+
+    table = {
+        ('synthetic', 2): row(
+            2, 88_080_384, (512, 448, 384),
+            wf.Bracket(losing_cell=(384, 336, 288), losing_speedup=0.64,
+                       winning_cell=(512, 448, 384), winning_speedup=1.23),
+            'synthetic finite floor'),
+        ('synthetic', 4): row(
+            4, None, None,
+            wf.Bracket(losing_cell=(1024, 1008, 992), losing_speedup=0.92,
+                       winning_cell=None, winning_speedup=None),
+            'synthetic sentinel: no admission point at or below the '
+            '1024-class cell'),
+    }
+    monkeypatch.setattr(wf, 'FLOORS', table)
+    return table
+
+
+# ── the staleness report (loud, never fatal) ─────────────────────────────────
+def test_drift_in_the_projection_cost_code_is_reported_and_not_fatal():
+    """The floors describe a version of the projection code.  When that code
+    moves, say so -- and PASS.
+
+    This assertion used to fail, which handed a stop-everything chore to
+    whoever next touched a kernel: the suite stayed red until someone booked
+    a 4-GPU node or re-recorded the hashes by hand.  The measured harm of an
+    out-of-date floor is one device-count decision made on old numbers; that
+    does not buy a broken test run.  So it is reported here, reported again
+    by ``wf.stale_note()`` in every automatic device selection, and a planned
+    nightly automation owns the re-measurement.
+
+    The hash is deliberately over whole FILES for the kernels and the
     drivers: the module-level chunk constants and budget class attributes
     those files carry move a crossover without touching any function named
     here, and a function-level hash would sail past them.
     """
     stale = wf.stale_cost_inputs()
-    if stale:
-        changed = '\n'.join(
-            '    {}\n        blessed {}\n        now     {}'.format(
-                name, (blessed or 'MISSING')[:16], (actual or 'MISSING')[:16])
-            for name, blessed, actual in stale)
-        pytest.fail(
-            'the projection-cost code changed, so the multi-GPU widening '
-            'speed floors in mbirtorch/_widening_floors.py may no longer '
-            'describe it.\n\nchanged inputs:\n{}\n\n'
-            'To RE-MEASURE (on a 4-GPU node, roughly 30-60 minutes):\n'
-            '    {}\n\n'
-            'To RE-BLESS the hashes only, when the change provably cannot '
-            'move a projection cost (no GPU needed):\n'
-            '    {} --bless\n\n'
-            'To acknowledge the debt WITHOUT re-measuring -- the tests pass '
-            'and every automatic device selection logs the staleness:\n'
-            '    {} --bless --accept-stale'.format(changed, REFRESH, REFRESH,
-                                                   REFRESH))
+    if not stale:
+        return
+    changed = '\n'.join(
+        '    {}\n        recorded {}\n        now      {}'.format(
+            name, (recorded or 'MISSING')[:16], (actual or 'MISSING')[:16])
+        for name, recorded, actual in stale)
+    report = (
+        'FLOORS STALE: the projection-cost code changed, so the multi-GPU '
+        'widening speed floors in mbirtorch/_widening_floors.py no longer '
+        'describe it.  They still govern, and every automatic device '
+        'selection logs this.\n\nchanged inputs:\n{}\n\n'
+        'To RE-MEASURE (on a 4-GPU node, roughly 30-60 minutes), then paste '
+        'the printed block:\n'
+        '    {}\n\n'
+        'To RE-RECORD the hashes only, when the change provably cannot move '
+        'a projection cost (no GPU needed):\n'
+        '    {} --bless\n\n'
+        'Nothing needs to be done to keep working: this test passes '
+        'stale.'.format(changed, REFRESH, REFRESH))
+    print('\n' + report)
+    warnings.warn(report, stacklevel=2)
 
 
+def test_a_drifted_cost_input_names_itself_in_the_log_with_no_human_involved(
+        monkeypatch):
+    """The note no longer waits for anyone to write a date by hand: forge a
+    recorded hash so the live check sees a change, and the note names what
+    moved.
+
+    The cache is reset first because the check runs once per process, and
+    some earlier consultation in this session may already have run it.
+    """
+    forged = dict(wf.BLESSED_COST_HASHES)
+    forged['projectors.py'] = '0' * 64
+    monkeypatch.setattr(wf, 'BLESSED_COST_HASHES', forged)
+    monkeypatch.setattr(wf, 'STALE_SINCE', None)
+    monkeypatch.setattr(wf, '_DRIFT_CHECK', None)
+
+    note = wf.stale_note()
+    assert note is not None, 'live drift must produce a note by itself'
+    assert 'projectors.py' in note, note
+    assert 'refresh_widening_floors.py' in note, note
+    # The drift path, not the stamp path: STALE_SINCE is unset here.
+    assert 'stale since' not in note, note
+    # And it is computed once: the second call does not re-hash anything.
+    assert wf.stale_note() == note
+
+
+def test_a_staleness_check_that_cannot_run_is_logged_rather_than_raised(
+        monkeypatch):
+    """A missing file mid-refactor must not take a reconstruction down with
+    it.  The note reports that the floors could not be checked -- which is
+    not the same claim as 'fresh' -- and nothing raises."""
+    def exploding():
+        raise FileNotFoundError('mbirtorch/projectors.py')
+
+    monkeypatch.setattr(wf, 'stale_cost_inputs', exploding)
+    monkeypatch.setattr(wf, 'STALE_SINCE', None)
+    monkeypatch.setattr(wf, '_DRIFT_CHECK', None)
+
+    note = wf.stale_note()
+    assert 'could not be checked' in note, note
+    assert 'FileNotFoundError' in note, note
+
+
+# ── the tamper guard (this still fails hard) ─────────────────────────────────
 def test_the_floors_hashes_and_staleness_stamp_move_as_one_unit():
-    """The cheap way to green the test above is to paste a fresh hash in by
-    hand, leaving floors that were never re-measured.  The checksum binds all
-    three, so that shortcut fails HERE instead."""
+    """Now that a changed cost input only warns, hand-editing a hash is the
+    cheap way to silence the note while leaving floors that were never
+    re-measured.  The checksum binds all three, so that shortcut fails HERE
+    -- and this one is not a warning."""
     assert wf.table_checksum() == wf.TABLE_CHECKSUM, (
         'mbirtorch/_widening_floors.py was edited without going through the '
         'refresh script: FLOORS, BLESSED_COST_HASHES and STALE_SINCE are '
         'bound by TABLE_CHECKSUM and must be written together.\n'
-        '    {} --bless            (after re-measuring)\n'
-        '    {} --bless --accept-stale   (to record the debt instead)'.format(
-            REFRESH, REFRESH))
+        '    {} --bless            (after re-measuring)'.format(REFRESH))
 
 
 def test_a_hand_edited_hash_is_caught_by_the_checksum(monkeypatch):
-    """The binding, exercised rather than asserted: greening the tripwire by
-    hand must not also green the checksum."""
+    """The binding, exercised rather than asserted: silencing the staleness
+    note by hand must not also green the checksum."""
     forged = dict(wf.BLESSED_COST_HASHES)
     forged['projectors.py'] = '0' * 64
     monkeypatch.setattr(wf, 'BLESSED_COST_HASHES', forged)
     assert wf.table_checksum() != wf.TABLE_CHECKSUM
 
 
-def test_the_stale_stamp_reaches_the_log_when_it_is_set(monkeypatch):
-    """An acknowledged-stale table passes the tests and pays for it in the
-    device-selection log, which is the whole point of the trade.
-
-    Both states are set here rather than read off the shipped table: an
-    assertion that today's table is fresh would fail the moment anyone used
-    the documented ``--bless --accept-stale`` path, which is the one path
-    this test exists to bless.
+def test_the_stale_stamp_still_reaches_the_log_when_it_is_set(monkeypatch):
+    """STALE_SINCE survives as a hand-written record of a reason to
+    re-measure that no hash can see.  It is read here against a check that
+    found NO changed cost input, so the hand-written path is tested on its
+    own rather than through whatever the shipped table's hashes happen to say
+    today.
     """
+    monkeypatch.setattr(wf, '_DRIFT_CHECK', ((), None))
     monkeypatch.setattr(wf, 'STALE_SINCE', None)
     assert wf.stale_note() is None
     monkeypatch.setattr(wf, 'STALE_SINCE', '2026-01-02')
@@ -99,7 +197,7 @@ def test_every_floor_carries_the_provenance_to_re_measure_it():
         assert floor.gpu and floor.config, where
         assert 0.0 <= floor.spread < 1.0, where
         assert floor.note, where
-        # The comparison count is the floor_4 rule made explicit.
+        # A floor is always measured against a SMALLER device count.
         assert floor.against >= 1 and floor.against < count, where
 
 
@@ -127,9 +225,14 @@ def test_every_floor_records_the_bracket_it_was_read_off():
                 assert bracket.losing_speedup <= 1.0 + floor.spread, where
 
 
-def test_a_sentinel_says_how_far_it_was_tested():
+def test_a_sentinel_says_how_far_it_was_tested(monkeypatch):
     """A sentinel is not a permanent never; it is a place a refresh has to
-    start from, so it must say where that is."""
+    start from, so it must say where that is.
+
+    Read off a synthetic table: the shipped one has no sentinel row today, so
+    asserting against it would test the current data rather than the rule.
+    """
+    install_a_table_with_a_sentinel(monkeypatch)
     sentinels = [(key, floor) for key, floor in wf.FLOORS.items()
                  if floor.elements is None]
     assert sentinels, 'the sentinel path is unexercised if no row uses it'
@@ -188,9 +291,13 @@ def test_an_unmeasured_family_admits_everything_rather_than_refusing_it():
     assert ok and 'no speed floors are measured' in why
 
 
-def test_the_sentinel_holds_its_count_at_every_size():
+def test_the_sentinel_holds_its_count_at_every_size(monkeypatch):
+    """A sentinel excludes its count at EVERY size, including sizes above the
+    largest one tested -- the refusal names that limit rather than pretending
+    the count was priced there."""
+    install_a_table_with_a_sentinel(monkeypatch)
     for size in (1, 88_080_384, 1_023_934_464, 10 ** 12):
-        ok, why = wf.admitted('cone', 2, size)
+        ok, why = wf.admitted('synthetic', 4, size)
         assert not ok
         assert 'sentinel' in why and 'largest size tested' in why
 
@@ -208,15 +315,17 @@ def test_a_floor_admits_exactly_at_its_own_value():
     assert not wf.admitted('parallel', 2, floor.elements - 1)[0]
 
 
-def test_the_fallback_note_says_capacity_overrode_speed():
+def test_the_fallback_note_says_capacity_overrode_speed(monkeypatch):
     why = wf.fallback_reason('parallel', 2, 11_010_048)
     assert 'chosen past its speed floor' in why
     assert 'no admitted count fits' in why
     assert '11.0M sinogram elements < 88.1M' in why
     # A sentinel row has no number to compare against, and says so instead of
-    # printing a nonsense inequality.
+    # printing a nonsense inequality.  Synthetic, since the shipped table has
+    # carried no sentinel row since the 2026-08-10 refresh.
+    install_a_table_with_a_sentinel(monkeypatch)
     assert 'no admission point is measured' in wf.fallback_reason(
-        'cone', 2, 88_080_384)
+        'synthetic', 4, 88_080_384)
 
 
 def test_sinogram_elements_is_the_product_of_the_shape():

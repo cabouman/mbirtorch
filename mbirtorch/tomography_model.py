@@ -299,8 +299,9 @@ class TomographyModel(ParameterHandler):
     def _transient_cols(self, band_cols):
         """The column count of this geometry's dominant per-view transient,
         for the driver's view-batch budget.  The base tracks the runtime
-        band length (single-fan geometries); a two-fan geometry overrides
-        with its params-derived width.  Geometry-owned because the value is
+        band length (single-fan geometries); a two-fan geometry -- one
+        whose slice band projects onto many detector rows, like cone --
+        overrides with its params-derived width.  Geometry-owned because the value is
         calibrated: changing it silently changes batch sizes, float
         summation order, and measured peaks."""
         return band_cols
@@ -368,10 +369,11 @@ class TomographyModel(ParameterHandler):
         DEFAULT = one band per slice-owner (the whole shard).  This differs
         from mbirjax deliberately, on measurement: mbirjax's sweeps found
         time flat across B, so it streams by default for the memory win, but
-        the torch banded pass is orchestration-bound (eager fan-out per
-        band), and the H100 gate matrix priced its sub-band default at +47
-        to +66 percent warm-vcd time at the n=2 cells -- past the
-        replacement-rule ceiling -- for peak savings of 0 to 61 percent.
+        the torch banded pass pays a fixed orchestration cost per band
+        (eager fan-out), and splitting the shard into sub-bands was measured
+        on four H100s at 47 to 66 percent MORE reconstruction time at two
+        devices, for peak-memory savings of 0 to 61 percent -- far more
+        time than the memory is worth on this path.
         Time buys nothing back here because a single torch device never runs
         the banded drivers at all (the trivial fast path uses the plain
         projectors), so mbirjax's stream-even-at-n=1 rationale is void.
@@ -523,8 +525,9 @@ class TomographyModel(ParameterHandler):
                         else:
                             for i in range(sp.n_devices):
                                 partial_shards[i].add_(partials[i])
-                        # Accumulated -- release the name (the back driver's
-                        # twin).  The next band's `partials = run_per_device(...)`
+                        # Accumulated -- release the name, the same release
+                        # the back driver makes.  The next band's
+                        # `partials = run_per_device(...)`
                         # evaluates BEFORE rebinding, so an un-released list
                         # keeps the previous band's full-row partial live on
                         # every device through the next band's projection: one
@@ -892,13 +895,25 @@ class TomographyModel(ParameterHandler):
         return the ledger for the layout settled on.
 
         This is the one site where the automatic device count is chosen, and
-        it is deliberately not model construction.  Three reasons, in order of
-        weight.  A construction-time choice would give ``QGGMRFDenoiser`` a
-        multi-device layout its own loop cannot run.  The ledger needs a free
-        memory reading, and that is only knowable when the reconstruction is
-        about to start; a reading taken at construction would be trusted while
-        stale.  And a developer calling a projector directly has not asked for
-        a layout change, so the reconstruction entries are the right scope.
+        it is deliberately not model construction.  Two reasons carry that.
+        The ledger needs a free memory reading, and that is only knowable when
+        the reconstruction is about to start; a reading taken at construction
+        would be trusted while stale.  And a developer calling a projector
+        directly has not asked for a layout change, so the reconstruction
+        entries are the right scope.
+
+        A third reason used to be stated here and no longer holds:
+        ``QGGMRFDenoiser`` once had no multi-device loop, so a
+        construction-time choice could have handed it a layout it could not
+        run.  The 2026-08 prerelease gave the denoiser a real sharded loop, so
+        that constraint is gone.  What is true today is narrower: the denoiser
+        never enters :meth:`vcd_recon`, the sole call site of this method, so
+        it reaches several devices only through an explicit
+        :meth:`configure_devices` call -- and the first branch below already
+        treats an explicit layout as the caller's, neither searched nor
+        reduced.  Whether the denoiser should instead become a consumer of the
+        automatic policy is an open entry-point question; it is not settled
+        here, and nothing in this method assumes either answer.
 
         The choice is re-evaluated on every entry while the layout is still
         automatic, because a long-lived model in a Plug-and-Play loop can
@@ -1080,7 +1095,7 @@ class TomographyModel(ParameterHandler):
 
     def _settle(self, devices, ledger, rejected):
         """Install the chosen layout when it differs from the current one, log
-        the choice, and arm the calibration mode."""
+        the choice, and enable the calibration mode."""
         chosen, current = len(devices), self.sino_placement.n_devices
         # The search records a speed-floor note the moment it REACHES a held
         # count, before the outcome is known.  A count it then settles on was

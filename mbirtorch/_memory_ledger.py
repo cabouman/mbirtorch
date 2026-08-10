@@ -71,13 +71,13 @@ APPLY_CYLINDERS = 2
 
 # Library workspace that torch allocates through its own caching allocator,
 # and that the ledger's array enumeration therefore cannot see.  Measured as
-# a FLAT 32 to 33 MiB across gate cells whose peaks span 2.26 GiB to 26.68
+# a FLAT 32 to 33 MiB across problem sizes whose peaks span 2.26 GiB to 26.68
 # GiB.  The residual does not scale over that twelvefold range, so it is a
 # fixed per-process allocation rather than a missing array term.  The size and
 # the architecture match the cuBLAS workspace, which is 32 MiB per stream on
 # this class of device.  Charged at 64 MiB, which covers the measurement with
-# headroom at a cost of 2.8 percent at the smallest gate cell and 0.2 percent
-# at the largest.
+# headroom at a cost of 2.8 percent at the smallest size measured and 0.2
+# percent at the largest.
 FIXED_DEVICE_OVERHEAD_BYTES = 64 * 2 ** 20
 
 CALIBRATION_ENV_VAR = 'MBIRTORCH_MEMORY_CALIBRATION'
@@ -301,25 +301,23 @@ def estimate_peak_device_bytes(plan):
         Python evaluates the call before it rebinds, so the loop holds the
         accumulator and the incoming block -- ``min(2, view_batches)``.  The
         release is what makes it two: without it the outgoing block survives
-        the next kernel as well, which is the three the phase probe measured
-        at the gate cells before it landed.
+        the next kernel as well, for three.
 
-        CALIBRATED ON MEASUREMENT, not on the code reading alone.  mg6 read
-        the pre-release loop at 2.49, 0.99 and 1.97 live cylinders where the
-        reading said 3, 2 and 3 -- at 4, 2 and 5 view batches per band pass --
-        so the difference between the reading and the measurement is absorbed
-        by the ``back batch`` charge beside it, which the same rows price 30
-        to 45 percent conservative.  Charging min(2, batches) here plus that
-        batch clears every mg6 worker peak with the release applied: 1.07 at
-        parallel 1024 n=2, 1.13 at parallel 1024 n=4, 1.12 at cone 1024 n=4
-        and 1.20 at cone 512 n=2, worst device 1.07.
+        The count of two comes from measurement, not from reading the code
+        alone.  Measured multi-device runs hold somewhat fewer live blocks
+        than the reading predicts, because a block is often freed partway
+        through the next kernel; the shortfall is absorbed by the ``back
+        batch`` charge beside it, which the same runs show to be 30 to 45
+        percent larger than what is actually held.  Two blocks here plus that
+        batch charge covers every measured multi-device peak.
 
         n == 1 stays at THREE.  The release removes the same array there, but
-        the n=1 calibration sits at 1.009 and 1.104, and dropping a full
-        cylinder from a charge that thin risks going under 1.00 if the peak
-        instant is not exactly where this reading puts it.  The ledger may
-        over-charge; it may not under-charge.  The third cylinder comes off
-        n=1 when an n=1 calibration run confirms the drop.
+        the single-device charge already sits within about a percent of the
+        measured peak, and dropping a whole cylinder from a charge that thin
+        risks landing below the true peak if the peak instant is not exactly
+        where this reading puts it.  The ledger may over-charge; it may not
+        under-charge.  The third cylinder comes off n=1 only when a
+        single-device measurement confirms the drop.
 
         This is charged on every VIEW owner: the workers run wherever there
         are views to project, not only where the bands land.
@@ -337,19 +335,35 @@ def estimate_peak_device_bytes(plan):
 
         Each slice-owner keeps its reduced band in ``recon_tensors`` for the
         rest of the loop, so from its own pass onward it carries one extra
-        cylinder-shard through every later pass's projection.  Real,
-        unavoidable, and uncharged before the sub-phase split; mg6 read it
-        directly as the +1 step in the band-pass entry of every device that
-        had already owned a pass.
+        cylinder-shard through every later pass's projection.  Real and
+        unavoidable: measurement shows the extra cylinder appearing on a
+        device as soon as it has owned a pass.
         """
         if n == 1 or not is_slice_owner(i):
             return 0
         return cyl(i, num_pixels)
 
+    # ── the forward terms ────────────────────────────────────────────────────
+    # These terms charge only arrays the code can be seen to allocate: no
+    # phase carries a safety margin, and none may be added back.  The two that
+    # replaced the old margin are the loop's second live block (forward_block)
+    # measured at the block's real detector-row extent (forward_block_rows).
+    # Checked against measured peaks on 2026-08-10 (four H100s, at two and
+    # four devices, both geometries, weighted and unweighted), where the
+    # forward projection was the phase that set the modeled peak on nearly
+    # every run.
+    #
+    # The constraint these terms have to keep: every modeled peak must sit at
+    # or above the measured one, and the thinnest margin measured was a
+    # fraction of a percent, so they may not be trimmed casually.
+    # Over-charging is bounded too -- CALIBRATION_BAND asks the model to stay
+    # within 1.30x of the measurement -- so an unneeded term is also a defect.
     def forward_fixed(i):
         """The forward's assembled output.  A multi-device owner holds the
-        per-band pieces AND their concatenation (row-aligned), or the running
-        partial AND the incoming one (two-fan), so it pays twice."""
+        per-band pieces AND their concatenation (a row-aligned geometry, one
+        whose detector row r comes from recon slice r), or the running partial
+        AND the incoming one (a two-fan geometry such as cone, where one slice
+        projects onto many detector rows), so it pays twice."""
         if not is_view_owner(i):
             return 0
         return sino_dev(i) if n == 1 else 2 * sino_dev(i)
@@ -361,60 +375,72 @@ def estimate_peak_device_bytes(plan):
         band onto every view-owner, and the copy stays live for the whole of
         that band's projection.  One band is the whole shard by default, so
         the copy is a full cylinder-shard on each device, on top of the
-        device's own shard.  Never charged before; it is what the whole-run
-        peak at cone 1024 with four devices needs.
+        device's own shard.  Without this term the model falls below the
+        measured peak on a large cone reconstruction at four devices.
         """
         if n == 1 or not is_view_owner(i):
             return 0
         return cyl(i, num_pixels)
 
-    def forward_residual(i):
-        """A MEASURED MARGIN: this ledger models released code, and every
-        measurement that exists was taken before the releases landed.
+    def forward_view_batches(i, num_pixels):
+        """How many batches one owner's forward view loop runs, or None when
+        this plan prices no batch (a hand-built plan with no cost model).
+        The counterpart of ``back_view_batches`` above, using the forward's
+        own cost model."""
+        real_views = plan.view_blocks[i][1]
+        if real_views <= 0 or plan.view_charge is None:
+            return None
+        view_batch = int(plan.view_charge(
+            'forward', int(num_pixels), forward_cols(i))[0])
+        return max(1, -(-int(real_views) // max(1, view_batch)))
 
-        The mg2 whole-run peaks attribute exactly.  At parallel 1024 they are
-        a back-loop sub-step to within 0.001 cylinders -- the direct recon's
-        workers at two devices weighted, the hessian's workers at two devices
-        unweighted, and a band reduce at four devices, either phase.  At cone
-        1024 with four devices the peak sits 1.73 cylinders ABOVE anything in
-        either back loop, so it is a forward phase; the terms above put its
-        live set within 2.5 percent of the measurement.
+    def forward_block_rows(i):
+        """The DETECTOR-ROW extent of one forward view block.
 
-        Every one of those peaks holds a stale binding that this change
-        releases, so each should fall.  Charging the corrected terms alone
-        lands at 0.92 and 0.93 of the RAW measurements while clearing 1.03
-        against the same measurements less the predicted saving.  Rather than
-        rest the floor on a predicted saving, one per-device sinogram shard --
-        the largest single array either release frees -- is charged here to
-        keep the modeled peak above every measurement AS MEASURED.
-
-        It sits on the forward because that is where it costs least: the back
-        loop's correction keeps its full benefit, and the forward's own
-        attribution is the one still open (charter A).  RETIREMENT: a
-        calibration run against the released code replaces this with the raw
-        post-release numbers.  Two forward terms were identified and NOT
-        charged, being subsumed by this margin -- the view-range loop holds
-        two assembled blocks rather than one (the same evaluate-before-rebind
-        the back loop had), and a two-fan block spans the detector ROW count
-        rather than the voxel band ``forward_block`` prices.
+        A row-aligned geometry's body sizes its output by the value columns it
+        was handed -- ``_parallel_forward_view_batch_triton`` allocates
+        ``(views, channels, num_value_cols)`` -- so a slice band yields the
+        matching row band and the block shrinks with the band.  A TWO-FAN
+        body's output spans the whole detector whatever band the values carry:
+        ``_cone_forward_view_batch_triton`` allocates ``(views, channels,
+        num_rows_r)`` and reads ``num_rows_r`` from the params, because one
+        slice band lights up every row it projects onto.  So the block does
+        NOT shrink with the band there, and charging it at the band instead
+        would under-charge the cone forward by ``(rows - band)`` per view.
         """
-        if n == 1 or not is_view_owner(i):
-            return 0
-        return sino_dev(i)
+        return forward_cols(i) if plan.rows_track_slices else plan.sino_rows
 
-    def forward_block(i, num_pixels, cols):
-        """One assembled view block, which is not part of the batch charge.
+    def forward_block(i, num_pixels):
+        """The view block the loop holds BESIDES the one the batch prices.
 
-        The block's size follows the view batch, and the batch follows the
-        pixel count of THIS call, so the subset phases must pass their own
-        subset size rather than the full index count.
+        ``Projectors.sparse_forward_project_view_range`` is ``block =
+        fwd_body(...)`` then ``out[...] = block``, with no release: python
+        evaluates the next call before it rebinds ``block``, so the loop holds
+        the outgoing block and the incoming one -- ``min(2, view_batches)``
+        blocks.  The back loop would hold the same two if it did not release
+        its block explicitly.
+
+        ONE of those two is already inside ``forward batch``.  A forward
+        body's output plane scales with the view batch, so each body's
+        ``_view_batch_cost`` charges it per view and says so; the back body's
+        cost model does not, its output being call-fixed at any batch.  This
+        term is therefore the REMAINDER -- one block while the loop runs more
+        than a single batch, and nothing when it runs one, which is the whole
+        live set there.
+
+        The batch follows the pixel count of THIS call, so the subset phases
+        must pass their own subset size rather than the full index count.
         """
         if not is_view_owner(i):
             return 0
+        batches = forward_view_batches(i, num_pixels)
+        live = 2 if batches is None else min(2, batches)
         view_batch = 1
         if plan.view_charge is not None:
-            view_batch = plan.view_charge('forward', num_pixels, cols)[0]
-        return view_batch * cols * num_channels * _F32_BYTES
+            view_batch = plan.view_charge('forward', num_pixels,
+                                          forward_cols(i))[0]
+        return ((live - 1) * int(view_batch) * forward_block_rows(i)
+                * num_channels * _F32_BYTES)
 
     # ── the persistent set ───────────────────────────────────────────────────
     # One sinogram-shaped weights term, never two: when the caller supplies
@@ -425,9 +451,9 @@ def estimate_peak_device_bytes(plan):
     # supplied weights array is placed at the top of vcd_recon, so it is
     # resident from the direct recon onward.  The internally built all-ones
     # array is created inside the hessian block, so on an unweighted run
-    # nothing weights-shaped exists before that.  The phase probe's entry
-    # column pinned both: the unweighted direct recon enters at one sinogram,
-    # the weighted one at two.
+    # nothing weights-shaped exists before that.  Measurement confirms both:
+    # an unweighted direct recon starts with one sinogram-shaped array live,
+    # a weighted one with two.
     weights_resident = plan.weights_supplied or not plan.fm_hessian_supplied
 
     def weights_term(i):
@@ -476,11 +502,11 @@ def estimate_peak_device_bytes(plan):
 
         The workers project and the reduce gathers, and they never run at the
         same time: the workers' locals die on return, and the reduce's copies
-        do not exist until they do.  Summing the two charged a peak that is
-        never live -- 4.2 cylinders per device above the larger sub-step at
-        parallel 1024 with four devices, which mg6 measured directly.  Both
-        sub-phases are emitted and the per-device maximum over phases picks
-        between them, exactly as the loop/scatter split does.
+        do not exist until they do.  Summing the two would charge a peak that
+        is never live -- measurement puts the sum several cylinders per device
+        above the larger of the two sub-steps.  Both sub-phases are emitted
+        and the per-device maximum over phases picks between them, exactly as
+        the loop/scatter split does.
 
         The sub-phase names keep the parent name as a prefix, so any consumer
         matching on the parent (a preflight message, a calibration row, a
@@ -548,10 +574,8 @@ def estimate_peak_device_bytes(plan):
             ('voxel gather', per_dev(lambda i: cyl(i, p_full))),
             ('broadcast band', per_dev(lambda i: forward_band_copy(i, p_full))),
             ('forward output', per_dev(forward_fixed)),
-            ('forward block',
-             per_dev(lambda i: forward_block(i, p_full, forward_cols(i)))),
+            ('forward block', per_dev(lambda i: forward_block(i, p_full))),
             ('forward batch', per_dev(lambda i: forward_batch(i, p_full))),
-            ('forward margin (pre-release)', per_dev(forward_residual)),
         ]
         phases.append(_phase('initial forward projection', forward_terms,
                              n, base=constant_base,
@@ -636,12 +660,11 @@ def estimate_peak_device_bytes(plan):
                                  base_terms=constant_terms))
 
     # ── the per-iteration statistics ─────────────────────────────────────────
-    # Charged as ZERO by the first version of this ledger, on the grounds that
-    # the other phases dominate it.  The two residency fixes shrank those
-    # phases and falsified the assumption: on an unweighted run this phase is
-    # now the peak.  Its transient measured EXACTLY two sinogram-shaped arrays
-    # at the 1024 cells, which is the two squared-error products; the recon L1
-    # fuses into its own reduction and materializes nothing.
+    # This phase has to be charged rather than assumed small: on an unweighted
+    # run it is the peak.  Its transient measures EXACTLY two sinogram-shaped
+    # arrays at the largest sizes tested, which is the two squared-error
+    # products; the recon L1 fuses into its own reduction and materializes
+    # nothing.
     phases.append(_phase(
         'per-iteration statistics',
         [('squared-error products', per_dev(lambda i: 2 * sino_dev(i)))],
@@ -678,10 +701,8 @@ def estimate_peak_device_bytes(plan):
                     lambda i: sino_dev(i) if n > 1 and is_view_owner(i) else 0)),
                 ('broadcast band', per_dev(
                     lambda i: forward_band_copy(i, p_sub))),
-                ('forward block', per_dev(
-                    lambda i: forward_block(i, p_sub, forward_cols(i)))),
+                ('forward block', per_dev(lambda i: forward_block(i, p_sub))),
                 ('forward batch', per_dev(lambda i: forward_batch(i, p_sub))),
-                ('forward margin (pre-release)', per_dev(forward_residual)),
             ],
             'state application': [
                 ('direction and scaled direction',

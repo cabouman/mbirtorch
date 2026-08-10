@@ -1,77 +1,68 @@
 """Per-geometry, per-count SPEED floors for the automatic device count.
 
-WHAT A FLOOR IS.  The automatic device-count policy
-(:meth:`TomographyModel._apply_device_policy`) is a CAPACITY rule: it walks
-the visible counts largest-first and takes the first one whose modeled peak
-fits.  Capacity alone widens small problems onto counts that run SLOWER --
-measured harm of 13x at a 128-class cell and 5.1x at a sparse-view shape.  A
-floor is the problem size, in SINOGRAM ELEMENTS (``prod(sinogram_shape)``),
-at or above which a device count is worth using at all.  Below its floor a
-count is not admitted by the AUTOMATIC path; it is never removed from the
-search, only pushed behind every admitted count, so capacity still wins when
-nothing admitted fits.
+The automatic device-count policy
+(:meth:`TomographyModel._apply_device_policy`) picks the widest device count
+whose modeled peak memory fits.  Fitting is not the same as being faster:
+widening a small problem was measured 13x slower on parallel beam and 5.1x
+slower on a sparse-view shape.  A floor is the problem size, in SINOGRAM
+ELEMENTS (``prod(sinogram_shape)``), at or above which a device count is
+worth using.  Below its floor a count is not admitted by the automatic path
+-- not removed from the search, only pushed behind every admitted count, so
+capacity still wins when nothing admitted fits.  A count of 1 is always
+admitted.
 
-The metric is sinogram elements because that is what the decision site
-already knows before any array is placed, and because the measurement chose
-it: a sparse-view probe whose sinogram elements and recon voxels disagree by
-a full ladder step landed on the side the sinogram metric predicted, where
-widening to two devices was a 1.87x regression.
+Sinogram elements is the size metric because the decision site knows the
+sinogram shape before any array is placed, and because measurement chose it:
+on a sparse-view problem whose sinogram elements and recon voxels point at
+different sizes, widening to two devices was a 1.87x regression, which is
+what the sinogram count predicts.
 
-THE CROSSOVER RULE THAT SETS A FLOOR.  Each count's floor is its crossover
-against the best SMALLER ADMITTED count -- not against n=1 unconditionally.
-So the parallel n=4 floor is where n=4 overtakes n=2 (n=2 being admitted
-below it), while the cone n=4 floor is where n=4 overtakes n=1, because cone
-n=2 is never admitted and so is never the count n=4 has to beat.  Where the
-measurement brackets a crossover between two ladder sizes, the floor is set
-at the CONSERVATIVE end -- the larger size -- because the measured asymmetry
-is lopsided: widening a below-knee problem cost multiples, while holding a
-just-above-knee problem at a smaller count costs a few percent.
+Each count's floor is the size at which it overtakes the best SMALLER
+ADMITTED count, not where it overtakes one device: the parallel n=4 floor is
+where n=4 overtakes n=2.  Where the measurement brackets the crossing point
+between two tested sizes, the floor takes the larger, because the risk is
+lopsided -- widening too early has cost multiples, while holding a
+just-large-enough problem at a smaller count costs a few percent.
 
-SENTINEL ENTRIES.  ``elements=None`` means no admission point was found at
-or below the largest size measured.  It is NOT a hard "never": it excludes
-the count at every size until a refresh measures an admission point, and it
-carries ``largest_tested`` so the refresh knows where to start probing.
+``elements=None`` -- a "sentinel" row, as the refusal message and the tests
+call it -- records a count with no admission size at or below the largest
+size tested.  It is not a permanent refusal: it excludes that count
+everywhere until a refresh finds an admission size, and it carries
+``largest_tested`` so the refresh knows where to start.  No row is in that
+state today.  A count with no row inherits the row of the next MEASURED count
+above it (n=3 is governed by the n=4 floor, as is any count above 4), and a
+model declaring no ``_floor_family`` gets the parallel floors, the more
+permissive measured set, with the reason string and the verbose-2 log both
+saying so.
 
-COUNTS WITH NO ENTRY inherit the entry of the next MEASURED count above
-them, which is the conservative direction: n=3 is governed by the n=4 floor,
-and so is any count above 4.  A count of 1 is always admitted.
+The nightly runs validate none of this: every one of them, n=1 included, pins
+the count through ``MBIRTORCH_NUM_DEVICES``, and a pin bypasses the guard by
+construction.  The chosen-count tests in ``tests/test_device_policy.py`` are
+the standing coverage -- the only place the ordering rule runs end to end.
 
-FAMILY.  A model names its family with the class attribute ``_floor_family``
-(``'parallel'``, ``'cone'``).  ``None`` -- the base-class default -- means
-the parallel floors apply, since they are the more permissive measured set;
-the accessor's reason string says so, and the selection path logs the
-substitution at verbose 2, so a geometry that was never measured never has
-the fact hidden from it.
+MAINTENANCE.  These are measurements, only as good as the projection code
+they were taken against, and a table that no longer matches that code still
+governs and still runs.  The first guard consultation in a process hashes the
+projection-cost inputs against :data:`BLESSED_COST_HASHES`, and
+:func:`stale_note` names whatever moved on every automatic device selection
+until it stops moving; ``tests/test_widening_floors.py`` prints the same
+report, warns, and PASSES, because out-of-date numbers are a reason to
+re-measure rather than a reason to stop a reconstruction or a test run.  Two
+things do fail hard: :data:`TABLE_CHECKSUM` binds the floors, the recorded
+hashes and :data:`STALE_SINCE` into one unit, so hand-editing a hash to
+silence the note is caught, and the provenance checks (dates, brackets,
+floors rising with the count) are assertions.
+``dev_scripts/refresh_widening_floors.py`` is the SOLE writer of those three
+constants, and pasting its output is the one thing that clears the note.  If
+code that determines projection cost MOVES (a new driver function in
+``tomography_model``, batching logic moving to a new file), add it to
+:data:`COST_INPUT_FILES` or :data:`COST_INPUT_METHODS` in the same change and
+re-record the hashes: the check covers only what it names.
 
-WHAT VALIDATES THESE NUMBERS.  Not the nightly, and not the measurement
-campaigns: every nightly row, n=1 included, is env-pinned through
-``MBIRTORCH_NUM_DEVICES``, and a pin bypasses this guard by construction.
-The chosen-count unit tests in ``tests/test_device_policy.py`` are therefore
-the guard's standing regression coverage -- they are the only place the
-ordering rule is exercised end to end.
-
-MAINTENANCE.  These numbers are measurements, not constants, and they are
-only as good as the projection code they were measured against.
-
-  * ``dev_scripts/refresh_widening_floors.py`` re-measures them on a 4-GPU
-    node and prints a paste-ready replacement for :data:`FLOORS`, provenance
-    included.  It is the SOLE writer of the three things that must move
-    together: the floors, their provenance, and the blessed hashes below.
-    :data:`TABLE_CHECKSUM` binds all three, so greening the test by hand
-    editing a hash fails a different assertion instead.
-  * ``tests/test_widening_floors.py`` FAILS as soon as the projection-cost
-    code changes -- the Triton kernels, the projector drivers, or the two
-    sharded projection methods -- and keeps failing until the floors are
-    re-measured or the hashes are re-blessed.
-  * ``refresh_widening_floors.py --bless --accept-stale`` re-blesses the
-    hashes WITHOUT re-measuring, and stamps :data:`STALE_SINCE`.  The test
-    passes in that state; the device-selection log carries the debt instead.
-
-The escape hatch is the environment variable named in :data:`GUARD_ENV_VAR`:
-set it to ``0`` and the guard is consulted nowhere, restoring the pure
-capacity order.  Both pin mechanisms -- an explicit ``configure_devices``
-call and ``MBIRTORCH_NUM_DEVICES`` -- bypass the guard by construction,
-because a count the caller named is not the library's to second-guess.
+Set the environment variable named in :data:`GUARD_ENV_VAR` to ``0`` to turn
+the guard off and restore the pure capacity order.  An explicit
+``configure_devices`` call and ``MBIRTORCH_NUM_DEVICES`` bypass it anyway: a
+count the caller named is not the library's to second-guess.
 """
 
 import hashlib
@@ -92,35 +83,37 @@ MEASURED_CONFIG = ('warm median of 3 seeded 3-iteration VCD recons, cold '
                    'pass discarded, package-default subset schedule, Triton '
                    'kernels on, torch.compile auto')
 
-#: THE ENVELOPE CAVEAT.  These floors are validated at MEASURED_CONFIG only.
-#: A different iteration count or a different subset schedule moves the
-#: per-subset host-sync cost that sets these knees, and is outside the
-#: measured envelope: the floors are still applied there, but they were not
-#: validated there.  A workload that lives at a different configuration
-#: should re-measure rather than assume.
+#: These floors are validated at MEASURED_CONFIG only.  A different iteration
+#: count or a different subset schedule moves the per-subset host-sync cost
+#: that sets these crossovers, so it falls outside what was measured: the
+#: floors are still applied there, but they were not validated there.  A
+#: workload that runs at a different configuration should re-measure rather
+#: than assume.
 MEASUREMENT_CAVEAT = ('validated at MEASURED_CONFIG only; a different '
                       'iteration count or subset schedule is outside the '
                       'measured envelope')
 
-#: Where a crossover was pinned down: the largest cell where the count under
-#: test LOST, the smallest where it WON, and the speedups measured there
-#: against the comparison count.  A side is None when no such cell was
-#: measured -- ``winning_cell is None`` is what makes a row a sentinel.
+#: Where a crossover was pinned down: the largest problem size at which the
+#: count under test LOST, the smallest at which it WON, and the speedups
+#: measured there against the comparison count.  A side is None when no such
+#: size was measured; ``winning_cell is None`` is what makes ``elements``
+#: None.  A "cell" here is one measured (views, rows, channels) sinogram
+#: shape.
 Bracket = namedtuple('Bracket', ('losing_cell', 'losing_speedup',
                                  'winning_cell', 'winning_speedup'))
 
 #: One row of the table.  ``elements`` is the floor in sinogram elements, or
-#: None for a sentinel (no admission point measured).  ``cell`` is the
-#: (views, rows, channels) shape the floor was read off; ``against`` is the
-#: count the crossover was taken against (the best smaller ADMITTED count);
-#: ``spread`` is the largest warm-repeat spread among the arms the row was
-#: read from, which is the noise the crossover had to clear.
+#: None when no admission size was measured.  ``cell`` is the (views, rows,
+#: channels) sinogram shape the floor was read off; ``against`` is the count
+#: the crossover was taken against (the best smaller ADMITTED count);
+#: ``spread`` is the widest spread among the warm repeats the row was read
+#: from, which is the run-to-run noise the crossover had to clear.
 Floor = namedtuple('Floor', ('family', 'count', 'elements', 'cell', 'against',
                              'bracket', 'spread', 'gpu', 'config', 'measured',
                              'commit', 'largest_tested', 'note'))
 
 # ── the measured table ───────────────────────────────────────────────────────
-# Sizes named by their ladder class:
+# The measured sinogram shapes, each named for its view count:
 #     384-class  (384, 336, 288)     =    37,158,912 sinogram elements
 #     512-class  (512, 448, 384)     =    88,080,384 sinogram elements
 #     768-class  (768, 672, 576)     =   297,271,296 sinogram elements
@@ -129,51 +122,52 @@ FLOORS = {
     ('parallel', 2): Floor(
         family='parallel', count=2, elements=88_080_384, cell=(512, 448, 384),
         against=1,
-        bracket=Bracket(losing_cell=(384, 336, 288), losing_speedup=0.63,
-                        winning_cell=(512, 448, 384), winning_speedup=1.22),
-        spread=0.054, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
-        measured='2026-08-09', commit='f7e08da',
-        largest_tested=1_023_934_464,
-        note='n=2 overtakes n=1 at the 512-class cell and wins at every '
-             'larger size measured.  The spread is the 384-class n=1 arm, '
-             'the noisiest in the bracket'),
+        bracket=Bracket(losing_cell=(384, 336, 288), losing_speedup=0.64,
+                        winning_cell=(512, 448, 384), winning_speedup=1.23),
+        spread=0.09623, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-10', commit='a880d9c',
+        largest_tested=297_271_296,
+        note='unchanged by the 2026-08-10 refresh.  The spread comes from '
+             'the 384-class n=1 runs, the noisiest in the family; at the '
+             'floor shape itself n=2 wins by 1.23x'),
     ('parallel', 4): Floor(
         family='parallel', count=4, elements=1_023_934_464,
         cell=(1024, 1008, 992), against=2,
         bracket=Bracket(losing_cell=(768, 672, 576), losing_speedup=0.74,
-                        winning_cell=(1024, 1008, 992), winning_speedup=1.68),
-        spread=0.0092, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
-        measured='2026-08-09', commit='f7e08da',
+                        winning_cell=(1024, 1008, 992), winning_speedup=1.67),
+        spread=0.008199, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-10', commit='a880d9c',
         largest_tested=1_023_934_464,
-        note='n=4 overtakes n=2 somewhere in the 768-to-1024 bracket; the '
-             'floor takes the conservative end, since at the 768-class cell '
-             'n=2 still led n=1 by 1.60x against n=4\'s 1.18x'),
+        note='measured against n=2, which still wins at the 768-class '
+             'shape'),
     ('cone', 2): Floor(
-        family='cone', count=2, elements=None, cell=None, against=1,
-        bracket=Bracket(losing_cell=(1024, 1008, 992), losing_speedup=0.92,
-                        winning_cell=None, winning_speedup=None),
-        spread=0.011, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
-        measured='2026-08-09', commit='f7e08da',
+        family='cone', count=2, elements=88_080_384, cell=(512, 448, 384),
+        against=1,
+        bracket=Bracket(losing_cell=None, losing_speedup=None,
+                        winning_cell=(512, 448, 384), winning_speedup=1.02),
+        spread=0.005233, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-10', commit='a880d9c',
         largest_tested=1_023_934_464,
-        note='SENTINEL: no admission point at or below the 1024-class cell, '
-             'the largest size measured -- it reads 0.55x, 0.66x, 1.02x and '
-             '0.92x across the 256-, 384-, 512- and 1024-class cells, so the '
-             'one nominal win sits inside its own spread.  Not a permanent '
-             'never: a refresh that probes above largest_tested can replace '
-             'this row'),
+        note='the FIRST admission size ever measured for this entry: '
+             'before the 2026-08-10 refresh, no size had one.  MARGINAL, '
+             'on a 1.02x win clearing a 0.52 percent spread, and with no '
+             'losing shape recorded because no smaller shape was tried '
+             'once the 512-class shape won.  If this admission is wrong, '
+             'the cost is a few percent, by the measured asymmetry'),
     ('cone', 4): Floor(
         family='cone', count=4, elements=1_023_934_464,
         cell=(1024, 1008, 992), against=1,
-        bracket=Bracket(losing_cell=(512, 448, 384), losing_speedup=0.68,
+        bracket=Bracket(losing_cell=(768, 672, 576), losing_speedup=0.98,
                         winning_cell=(1024, 1008, 992), winning_speedup=1.16),
-        spread=0.0064, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
-        measured='2026-08-09', commit='f7e08da',
+        spread=0.003432, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-10', commit='a880d9c',
         largest_tested=1_023_934_464,
-        note='the comparison count is n=1, not n=2, because cone n=2 is '
-             'never admitted.  COARSE BRACKET: the cone ladder has no cell '
-             'between the 512- and 1024-class sizes, a 12x jump in sinogram '
-             'elements, and the winning cell was measured in a separate job '
-             'on a different node, so the floor takes the conservative end'),
+        note='the refresh narrowed the bracket from 512-to-1024 down to '
+             '768-to-1024; the floor did not move.  Measured against '
+             'n=1, because cone n=2 was not admitted anywhere when this '
+             'row was set.  Now that cone n=2 has a floor, the crossover '
+             'rule means the next refresh re-derives this row against '
+             'n=2'),
 }
 
 # ── the projection-cost inputs the floors were measured against ──────────────
@@ -190,39 +184,37 @@ COST_INPUT_FILES = ('triton_parallel.py', 'triton_cone.py', 'projectors.py')
 COST_INPUT_METHODS = ('_sparse_forward_project_sharded',
                       '_sparse_back_project_sharded')
 
-#: sha256 of each cost input as of the measurement above.  Re-bless with
+#: sha256 of each cost input as of the measurement above -- the recorded
+#: ("blessed") values the live check compares against.  Re-record them with
 #: ``python dev_scripts/refresh_widening_floors.py --bless``.
 BLESSED_COST_HASHES = {
     'TomographyModel._sparse_back_project_sharded':
         '8a39fb4d97a9573933520ce780eae5dd2097e5a068caa3ee2178114ba8989772',
     'TomographyModel._sparse_forward_project_sharded':
-        'e5cb2e89df6452d998f2558487c3924a404620378bfedda7cb9598be9ed9d7c3',
+        'f2a1fff6d1ea2627abfa4d02f1b5ad08e80383f4eef6bd037e4743c200b9f7b2',
     'projectors.py':
-        '2f0520ee7519550daa639373d5b7bc442a2fa1ccd21166bfe40aaeba551613c8',
+        '6977a6181accbaee9235246ce2cc59f17869d9666daae91a3748b2c21f143cf6',
     'triton_cone.py':
         '8d3820c2101f8d3fbb7823f2d9b6e6e6253164bd14a2c276d167d9ba0a135154',
     'triton_parallel.py':
         '78fc531463124e634950c97bb3ebb40fd69bc9cce1e42073a4b7345ba50ca9f1',
 }
 
-#: The date the hashes were re-blessed WITHOUT a new measurement, or None
-#: when the floors and the hashes were written together by a real refresh.
-#: A non-None value is acknowledged debt: the tests pass, and every
-#: automatic device selection logs that the floors are stale.
-#: Stamped 2026-08-10 by the back-loop residency pair: the two stale-partial
-#: releases in the banded drivers and the block release in the back view
-#: loop.  All three are residency-only -- no arithmetic, no summation order,
-#: no chunk constant, no batch size moves -- but the refresh script names "a
-#: banded driver" as a cost input whose change moves a crossover, so the debt
-#: is recorded rather than blessed away.  A refresh run clears it.
-STALE_SINCE = '2026-08-10'
+#: A hand-written staleness date, or None -- currently None, from the
+#: 2026-08-10 refresh run.  A refresh ALWAYS writes None here, because
+#: :func:`stale_note` detects a changed cost input by itself and a
+#: hand-written date adds nothing.  The field stays because
+#: :data:`TABLE_CHECKSUM` binds it, and because someone may still want to
+#: record a reason to re-measure that no hash can see -- new hardware, a
+#: changed subset schedule.
+STALE_SINCE = None
 
 #: sha256 binding FLOORS, BLESSED_COST_HASHES and STALE_SINCE together.
 #: These three move as one unit or not at all -- editing a hash by hand to
 #: green the test leaves this behind, and the test says so.  Recomputed and
 #: printed by ``refresh_widening_floors.py --bless``.
 TABLE_CHECKSUM = \
-    '9367439054bde4e1d5070f187ca1b842d80891044a61ef89b8f9e2b083f1fdb3'
+    'aa728b2070772ef627874d3bfc11206088ee3666f8e240319e50bea777596886'
 
 
 # ── the env knob ─────────────────────────────────────────────────────────────
@@ -234,14 +226,77 @@ def guard_enabled():
         not in _GUARD_OFF_VALUES
 
 
+# ── staleness, detected rather than declared ─────────────────────────────────
+#: The live check for changed cost inputs, computed once per process on the
+#: first guard consultation and cached here: ``(changed_names, failure)``.
+#: None means it has not run yet.  A test that changes what the check would
+#: see resets this to None first.
+_DRIFT_CHECK = None
+
+#: The one command that clears a staleness note, named in every note that
+#: reports one.
+_REFRESH_COMMAND = 'dev_scripts/refresh_widening_floors.py'
+
+
+def _drift_check():
+    """The cost inputs that no longer hash to their recorded values, as
+    ``(names, failure)``, computed once per process.
+
+    Hashing three files and two method sources is milliseconds, but the guard
+    is consulted on every automatic device selection, so it is done once and
+    cached.  A check that CANNOT run -- a file moved mid-refactor, a method
+    renamed out from under :data:`COST_INPUT_METHODS` -- returns its failure
+    for the log instead of raising: saying the measurements need refreshing
+    must never be able to break a reconstruction, which is the whole reason
+    the note replaced a hard failure.
+    """
+    global _DRIFT_CHECK
+    if _DRIFT_CHECK is None:
+        try:
+            _DRIFT_CHECK = (tuple(name for name, _want, _got
+                                  in stale_cost_inputs()), None)
+        except Exception as exc:                                  # noqa: BLE001
+            _DRIFT_CHECK = ((), '{}: {}'.format(type(exc).__name__, exc))
+    return _DRIFT_CHECK
+
+
 def stale_note():
-    """The one-line debt notice for the device-selection log, or None."""
-    if STALE_SINCE is None:
+    """The one-line notice for the device-selection log that the floors need
+    re-measuring, or None.
+
+    Either of two things puts a note here, and they are reported together
+    when both hold:
+
+      * A projection-cost input no longer matches its recorded hash, so the
+        floors were measured against code that has since changed.  This is
+        the ordinary path and it needs no human in it: the note names the
+        inputs that moved.
+      * :data:`STALE_SINCE` -- a hand-written date, kept for reasons to
+        re-measure that no hash can see.
+
+    A check that could not run says so rather than implying freshness.  The
+    note is advisory in every case: the floors still govern, and a real
+    refresh is what clears it.
+    """
+    drifted, failure = _drift_check()
+    parts = []
+    if failure is not None:
+        parts.append('the widening speed floors could not be checked against '
+                     'the projection-cost code ({}), so whether they are '
+                     'stale is unknown'.format(failure))
+    elif drifted:
+        parts.append('the widening speed floors were measured against '
+                     'projection-cost code that has since changed ({}), so '
+                     'they may no longer describe it'.format(
+                         ', '.join(drifted)))
+    if STALE_SINCE is not None:
+        parts.append('the widening speed floors are marked stale since {}: '
+                     'the floors were not re-measured when they were '
+                     'recorded as owing a measurement'.format(STALE_SINCE))
+    if not parts:
         return None
-    return ('the widening speed floors are marked stale since {}: the '
-            'projection-cost hashes were re-blessed without re-measuring '
-            '(dev_scripts/refresh_widening_floors.py re-measures '
-            'them)'.format(STALE_SINCE))
+    return '{}; re-measuring with {} clears this'.format('; '.join(parts),
+                                                         _REFRESH_COMMAND)
 
 
 # ── the metric ───────────────────────────────────────────────────────────────
@@ -403,8 +458,8 @@ def cost_input_hashes():
 
 
 def stale_cost_inputs():
-    """The cost inputs whose hash no longer matches the blessed one, as
-    ``[(name, blessed, actual), ...]``.  Empty means the floors still
+    """The cost inputs whose hash no longer matches the recorded one, as
+    ``[(name, recorded, actual), ...]``.  Empty means the floors still
     describe the code they were measured against."""
     actual = cost_input_hashes()
     stale = []
@@ -418,7 +473,7 @@ def stale_cost_inputs():
 
 def table_checksum():
     """sha256 over the three things a refresh writes together: the floors,
-    the blessed hashes, and the staleness stamp.
+    the recorded cost-input hashes, and the staleness date.
 
     Hand-editing one of them -- the cheap way to green the hash test -- moves
     this and fails a different assertion, which is the point.
@@ -432,8 +487,11 @@ def table_checksum():
 def bless_lines(stale_since=None):
     """The paste-ready replacement for the three bound constants.
 
-    ``stale_since`` is the date stamped by ``--bless --accept-stale``; None
-    is a bless that followed a real measurement.
+    ``stale_since`` is None for every refresh: a changed cost input is
+    detected live, so a re-record that follows a real measurement leaves
+    :data:`STALE_SINCE` unset and the note clears itself.  The parameter
+    remains for a human recording a reason to re-measure that no hash can
+    see.
     """
     hashes = cost_input_hashes()
     lines = ['BLESSED_COST_HASHES = {']

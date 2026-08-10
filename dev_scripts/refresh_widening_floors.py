@@ -4,13 +4,27 @@ WHY THIS EXISTS.  ``mbirtorch/_widening_floors.py`` holds a MEASUREMENT, not a
 constant: the sinogram size at which each device count starts paying for
 itself.  Change what a projection costs -- a kernel, a chunk constant, a
 transient budget, a banded driver -- and the crossovers move.
-``tests/test_widening_floors.py`` fails as soon as any of those inputs change,
-and this script is the one command that answers it.
+
+NOTHING FORCES YOU TO RUN THIS.  A changed cost input is found automatically:
+the library hashes the cost inputs on the first guard consultation in a
+process and ``_widening_floors.stale_note()`` names whatever moved, in every
+automatic device selection, until it stops moving.
+``tests/test_widening_floors.py`` reports the same thing and PASSES.
+Re-measuring is work to schedule deliberately -- a planned nightly automation
+will own it -- and running this script, then pasting its output, is what
+clears the note.
 
 THIS SCRIPT IS THE SOLE WRITER of the three things that must move together:
-the floors, their provenance, and the blessed cost-input hashes.  It prints
-all three as one block, bound by a checksum, so greening the test by hand
-editing a hash fails a different assertion instead.
+the floors, their provenance, and the recorded cost-input hashes.  It prints
+all three as one block, bound by a checksum, so silencing the staleness note
+by hand editing a hash fails the checksum test instead.  That test still
+fails HARD: tamper protection was never the optional part.
+
+THE WORDS THIS SCRIPT USES.  A CELL is one problem to measure: a geometry
+family and a sinogram shape.  An ARM is one timed reconstruction of a cell at
+one device count.  The LADDER is the fixed list of sinogram shapes a refresh
+measures at.  A SENTINEL row is one whose ``elements`` is None -- a device
+count for which no admission size has been found yet.
 
 THE METHOD, per cell and per device count: one cold recon, DISCARDED, then the
 warm median of 3 seeded 3-iteration reconstructions.  Every arm runs in a
@@ -22,28 +36,32 @@ every arm of that cell loads it; otherwise the arms would reconstruct
 different arrays and the comparison would not be controlled.
 
 THE CROSSOVER RULE.  A count's floor is its crossover against the best smaller
-ADMITTED count, not against n=1 unconditionally: parallel n=4 must beat n=2,
-while cone n=4 must beat n=1 because cone n=2 is never admitted.  A win counts
-only when it clears 1.0x by more than that cell's warm spread, so one noisy
-cell cannot move a floor.  Where the crossover falls between two ladder cells,
-the floor takes the CONSERVATIVE end -- the larger cell.
+ADMITTED count, not against n=1 unconditionally: parallel n=4 must beat n=2.
+The admitted set is read off the CURRENT table, so the comparison count can
+change between refreshes -- cone n=4 was measured against n=1 while cone n=2
+had no admission size, and the 2026-08-10 refresh that gave cone n=2 a floor
+makes the next cone n=4 refresh compare against n=2.  A win counts only when
+it clears 1.0x by more than that cell's warm spread, so one noisy cell cannot
+move a floor.  Where the crossover falls between two ladder cells, the floor
+takes the CONSERVATIVE end -- the larger cell.
 
-THE CELLS.  For a finite floor: the ladder cells bracketing it -- one below,
-the floor's own, one above.  For a SENTINEL: the 512-, 768- and 1024-class
-cells, hunting the admission point that has never been found.  A sentinel
-TRIPS when its count clears 1.0x by more than the measured spread, and the
-trip prints a proposed finite floor.  Sizes above a row's ``largest_tested``
-are not probed here and are reported as still unprobed.
+WHICH CELLS RUN.  For a finite floor: the ladder cells bracketing it -- one
+below, the floor's own, one above.  For a sentinel: the 512-, 768- and
+1024-class cells, looking for the admission size that has never been found.
+A sentinel becomes a finite floor when its count clears 1.0x by more than the
+measured spread, and the script prints the proposed floor.  Sizes above a
+row's ``largest_tested`` are not measured here and are reported as such.
 
 Run:
     python dev_scripts/refresh_widening_floors.py            # a 4-GPU node
     python dev_scripts/refresh_widening_floors.py --plan     # arms, then exit
     python dev_scripts/refresh_widening_floors.py --smoke    # tiny, CPU, fast
     python dev_scripts/refresh_widening_floors.py --bless    # hashes only
-    python dev_scripts/refresh_widening_floors.py --bless --accept-stale
 
 ``--plan``, ``--smoke`` and ``--bless`` need no GPU.  The real run needs CUDA
-and takes roughly 30-60 minutes.
+and takes roughly 30-60 minutes.  ``--accept-stale`` is accepted and does
+nothing: acknowledging by hand that a re-measurement is owed is what the
+automatic detection replaced.
 
 Environment:
     REFRESH_PYTHON      interpreter for the arm subprocesses (default: this one)
@@ -76,11 +94,12 @@ ITERATIONS = int(os.environ.get('REFRESH_ITERATIONS', '3'))
 WARM_REPEATS = int(os.environ.get('REFRESH_REPEATS', '3'))
 SEED = 13
 
-#: The size ladder, one geometric family, largest last.  A floor is always one
-#: of these sizes, so a refresh reports a floor by naming a cell.
+#: The sizes every refresh measures at, roughly geometric, largest last.  A
+#: floor is always one of these sizes, so a refresh reports a floor by naming
+#: a cell.
 LADDER = [(128, 112, 96), (192, 168, 144), (256, 224, 192), (384, 336, 288),
           (512, 448, 384), (768, 672, 576), (1024, 1008, 992)]
-#: The cells a sentinel row is probed at.
+#: The cells a sentinel row is measured at.
 SENTINEL_PROBES = [(512, 448, 384), (768, 672, 576), (1024, 1008, 992)]
 #: Tiny stand-ins so --smoke exercises every path in seconds on a CPU.
 SMOKE_LADDER = [(8, 12, 16), (12, 12, 16), (16, 12, 16)]
@@ -101,9 +120,10 @@ def cell_named(target_elements, ladder):
 def comparison_count(family, count):
     """The best smaller ADMITTED count -- what ``count`` has to beat.
 
-    Read off the table rather than assumed, which is what makes cone n=4
-    compare against n=1: cone n=2 is a sentinel, so it is never admitted and
-    is never the count n=4 has to overtake.
+    Read off the table rather than assumed.  A sentinel row is never
+    admitted, so it is never the count a wider one has to overtake; a row
+    that gains a finite floor joins the comparison at the next refresh, as
+    cone n=2 did on 2026-08-10.
     """
     for n in range(count - 1, 1, -1):
         row = wf.FLOORS.get((family, n))
@@ -185,9 +205,9 @@ def print_plan(plan, smoke):
     for (family, count) in sorted({(r['family'], r['count']) for r in plan}):
         floor = wf.FLOORS[(family, count)]
         if floor.elements is None:
-            print('  NOTE {} n={}: SENTINEL.  Probed at the {} cells above; '
-                  'sizes above largest_tested ({:,} sinogram elements) are '
-                  'NOT probed by this plan and remain unprobed.'.format(
+            print('  NOTE {} n={}: SENTINEL.  Measured at the {} cells '
+                  'above; sizes above largest_tested ({:,} sinogram '
+                  'elements) are NOT measured by this plan.'.format(
                       family, count, len(SENTINEL_PROBES),
                       floor.largest_tested))
         elif floor.elements >= top:
@@ -390,8 +410,8 @@ def speedup(measured, family, cell, count, against):
 
 
 def verdict(plan, measured):
-    """Per table row: the per-cell speedups, and the crossover the floor_4
-    rule reads off them.
+    """Per table row: the per-cell speedups, and the floor the crossover
+    rule above reads off them.
 
     A win counts only when it clears 1.0x by MORE than that cell's warm
     spread, which is what keeps one noisy cell from moving a floor.
@@ -425,19 +445,19 @@ def print_verdict(verdicts):
             print('  {:>20} {:>16,}   {:.3f}x  spread {:.1%}   {}'.format(
                 str(cell), elements(cell), ratio, spread,
                 'WINS' if wins else 'loses'))
-        probed = max(elements(c) for c, _r, _s, _w in record['rows'])
+        largest = max(elements(c) for c, _r, _s, _w in record['rows'])
         winner = record['winner']
         proposed = elements(winner) if winner else None
         if winner is None and floor.elements is None:
-            print('  no admission point in these cells -> the row stays a '
-                  'SENTINEL; sizes above {:,} sinogram elements remain '
-                  'unprobed.'.format(probed))
+            print('  no admission size in these cells -> the row stays a '
+                  'SENTINEL; sizes above {:,} sinogram elements are still '
+                  'unmeasured.'.format(largest))
         elif winner is None:
-            print('  NOTHING WON: the floor is above every cell probed '
+            print('  NOTHING WON: the floor is above every cell measured '
                   '({:,} sinogram elements).  Re-run with a larger ladder; '
-                  'this run cannot place a floor.'.format(probed))
+                  'this run cannot place a floor.'.format(largest))
         elif floor.elements is None:
-            print('  SENTINEL TRIPPED: n={} clears 1.0x by more than its '
+            print('  SENTINEL CLEARED: n={} beats 1.0x by more than its '
                   'spread at {}.  Proposed finite floor: {:,} sinogram '
                   'elements.'.format(count, winner, proposed))
         elif proposed != floor.elements:
@@ -486,7 +506,8 @@ def print_table(verdicts, commit):
             spread=max([s for _c, _r, s, _w in rows if s is not None] or [0.0]),
             today=today, commit=commit,
             # THIS run's largest cell, never the old row's: claiming a size
-            # this refresh did not probe is the lie the field exists to stop.
+            # this refresh never measured is the false claim the field exists
+            # to prevent.
             largest='{:_}'.format(max(elements(c)
                                       for c, _r, _s, _w in rows))))
     print('}')
@@ -506,22 +527,30 @@ def head_commit():
         return 'unknown'
 
 
-def do_bless(accept_stale):
+def do_bless():
+    """``--bless``: print fresh values for the three bound constants."""
     stale = wf.stale_cost_inputs()
-    print('projection-cost inputs that moved since the last bless: {}'.format(
-        ', '.join(name for name, _w, _g in stale) or 'none'))
-    if accept_stale:
-        stamp = datetime.date.today().isoformat()
-        print('\n--accept-stale: re-blessing the hashes WITHOUT re-measuring.')
-        print('The floors keep their old numbers and are stamped stale; every')
-        print('automatic device selection will log that debt until a real')
-        print('refresh replaces them.\n')
-    else:
-        stamp = None
-        print('\nRe-blessing after a measurement run.  If you have NOT just')
-        print('re-measured, use --bless --accept-stale instead, which records')
-        print('the debt rather than hiding it.\n')
-    print(wf.bless_lines(stale_since=stamp))
+    print('projection-cost inputs that moved since the hashes were last '
+          'recorded: {}'.format(
+              ', '.join(name for name, _w, _g in stale) or 'none'))
+    print('\nRecording the current hashes after a measurement run.  If you')
+    print('have NOT just re-measured, doing this hides a real change from')
+    print('the automatic staleness note; leave the old hashes in place')
+    print('instead and let the note stand until the floors are')
+    print('re-measured.\n')
+    print(wf.bless_lines(stale_since=None))
+    return 0
+
+
+def do_accept_stale():
+    """``--accept-stale``, kept parseable and made a no-op.
+
+    It used to stamp STALE_SINCE so the test would go green.  The test no
+    longer goes red over drift and the note no longer needs a stamp, so the
+    flag has nothing left to do.
+    """
+    print('--accept-stale: no longer needed -- drift is detected and logged '
+          'automatically; run a real refresh to clear the note.')
     return 0
 
 
@@ -534,17 +563,22 @@ def main(argv=None):
                         help='run tiny CPU cells end to end to prove the '
                              'plumbing (no GPU needed)')
     parser.add_argument('--bless', action='store_true',
-                        help='recompute and print the bound hash constants '
+                        help='recompute and print the three bound constants, '
+                             'recording the current cost-input hashes '
                              '(no GPU needed)')
     parser.add_argument('--accept-stale', action='store_true',
-                        help='with --bless: re-bless without re-measuring and '
-                             'stamp the floors stale')
+                        help='accepted and ignored: staleness is detected and '
+                             'logged automatically, so there is nothing to '
+                             'acknowledge by hand')
     args = parser.parse_args(argv)
 
-    if args.bless:
-        return do_bless(args.accept_stale)
+    # Checked before --bless: the pair used to mean "record the hashes
+    # without measuring", and someone typing it from memory should be told it
+    # is unnecessary rather than quietly re-record the hashes for real.
     if args.accept_stale:
-        parser.error('--accept-stale only means something with --bless')
+        return do_accept_stale()
+    if args.bless:
+        return do_bless()
 
     plan = build_plan(smoke=args.smoke)
     if args.plan:

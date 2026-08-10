@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import h5py
 import mbirtorch as mt
 from mbirtorch import _sharding
+from mbirtorch import _memory_ledger
 import scipy
 
 from . import pipeline
@@ -425,13 +426,24 @@ def scan_to_sino(obj_scan, blank_scan, dark_scan, defective_pixel_array=(),
         det_rotation (float): detector rotation in radians; 0 skips the rotation.
         batch_size (int): number of views per on-device batch.
         devices (sequence or None): devices to spread the views over.  None (default) uses all
-            visible CUDA devices, or the default device when there are none.
+            visible CUDA devices, capped by ``MBIRTORCH_NUM_DEVICES`` when that is set, or the
+            default device when there are none.
 
     Returns:
         numpy.ndarray: the sinogram, shape (num_views, num_det_rows, num_det_channels).
     """
     if devices is None:
         n = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        # The environment pin is process-wide: it is how a suite or a nightly
+        # fixes the device count so results, memory, and float trajectories do
+        # not depend on the host.  Preprocessing chooses its own default count
+        # (all visible devices, the mbirjax rule), but a pin the caller set is
+        # still the caller's, so it caps that default here.  This is only the
+        # pin; the broader question of what rule preprocessing should follow is
+        # an open entry-point item, deliberately not answered here.
+        pinned = _memory_ledger.pinned_device_count()
+        if pinned is not None:
+            n = min(n, pinned)
         devices = [f'cuda:{i}' for i in range(n)] if n > 0 else None
     obj_flat_indices = new_size1 = new_size2 = block_shape = None
     do_downsample = downsample_factor[0] * downsample_factor[1] > 1

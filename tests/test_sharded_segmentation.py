@@ -1,7 +1,12 @@
 """Gate for the sharded path of segment_plastic_metal: run the same volume
 through the function whole and split into shards, and require the same
-answer.  Identical is the right bar: the histogram counts are integers, so
-the thresholds match exactly, and the masks are pure thresholding.
+answer.  Identical is the right bar for THIS volume: the counts are exact
+integers and the masks are pure thresholding, so a threshold moves only if
+the sharded binning displaces a count across the boundary the DP picks.  That
+is a measured expectation, not a guarantee -- the device-side binning is
+float32 and truncating where numpy's is float64 with an edge-correction pass
+(see _sharded_masked_histogram) -- so a future volume that trips it is a
+tolerance question, not a bug in this gate.
 """
 
 import numpy as np
@@ -84,6 +89,86 @@ def test_export_recon_hdf5_accepts_shards(tmp_path):
     out, _ = mbirtorch.load_data_hdf5(out_path)
     assert out.shape == ref.shape          # padding cropped: 12 -> 11 slices
     assert np.array_equal(out, ref)
+
+
+def test_save_data_hdf5_writes_shards_without_gathering_first(tmp_path):
+    """save_data_hdf5 takes a Shards directly and writes exactly what
+    gathering first would have written -- same shape, dtype and content."""
+    import os
+    vol = _test_volume()
+    shards, _mask, _nreal = _as_shards(vol, 2)
+
+    ref_path = os.path.join(str(tmp_path), 'ref_save.h5')
+    out_path = os.path.join(str(tmp_path), 'sharded_save.h5')
+    mbirtorch.save_data_hdf5(ref_path, vol, 'recon')
+    mbirtorch.save_data_hdf5(out_path, shards, 'recon')
+
+    ref, _ = mbirtorch.load_data_hdf5(ref_path)
+    out, _ = mbirtorch.load_data_hdf5(out_path)
+    assert out.shape == ref.shape == vol.shape   # padding cropped: 12 -> 11
+    assert out.dtype == ref.dtype
+    assert np.array_equal(out, ref)
+
+
+def _view_sharded(vol, n_shards):
+    """The other sharded axis: split axis 0 (a sino-like placement) with the
+    engine's zero padding."""
+    placement = _sharding.Placement(['cpu'] * n_shards, axis=0,
+                                    real_size=vol.shape[0])
+    padded = np.zeros((placement.padded_size,) + vol.shape[1:], dtype=vol.dtype)
+    padded[:vol.shape[0]] = vol
+    tensors = [torch.as_tensor(padded[s0:s1])
+               for _dev, (s0, s1) in placement.shard_ranges(placement.padded_size)]
+    return _sharding.Shards(tensors, placement)
+
+
+@pytest.mark.parametrize('shard_axis', [-1, 0])
+def test_sharded_slab_source_matches_a_full_gather_at_every_boundary(shard_axis):
+    """The streaming source is what makes the sharded export hold one slab
+    instead of the whole volume, so its slab arithmetic is gated directly:
+    every slab of every width must equal the gathered array's rows.
+
+    Both branches are covered -- a slab crosses shards when the sharded axis
+    IS the slab axis, and draws from all of them when it is not.
+    """
+    from mbirtorch.utilities import _sharded_slab_source, _to_host
+
+    rng = np.random.default_rng(19)
+    vol = rng.uniform(size=(7, 4, 5)).astype(np.float32)
+    shards = (_view_sharded(vol, 2) if shard_axis == 0
+              else _as_shards(vol, 2)[0])
+
+    out_shape, dtype, produce_slab = _sharded_slab_source(shards)
+    ref = _to_host(shards)
+    assert out_shape == ref.shape
+    assert dtype == ref.dtype
+    assert np.array_equal(ref, vol)          # the padding really is cropped
+
+    for i0 in range(out_shape[0]):
+        for i1 in range(i0 + 1, out_shape[0] + 1):
+            slab = produce_slab(i0, i1)
+            assert np.array_equal(slab, ref[i0:i1]), (i0, i1)
+
+
+def test_degenerate_sharded_histogram_raises():
+    """A constant volume has no classes to separate.  numpy EXPANDS a
+    zero-width range when it derives the edges, so binning it here would put
+    every count in bin 0 against edges centered elsewhere -- counts and edges
+    describing different partitions, and thresholds quietly wrong.  Stopping
+    with the range named is the honest failure."""
+    flat = np.full((8, 8, 11), 0.3, dtype=np.float32)
+    shards, valid_mask, _nreal = _as_shards(flat, 2)
+    with pytest.raises(ValueError, match='degenerate range'):
+        mtp.multi_threshold_otsu(shards, classes=3, valid_mask=valid_mask)
+
+
+def test_all_padding_sharded_histogram_raises():
+    """Nothing valid to histogram is its own error, not a degenerate range."""
+    vol = _test_volume()
+    shards, valid_mask, _nreal = _as_shards(vol, 2)
+    with pytest.raises(ValueError, match='no valid entries'):
+        mtp.multi_threshold_otsu(shards, classes=3,
+                                 valid_mask=np.zeros_like(valid_mask))
 
 
 def _small_mar_case(devices):

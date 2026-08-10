@@ -12,8 +12,9 @@ whole sweep deterministic.
 Two paths, as in mbirjax: on one device the whole sweep runs through the
 compiled in-place update below; across several devices the image is
 slice-sharded and the sweep runs shard by shard, with the qGGMRF halos
-staged once per pass and the four line-search sums combined on the host
-into one step size.
+staged once per pass and the four line-search sums combined on the lead
+device into one step size.  Both paths keep the line search on device, so
+neither forces a host synchronization per subset.
 """
 
 import datetime
@@ -324,14 +325,34 @@ class QGGMRFDenoiser(TomographyModel):
 
         Mirrors vcd_recon's sharded path: the qGGMRF halos are staged once
         per pass, each device computes its shard's prior and identity-forward
-        terms, and the four line-search sums combine on the host into one
-        step size (the same formula as vcd_subset_denoiser).
+        terms, and the four line-search sums combine ON THE LEAD DEVICE into
+        one step size (the same formula as vcd_subset_denoiser).
+
+        The line search stays on device for the reason vcd_recon states at
+        its own combine: alpha is a scalar tensor, so no host synchronization
+        is forced per subset.  Reading the four sums back as Python floats
+        would cost 5 x n_devices device-to-host syncs per subset per pass,
+        from inside worker threads, for a scalar that is only ever consumed
+        on the devices again.  The single-device denoiser already keeps these
+        as tensors (see :func:`vcd_subset_denoiser`), so this also puts the
+        two paths on the same float32 arithmetic; the host syncs that remain
+        are one per PASS, for the convergence test and the logged history.
 
         Returns (flat_image shards, nmae history, alpha history, num_iters).
         """
         devices = image_sh.placement.devices
         n = len(devices)
         pl = image_sh.placement
+        dev0 = devices[0]
+
+        def combine_on_lead(parts):
+            """Sum per-shard 0-d tensor partials on the lead device: the
+            identity on one device, scalar-sized device moves otherwise."""
+            total = parts[0]
+            for part in parts[1:]:
+                total = total + _sharding.move_shard(part, dev0,
+                                                     self.dev2dev_safe)
+            return total
 
         # Flat (num_pixels, local_slices) shards; residual = image - init.
         flat_image = _sharding.Shards(
@@ -352,63 +373,89 @@ class QGGMRFDenoiser(TomographyModel):
         nmae_update = np.zeros(max_iters)
         alpha_values = np.zeros(max_iters)
         num_iters = 0
-        with torch.no_grad():
-            for i in range(max_iters):
-                # Halos once per pass, as in mbirjax's sharded denoiser.
-                halos['left'], halos['right'] = _sharding.exchange_qggmrf_halos(
-                    flat_image, self.dev2dev_safe)
-                ell1_accum = 0.0
-                alpha_accum = 0.0
-                for k in range(partition.shape[0]):
-                    idx = idx_per_dev[k]
+        # ONE per-device thread pool for the whole sweep, as vcd_recon keeps
+        # for its loop: the two fan-outs per subset reuse it instead of
+        # building and tearing down a private pool each time.  A caller that
+        # already installed one (a reconstruction driving the denoiser) keeps
+        # its own; n == 1 never needs one, since run_per_device short-circuits
+        # to a direct call there.
+        owns_pool = n > 1 and self._per_device_pool is None
+        if owns_pool:
+            self._per_device_pool = _sharding.device_pool(n)
+        try:
+            with torch.no_grad():
+                for i in range(max_iters):
+                    # Halos once per pass, as in mbirjax's sharded denoiser.
+                    halos['left'], halos['right'] = _sharding.exchange_qggmrf_halos(
+                        flat_image, self.dev2dev_safe)
+                    ell1_accum = 0.0
+                    alpha_accum = 0.0
+                    for k in range(partition.shape[0]):
+                        idx = idx_per_dev[k]
 
-                    def terms_worker(j, dev):
-                        grad, hess = grad_hess[j](
-                            flat_image.tensors[j], image_shape, idx[j],
-                            qggmrf_params, left_halo=halos['left'][j],
-                            right_halo=halos['right'][j],
-                            interface_mask=(None if interface_masks is None
-                                            else interface_masks[j]))
-                        cur_error = flat_error.tensors[j][idx[j]]
-                        forward_grad = -fm_constant * cur_error
-                        delta = -((forward_grad + grad) / (1.0 + hess))
-                        return (delta,
-                                float(torch.sum(grad * delta)),
-                                float(torch.sum(hess * delta ** 2)),
-                                float(fm_constant * torch.sum(cur_error * delta)),
-                                float(fm_constant * torch.sum(delta * delta)))
+                        def terms_worker(j, dev):
+                            grad, hess = grad_hess[j](
+                                flat_image.tensors[j], image_shape, idx[j],
+                                qggmrf_params, left_halo=halos['left'][j],
+                                right_halo=halos['right'][j],
+                                interface_mask=(None if interface_masks is None
+                                                else interface_masks[j]))
+                            cur_error = flat_error.tensors[j][idx[j]]
+                            forward_grad = -fm_constant * cur_error
+                            delta = -((forward_grad + grad) / (1.0 + hess))
+                            # 0-d tensors, not floats: they combine on the lead
+                            # device below and are consumed back on the devices.
+                            return (delta,
+                                    torch.sum(grad * delta),
+                                    torch.sum(hess * delta ** 2),
+                                    fm_constant * torch.sum(cur_error * delta),
+                                    fm_constant * torch.sum(delta * delta))
 
-                    results = _sharding.run_per_device(devices, terms_worker)
-                    deltas = [r[0] for r in results]
-                    prior_linear = sum(r[1] for r in results)
-                    prior_quadratic = sum(r[2] for r in results)
-                    forward_linear = sum(r[3] for r in results)
-                    forward_quadratic = sum(r[4] for r in results)
-                    alpha = ((forward_linear - prior_linear)
-                             / (forward_quadratic + prior_quadratic + _F32_EPS))
-                    alpha = min(max(alpha, _F32_EPS), 1.5)
+                        results = _sharding.run_per_device(
+                            devices, terms_worker, executor=self._per_device_pool)
+                        deltas = [r[0] for r in results]
+                        prior_linear = combine_on_lead([r[1] for r in results])
+                        prior_quadratic = combine_on_lead([r[2] for r in results])
+                        forward_linear = combine_on_lead([r[3] for r in results])
+                        forward_quadratic = combine_on_lead([r[4] for r in results])
+                        alpha = ((forward_linear - prior_linear)
+                                 / (forward_quadratic + prior_quadratic + _F32_EPS))
+                        alpha = torch.clamp(alpha, _F32_EPS, 1.5)
+                        # The step size is a scalar tensor on the lead device,
+                        # so each shard needs its own copy to scale its delta.
+                        alpha_per_device = (
+                            [alpha] if n == 1 else
+                            [_sharding.move_shard(alpha, dev, self.dev2dev_safe)
+                             for dev in devices])
 
-                    def apply_worker(j, dev):
-                        step = alpha * deltas[j]
-                        flat_image.tensors[j].index_add_(0, idx[j], step)
-                        flat_error.tensors[j].index_add_(0, idx[j], -step)
-                        return float(torch.sum(torch.abs(step)))
+                        def apply_worker(j, dev):
+                            step = alpha_per_device[j] * deltas[j]
+                            flat_image.tensors[j].index_add_(0, idx[j], step)
+                            flat_error.tensors[j].index_add_(0, idx[j], -step)
+                            return torch.sum(torch.abs(step))
 
-                    ell1_parts = _sharding.run_per_device(devices, apply_worker)
-                    ell1_accum += sum(ell1_parts)
-                    alpha_accum += alpha
+                        ell1_parts = _sharding.run_per_device(
+                            devices, apply_worker, executor=self._per_device_pool)
+                        ell1_accum = ell1_accum + combine_on_lead(ell1_parts)
+                        alpha_accum = alpha_accum + alpha
 
-                image_l1 = sum(float(torch.sum(torch.abs(t)))
-                               for t in flat_image.tensors)
-                nmae = ell1_accum / image_l1
-                nmae_update[i] = nmae
-                alpha_values[i] = alpha_accum / partition.shape[0]
-                num_iters += 1
-                if verbose >= 1 and (i % 5) == 0:
-                    self.logger.info('After iteration {} of a max of {}: Pct change={:.4f}'
-                                     .format(i + first_iteration, max_iters, 100 * nmae))
-                if nmae < stop_thresh:
-                    break
+                    # The one host synchronization per pass: the convergence
+                    # test and the two logged histories need Python numbers.
+                    image_l1 = combine_on_lead([torch.sum(torch.abs(t))
+                                                for t in flat_image.tensors])
+                    nmae = float(ell1_accum) / float(image_l1)
+                    nmae_update[i] = nmae
+                    alpha_values[i] = float(alpha_accum) / partition.shape[0]
+                    num_iters += 1
+                    if verbose >= 1 and (i % 5) == 0:
+                        self.logger.info('After iteration {} of a max of {}: Pct change={:.4f}'
+                                         .format(i + first_iteration, max_iters, 100 * nmae))
+                    if nmae < stop_thresh:
+                        break
+        finally:
+            if owns_pool:
+                self._per_device_pool.shutdown(wait=True)
+                self._per_device_pool = None
         return flat_image, nmae_update, alpha_values, num_iters
 
 
