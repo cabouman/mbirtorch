@@ -71,8 +71,8 @@ def test_denoise_reduces_noise(device):
 def test_sharded_denoise_matches_single_device():
     """Two CPU shards vs one device on the same seeded problem.  The sharded
     path stages halos once per pass and combines the step-size sums on the
-    host, so agreement is at float level, not bitwise (gate per the measured
-    iterated-comparison floor)."""
+    lead device, so agreement is at float level, not bitwise (gate per the
+    measured iterated-comparison floor)."""
     shape = (24, 24, 21)   # 2 shards pad the slice axis 21 -> 22
     clean = np.zeros(shape, dtype=np.float32)
     clean[6:-6, 6:-6, 5:-5] = 1.0

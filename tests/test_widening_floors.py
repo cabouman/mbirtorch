@@ -1,4 +1,5 @@
-"""The widening speed floors, their invariants, and their staleness report.
+"""The widening speed floors, their invariants, their staleness report, and
+the refresh tool's report of which geometries still need measuring.
 
 The floors are a MEASUREMENT of where each device count starts paying for
 itself, and a measurement is only as good as the code it was taken against.
@@ -20,11 +21,35 @@ Two things still fail HARD, because neither is merely work to schedule:
 The selection RULE these numbers feed is tested in test_device_policy.py.
 """
 
+import importlib.util
+import os
 import warnings
+
+import pytest
 
 from mbirtorch import _widening_floors as wf
 
 REFRESH = 'python dev_scripts/refresh_widening_floors.py'
+REFRESH_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    'dev_scripts', 'refresh_widening_floors.py')
+
+
+@pytest.fixture(scope='module')
+def refresh_tool():
+    """The refresh script, loaded from its path.
+
+    dev_scripts is not an installed package, so the tool is loaded by file
+    rather than imported by name.  Only its reporting helpers are exercised
+    here; nothing in this file measures anything or starts a subprocess.
+    """
+    if not os.path.exists(REFRESH_PATH):
+        pytest.skip('dev_scripts/refresh_widening_floors.py is not present')
+    spec = importlib.util.spec_from_file_location('refresh_widening_floors',
+                                                  REFRESH_PATH)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def install_a_table_with_a_sentinel(monkeypatch):
@@ -331,6 +356,94 @@ def test_the_fallback_note_says_capacity_overrode_speed(monkeypatch):
 def test_sinogram_elements_is_the_product_of_the_shape():
     assert wf.sinogram_elements((512, 448, 384)) == 88_080_384
     assert wf.sinogram_elements((1024, 1008, 992)) == 1_023_934_464
+
+
+# ── the refresh tool's "needs measurement" report ────────────────────────────
+def test_the_refresh_tool_reports_the_geometries_that_take_the_fallback(
+        refresh_tool):
+    """The one tool whose job is to say "this geometry needs measurement"
+    must not be silent about the geometries that actually need it.
+
+    A class that declares no floor family is governed by the DEFAULT_FAMILY
+    floors, which were measured on a different geometry.  That is the state
+    every newly ported geometry arrives in, so it is reported under the None
+    key rather than skipped for having nothing declared.
+    """
+    import mbirtorch
+
+    missing = refresh_tool.unmeasured_families()
+    assert None in missing, (
+        'the classes that declare no floor family are the ones taking the '
+        'substituted floors, and they are what this report is for')
+    undeclared = missing[None]
+    assert 'TranslationModel' in undeclared
+    assert 'MultiAxisParallelModel' in undeclared
+
+    # Every reported class really does inherit the base value rather than
+    # naming a family of its own, so the report matches the code it describes.
+    for name in undeclared:
+        assert getattr(mbirtorch, name)._floor_family is None
+
+
+def test_the_report_covers_every_geometry_that_reaches_the_device_decision(
+        refresh_tool):
+    """The report is scoped to classes a floor can actually govern.
+
+    A floor is consulted when a model chooses its own device count, which
+    happens on the shared reconstruction path.  The base class is not a
+    geometry and QGGMRFDenoiser refuses recon, so neither can reach that
+    decision and neither is work to measure.  An exported alias is the same
+    class object as the class it aliases, so it must not be counted twice.
+    """
+    reported = {name for names in refresh_tool.unmeasured_families().values()
+                for name in names}
+    assert 'TomographyModel' not in reported
+    assert 'QGGMRFDenoiser' not in reported
+    # MultiAxisParallelBeamModel is an alias of MultiAxisParallelModel; the
+    # class is reported once, under its own name.
+    assert 'MultiAxisParallelBeamModel' not in reported
+    # The two measured families are governed by their own rows, so they are
+    # not outstanding work.
+    assert 'ParallelBeamModel' not in reported
+    assert 'ConeBeamModel' not in reported
+
+
+def test_a_declared_family_with_no_rows_is_still_reported_under_its_name(
+        refresh_tool, monkeypatch):
+    """The other way to arrive unmeasured: name a family the table has never
+    heard of.  Widening the report to undeclared classes must not drop the
+    case it already handled, so both keys are exercised here."""
+    monkeypatch.setattr(refresh_tool.wf, 'FLOORS',
+                        {key: value for key, value in wf.FLOORS.items()
+                         if key[0] != 'parallel'})
+
+    missing = refresh_tool.unmeasured_families()
+    assert missing.get('parallel') == ['ParallelBeamModel']
+    assert 'TranslationModel' in missing[None]
+
+
+def test_the_printed_report_names_the_class_and_the_floors_it_borrows(
+        refresh_tool, capsys):
+    """Reading the report has to be enough: it names which class is
+    unmeasured and which family's floors are standing in for it, so nobody
+    has to go read the fallback rule to find out what is governing."""
+    refresh_tool.print_plan(refresh_tool.build_plan(smoke=True), smoke=True)
+
+    printed = capsys.readouterr().out
+    assert 'NEEDS MEASUREMENT' in printed
+    assert 'TranslationModel' in printed
+    assert 'MultiAxisParallelModel' in printed
+    assert wf.DEFAULT_FAMILY in printed
+
+
+def test_the_refresh_tool_refuses_to_measure_a_family_it_cannot_build(
+        refresh_tool):
+    """The report above invites someone to declare a new floor family.  The
+    builder must then refuse the family it has no geometry for: falling
+    through to parallel beam would time parallel beam and record the numbers
+    under the new family's name."""
+    with pytest.raises(ValueError, match='cannot build a model for floor family'):
+        refresh_tool._build_model('translation', (8, 12, 16), 'cpu')
 
 
 # ── the env knob ─────────────────────────────────────────────────────────────

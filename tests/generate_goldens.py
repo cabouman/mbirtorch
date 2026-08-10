@@ -8,6 +8,17 @@ Run in the mbirjax conda env:
 Writes tests/goldens/golden_<cell>.npz (gitignored; regenerate at will).  The
 recorded jax version is the frozen comparison baseline (0.10.1).
 
+WHERE THE GOLDENS COME FROM ON ANOTHER MACHINE.  tests/goldens/ is gitignored,
+so nothing ships them: a fresh checkout has no archive, and every parity test
+in tests/ skips itself with a message naming this script.  A run that is meant to
+ENFORCE parity -- a nightly, or a release check -- has to run this script in
+the mbirjax env FIRST and then run the suite with RUN_GOLDENS=1 (see
+dev_scripts/run_tests.sh), because a run that SKIPS these tests reports the
+same "passed" as a run that gates them.  An archive generated before a
+geometry was added is missing that geometry's keys, so its tests skip while
+the rest still pass; regenerating after anything is added here is part of the
+same step.
+
 Contents per cell: the shepp-logan phantom, its sinogram, transmission-root
 weights, sparse fwd/back outputs on a fixed subset, the qGGMRF gradient and
 Hessian on that subset, the Hessian diagonal, the FBP recon, the auto-set

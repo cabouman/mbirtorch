@@ -1,10 +1,16 @@
-"""Gates for get_ct_model and the demo-data generators.
+"""Gates for the two public model-construction helpers -- get_ct_model and
+copy_ct_model -- and the demo-data generators.
 
 The reference phantom shares its numpy code with mbirjax, so it gates on
 exact equality.  The demo sinograms have the projectors in the loop, so
 they gate at the projector tolerance with a small allowance for phantom
 voxels that sit exactly on an ellipsoid boundary.  get_ct_model gates on
 class and recon shape against the mbirjax golden.
+
+Both helpers accept four geometries, and each geometry names its per-view
+parameters differently, so the tests at the end of this file gate every
+geometry through both helpers rather than assuming the angle-based form
+carries over.
 """
 
 import os
@@ -155,3 +161,152 @@ def test_gen_translation_vectors_grid():
     assert np.allclose(vecs[:, 1], 0.0)                       # no y motion
     assert np.allclose(sorted(set(vecs[:, 0])), [-10.0, 0.0, 10.0])
     assert np.allclose(sorted(set(vecs[:, 2])), [-2.5, 2.5])
+
+
+# ── the two helpers across all four geometries ───────────────────────────────
+MA_CELL = (16, 24, 20)
+TCT_DETS = (40, 32)
+
+
+def _multiaxis_angles(num_views=MA_CELL[0]):
+    """(azimuth, elevation) pairs -- multiaxis's angles are a (num_views, 2)
+    array, not the 1D vector parallel and cone take."""
+    azimuth = np.linspace(0, np.pi, num_views, endpoint=False)
+    elevation = np.linspace(-0.5, 0.5, num_views)
+    return np.stack([azimuth, elevation], axis=1)
+
+
+def _multiaxis_model():
+    model = mbirtorch.MultiAxisParallelModel(MA_CELL, _multiaxis_angles())
+    model.set_params(no_warning=True, verbose=0)
+    return model
+
+
+def _translation_model():
+    vectors = mbirtorch.gen_translation_vectors(4, 4, x_spacing=3.0, z_spacing=2.0)
+    model = mbirtorch.TranslationModel((vectors.shape[0],) + TCT_DETS, vectors,
+                                       source_detector_dist=128.0, source_iso_dist=32.0)
+    model.set_params(no_warning=True, verbose=0)
+    return model
+
+
+@pytest.mark.parametrize("make_model,view_key", [
+    (_multiaxis_model, 'angles'),
+    (_translation_model, 'translation_vectors'),
+], ids=["multiaxis", "translation"])
+def test_copy_ct_model_with_no_changes_reproduces_the_model(make_model, view_key):
+    """The copy is the same reconstruction, not merely the same class.
+
+    The per-view array is gated EXACTLY, because carrying it through
+    get_all_params and build_model unchanged is the whole job here: an array
+    dropped, reshaped or read under the wrong key shows up as an inexact
+    round trip rather than as a different repr.
+
+    The sinogram is gated at float level instead.  Two separately built
+    models sum their views in their own order, so a copy of an unchanged
+    PARALLEL or CONE model already differs from its original by 5e-8 to
+    1.3e-7 on this phantom; multiaxis measures 6.8e-8 and translation 0.
+    Bitwise is therefore the wrong bar for every geometry, not just the new
+    ones, and 1e-5 leaves roughly two orders of headroom over the largest
+    measured difference.
+    """
+    model = make_model()
+    copy = mbirtorch.copy_ct_model(model)
+
+    assert type(copy) is type(model)
+    assert tuple(copy.get_params('sinogram_shape')) == tuple(model.get_params('sinogram_shape'))
+    assert tuple(copy.get_params('recon_shape')) == tuple(model.get_params('recon_shape'))
+    assert np.array_equal(np.asarray(copy.get_params(view_key)),
+                          np.asarray(model.get_params(view_key)))
+
+    recon_shape = tuple(model.get_params('recon_shape'))
+    phantom = mbirtorch.gen_translation_phantom(recon_shape, 'dots', None, fill_rate=0.05)
+    err = _rel_max(copy.forward_project(phantom), model.forward_project(phantom))
+    print(f"copy_ct_model forward rel_max = {err:.2e}")
+    assert err < 1e-5
+
+
+def test_copy_ct_model_multiaxis_takes_new_angles_and_detector_rows():
+    """Multiaxis reaches copy_ct_model through the angles key like parallel
+    and cone; the only difference is that each entry is a pair, so the view
+    count is the number of ROWS of the array."""
+    model = _multiaxis_model()
+
+    fewer_rows = mbirtorch.copy_ct_model(model, new_num_det_rows=12)
+    assert tuple(fewer_rows.get_params('sinogram_shape')) == (MA_CELL[0], 12, MA_CELL[2])
+    assert np.asarray(fewer_rows.get_params('angles')).shape == (MA_CELL[0], 2)
+
+    new_angles = _multiaxis_angles(num_views=8)
+    fewer_views = mbirtorch.copy_ct_model(model, new_angles=new_angles)
+    assert tuple(fewer_views.get_params('sinogram_shape')) == (8,) + MA_CELL[1:]
+    assert np.allclose(np.asarray(fewer_views.get_params('angles')), new_angles)
+
+
+def test_copy_ct_model_translation_takes_new_translation_vectors():
+    """Translation's required parameters carry translation_vectors and no
+    angles at all, so the copy has to read and write that key -- and the
+    source/detector distances have to survive the round trip with it."""
+    model = _translation_model()
+
+    fewer_rows = mbirtorch.copy_ct_model(model, new_num_det_rows=20)
+    assert tuple(fewer_rows.get_params('sinogram_shape')) == (16, 20, TCT_DETS[1])
+    assert np.asarray(fewer_rows.get_params('translation_vectors')).shape == (16, 3)
+    assert float(fewer_rows.get_params('source_detector_dist')) == 128.0
+    assert float(fewer_rows.get_params('source_iso_dist')) == 32.0
+
+    new_vectors = mbirtorch.gen_translation_vectors(3, 3, x_spacing=3.0, z_spacing=2.0)
+    fewer_views = mbirtorch.copy_ct_model(model, new_translation_vectors=new_vectors)
+    assert tuple(fewer_views.get_params('sinogram_shape')) == (9,) + TCT_DETS
+    assert np.allclose(np.asarray(fewer_views.get_params('translation_vectors')), new_vectors)
+
+
+def test_copy_ct_model_rejects_the_per_view_argument_that_does_not_apply():
+    """Silently ignoring the wrong argument would return an unchanged copy
+    and look like success, so each geometry refuses the other's."""
+    with pytest.raises(ValueError, match='translations rather than angles'):
+        mbirtorch.copy_ct_model(_translation_model(), new_angles=np.linspace(0, np.pi, 4))
+    with pytest.raises(ValueError, match='TranslationModel only'):
+        mbirtorch.copy_ct_model(_multiaxis_model(),
+                                new_translation_vectors=np.zeros((4, 3), dtype=np.float32))
+
+
+def test_copy_ct_model_still_rejects_a_class_it_does_not_support():
+    """The refusal names the four supported classes, so a caller learns what
+    to reach for instead of only what failed."""
+    denoiser = mbirtorch.QGGMRFDenoiser((8, 8, 4))
+    with pytest.raises(TypeError, match='MultiAxisParallelModel and TranslationModel'):
+        mbirtorch.copy_ct_model(denoiser)
+
+
+def test_get_ct_model_builds_multiaxis_and_translation():
+    """Both new branches build the class their geometry_type names, with the
+    same reconstruction geometry the constructor would have chosen."""
+    angles = _multiaxis_angles()
+    multiaxis = mbirtorch.get_ct_model('multiaxis', MA_CELL, angles)
+    assert type(multiaxis).__name__ == 'MultiAxisParallelModel'
+    assert tuple(multiaxis.get_params('recon_shape')) == \
+        tuple(_multiaxis_model().get_params('recon_shape'))
+
+    vectors = mbirtorch.gen_translation_vectors(4, 4, x_spacing=3.0, z_spacing=2.0)
+    translation = mbirtorch.get_ct_model('translation', (vectors.shape[0],) + TCT_DETS,
+                                         translation_vectors=vectors,
+                                         source_detector_dist=128.0, source_iso_dist=32.0)
+    assert type(translation).__name__ == 'TranslationModel'
+    assert tuple(translation.get_params('recon_shape')) == \
+        tuple(_translation_model().get_params('recon_shape'))
+
+
+def test_get_ct_model_translation_needs_translation_vectors():
+    """A translation geometry has no angles, so the omission has to be named
+    rather than surfacing as a constructor TypeError about a positional."""
+    with pytest.raises(ValueError, match='needs translation_vectors'):
+        mbirtorch.get_ct_model('translation', (16,) + TCT_DETS,
+                               source_detector_dist=128.0, source_iso_dist=32.0)
+
+
+def test_get_ct_model_warns_on_multiaxis_z_shifts():
+    """Same as parallel: axial shifts are a cone-only mode, and ignoring one
+    silently would drop part of the caller's geometry."""
+    with pytest.warns(UserWarning):
+        mbirtorch.get_ct_model('multiaxis', MA_CELL, _multiaxis_angles(),
+                               helical_z_shifts=np.zeros(MA_CELL[0]))

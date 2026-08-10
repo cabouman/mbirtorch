@@ -163,11 +163,20 @@ def build_plan(smoke=False):
 
 
 def unmeasured_families():
-    """Floor families a model class declares that the table has no rows for.
+    """Model classes whose automatic device count is set by floors that were
+    never measured for them, keyed by the floor family each class declares.
 
-    A geometry added without a measurement silently inherits the parallel
-    floors; this is where that shows up as work to do rather than as a
-    surprise in someone's log.
+    A geometry reaches this state two ways, and both are work to do rather
+    than a surprise in someone's log:
+
+      * it DECLARES a ``_floor_family`` the table has no rows for, keyed here
+        under that name; or
+      * it declares no family at all -- the inherited base value -- and so
+        falls back to the ``wf.DEFAULT_FAMILY`` floors, keyed here under None.
+
+    The second case is the one a newly ported geometry arrives in, and it is
+    the one this function used to skip, which left the tool silent about
+    exactly the classes relying on the fallback.
     """
     import mbirtorch
     from mbirtorch.tomography_model import TomographyModel
@@ -175,12 +184,20 @@ def unmeasured_families():
     seen, known = {}, set(wf.families())
     for name in dir(mbirtorch):
         cls = getattr(mbirtorch, name)
-        family = (getattr(cls, '_floor_family', None)
-                  if isinstance(cls, type)
-                  and issubclass(cls, TomographyModel) else None)
-        if family is not None and family not in known:
-            seen.setdefault(family, []).append(name)
-    return seen
+        if not (isinstance(cls, type) and issubclass(cls, TomographyModel)):
+            continue
+        # The base class is not a geometry, and a subclass that does not
+        # reconstruct through the shared VCD loop never reaches the automatic
+        # device-count decision the floors govern -- QGGMRFDenoiser subclasses
+        # TomographyModel but refuses recon, so no floor ever applies to it.
+        if cls is TomographyModel or cls.recon is not TomographyModel.recon:
+            continue
+        family = getattr(cls, '_floor_family', None)
+        if family is None or family not in known:
+            # An exported alias and its class are the same object, so record
+            # the class's own name once rather than once per exported name.
+            seen.setdefault(family, set()).add(cls.__name__)
+    return {family: sorted(names) for family, names in seen.items()}
 
 
 def print_plan(plan, smoke):
@@ -217,13 +234,21 @@ def print_plan(plan, smoke):
                   'cell.'.format(family, count))
     missing = unmeasured_families()
     if missing:
-        for family, classes in sorted(missing.items()):
-            print('  NEEDS MEASUREMENT: floor family {!r} is declared by {} '
-                  'but has no rows; it currently inherits the {} floors.'
-                  .format(family, ', '.join(sorted(classes)),
-                          wf.DEFAULT_FAMILY))
+        # The None key sorts first: a class that declares no family is taking
+        # the fallback silently, which is the case worth reading first.
+        for family, classes in sorted(
+                missing.items(),
+                key=lambda item: (item[0] is not None, item[0] or '')):
+            if family is None:
+                print('  NEEDS MEASUREMENT: {} declare no floor family, so the '
+                      '{} floors govern their automatic device count.'
+                      .format(', '.join(classes), wf.DEFAULT_FAMILY))
+            else:
+                print('  NEEDS MEASUREMENT: floor family {!r} is declared by {} '
+                      'but has no rows; it currently inherits the {} floors.'
+                      .format(family, ', '.join(classes), wf.DEFAULT_FAMILY))
     else:
-        print('  every declared floor family has rows.')
+        print('  every model class is governed by floors measured for it.')
 
 
 # ── the worker: one arm, one subprocess ──────────────────────────────────────
@@ -238,9 +263,17 @@ def _build_model(family, cell, device):
         model = mbirtorch.ConeBeamModel(
             tuple(cell), angles, source_detector_dist=4.0 * num_channels,
             source_iso_dist=2.0 * num_channels)
-    else:
+    elif family == 'parallel':
         angles = np.linspace(0, np.pi, num_views, endpoint=False)
         model = mbirtorch.ParallelBeamModel(tuple(cell), angles)
+    else:
+        # Falling through to parallel beam here would time parallel beam and
+        # record the result under this family's name, which is the one way a
+        # floor can be wrong without anything looking wrong.
+        raise ValueError(
+            'refresh_widening_floors cannot build a model for floor family '
+            '{!r}.  Add its geometry to _build_model before measuring it.'
+            .format(family))
     if device != 'cuda':
         # CPU/MPS only: the env pin is a CUDA mechanism (the policy
         # short-circuits below two visible devices), so the smoke has to place

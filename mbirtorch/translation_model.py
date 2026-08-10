@@ -17,8 +17,12 @@ mbirjax).
 Known scale limit, recorded at port time: at production TCT detector shapes
 (~1900x3000 panels) the back projection holds (view_batch, P, rows) and
 (view_batch, P, slices) transients, so large pixel batches are memory-bound
-and the view batch shrinks accordingly.  A planned engine change may restore
-pixel batching; no workaround is built here.
+and the view batch shrinks accordingly.  What would relieve it is a change
+to the projector drivers, not to this file: they currently tile over views
+only, and tiling over the pixel axis as well -- the two-axis tiling
+described in projectors.py, which mbirjax's sparse projection drivers do --
+would let the pixel batch shrink instead of the view batch.  Nothing here
+works around its absence.
 """
 
 import warnings
@@ -112,8 +116,9 @@ def _translation_forward_view_batch(values, pixel_indices, view_params_batch,
     slice_start + L); the z geometry stays anchored on the full num_slices
     center and taps outside the band contribute zero.
 
-    ``plan`` is the memoization slot for a future sorted/CSR stream variant;
-    unused today."""
+    ``plan`` is accepted and ignored.  It reserves a place for a future
+    body that would precompute its geometry once and reuse it across
+    calls; nothing reads it today."""
     n_p, centers, W_p_c, weight_scale, pixel_mag = _translation_horizontal_data(
         pixel_indices, view_params_batch, num_recon_rows, num_recon_cols,
         num_channels, delta_voxel, delta_voxel_row, delta_det_channel,
@@ -179,8 +184,9 @@ def _translation_back_view_batch(sino_batch, pixel_indices, view_params_batch,
     gather onto the slices.  Returns (P, S), or (P, band_slices) for a slice
     band, exactly as in cone.
 
-    ``plan`` is the memoization slot for a future sorted/CSR stream variant;
-    unused today."""
+    ``plan`` is accepted and ignored.  It reserves a place for a future
+    body that would precompute its geometry once and reuse it across
+    calls; nothing reads it today."""
     n_p, centers, W_p_c, weight_scale, pixel_mag = _translation_horizontal_data(
         pixel_indices, view_params_batch, num_recon_rows, num_recon_cols,
         num_channels, delta_voxel, delta_voxel_row, delta_det_channel,

@@ -828,17 +828,25 @@ def stitch_arrays(array_list, overlap, axis=2, ramp_overlap=None):
     return swap(stitched, 0, axis)
 
 
-def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_det_rows=None, new_num_det_cols=None):
+def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_det_rows=None, new_num_det_cols=None,
+                  new_translation_vectors=None):
     """
-    Create a TomographyModel with the same type and parameters as the given ct_model except with the new input angles
-    and a corresponding sinogram shape.  Restricted to ParallelBeam and ConeBeam models.
+    Create a TomographyModel with the same type and parameters as the given ct_model except with the new per-view
+    parameters and a corresponding sinogram shape.  Supports the ParallelBeam, ConeBeam, MultiAxisParallel and
+    Translation models.
+
+    Each geometry names its per-view parameters differently, and the copy uses whichever name the model's own
+    constructor takes: ``new_angles`` for the three angle-based geometries (a 1D vector for parallel and cone, a
+    (num_views, 2) array of (azimuth, elevation) pairs for multiaxis) and ``new_translation_vectors`` for
+    TranslationModel.  Passing the argument that does not apply to the given model raises rather than being ignored.
 
     If the user explicitly set the devices on ct_model with configure_devices, the copy
     gets the same devices.  Otherwise the copy chooses its own devices when it is used.
 
     Args:
         ct_model (TomographyModel): The model to copy.
-        new_angles (ndarray of float, optional): 1D vector of projection angles in radians.
+        new_angles (ndarray of float, optional): Projection angles in radians -- a 1D vector for ParallelBeamModel and
+            ConeBeamModel, or a (num_views, 2) array of (azimuth, elevation) pairs for MultiAxisParallelModel.
             If None, then use the angles in ct_model. Defaults to None.
         new_helical_z_shifts (ndarray of float, optional): 1D vector of per-view axial shifts in ALU for ConeBeamModel.
             Defaults to None.
@@ -846,26 +854,42 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
             If None, then use the num_det_rows in ct_model. Defaults to None.
         new_num_det_cols (int, optional): Number of detector columns in the new model.
             If None, then use the num_det_cols in ct_model. Defaults to None.
+        new_translation_vectors (ndarray of float, optional): (num_views, 3) array of object translations (x, y, z) in
+            ALU for TranslationModel.  If None, then use the translation_vectors in ct_model. Defaults to None.
 
     Returns:
-        An instance of ConeBeamModel or ParallelBeam model
+        An instance of the same model class as ct_model
     """
-    if str(type(ct_model)).find('ConeBeamModel') > 0:
-        is_cone = True
-    elif str(type(ct_model)).find('ParallelBeamModel') > 0:
-        is_cone = False
-    else:
-        raise TypeError('copy_ct_model() supports ConeBeamModel and ParallelBeamModel only; '
-                        f'got {type(ct_model).__name__}.  TranslationModel and '
-                        'MultiAxisParallelModel are not yet supported (matching mbirjax); '
-                        'construct the new model directly.')
+    model_name = str(type(ct_model))
+    is_cone = model_name.find('ConeBeamModel') > 0
+    is_translation = model_name.find('TranslationModel') > 0
+    # MultiAxisParallelModel is matched on its own name rather than through 'ParallelBeamModel', which is not a
+    # substring of it.
+    if not (is_cone or is_translation or model_name.find('ParallelBeamModel') > 0
+            or model_name.find('MultiAxisParallelModel') > 0):
+        raise TypeError('copy_ct_model() supports ConeBeamModel, ParallelBeamModel, MultiAxisParallelModel and '
+                        f'TranslationModel; got {type(ct_model).__name__}.  Construct the new model directly.')
 
     # get_all_params is the single source of truth for reading the params back out: it gives the
     # constructor args with the view components already unpacked (angles + helical_z_shifts for cone)
     # and geometry_type in required, so build_model can reconstruct the class.
     required, optional, regularization = ct_model.get_all_params()
 
-    old_angles = required['angles']
+    # The key the per-view parameters arrive under is the one the constructor declares, so the copy reads and writes
+    # that key rather than assuming every geometry has angles.  Translation carries translation_vectors and no angles
+    # at all; the other three carry angles, of one column (parallel, cone) or two (multiaxis).
+    if is_translation:
+        view_key, new_view_params = 'translation_vectors', new_translation_vectors
+        if new_angles is not None or new_helical_z_shifts is not None:
+            raise ValueError('copy_ct_model: a TranslationModel has per-view translations rather than angles; '
+                             'pass new_translation_vectors.')
+    else:
+        view_key, new_view_params = 'angles', new_angles
+        if new_translation_vectors is not None:
+            raise ValueError('copy_ct_model: new_translation_vectors applies to a TranslationModel only; '
+                             f'got {type(ct_model).__name__}, so pass new_angles.')
+
+    old_view_params = required[view_key]
     new_shape = list(required['sinogram_shape'])
 
     if is_cone:
@@ -884,14 +908,16 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
                 raise ValueError('copy_ct_model: new_helical_z_shifts must have the same length as the existing angles.')
         required['helical_z_shifts'] = new_helical_z_shifts
 
-    if new_angles is None:
-        new_angles = old_angles
-    new_shape[0] = len(new_angles)
+    if new_view_params is None:
+        new_view_params = old_view_params
+    # len() is the view count for every form here: one entry per view, whether that entry is a scalar angle or a row
+    # of a (num_views, 2) or (num_views, 3) array.
+    new_shape[0] = len(new_view_params)
     if new_num_det_rows is not None:
         new_shape[1] = new_num_det_rows
     if new_num_det_cols is not None:
         new_shape[2] = new_num_det_cols
-    required['angles'] = new_angles
+    required[view_key] = new_view_params
     required['sinogram_shape'] = tuple(new_shape)
 
     # The sinogram shape changed, so drop recon_shape and let build_model's auto pass recompute it.
@@ -1056,22 +1082,27 @@ def merge_log_files(merged_path, labeled_paths):
             os.path.abspath(merged_path)))
 
 
-def get_ct_model(geometry_type, sinogram_shape, angles, source_detector_dist=None, source_iso_dist=None, helical_z_shifts=None):
+def get_ct_model(geometry_type, sinogram_shape, angles=None, source_detector_dist=None, source_iso_dist=None,
+                 helical_z_shifts=None, translation_vectors=None):
     """
     Create an instance of TomographyModel with the given parameters
 
     Args:
-        geometry_type (str): 'parallel' or 'cone'
+        geometry_type (str): 'parallel', 'cone', 'multiaxis' or 'translation'
         sinogram_shape (tuple list of int): (num_views, num_rows, num_channels)
-        angles (ndarray of float): 1D vector of projection angles in radians
+        angles (ndarray of float, optional): Projection angles in radians -- a 1D vector for 'parallel' and 'cone', or a
+            (num_views, 2) array of (azimuth, elevation) pairs for 'multiaxis'.  Not used by 'translation', which takes
+            translation_vectors instead.  Defaults to None.
         source_detector_dist (float or None, optional): Distance in ALU from source to detector.  Defaults to None for geometries that don't need this.
         source_iso_dist (float or None, optional): Distance in ALU from source to iso.  Defaults to None for geometries that don't need this.
         helical_z_shifts (ndarray, optional):
             Per-view axial shifts (ALU), same length as angles.
             Required when use_helical=True.
+        translation_vectors (ndarray of float, optional): (num_views, 3) array of object translations (x, y, z) in ALU.
+            Required for geometry_type 'translation' and unused by the others.  Defaults to None.
 
     Returns:
-        An instance of ConeBeamModel or ParallelBeam model
+        An instance of ConeBeamModel, ParallelBeamModel, MultiAxisParallelModel or TranslationModel
     """
     import mbirtorch
 
@@ -1082,11 +1113,21 @@ def get_ct_model(geometry_type, sinogram_shape, angles, source_detector_dist=Non
         if helical_z_shifts is not None:
             warnings.warn("Helical mode (helical_z_shifts) is only supported for geometry_type='cone'; ignoring z_shifts.", UserWarning)
         model = mbirtorch.ParallelBeamModel(sinogram_shape, angles)
+    elif geometry_type == 'multiaxis':
+        if helical_z_shifts is not None:
+            warnings.warn("Helical mode (helical_z_shifts) is only supported for geometry_type='cone'; ignoring z_shifts.", UserWarning)
+        model = mbirtorch.MultiAxisParallelModel(sinogram_shape, angles)
+    elif geometry_type == 'translation':
+        if translation_vectors is None:
+            raise ValueError("get_ct_model() with geometry_type 'translation' needs translation_vectors, a "
+                             "(num_views, 3) array of object translations in ALU; a translation geometry has no "
+                             "angles.")
+        model = mbirtorch.TranslationModel(sinogram_shape, translation_vectors,
+                                           source_detector_dist=source_detector_dist,
+                                           source_iso_dist=source_iso_dist)
     else:
-        raise ValueError("get_ct_model() supports geometry_type 'cone' and 'parallel' only; "
-                         f"got {geometry_type!r}.  For the translation and multiaxis "
-                         "geometries (not yet supported here, matching mbirjax), construct "
-                         "TranslationModel or MultiAxisParallelModel directly.")
+        raise ValueError("get_ct_model() supports geometry_type 'cone', 'parallel', 'multiaxis' and 'translation'; "
+                         f"got {geometry_type!r}.")
 
     return model
 

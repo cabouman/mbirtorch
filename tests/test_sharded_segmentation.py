@@ -15,6 +15,7 @@ import torch
 
 import mbirtorch
 import mbirtorch.preprocess as mtp
+import mbirtorch.preprocess.mar as mtmar
 from mbirtorch import _sharding
 
 
@@ -209,6 +210,81 @@ def test_sharded_bh_correction_matches_single_device():
     rel = float(np.max(np.abs(out - ref)) / np.max(np.abs(ref)))
     print(f"sharded vs single MAR recon rel_max = {rel:.2e}")
     assert rel < 1e-3
+
+
+# ── the plastic-coefficient floor, on one device with a view mask ────────────
+# This case is unsharded, but it exists only because of sharding: the view
+# mask that reaches it is the padding indicator a multi-device placement
+# builds.  So it is gated here, beside the sharded MAR path it belongs to.
+# The exponent tuples below are the ones bh_correction builds for one metal
+# term with one cross term, which makes the two quantities inside
+# _correct_plastic_sinogram simple enough to write out independently:
+#   Sp          = theta[0] + theta[1] * m
+#   y_minus_Sm  = clamp(y - theta[2] * m, min=0)
+MASKED_FLOOR_EXPONENTS = [(1, 0), (1, 1), (0, 1)]
+MASKED_FLOOR_THETA = np.array([0.3, 0.7, 0.2])
+MASKED_FLOOR_GAMMA = 1.5      # large enough that the floor actually binds
+
+
+def _masked_floor_case(num_views=6, real_views=4, det_shape=(5, 7)):
+    """A padded single-device sinogram triple plus its real-view mask."""
+    rng = np.random.default_rng(0)
+    full = (num_views,) + det_shape
+
+    def draw():
+        array = torch.as_tensor(rng.random(full).astype(np.float32))
+        array[real_views:] = 0        # the padded views the engine zero-fills
+        return array
+
+    plastic, metal, measured = draw(), draw(), draw()
+    view_mask = torch.as_tensor(
+        (np.arange(num_views) < real_views).reshape(num_views, 1, 1))
+    num_real_pixels = real_views * det_shape[0] * det_shape[1]
+    return plastic, metal, measured, view_mask, num_real_pixels
+
+
+def test_masked_single_device_plastic_floor_keeps_the_unsharded_arithmetic():
+    """One plain tensor plus a view mask must take the float32 reduction.
+
+    This is the branch a padded sinogram would reach if it were handed to
+    the correction as a single tensor, and it is the one combination the MAR
+    tests never drove.  The sharded form sums each piece to a Python float
+    and divides in float64, which is a different rounding: the check below
+    pins the result to the float32 expression and, on this seeded input,
+    shows the float64 form landing somewhere else -- so a change back to it
+    fails here instead of silently moving a single-device answer.
+    """
+    plastic, metal, measured, view_mask, num_real_pixels = _masked_floor_case()
+    theta, gamma = MASKED_FLOOR_THETA, MASKED_FLOOR_GAMMA
+
+    out = mtmar._correct_plastic_sinogram(
+        measured, plastic, [metal], theta, MASKED_FLOOR_EXPONENTS,
+        num_cross_terms=1, num_metal_terms=1, p_normalization=1.0, gamma=gamma,
+        view_mask=view_mask, num_real_pixels=num_real_pixels)
+
+    plastic_coef = (torch.zeros_like(plastic)
+                    + float(theta[0]) * torch.ones_like(plastic)
+                    + float(theta[1]) * metal)
+    residual = torch.clamp(measured - float(theta[2]) * metal, min=0)
+
+    # The expression this branch is required to keep: a float32 masked sum,
+    # divided by the real pixel count, held against Sp with torch.maximum.
+    float32_floor = gamma * (torch.sum(plastic_coef * view_mask) / float(num_real_pixels))
+    expected = 1.0 * residual / torch.maximum(plastic_coef, float32_floor)
+    assert torch.equal(out, expected)
+
+    # The float64 host divide, which is what the sharded branch must use and
+    # what this branch must not: on this input it moves the floor by one unit
+    # in the last place and changes every clamped element.
+    float64_floor = gamma * (float(torch.sum(plastic_coef * view_mask)) / float(num_real_pixels))
+    combined = 1.0 * residual / torch.clamp(plastic_coef, min=float64_floor)
+    assert float32_floor.item() != float64_floor, (
+        'the two reductions agree on this input, so the check above would '
+        'pass either way; pick an input where they differ')
+    print("masked single-device Sp floor: "
+          f"float32 {float32_floor.item()!r} vs float64 {float64_floor!r}, "
+          f"{int((expected != combined).sum())} elements differ")
+    assert not torch.equal(expected, combined)
 
 
 def test_sharded_save_and_export_stream_by_slab(tmp_path, monkeypatch):

@@ -439,8 +439,9 @@ class QGGMRFDenoiser(TomographyModel):
                         ell1_accum = ell1_accum + combine_on_lead(ell1_parts)
                         alpha_accum = alpha_accum + alpha
 
-                    # The one host synchronization per pass: the convergence
-                    # test and the two logged histories need Python numbers.
+                    # The three host reads per pass, all at this one
+                    # synchronization point: the convergence test and the two
+                    # logged histories need Python numbers.
                     image_l1 = combine_on_lead([torch.sum(torch.abs(t))
                                                 for t in flat_image.tensors])
                     nmae = float(ell1_accum) / float(image_l1)

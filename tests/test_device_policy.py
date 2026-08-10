@@ -698,44 +698,92 @@ def test_skipping_the_memory_preflight_leaves_the_speed_floors_in_force(
 
 # ── geometries the floors have never met ─────────────────────────────────────
 class _UnlistedGeometry(mbirtorch.ParallelBeamModel):
-    """A geometry that never declared a floor family, as TranslationModel and
-    any future class would arrive."""
+    """A stand-in that declares no floor family.
+
+    The two real classes below are the standing coverage for this path, and
+    this one is kept beside them for the same reason
+    test_widening_floors.py keeps a synthetic table: the RULE has to outlive
+    the data.  Once a refresh measures multiaxis and translation they will
+    declare families of their own and stop exercising the fallback, and the
+    fallback still has to work for whatever geometry arrives next.
+    """
 
     _floor_family = None
 
 
-def test_a_model_with_no_floor_family_gets_the_parallel_floors(monkeypatch,
-                                                               unpinned):
-    def make(shape):
-        angles = np.linspace(0, np.pi, shape[0], endpoint=False)
-        model = _UnlistedGeometry(shape, angles)
-        model.configure_devices(devices=['cpu'])
-        model.set_params(no_warning=True, verbose=0)
-        return model
+def _synthetic_no_family(shape):
+    angles = np.linspace(0, np.pi, shape[0], endpoint=False)
+    return _UnlistedGeometry(shape, angles)
 
-    small = with_four_visible(monkeypatch, make(CELL_128))
+
+def _multiaxis_no_family(shape):
+    """Multiaxis angles are (azimuth, elevation) pairs, one row per view."""
+    azimuth = np.linspace(0, np.pi, shape[0], endpoint=False)
+    elevation = np.linspace(-0.4, 0.4, shape[0])
+    return mbirtorch.MultiAxisParallelModel(shape, np.stack([azimuth, elevation], axis=1))
+
+
+def _translation_no_family(shape):
+    """Translation views are object translations, laid out on a grid whose
+    two side lengths multiply to the view count."""
+    num_views = shape[0]
+    num_x = 16 if num_views == CELL_128[0] else 32
+    vectors = mbirtorch.gen_translation_vectors(num_x, num_views // num_x,
+                                                x_spacing=3.0, z_spacing=2.0)
+    return mbirtorch.TranslationModel(shape, vectors,
+                                      source_detector_dist=4.0 * shape[2],
+                                      source_iso_dist=1.0 * shape[2])
+
+
+UNMEASURED_GEOMETRIES = [
+    (_multiaxis_no_family, 'MultiAxisParallelModel'),
+    (_translation_no_family, 'TranslationModel'),
+    (_synthetic_no_family, '_UnlistedGeometry'),
+]
+
+
+def _built(make, shape, verbose=0):
+    model = make(shape)
+    model.configure_devices(devices=['cpu'])
+    model.set_params(no_warning=True, verbose=verbose)
+    return model
+
+
+@pytest.mark.parametrize("make,class_name", UNMEASURED_GEOMETRIES,
+                         ids=[name for _make, name in UNMEASURED_GEOMETRIES])
+def test_a_model_with_no_floor_family_gets_the_parallel_floors(
+        monkeypatch, unpinned, make, class_name):
+    """Every class that declares no floor family is governed by the parallel
+    floors -- checked on the two real geometries that arrive that way, not
+    only on a stand-in."""
+    model = make(CELL_128)
+    assert type(model).__name__ == class_name
+    assert model._floor_family is None
+
+    small = with_four_visible(monkeypatch, _built(make, CELL_128))
     small._apply_device_policy()
     assert small.sino_placement.n_devices == 1
 
     # The permissive set, not a refusal: at the parallel n=2 floor it widens.
-    at_the_floor = with_four_visible(monkeypatch, make(CELL_512))
+    at_the_floor = with_four_visible(monkeypatch, _built(make, CELL_512))
     at_the_floor._apply_device_policy()
     assert at_the_floor.sino_placement.n_devices == 2
 
 
+@pytest.mark.parametrize("make,class_name", UNMEASURED_GEOMETRIES,
+                         ids=[name for _make, name in UNMEASURED_GEOMETRIES])
 def test_the_substituted_family_is_named_in_the_log(monkeypatch, unpinned,
-                                                    caplog):
+                                                    caplog, make, class_name):
     """A geometry that was never measured must not have that fact hidden from
-    it, so the selection path says which floors it borrowed."""
-    angles = np.linspace(0, np.pi, CELL_128[0], endpoint=False)
-    model = _UnlistedGeometry(CELL_128, angles)
-    model.configure_devices(devices=['cpu'])
-    model.set_params(no_warning=True, verbose=2)
-    with_four_visible(monkeypatch, model)
+    it, so the selection path says which class borrowed which floors."""
+    model = with_four_visible(monkeypatch, _built(make, CELL_128, verbose=2))
     with caplog.at_level('DEBUG', logger=model.logger.name):
         model._apply_device_policy()
     assert 'names no _floor_family' in caplog.text
     assert 'parallel widening speed floors' in caplog.text
+    # The line names the class, so a log read months later says which
+    # geometry was running on borrowed numbers.
+    assert class_name in caplog.text
 
 
 # ── the split_sino_recon halves ──────────────────────────────────────────────
