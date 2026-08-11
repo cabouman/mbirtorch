@@ -1,12 +1,14 @@
 name: Dependency watch
 # The nightly watch (plans repo: plans/torch_port/active/
-# python_matrix_nightly_check.md).  Currently in DRY-RUN mode (increment 3):
-# it composes and prints the pull request it would open, and writes nothing.
+# python_matrix_nightly_check.md).  LIVE: on a divergence between torch's
+# supported versions and ours, confirmed on two consecutive nights, it opens
+# ONE pull request against prerelease with the exact edit, requests review
+# from both maintainers (that is the email), and dispatches CI on the branch.
+# A pull request in any state for the same divergence stands as the answer:
+# nothing is opened twice, and closing one unmerged is a standing "no".
 #
-# GitHub runs scheduled workflows from the DEFAULT branch (main), so the
-# schedule takes effect when this file reaches main; until then the rehearsal
-# runs by manual dispatch.  The watch itself always reads and proposes
-# against prerelease.
+# GitHub runs scheduled workflows from the DEFAULT branch (main); the watch
+# itself always reads and proposes against prerelease.
 
 on:
   schedule:
@@ -36,11 +38,36 @@ jobs:
           path: .watch-state
           key: dependency-watch-state-${{ github.run_id }}
           restore-keys: dependency-watch-state-
-      - name: Run the watch (dry run)
+      - name: Run the watch
+        id: watch
         run: |
-          python ci/dependency_watch.py --dry-run \
+          python ci/dependency_watch.py --act \
             --state .watch-state/last-divergence \
             --base-sha "$(git rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Open the pull request
+        if: steps.watch.outputs.act == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BRANCH="${{ steps.watch.outputs.branch }}"
+          # A pull request in any state for this branch is a standing answer.
+          if [ "$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" \
+                  --state all --json id --jq length)" != "0" ]; then
+            echo "a pull request for $BRANCH already exists; nothing to do" \
+              | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git commit -a -m "${{ steps.watch.outputs.title }}"
+          git push -f origin "$BRANCH"
+          gh pr create --repo "$GITHUB_REPOSITORY" --base prerelease \
+            --head "$BRANCH" --title "${{ steps.watch.outputs.title }}" \
+            --body-file "${{ steps.watch.outputs.body_path }}" \
+            --reviewer cabouman --reviewer gbuzzard \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+          gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$BRANCH"
       - name: Save the two-night state
         if: always()
         uses: actions/cache/save@v4
