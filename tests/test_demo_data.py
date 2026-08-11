@@ -155,3 +155,13 @@ def test_gen_translation_vectors_grid():
     assert np.allclose(vecs[:, 1], 0.0)                       # no y motion
     assert np.allclose(sorted(set(vecs[:, 0])), [-10.0, 0.0, 10.0])
     assert np.allclose(sorted(set(vecs[:, 2])), [-2.5, 2.5])
+
+
+def test_generate_demo_data_multiaxis():
+    phantom, sino, params = mbirtorch.generate_demo_data(
+        model_type='multiaxis', elevation_degrees=25.0, object_type='cube',
+        num_views=8, num_det_rows=16, num_det_channels=24)
+    assert sino.shape == (8, 16, 24)
+    assert params['angles'].shape == (8, 2)
+    assert np.allclose(params['angles'][:, 1], np.deg2rad(25.0))
+    assert np.isfinite(np.asarray(sino)).all() and np.asarray(sino).max() > 0
