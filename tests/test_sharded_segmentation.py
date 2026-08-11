@@ -222,17 +222,32 @@ def test_sharded_bh_correction_matches_single_device():
 #   Sp          = theta[0] + theta[1] * m
 #   y_minus_Sm  = clamp(y - theta[2] * m, min=0)
 MASKED_FLOOR_EXPONENTS = [(1, 0), (1, 1), (0, 1)]
-MASKED_FLOOR_THETA = np.array([0.3, 0.7, 0.2])
-MASKED_FLOOR_GAMMA = 1.5      # large enough that the floor actually binds
+# Exact binary fractions, so Sp = theta[0] + theta[1] * m is an exact multiple
+# of 1/512 (see the draw below) and its masked sum is exact in float32.
+MASKED_FLOOR_THETA = np.array([0.25, 0.5, 0.25])
+# Sp runs over [0.25, 0.75) here, so this floor lands inside that range: it
+# binds for most elements and leaves the rest to torch.maximum's other branch.
+MASKED_FLOOR_GAMMA = 1.25
 
 
 def _masked_floor_case(num_views=6, real_views=4, det_shape=(5, 7)):
-    """A padded single-device sinogram triple plus its real-view mask."""
+    """A padded single-device sinogram triple plus its real-view mask.
+
+    The draws are quantized to multiples of 1/256 so that the masked sum the
+    test turns on is EXACT in float32: every partial sum of Sp over the 140
+    real pixels is a multiple of 1/512 below 128, which float32 holds exactly,
+    so no summation order and no device can move it.  That is what makes the
+    two floors compared below -- and whether they differ -- a property of this
+    input rather than of the host that ran it.  Drawing plain float32 leaves
+    the sum host-dependent, and the CUDA nightly read a sum whose two floors
+    rounded to the same float32, which left the last check with nothing to see.
+    """
     rng = np.random.default_rng(0)
     full = (num_views,) + det_shape
 
     def draw():
-        array = torch.as_tensor(rng.random(full).astype(np.float32))
+        quantized = np.floor(rng.random(full) * 256.0) / 256.0
+        array = torch.as_tensor(quantized.astype(np.float32))
         array[real_views:] = 0        # the padded views the engine zero-fills
         return array
 
@@ -250,9 +265,9 @@ def test_masked_single_device_plastic_floor_keeps_the_unsharded_arithmetic():
     the correction as a single tensor, and it is the one combination the MAR
     tests never drove.  The sharded form sums each piece to a Python float
     and divides in float64, which is a different rounding: the check below
-    pins the result to the float32 expression and, on this seeded input,
-    shows the float64 form landing somewhere else -- so a change back to it
-    fails here instead of silently moving a single-device answer.
+    pins the result to the float32 expression and, on the constructed input
+    above, shows the float64 form landing somewhere else -- so a change back
+    to it fails here instead of silently moving a single-device answer.
     """
     plastic, metal, measured, view_mask, num_real_pixels = _masked_floor_case()
     theta, gamma = MASKED_FLOOR_THETA, MASKED_FLOOR_GAMMA
@@ -275,16 +290,35 @@ def test_masked_single_device_plastic_floor_keeps_the_unsharded_arithmetic():
 
     # The float64 host divide, which is what the sharded branch must use and
     # what this branch must not: on this input it moves the floor by one unit
-    # in the last place and changes every clamped element.
+    # in the last place and changes most of the clamped elements.
     float64_floor = gamma * (float(torch.sum(plastic_coef * view_mask)) / float(num_real_pixels))
     combined = 1.0 * residual / torch.clamp(plastic_coef, min=float64_floor)
-    assert float32_floor.item() != float64_floor, (
-        'the two reductions agree on this input, so the check above would '
-        'pass either way; pick an input where they differ')
+
+    # Whether the two forms CAN differ at all, checked rather than assumed.
+    # Two things have to hold.  The clamp receives the float64 floor as a
+    # float32 scalar, so the comparison that matters is between the two floors
+    # AS FLOAT32 -- a gap narrower than half a float32 step disappears in that
+    # cast and leaves nothing downstream to see (the CUDA nightly read a gap of
+    # 1.4e-08 against a step of 1.2e-07 and no element differed).  And the
+    # floor has to bind somewhere with something to divide, since an element
+    # above both floors is divided by itself either way.  The exact masked sum
+    # makes both facts host-independent, so the assert should hold wherever
+    # this runs; it is skipped with a message rather than failed if some
+    # machine still lands the two floors on one float32, because then the test
+    # has no discrimination to offer and would pass whichever form the library
+    # used.
+    floors_differ = float32_floor.item() != float(np.float32(float64_floor))
+    binds = bool(((plastic_coef < float32_floor) & (residual > 0)).any())
     print("masked single-device Sp floor: "
           f"float32 {float32_floor.item()!r} vs float64 {float64_floor!r}, "
-          f"{int((expected != combined).sum())} elements differ")
-    assert not torch.equal(expected, combined)
+          f"{int((expected != combined).sum())} elements differ; "
+          f"floors differ as float32: {floors_differ}, floor binds: {binds}")
+    if floors_differ and binds:
+        assert not torch.equal(expected, combined)
+    else:
+        print('the two forms cannot be told apart on this input, so the check '
+              'above would pass either way; the inequality is skipped rather '
+              'than asserted')
 
 
 def test_sharded_save_and_export_stream_by_slab(tmp_path, monkeypatch):

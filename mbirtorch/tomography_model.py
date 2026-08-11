@@ -44,9 +44,14 @@ _F32_EPS = float(np.finfo(np.float32).eps)
 # The cylinder is this many columns by the whole slice axis, so this is the
 # knob that bounds the cross-device transient on that path.  Measured
 # 2026-08-10 on four H100s, job mg10: per-device forward time fell at every
-# batch tried -- 2048, 4096, 8192 -- and was still falling at the largest, so
-# this is the largest value MEASURED and not a knee, and the sweep above it
-# has not been run.  Set forward_project_pixel_batch on the model to override.
+# batch tried -- 2048, 4096, 8192 -- and was still falling at the largest.
+# The sweep above it ran the next night (job mg11, same machines, 1K cells):
+# 16384 and 32768 kept improving the composed wall by a further 4 to 15
+# percent depending on geometry and device count, so the knee is still not
+# bracketed.  8192 stays the default anyway, because those readings come from
+# a 1K harness and production runs at 2K and above, where the batch's
+# transient grows with the slice axis and the sweep has not been run.  Set
+# forward_project_pixel_batch on the model to override.
 FORWARD_PIXEL_BATCH = 8192
 
 # Forces the column gather on ('1', 'true', 'yes', 'on') or off ('0',
@@ -388,22 +393,27 @@ class TomographyModel(ParameterHandler):
         DEFAULT = one band per slice-owner (the whole shard).  This differs
         from mbirjax deliberately, on measurement: mbirjax's sweeps found
         time flat across B, so it streams by default for the memory win, but
-        the torch banded pass pays a fixed orchestration cost per band
-        (eager fan-out), and splitting the shard into sub-bands was measured
-        on four H100s at 47 to 66 percent MORE reconstruction time at two
-        devices, for peak-memory savings of 0 to 61 percent -- far more
-        time than the memory is worth on this path.
+        the torch banded pass pays a fixed orchestration cost per band.
+        With the compiled kernels in place, splitting the shard into
+        sub-bands was measured on four H100s at 2 to 23 percent more busy
+        time at parallel 1024 with two devices, depending on the walk (job
+        mg10, 2026-08-10; an earlier pre-kernel reading of 47 to 66 percent
+        overstated the cost).  The one exception, a 9.5 percent win at the
+        63-slice walk, is non-monotonic and unexplained, and is not a basis
+        for a default.
         Time buys nothing back here because a single torch device never runs
         the banded drivers at all (the trivial fast path uses the plain
         projectors), so mbirjax's stream-even-at-n=1 rationale is void.
 
         A smaller B remains a real MEMORY lever (the per-band broadcast
         copy, the per-band partial, and each slice-owner's reduce gather all
-        scale with B; measured n=4 @512: 6.6 to 2.6 GiB for +8 percent
-        time).  Set ``forward_project_slice_band`` /
-        ``back_project_slice_band`` on the model to opt in with a fixed B
-        when a run is memory-constrained.  Every result is capped at
-        slices_per_dev so a band never crosses a slice-owner boundary."""
+        scale with B; the same mg10 sweep read per-device peaks of 11.84 to
+        11.97 GB across the sub-band walks against 12.48 GB at the default,
+        with total copied bytes unchanged).  Set
+        ``forward_project_slice_band`` / ``back_project_slice_band`` on the
+        model to opt in with a fixed B when a run is memory-constrained.
+        Every result is capped at slices_per_dev so a band never crosses a
+        slice-owner boundary."""
         b = fixed_band if fixed_band else slices_per_dev
         return min(int(b), slices_per_dev)
 
@@ -426,9 +436,11 @@ class TomographyModel(ParameterHandler):
         help them too, but neither has ever been timed on it and neither
         should be switched over on an argument.
 
-        The SWITCH must be on.  ``forward_column_gather`` is unset by
-        default, which leaves the banded walk as the shipped behaviour; the
-        banded branch stays in place and is the rollback.
+        The SWITCH must not be off.  ``forward_column_gather`` unset means
+        the gather runs: it is the shipped behaviour for the geometries that
+        declare the capability, gated on measured speed, value, and memory
+        (2026-08-11, four H100s, both geometries).  Setting it to False
+        selects the banded walk, which stays in place as the rollback.
 
         The ENVIRONMENT may override the switch either way, which is what
         lets one session run both shapes over the same inputs and compare
@@ -441,7 +453,8 @@ class TomographyModel(ParameterHandler):
             return True
         if override in _COLUMN_GATHER_OFF_VALUES:
             return False
-        return bool(getattr(self, 'forward_column_gather', None))
+        switch = getattr(self, 'forward_column_gather', None)
+        return True if switch is None else bool(switch)
 
     def _forward_pixel_batch(self):
         """How many pixel columns one gathered cylinder covers.
@@ -1395,9 +1408,19 @@ class TomographyModel(ParameterHandler):
     # parallel beam only: translation and multiaxis have the same
     # band-independent per-call cost as cone and should gain from it too, but
     # a geometry is switched over on its own measurement rather than on the
-    # argument.  Declaring this True does not turn the path on --
-    # forward_column_gather does that.
+    # argument.  Declaring this True is what lets the gather run, and it runs
+    # by default -- forward_column_gather = False selects the banded walk.
     column_gather_geometry = False
+
+    # The fewest pixels this geometry's COMPILED bodies may be called with.
+    # 1 -- the base value -- means any width, which is what a geometry whose
+    # compiled bodies are all correct wants.  A geometry that declares more
+    # gets narrow calls padded up to that width and unpadded again outside the
+    # compiled region (see projectors.forward_at_min_pixel_width, which also
+    # carries the measured reason parallel beam declares 2).  It is a property
+    # of the geometry's bodies rather than a user setting, so it is a class
+    # attribute and not a parameter.
+    min_compiled_pixel_width = 1
 
     # Which measured set of widening speed floors governs this geometry's
     # automatic device count (see _widening_floors).  None -- the base value

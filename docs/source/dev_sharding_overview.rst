@@ -131,9 +131,11 @@ sharding.
 
 **The default band is the whole shard**, which differs from MBIRJAX deliberately
 and on measurement.  MBIRJAX's sweeps found time flat across band length, so it
-streams by default for the memory win.  The torch banded pass is instead
-orchestration-bound, because the fan-out per band is eager: a sub-band default
-measured 47 to 66 percent more warm reconstruction time at the two-device cells.
+streams by default for the memory win.  The torch banded pass pays a fixed
+orchestration cost per band: with the compiled kernels in place, sub-band walks
+measured 2 to 23 percent more busy time at parallel 1024 with two devices,
+depending on the walk (an earlier pre-kernel reading of 47 to 66 percent
+overstated the cost).
 MBIRJAX's stream-even-at-one-device rationale is also void here, because a single
 torch device never runs the banded drivers at all -- the trivial path uses the
 plain projectors.  A smaller band remains a real **memory** lever, since the

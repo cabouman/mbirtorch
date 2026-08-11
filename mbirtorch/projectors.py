@@ -127,6 +127,91 @@ def maybe_compile(fn, enabled, instance_key=None):
     return guarded
 
 
+# ── the minimum pixel width a compiled body is called at ─────────────────────
+# A model may declare that its compiled bodies must not be called with fewer
+# than N pixels (``min_compiled_pixel_width``, see TomographyModel).  The two
+# wrappers below pad a narrower call up to N and undo the padding on the way
+# out.  They are applied OUTSIDE torch.compile, around the callable
+# maybe_compile returns, so the padding is ordinary python that dynamo never
+# traces -- padding inside the body would be traced and specialized with it,
+# which is exactly what has to be avoided.
+#
+# Why they exist (measured 2026-08-11, linux CPU, torch 2.13.0): inductor
+# miscompiles the one-pixel specialization of both fused parallel-beam bodies.
+# A one-pixel call puts that pixel's horizontal-fan footprint one whole
+# detector channel away from where the same pixel lands in a call with more
+# pixels -- 6.56e-02 relative error on the forward (the pixel's mass at
+# channels {4, 5} instead of {3, 4}) and 5.04e-02 on the back, on a seeded
+# 8x6x8 test cell.  Eager is correct at one pixel (1.05e-07), every width of
+# two or more is correct compiled, and a one-pixel call is correct once the
+# process has compiled the body at a larger width, so what is wrong is the
+# one-pixel compile itself.  The cone bodies do not have the defect, and macOS
+# inductor compiles the same one-pixel body correctly.  One-pixel calls are
+# ordinary: sparse_forward_project with a single index makes one, and the
+# column gather's pixel batching makes one whenever a batch, or the remainder
+# of a batch, is a single pixel.
+#
+# The driver's view-batch charge is computed from the REAL pixel count, before
+# the padding: it prices the transient of a call this small at a batch far
+# below any cap, so the one padded column cannot move it.
+
+
+def _callable_name(fn, fallback):
+    """A readable name for a wrapped callable, for the wrapper's own name."""
+    return getattr(fn, '__name__', fallback)
+
+
+def forward_at_min_pixel_width(compiled, min_width):
+    """The forward body with narrow pixel batches padded to ``min_width``.
+
+    The padded columns carry zero values at a repeated -- hence in-range --
+    pixel index.  The forward output has no pixel axis: the fan bins each
+    pixel's weighted row into the detector channels with index_add_, so a
+    zero-valued column adds exactly 0.0 wherever it lands and the padded call
+    returns bit-identical values with nothing to slice off (verified against
+    the eager body).
+    """
+    def forward_padded(values, pixel_indices, *args, **kwargs):
+        width = int(pixel_indices.shape[0])
+        if width == 0 or width >= min_width:
+            return compiled(values, pixel_indices, *args, **kwargs)
+        pad = min_width - width
+        wide_values = torch.cat(
+            [values, values.new_zeros((pad,) + tuple(values.shape[1:]))])
+        wide_indices = torch.cat([pixel_indices,
+                                  pixel_indices[-1:].repeat(pad)])
+        return compiled(wide_values, wide_indices, *args, **kwargs)
+
+    forward_padded.__name__ = f'padded_{_callable_name(compiled, "forward")}'
+    return forward_padded
+
+
+def back_at_min_pixel_width(compiled, min_width):
+    """The back body with narrow pixel batches padded to ``min_width``.
+
+    The back output DOES carry the pixel axis, so here the padding repeats the
+    last real pixel index and the extra rows are sliced off again.  Every
+    output row is computed from its own pixel alone (the fan gathers per pixel
+    and sums over views), so the rows that stay are the rows the narrow call
+    would have produced -- exactly, not to a tolerance (verified against the
+    eager body, at coeff_power 1 and 2).
+    """
+    def back_padded(sino_batch, pixel_indices, *args, **kwargs):
+        width = int(pixel_indices.shape[0])
+        if width == 0 or width >= min_width:
+            return compiled(sino_batch, pixel_indices, *args, **kwargs)
+        pad = min_width - width
+        wide_indices = torch.cat([pixel_indices,
+                                  pixel_indices[-1:].repeat(pad)])
+        block = compiled(sino_batch, wide_indices, *args, **kwargs)
+        # Cloned rather than returned as a view, so the caller's output owns
+        # its memory and does not keep the padded block alive.
+        return block[:width].clone()
+
+    back_padded.__name__ = f'padded_{_callable_name(compiled, "back")}'
+    return back_padded
+
+
 def compile_serialized():
     """The process-wide compile lock, as a context manager -- for HAND-WRITTEN
     kernel paths only::
@@ -258,11 +343,30 @@ class Projectors:
         fwd_body, back_body = model._view_batch_bodies()
         use_compile = model.compile_enabled
         n_dev = model.sino_placement.n_devices
+        min_width = int(getattr(model, 'min_compiled_pixel_width', 1))
+
+        def bind(body, pad_narrow, i):
+            """One device's bound body: compiled, then wrapped when the model
+            declares a minimum pixel width AND the binding really did compile.
+
+            The identity test is the whole gate.  maybe_compile hands back the
+            function itself when compilation is off and when the body is a
+            hand-written kernel (``_mbirtorch_no_compile``); neither can be
+            miscompiled, so neither needs the workaround, and leaving them
+            alone keeps the two things callers read off a bound body -- its
+            identity and its ``_view_batch_cost`` attribute -- exactly as they
+            were.  Every driver, plain and sharded, reads its body from these
+            two lists, so this is the one place per direction to wrap."""
+            bound = maybe_compile(body, use_compile, instance_key=i)
+            if min_width > 1 and bound is not body:
+                bound = pad_narrow(bound, min_width)
+            return bound
+
         self._fwd_body_per_dev = [
-            maybe_compile(fwd_body, use_compile, instance_key=i)
+            bind(fwd_body, forward_at_min_pixel_width, i)
             for i in range(n_dev)]
         self._back_body_per_dev = [
-            maybe_compile(back_body, use_compile, instance_key=i)
+            bind(back_body, back_at_min_pixel_width, i)
             for i in range(n_dev)]
         # View parameters, read from the CURRENT params at every projector
         # build (create_projectors re-runs on reconfigure/recompile, closing

@@ -346,7 +346,9 @@ class ConeBeamModel(TomographyModel):
     # Cone is the geometry the multi-device forward's column gather was
     # measured on (see TomographyModel._column_gather_forward for what else
     # has to hold before it runs, and _sparse_forward_project_columns for the
-    # numbers).  The path is still off unless forward_column_gather is set.
+    # numbers).  The path runs by default since its speed, value, and memory
+    # gates passed (2026-08-11, four H100s); forward_column_gather = False
+    # restores the banded walk.
     column_gather_geometry = True
 
     def create_projectors(self):

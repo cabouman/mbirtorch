@@ -101,8 +101,9 @@ Tips for efficiency
   gather back to the host, so it can feed another on-device step directly.
 * **Trade memory for time with a smaller band.**  Setting ``forward_project_slice_band`` or
   ``back_project_slice_band`` on the model streams the slice axis in smaller pieces.  This is
-  a memory lever: on a measured 4-device 512-cell run it took peak memory from 6.6 GiB to
-  2.6 GiB for about 8 percent more time.  Leave it unset unless a run is memory-constrained.
+  a memory lever: a measured 2-device run at the 1024 class saved about 0.5 GB of per-device
+  peak for about 2 percent more time at the 252-slice band, and narrower bands saved slightly
+  more memory for more time.  Leave it unset unless a run is memory-constrained.
 * **More devices is often slower.**  See the next section; this matters more in MBIRTorch
   than the equivalent advice does in MBIRJAX.
 

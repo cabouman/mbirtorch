@@ -1221,26 +1221,29 @@ def test_plan_from_model_reads_the_resolved_pixel_batch(monkeypatch):
     model.configure_devices(devices=['cpu'])
     model.set_params(no_warning=True, verbose=0)
     devices = ['cpu', 'cpu']
+    # Unset means the gather (the shipped default), so the charge is present
+    # at the shipped batch; refusing the gather removes it.
+    assert _memory_ledger.plan_from_model(
+        model, devices).column_pixel_batch == FORWARD_PIXEL_BATCH
+    model.forward_column_gather = False
     assert _memory_ledger.plan_from_model(
         model, devices).column_pixel_batch is None
     model.forward_column_gather = True
-    assert _memory_ledger.plan_from_model(
-        model, devices).column_pixel_batch == FORWARD_PIXEL_BATCH
     model.forward_project_pixel_batch = 512
     assert _memory_ledger.plan_from_model(
         model, devices).column_pixel_batch == 512
     # The row-aligned geometry takes the same path, so the same resolution has
-    # to reach its charge -- and the charge stays absent while its switch is
-    # off, which is the shipped state for both geometries.
+    # to reach its charge -- present by default, absent when refused, exactly
+    # as on cone.
     par = mbirtorch.ParallelBeamModel(cell, np.linspace(0, np.pi, cell[0],
                                                         endpoint=False))
     par.configure_devices(devices=['cpu'])
     par.set_params(no_warning=True, verbose=0)
     assert _memory_ledger.plan_from_model(
-        par, devices).column_pixel_batch is None
-    par.forward_column_gather = True
-    assert _memory_ledger.plan_from_model(
         par, devices).column_pixel_batch == FORWARD_PIXEL_BATCH
+    par.forward_column_gather = False
+    assert _memory_ledger.plan_from_model(
+        par, devices).column_pixel_batch is None
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────

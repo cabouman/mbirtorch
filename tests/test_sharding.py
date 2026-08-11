@@ -812,11 +812,15 @@ def test_gather_column_band_moves_across_real_devices():
     assert torch.allclose(cyl.cpu(), full[8:16], atol=1e-6)
 
 
-def test_column_gather_matches_single_device_at_every_batch():
+def test_column_gather_matches_single_device_at_every_batch(monkeypatch):
     # The values gate on virtual CPU devices: a full-height call at
     # slice_start=0 is the single-device call shape, so the gathered forward
     # must reproduce the single-device values -- at one batch covering the
-    # pass, and at batches that force several.
+    # pass, and at batches that force several.  The environment is cleared
+    # first so a suite run forcing the banded walk cannot unseat the gather
+    # this test is about -- the same pinning the banded tests do in reverse.
+    from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
+    monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
     for n in (2, 3):
         for batch in (None, 1, 5, 10 ** 6):
             m, idx, vals, _sino, ref_fwd, _ref_back = _cone_column_case(
@@ -827,10 +831,13 @@ def test_column_gather_matches_single_device_at_every_batch():
             assert rel < 1e-5, (n, batch, rel)
 
 
-def test_column_gather_holds_the_adjoint_and_the_padded_forms():
+def test_column_gather_holds_the_adjoint_and_the_padded_forms(monkeypatch):
     # The back driver is untouched, so the pair must stay adjoint with the
     # gather on -- on a padded cell (9 views, 7 rows over 2 devices pads both
     # axes), where the gathered cylinder carries the inert padded slice tail.
+    # The environment is cleared first, for the reason above.
+    from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
+    monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
     m, idx, vals, sino, ref_fwd, ref_back = _cone_column_case(
         ["cpu", "cpu"], cell=(9, 7, 8), pixel_batch=4)
     assert m.recon_placement.is_padded and m.sino_placement.is_padded
@@ -849,8 +856,11 @@ def test_column_gather_replaces_the_band_broadcast(monkeypatch):
     # gather_column_band and must NOT broadcast a band; each gather takes one
     # piece per slice-owner and yields a cylinder that is the batch wide and
     # the WHOLE device-form slice axis tall; and each projector call runs at
-    # slice_start=0 over that whole axis for the owner's own views.
+    # slice_start=0 over that whole axis for the owner's own views.  The
+    # environment is cleared first, for the reason above.
     from mbirtorch import _sharding as sharding
+    from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
+    monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
     batch, n = 4, 2
     m, idx, vals, _sino, _ref_fwd, _ref_back = _cone_column_case(
         ["cpu"] * n, pixel_batch=batch)
@@ -902,27 +912,31 @@ def test_column_gather_replaces_the_band_broadcast(monkeypatch):
         in m.sino_placement.padded_shard_ranges() if valid > 0}
 
 
-def test_the_column_gather_is_off_by_default_and_scoped_to_its_geometry(
+def test_the_column_gather_is_on_by_default_and_scoped_to_its_geometry(
         monkeypatch):
-    # The switch: off unless asked, refused on a geometry the shape has never
+    # The switch: on unless refused, refused on a geometry the shape has never
     # been measured on however it is asked, and overridable from the
     # environment either way so one session can run both shapes over the same
     # inputs.  The environment is cleared first, because this test reads the
-    # DEFAULT and a suite run may be forcing the path on around it.
+    # DEFAULT and a suite run may be forcing the path around it.
     import mbirtorch
     from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
     monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
     cone, _idx, _vals, _sino, _f, _b = _cone_banded_case(["cpu", "cpu"])
     assert cone.column_gather_geometry
-    assert not cone._column_gather_forward()          # default off
+    assert cone._column_gather_forward()              # default on
+    cone.forward_column_gather = False                # the rollback
+    assert not cone._column_gather_forward()
     cone.forward_column_gather = True
     assert cone._column_gather_forward()
 
     # The row-aligned geometry declares the same capability, on its own
-    # measurement, and is off by default in the same way.
+    # measurement, and is on by default in the same way.
     angles = np.linspace(0, np.pi, 8, endpoint=False)
     par = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
     assert par.column_gather_geometry
+    assert par._column_gather_forward()
+    par.forward_column_gather = False
     assert not par._column_gather_forward()
     par.forward_column_gather = True
     assert par._column_gather_forward()
@@ -937,27 +951,32 @@ def test_the_column_gather_is_off_by_default_and_scoped_to_its_geometry(
     assert not trans.column_gather_geometry
     assert not trans._column_gather_forward()
 
+    # The environment wins over the attribute in BOTH directions: `cone` holds
+    # an explicit True and `refused` an explicit False, and each env value
+    # drives the two models to the same answer.
     import os
-    off = _cone_banded_case(["cpu", "cpu"])[0]
-    for value, expected_off, expected_on in (("1", True, True),
-                                             ("on", True, True),
-                                             ("0", False, False),
-                                             ("off", False, False)):
+    refused = _cone_banded_case(["cpu", "cpu"])[0]
+    refused.forward_column_gather = False
+    for value, expected in (("1", True), ("on", True),
+                            ("0", False), ("off", False)):
         os.environ[COLUMN_GATHER_ENV_VAR] = value
         try:
-            assert off._column_gather_forward() is expected_off
-            assert cone._column_gather_forward() is expected_on
+            assert refused._column_gather_forward() is expected
+            assert cone._column_gather_forward() is expected
         finally:
             del os.environ[COLUMN_GATHER_ENV_VAR]
-    assert not off._column_gather_forward()
+    assert not refused._column_gather_forward()
+    unset = _cone_banded_case(["cpu", "cpu"])[0]
+    assert unset._column_gather_forward()             # the shipped default
 
 
 @pytest.mark.parametrize('geometry', ('cone', 'parallel'))
 def test_the_banded_walk_is_what_runs_with_the_switch_off(geometry,
                                                           monkeypatch):
     # The rollback, exercised on both geometries that can take the gather:
-    # with the switch off the forward is the banded walk, which broadcasts
-    # bands and gathers no columns.  The environment knob is cleared first for
+    # switching the gather off selects the banded walk, which broadcasts
+    # bands and gathers no columns.  The switch has to be refused explicitly
+    # now that unset means on, and the environment knob is cleared first for
     # the reason above.
     from mbirtorch import _sharding as sharding
     from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
@@ -966,6 +985,7 @@ def test_the_banded_walk_is_what_runs_with_the_switch_off(geometry,
         m, idx, vals, _sino, ref_fwd, _rb = _cone_banded_case(["cpu", "cpu"])
     else:
         m, idx, vals, _sino, ref_fwd, _rb, _b2 = _banded_case(["cpu", "cpu"])
+    m.forward_column_gather = False
     assert m.column_gather_geometry and not m._column_gather_forward()
     broadcasts = []
     real_broadcast = sharding.broadcast_band_to_views
@@ -984,13 +1004,16 @@ def test_the_banded_walk_is_what_runs_with_the_switch_off(geometry,
     assert np.allclose(fwd, ref_fwd, atol=1e-5)
 
 
-def test_column_gather_recon_matches_single_device():
+def test_column_gather_recon_matches_single_device(monkeypatch):
     # The end-to-end gate: a seeded cone reconstruction on two virtual CPU
     # devices with the gather on must reproduce the single-device run, which
     # is where the two changed summation orders (the vertical sum into the
     # body, the pixel sum out of it) would show up if they were not inside
-    # the value class the forward already has.
+    # the value class the forward already has.  The environment is cleared
+    # first so each of the three runs below is the shape it names.
     import mbirtorch
+    from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
+    monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
     cell = (8, 8, 8)
     angles = np.linspace(0, 2 * np.pi, cell[0], endpoint=False)
 
@@ -1012,6 +1035,7 @@ def test_column_gather_recon_matches_single_device():
     ref, _ = m1.recon(sino, max_iterations=2, stop_threshold_change_pct=0.0)
 
     banded = build(["cpu", "cpu"])
+    banded.forward_column_gather = False    # unset now means the gather
     np.random.seed(31)
     banded_out, _ = banded.recon(sino, max_iterations=2,
                                  stop_threshold_change_pct=0.0)
@@ -1068,7 +1092,11 @@ def _parallel_column_case(devices, sino_shape=(8, 6, 8), pixel_batch=None):
     return m, idx, vals, sino, ref_fwd, ref_back
 
 
-def test_parallel_column_gather_matches_the_shape_it_replaces():
+def test_parallel_column_gather_matches_the_shape_it_replaces(monkeypatch):
+    # The environment is cleared first so each leg below runs the shape it
+    # names, whatever a suite run is forcing around this test.
+    from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
+    monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
     # The values gate.  Both shapes are run over the same inputs in the same
     # process and both are held to the same bar, which is the reading that
     # does not move with the compile state above; the two distances are
@@ -1083,6 +1111,7 @@ def test_parallel_column_gather_matches_the_shape_it_replaces():
         # call; the large value asks for that explicitly.
         for batch in (None, 10 ** 6):
             m, idx, vals, _sino, ref_fwd, _rb = _banded_case(["cpu"] * n)[:6]
+            m.forward_column_gather = False   # unset now means the gather
             banded = m._gather_sinogram(m.sparse_forward_project(vals, idx))
             m.forward_column_gather = True
             if batch is not None:
@@ -1113,6 +1142,9 @@ def test_parallel_column_gather_matches_the_shape_it_replaces():
 
 def test_parallel_column_gather_gathers_columns_and_sizes_its_rows_by_them(
         monkeypatch):
+    # The environment is cleared first, for the reason above.
+    from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
+    monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
     # The mechanics witness, plus the row-aligned fact the banded walk used to
     # supply by construction.  With the gather on, the parallel forward calls
     # gather_column_band and broadcasts no band; each cylinder is one pixel
@@ -1173,7 +1205,11 @@ def test_parallel_column_gather_gathers_columns_and_sizes_its_rows_by_them(
     assert all(tuple(t.shape[1:]) == (slices, channels) for t in fwd.tensors)
 
 
-def test_parallel_column_gather_holds_the_padded_and_sparse_view_forms():
+def test_parallel_column_gather_holds_the_padded_and_sparse_view_forms(
+        monkeypatch):
+    # The environment is cleared first, for the reason above.
+    from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
+    monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
     # The two forms where a row-aligned geometry's DEVICE shape differs from
     # its problem shape.  A padded slice axis pads the sinogram's detector
     # rows with it, so every block this driver assembles -- including the
@@ -1247,4 +1283,106 @@ def test_parallel_column_gather_recon_matches_single_device():
     print(f"parallel recon vs n1: column gather {rel:.2e}, "
           f"banded {rel_banded:.2e}")
     assert rel < 5e-4, rel     # the sharded VCD loop's own floor at this cell
+
+
+# ── one pixel at a time ──────────────────────────────────────────────────────
+# The column gather's pixel batching hands the projectors a one-pixel call
+# whenever a batch, or the remainder of a batch, is a single pixel, and a user
+# can ask for one directly.  On linux with torch 2.13.0, CPU inductor
+# miscompiles exactly that case in both parallel bodies and lands the pixel's
+# footprint one detector channel off (measured 2026-08-11: 6.56e-02 relative on
+# the forward, 5.04e-02 on the back, on the 8x6x8 cell below; eager is right,
+# and so is every width of two or more).  The driver pads a one-pixel call to
+# two and takes the padding back out.  These two tests hold that: the first is
+# the property a user cares about, the second is the padding itself.  Both pass
+# on any machine whose compiler is sound -- macOS is one -- so their value is
+# the linux nightly.
+def test_parallel_solo_pixel_projections_match_the_full_pass():
+    # A pixel projects the same whether it is asked for alone or with the
+    # others.  Forward: the projections of the single pixels sum to the whole
+    # pass, because the forward is linear in the voxels and each pixel writes
+    # its own footprint into the same sinogram.  Back: one pixel's cylinder is
+    # that pixel's row of the whole pass, computed from the same sinogram.  A
+    # body that reads a one-pixel call differently shows up here as an
+    # order-one error, not as a last bit.
+    m, idx, vals, sino, ref_fwd, ref_back, _b2 = _banded_case(["cpu"])
+    solo_fwd = np.zeros_like(ref_fwd)
+    for i in range(len(idx)):
+        solo_fwd += m.sparse_forward_project(vals[i:i + 1],
+                                             idx[i:i + 1]).cpu().numpy()
+    rel = np.max(np.abs(solo_fwd - ref_fwd)) / np.max(np.abs(ref_fwd))
+    print(f"parallel solo-pixel forward sum: rel {rel:.2e}")
+    assert rel < 1e-5, rel
+
+    for i in (0, 1, len(idx) // 2, len(idx) - 1):
+        row = m.sparse_back_project(sino, idx[i:i + 1]).cpu().numpy()
+        assert row.shape == (1, ref_back.shape[1])
+        rel_back = (np.max(np.abs(row[0] - ref_back[i]))
+                    / np.max(np.abs(ref_back[i])))
+        print(f"parallel solo-pixel back, pixel {i}: rel {rel_back:.2e}")
+        assert rel_back < 1e-5, (i, rel_back)
+
+
+def test_the_minimum_pixel_width_padding_keeps_the_values():
+    # The padding itself, held against the eager bodies it must agree with.
+    # The forward's padded column carries zero values at a repeated pixel
+    # index, and the forward output has no pixel axis, so the padded call is
+    # bit-identical and nothing is sliced off.  The back's output does carry
+    # the pixel axis, so the padded call's extra row is sliced away and the row
+    # that stays must be exact, not close -- at both coefficient powers.  A
+    # call that is already wide enough goes through untouched.
+    from mbirtorch import ConeBeamModel, projectors
+    from mbirtorch.parallel_beam import (ParallelBeamModel,
+                                         _parallel_back_view_batch,
+                                         _parallel_forward_view_batch)
+    # Declared by the geometry whose bodies need it, and by no other.
+    assert ParallelBeamModel.min_compiled_pixel_width == 2
+    assert ConeBeamModel.min_compiled_pixel_width == 1
+
+    m, idx, vals, sino, _rf, _rb, _b2 = _banded_case(["cpu"])
+    args = m._view_batch_args()
+    view_params = torch.as_tensor(np.asarray(m.get_params('angles')),
+                                  dtype=torch.float32)
+    one_idx = torch.as_tensor(idx[7:8], dtype=torch.int64)
+    one_vals = torch.as_tensor(vals[7:8])
+    sino_t = torch.as_tensor(sino)
+    widths = []
+
+    def spy_forward(values, pixel_indices, *a, **kw):
+        widths.append(int(pixel_indices.shape[0]))
+        return _parallel_forward_view_batch(values, pixel_indices, *a, **kw)
+
+    def spy_back(sino_batch, pixel_indices, *a, **kw):
+        widths.append(int(pixel_indices.shape[0]))
+        return _parallel_back_view_batch(sino_batch, pixel_indices, *a, **kw)
+
+    padded_fwd = projectors.forward_at_min_pixel_width(spy_forward, 2)
+    padded_back = projectors.back_at_min_pixel_width(spy_back, 2)
+
+    assert torch.equal(
+        padded_fwd(one_vals, one_idx, view_params, **args),
+        _parallel_forward_view_batch(one_vals, one_idx, view_params, **args))
+    assert widths == [2]                     # the body never saw one pixel
+    for power in (1, 2):
+        wrapped = padded_back(sino_t, one_idx, view_params,
+                              coeff_power=power, **args)
+        plain = _parallel_back_view_batch(sino_t, one_idx, view_params,
+                                          coeff_power=power, **args)
+        assert wrapped.shape == plain.shape
+        assert torch.equal(wrapped, plain), power
+    assert widths == [2, 2, 2]
+
+    all_idx = torch.as_tensor(idx, dtype=torch.int64)
+    padded_fwd(torch.as_tensor(vals), all_idx, view_params, **args)
+    padded_back(sino_t, all_idx, view_params, **args)
+    assert widths[-2:] == [len(idx), len(idx)]
+
+    # And the driver wraps what it compiles, only that: a hand-written kernel
+    # body comes back from maybe_compile as itself, cannot be miscompiled, and
+    # must keep its identity and its cost attribute.
+    pf = m.projector_functions
+    raw_fwd, raw_back = m._view_batch_bodies()
+    for bound, raw in ((pf._fwd_body_per_dev[0], raw_fwd),
+                       (pf._back_body_per_dev[0], raw_back)):
+        assert bound.__name__.startswith('padded_') == (bound is not raw)
 
