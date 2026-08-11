@@ -157,6 +157,18 @@ class ParallelBeamModel(TomographyModel):
     # automatic device count (see _widening_floors).
     _floor_family = 'parallel'
 
+    # Parallel takes the multi-device forward's column gather for a reason of
+    # its own: the forward kernel runs about twice as efficiently per slice on
+    # a full-width block of values as on the shard-width blocks the banded
+    # walk hands it at more than one device, and the gather hands it full
+    # width whatever the device count (measured 2026-08-10 on one H100, at
+    # 0.0411 ms per slice on a 1008-wide block against 0.0823 on a 504-wide
+    # one with the device count held at one).  Cone declares the same
+    # attribute because a slice band buys its kernel nothing at all; see
+    # TomographyModel._column_gather_forward for what else has to hold before
+    # the path runs.  It is still off unless forward_column_gather is set.
+    column_gather_geometry = True
+
     def get_psf_radius(self):
         """Computes the integer radius of the PSF kernel for parallel beam
         projection: the maximum number of detector channels on either side of

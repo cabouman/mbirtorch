@@ -414,13 +414,17 @@ class TomographyModel(ParameterHandler):
         Three things have to agree, and each guards a different mistake.
 
         The GEOMETRY must be one the column gather has been measured for.
-        ``column_gather_geometry`` is set by cone beam alone: translation and
-        multiaxis share the same banded branch and the same
-        band-independent per-call cost, so the shape should help them too,
-        but neither has ever been timed on it and neither should be switched
-        over on an argument.  A row-aligned geometry is excluded outright --
-        there each detector row has a single producing slice band, so a full
-        slice range per call would be pure waste.
+        ``column_gather_geometry`` is set by cone beam and by parallel beam,
+        which want the same full slice range for two different measured
+        reasons.  Cone NEEDS it: one slice projects onto a range of detector
+        rows, so a band-sized call still writes every row and costs what a
+        full call costs.  Parallel merely wants it: its forward kernel runs
+        about twice as efficiently per slice on a full-width block of values
+        as on the shard-width blocks the banded walk hands it at more than
+        one device.  Translation and multiaxis share cone's banded
+        branch and its band-independent per-call cost, so the shape should
+        help them too, but neither has ever been timed on it and neither
+        should be switched over on an argument.
 
         The SWITCH must be on.  ``forward_column_gather`` is unset by
         default, which leaves the banded walk as the shipped behaviour; the
@@ -430,7 +434,7 @@ class TomographyModel(ParameterHandler):
         lets one session run both shapes over the same inputs and compare
         their values.
         """
-        if self.rows_track_slices or not self.column_gather_geometry:
+        if not self.column_gather_geometry:
             return False
         override = os.environ.get(COLUMN_GATHER_ENV_VAR, '').strip().lower()
         if override in _COLUMN_GATHER_ON_VALUES:
@@ -629,27 +633,39 @@ class TomographyModel(ParameterHandler):
         :meth:`_sparse_forward_project_sharded`, for the geometries
         :meth:`_column_gather_forward` admits.
 
-        WHY the shape exists.  A geometry whose slices spread over a range of
-        detector rows pays per projector call whatever the slice band
-        contains, because the call's output spans the whole detector either
-        way.  Walking one band per slice-owner therefore costs that owner
-        count times one full call, and the forward stops falling when devices
-        are added -- measured flat at 32.2, 30.6 and 30.5 s over one, two and
-        four devices.  A full-height call per pixel batch is the shape the
-        single-device path already runs, so the work divides with the view
-        split the way it was meant to.  Measured 2026-08-10 on four H100s,
-        job mg10: cone's per-device forward fell from 29.7 to 19.4 s at two
-        devices and from 29.3 to 15.3 s at four, with a lower peak.
+        WHY the shape exists, for the two geometries that take it.  A
+        geometry whose slices spread over a range of detector rows pays per
+        projector call whatever the slice band contains, because the call's
+        output spans the whole detector either way.  Walking one band per
+        slice-owner therefore costs that owner count times one full call, and
+        the forward stops falling when devices are added -- measured flat at
+        32.2, 30.6 and 30.5 s over one, two and four devices.  A full-height
+        call per pixel batch is the shape the single-device path already
+        runs, so the work divides with the view split the way it was meant
+        to.  Measured 2026-08-10 on four H100s, job mg10: cone's per-device
+        forward fell from 29.7 to 19.4 s at two devices and from 29.3 to
+        15.3 s at four, with a lower peak.
+
+        A ROW-ALIGNED geometry's banded walk does divide the work, so its
+        reason is the other one: the forward kernel is about twice as
+        efficient per slice on a full-width block of values as on the
+        shard-width blocks the banded walk hands it, and this shape hands it
+        full width at every device count.  Measured 2026-08-10 on one H100,
+        at 0.0411 ms per slice on a 1008-wide block against 0.0823 on a
+        504-wide one with the device count held at one.
 
         WHAT DOES NOT MOVE.  Every view-owner still produces its own views'
         whole sinogram block, from the same voxels, through the same body, so
         the operator is unchanged and the sharded forward stays the adjoint
         of the sharded back.  Only which device assembles which voxels
         changes, and the back driver is untouched.  Two summation orders do
-        change: the vertical sum moves from a host-side sum across bands into
-        the body, and the pixel sum moves the other way, from the body into
-        the host-side sum across pixel batches.  Both sit inside the value
-        class the forward already has.
+        change for a two-fan geometry: the vertical sum moves from a host-side
+        sum across bands into the body, and the pixel sum moves the other way,
+        from the body into the host-side sum across pixel batches.  Both sit
+        inside the value class the forward already has.  A row-aligned
+        geometry has no vertical sum to move, its rows being concatenated
+        rather than added, so the pixel sum is the whole of what changes
+        there, and nothing changes at all when one batch covers the pass.
 
         The two skips of the banded form are kept or dropped deliberately.  A
         view-owner with no real views receives no gathers and produces an
@@ -663,11 +679,19 @@ class TomographyModel(ParameterHandler):
         transfer instead is the pixel batch.  The memory ledger stops
         charging the band copy to match.  ``back_project_slice_band`` is
         unaffected, the back driver being untouched."""
-        sp, _rp, view_spans, _band_ranges, idx_per = self._banded_setup(
+        sp, rp, view_spans, _band_ranges, idx_per = self._banded_setup(
             pixel_indices)
         pf = self.projector_functions
-        num_rows = int(self.get_params('sinogram_shape')[1])
         num_channels = int(self.get_params('sinogram_shape')[2])
+        # How tall a block one call returns, which is what the empty blocks
+        # below have to match.  A row-aligned geometry's body sizes its output
+        # by the values it was handed, and the gathered cylinder is the whole
+        # DEVICE-form slice axis -- padded tail included, which is exactly the
+        # length that geometry's sinogram pads its detector rows to.  A
+        # geometry whose slices spread over a range of rows returns the real
+        # detector rows whatever it is handed.
+        num_rows = (int(rp.padded_size) if self.rows_track_slices
+                    else int(self.get_params('sinogram_shape')[1]))
         num_pixels = int(idx_per[0].shape[0])
         shards = voxel_shards.tensors        # in device = global slice order
         pixel_batch = self._forward_pixel_batch()
@@ -1367,11 +1391,12 @@ class TomographyModel(ParameterHandler):
 
     # Whether this geometry's multi-device forward MAY gather pixel columns
     # instead of walking slice bands (see _column_gather_forward).  False is
-    # the base value because the shape has been measured on cone beam alone:
-    # translation and multiaxis have the same band-independent per-call cost
-    # and should gain from it too, but a geometry is switched over on its own
-    # measurement rather than on the argument.  Declaring this True does not
-    # turn the path on -- forward_column_gather does that.
+    # the base value because the shape has been measured on cone beam and
+    # parallel beam only: translation and multiaxis have the same
+    # band-independent per-call cost as cone and should gain from it too, but
+    # a geometry is switched over on its own measurement rather than on the
+    # argument.  Declaring this True does not turn the path on --
+    # forward_column_gather does that.
     column_gather_geometry = False
 
     # Which measured set of widening speed floors governs this geometry's

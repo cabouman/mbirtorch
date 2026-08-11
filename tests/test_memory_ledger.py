@@ -1116,15 +1116,25 @@ def test_format_calibration_judges_against_the_band_it_is_given():
 
 
 # ── the forward's column gather ──────────────────────────────────────────────
-def test_the_column_gather_swaps_the_band_copy_for_a_gathered_cylinder():
+@pytest.mark.parametrize('aligned', (False, True),
+                         ids=('two-fan', 'row-aligned'))
+def test_the_column_gather_swaps_the_band_copy_for_a_gathered_cylinder(aligned):
     """The two states of the same phase.  Walking slice bands leaves a
     broadcast band resident on every view-owner; gathering columns leaves a
     cylinder that is one pixel batch wide and the whole slice axis tall, and
-    no band at all.  Both forward phases carry the swap."""
+    no band at all.  Both forward phases carry the swap.
+
+    Both GEOMETRIES are priced by the same arithmetic, and the parametrization
+    is the claim: what a gather holds is set by the shape it assembles -- one
+    pixel batch by the whole device-form slice axis -- and not by whether the
+    geometry's detector rows track its slices.  The two take the path for
+    different reasons and pay the same term for it."""
     slices, batch = 32, 100                  # make_plan's slice axis
-    banded = estimate_peak_device_bytes(make_plan(n_devices=2))
+    banded = estimate_peak_device_bytes(
+        make_plan(n_devices=2, rows_track_slices=aligned))
     gathered = estimate_peak_device_bytes(
-        make_plan(n_devices=2, column_pixel_batch=batch))
+        make_plan(n_devices=2, rows_track_slices=aligned,
+                  column_pixel_batch=batch))
     for fragment in ('initial forward projection',
                      'subset delta forward projection'):
         walked = dict(_named(banded, fragment).terms)
@@ -1219,14 +1229,18 @@ def test_plan_from_model_reads_the_resolved_pixel_batch(monkeypatch):
     model.forward_project_pixel_batch = 512
     assert _memory_ledger.plan_from_model(
         model, devices).column_pixel_batch == 512
-    # A row-aligned geometry never takes the path, however it is asked.
+    # The row-aligned geometry takes the same path, so the same resolution has
+    # to reach its charge -- and the charge stays absent while its switch is
+    # off, which is the shipped state for both geometries.
     par = mbirtorch.ParallelBeamModel(cell, np.linspace(0, np.pi, cell[0],
                                                         endpoint=False))
     par.configure_devices(devices=['cpu'])
     par.set_params(no_warning=True, verbose=0)
-    par.forward_column_gather = True
     assert _memory_ledger.plan_from_model(
         par, devices).column_pixel_batch is None
+    par.forward_column_gather = True
+    assert _memory_ledger.plan_from_model(
+        par, devices).column_pixel_batch == FORWARD_PIXEL_BATCH
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────

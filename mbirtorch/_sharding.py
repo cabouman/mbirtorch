@@ -29,9 +29,11 @@ the SLICE axis:
 pixel columns at every slice on one view-owner.  A geometry whose slices
 project onto a range of detector rows needs the whole slice axis before it
 can produce any of its own rows, so a slice band buys it nothing, and the
-forward driver gathers columns for it when that path is switched on.  Only
-the forward has the second shape; the back projection reduces through
-``sum_band_to_owner`` either way.
+forward driver gathers columns for it when that path is switched on.  A
+row-aligned geometry can produce its rows from a band and takes the same
+gather anyway, because its kernel is markedly faster on the wider block of
+values.  Only the forward has the second shape; the back projection reduces
+through ``sum_band_to_owner`` either way.
 """
 
 import warnings
@@ -288,7 +290,10 @@ def gather_column_band(shard_tensors, p0, p1, target, dev2dev_safe=True):
     the rows it owns.  It takes a narrow column of pixels at every slice
     instead.  What one gather costs is then set by the width of the column
     batch and not by the device count, which is what makes the shape usable
-    at volumes where a whole assembled cylinder would not fit.
+    at volumes where a whole assembled cylinder would not fit.  A row-aligned
+    geometry, which could work from a band, takes the same gather for a
+    performance reason instead: what it gets back is a full-width block of
+    values, which is the width regime its kernel is efficient in.
 
     The concatenation is in shard order, which is global slice order, and it
     keeps the device form's padded slice tail rather than trimming it.  The

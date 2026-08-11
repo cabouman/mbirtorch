@@ -904,11 +904,11 @@ def test_column_gather_replaces_the_band_broadcast(monkeypatch):
 
 def test_the_column_gather_is_off_by_default_and_scoped_to_its_geometry(
         monkeypatch):
-    # The switch: off unless asked, refused on a row-aligned geometry however
-    # it is asked, and overridable from the environment either way so one
-    # session can run both shapes over the same inputs.  The environment is
-    # cleared first, because this test reads the DEFAULT and a suite run may
-    # be forcing the path on around it.
+    # The switch: off unless asked, refused on a geometry the shape has never
+    # been measured on however it is asked, and overridable from the
+    # environment either way so one session can run both shapes over the same
+    # inputs.  The environment is cleared first, because this test reads the
+    # DEFAULT and a suite run may be forcing the path on around it.
     import mbirtorch
     from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
     monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
@@ -918,11 +918,24 @@ def test_the_column_gather_is_off_by_default_and_scoped_to_its_geometry(
     cone.forward_column_gather = True
     assert cone._column_gather_forward()
 
+    # The row-aligned geometry declares the same capability, on its own
+    # measurement, and is off by default in the same way.
     angles = np.linspace(0, np.pi, 8, endpoint=False)
     par = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
-    par.forward_column_gather = True
-    assert not par.column_gather_geometry
+    assert par.column_gather_geometry
     assert not par._column_gather_forward()
+    par.forward_column_gather = True
+    assert par._column_gather_forward()
+
+    # A geometry that has never been timed on the shape refuses it however it
+    # is asked: translation shares cone's banded branch, and an argument that
+    # it should gain too is not a measurement.
+    trans = mbirtorch.TranslationModel(
+        (4, 6, 8), np.zeros((4, 3), dtype=np.float32),
+        source_detector_dist=32.0, source_iso_dist=16.0)
+    trans.forward_column_gather = True
+    assert not trans.column_gather_geometry
+    assert not trans._column_gather_forward()
 
     import os
     off = _cone_banded_case(["cpu", "cpu"])[0]
@@ -939,15 +952,21 @@ def test_the_column_gather_is_off_by_default_and_scoped_to_its_geometry(
     assert not off._column_gather_forward()
 
 
-def test_the_banded_walk_is_what_runs_with_the_switch_off(monkeypatch):
-    # The rollback, exercised: with the switch off the cone forward is the
-    # banded walk, which broadcasts bands and gathers no columns.  The
-    # environment knob is cleared first for the reason above.
+@pytest.mark.parametrize('geometry', ('cone', 'parallel'))
+def test_the_banded_walk_is_what_runs_with_the_switch_off(geometry,
+                                                          monkeypatch):
+    # The rollback, exercised on both geometries that can take the gather:
+    # with the switch off the forward is the banded walk, which broadcasts
+    # bands and gathers no columns.  The environment knob is cleared first for
+    # the reason above.
     from mbirtorch import _sharding as sharding
     from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
     monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
-    m, idx, vals, _sino, ref_fwd, _ref_back = _cone_banded_case(["cpu", "cpu"])
-    assert not m._column_gather_forward()
+    if geometry == 'cone':
+        m, idx, vals, _sino, ref_fwd, _rb = _cone_banded_case(["cpu", "cpu"])
+    else:
+        m, idx, vals, _sino, ref_fwd, _rb, _b2 = _banded_case(["cpu", "cpu"])
+    assert m.column_gather_geometry and not m._column_gather_forward()
     broadcasts = []
     real_broadcast = sharding.broadcast_band_to_views
 
@@ -1010,3 +1029,222 @@ def test_column_gather_recon_matches_single_device():
     print(f"cone recon vs n1: column gather {rel:.2e}, "
           f"banded {rel_banded:.2e}")
     assert rel < 5e-3, rel     # the shipped parity floor, as above
+
+
+# ── the same gather, on the row-aligned geometry ─────────────────────────────
+# Parallel takes the column gather for a different measured reason than cone.
+# It CAN produce its detector rows from a slice band -- the banded walk does
+# exactly that -- but its forward kernel runs about twice as efficiently per
+# slice on the full-width block of values the gather hands it as on the
+# shard-width blocks the band hands it (measured 2026-08-10 on one H100, at
+# 0.0411 ms per slice on a 1008-wide block against 0.0823 on a 504-wide one,
+# with the device count held at one).
+#
+# The value bar was expected to be EQUALITY here, on the argument that each
+# detector row keeps a single producing call and CPU sums are deterministic.
+# The row half of that is true, and the mechanics test below asserts it
+# directly.  Equality is not, and the measurement that settled it is recorded
+# because it is worth knowing before anyone tries again (2026-08-10, this
+# suite, virtual CPU devices).  Run first in a fresh interpreter, BOTH the
+# banded walk and the column gather reproduce the single-device sinogram bit
+# for bit.  Run once other shapes have gone through the same per-device
+# bodies -- which is what a full suite run does -- both land in the float32
+# epsilon class instead, the banded walk at 1.6e-07 to 4.0e-07 and the gather
+# at 1.1e-07 to 4.0e-07 over the same cells.  The cause is the same for both:
+# the per-device bodies are separately torch.compiled, and what a compiled
+# body emits depends on the shapes its instance has already seen, so two
+# devices can differ in the last bit on identical inputs.  Bit-equality is
+# therefore a property of the process, not of the driver shape, and these
+# tests hold the gather against the shape it replaces instead.
+def _parallel_column_case(devices, sino_shape=(8, 6, 8), pixel_batch=None):
+    """A parallel model on virtual CPU devices with the column gather
+    switched on, plus its single-device reference."""
+    m, idx, vals, sino, ref_fwd, ref_back, _b2 = _banded_case(devices,
+                                                              sino_shape)
+    m.forward_column_gather = True
+    if pixel_batch is not None:
+        m.forward_project_pixel_batch = pixel_batch
+    assert m._column_gather_forward()
+    return m, idx, vals, sino, ref_fwd, ref_back
+
+
+def test_parallel_column_gather_matches_the_shape_it_replaces():
+    # The values gate.  Both shapes are run over the same inputs in the same
+    # process and both are held to the same bar, which is the reading that
+    # does not move with the compile state above; the two distances are
+    # printed side by side for the same reason.  One call per view-owner over
+    # every pixel is the single-device call in every respect that sets a
+    # value: the same voxel columns in one array, the whole slice range
+    # anchored at 0, and each detector row produced by that one call and no
+    # other.  A row taking contributions from more than one call would show up
+    # here as an order-one error, not as a last bit.
+    for n in (2, 3):
+        # None takes the shipped batch, which covers a pass this size in one
+        # call; the large value asks for that explicitly.
+        for batch in (None, 10 ** 6):
+            m, idx, vals, _sino, ref_fwd, _rb = _banded_case(["cpu"] * n)[:6]
+            banded = m._gather_sinogram(m.sparse_forward_project(vals, idx))
+            m.forward_column_gather = True
+            if batch is not None:
+                m.forward_project_pixel_batch = batch
+            fwd = m._gather_sinogram(m.sparse_forward_project(vals, idx))
+            scale = np.max(np.abs(ref_fwd))
+            rel = np.max(np.abs(fwd - ref_fwd)) / scale
+            rel_banded = np.max(np.abs(banded - ref_fwd)) / scale
+            print(f"parallel column gather n={n} batch={batch}: rel {rel:.2e},"
+                  f" banded {rel_banded:.2e}")
+            assert rel < 1e-5 and rel_banded < 1e-5, (n, batch, rel,
+                                                      rel_banded)
+
+    # The one summation order this shape does change for a row-aligned
+    # geometry: several pixel batches turn a single accumulation over every
+    # pixel into a host-side sum of per-batch partials.  Nothing about the
+    # rows moves, so what is left is float noise in the same class as above
+    # (measured 1.0e-07 to 1.6e-07 here).  This is the case that runs at
+    # production sizes, where the pass is far wider than one batch.
+    for batch in (1, 5, 7):
+        m, idx, vals, _sino, ref_fwd, _rb = _parallel_column_case(
+            ["cpu", "cpu"], pixel_batch=batch)
+        fwd = m._gather_sinogram(m.sparse_forward_project(vals, idx))
+        rel = np.max(np.abs(fwd - ref_fwd)) / np.max(np.abs(ref_fwd))
+        print(f"parallel column gather, {batch}-pixel batches: rel {rel:.2e}")
+        assert rel < 1e-5, (batch, rel)
+
+
+def test_parallel_column_gather_gathers_columns_and_sizes_its_rows_by_them(
+        monkeypatch):
+    # The mechanics witness, plus the row-aligned fact the banded walk used to
+    # supply by construction.  With the gather on, the parallel forward calls
+    # gather_column_band and broadcasts no band; each cylinder is one pixel
+    # batch by the WHOLE device-form slice axis; each projector call runs at
+    # slice_start=0 over that whole axis for the owner's own views; and the
+    # block that comes back is as TALL as the cylinder, because a row-aligned
+    # body sizes its output by the values it was handed.  That last one is why
+    # the assembled shard carries the device form's padded row count and not
+    # the real detector rows.
+    from mbirtorch import _sharding as sharding
+    batch, n = 4, 2
+    m, idx, vals, _sino, _ref_fwd, _rb = _parallel_column_case(
+        ["cpu"] * n, pixel_batch=batch)
+    slices = m.recon_placement.padded_size
+    channels = int(m.get_params('sinogram_shape')[2])
+    gathers, calls = [], []
+    real_gather = sharding.gather_column_band
+
+    def spy_gather(shard_tensors, p0, p1, target, dev2dev_safe=True):
+        out = real_gather(shard_tensors, p0, p1, target, dev2dev_safe)
+        gathers.append((len(shard_tensors), p0, p1, tuple(out.shape)))
+        return out
+
+    def spy_broadcast(*args, **kwargs):
+        raise AssertionError("the column gather must not broadcast a band")
+
+    real_call = m.projector_functions.sparse_forward_project_view_range
+
+    def spy_call(band_values, pixel_indices, view_range, slice_start=0,
+                 dev_index=0, plan=None):
+        block = real_call(band_values, pixel_indices, view_range,
+                          slice_start=slice_start, dev_index=dev_index,
+                          plan=plan)
+        calls.append((tuple(band_values.shape), tuple(view_range), slice_start,
+                      tuple(block.shape)))
+        return block
+
+    monkeypatch.setattr(sharding, "gather_column_band", spy_gather)
+    monkeypatch.setattr(sharding, "broadcast_band_to_views", spy_broadcast)
+    monkeypatch.setattr(m.projector_functions,
+                        "sparse_forward_project_view_range", spy_call)
+    fwd = m.sparse_forward_project(vals, idx)
+
+    expected_batches = -(-len(idx) // batch)
+    assert len(gathers) == n * expected_batches
+    for pieces, p0, p1, shape in gathers:
+        assert pieces == n                      # one piece per slice-owner
+        assert shape == (p1 - p0, slices)       # the batch, at every slice
+        assert p1 - p0 <= batch
+    assert len(calls) == n * expected_batches
+    for cyl_shape, (v0, v1), slice_start, block_shape in calls:
+        assert slice_start == 0 and cyl_shape[1] == slices
+        assert block_shape == (v1 - v0, slices, channels)
+    assert set((v0, v1) for _c, (v0, v1), _s, _b in calls) == {
+        (v0, v0 + valid) for _d, (v0, _v1), valid
+        in m.sino_placement.padded_shard_ranges() if valid > 0}
+    # And the shard the driver assembles carries those same rows.
+    assert all(tuple(t.shape[1:]) == (slices, channels) for t in fwd.tensors)
+
+
+def test_parallel_column_gather_holds_the_padded_and_sparse_view_forms():
+    # The two forms where a row-aligned geometry's DEVICE shape differs from
+    # its problem shape.  A padded slice axis pads the sinogram's detector
+    # rows with it, so every block this driver assembles -- including the
+    # empty one it builds for a view-owner with no real views -- has to be the
+    # padded row count.  Sized at the real detector rows instead, which is the
+    # count a row-RANGE geometry's blocks carry, the shards do not concatenate
+    # at all.
+    for shape, devs in (((9, 7, 8), 2),        # both axes padded
+                        ((3, 7, 8), 4)):       # padded rows, an empty owner
+        m, idx, vals, sino, ref_fwd, ref_back = _parallel_column_case(
+            ["cpu"] * devs, sino_shape=shape, pixel_batch=10 ** 6)
+        assert m.recon_placement.is_padded and m.sino_placement.is_padded
+        real_rows = shape[1]
+        fwd = m.sparse_forward_project(vals, idx)
+        assert all(t.shape[1] == m.recon_placement.padded_size
+                   for t in fwd.tensors), shape
+        # The padded row tail stays identically zero, as the entry fill left
+        # it: the gathered cylinder's padded slice tail is zero, and a
+        # row-aligned body maps those columns straight to those rows.
+        assert max(float(t[:, real_rows:].abs().max()) for t in fwd.tensors) \
+            == 0.0, shape
+        assert np.allclose(m._gather_sinogram(fwd), ref_fwd, atol=1e-5), shape
+        # The back driver is untouched, so the pair stays adjoint.
+        back = m.sparse_back_project(sino, idx)
+        assert np.allclose(back.gather()[:, :vals.shape[1]], ref_back,
+                           atol=1e-5)
+        lhs = float(np.sum(m._gather_sinogram(fwd) * sino))
+        rhs = float(np.sum(vals * back.gather()[:, :vals.shape[1]]))
+        assert abs(lhs - rhs) / max(abs(rhs), 1e-30) < 1e-4, (shape, lhs, rhs)
+
+
+def test_parallel_column_gather_recon_matches_single_device():
+    # The end-to-end gate, where the subset passes call the forward on small
+    # pixel sets and the pixel batch above therefore bites: a seeded parallel
+    # reconstruction on two virtual CPU devices with the gather on must
+    # reproduce the single-device run within the loop's own multi-device
+    # floor, which the banded walk beside it is read against.
+    import mbirtorch
+    sino_shape = (8, 6, 8)
+    angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
+
+    def build(devices):
+        m = mbirtorch.ParallelBeamModel(sino_shape, angles)
+        m.configure_devices(devices=["cpu"])
+        m.set_params(no_warning=True, verbose=0)
+        if len(devices) > 1:
+            m.configure_devices(devices=devices)
+        return m
+
+    m1 = build(["cpu"])
+    rs = tuple(m1.get_params('recon_shape'))
+    phantom = np.zeros(rs, dtype=np.float32)
+    phantom[1:-1, 1:-1, 1:-1] = 1.0
+    sino = m1.forward_project(phantom)
+    np.random.seed(31)
+    ref, _ = m1.recon(sino, max_iterations=3, stop_threshold_change_pct=0.0)
+
+    banded = build(["cpu", "cpu"])
+    np.random.seed(31)
+    banded_out, _ = banded.recon(sino, max_iterations=3,
+                                 stop_threshold_change_pct=0.0)
+    gathered = build(["cpu", "cpu"])
+    gathered.forward_column_gather = True
+    gathered.forward_project_pixel_batch = 8
+    np.random.seed(31)
+    out, _ = gathered.recon(sino, max_iterations=3,
+                            stop_threshold_change_pct=0.0)
+    scale = max(np.max(np.abs(ref)), 1e-30)
+    rel = np.max(np.abs(out - ref)) / scale
+    rel_banded = np.max(np.abs(banded_out - ref)) / scale
+    print(f"parallel recon vs n1: column gather {rel:.2e}, "
+          f"banded {rel_banded:.2e}")
+    assert rel < 5e-4, rel     # the sharded VCD loop's own floor at this cell
+
