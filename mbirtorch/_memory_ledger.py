@@ -72,12 +72,18 @@ DIRECTION_CYLINDERS = 7
 # apply_worker holds the direction and the scaled direction.
 APPLY_CYLINDERS = 2
 # How many gathered column cylinders a forward on the column-gather path
-# holds at once: the pieces that arrive from the slice-owners and the
-# concatenation they are assembled into.  It is two rather than three because
-# the driver releases the previous batch's cylinder before the next gather,
-# which python would otherwise evaluate before rebinding the name
-# (TomographyModel._sparse_forward_project_columns).
-COLUMN_GATHER_RESIDENTS = 2
+# holds at once (TomographyModel._sparse_forward_project_columns).  The driver
+# issues each batch's gather one batch ahead of the projection that reads it,
+# so at the widest instant -- inside the gather that runs ahead -- a device
+# holds three: the cylinder the projection is about to read, the pieces
+# arriving from the slice-owners for the batch after it, and the concatenation
+# those pieces are assembled into.
+#
+# The last batch of a pass has nothing to gather ahead of it, and a pass that
+# fits in one batch never gathers ahead at all, so both hold two rather than
+# three.  The charge covers the widest instant, which is the rule the ledger
+# keeps: it may charge more than a run needs but never less.
+COLUMN_GATHER_RESIDENTS = 3
 
 # Library workspace that torch allocates through its own caching allocator,
 # and that the ledger's array enumeration therefore cannot see.  Measured as
@@ -529,13 +535,14 @@ def estimate_peak_device_bytes(plan):
         from every slice-owner and concatenates them, so what a view-owner
         holds is that batch by the WHOLE device-form slice axis -- and,
         unlike the band copy it replaces, that does not grow with the shard,
-        so it does not grow with the problem at a fixed batch.  Two are live
-        at the gather, the arriving pieces and their concatenation; see
-        COLUMN_GATHER_RESIDENTS for why two and not three.
+        so it does not grow with the problem at a fixed batch.  Three are live
+        at the widest instant, because the driver gathers one batch ahead of
+        the projection that reads it; see COLUMN_GATHER_RESIDENTS for which
+        three.
 
-        Measured 2026-08-10 on four H100s, job mg10: the assembled cylinder
-        read 7.9, 15.8 and 31.5 MiB at batches 2048, 4096 and 8192 at 1008
-        slices, which is the closed form exactly.
+        Measured 2026-08-10 on four H100s, job mg10: ONE such cylinder read
+        7.9, 15.8 and 31.5 MiB at batches 2048, 4096 and 8192 at 1008 slices,
+        which is the closed form exactly.
         """
         if n == 1 or not is_view_owner(i) or not plan.column_pixel_batch:
             return 0

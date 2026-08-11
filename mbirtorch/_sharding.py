@@ -36,6 +36,8 @@ values.  Only the forward has the second shape; the back projection reduces
 through ``sum_band_to_owner`` either way.
 """
 
+import contextlib
+import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 
@@ -403,6 +405,142 @@ def gather_column_band(shard_tensors, p0, p1, target, dev2dev_safe=True):
     pieces = [move_shard(t[p0:p1], target, dev2dev_safe=dev2dev_safe)
               for t in shard_tensors]
     return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=1)
+
+
+# ── copy streams for the column gather (CUDA only) ───────────────────────────
+# One extra CUDA stream per device, used for nothing but the column gather's
+# cross-device copies.  A stream runs its work in the order it was given, one
+# item at a time, so copies left on the stream a device projects on can only
+# take turns with those projections however early they are issued -- torch
+# issues a cross-device copy on the SOURCE device's current stream and orders
+# the DESTINATION device's current stream behind it, and for the gather's
+# worker threads both of those are the default stream the device projects on.
+# A stream of their own is what lets a copy and a projection run at once.
+#
+# Cached per device index and created once, the way projectors.py caches its
+# compiled bodies: the lock is taken only to CREATE a stream, so the worker
+# threads that ask for one every batch find it already there and stay
+# lock-free.
+_COPY_STREAMS = {}
+_COPY_STREAM_LOCK = threading.Lock()
+
+
+def copy_stream(device):
+    """The dedicated copy stream for ``device``, or None when it has none.
+
+    None is returned for every non-CUDA device, and it is the signal the
+    callers below read as "this device has no streams to arrange": each of
+    them then does the plain synchronous thing, which is what the CPU and MPS
+    paths have always done.
+    """
+    device = torch.device(device)
+    if device.type != 'cuda':
+        return None
+    index = (device.index if device.index is not None
+             else torch.cuda.current_device())
+    stream = _COPY_STREAMS.get(index)
+    if stream is None:
+        with _COPY_STREAM_LOCK:
+            stream = _COPY_STREAMS.get(index)
+            if stream is None:
+                stream = torch.cuda.Stream(device=index)
+                _COPY_STREAMS[index] = stream
+    return stream
+
+
+def _gather_stream_devices(shard_tensors, target):
+    """The distinct CUDA devices one gather touches: every shard's device and
+    the target it assembles on.  Ordered by device index so that the nested
+    stream contexts are always entered in the same order."""
+    seen = {}
+    for dev in [t.device for t in shard_tensors] + [torch.device(target)]:
+        if dev.type == 'cuda':
+            index = (dev.index if dev.index is not None
+                     else torch.cuda.current_device())
+            seen[index] = torch.device('cuda', index)
+    return [seen[index] for index in sorted(seen)]
+
+
+def open_copy_streams(devices):
+    """Let the copy streams start: each waits for its device's compute stream.
+
+    The shards a gather reads were written by earlier kernels on the compute
+    stream, and a copy stream knows nothing of that stream's ordering, so
+    without this a copy could read a shard before the kernel that filled it
+    had finished.  Called once per forward rather than per batch: it orders
+    the copy stream behind everything queued so far, which covers every batch
+    that follows.
+    """
+    for dev in devices:
+        stream = copy_stream(dev)
+        if stream is not None:
+            stream.wait_stream(torch.cuda.current_stream(torch.device(dev)))
+
+
+def close_copy_streams(devices):
+    """The other half of :func:`open_copy_streams`: each compute stream waits
+    for its copy stream.
+
+    A copy READS a slice-owner's shard, and whatever writes that shard next
+    runs on the compute stream.  Nothing else orders those two, so without
+    this a later update could overwrite a shard while a copy was still
+    reading it.
+    """
+    for dev in devices:
+        stream = copy_stream(dev)
+        if stream is not None:
+            torch.cuda.current_stream(torch.device(dev)).wait_stream(stream)
+
+
+def gather_column_band_async(shard_tensors, p0, p1, target, dev2dev_safe=True):
+    """:func:`gather_column_band`, issued on the copy streams.
+
+    The values are the same either way; what this adds is that the copies do
+    not go into the queue the projections run in, so a gather can be moving
+    while an earlier batch is projected.
+
+    Returns:
+        (tensor, ready): the assembled cylinder, and an event that fires once
+        its copies have landed -- or None for the event off CUDA, where the
+        copies are already finished by the time this returns.
+    """
+    stream = copy_stream(target)
+    if stream is None:
+        return gather_column_band(shard_tensors, p0, p1, target,
+                                  dev2dev_safe), None
+    # BOTH ends of every copy have to be on a copy stream: torch issues the
+    # copy on the source's current stream and orders the destination's current
+    # stream behind it, so leaving either end on its default stream would put
+    # the copy straight back in the queue the projections run in.
+    with contextlib.ExitStack() as stack:
+        for dev in _gather_stream_devices(shard_tensors, target):
+            stack.enter_context(torch.cuda.stream(copy_stream(dev)))
+        cylinder = gather_column_band(shard_tensors, p0, p1, target,
+                                      dev2dev_safe)
+        ready = torch.cuda.Event()
+        ready.record(stream)
+    # The cylinder was allocated on the copy stream and is read on the compute
+    # stream.  Without this the caching allocator would be free to hand its
+    # block to the next gather the moment python drops the name, while the
+    # projection was still reading it.  This covers the arriving pieces too:
+    # they are allocated and concatenated on the one copy stream, and the only
+    # one that ever escapes is the single-shard case, where the piece IS the
+    # cylinder returned here.
+    cylinder.record_stream(torch.cuda.current_stream(torch.device(target)))
+    return cylinder, ready
+
+
+def wait_for_column_band(target, ready):
+    """Hold ``target``'s compute stream until one batch's copies have landed.
+
+    The event is per batch and is waited on immediately before the projection
+    that reads that batch.  Waiting on the copy stream as a whole instead
+    would also wait for the batch gathered ahead, which is exactly the work
+    meant to be moving during this projection, and the overlap would collapse
+    back into taking turns.
+    """
+    if ready is not None:
+        torch.cuda.current_stream(torch.device(target)).wait_event(ready)
 
 
 # ── per-device threaded execution (the mbirjax thread_execution.py port) ──────

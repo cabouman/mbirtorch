@@ -690,6 +690,19 @@ class TomographyModel(ParameterHandler):
         slice-owner at once; the padding it carries is inert (see
         :func:`_sharding.gather_column_band`).
 
+        Each batch's gather is issued ONE BATCH AHEAD of the projection that
+        reads it, and on CUDA its copies run on a stream of their own, so a
+        device projects one batch while the next batch's values are still
+        moving to it.  Issuing early is what makes that possible; the separate
+        stream is what makes it happen, because a stream runs its work one
+        item at a time and copies sharing the projection's stream could only
+        take turns with it.  The accumulation is untouched -- the batches are
+        still summed in the same order -- so the values do not move; what
+        changes is that a device holds one more cylinder at once, which the
+        memory ledger charges (COLUMN_GATHER_RESIDENTS).  The comment at the
+        gather gives the full ordering argument, and off CUDA the gather stays
+        the synchronous one it has always been.
+
         ``forward_project_slice_band`` has nothing to act on here, because
         this shape does not band the slice axis at all; what bounds the
         transfer instead is the pixel batch.  The memory ledger stops
@@ -711,6 +724,8 @@ class TomographyModel(ParameterHandler):
         num_pixels = int(idx_per[0].shape[0])
         shards = voxel_shards.tensors        # in device = global slice order
         pixel_batch = self._forward_pixel_batch()
+        batch_bounds = [(p0, min(p0 + pixel_batch, num_pixels))
+                        for p0 in range(0, num_pixels, pixel_batch)]
 
         def worker(i, dev):
             v0, v1, _block = view_spans[i]
@@ -721,19 +736,66 @@ class TomographyModel(ParameterHandler):
                                    dtype=voxel_shards.dtype, device=dev)
             local_idx = idx_per[i]
             owned = None
-            for p0 in range(0, num_pixels, pixel_batch):
-                p1 = min(p0 + pixel_batch, num_pixels)
-                full_cyl = _sharding.gather_column_band(
+
+            def gather(k):
+                p0, p1 = batch_bounds[k]
+                return _sharding.gather_column_band_async(
                     shards, p0, p1, dev, self.dev2dev_safe)
+
+            # The batch after the one being projected, gathered ahead of it.
+            # A pass of one batch has nothing to gather ahead, and no pixels
+            # at all leaves this empty.
+            ahead = gather(0) if batch_bounds else None
+            for k, (p0, p1) in enumerate(batch_bounds):
+                full_cyl, ready = ahead
+                # Issue the NEXT batch's gather before this batch is
+                # projected, rather than after, so its copies are already
+                # moving while this projection runs.  Nothing here waits for a
+                # value: run_per_device performs no synchronization, and the
+                # gather returns once its copies are issued.
+                #
+                # THE ORDERING, end to end.  Four things arrange it, and each
+                # covers a different way the copies and the projections could
+                # get in each other's way.
+                #
+                # The copies run on a stream of their own, one per device
+                # (:func:`_sharding.copy_stream`).  A stream runs its work in
+                # the order it was given, one item at a time, so copies left
+                # on the stream a device projects on could only take turns
+                # with the projections, however early they were issued.  On
+                # their own stream the two run at once.
+                #
+                # Before any copy starts, each copy stream waits for its
+                # device's compute stream, so a copy cannot read a shard
+                # before the kernel that wrote it has finished
+                # (``open_copy_streams``, called once below).
+                #
+                # Every batch carries its OWN event, recorded on the copy
+                # stream once that batch's copies and their concatenation are
+                # queued.  The compute stream waits for that one event just
+                # before the projection that reads that batch, so a projection
+                # never starts on a cylinder that has not arrived -- and never
+                # waits for the batch gathered ahead of it, which is the work
+                # meant to be moving right now.
+                #
+                # After the pass, each compute stream waits for its copy
+                # stream (``close_copy_streams``), so a later update cannot
+                # overwrite a shard while a copy is still reading it.
+                #
+                # Off CUDA none of this applies: the gather copies
+                # synchronously, returns no event, the wait below does
+                # nothing, and the values are the ones the plain path has
+                # always produced.
+                ahead = gather(k + 1) if k + 1 < len(batch_bounds) else None
+                _sharding.wait_for_column_band(dev, ready)
                 part = pf.sparse_forward_project_view_range(
                     full_cyl, local_idx[p0:p1], (v0, v1), slice_start=0,
                     dev_index=i)
-                # Released BEFORE the accumulation and before the next
-                # gather: the next batch's gather evaluates before it rebinds
-                # this name, so without the release each device carries the
-                # previous batch's cylinder through the next batch's
-                # transfer.  The same release the banded branch makes on its
-                # per-band partials.
+                # Released BEFORE the accumulation, so a device carries this
+                # batch's cylinder no further than the projection that reads
+                # it.  With the gather ahead of it, the batch after this one is
+                # already resident by now, which is the third cylinder the
+                # memory ledger charges (COLUMN_GATHER_RESIDENTS).
                 full_cyl = None
                 if owned is None:
                     owned = part
@@ -753,9 +815,23 @@ class TomographyModel(ParameterHandler):
         # worker: a fan-out per pixel batch would issue a thread dispatch per
         # (batch, device), and putting the loop inside also issues each
         # device's gathers from the thread that consumes them.
-        with self._band_pool(sp.n_devices) as pool:
-            tensors = _sharding.run_per_device(sp.devices, worker,
-                                               executor=pool)
+        #
+        # The copies read the slice-owners' shards and land on the
+        # view-owners, so both sets of devices have a copy stream to order
+        # (see the comment at the gather above).  Off CUDA both calls do
+        # nothing.
+        gather_devices = (list(voxel_shards.placement.devices)
+                          + list(sp.devices))
+        _sharding.open_copy_streams(gather_devices)
+        try:
+            with self._band_pool(sp.n_devices) as pool:
+                tensors = _sharding.run_per_device(sp.devices, worker,
+                                                   executor=pool)
+        finally:
+            # Closed even if a worker raised: copies that were already issued
+            # are still in flight, and the shards they read must not be
+            # overwritten under them.
+            _sharding.close_copy_streams(gather_devices)
         if sp.is_padded:
             # The banded form's own tail fill: zero-fill each owner's padded
             # view tail up to its block length.

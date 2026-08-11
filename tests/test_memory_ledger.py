@@ -1184,7 +1184,14 @@ def test_the_column_gather_swaps_the_band_copy_for_a_gathered_cylinder(aligned):
     is the claim: what a gather holds is set by the shape it assembles -- one
     pixel batch by the whole device-form slice axis -- and not by whether the
     geometry's detector rows track its slices.  The two take the path for
-    different reasons and pay the same term for it."""
+    different reasons and pay the same term for it.
+
+    THREE such cylinders are charged, not one: the driver gathers one batch
+    ahead of the projection that reads it, so the widest instant holds the
+    cylinder about to be projected, the pieces arriving for the batch after
+    it, and their concatenation.  The count is written out here rather than
+    read from the module, so that changing the constant alone cannot move the
+    charge without this test noticing."""
     slices, batch = 32, 100                  # make_plan's slice axis
     banded = estimate_peak_device_bytes(
         make_plan(n_devices=2, rows_track_slices=aligned))
@@ -1198,19 +1205,25 @@ def test_the_column_gather_swaps_the_band_copy_for_a_gathered_cylinder(aligned):
         assert walked['broadcast band'][0] > 0, fragment
         assert walked['column cylinder'] == [0, 0], fragment
         assert columns['broadcast band'] == [0, 0], fragment
-        assert columns['column cylinder'] == [2 * batch * slices * 4] * 2, \
+        assert columns['column cylinder'] == [3 * batch * slices * 4] * 2, \
             fragment
 
 
 def test_the_gathered_cylinder_is_capped_by_the_pass_it_covers():
     """A batch wider than the pixel set gathers the pixel set: the charge
     follows what one call is actually handed, which is what keeps the term
-    honest at the small end without a separate rule."""
+    honest at the small end without a separate rule.
+
+    Such a pass runs as a single batch and so gathers nothing ahead, holding
+    two cylinders where the charge is three.  That over-charge is deliberate:
+    the ledger's one hard rule is that it may never charge less than a run
+    needs, and one term that covers the widest instant is simpler than a
+    second rule for the passes that fall short of it."""
     slices, pixels = 32, 800
     ledger = estimate_peak_device_bytes(
         make_plan(n_devices=2, column_pixel_batch=10 ** 6))
     terms = dict(_named(ledger, 'initial forward projection').terms)
-    assert terms['column cylinder'] == [2 * pixels * slices * 4] * 2
+    assert terms['column cylinder'] == [3 * pixels * slices * 4] * 2
 
 
 def test_the_gathered_cylinder_does_not_grow_with_the_device_count():

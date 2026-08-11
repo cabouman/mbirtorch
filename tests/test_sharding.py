@@ -970,6 +970,100 @@ def test_column_gather_replaces_the_band_broadcast(monkeypatch):
         in m.sino_placement.padded_shard_ranges() if valid > 0}
 
 
+def test_the_column_gather_runs_one_batch_ahead_of_the_projection(monkeypatch):
+    # The prefetch witness.  Each view-owner issues the NEXT pixel batch's
+    # gather before it projects the current batch, so that on real devices the
+    # copies feeding one projection can be moving while another projection
+    # runs.  On virtual CPU devices nothing moves and nothing can be timed, so
+    # what is asserted here is the ORDER the driver issues its work in, which
+    # is the part of the change that has to hold on every device.
+    #
+    # The order one worker records is g0, g1, p0, g2, p1, ... , g(K-1), p(K-2),
+    # p(K-1): batch k+1's gather is issued before batch k is projected, the
+    # first gather runs before the loop, and the last batch has nothing to
+    # gather ahead of it.  The entry and exit of each projection are both
+    # recorded, so the witness is not merely that the gather precedes the
+    # accumulation -- it precedes the projector call entirely.
+    #
+    # Each worker runs in its own thread, so events are kept per thread.  A
+    # pool thread is allowed to run more than one worker when one finishes
+    # before the next is submitted, and it would then record two workers'
+    # sequences end to end; the check reads blocks rather than the whole list
+    # so that it witnesses the order either way.
+    #
+    # The environment knob is cleared first, the way the tests around this one
+    # already do: it forces the gather off whatever the model says, so a suite
+    # run that sets it would otherwise decide what this test measures.
+    import threading
+    from mbirtorch import _sharding as sharding
+    from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
+    monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
+    batch, n = 4, 2
+    m, idx, vals, _sino, ref_fwd, _rb = _cone_column_case(
+        ["cpu"] * n, pixel_batch=batch)
+    n_batches = -(-len(idx) // batch)
+    assert n_batches > 1                       # or there is no prefetch to see
+    events = {}
+    real_gather = sharding.gather_column_band
+    real_call = m.projector_functions.sparse_forward_project_view_range
+
+    def spy_gather(shard_tensors, p0, p1, target, dev2dev_safe=True):
+        # Recorded at ENTRY: what is being witnessed is when the gather is
+        # issued, not when it returns.
+        events.setdefault(threading.get_ident(), []).append(f'g{p0 // batch}')
+        return real_gather(shard_tensors, p0, p1, target, dev2dev_safe)
+
+    def spy_call(band_values, pixel_indices, view_range, slice_start=0,
+                 dev_index=0, plan=None):
+        seq = events.setdefault(threading.get_ident(), [])
+        # Number the projections within THIS worker, which begins at its own
+        # first gather, so that a thread running a second worker starts over
+        # at zero rather than counting on from the first.
+        first = len(seq) - 1 - seq[::-1].index('g0')
+        k = sum(1 for e in seq[first:] if e.endswith('-in'))
+        seq.append(f'p{k}-in')
+        block = real_call(band_values, pixel_indices, view_range,
+                          slice_start=slice_start, dev_index=dev_index,
+                          plan=plan)
+        seq.append(f'p{k}-out')
+        return block
+
+    monkeypatch.setattr(sharding, "gather_column_band", spy_gather)
+    monkeypatch.setattr(m.projector_functions,
+                        "sparse_forward_project_view_range", spy_call)
+    fwd = m._gather_sinogram(m.sparse_forward_project(vals, idx))
+
+    expected = ['g0']
+    for k in range(n_batches):
+        if k + 1 < n_batches:
+            expected.append(f'g{k + 1}')
+        expected += [f'p{k}-in', f'p{k}-out']
+    assert events, "the column gather did not run"
+    recorded = 0
+    for seq in events.values():
+        # Every worker of this cell owns real views, so each ran the whole
+        # sequence; a thread holds a whole number of them.
+        assert len(seq) % len(expected) == 0, seq
+        for start in range(0, len(seq), len(expected)):
+            assert seq[start:start + len(expected)] == expected, seq
+            recorded += 1
+    assert recorded == n                       # one sequence per view-owner
+    # The prefetch moves WHEN a gather is issued and nothing else, so the
+    # values are the ones the path already produced.
+    assert np.allclose(fwd, ref_fwd, atol=1e-5)
+
+    # And the values hold across batch widths that force several batches,
+    # including one that leaves a short final batch (30 pixels over 7).
+    for width in (1, 3, 7):
+        mb, idxb, valsb, _s, ref_b, _rb2 = _cone_column_case(
+            ["cpu"] * n, pixel_batch=width)
+        out = mb._gather_sinogram(mb.sparse_forward_project(valsb, idxb))
+        rel = np.max(np.abs(out - ref_b)) / np.max(np.abs(ref_b))
+        print(f"cone gather one batch ahead, {width}-pixel batches: "
+              f"rel {rel:.2e}")
+        assert rel < 1e-5, (width, rel)
+
+
 def test_the_column_gather_is_on_by_default_and_scoped_to_its_geometry(
         monkeypatch):
     # The switch: on unless refused, refused on a geometry the shape has never
