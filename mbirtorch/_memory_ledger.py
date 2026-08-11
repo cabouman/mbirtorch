@@ -71,6 +71,13 @@ PROX_CYLINDERS = 4
 DIRECTION_CYLINDERS = 7
 # apply_worker holds the direction and the scaled direction.
 APPLY_CYLINDERS = 2
+# How many gathered column cylinders a forward on the column-gather path
+# holds at once: the pieces that arrive from the slice-owners and the
+# concatenation they are assembled into.  It is two rather than three because
+# the driver releases the previous batch's cylinder before the next gather,
+# which python would otherwise evaluate before rebinding the name
+# (TomographyModel._sparse_forward_project_columns).
+COLUMN_GATHER_RESIDENTS = 2
 
 # Library workspace that torch allocates through its own caching allocator,
 # and that the ledger's array enumeration therefore cannot see.  Measured as
@@ -225,6 +232,11 @@ class LedgerPlan:
     # ── knobs and model choices ──────────────────────────────────────────────
     forward_band: int = None
     back_band: int = None
+    # The pixel-column batch the forward's column gather assembles at once,
+    # or None when the forward walks slice bands instead.  One field rather
+    # than a flag and a width, so the two can never disagree, and resolved by
+    # the model in plan_from_model rather than re-derived here.
+    column_pixel_batch: int = None
     qggmrf_cylinders: int = QGGMRF_CYLINDERS_COMPILED
     # (direction, num_pixels, band_cols) -> (view_batch, bytes_per_view), with
     # direction in {'forward', 'back'}.  Defaults to a no-charge model so a
@@ -298,16 +310,36 @@ def estimate_peak_device_bytes(plan):
         return (plan.band_length(i, 'back') if plan.rows_track_slices
                 else num_rows_dev)
 
+    def column_gather_slices():
+        """The slice extent one column-gather call is handed: the WHOLE
+        device-form slice axis, padded tail included, because the gathered
+        cylinder spans every slice-owner at once."""
+        return sum(int(block[0]) for block in plan.slice_blocks)
+
+    def forward_call_pixels(num_pixels):
+        """How many pixel columns ONE forward call is handed: every pixel of
+        the pass by default, and one column batch on the column-gather path,
+        which is what makes that path's per-call terms fall."""
+        if plan.column_pixel_batch:
+            return min(int(num_pixels), int(plan.column_pixel_batch))
+        return int(num_pixels)
+
     def forward_cols(i):
         """The forward call's band_cols: its voxel columns."""
-        return (int(plan.recon_shape[2]) if n == 1
-                else plan.band_length(i, 'forward'))
+        if n == 1:
+            return int(plan.recon_shape[2])
+        if plan.column_pixel_batch:
+            return column_gather_slices()
+        return plan.band_length(i, 'forward')
 
     def band_slices(i, direction):
         """The slice extent one projection call is handed: the whole slice
-        axis at one device, this owner's slice band under sharding."""
+        axis at one device, this owner's slice band under sharding, and the
+        whole device-form axis again on the column-gather path."""
         if n == 1:
             return int(plan.recon_shape[2])
+        if direction == 'forward' and plan.column_pixel_batch:
+            return column_gather_slices()
         return plan.band_length(i, direction)
 
     def torch_body_batch(i, direction, num_pixels):
@@ -341,9 +373,12 @@ def estimate_peak_device_bytes(plan):
     def forward_batch(i, num_pixels):
         if not is_view_owner(i):
             return 0
+        # A call's own pixel count, which is the pass's on the banded path
+        # and one column batch on the column-gather path.
+        call_pixels = forward_call_pixels(num_pixels)
         if 'forward' in plan.torch_body_directions:
-            return torch_body_batch(i, 'forward', num_pixels)
-        return plan.batch_bytes('forward', num_pixels, forward_cols(i))
+            return torch_body_batch(i, 'forward', call_pixels)
+        return plan.batch_bytes('forward', call_pixels, forward_cols(i))
 
     def band_reduce(i, num_pixels):
         """The back reduce's co-residency on a slice-owner.
@@ -457,10 +492,34 @@ def estimate_peak_device_bytes(plan):
         the copy is a full cylinder-shard on each device, on top of the
         device's own shard.  Without this term the model falls below the
         measured peak on a large cone reconstruction at four devices.
+
+        The column-gather path broadcasts no band at all, so this term is
+        zero there and ``forward_column_cylinder`` charges what it holds
+        instead.
         """
-        if n == 1 or not is_view_owner(i):
+        if n == 1 or not is_view_owner(i) or plan.column_pixel_batch:
             return 0
         return cyl(i, num_pixels)
+
+    def forward_column_cylinder(i, num_pixels):
+        """The gathered cylinder the column-gather forward assembles.
+
+        ``_sharding.gather_column_band`` moves one batch of pixel columns
+        from every slice-owner and concatenates them, so what a view-owner
+        holds is that batch by the WHOLE device-form slice axis -- and,
+        unlike the band copy it replaces, that does not grow with the shard,
+        so it does not grow with the problem at a fixed batch.  Two are live
+        at the gather, the arriving pieces and their concatenation; see
+        COLUMN_GATHER_RESIDENTS for why two and not three.
+
+        Measured 2026-08-10 on four H100s, job mg10: the assembled cylinder
+        read 7.9, 15.8 and 31.5 MiB at batches 2048, 4096 and 8192 at 1008
+        slices, which is the closed form exactly.
+        """
+        if n == 1 or not is_view_owner(i) or not plan.column_pixel_batch:
+            return 0
+        return (COLUMN_GATHER_RESIDENTS * forward_call_pixels(num_pixels)
+                * column_gather_slices() * _F32_BYTES)
 
     def forward_view_batches(i, num_pixels):
         """How many batches one owner's forward view loop runs, or None when
@@ -471,7 +530,7 @@ def estimate_peak_device_bytes(plan):
         if real_views <= 0 or plan.view_charge is None:
             return None
         view_batch = int(plan.view_charge(
-            'forward', int(num_pixels), forward_cols(i))[0])
+            'forward', forward_call_pixels(num_pixels), forward_cols(i))[0])
         return max(1, -(-int(real_views) // max(1, view_batch)))
 
     def forward_block_rows(i):
@@ -515,7 +574,9 @@ def estimate_peak_device_bytes(plan):
         charged.
 
         The batch follows the pixel count of THIS call, so the subset phases
-        must pass their own subset size rather than the full index count.
+        must pass their own subset size rather than the full index count --
+        and on the column-gather path a call's pixel count is one column
+        batch, which raises the view batch and with it this block.
         """
         if not is_view_owner(i):
             return 0
@@ -524,7 +585,8 @@ def estimate_peak_device_bytes(plan):
         already_paid = 0 if 'forward' in plan.torch_body_directions else 1
         view_batch = 1
         if plan.view_charge is not None:
-            view_batch = plan.view_charge('forward', num_pixels,
+            view_batch = plan.view_charge('forward',
+                                          forward_call_pixels(num_pixels),
                                           forward_cols(i))[0]
         return ((live - already_paid) * int(view_batch)
                 * forward_block_rows(i) * num_channels * _F32_BYTES)
@@ -660,6 +722,8 @@ def estimate_peak_device_bytes(plan):
             ('init recon', per_dev(recon_dev)),
             ('voxel gather', per_dev(lambda i: cyl(i, p_full))),
             ('broadcast band', per_dev(lambda i: forward_band_copy(i, p_full))),
+            ('column cylinder', per_dev(
+                lambda i: forward_column_cylinder(i, p_full))),
             ('forward output', per_dev(forward_fixed)),
             ('forward block', per_dev(lambda i: forward_block(i, p_full))),
             ('forward batch', per_dev(lambda i: forward_batch(i, p_full))),
@@ -788,6 +852,8 @@ def estimate_peak_device_bytes(plan):
                     lambda i: sino_dev(i) if n > 1 and is_view_owner(i) else 0)),
                 ('broadcast band', per_dev(
                     lambda i: forward_band_copy(i, p_sub))),
+                ('column cylinder', per_dev(
+                    lambda i: forward_column_cylinder(i, p_sub))),
                 ('forward block', per_dev(lambda i: forward_block(i, p_sub))),
                 ('forward batch', per_dev(lambda i: forward_batch(i, p_sub))),
             ],
@@ -907,6 +973,11 @@ def plan_from_model(model, devices, partition_sequence=None, weights=None,
         hessian_masked=model.get_params('use_ror_mask') is not False,
         forward_band=getattr(model, 'forward_project_slice_band', None),
         back_band=getattr(model, 'back_project_slice_band', None),
+        # Both read from the model's own resolvers rather than re-derived
+        # here: a charge that re-implements a driver rule is a charge that
+        # can be left behind when the rule moves.
+        column_pixel_batch=(model._forward_pixel_batch()
+                            if model._column_gather_forward() else None),
         qggmrf_cylinders=qggmrf_cylinder_count(model),
         view_charge=charge,
         torch_body_directions=torch_body_directions(model),

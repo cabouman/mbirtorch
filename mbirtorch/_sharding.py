@@ -15,13 +15,23 @@ tensors there,
 so the n=1 reconstruction path is unchanged.
 
 Under view/slice sharding the only data that crosses the recon<->sino
-boundary is voxel-cylinder slice-bands (the sinogram is written locally on
-its view-shard and never moves).  That crossing is the banded adjoint pair:
+boundary is voxel cylinders (the sinogram is written locally on its
+view-shard and never moves).  Two shapes of that crossing exist, and they
+differ in which axis of the cylinder is cut.  The banded adjoint pair cuts
+the SLICE axis:
 
   - ``broadcast_band_to_views`` (forward / all-gather): copy a slice-band
     from its slice-owner to every view-owner.
   - ``sum_band_to_owner`` (back / reduce-scatter): sum each view-owner's
     band partials onto the band's slice-owner.
+
+``gather_column_band`` cuts the PIXEL axis instead: it assembles one batch of
+pixel columns at every slice on one view-owner.  A geometry whose slices
+project onto a range of detector rows needs the whole slice axis before it
+can produce any of its own rows, so a slice band buys it nothing, and the
+forward driver gathers columns for it when that path is switched on.  Only
+the forward has the second shape; the back projection reduces through
+``sum_band_to_owner`` either way.
 """
 
 import warnings
@@ -261,6 +271,52 @@ def broadcast_band_to_views(band, view_owners, dev2dev_safe=True):
     """
     return {dev: move_shard(band, dev, dev2dev_safe=dev2dev_safe)
             for dev in view_owners}
+
+
+def gather_column_band(shard_tensors, p0, p1, target, dev2dev_safe=True):
+    """Gather one batch of pixel columns, at EVERY slice, onto ``target``.
+
+    The forward's second transfer primitive, built from :func:`move_shard`
+    exactly as :func:`broadcast_band_to_views` is.  Each slice-owner holds
+    the same pixel columns for its own slices, so moving every owner's
+    ``[p0:p1]`` rows to one device and concatenating them along the slice
+    axis assembles those columns' whole cylinder there.
+
+    This is the cross-device shape a geometry needs when one recon slice
+    projects onto a RANGE of detector rows: such a view-owner cannot produce
+    any of its own rows from a slice band, because every slice contributes to
+    the rows it owns.  It takes a narrow column of pixels at every slice
+    instead.  What one gather costs is then set by the width of the column
+    batch and not by the device count, which is what makes the shape usable
+    at volumes where a whole assembled cylinder would not fit.
+
+    The concatenation is in shard order, which is global slice order, and it
+    keeps the device form's padded slice tail rather than trimming it.  The
+    tail is held at zero by the model, a zero voxel contributes nothing
+    through a projection, and the geometry bodies anchor their z geometry on
+    the real slice count from the params rather than on the width of the
+    array they are handed -- so the tail is inert, and trimming it would only
+    force a non-contiguous copy inside the projector.
+
+    This changes which device assembles which voxels, never which device
+    produces which sinogram rows, so it has no adjoint of its own: the back
+    projection is untouched and still reduces through
+    :func:`sum_band_to_owner`.
+
+    Args:
+        shard_tensors (sequence of tensor): the slice-sharded cylinders, each
+            (num_pixels, local_slices), in global slice order.
+        p0 (int): first pixel column of the batch.
+        p1 (int): one past the last pixel column of the batch.
+        target (torch.device): the view-owner the cylinder is assembled on.
+        dev2dev_safe (bool): forwarded to :func:`move_shard`.
+
+    Returns:
+        tensor: (p1 - p0, total_slices) on ``target``.
+    """
+    pieces = [move_shard(t[p0:p1], target, dev2dev_safe=dev2dev_safe)
+              for t in shard_tensors]
+    return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=1)
 
 
 # ── per-device threaded execution (the mbirjax thread_execution.py port) ──────

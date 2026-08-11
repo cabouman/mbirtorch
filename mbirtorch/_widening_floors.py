@@ -175,13 +175,20 @@ FLOORS = {
 #: module-level chunk constants and the budget class attributes these files
 #: carry are exactly the kind of tuning that moves a crossover without
 #: touching any function this table names, so a function-level hash would
-#: miss them.
-COST_INPUT_FILES = ('triton_parallel.py', 'triton_cone.py', 'projectors.py')
+#: miss them.  ``_sharding.py`` is here because it holds the cross-device
+#: transfer primitives the multi-device drivers are built from, and how much
+#: those move is most of what a wider device count costs.
+COST_INPUT_FILES = ('triton_parallel.py', 'triton_cone.py', 'projectors.py',
+                    '_sharding.py')
 
 #: Methods of TomographyModel that drive the multi-device projections.  The
 #: rest of that module moves for reasons unrelated to projection cost, so the
-#: hash is taken over these two sources rather than the whole file.
+#: hash is taken over these sources rather than the whole file.  The column
+#: gather is a third driver rather than a branch of the first, so it is named
+#: here in its own right; leaving it out would let the pixel batch it walks
+#: change without anything noticing.
 COST_INPUT_METHODS = ('_sparse_forward_project_sharded',
+                      '_sparse_forward_project_columns',
                       '_sparse_back_project_sharded')
 
 #: sha256 of each cost input as of the measurement above -- the recorded

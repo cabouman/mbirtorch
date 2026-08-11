@@ -343,6 +343,12 @@ class ConeBeamModel(TomographyModel):
     # higher than parallel's: its n=2 has no measured admission point at all.
     _floor_family = 'cone'
 
+    # Cone is the geometry the multi-device forward's column gather was
+    # measured on (see TomographyModel._column_gather_forward for what else
+    # has to hold before it runs, and _sparse_forward_project_columns for the
+    # numbers).  The path is still off unless forward_column_gather is set.
+    column_gather_geometry = True
+
     def create_projectors(self):
         super().create_projectors()
         # Warm the DC-damping profile and its per-device compiled instances

@@ -1115,6 +1115,120 @@ def test_format_calibration_judges_against_the_band_it_is_given():
         rows, band=_memory_ledger.TORCH_BODY_CALIBRATION_BAND)
 
 
+# ── the forward's column gather ──────────────────────────────────────────────
+def test_the_column_gather_swaps_the_band_copy_for_a_gathered_cylinder():
+    """The two states of the same phase.  Walking slice bands leaves a
+    broadcast band resident on every view-owner; gathering columns leaves a
+    cylinder that is one pixel batch wide and the whole slice axis tall, and
+    no band at all.  Both forward phases carry the swap."""
+    slices, batch = 32, 100                  # make_plan's slice axis
+    banded = estimate_peak_device_bytes(make_plan(n_devices=2))
+    gathered = estimate_peak_device_bytes(
+        make_plan(n_devices=2, column_pixel_batch=batch))
+    for fragment in ('initial forward projection',
+                     'subset delta forward projection'):
+        walked = dict(_named(banded, fragment).terms)
+        columns = dict(_named(gathered, fragment).terms)
+        assert walked['broadcast band'][0] > 0, fragment
+        assert walked['column cylinder'] == [0, 0], fragment
+        assert columns['broadcast band'] == [0, 0], fragment
+        assert columns['column cylinder'] == [2 * batch * slices * 4] * 2, \
+            fragment
+
+
+def test_the_gathered_cylinder_is_capped_by_the_pass_it_covers():
+    """A batch wider than the pixel set gathers the pixel set: the charge
+    follows what one call is actually handed, which is what keeps the term
+    honest at the small end without a separate rule."""
+    slices, pixels = 32, 800
+    ledger = estimate_peak_device_bytes(
+        make_plan(n_devices=2, column_pixel_batch=10 ** 6))
+    terms = dict(_named(ledger, 'initial forward projection').terms)
+    assert terms['column cylinder'] == [2 * pixels * slices * 4] * 2
+
+
+def test_the_gathered_cylinder_does_not_grow_with_the_device_count():
+    """The property that dissolves the objection to assembling whole
+    cylinders: the term is the batch by the WHOLE slice axis on every
+    view-owner, so adding devices does not change it -- where the broadcast
+    band it replaces is a shard and halves with the count."""
+    charges, bands = [], []
+    for n in (2, 4):
+        gathered = estimate_peak_device_bytes(
+            make_plan(n_devices=n, column_pixel_batch=100))
+        walked = estimate_peak_device_bytes(make_plan(n_devices=n))
+        charges.append(dict(_named(gathered, 'initial forward projection')
+                            .terms)['column cylinder'][0])
+        bands.append(dict(_named(walked, 'initial forward projection')
+                          .terms)['broadcast band'][0])
+    assert charges[0] == charges[1]
+    assert bands[1] == bands[0] // 2
+    # A single device never gathers: it holds the whole volume already.
+    one = estimate_peak_device_bytes(
+        make_plan(n_devices=1, column_pixel_batch=100))
+    assert dict(_named(one, 'initial forward projection')
+                .terms)['column cylinder'] == [0]
+
+
+def test_the_column_gather_prices_the_call_it_actually_makes():
+    """The two terms that move with the new call shape.  One call is handed
+    the WHOLE device-form slice axis instead of a band, and one pixel batch
+    instead of every pixel of the pass, so the per-view cost model must be
+    asked those two numbers."""
+    asked = []
+
+    def charge(direction, num_pixels, band_cols):
+        asked.append((direction, num_pixels, band_cols))
+        return 4, 1024
+
+    batch = 100
+    estimate_peak_device_bytes(make_plan(n_devices=2, view_charge=charge))
+    walked = [(p, c) for d, p, c in asked if d == 'forward']
+    asked.clear()
+    estimate_peak_device_bytes(
+        make_plan(n_devices=2, view_charge=charge, column_pixel_batch=batch))
+    gathered = [(p, c) for d, p, c in asked if d == 'forward']
+    assert {c for _p, c in walked} == {16}          # one slice shard of 32
+    assert {c for _p, c in gathered} == {32}        # the whole slice axis
+    assert max(p for p, _c in walked) == 800        # the whole pass
+    assert max(p for p, _c in gathered) == batch
+
+
+def test_plan_from_model_reads_the_resolved_pixel_batch(monkeypatch):
+    """The ledger must not re-derive the driver's rule.  It asks the model
+    for the batch it would actually walk, so a changed default or an override
+    reaches the charge without a second edit here.
+
+    The environment knob is cleared first, because the first assertion reads
+    the default and a suite run may be forcing the path on around it."""
+    from mbirtorch.tomography_model import (COLUMN_GATHER_ENV_VAR,
+                                            FORWARD_PIXEL_BATCH)
+    monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
+    cell = (8, 8, 8)
+    angles = np.linspace(0, 2 * np.pi, cell[0], endpoint=False)
+    model = mbirtorch.ConeBeamModel(cell, angles, source_detector_dist=32,
+                                    source_iso_dist=16)
+    model.configure_devices(devices=['cpu'])
+    model.set_params(no_warning=True, verbose=0)
+    devices = ['cpu', 'cpu']
+    assert _memory_ledger.plan_from_model(
+        model, devices).column_pixel_batch is None
+    model.forward_column_gather = True
+    assert _memory_ledger.plan_from_model(
+        model, devices).column_pixel_batch == FORWARD_PIXEL_BATCH
+    model.forward_project_pixel_batch = 512
+    assert _memory_ledger.plan_from_model(
+        model, devices).column_pixel_batch == 512
+    # A row-aligned geometry never takes the path, however it is asked.
+    par = mbirtorch.ParallelBeamModel(cell, np.linspace(0, np.pi, cell[0],
+                                                        endpoint=False))
+    par.configure_devices(devices=['cpu'])
+    par.set_params(no_warning=True, verbose=0)
+    par.forward_column_gather = True
+    assert _memory_ledger.plan_from_model(
+        par, devices).column_pixel_batch is None
+
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 def _named(ledger, fragment):
     for phase in ledger.phases:

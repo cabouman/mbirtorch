@@ -38,6 +38,25 @@ from .projectors import Projectors, maybe_compile
 
 _F32_EPS = float(np.finfo(np.float32).eps)
 
+# ── the multi-device forward's column gather ─────────────────────────────────
+# How many pixel columns one gathered cylinder covers (see
+# TomographyModel._forward_pixel_batch and _sparse_forward_project_columns).
+# The cylinder is this many columns by the whole slice axis, so this is the
+# knob that bounds the cross-device transient on that path.  Measured
+# 2026-08-10 on four H100s, job mg10: per-device forward time fell at every
+# batch tried -- 2048, 4096, 8192 -- and was still falling at the largest, so
+# this is the largest value MEASURED and not a knee, and the sweep above it
+# has not been run.  Set forward_project_pixel_batch on the model to override.
+FORWARD_PIXEL_BATCH = 8192
+
+# Forces the column gather on ('1', 'true', 'yes', 'on') or off ('0',
+# 'false', 'no', 'off') whatever the model attribute says.  Read per call,
+# like the other environment knobs, so one session can run both shapes -- the
+# comparison the value gate for this path is read from.
+COLUMN_GATHER_ENV_VAR = 'MBIRTORCH_FORWARD_COLUMN_GATHER'
+_COLUMN_GATHER_ON_VALUES = ('1', 'true', 'yes', 'on')
+_COLUMN_GATHER_OFF_VALUES = ('0', 'false', 'no', 'off')
+
 
 # ── compiled updater glue (module level, one compile per process) ─────────────
 # Eagerly there were ~20 kernel launches per subset between the projector
@@ -388,6 +407,49 @@ class TomographyModel(ParameterHandler):
         b = fixed_band if fixed_band else slices_per_dev
         return min(int(b), slices_per_dev)
 
+    def _column_gather_forward(self):
+        """Whether the multi-device forward gathers pixel COLUMNS instead of
+        walking slice bands.
+
+        Three things have to agree, and each guards a different mistake.
+
+        The GEOMETRY must be one the column gather has been measured for.
+        ``column_gather_geometry`` is set by cone beam alone: translation and
+        multiaxis share the same banded branch and the same
+        band-independent per-call cost, so the shape should help them too,
+        but neither has ever been timed on it and neither should be switched
+        over on an argument.  A row-aligned geometry is excluded outright --
+        there each detector row has a single producing slice band, so a full
+        slice range per call would be pure waste.
+
+        The SWITCH must be on.  ``forward_column_gather`` is unset by
+        default, which leaves the banded walk as the shipped behaviour; the
+        banded branch stays in place and is the rollback.
+
+        The ENVIRONMENT may override the switch either way, which is what
+        lets one session run both shapes over the same inputs and compare
+        their values.
+        """
+        if self.rows_track_slices or not self.column_gather_geometry:
+            return False
+        override = os.environ.get(COLUMN_GATHER_ENV_VAR, '').strip().lower()
+        if override in _COLUMN_GATHER_ON_VALUES:
+            return True
+        if override in _COLUMN_GATHER_OFF_VALUES:
+            return False
+        return bool(getattr(self, 'forward_column_gather', None))
+
+    def _forward_pixel_batch(self):
+        """How many pixel columns one gathered cylinder covers.
+
+        :data:`FORWARD_PIXEL_BATCH` carries the value and its provenance.
+        ``forward_project_pixel_batch`` on the model overrides it, the same
+        way ``forward_project_slice_band`` overrides the band rule.  The
+        memory ledger calls THIS method rather than re-deriving the number,
+        so a changed default cannot leave the charge behind."""
+        fixed = getattr(self, 'forward_project_pixel_batch', None)
+        return max(1, int(fixed)) if fixed else FORWARD_PIXEL_BATCH
+
     @staticmethod
     def _balanced_slice_bounds(extent, band_len):
         """Tile ``[0, extent)`` into balanced bands no longer than
@@ -444,12 +506,19 @@ class TomographyModel(ParameterHandler):
 
         Under padding each owner projects only its REAL views (padded views
         have no angles), and its padded view tail is zero-filled after
-        assembly, keeping the device form inert end to end."""
+        assembly, keeping the device form inert end to end.
+
+        A geometry whose slices spread over a range of detector rows can take
+        :meth:`_sparse_forward_project_columns` instead, which cuts the
+        cylinder the other way; :meth:`_column_gather_forward` says when."""
         if voxel_shards.placement.is_trivial:
             return _sharding.Shards(
                 [self.projector_functions._sparse_forward_project_single_device(
                     voxel_shards.tensors[0], pixel_indices)],
                 self.sino_placement)
+        if self._column_gather_forward():
+            return self._sparse_forward_project_columns(voxel_shards,
+                                                        pixel_indices)
         sp, rp, view_spans, band_ranges, idx_per = self._banded_setup(pixel_indices)
         pf = self.projector_functions
         aligned = self.rows_track_slices
@@ -544,6 +613,112 @@ class TomographyModel(ParameterHandler):
         if sp.is_padded:
             # Zero-fill each owner's padded view tail up to its block length
             # (built on the owner device; only the last owner has a tail).
+            tensors = [
+                t if t.shape[0] == block else torch.cat(
+                    [t, torch.zeros((block - t.shape[0],) + tuple(t.shape[1:]),
+                                    dtype=t.dtype, device=t.device)])
+                for t, (_v0, _v1, block) in zip(tensors, view_spans)]
+        return _sharding.Shards(tensors, sp)
+
+    def _sparse_forward_project_columns(self, voxel_shards, pixel_indices):
+        """The multi-device forward as a pixel-batched column gather: each
+        view-owner walks the pixel axis in batches, gathers each batch's
+        cylinder at every slice from every slice-owner, and makes ONE
+        projector call per batch over its own views and the whole slice
+        range.  The alternative to the banded walk in
+        :meth:`_sparse_forward_project_sharded`, for the geometries
+        :meth:`_column_gather_forward` admits.
+
+        WHY the shape exists.  A geometry whose slices spread over a range of
+        detector rows pays per projector call whatever the slice band
+        contains, because the call's output spans the whole detector either
+        way.  Walking one band per slice-owner therefore costs that owner
+        count times one full call, and the forward stops falling when devices
+        are added -- measured flat at 32.2, 30.6 and 30.5 s over one, two and
+        four devices.  A full-height call per pixel batch is the shape the
+        single-device path already runs, so the work divides with the view
+        split the way it was meant to.  Measured 2026-08-10 on four H100s,
+        job mg10: cone's per-device forward fell from 29.7 to 19.4 s at two
+        devices and from 29.3 to 15.3 s at four, with a lower peak.
+
+        WHAT DOES NOT MOVE.  Every view-owner still produces its own views'
+        whole sinogram block, from the same voxels, through the same body, so
+        the operator is unchanged and the sharded forward stays the adjoint
+        of the sharded back.  Only which device assembles which voxels
+        changes, and the back driver is untouched.  Two summation orders do
+        change: the vertical sum moves from a host-side sum across bands into
+        the body, and the pixel sum moves the other way, from the body into
+        the host-side sum across pixel batches.  Both sit inside the value
+        class the forward already has.
+
+        The two skips of the banded form are kept or dropped deliberately.  A
+        view-owner with no real views receives no gathers and produces an
+        empty block, as before.  The banded form's all-padding sub-band skip
+        has no counterpart here, because a gathered cylinder spans every
+        slice-owner at once; the padding it carries is inert (see
+        :func:`_sharding.gather_column_band`).
+
+        ``forward_project_slice_band`` has nothing to act on here, because
+        this shape does not band the slice axis at all; what bounds the
+        transfer instead is the pixel batch.  The memory ledger stops
+        charging the band copy to match.  ``back_project_slice_band`` is
+        unaffected, the back driver being untouched."""
+        sp, _rp, view_spans, _band_ranges, idx_per = self._banded_setup(
+            pixel_indices)
+        pf = self.projector_functions
+        num_rows = int(self.get_params('sinogram_shape')[1])
+        num_channels = int(self.get_params('sinogram_shape')[2])
+        num_pixels = int(idx_per[0].shape[0])
+        shards = voxel_shards.tensors        # in device = global slice order
+        pixel_batch = self._forward_pixel_batch()
+
+        def worker(i, dev):
+            v0, v1, _block = view_spans[i]
+            if v1 <= v0:
+                # A view-owner with no real views (the sparse-view extension)
+                # produces an empty block, which assembles as pure zeros.
+                return torch.zeros((0, num_rows, num_channels),
+                                   dtype=voxel_shards.dtype, device=dev)
+            local_idx = idx_per[i]
+            owned = None
+            for p0 in range(0, num_pixels, pixel_batch):
+                p1 = min(p0 + pixel_batch, num_pixels)
+                full_cyl = _sharding.gather_column_band(
+                    shards, p0, p1, dev, self.dev2dev_safe)
+                part = pf.sparse_forward_project_view_range(
+                    full_cyl, local_idx[p0:p1], (v0, v1), slice_start=0,
+                    dev_index=i)
+                # Released BEFORE the accumulation and before the next
+                # gather: the next batch's gather evaluates before it rebinds
+                # this name, so without the release each device carries the
+                # previous batch's cylinder through the next batch's
+                # transfer.  The same release the banded branch makes on its
+                # per-band partials.
+                full_cyl = None
+                if owned is None:
+                    owned = part
+                else:
+                    owned.add_(part)
+                # Released after the accumulation, so the summation order is
+                # untouched and only the residency changes.
+                part = None
+            if owned is None:
+                # No pixels at all: the owner still owes its views' block,
+                # and the banded form would have produced it as zeros too.
+                owned = torch.zeros((v1 - v0, num_rows, num_channels),
+                                    dtype=voxel_shards.dtype, device=dev)
+            return owned
+
+        # ONE fan-out for the whole call, with the pixel loop inside the
+        # worker: a fan-out per pixel batch would issue a thread dispatch per
+        # (batch, device), and putting the loop inside also issues each
+        # device's gathers from the thread that consumes them.
+        with self._band_pool(sp.n_devices) as pool:
+            tensors = _sharding.run_per_device(sp.devices, worker,
+                                               executor=pool)
+        if sp.is_padded:
+            # The banded form's own tail fill: zero-fill each owner's padded
+            # view tail up to its block length.
             tensors = [
                 t if t.shape[0] == block else torch.cat(
                     [t, torch.zeros((block - t.shape[0],) + tuple(t.shape[1:]),
@@ -1189,6 +1364,15 @@ class TomographyModel(ParameterHandler):
     # drivers take the row-aligned fast path when this is True and would
     # silently mis-assemble a geometry that forgot to declare itself.
     rows_track_slices = False
+
+    # Whether this geometry's multi-device forward MAY gather pixel columns
+    # instead of walking slice bands (see _column_gather_forward).  False is
+    # the base value because the shape has been measured on cone beam alone:
+    # translation and multiaxis have the same band-independent per-call cost
+    # and should gain from it too, but a geometry is switched over on its own
+    # measurement rather than on the argument.  Declaring this True does not
+    # turn the path on -- forward_column_gather does that.
+    column_gather_geometry = False
 
     # Which measured set of widening speed floors governs this geometry's
     # automatic device count (see _widening_floors).  None -- the base value

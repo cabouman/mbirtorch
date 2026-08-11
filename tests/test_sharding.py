@@ -751,3 +751,262 @@ def test_sparse_view_more_devices_than_views():
     crel = np.max(np.abs(cout - cref)) / max(np.max(np.abs(cref)), 1e-30)
     print(f"sparse-view cone n4 vs n1: rel {crel:.2e}")
     assert crel < 5e-3, crel   # same calibration as the parallel case above
+
+
+# ── the forward's column gather (default off) ────────────────────────────────
+# What may FAIL here, and what may only be recorded.  The value bar these
+# tests hold is the one the library already ships: the kernel-parity floor the
+# suites above enforce, at the 1e-5 relative these cone cases use on CPU.  The
+# multi-GPU measurement also registered an EXPECTATION beside that floor -- the
+# column gather sat about 1.5e-06 relative from the one-device anchor at the
+# 1024-class cell (measured 2026-08-10 on four H100s, job mg10), against a
+# banded walk that sat at its own repeat floor.  That expectation is recorded
+# so a later reading well outside it is visible to a human weighing the
+# tradeoff; it is deliberately NOT a threshold, and nothing here asserts it.
+# The distances below are printed for that comparison.  On CPU the runs are
+# deterministic and the gather's calls are the single-device call shape, so
+# what these tests do assert is exact-path mechanics rather than that bar.
+def _cone_column_case(devices, cell=(8, 8, 8), pixel_batch=None):
+    """A cone model on virtual CPU devices with the column gather switched
+    on, plus its single-device reference."""
+    m, idx, vals, sino, ref_fwd, ref_back = _cone_banded_case(devices, cell)
+    m.forward_column_gather = True
+    if pixel_batch is not None:
+        m.forward_project_pixel_batch = pixel_batch
+    assert m._column_gather_forward()
+    return m, idx, vals, sino, ref_fwd, ref_back
+
+
+def test_gather_column_band_assembles_the_full_height_cylinder():
+    # The primitive: every slice-owner's rows [p0:p1] moved to one target and
+    # concatenated along the SLICE axis, in shard (global slice) order.  A
+    # single shard short-circuits the concatenation.
+    from mbirtorch._sharding import gather_column_band
+    rng = np.random.default_rng(11)
+    full = torch.as_tensor(rng.standard_normal((9, 6)).astype(np.float32))
+    shards = [full[:, 0:2].contiguous(), full[:, 2:4].contiguous(),
+              full[:, 4:6].contiguous()]
+    cyl = gather_column_band(shards, 3, 7, torch.device("cpu"))
+    assert cyl.shape == (4, 6)
+    assert torch.equal(cyl, full[3:7])
+    # A degenerate range is legal and empty; one shard is returned as itself.
+    empty = gather_column_band(shards, 5, 5, torch.device("cpu"))
+    assert empty.shape == (0, 6)
+    one = gather_column_band(shards[:1], 0, 9, torch.device("cpu"))
+    assert torch.equal(one, shards[0])
+    # The host-bounce path is value-correct too (dev2dev_safe False).
+    bounced = gather_column_band(shards, 0, 9, torch.device("cpu"),
+                                 dev2dev_safe=False)
+    assert torch.equal(bounced, full)
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(),
+                    reason="needs a second local device (mps)")
+def test_gather_column_band_moves_across_real_devices():
+    from mbirtorch._sharding import gather_column_band
+    full = torch.rand(32, 8)
+    shards = [full[:, :4].contiguous().to("cpu"),
+              full[:, 4:].contiguous().to("mps")]
+    cyl = gather_column_band(shards, 8, 16, torch.device("mps"))
+    assert cyl.device.type == "mps"
+    assert torch.allclose(cyl.cpu(), full[8:16], atol=1e-6)
+
+
+def test_column_gather_matches_single_device_at_every_batch():
+    # The values gate on virtual CPU devices: a full-height call at
+    # slice_start=0 is the single-device call shape, so the gathered forward
+    # must reproduce the single-device values -- at one batch covering the
+    # pass, and at batches that force several.
+    for n in (2, 3):
+        for batch in (None, 1, 5, 10 ** 6):
+            m, idx, vals, _sino, ref_fwd, _ref_back = _cone_column_case(
+                ["cpu"] * n, pixel_batch=batch)
+            fwd = m._gather_sinogram(m.sparse_forward_project(vals, idx))
+            rel = np.max(np.abs(fwd - ref_fwd)) / np.max(np.abs(ref_fwd))
+            print(f"cone column gather n={n} batch={batch}: rel {rel:.2e}")
+            assert rel < 1e-5, (n, batch, rel)
+
+
+def test_column_gather_holds_the_adjoint_and_the_padded_forms():
+    # The back driver is untouched, so the pair must stay adjoint with the
+    # gather on -- on a padded cell (9 views, 7 rows over 2 devices pads both
+    # axes), where the gathered cylinder carries the inert padded slice tail.
+    m, idx, vals, sino, ref_fwd, ref_back = _cone_column_case(
+        ["cpu", "cpu"], cell=(9, 7, 8), pixel_batch=4)
+    assert m.recon_placement.is_padded and m.sino_placement.is_padded
+    fwd = m.sparse_forward_project(vals, idx)
+    back = m.sparse_back_project(sino, idx)
+    real = vals.shape[1]
+    assert np.allclose(m._gather_sinogram(fwd), ref_fwd, atol=1e-5)
+    assert np.allclose(back.gather()[:, :real], ref_back, atol=1e-5)
+    lhs = float(np.sum(m._gather_sinogram(fwd) * sino))
+    rhs = float(np.sum(vals * back.gather()[:, :real]))
+    assert abs(lhs - rhs) / max(abs(rhs), 1e-30) < 1e-4, (lhs, rhs)
+
+
+def test_column_gather_replaces_the_band_broadcast(monkeypatch):
+    # The mechanics witness.  With the gather on, the cone forward must call
+    # gather_column_band and must NOT broadcast a band; each gather takes one
+    # piece per slice-owner and yields a cylinder that is the batch wide and
+    # the WHOLE device-form slice axis tall; and each projector call runs at
+    # slice_start=0 over that whole axis for the owner's own views.
+    from mbirtorch import _sharding as sharding
+    batch, n = 4, 2
+    m, idx, vals, _sino, _ref_fwd, _ref_back = _cone_column_case(
+        ["cpu"] * n, pixel_batch=batch)
+    slices = m.recon_placement.padded_size
+    gathers, broadcasts, calls = [], [], []
+    real_gather = sharding.gather_column_band
+
+    def spy_gather(shard_tensors, p0, p1, target, dev2dev_safe=True):
+        out = real_gather(shard_tensors, p0, p1, target, dev2dev_safe)
+        gathers.append((len(shard_tensors), p0, p1, tuple(out.shape)))
+        return out
+
+    def spy_broadcast(*args, **kwargs):
+        broadcasts.append(args)
+        raise AssertionError("the column gather must not broadcast a band")
+
+    real_call = m.projector_functions.sparse_forward_project_view_range
+
+    def spy_call(band_values, pixel_indices, view_range, slice_start=0,
+                 dev_index=0, plan=None):
+        calls.append((tuple(band_values.shape), int(pixel_indices.shape[0]),
+                      tuple(view_range), slice_start))
+        return real_call(band_values, pixel_indices, view_range,
+                         slice_start=slice_start, dev_index=dev_index,
+                         plan=plan)
+
+    monkeypatch.setattr(sharding, "gather_column_band", spy_gather)
+    monkeypatch.setattr(sharding, "broadcast_band_to_views", spy_broadcast)
+    monkeypatch.setattr(m.projector_functions,
+                        "sparse_forward_project_view_range", spy_call)
+    m.sparse_forward_project(vals, idx)
+
+    expected_batches = -(-len(idx) // batch)
+    assert not broadcasts
+    assert len(gathers) == n * expected_batches
+    for pieces, p0, p1, shape in gathers:
+        assert pieces == n                      # one piece per slice-owner
+        assert shape == (p1 - p0, slices)       # the batch, at every slice
+        assert p1 - p0 <= batch
+    # One projector call per (pixel batch, view-owner), each over the whole
+    # slice axis anchored at 0 and over that owner's own real views.
+    assert len(calls) == n * expected_batches
+    spans = [(v0, v1) for _, _, (v0, v1), _ in calls]
+    for cyl_shape, n_pixels, (v0, v1), slice_start in calls:
+        assert slice_start == 0 and cyl_shape[1] == slices
+        assert n_pixels == cyl_shape[0] and v1 > v0
+    assert set(spans) == {
+        (v0, v0 + valid) for _d, (v0, _v1), valid
+        in m.sino_placement.padded_shard_ranges() if valid > 0}
+
+
+def test_the_column_gather_is_off_by_default_and_scoped_to_its_geometry(
+        monkeypatch):
+    # The switch: off unless asked, refused on a row-aligned geometry however
+    # it is asked, and overridable from the environment either way so one
+    # session can run both shapes over the same inputs.  The environment is
+    # cleared first, because this test reads the DEFAULT and a suite run may
+    # be forcing the path on around it.
+    import mbirtorch
+    from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
+    monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
+    cone, _idx, _vals, _sino, _f, _b = _cone_banded_case(["cpu", "cpu"])
+    assert cone.column_gather_geometry
+    assert not cone._column_gather_forward()          # default off
+    cone.forward_column_gather = True
+    assert cone._column_gather_forward()
+
+    angles = np.linspace(0, np.pi, 8, endpoint=False)
+    par = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
+    par.forward_column_gather = True
+    assert not par.column_gather_geometry
+    assert not par._column_gather_forward()
+
+    import os
+    off = _cone_banded_case(["cpu", "cpu"])[0]
+    for value, expected_off, expected_on in (("1", True, True),
+                                             ("on", True, True),
+                                             ("0", False, False),
+                                             ("off", False, False)):
+        os.environ[COLUMN_GATHER_ENV_VAR] = value
+        try:
+            assert off._column_gather_forward() is expected_off
+            assert cone._column_gather_forward() is expected_on
+        finally:
+            del os.environ[COLUMN_GATHER_ENV_VAR]
+    assert not off._column_gather_forward()
+
+
+def test_the_banded_walk_is_what_runs_with_the_switch_off(monkeypatch):
+    # The rollback, exercised: with the switch off the cone forward is the
+    # banded walk, which broadcasts bands and gathers no columns.  The
+    # environment knob is cleared first for the reason above.
+    from mbirtorch import _sharding as sharding
+    from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
+    monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
+    m, idx, vals, _sino, ref_fwd, _ref_back = _cone_banded_case(["cpu", "cpu"])
+    assert not m._column_gather_forward()
+    broadcasts = []
+    real_broadcast = sharding.broadcast_band_to_views
+
+    def spy_broadcast(band, view_owners, dev2dev_safe=True):
+        broadcasts.append(tuple(band.shape))
+        return real_broadcast(band, view_owners, dev2dev_safe)
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("the banded walk must not gather columns")
+
+    monkeypatch.setattr(sharding, "broadcast_band_to_views", spy_broadcast)
+    monkeypatch.setattr(sharding, "gather_column_band", refuse)
+    fwd = m._gather_sinogram(m.sparse_forward_project(vals, idx))
+    assert broadcasts
+    assert np.allclose(fwd, ref_fwd, atol=1e-5)
+
+
+def test_column_gather_recon_matches_single_device():
+    # The end-to-end gate: a seeded cone reconstruction on two virtual CPU
+    # devices with the gather on must reproduce the single-device run, which
+    # is where the two changed summation orders (the vertical sum into the
+    # body, the pixel sum out of it) would show up if they were not inside
+    # the value class the forward already has.
+    import mbirtorch
+    cell = (8, 8, 8)
+    angles = np.linspace(0, 2 * np.pi, cell[0], endpoint=False)
+
+    def build(devices):
+        m = mbirtorch.ConeBeamModel(cell, angles, source_detector_dist=32,
+                                    source_iso_dist=16)
+        m.configure_devices(devices=["cpu"])
+        m.set_params(no_warning=True, verbose=0)
+        if len(devices) > 1:
+            m.configure_devices(devices=devices)
+        return m
+
+    m1 = build(["cpu"])
+    rs = tuple(m1.get_params('recon_shape'))
+    phantom = np.zeros(rs, dtype=np.float32)
+    phantom[1:-1, 1:-1, 1:-1] = 1.0
+    sino = m1.forward_project(phantom)
+    np.random.seed(31)
+    ref, _ = m1.recon(sino, max_iterations=2, stop_threshold_change_pct=0.0)
+
+    banded = build(["cpu", "cpu"])
+    np.random.seed(31)
+    banded_out, _ = banded.recon(sino, max_iterations=2,
+                                 stop_threshold_change_pct=0.0)
+    gathered = build(["cpu", "cpu"])
+    gathered.forward_column_gather = True
+    gathered.forward_project_pixel_batch = 8
+    np.random.seed(31)
+    out, _ = gathered.recon(sino, max_iterations=2,
+                            stop_threshold_change_pct=0.0)
+    scale = max(np.max(np.abs(ref)), 1e-30)
+    rel = np.max(np.abs(out - ref)) / scale
+    rel_banded = np.max(np.abs(banded_out - ref)) / scale
+    # Printed rather than asserted against each other: which of the two sits
+    # closer to the anchor is the reading the registered expectation is for.
+    print(f"cone recon vs n1: column gather {rel:.2e}, "
+          f"banded {rel_banded:.2e}")
+    assert rel < 5e-3, rel     # the shipped parity floor, as above
