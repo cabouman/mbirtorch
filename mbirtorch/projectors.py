@@ -455,13 +455,25 @@ class Projectors:
 
     def sparse_forward_project_view_range(self, band_values, pixel_indices,
                                           view_range, slice_start=0,
-                                          dev_index=0, plan=None):
+                                          dev_index=0, plan=None,
+                                          accumulate_into=None):
         """Forward-project voxel values into ONE view-owner's sinogram block:
         the single forward loop -- the single-device full-range form is the
         adapter below over (0, num_views).  The geometry body owns all geometry,
         layout, and output orientation; this loop owns view slicing, the
         transient budget, and assembly (output sized lazily from the first
         block, so the driver never derives geometry-specific shapes).
+
+        ``accumulate_into`` lets a caller that runs this loop repeatedly -- the
+        column-gather forward, once per pixel batch -- add straight into the
+        block it is building instead of receiving a fresh one to add itself.
+        That merges two full-block passes into one and drops one full-block
+        allocation per call; see the accumulation comment in
+        ``TomographyModel._sparse_forward_project_columns`` for why it is worth
+        doing and why the values do not move.  The parameter is added HERE, on
+        a plain python method, and not to the geometry body: the bodies are
+        torch.compile'd per device with shape-keyed caches, so a new argument
+        there would recompile every one of them.
 
         Args:
             band_values: (P, cols) voxel cylinders (or a slice band), on this
@@ -475,6 +487,9 @@ class Projectors:
             dev_index (int): which per-device compiled instance to use.
             plan: the memoization slot for a future sorted/CSR stream variant
                 (per pixel-subset x view-range); unused today.
+            accumulate_into: an existing block of the shape this call returns.
+                Given one, the loop ADDS into it and returns it; given None
+                (every other caller), it allocates the block and writes.
 
         Returns:
             (v1 - v0, rows_or_band, num_channels) on the input's device.
@@ -486,7 +501,12 @@ class Projectors:
         vb_size = self._effective_view_batch(fwd_body, pixel_indices.shape[0],
                                              band_values.shape[-1], args)
         view_params = self._view_params_per_dev[dev_index]
-        out = None
+        out = accumulate_into
+        # Whether this call adds into a block it was handed or fills one of its
+        # own, decided ONCE here rather than per view batch: an accumulating
+        # call adds every batch, including the first, because the block already
+        # holds earlier calls' work.
+        adding = out is not None
         for v in range(v0, v1, vb_size):
             view_params_batch = view_params[v:min(v + vb_size, v1)]
             block = fwd_body(
@@ -495,7 +515,14 @@ class Projectors:
             if out is None:
                 out = torch.empty((v1 - v0,) + tuple(block.shape[1:]),
                                   dtype=block.dtype, device=block.device)
-            out[v - v0:v - v0 + block.shape[0]] = block
+            rows = slice(v - v0, v - v0 + block.shape[0])
+            # View batches cover DISJOINT rows of the block, so neither arm
+            # sums anything across this loop -- assignment and addition touch
+            # each row exactly once either way.
+            if adding:
+                out[rows].add_(block)
+            else:
+                out[rows] = block
         return out
 
     def sparse_back_project_view_range(self, local_sino, pixel_indices,

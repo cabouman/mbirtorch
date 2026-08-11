@@ -696,12 +696,22 @@ class TomographyModel(ParameterHandler):
         moving to it.  Issuing early is what makes that possible; the separate
         stream is what makes it happen, because a stream runs its work one
         item at a time and copies sharing the projection's stream could only
-        take turns with it.  The accumulation is untouched -- the batches are
-        still summed in the same order -- so the values do not move; what
-        changes is that a device holds one more cylinder at once, which the
-        memory ledger charges (COLUMN_GATHER_RESIDENTS).  The comment at the
-        gather gives the full ordering argument, and off CUDA the gather stays
-        the synchronous one it has always been.
+        take turns with it.  The batches are summed in the same order they
+        always were, so the values do not move; what changes is that a device
+        holds one more cylinder at once, which the memory ledger charges
+        (COLUMN_GATHER_RESIDENTS).  The comment at the gather gives the full
+        ordering argument, and off CUDA the gather stays the synchronous one it
+        has always been.
+
+        Each batch after the first adds into the owner's block from INSIDE the
+        projector's view loop (``accumulate_into``), rather than receiving its
+        own block for the driver to add.  That drops a full-block pass and a
+        full-block allocation per batch -- a cost that does not shrink with the
+        batch, so bigger batches only hide it -- and it lowers the widest
+        instant by the block it no longer allocates.  The summation order is
+        unchanged, element for element.  The comment at the accumulation carries
+        the argument, including why a preallocated zeroed buffer would be worse
+        rather than better.
 
         ``forward_project_slice_band`` has nothing to act on here, because
         this shape does not band the slice axis at all; what bounds the
@@ -788,22 +798,57 @@ class TomographyModel(ParameterHandler):
                 # always produced.
                 ahead = gather(k + 1) if k + 1 < len(batch_bounds) else None
                 _sharding.wait_for_column_band(dev, ready)
-                part = pf.sparse_forward_project_view_range(
-                    full_cyl, local_idx[p0:p1], (v0, v1), slice_start=0,
-                    dev_index=i)
-                # Released BEFORE the accumulation, so a device carries this
-                # batch's cylinder no further than the projection that reads
-                # it.  With the gather ahead of it, the batch after this one is
-                # already resident by now, which is the third cylinder the
-                # memory ledger charges (COLUMN_GATHER_RESIDENTS).
-                full_cyl = None
+                # THE ACCUMULATION.  The first batch's projection allocates the
+                # owner's block and fills it; every later batch adds into that
+                # same block from inside the projector's own view loop, which
+                # is where the block was going to be written anyway.
+                #
+                # What this removes, per batch after the first: the projector
+                # allocated a fresh full block, copied its view batches into
+                # it, and handed it back for the driver to add -- two full-block
+                # passes and one full-block allocation where a single pass does
+                # the same work.  The cost is the same at every batch size, so
+                # it is one the bigger batches HIDE rather than remove, and a
+                # 1024-class pass at the default batch runs on the order of a
+                # hundred of them.
+                #
+                # NOT a preallocated zeroed buffer, which is the shape this
+                # looks like from a distance and is strictly worse: adopting
+                # the first batch's block, as below, costs no zero-fill and no
+                # add, while a zeroed buffer pays both.
+                #
+                # THE VALUES DO NOT MOVE.  Per element the sequence is still
+                # batch 0's contribution, then batch 1's added to it, then batch
+                # 2's -- the same summands added in the same order as the
+                # driver-side add did.  Only where the addition happens changes,
+                # so the result is bit for bit what it was.
+                #
+                # STREAM LIFETIMES are untouched, and the persistent block needs
+                # no record_stream.  It is allocated, written and added into
+                # ONLY by this device's compute stream, in program order, and a
+                # stream runs its work in order; the copy streams read the
+                # slice-owners' shards and write the gathered cylinders, and
+                # never touch this block.  Holding it across batches instead of
+                # freeing it each time also keeps its memory out of the caching
+                # allocator between batches, so it can never be handed to a
+                # copy stream mid-pass.
                 if owned is None:
-                    owned = part
+                    owned = pf.sparse_forward_project_view_range(
+                        full_cyl, local_idx[p0:p1], (v0, v1), slice_start=0,
+                        dev_index=i)
                 else:
-                    owned.add_(part)
-                # Released after the accumulation, so the summation order is
-                # untouched and only the residency changes.
-                part = None
+                    pf.sparse_forward_project_view_range(
+                        full_cyl, local_idx[p0:p1], (v0, v1), slice_start=0,
+                        dev_index=i, accumulate_into=owned)
+                # Released once the projection that reads it has been issued, so
+                # a device carries this batch's cylinder no further.  With the
+                # gather ahead of it, the batch after this one is already
+                # resident by now, which is the third cylinder the memory ledger
+                # charges (COLUMN_GATHER_RESIDENTS).  The release moved after
+                # the accumulation because the accumulation moved INTO the
+                # projection; the widest instant is narrower than it was, the
+                # separate incoming block having gone.
+                full_cyl = None
             if owned is None:
                 # No pixels at all: the owner still owes its views' block,
                 # and the banded form would have produced it as zeros too.

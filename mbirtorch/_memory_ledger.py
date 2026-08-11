@@ -505,7 +505,15 @@ def estimate_peak_device_bytes(plan):
         per-band pieces AND their concatenation (a row-aligned geometry, one
         whose detector row r comes from recon slice r), or the running partial
         AND the incoming one (a two-fan geometry such as cone, where one slice
-        projects onto many detector rows), so it pays twice."""
+        projects onto many detector rows), so it pays twice.
+
+        The COLUMN-GATHER forward holds one rather than two: its batches add
+        into the owner's block from inside the projector's view loop, so there
+        is no separate incoming block to hold beside it.  The charge stays at
+        two anyway.  It is shared with the banded path, which really does hold
+        both, and the ledger's rule is that it may charge more than a run needs
+        but never less -- so the column-gather path is deliberately over-charged
+        by one block here rather than given a term of its own."""
         if not is_view_owner(i):
             return 0
         return sino_dev(i) if n == 1 else 2 * sino_dev(i)
@@ -581,11 +589,12 @@ def estimate_peak_device_bytes(plan):
         """The view block the loop holds BESIDES the one the batch prices.
 
         ``Projectors.sparse_forward_project_view_range`` is ``block =
-        fwd_body(...)`` then ``out[...] = block``, with no release: python
-        evaluates the next call before it rebinds ``block``, so the loop holds
-        the outgoing block and the incoming one -- ``min(2, view_batches)``
-        blocks.  The back loop would hold the same two if it did not release
-        its block explicitly.
+        fwd_body(...)`` then ``out[...] = block`` (or ``out[...].add_(block)``
+        when the caller accumulates), with no release: python evaluates the next
+        call before it rebinds ``block``, so the loop holds the outgoing block
+        and the incoming one -- ``min(2, view_batches)`` blocks.  Which of the
+        two arms runs does not change that count.  The back loop would hold the
+        same two if it did not release its block explicitly.
 
         ONE of those two is already inside ``forward batch`` when the body
         declares its own cost.  A forward kernel body's output plane scales

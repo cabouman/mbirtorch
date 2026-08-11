@@ -938,12 +938,12 @@ def test_column_gather_replaces_the_band_broadcast(monkeypatch):
     real_call = m.projector_functions.sparse_forward_project_view_range
 
     def spy_call(band_values, pixel_indices, view_range, slice_start=0,
-                 dev_index=0, plan=None):
+                 dev_index=0, plan=None, accumulate_into=None):
         calls.append((tuple(band_values.shape), int(pixel_indices.shape[0]),
                       tuple(view_range), slice_start))
         return real_call(band_values, pixel_indices, view_range,
                          slice_start=slice_start, dev_index=dev_index,
-                         plan=plan)
+                         plan=plan, accumulate_into=accumulate_into)
 
     monkeypatch.setattr(sharding, "gather_column_band", spy_gather)
     monkeypatch.setattr(sharding, "broadcast_band_to_views", spy_broadcast)
@@ -1014,7 +1014,7 @@ def test_the_column_gather_runs_one_batch_ahead_of_the_projection(monkeypatch):
         return real_gather(shard_tensors, p0, p1, target, dev2dev_safe)
 
     def spy_call(band_values, pixel_indices, view_range, slice_start=0,
-                 dev_index=0, plan=None):
+                 dev_index=0, plan=None, accumulate_into=None):
         seq = events.setdefault(threading.get_ident(), [])
         # Number the projections within THIS worker, which begins at its own
         # first gather, so that a thread running a second worker starts over
@@ -1024,7 +1024,7 @@ def test_the_column_gather_runs_one_batch_ahead_of_the_projection(monkeypatch):
         seq.append(f'p{k}-in')
         block = real_call(band_values, pixel_indices, view_range,
                           slice_start=slice_start, dev_index=dev_index,
-                          plan=plan)
+                          plan=plan, accumulate_into=accumulate_into)
         seq.append(f'p{k}-out')
         return block
 
@@ -1326,10 +1326,10 @@ def test_parallel_column_gather_gathers_columns_and_sizes_its_rows_by_them(
     real_call = m.projector_functions.sparse_forward_project_view_range
 
     def spy_call(band_values, pixel_indices, view_range, slice_start=0,
-                 dev_index=0, plan=None):
+                 dev_index=0, plan=None, accumulate_into=None):
         block = real_call(band_values, pixel_indices, view_range,
                           slice_start=slice_start, dev_index=dev_index,
-                          plan=plan)
+                          plan=plan, accumulate_into=accumulate_into)
         calls.append((tuple(band_values.shape), tuple(view_range), slice_start,
                       tuple(block.shape)))
         return block
@@ -1391,6 +1391,125 @@ def test_parallel_column_gather_holds_the_padded_and_sparse_view_forms(
         lhs = float(np.sum(m._gather_sinogram(fwd) * sino))
         rhs = float(np.sum(vals * back.gather()[:, :vals.shape[1]]))
         assert abs(lhs - rhs) / max(abs(rhs), 1e-30) < 1e-4, (shape, lhs, rhs)
+
+
+def test_column_gather_batch_accumulation_matches_the_shape_it_replaces(
+        monkeypatch):
+    # The environment is cleared first, for the reason above.
+    from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
+    monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
+    # Each pixel batch after the first adds into the owner's block from inside
+    # the projector's view loop, rather than assembling its own block for the
+    # driver to add afterwards.  Those are the same summands added in the same
+    # order, element for element, so the bar here is EQUALITY and not closeness.
+    #
+    # This one is safe to assert bit for bit whatever the compile state, unlike
+    # the cross-device comparisons above.  Both legs drive the SAME per-device
+    # compiled bodies over the SAME shapes in the SAME process, so every block
+    # entering the accumulation is identical by construction and the legs differ
+    # only in the arithmetic that combines them.  The caveat recorded above is
+    # about two DEVICES emitting different code for one shape, which cannot
+    # separate two legs that share their devices.
+    #
+    # There IS a second thing that separates two runs, and it has to be held
+    # still for the equality above to mean anything: torch's CPU scatter reduces
+    # in PARALLEL, so the body is not reproducible run to run once the problem
+    # is big enough to thread -- one shape run twice already differs from
+    # itself.  Measured 2026-08-11 in a full suite run, this cell at two devices
+    # and 5-pixel batches: one shape against itself 5.2e-08, and the two shapes
+    # against each other 1.0e-07, which is that same noise drawn again and then
+    # carried through eight batches of accumulation rather than any reordering.
+    # On a 64x48x64 cell over 4096 pixels at 10 threads all three comparisons
+    # sat at 7.5e-08 together, the change adding nothing over the noise.
+    #
+    # So the threads are pinned to one below.  That removes the only thing that
+    # separates two runs of the same arithmetic and lets this test assert what
+    # it is actually about -- that moving the addition does not move the
+    # values -- rather than measuring the scatter's thread scheduling.  Pinned,
+    # every case here is bit-equal, including the ones that are not when the
+    # scatter is free to thread.
+
+    def prior_shape(real_call, accumulating):
+        """The accumulation as it stood before it moved into the view loop:
+        every call assembles a block of its own, and the running block is added
+        to it afterwards.  Counts the calls that were asked to accumulate, so
+        the comparison below cannot pass by never exercising the new arm."""
+        def call(band_values, pixel_indices, view_range, slice_start=0,
+                 dev_index=0, plan=None, accumulate_into=None):
+            block = real_call(band_values, pixel_indices, view_range,
+                              slice_start=slice_start, dev_index=dev_index,
+                              plan=plan)
+            if accumulate_into is None:
+                return block
+            accumulating.append(1)
+            accumulate_into.add_(block)
+            return accumulate_into
+        return call
+
+    # Both geometries, two and three virtual CPU devices, and batches small
+    # enough that the pass runs many of them -- which is the case the fusion
+    # exists for and the only one where the two shapes can differ at all.
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        for name, case in (("parallel", _parallel_column_case),
+                           ("cone", _cone_column_case)):
+            for n in (2, 3):
+                for batch in (1, 3, 5):
+                    m, idx, vals = case(["cpu"] * n, pixel_batch=batch)[:3]
+                    batches = -(-len(idx) // batch)
+                    assert batches >= 2, (name, batch)
+                    fused = np.asarray(
+                        m._gather_sinogram(m.sparse_forward_project(vals, idx)))
+                    # The same shape run twice, as the control: with the threads
+                    # pinned this is exact, and a case where it were not would
+                    # mean the noise above had another source and the comparison
+                    # below could not be read as an ordering test.
+                    control = np.asarray(
+                        m._gather_sinogram(m.sparse_forward_project(vals, idx)))
+                    assert np.array_equal(fused, control), (name, n, batch)
+                    real_call = (m.projector_functions
+                                 .sparse_forward_project_view_range)
+                    accumulating = []
+                    with monkeypatch.context() as mp:
+                        mp.setattr(m.projector_functions,
+                                   "sparse_forward_project_view_range",
+                                   prior_shape(real_call, accumulating))
+                        prior = np.asarray(m._gather_sinogram(
+                            m.sparse_forward_project(vals, idx)))
+                    assert np.array_equal(fused, prior), (name, n, batch)
+                    # Every view-owner with real views accumulates on all but
+                    # its first batch, so the new arm ran once per (owner,
+                    # batch) less one batch per owner.
+                    owners = sum(1 for _d, (_v0, _v1), valid
+                                 in m.sino_placement.padded_shard_ranges()
+                                 if valid > 0)
+                    assert len(accumulating) == owners * (batches - 1), (
+                        name, n, batch, len(accumulating), owners, batches)
+
+        # The parameter itself, at the projector: handed a block it adds into
+        # that block and hands back the same object; handed None it allocates
+        # and writes.  Accumulating one call's values onto another's therefore
+        # doubles them exactly.  Inside the pinned region with the rest, because
+        # this compares two separate evaluations of the same body and the free
+        # scatter separates those on its own.
+        m, idx, vals = _banded_case(["cpu"])[:3]
+        pf = m.projector_functions
+        num_views = int(m.get_params('sinogram_shape')[0])
+        t_vals = torch.as_tensor(vals)
+        t_idx = torch.as_tensor(idx, dtype=torch.int64)
+        once = pf.sparse_forward_project_view_range(t_vals, t_idx,
+                                                    (0, num_views))
+        running = pf.sparse_forward_project_view_range(t_vals, t_idx,
+                                                       (0, num_views))
+        assert torch.equal(once, running)         # the control, as above
+        same = pf.sparse_forward_project_view_range(t_vals, t_idx,
+                                                    (0, num_views),
+                                                    accumulate_into=running)
+        assert same is running
+        assert torch.equal(running, once + once)
+    finally:
+        torch.set_num_threads(threads)
 
 
 def test_parallel_column_gather_recon_matches_single_device():
