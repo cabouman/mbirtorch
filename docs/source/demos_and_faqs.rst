@@ -7,16 +7,34 @@ Demos and FAQs
 Demos
 -----
 
-The basic demo below illustrates some of the features of MBIRTorch:
+The demo scripts are in the `demo folder <https://github.com/cabouman/mbirtorch/blob/main/demo/>`__.
+Follow the installation instructions in :ref:`InstallationDocs`, then run any script directly.
+Each is short and self-contained; adjust the parameters near the top and rerun to see their effect.
 
-* **Basic Demo:** `Python script <https://github.com/cabouman/mbirtorch/blob/main/demo/demo_1_shepp_logan.py>`__
+.. list-table::
+   :header-rows: 1
+   :widths: 34 66
 
-Follow the installation instructions in :ref:`InstallationDocs` and run the script directly.
-
-Then adjust some of the parameters to better understand how the code works.
-If you have a GPU, you can increase the problem size by changing ``num_views``, ``num_det_rows``, and ``num_det_channels``.
-
-There are more demos here: `MBIRTorch demos <https://github.com/cabouman/mbirtorch/blob/main/demo/>`__
+   * - Script
+     - What it demonstrates
+   * - ``demo_1_parallel_basics.py``
+     - The basic pipeline: make a phantom, project it to a sinogram, reconstruct, view.
+   * - ``demo_2_cone_beam.py``
+     - Cone-beam geometry, simulated measurement noise, noise weighting, saving results.
+   * - ``demo_3_parallel_roi.py``
+     - Region-of-interest reconstruction when the object extends outside the field of view.
+   * - ``demo_4_cone_axial_fov.py``
+     - Cone-beam artifacts from material above and below the field of view, and axial padding.
+   * - ``demo_5_direct_vs_mbir.py``
+     - Direct reconstruction (FBP) versus model-based reconstruction (MBIR), including sparse views.
+   * - ``demo_6_helical.py``
+     - Helical cone-beam scanning and reconstruction.
+   * - ``demo_7_multiaxis.py``
+     - The multiaxis parallel geometry (laminography): tilted views and their reconstruction.
+   * - ``demo_8_units_and_voxels.py``
+     - Physical units (ALUs), detector spacing, voxel shape, and auto_set_recon_geometry().
+   * - ``demo_9_denoiser.py``
+     - The qGGMRF denoiser applied to a noisy 3D image.
 
 
 Data Generation
@@ -40,8 +58,9 @@ geometry, so you can try MBIRTorch without a real dataset:
 Key options:
 
 * ``object_type`` -- ``'shepp-logan'`` or ``'cube'``.
-* ``model_type`` -- ``'parallel'`` or ``'cone'``; ``params`` returns the matching
-  geometry parameters (always the view ``angles``, plus the source distances for cone beam).
+* ``model_type`` -- ``'parallel'``, ``'cone'``, or ``'multiaxis'``; ``params`` returns the
+  matching geometry parameters (always the view ``angles``, plus the source distances for
+  cone beam and the tilt for multiaxis).
 * ``num_views``, ``num_det_rows``, ``num_det_channels`` -- the sinogram size; increase these (with a GPU)
   to make a larger problem.
 * ``target_max_attenuation`` -- scales the phantom so its sinogram has a realistic peak attenuation
@@ -69,8 +88,7 @@ You can improve the reconstruction by increasing recon_shape:
 Note that the scale factor need only be large enough to give some padding around the region of valid projection --
 it does not need to match the size of the true object.  Larger scale factors will lead to increased time and memory.
 
-.. PENDING(demos): mbirjax adds "See Demo 2: Large Object for an example of this." after the
-   first paragraph above.  Restore that sentence when a matching mbirtorch demo exists.
+See ``demo_3_parallel_roi.py`` for an example of this.
 
 Q: Why is my reconstruction blurry?
 +++++++++++++++++++++++++++++++++++
@@ -106,10 +124,6 @@ also make sure axial padding is disabled (``axial_pad_fraction=0``, the default 
 
 We continue to improve the time and memory efficiency of MBIRTorch.
 
-.. PENDING(demos): mbirjax closes that paragraph with "In either case, you can do a center
-   cropped reconstruction as in Demo 3: Cropped Center, although as seen in that demo, this
-   can introduce an intensity shift and other artifacts."  Restore when a matching demo exists.
-
 
 Q: Why does my reconstruction have artifacts?
 +++++++++++++++++++++++++++++++++++++++++++++
@@ -123,9 +137,10 @@ close to the object.
 For transmission tomography, it is critically important to preprocess the raw photon measurements by normalizing by an air-scan and taking the negative log of the ratio.
 We provide simple preprocessing utilities in ``mbirtorch.preprocess`` for doing this, and we plan to provide more utilities for specific instruments in the future.
 
-In conebeam scans, it is sometimes the case that the rotation direction is reversed.
-This can cause the reconstruction to look blurry or distorted.
-You can correct this by simply taking the negative of your view angles.
+In cone-beam scans, it is sometimes the case that the rotation direction is reversed.
+The symptom is a reconstruction that is subtly warped, with shapes distorted and the top and
+bottom of the object mirrored.  You can correct this by taking the negative of your view
+angles, or equivalently reversing their order with ``angles[::-1]``.
 
 A common artifact is rings near the center of the reconstruction that are generated when the center-of-rotation is
 not in the center of the detector.  This can be corrected by setting the parameter ``det_channel_offset`` to reposition
@@ -158,10 +173,6 @@ bad detector pixels and ``remove_sino_offset`` for a residual sinogram offset.
 
 A bright ring at the outer *boundary* of the reconstruction -- typically accompanied by the
 "Lateral FoV truncation detected" warning -- means the object extends past the field of view; see the next FAQ.
-
-.. PENDING(demos): mbirjax adds "See Demo 3: Wrong Rotation Direction above for an example of
-   what can happen if the rotation direction is incorrect." to the rotation-direction
-   paragraph.  Restore when a matching mbirtorch demo exists.
 
 
 Q: What does the "Lateral FoV truncation detected" warning mean?

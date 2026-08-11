@@ -1529,6 +1529,7 @@ class ModelType(str, Enum):
     PARALLEL = 'parallel'
     CONE = 'cone'
     TRANSLATION = 'translation'
+    MULTIAXIS = 'multiaxis'
 
 
 def generate_demo_data(
@@ -1548,6 +1549,7 @@ def generate_demo_data(
     helical_z_range=None,
     helical_z_center=0.0,
     use_curved_detector=False,
+    elevation_degrees=0.0,
     voxel_row_aspect=1.0,
     voxel_slice_aspect=1.0,
     target_max_attenuation=None,
@@ -1585,6 +1587,9 @@ def generate_demo_data(
         helical_z_range (float, optional): Total axial travel over the scan in ALU for helical mode.
         helical_z_center (float, optional): Midpoint of axial travel over the scan in ALU for helical mode.
         use_curved_detector (bool, optional): (cone beam geometry parameter)
+        elevation_degrees (float, optional): (multiaxis geometry parameter) The
+            constant tilt of every view out of the horizontal plane, in degrees.
+            Defaults to 0.0.
         voxel_row_aspect (float, optional): Aspect ratio for recon rows relative to columns.  Defaults to 1.0.
         voxel_slice_aspect (float, optional): Aspect ratio for recon slices relative to rows.  Defaults to 1.0.
         target_max_attenuation (float, optional): Target max sinogram attenuation for Shepp-Logan phantom.  Defaults to None, for which each voxel is in the range [0, 1].  May not be accurate if any detector or voxel dimensions are not 1.
@@ -1612,7 +1617,19 @@ def generate_demo_data(
 
     # Initialize model
 
-    if model_type == ModelType.PARALLEL:
+    if model_type == ModelType.MULTIAXIS:
+        # Azimuths over a half rotation, all views at one elevation (tilt).
+        azimuths = np.linspace(0, np.pi, num_views, endpoint=False)
+        elevations = np.deg2rad(elevation_degrees) * np.ones(num_views)
+        angles = np.column_stack([azimuths, elevations]).astype(np.float32)
+        sinogram_shape = (num_views, num_det_rows, num_det_channels)
+        ct_model_for_generation = mbirtorch.MultiAxisParallelModel(sinogram_shape, angles)
+        ct_model_for_generation.set_params(voxel_row_aspect=voxel_row_aspect)
+        ct_model_for_generation.set_params(voxel_slice_aspect=voxel_slice_aspect)
+        ct_model_for_generation.auto_set_recon_geometry()
+        params = {'angles': angles, 'elevation_degrees': elevation_degrees,
+                  'voxel_row_aspect': voxel_row_aspect, 'voxel_slice_aspect': voxel_slice_aspect}
+    elif model_type == ModelType.PARALLEL:
         start_angle = 0
         sinogram_shape = (num_views, num_det_rows, num_det_channels)
         angles = np.linspace(start_angle, end_angle, num_views, endpoint=False)
