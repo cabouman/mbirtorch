@@ -141,27 +141,83 @@ def test_persistent_set_shrinks_with_the_device_count():
     assert persistent_4 == persistent_1 // 4
 
 
-def test_band_reduce_is_flat_in_the_device_count():
-    """The finding the error message's remedy ordering rests on.
+def test_band_reduce_shrinks_with_the_device_count():
+    """The signature that replaced the flat one, and the closed form it rests
+    on.
 
-    sum_band_to_owner materializes all n partials on the owner before summing,
-    and one band is the whole shard by default, so the term reads about 1.5x a
-    full-volume cylinder set at both two and four devices.  Adding devices
-    shrinks the persistent set and leaves this where it was.
+    sum_band_to_owner used to move all n partials onto the owner before
+    summing them, so the owner held n bands plus the running total.  One band
+    is the whole shard by default, so that was about 1.5x a full-volume
+    cylinder set at BOTH two and four devices: adding devices shrank the
+    persistent set and left this where it was.  The reduce now streams each
+    arriving partial in bounded row slabs, so the owner holds its running
+    total, the partial it produced itself, and one slab per source --
+    ``num_pixels x (shard + band)`` plus ``(n - 1)`` slabs, which is two
+    cylinder-SHARDS at the default band and therefore halves when the device
+    count doubles.
+
+    Priced at a production-like size, where a band is far larger than one
+    slab.  At the small sizes the other tests use, a whole band fits inside a
+    single slab and moves in one piece, exactly as it always did.
     """
+    pixels, slices = 800_000, 1024
+
     def reduce_bytes(n):
-        ledger = estimate_peak_device_bytes(make_plan(n_devices=n))
+        ledger = estimate_peak_device_bytes(make_plan(
+            n_devices=n, recon=(1024, 1024, slices),
+            num_pixels_full=pixels, granularities=(1,)))
         return dict(_sub(ledger, 'subset back projection', n,
                          'band reduce').terms)['band reduce'][0]
 
+    # The closed form, pinned exactly at both counts.
+    for n in (2, 4):
+        band = slices // n                       # one shard, the default band
+        slab = _sharding.reduce_slab_rows(pixels, band * 4) * band * 4
+        assert reduce_bytes(n) == 2 * pixels * band * 4 + (n - 1) * slab
     two, four = reduce_bytes(2), reduce_bytes(4)
-    assert two > 0 and four > 0
-    # Flat within 1 percent between n=2 and n=4, not shrinking like 1/n.
-    assert abs(two - four) / two < 0.01
-    # And it does NOT collapse toward zero: both sit near 1.5x one full set.
-    subset_full = math.ceil(800 / 4) * 32 * 4
-    assert two == pytest.approx(1.5 * subset_full, rel=0.02)
+    # It now falls with the device count instead of standing still.  Not
+    # exactly a half, because the slab term is a fixed number of bytes and
+    # there is one more of them at four devices.
+    assert 0.5 <= four / two <= 0.56
+    # And it is well under what the old materialize-then-sum form charged:
+    # n + 1 bands at two devices, n + 2 at four.
+    assert two < 0.8 * 3 * pixels * (slices // 2) * 4
+    assert four < 0.4 * 6 * pixels * (slices // 4) * 4
     assert reduce_bytes(1) == 0       # a single device never runs the reduce
+
+
+def test_band_reduce_charges_the_bands_already_reduced_this_pass():
+    """A band smaller than the shard means several reduces per owner, and the
+    owner holds the ones it has finished until it concatenates them.
+
+    The old charge counted only the band in flight, so it fell toward zero as
+    the band narrowed while the owner really was holding most of a shard.
+    The ``shard + band`` form covers both: the bands already done, at most
+    ``shard - band``, and the two live ones.
+    """
+    plan = make_plan(n_devices=2, back_band=4)
+    ledger = estimate_peak_device_bytes(plan)
+    charged = dict(_sub(ledger, 'subset back projection', 2,
+                        'band reduce').terms)['band reduce'][0]
+    p_sub, shard, band = math.ceil(800 / 4), 16, 4
+    slab = _sharding.reduce_slab_rows(p_sub, band * 4) * band * 4
+    assert charged == p_sub * (shard + band) * 4 + slab
+
+    # The floor rule in the place it bites: however narrow the band, the owner
+    # still ends the pass holding a whole shard, so the charge may not fall
+    # under one cylinder-shard.  The old form did, which is what this
+    # replaces: it charged only the band in flight.
+    def charge(band_length):
+        led = estimate_peak_device_bytes(make_plan(n_devices=2,
+                                                   back_band=band_length))
+        return dict(_sub(led, 'subset back projection', 2,
+                         'band reduce').terms)['band reduce'][0]
+
+    one_shard = p_sub * shard * 4
+    for band_length in (1, 2, 4, 8, 16):
+        assert charge(band_length) > one_shard, band_length
+    # And it still falls as the band narrows, so the knob remains a lever.
+    assert charge(1) < charge(4) < charge(16)
 
 
 def test_empty_shard_extensions_skip_their_role_terms():

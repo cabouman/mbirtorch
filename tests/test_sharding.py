@@ -53,6 +53,64 @@ def test_banded_adjoint_pair_values():
     assert torch.allclose(total, partials[0] + partials[1])
 
 
+def test_the_streamed_reduce_matches_the_one_shot_sum_exactly(monkeypatch):
+    """The reduce moves each arriving partial in bounded row slabs, so the
+    owner never holds more than one slab per source above its running total.
+
+    Streaming partitions the ELEMENTS: each element is still accumulated in
+    partial order, so the streamed result is bit for bit the one-shot sum and
+    not merely close to it.  And the partials are read, never written, so a
+    caller may still use them afterwards.
+    """
+    from mbirtorch import _sharding
+    owner = torch.device("cpu")
+    partials = [torch.rand(37, 5) for _ in range(4)]
+    untouched = [p.clone() for p in partials]
+    one_shot = ((partials[0] + partials[1]) + partials[2]) + partials[3]
+    # 40 bytes is two rows of a 5-column float32 band, so this runs 19 slabs
+    # rather than the single slab the default budget would give at this size.
+    monkeypatch.setattr(_sharding, "REDUCE_SLAB_BYTES", 40)
+    assert _sharding.reduce_slab_rows(37, 5 * 4) == 2
+    total = sum_band_to_owner(partials, owner)
+    assert torch.equal(total, one_shot)
+    assert all(torch.equal(p, u) for p, u in zip(partials, untouched))
+    # A single partial is still handed straight back, with no copy made.
+    assert sum_band_to_owner(partials[:1], owner) is partials[0]
+
+
+def test_the_streamed_reduce_leaves_the_sharded_back_projection_unchanged(
+        monkeypatch):
+    """The test above pins the reduce; this one pins the driver that calls it.
+
+    At test sizes a whole band fits inside one slab and moves in a single
+    piece, so the streaming path runs end to end only when the budget is
+    forced down.  Without this the suite would never execute a multi-slab
+    reduce through the real back projection.
+    """
+    import mbirtorch
+    from mbirtorch import _sharding
+    sino_shape = (9, 7, 8)                       # padded slices, 2 devices
+    angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
+
+    def build(devices):
+        m = mbirtorch.ParallelBeamModel(sino_shape, angles)
+        m.configure_devices(devices=["cpu"])
+        m.set_params(no_warning=True, verbose=0)
+        if devices != ["cpu"]:
+            m.configure_devices(devices=devices)
+        return m
+
+    rng = np.random.default_rng(11)
+    sino = rng.standard_normal(sino_shape).astype(np.float32)
+    reference = build(["cpu"]).back_project(sino)
+    # Two rows of a four-slice band at a time: many slabs, not one.
+    monkeypatch.setattr(_sharding, "REDUCE_SLAB_BYTES", 2 * 4 * 4)
+    m2 = build(["cpu", "cpu"])
+    streamed = m2._gather_recon(m2.back_project(sino, output_sharded=True))
+    rel = np.max(np.abs(streamed - reference)) / np.max(np.abs(reference))
+    assert rel < 1e-5, rel
+
+
 def test_run_per_device_order_and_pool():
     devs = ["cpu", "cpu", "cpu"]
     out = run_per_device(devs, lambda i, d: (i, str(d)))

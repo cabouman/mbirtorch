@@ -246,6 +246,36 @@ def move_shard(x, target, dev2dev_safe=True):
     return torch.as_tensor(x.detach().cpu().numpy()).to(target)
 
 
+#: How many bytes of one arriving partial the reduce moves at a time.  A
+#: REASONED default, not a measured knee -- the cluster measurement of this
+#: change comes after it.  The slab has to be large enough that the fixed
+#: cost of one step (a python call, one device-to-device copy, one add) stays
+#: small beside the step's own work: at 64 MiB the copy and the add take
+#: hundreds of microseconds on any device-to-device link, against tens of
+#: microseconds of launch and dispatch, so the host stays well ahead of the
+#: devices and the streaming overhead is a few percent of the reduce.  And it
+#: has to be small enough to be negligible beside the band it streams: a
+#: production band is gigabytes, so the slab is well under one percent of it.
+#: A band smaller than one slab moves in a single piece, which is exactly
+#: what the reduce did before, so nothing changes at small sizes.
+REDUCE_SLAB_BYTES = 64 * 2 ** 20
+
+
+def reduce_slab_rows(num_rows, row_bytes):
+    """How many rows of a band partial :func:`sum_band_to_owner` moves per
+    step, given the bytes in one row of it.
+
+    Shared with the memory ledger, which prices the transient this bounds:
+    the size the code moves and the size the model charges must not be able
+    to drift apart.
+    """
+    # Never zero: the answer is a loop step, and a step of zero is an error
+    # even where the range it walks is empty.
+    if row_bytes <= 0:
+        return max(1, int(num_rows))
+    return max(1, min(int(num_rows), int(REDUCE_SLAB_BYTES) // int(row_bytes)))
+
+
 def sum_band_to_owner(partials, owner, dev2dev_safe=True):
     """Move per-device partials onto ``owner`` and sum them there.
 
@@ -253,11 +283,62 @@ def sum_band_to_owner(partials, owner, dev2dev_safe=True):
     view-sharding each device computed only a partial back projection (its
     own views' contribution) for some band of slices; the true value is the
     sum over devices, formed and left resident on the band's slice-owner.
+
+    The sum is STREAMED in row slabs, and that is what bounds the owner's
+    peak.  Moving every partial across first and then summing them held n
+    whole bands on the owner at once, and because one band is the whole shard
+    by default, that transient did not shrink as devices were added: n
+    devices each holding a band of 1/n of the volume is the same number of
+    bytes at every device count.  Streaming leaves the owner holding its
+    running total and one bounded slab per source instead, so what it holds
+    ABOVE the total is a fixed number of bytes rather than a share of the
+    volume.
+
+    The summation order is unchanged.  Every element is still accumulated in
+    the order the partials are given, so the result is bit for bit what the
+    unstreamed reduce produced: streaming partitions the elements, and no
+    element's own sequence of additions is touched.
+
+    The partials are read and never written.  The first one is copied (or
+    moved) to make the running total, so a caller may still use its arrays
+    after the call.
+
+    Args:
+        partials (list of tensor): one band partial per contributing device,
+            all of the same shape, summed in the order given.
+        owner (torch.device): the band's slice-owner, where the sum is formed
+            and left resident.
+        dev2dev_safe (bool): forwarded to :func:`move_shard`.
     """
-    contribs = [move_shard(p, owner, dev2dev_safe=dev2dev_safe) for p in partials]
-    total = contribs[0]
-    for c in contribs[1:]:
-        total = total + c
+    if len(partials) == 1:
+        return move_shard(partials[0], owner, dev2dev_safe=dev2dev_safe)
+    total = move_shard(partials[0], owner, dev2dev_safe=dev2dev_safe)
+    if total is partials[0]:
+        # The first partial already lives on the owner, so move_shard handed
+        # back the caller's own tensor.  Accumulate into a copy of it rather
+        # than writing through to an array the caller still holds.
+        total = total.clone()
+    num_rows = int(total.shape[0])
+    row_bytes = (total.numel() // max(1, num_rows)) * total.element_size()
+    step = reduce_slab_rows(num_rows, row_bytes)
+    for start in range(0, num_rows, step):
+        stop = min(start + step, num_rows)
+        # Rows, not slices: a partial is (pixels, slices) with the slices
+        # contiguous, so a block of ROWS is a contiguous piece and each
+        # transfer stays a single flat copy.  Every source's transfer for
+        # this slab is issued BEFORE any of them is consumed, so copies from
+        # different devices still overlap each other the way they did when
+        # whole bands were moved up front.
+        slabs = [move_shard(p[start:stop], owner, dev2dev_safe=dev2dev_safe)
+                 for p in partials[1:]]
+        rows = total[start:stop]
+        for slab in slabs:
+            rows.add_(slab)
+        # Released here: the next iteration's list comprehension is evaluated
+        # BEFORE `slabs` is rebound, so without this the previous slabs stay
+        # live on the owner through the next slab's transfers, doubling the
+        # very transient this loop exists to bound.
+        slabs = None
     return total
 
 

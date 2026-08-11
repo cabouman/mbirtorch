@@ -406,10 +406,13 @@ class TomographyModel(ParameterHandler):
         projectors), so mbirjax's stream-even-at-n=1 rationale is void.
 
         A smaller B remains a real MEMORY lever (the per-band broadcast
-        copy, the per-band partial, and each slice-owner's reduce gather all
-        scale with B; the same mg10 sweep read per-device peaks of 11.84 to
-        11.97 GB across the sub-band walks against 12.48 GB at the default,
-        with total copied bytes unchanged).  Set
+        copy, the per-band partial, and the running total each slice-owner
+        reduces into all scale with B; the same mg10 sweep read per-device
+        peaks of 11.84 to 11.97 GB across the sub-band walks against 12.48 GB
+        at the default, with total copied bytes unchanged).  That sweep
+        predates the streamed reduce, which took the default-B reduce from n
+        whole bands down to two plus a bounded slab, so expect a narrower gap
+        than those peaks show.  Set
         ``forward_project_slice_band`` / ``back_project_slice_band`` on the
         model to opt in with a fixed B when a run is memory-constrained.
         Every result is capped at slices_per_dev so a band never crosses a

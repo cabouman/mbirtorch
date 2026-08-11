@@ -383,20 +383,41 @@ def estimate_peak_device_bytes(plan):
     def band_reduce(i, num_pixels):
         """The back reduce's co-residency on a slice-owner.
 
-        ``sum_band_to_owner`` moves ALL n partials onto the owner before the
-        summation loop begins, so the owner holds n arrays of one band plus
-        the running total.  At three devices and above the old and the new
-        total coexist during a rebind, so the count is n + 2 there.  Because
-        one band is the whole shard by default, this term is very nearly
-        INDEPENDENT of the device count: it reads 1.5x a full-volume cylinder
-        set at both two and four devices.  Adding devices shrinks the
-        persistent set and leaves this where it was, which is why the
-        slice-band knob is the remedy the error message names for it.
+        ``sum_band_to_owner`` streams: it forms the running total for a band
+        once on the owner, then adds each arriving partial one row slab at a
+        time and frees the slab before the next one arrives.  At the widest
+        instant the owner holds
+
+          * the bands of its shard it has already reduced this pass and is
+            holding for the concatenation, at most ``shard - band`` slices,
+          * the running total for the band it is on, one band,
+          * the partial it produced itself, which the driver keeps alive
+            across the reduce, one band,
+          * one slab per arriving partial, each bounded by
+            ``_sharding.REDUCE_SLAB_BYTES``.
+
+        That is ``shard + band`` slices of cylinder plus a bounded slab term,
+        which at the default band -- the whole shard -- is TWO
+        cylinder-shards.  So it now falls as 1/n with the device count.  The
+        old materialize-then-sum form held n whole bands plus the running
+        totals, which is the same number of bytes at every device count: it
+        measured 1.5x a full-volume cylinder set at both two and four
+        devices, and adding devices did not move it.
+
+        The slab term does not shrink with the device count, but it is a
+        fixed number of bytes rather than a share of the volume.  When a band
+        is smaller than one slab the whole band moves in one piece, which is
+        what the reduce always did, and this reads as the n + 1 bands that
+        then really are live.
         """
         if n == 1 or not is_slice_owner(i):
             return 0
-        copies = n + 1 if n == 2 else n + 2
-        return copies * int(num_pixels) * plan.band_length(i, 'back') * _F32_BYTES
+        band = plan.band_length(i, 'back')
+        shard = plan.slice_blocks[i][0]
+        row_bytes = int(band) * _F32_BYTES
+        slab_rows = _sharding.reduce_slab_rows(int(num_pixels), row_bytes)
+        return (int(num_pixels) * (int(shard) + int(band)) * _F32_BYTES
+                + (n - 1) * slab_rows * row_bytes)
 
     def back_view_batches(i, num_pixels):
         """How many batches one worker's view loop runs, or None when this
@@ -1150,9 +1171,11 @@ def format_shortfall(ledger, rows, num_devices_tried, closest_count=None,
             + closest,
         '', 'Remedies, most effective first:',
         '  model.back_project_slice_band = <slices>   '
-        '# the band reduce barely shrinks with more',
+        '# shrinks every back projection transient',
         '                                             '
-        '# devices; this is its only lever',
+        '# that is sized by a band, on top of what',
+        '                                             '
+        '# more devices already save',
         '  model.view_batch_size = <views>            '
         '# caps the projector batch transient',
         '  model.set_params(granularity=[...])        '
