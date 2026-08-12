@@ -23,11 +23,11 @@ Releasing a New Version
 
 This is only available for registered maintainers.
 
-1. Update ``__version__`` in ``mbirtorch/__init__.py`` and merge to
-   ``prerelease``.  This is the only place the version number is written.
+1. Update the version number by editing the value of ``__version__`` to be ``X.Y.Z`` in ``mbirtorch/__init__.py``.
+Commit this to the ``prerelease`` branch.
 
-2. On GitHub, draft a new release: tag ``vX.Y.ZrcN``, target ``prerelease``,
-   check "Set as a pre-release", and publish.  This uploads to TestPyPI.
+2. On GitHub, draft a new release: tag ``vX.Y.ZrcN`` in the ``prerelease`` branch.
+Check "Set as a pre-release", and publish.  This will automatically upload the release to TestPyPI.
 
 3. Check the TestPyPI upload::
 
