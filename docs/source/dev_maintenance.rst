@@ -26,6 +26,9 @@ This is only available for registered maintainers.
 The tag must always equal ``v`` + ``__version__``; the upload fails otherwise.
 The example below releases version 0.2.0.
 
+Releasing to TestPyPI
++++++++++++++++++++++
+
 1. In ``mbirtorch/__init__.py``, set ``__version__ = "0.2.0rc1"``.
    Commit this to the ``prerelease`` branch.
 
@@ -38,6 +41,9 @@ The example below releases version 0.2.0.
 
    If it fails, fix the problem, set ``__version__ = "0.2.0rc2"``, and repeat
    from step 2.
+
+Releasing to PyPI
++++++++++++++++++
 
 4. Set ``__version__ = "0.2.0"`` and commit to ``prerelease``.  Open a pull
    request from ``prerelease`` to ``main`` and merge it when the checks pass.
