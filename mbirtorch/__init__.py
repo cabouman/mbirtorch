@@ -5,7 +5,7 @@ default, with device tensors available via ``output_sharded=True`` (the name
 kept for API compatibility; here it means "return the device tensor").
 """
 
-__version__ = "0.0.1"
+__version__ = "0.0.1rc2"
 
 # ── persistent torch.compile cache ────────────────────────────────────────────
 # The inductor cache directory defaults to /tmp/torchinductor_<user>, which the
