@@ -35,7 +35,7 @@ individual pages for more detail. See :ref:`DemosFAQs` for examples.
    _sharding.run_per_device, get_psf_radii).
 
    Restoring these options therefore requires a different mechanism, not a narrower
-   __all__.  The measured numbers are in plans/torch_port/docs.md.
+   __all__.
 
 .. automodule:: mbirtorch
    :no-index:

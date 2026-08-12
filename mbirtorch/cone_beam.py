@@ -343,6 +343,14 @@ class ConeBeamModel(TomographyModel):
     # higher than parallel's: its n=2 has no measured admission point at all.
     _floor_family = 'cone'
 
+    # Cone is the geometry the multi-device forward's column gather was
+    # measured on (see TomographyModel._column_gather_forward for what else
+    # has to hold before it runs, and _sparse_forward_project_columns for the
+    # numbers).  The path runs by default since its speed, value, and memory
+    # gates passed (2026-08-11, four H100s); forward_column_gather = False
+    # restores the banded walk.
+    column_gather_geometry = True
+
     def create_projectors(self):
         super().create_projectors()
         # Warm the DC-damping profile and its per-device compiled instances
@@ -764,6 +772,12 @@ class ConeBeamModel(TomographyModel):
             applies no short-scan redundancy weighting; for helical scans it is
             approximate regardless.  Best used as an initializer for ``recon()``.
         """
+        # Settle the device layout before the first large allocation, as
+        # recon() does: a no-op when the user already chose devices;
+        # otherwise the automatic selection runs here, so a bare FDK call
+        # spreads across the GPUs instead of landing whole on one (the A2
+        # gap that failed the full-resolution MAR runs).
+        self._apply_device_policy()
         # Place once at entry so the filter receives device-form data (a no-op
         # when already placed; a single device is the trivial 1-shard case).
         # The pipeline then stays on-device throughout -- fdk_filter then

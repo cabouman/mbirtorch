@@ -15,15 +15,29 @@ tensors there,
 so the n=1 reconstruction path is unchanged.
 
 Under view/slice sharding the only data that crosses the recon<->sino
-boundary is voxel-cylinder slice-bands (the sinogram is written locally on
-its view-shard and never moves).  That crossing is the banded adjoint pair:
+boundary is voxel cylinders (the sinogram is written locally on its
+view-shard and never moves).  Two shapes of that crossing exist, and they
+differ in which axis of the cylinder is cut.  The banded adjoint pair cuts
+the SLICE axis:
 
   - ``broadcast_band_to_views`` (forward / all-gather): copy a slice-band
     from its slice-owner to every view-owner.
   - ``sum_band_to_owner`` (back / reduce-scatter): sum each view-owner's
     band partials onto the band's slice-owner.
+
+``gather_column_band`` cuts the PIXEL axis instead: it assembles one batch of
+pixel columns at every slice on one view-owner.  A geometry whose slices
+project onto a range of detector rows needs the whole slice axis before it
+can produce any of its own rows, so a slice band buys it nothing, and the
+forward driver gathers columns for it when that path is switched on.  A
+row-aligned geometry can produce its rows from a band and takes the same
+gather anyway, because its kernel is markedly faster on the wider block of
+values.  Only the forward has the second shape; the back projection reduces
+through ``sum_band_to_owner`` either way.
 """
 
+import contextlib
+import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 
@@ -234,6 +248,36 @@ def move_shard(x, target, dev2dev_safe=True):
     return torch.as_tensor(x.detach().cpu().numpy()).to(target)
 
 
+#: How many bytes of one arriving partial the reduce moves at a time.  A
+#: REASONED default, not a measured knee -- the cluster measurement of this
+#: change comes after it.  The slab has to be large enough that the fixed
+#: cost of one step (a python call, one device-to-device copy, one add) stays
+#: small beside the step's own work: at 64 MiB the copy and the add take
+#: hundreds of microseconds on any device-to-device link, against tens of
+#: microseconds of launch and dispatch, so the host stays well ahead of the
+#: devices and the streaming overhead is a few percent of the reduce.  And it
+#: has to be small enough to be negligible beside the band it streams: a
+#: production band is gigabytes, so the slab is well under one percent of it.
+#: A band smaller than one slab moves in a single piece, which is exactly
+#: what the reduce did before, so nothing changes at small sizes.
+REDUCE_SLAB_BYTES = 64 * 2 ** 20
+
+
+def reduce_slab_rows(num_rows, row_bytes):
+    """How many rows of a band partial :func:`sum_band_to_owner` moves per
+    step, given the bytes in one row of it.
+
+    Shared with the memory ledger, which prices the transient this bounds:
+    the size the code moves and the size the model charges must not be able
+    to drift apart.
+    """
+    # Never zero: the answer is a loop step, and a step of zero is an error
+    # even where the range it walks is empty.
+    if row_bytes <= 0:
+        return max(1, int(num_rows))
+    return max(1, min(int(num_rows), int(REDUCE_SLAB_BYTES) // int(row_bytes)))
+
+
 def sum_band_to_owner(partials, owner, dev2dev_safe=True):
     """Move per-device partials onto ``owner`` and sum them there.
 
@@ -241,11 +285,62 @@ def sum_band_to_owner(partials, owner, dev2dev_safe=True):
     view-sharding each device computed only a partial back projection (its
     own views' contribution) for some band of slices; the true value is the
     sum over devices, formed and left resident on the band's slice-owner.
+
+    The sum is STREAMED in row slabs, and that is what bounds the owner's
+    peak.  Moving every partial across first and then summing them held n
+    whole bands on the owner at once, and because one band is the whole shard
+    by default, that transient did not shrink as devices were added: n
+    devices each holding a band of 1/n of the volume is the same number of
+    bytes at every device count.  Streaming leaves the owner holding its
+    running total and one bounded slab per source instead, so what it holds
+    ABOVE the total is a fixed number of bytes rather than a share of the
+    volume.
+
+    The summation order is unchanged.  Every element is still accumulated in
+    the order the partials are given, so the result is bit for bit what the
+    unstreamed reduce produced: streaming partitions the elements, and no
+    element's own sequence of additions is touched.
+
+    The partials are read and never written.  The first one is copied (or
+    moved) to make the running total, so a caller may still use its arrays
+    after the call.
+
+    Args:
+        partials (list of tensor): one band partial per contributing device,
+            all of the same shape, summed in the order given.
+        owner (torch.device): the band's slice-owner, where the sum is formed
+            and left resident.
+        dev2dev_safe (bool): forwarded to :func:`move_shard`.
     """
-    contribs = [move_shard(p, owner, dev2dev_safe=dev2dev_safe) for p in partials]
-    total = contribs[0]
-    for c in contribs[1:]:
-        total = total + c
+    if len(partials) == 1:
+        return move_shard(partials[0], owner, dev2dev_safe=dev2dev_safe)
+    total = move_shard(partials[0], owner, dev2dev_safe=dev2dev_safe)
+    if total is partials[0]:
+        # The first partial already lives on the owner, so move_shard handed
+        # back the caller's own tensor.  Accumulate into a copy of it rather
+        # than writing through to an array the caller still holds.
+        total = total.clone()
+    num_rows = int(total.shape[0])
+    row_bytes = (total.numel() // max(1, num_rows)) * total.element_size()
+    step = reduce_slab_rows(num_rows, row_bytes)
+    for start in range(0, num_rows, step):
+        stop = min(start + step, num_rows)
+        # Rows, not slices: a partial is (pixels, slices) with the slices
+        # contiguous, so a block of ROWS is a contiguous piece and each
+        # transfer stays a single flat copy.  Every source's transfer for
+        # this slab is issued BEFORE any of them is consumed, so copies from
+        # different devices still overlap each other the way they did when
+        # whole bands were moved up front.
+        slabs = [move_shard(p[start:stop], owner, dev2dev_safe=dev2dev_safe)
+                 for p in partials[1:]]
+        rows = total[start:stop]
+        for slab in slabs:
+            rows.add_(slab)
+        # Released here: the next iteration's list comprehension is evaluated
+        # BEFORE `slabs` is rebound, so without this the previous slabs stay
+        # live on the owner through the next slab's transfers, doubling the
+        # very transient this loop exists to bound.
+        slabs = None
     return total
 
 
@@ -261,6 +356,191 @@ def broadcast_band_to_views(band, view_owners, dev2dev_safe=True):
     """
     return {dev: move_shard(band, dev, dev2dev_safe=dev2dev_safe)
             for dev in view_owners}
+
+
+def gather_column_band(shard_tensors, p0, p1, target, dev2dev_safe=True):
+    """Gather one batch of pixel columns, at EVERY slice, onto ``target``.
+
+    The forward's second transfer primitive, built from :func:`move_shard`
+    exactly as :func:`broadcast_band_to_views` is.  Each slice-owner holds
+    the same pixel columns for its own slices, so moving every owner's
+    ``[p0:p1]`` rows to one device and concatenating them along the slice
+    axis assembles those columns' whole cylinder there.
+
+    This is the cross-device shape a geometry needs when one recon slice
+    projects onto a RANGE of detector rows: such a view-owner cannot produce
+    any of its own rows from a slice band, because every slice contributes to
+    the rows it owns.  It takes a narrow column of pixels at every slice
+    instead.  What one gather costs is then set by the width of the column
+    batch and not by the device count, which is what makes the shape usable
+    at volumes where a whole assembled cylinder would not fit.  A row-aligned
+    geometry, which could work from a band, takes the same gather for a
+    performance reason instead: what it gets back is a full-width block of
+    values, which is the width regime its kernel is efficient in.
+
+    The concatenation is in shard order, which is global slice order, and it
+    keeps the device form's padded slice tail rather than trimming it.  The
+    tail is held at zero by the model, a zero voxel contributes nothing
+    through a projection, and the geometry bodies anchor their z geometry on
+    the real slice count from the params rather than on the width of the
+    array they are handed -- so the tail is inert, and trimming it would only
+    force a non-contiguous copy inside the projector.
+
+    This changes which device assembles which voxels, never which device
+    produces which sinogram rows, so it has no adjoint of its own: the back
+    projection is untouched and still reduces through
+    :func:`sum_band_to_owner`.
+
+    Args:
+        shard_tensors (sequence of tensor): the slice-sharded cylinders, each
+            (num_pixels, local_slices), in global slice order.
+        p0 (int): first pixel column of the batch.
+        p1 (int): one past the last pixel column of the batch.
+        target (torch.device): the view-owner the cylinder is assembled on.
+        dev2dev_safe (bool): forwarded to :func:`move_shard`.
+
+    Returns:
+        tensor: (p1 - p0, total_slices) on ``target``.
+    """
+    pieces = [move_shard(t[p0:p1], target, dev2dev_safe=dev2dev_safe)
+              for t in shard_tensors]
+    return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=1)
+
+
+# ── copy streams for the column gather (CUDA only) ───────────────────────────
+# One extra CUDA stream per device, used for nothing but the column gather's
+# cross-device copies.  A stream runs its work in the order it was given, one
+# item at a time, so copies left on the stream a device projects on can only
+# take turns with those projections however early they are issued -- torch
+# issues a cross-device copy on the SOURCE device's current stream and orders
+# the DESTINATION device's current stream behind it, and for the gather's
+# worker threads both of those are the default stream the device projects on.
+# A stream of their own is what lets a copy and a projection run at once.
+#
+# Cached per device index and created once, the way projectors.py caches its
+# compiled bodies: the lock is taken only to CREATE a stream, so the worker
+# threads that ask for one every batch find it already there and stay
+# lock-free.
+_COPY_STREAMS = {}
+_COPY_STREAM_LOCK = threading.Lock()
+
+
+def copy_stream(device):
+    """The dedicated copy stream for ``device``, or None when it has none.
+
+    None is returned for every non-CUDA device, and it is the signal the
+    callers below read as "this device has no streams to arrange": each of
+    them then does the plain synchronous thing, which is what the CPU and MPS
+    paths have always done.
+    """
+    device = torch.device(device)
+    if device.type != 'cuda':
+        return None
+    index = (device.index if device.index is not None
+             else torch.cuda.current_device())
+    stream = _COPY_STREAMS.get(index)
+    if stream is None:
+        with _COPY_STREAM_LOCK:
+            stream = _COPY_STREAMS.get(index)
+            if stream is None:
+                stream = torch.cuda.Stream(device=index)
+                _COPY_STREAMS[index] = stream
+    return stream
+
+
+def _gather_stream_devices(shard_tensors, target):
+    """The distinct CUDA devices one gather touches: every shard's device and
+    the target it assembles on.  Ordered by device index so that the nested
+    stream contexts are always entered in the same order."""
+    seen = {}
+    for dev in [t.device for t in shard_tensors] + [torch.device(target)]:
+        if dev.type == 'cuda':
+            index = (dev.index if dev.index is not None
+                     else torch.cuda.current_device())
+            seen[index] = torch.device('cuda', index)
+    return [seen[index] for index in sorted(seen)]
+
+
+def open_copy_streams(devices):
+    """Let the copy streams start: each waits for its device's compute stream.
+
+    The shards a gather reads were written by earlier kernels on the compute
+    stream, and a copy stream knows nothing of that stream's ordering, so
+    without this a copy could read a shard before the kernel that filled it
+    had finished.  Called once per forward rather than per batch: it orders
+    the copy stream behind everything queued so far, which covers every batch
+    that follows.
+    """
+    for dev in devices:
+        stream = copy_stream(dev)
+        if stream is not None:
+            stream.wait_stream(torch.cuda.current_stream(torch.device(dev)))
+
+
+def close_copy_streams(devices):
+    """The other half of :func:`open_copy_streams`: each compute stream waits
+    for its copy stream.
+
+    A copy READS a slice-owner's shard, and whatever writes that shard next
+    runs on the compute stream.  Nothing else orders those two, so without
+    this a later update could overwrite a shard while a copy was still
+    reading it.
+    """
+    for dev in devices:
+        stream = copy_stream(dev)
+        if stream is not None:
+            torch.cuda.current_stream(torch.device(dev)).wait_stream(stream)
+
+
+def gather_column_band_async(shard_tensors, p0, p1, target, dev2dev_safe=True):
+    """:func:`gather_column_band`, issued on the copy streams.
+
+    The values are the same either way; what this adds is that the copies do
+    not go into the queue the projections run in, so a gather can be moving
+    while an earlier batch is projected.
+
+    Returns:
+        (tensor, ready): the assembled cylinder, and an event that fires once
+        its copies have landed -- or None for the event off CUDA, where the
+        copies are already finished by the time this returns.
+    """
+    stream = copy_stream(target)
+    if stream is None:
+        return gather_column_band(shard_tensors, p0, p1, target,
+                                  dev2dev_safe), None
+    # BOTH ends of every copy have to be on a copy stream: torch issues the
+    # copy on the source's current stream and orders the destination's current
+    # stream behind it, so leaving either end on its default stream would put
+    # the copy straight back in the queue the projections run in.
+    with contextlib.ExitStack() as stack:
+        for dev in _gather_stream_devices(shard_tensors, target):
+            stack.enter_context(torch.cuda.stream(copy_stream(dev)))
+        cylinder = gather_column_band(shard_tensors, p0, p1, target,
+                                      dev2dev_safe)
+        ready = torch.cuda.Event()
+        ready.record(stream)
+    # The cylinder was allocated on the copy stream and is read on the compute
+    # stream.  Without this the caching allocator would be free to hand its
+    # block to the next gather the moment python drops the name, while the
+    # projection was still reading it.  This covers the arriving pieces too:
+    # they are allocated and concatenated on the one copy stream, and the only
+    # one that ever escapes is the single-shard case, where the piece IS the
+    # cylinder returned here.
+    cylinder.record_stream(torch.cuda.current_stream(torch.device(target)))
+    return cylinder, ready
+
+
+def wait_for_column_band(target, ready):
+    """Hold ``target``'s compute stream until one batch's copies have landed.
+
+    The event is per batch and is waited on immediately before the projection
+    that reads that batch.  Waiting on the copy stream as a whole instead
+    would also wait for the batch gathered ahead, which is exactly the work
+    meant to be moving during this projection, and the overlap would collapse
+    back into taking turns.
+    """
+    if ready is not None:
+        torch.cuda.current_stream(torch.device(target)).wait_event(ready)
 
 
 # ── per-device threaded execution (the mbirjax thread_execution.py port) ──────

@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "MBIRTorch: High-performance tomographic reconstruction using PyTorch"
+authors:
+  - family-names: Buzzard
+    given-names: Gregery T.
+  - family-names: Bouman
+    given-names: Charles A.
+year: 2026
+url: "https://github.com/cabouman/mbirtorch"
+license: BSD-3-Clause

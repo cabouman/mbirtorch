@@ -9,7 +9,7 @@ The MBIR Development Team is listed below in alphabetical order:
 
 **MBIRTorch Sponsors**
 
-We would like to thank the following sponsors for their financial support in the development of both this python package:
+We would like to thank the following sponsors for their financial support in the development of this python package:
 
     * Eli Lilly Company
     * Oak Ridge National Laboratory
@@ -17,16 +17,21 @@ We would like to thank the following sponsors for their financial support in the
 
 **Citation**
 
-MBIRTorch is a PyTorch port of `MBIRJAX <https://github.com/cabouman/mbirjax>`__.
 Please use the following Bibtex citation when referencing this software.
 ::
 
-    @Misc {mbirjax-2024,
-    author = {Charles A. Bouman, Gregery T. Buzzard, Mingqi Yang, Ziyun Li, Diyu Yang, M. Samin Chowdhury, Karl Weisenburger, Caden Cardell, Brendt Wohlberg, and Chen Zhang},
-    title =	{{MBIRJAX}: {H}igh-performance tomographic reconstruction},
-    howpublished = {Software library available from \url{https://github.com/cabouman/mbirjax}},
-    year = 2024
+    @misc{mbirtorch-2026,
+    title = {{MBIRTorch}: {H}igh-performance tomographic reconstruction using {PyTorch}},
+    author = {Gregery T. Buzzard and Charles A. Bouman},
+    howpublished = {Software library available from \url{https://github.com/cabouman/mbirtorch}},
+    year = 2026
     }
+
+Alternatively, GitHub's "Cite this repository" button on the repository page
+generates this citation from the repository's ``CITATION.cff`` file.
+
+MBIRTorch is a PyTorch port of `MBIRJAX <https://github.com/cabouman/mbirjax>`__
+:cite:`mbirjax-2024`; please also cite it when referencing the underlying methods.
 
 **References**
 

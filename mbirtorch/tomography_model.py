@@ -38,6 +38,30 @@ from .projectors import Projectors, maybe_compile
 
 _F32_EPS = float(np.finfo(np.float32).eps)
 
+# ── the multi-device forward's column gather ─────────────────────────────────
+# How many pixel columns one gathered cylinder covers (see
+# TomographyModel._forward_pixel_batch and _sparse_forward_project_columns).
+# The cylinder is this many columns by the whole slice axis, so this is the
+# knob that bounds the cross-device transient on that path.  Measured
+# 2026-08-10 on four H100s, job mg10: per-device forward time fell at every
+# batch tried -- 2048, 4096, 8192 -- and was still falling at the largest.
+# The sweep above it ran the next night (job mg11, same machines, 1K cells):
+# 16384 and 32768 kept improving the composed wall by a further 4 to 15
+# percent depending on geometry and device count, so the knee is still not
+# bracketed.  8192 stays the default anyway, because those readings come from
+# a 1K harness and production runs at 2K and above, where the batch's
+# transient grows with the slice axis and the sweep has not been run.  Set
+# forward_project_pixel_batch on the model to override.
+FORWARD_PIXEL_BATCH = 8192
+
+# Forces the column gather on ('1', 'true', 'yes', 'on') or off ('0',
+# 'false', 'no', 'off') whatever the model attribute says.  Read per call,
+# like the other environment knobs, so one session can run both shapes -- the
+# comparison the value gate for this path is read from.
+COLUMN_GATHER_ENV_VAR = 'MBIRTORCH_FORWARD_COLUMN_GATHER'
+_COLUMN_GATHER_ON_VALUES = ('1', 'true', 'yes', 'on')
+_COLUMN_GATHER_OFF_VALUES = ('0', 'false', 'no', 'off')
+
 
 # ── compiled updater glue (module level, one compile per process) ─────────────
 # Eagerly there were ~20 kernel launches per subset between the projector
@@ -369,24 +393,82 @@ class TomographyModel(ParameterHandler):
         DEFAULT = one band per slice-owner (the whole shard).  This differs
         from mbirjax deliberately, on measurement: mbirjax's sweeps found
         time flat across B, so it streams by default for the memory win, but
-        the torch banded pass pays a fixed orchestration cost per band
-        (eager fan-out), and splitting the shard into sub-bands was measured
-        on four H100s at 47 to 66 percent MORE reconstruction time at two
-        devices, for peak-memory savings of 0 to 61 percent -- far more
-        time than the memory is worth on this path.
+        the torch banded pass pays a fixed orchestration cost per band.
+        With the compiled kernels in place, splitting the shard into
+        sub-bands was measured on four H100s at 2 to 23 percent more busy
+        time at parallel 1024 with two devices, depending on the walk (job
+        mg10, 2026-08-10; an earlier pre-kernel reading of 47 to 66 percent
+        overstated the cost).  The one exception, a 9.5 percent win at the
+        63-slice walk, is non-monotonic and unexplained, and is not a basis
+        for a default.
         Time buys nothing back here because a single torch device never runs
         the banded drivers at all (the trivial fast path uses the plain
         projectors), so mbirjax's stream-even-at-n=1 rationale is void.
 
         A smaller B remains a real MEMORY lever (the per-band broadcast
-        copy, the per-band partial, and each slice-owner's reduce gather all
-        scale with B; measured n=4 @512: 6.6 to 2.6 GiB for +8 percent
-        time).  Set ``forward_project_slice_band`` /
-        ``back_project_slice_band`` on the model to opt in with a fixed B
-        when a run is memory-constrained.  Every result is capped at
-        slices_per_dev so a band never crosses a slice-owner boundary."""
+        copy, the per-band partial, and the running total each slice-owner
+        reduces into all scale with B; the same mg10 sweep read per-device
+        peaks of 11.84 to 11.97 GB across the sub-band walks against 12.48 GB
+        at the default, with total copied bytes unchanged).  That sweep
+        predates the streamed reduce, which took the default-B reduce from n
+        whole bands down to two plus a bounded slab, so expect a narrower gap
+        than those peaks show.  Set
+        ``forward_project_slice_band`` / ``back_project_slice_band`` on the
+        model to opt in with a fixed B when a run is memory-constrained.
+        Every result is capped at slices_per_dev so a band never crosses a
+        slice-owner boundary."""
         b = fixed_band if fixed_band else slices_per_dev
         return min(int(b), slices_per_dev)
+
+    def _column_gather_forward(self):
+        """Whether the multi-device forward gathers pixel COLUMNS instead of
+        walking slice bands.
+
+        Three things have to agree, and each guards a different mistake.
+
+        The GEOMETRY must be one the column gather has been measured for.
+        ``column_gather_geometry`` is set by cone beam and by parallel beam,
+        which want the same full slice range for two different measured
+        reasons.  Cone NEEDS it: one slice projects onto a range of detector
+        rows, so a band-sized call still writes every row and costs what a
+        full call costs.  Parallel merely wants it: its forward kernel runs
+        about twice as efficiently per slice on a full-width block of values
+        as on the shard-width blocks the banded walk hands it at more than
+        one device.  Translation and multiaxis share cone's banded
+        branch and its band-independent per-call cost, so the shape should
+        help them too, but neither has ever been timed on it and neither
+        should be switched over on an argument.
+
+        The SWITCH must not be off.  ``forward_column_gather`` unset means
+        the gather runs: it is the shipped behaviour for the geometries that
+        declare the capability, gated on measured speed, value, and memory
+        (2026-08-11, four H100s, both geometries).  Setting it to False
+        selects the banded walk, which stays in place as the rollback.
+
+        The ENVIRONMENT may override the switch either way, which is what
+        lets one session run both shapes over the same inputs and compare
+        their values.
+        """
+        if not self.column_gather_geometry:
+            return False
+        override = os.environ.get(COLUMN_GATHER_ENV_VAR, '').strip().lower()
+        if override in _COLUMN_GATHER_ON_VALUES:
+            return True
+        if override in _COLUMN_GATHER_OFF_VALUES:
+            return False
+        switch = getattr(self, 'forward_column_gather', None)
+        return True if switch is None else bool(switch)
+
+    def _forward_pixel_batch(self):
+        """How many pixel columns one gathered cylinder covers.
+
+        :data:`FORWARD_PIXEL_BATCH` carries the value and its provenance.
+        ``forward_project_pixel_batch`` on the model overrides it, the same
+        way ``forward_project_slice_band`` overrides the band rule.  The
+        memory ledger calls THIS method rather than re-deriving the number,
+        so a changed default cannot leave the charge behind."""
+        fixed = getattr(self, 'forward_project_pixel_batch', None)
+        return max(1, int(fixed)) if fixed else FORWARD_PIXEL_BATCH
 
     @staticmethod
     def _balanced_slice_bounds(extent, band_len):
@@ -444,12 +526,19 @@ class TomographyModel(ParameterHandler):
 
         Under padding each owner projects only its REAL views (padded views
         have no angles), and its padded view tail is zero-filled after
-        assembly, keeping the device form inert end to end."""
+        assembly, keeping the device form inert end to end.
+
+        A geometry whose slices spread over a range of detector rows can take
+        :meth:`_sparse_forward_project_columns` instead, which cuts the
+        cylinder the other way; :meth:`_column_gather_forward` says when."""
         if voxel_shards.placement.is_trivial:
             return _sharding.Shards(
                 [self.projector_functions._sparse_forward_project_single_device(
                     voxel_shards.tensors[0], pixel_indices)],
                 self.sino_placement)
+        if self._column_gather_forward():
+            return self._sparse_forward_project_columns(voxel_shards,
+                                                        pixel_indices)
         sp, rp, view_spans, band_ranges, idx_per = self._banded_setup(pixel_indices)
         pf = self.projector_functions
         aligned = self.rows_track_slices
@@ -544,6 +633,253 @@ class TomographyModel(ParameterHandler):
         if sp.is_padded:
             # Zero-fill each owner's padded view tail up to its block length
             # (built on the owner device; only the last owner has a tail).
+            tensors = [
+                t if t.shape[0] == block else torch.cat(
+                    [t, torch.zeros((block - t.shape[0],) + tuple(t.shape[1:]),
+                                    dtype=t.dtype, device=t.device)])
+                for t, (_v0, _v1, block) in zip(tensors, view_spans)]
+        return _sharding.Shards(tensors, sp)
+
+    def _sparse_forward_project_columns(self, voxel_shards, pixel_indices):
+        """The multi-device forward as a pixel-batched column gather: each
+        view-owner walks the pixel axis in batches, gathers each batch's
+        cylinder at every slice from every slice-owner, and makes ONE
+        projector call per batch over its own views and the whole slice
+        range.  The alternative to the banded walk in
+        :meth:`_sparse_forward_project_sharded`, for the geometries
+        :meth:`_column_gather_forward` admits.
+
+        WHY the shape exists, for the two geometries that take it.  A
+        geometry whose slices spread over a range of detector rows pays per
+        projector call whatever the slice band contains, because the call's
+        output spans the whole detector either way.  Walking one band per
+        slice-owner therefore costs that owner count times one full call, and
+        the forward stops falling when devices are added -- measured flat at
+        32.2, 30.6 and 30.5 s over one, two and four devices.  A full-height
+        call per pixel batch is the shape the single-device path already
+        runs, so the work divides with the view split the way it was meant
+        to.  Measured 2026-08-10 on four H100s, job mg10: cone's per-device
+        forward fell from 29.7 to 19.4 s at two devices and from 29.3 to
+        15.3 s at four, with a lower peak.
+
+        A ROW-ALIGNED geometry's banded walk does divide the work, so its
+        reason is the other one: the forward kernel is about twice as
+        efficient per slice on a full-width block of values as on the
+        shard-width blocks the banded walk hands it, and this shape hands it
+        full width at every device count.  Measured 2026-08-10 on one H100,
+        at 0.0411 ms per slice on a 1008-wide block against 0.0823 on a
+        504-wide one with the device count held at one.
+
+        WHAT DOES NOT MOVE.  Every view-owner still produces its own views'
+        whole sinogram block, from the same voxels, through the same body, so
+        the operator is unchanged and the sharded forward stays the adjoint
+        of the sharded back.  Only which device assembles which voxels
+        changes, and the back driver is untouched.  Two summation orders do
+        change for a two-fan geometry: the vertical sum moves from a host-side
+        sum across bands into the body, and the pixel sum moves the other way,
+        from the body into the host-side sum across pixel batches.  Both sit
+        inside the value class the forward already has.  A row-aligned
+        geometry has no vertical sum to move, its rows being concatenated
+        rather than added, so the pixel sum is the whole of what changes
+        there, and nothing changes at all when one batch covers the pass.
+
+        The two skips of the banded form are kept or dropped deliberately.  A
+        view-owner with no real views receives no gathers and produces an
+        empty block, as before.  The banded form's all-padding sub-band skip
+        has no counterpart here, because a gathered cylinder spans every
+        slice-owner at once; the padding it carries is inert (see
+        :func:`_sharding.gather_column_band`).
+
+        Each batch's gather is issued ONE BATCH AHEAD of the projection that
+        reads it, and on CUDA its copies run on a stream of their own, so a
+        device projects one batch while the next batch's values are still
+        moving to it.  Issuing early is what makes that possible; the separate
+        stream is what makes it happen, because a stream runs its work one
+        item at a time and copies sharing the projection's stream could only
+        take turns with it.  The batches are summed in the same order they
+        always were, so the values do not move; what changes is that a device
+        holds one more cylinder at once, which the memory ledger charges
+        (COLUMN_GATHER_RESIDENTS).  The comment at the gather gives the full
+        ordering argument, and off CUDA the gather stays the synchronous one it
+        has always been.
+
+        Each batch after the first adds into the owner's block from INSIDE the
+        projector's view loop (``accumulate_into``), rather than receiving its
+        own block for the driver to add.  That drops a full-block pass and a
+        full-block allocation per batch -- a cost that does not shrink with the
+        batch, so bigger batches only hide it -- and it lowers the widest
+        instant by the block it no longer allocates.  The summation order is
+        unchanged, element for element.  The comment at the accumulation carries
+        the argument, including why a preallocated zeroed buffer would be worse
+        rather than better.
+
+        ``forward_project_slice_band`` has nothing to act on here, because
+        this shape does not band the slice axis at all; what bounds the
+        transfer instead is the pixel batch.  The memory ledger stops
+        charging the band copy to match.  ``back_project_slice_band`` is
+        unaffected, the back driver being untouched."""
+        sp, rp, view_spans, _band_ranges, idx_per = self._banded_setup(
+            pixel_indices)
+        pf = self.projector_functions
+        num_channels = int(self.get_params('sinogram_shape')[2])
+        # How tall a block one call returns, which is what the empty blocks
+        # below have to match.  A row-aligned geometry's body sizes its output
+        # by the values it was handed, and the gathered cylinder is the whole
+        # DEVICE-form slice axis -- padded tail included, which is exactly the
+        # length that geometry's sinogram pads its detector rows to.  A
+        # geometry whose slices spread over a range of rows returns the real
+        # detector rows whatever it is handed.
+        num_rows = (int(rp.padded_size) if self.rows_track_slices
+                    else int(self.get_params('sinogram_shape')[1]))
+        num_pixels = int(idx_per[0].shape[0])
+        shards = voxel_shards.tensors        # in device = global slice order
+        pixel_batch = self._forward_pixel_batch()
+        batch_bounds = [(p0, min(p0 + pixel_batch, num_pixels))
+                        for p0 in range(0, num_pixels, pixel_batch)]
+
+        def worker(i, dev):
+            v0, v1, _block = view_spans[i]
+            if v1 <= v0:
+                # A view-owner with no real views (the sparse-view extension)
+                # produces an empty block, which assembles as pure zeros.
+                return torch.zeros((0, num_rows, num_channels),
+                                   dtype=voxel_shards.dtype, device=dev)
+            local_idx = idx_per[i]
+            owned = None
+
+            def gather(k):
+                p0, p1 = batch_bounds[k]
+                return _sharding.gather_column_band_async(
+                    shards, p0, p1, dev, self.dev2dev_safe)
+
+            # The batch after the one being projected, gathered ahead of it.
+            # A pass of one batch has nothing to gather ahead, and no pixels
+            # at all leaves this empty.
+            ahead = gather(0) if batch_bounds else None
+            for k, (p0, p1) in enumerate(batch_bounds):
+                full_cyl, ready = ahead
+                # Issue the NEXT batch's gather before this batch is
+                # projected, rather than after, so its copies are already
+                # moving while this projection runs.  Nothing here waits for a
+                # value: run_per_device performs no synchronization, and the
+                # gather returns once its copies are issued.
+                #
+                # THE ORDERING, end to end.  Four things arrange it, and each
+                # covers a different way the copies and the projections could
+                # get in each other's way.
+                #
+                # The copies run on a stream of their own, one per device
+                # (:func:`_sharding.copy_stream`).  A stream runs its work in
+                # the order it was given, one item at a time, so copies left
+                # on the stream a device projects on could only take turns
+                # with the projections, however early they were issued.  On
+                # their own stream the two run at once.
+                #
+                # Before any copy starts, each copy stream waits for its
+                # device's compute stream, so a copy cannot read a shard
+                # before the kernel that wrote it has finished
+                # (``open_copy_streams``, called once below).
+                #
+                # Every batch carries its OWN event, recorded on the copy
+                # stream once that batch's copies and their concatenation are
+                # queued.  The compute stream waits for that one event just
+                # before the projection that reads that batch, so a projection
+                # never starts on a cylinder that has not arrived -- and never
+                # waits for the batch gathered ahead of it, which is the work
+                # meant to be moving right now.
+                #
+                # After the pass, each compute stream waits for its copy
+                # stream (``close_copy_streams``), so a later update cannot
+                # overwrite a shard while a copy is still reading it.
+                #
+                # Off CUDA none of this applies: the gather copies
+                # synchronously, returns no event, the wait below does
+                # nothing, and the values are the ones the plain path has
+                # always produced.
+                ahead = gather(k + 1) if k + 1 < len(batch_bounds) else None
+                _sharding.wait_for_column_band(dev, ready)
+                # THE ACCUMULATION.  The first batch's projection allocates the
+                # owner's block and fills it; every later batch adds into that
+                # same block from inside the projector's own view loop, which
+                # is where the block was going to be written anyway.
+                #
+                # What this removes, per batch after the first: the projector
+                # allocated a fresh full block, copied its view batches into
+                # it, and handed it back for the driver to add -- two full-block
+                # passes and one full-block allocation where a single pass does
+                # the same work.  The cost is the same at every batch size, so
+                # it is one the bigger batches HIDE rather than remove, and a
+                # 1024-class pass at the default batch runs on the order of a
+                # hundred of them.
+                #
+                # NOT a preallocated zeroed buffer, which is the shape this
+                # looks like from a distance and is strictly worse: adopting
+                # the first batch's block, as below, costs no zero-fill and no
+                # add, while a zeroed buffer pays both.
+                #
+                # THE VALUES DO NOT MOVE.  Per element the sequence is still
+                # batch 0's contribution, then batch 1's added to it, then batch
+                # 2's -- the same summands added in the same order as the
+                # driver-side add did.  Only where the addition happens changes,
+                # so the result is bit for bit what it was.
+                #
+                # STREAM LIFETIMES are untouched, and the persistent block needs
+                # no record_stream.  It is allocated, written and added into
+                # ONLY by this device's compute stream, in program order, and a
+                # stream runs its work in order; the copy streams read the
+                # slice-owners' shards and write the gathered cylinders, and
+                # never touch this block.  Holding it across batches instead of
+                # freeing it each time also keeps its memory out of the caching
+                # allocator between batches, so it can never be handed to a
+                # copy stream mid-pass.
+                if owned is None:
+                    owned = pf.sparse_forward_project_view_range(
+                        full_cyl, local_idx[p0:p1], (v0, v1), slice_start=0,
+                        dev_index=i)
+                else:
+                    pf.sparse_forward_project_view_range(
+                        full_cyl, local_idx[p0:p1], (v0, v1), slice_start=0,
+                        dev_index=i, accumulate_into=owned)
+                # Released once the projection that reads it has been issued, so
+                # a device carries this batch's cylinder no further.  With the
+                # gather ahead of it, the batch after this one is already
+                # resident by now, which is the third cylinder the memory ledger
+                # charges (COLUMN_GATHER_RESIDENTS).  The release moved after
+                # the accumulation because the accumulation moved INTO the
+                # projection; the widest instant is narrower than it was, the
+                # separate incoming block having gone.
+                full_cyl = None
+            if owned is None:
+                # No pixels at all: the owner still owes its views' block,
+                # and the banded form would have produced it as zeros too.
+                owned = torch.zeros((v1 - v0, num_rows, num_channels),
+                                    dtype=voxel_shards.dtype, device=dev)
+            return owned
+
+        # ONE fan-out for the whole call, with the pixel loop inside the
+        # worker: a fan-out per pixel batch would issue a thread dispatch per
+        # (batch, device), and putting the loop inside also issues each
+        # device's gathers from the thread that consumes them.
+        #
+        # The copies read the slice-owners' shards and land on the
+        # view-owners, so both sets of devices have a copy stream to order
+        # (see the comment at the gather above).  Off CUDA both calls do
+        # nothing.
+        gather_devices = (list(voxel_shards.placement.devices)
+                          + list(sp.devices))
+        _sharding.open_copy_streams(gather_devices)
+        try:
+            with self._band_pool(sp.n_devices) as pool:
+                tensors = _sharding.run_per_device(sp.devices, worker,
+                                                   executor=pool)
+        finally:
+            # Closed even if a worker raised: copies that were already issued
+            # are still in flight, and the shards they read must not be
+            # overwritten under them.
+            _sharding.close_copy_streams(gather_devices)
+        if sp.is_padded:
+            # The banded form's own tail fill: zero-fill each owner's padded
+            # view tail up to its block length.
             tensors = [
                 t if t.shape[0] == block else torch.cat(
                     [t, torch.zeros((block - t.shape[0],) + tuple(t.shape[1:]),
@@ -1189,6 +1525,26 @@ class TomographyModel(ParameterHandler):
     # drivers take the row-aligned fast path when this is True and would
     # silently mis-assemble a geometry that forgot to declare itself.
     rows_track_slices = False
+
+    # Whether this geometry's multi-device forward MAY gather pixel columns
+    # instead of walking slice bands (see _column_gather_forward).  False is
+    # the base value because the shape has been measured on cone beam and
+    # parallel beam only: translation and multiaxis have the same
+    # band-independent per-call cost as cone and should gain from it too, but
+    # a geometry is switched over on its own measurement rather than on the
+    # argument.  Declaring this True is what lets the gather run, and it runs
+    # by default -- forward_column_gather = False selects the banded walk.
+    column_gather_geometry = False
+
+    # The fewest pixels this geometry's COMPILED bodies may be called with.
+    # 1 -- the base value -- means any width, which is what a geometry whose
+    # compiled bodies are all correct wants.  A geometry that declares more
+    # gets narrow calls padded up to that width and unpadded again outside the
+    # compiled region (see projectors.forward_at_min_pixel_width, which also
+    # carries the measured reason parallel beam declares 2).  It is a property
+    # of the geometry's bodies rather than a user setting, so it is a class
+    # attribute and not a parameter.
+    min_compiled_pixel_width = 1
 
     # Which measured set of widening speed floors governs this geometry's
     # automatic device count (see _widening_floors).  None -- the base value

@@ -28,10 +28,13 @@ ledger is computed at ANY device count, including one, and compared against
 ``torch.cuda.max_memory_allocated`` at the end of the reconstruction.  That
 mode owns the peak counter (it resets it), so it is never on by default.
 
-Two consumers share ONE per-view cost model.  The projection drivers use
+Two consumers share ONE view batch.  The projection drivers use
 ``Projectors.view_batch_charge`` to choose a view batch; the ledger calls
-the same function to price that batch's residency.  The charge excludes the
-call-fixed outputs by contract, so the ledger adds those itself, per phase.
+the same function so it prices the batch the driver would actually run.  The
+charge excludes the call-fixed outputs by contract, so the ledger adds those
+itself, per phase.  It also reprices the batch when the body is a torch body,
+because there the driver's number is a nominal slab used to bound the batch
+and not a statement of what the batch holds; see TORCH_BODY_VIEW_SLABS.
 """
 
 import math
@@ -68,6 +71,19 @@ PROX_CYLINDERS = 4
 DIRECTION_CYLINDERS = 7
 # apply_worker holds the direction and the scaled direction.
 APPLY_CYLINDERS = 2
+# How many gathered column cylinders a forward on the column-gather path
+# holds at once (TomographyModel._sparse_forward_project_columns).  The driver
+# issues each batch's gather one batch ahead of the projection that reads it,
+# so at the widest instant -- inside the gather that runs ahead -- a device
+# holds three: the cylinder the projection is about to read, the pieces
+# arriving from the slice-owners for the batch after it, and the concatenation
+# those pieces are assembled into.
+#
+# The last batch of a pass has nothing to gather ahead of it, and a pass that
+# fits in one batch never gathers ahead at all, so both hold two rather than
+# three.  The charge covers the widest instant, which is the rule the ledger
+# keeps: it may charge more than a run needs but never less.
+COLUMN_GATHER_RESIDENTS = 3
 
 # Library workspace that torch allocates through its own caching allocator,
 # and that the ledger's array enumeration therefore cannot see.  Measured as
@@ -87,10 +103,48 @@ CALIBRATION_ENV_VAR = 'MBIRTORCH_MEMORY_CALIBRATION'
 # configure_devices: the count is not searched and is never reduced, while the
 # empty-shard validation and the preflight still apply.
 DEVICE_COUNT_ENV_VAR = 'MBIRTORCH_NUM_DEVICES'
+# How many per-view slabs one view batch of a TORCH BODY holds.  A torch body
+# is a projection body written as general torch code, which is what a geometry
+# with no hand-written kernel runs.  A hand-written kernel body declares what
+# one of its views costs; a torch body declares nothing, so the driver prices
+# it at ONE nominal slab -- (view batch, pixels, columns) floats -- and that
+# single slab is what the ledger used to charge.
+#
+# A torch body holds a whole loop of those slabs at once.  It walks the
+# interpolation kernel one offset at a time, and each offset materializes an
+# integer index array, a weight array and a gathered array of the slab's
+# shape, none of which fuse away; the running output and the mapped centers
+# stay live across the whole loop beside them.
+#
+# Measured 2026-08-10 on four H100s (job mg8), over the two geometries with no
+# hand-written kernels, four problem sizes, and one, two and four devices.
+# The runs whose measured peak is set by the projection itself need 12.9
+# slabs to cover it, and no run needs more.  Charged at 14, eight percent
+# above the tightest of those readings.
+#
+# ONE count covers both projection directions and both geometries, because the
+# ledger cannot tell which body it holds: it sees only that the body declares
+# no cost.  The count is a measured multiplier and not a count of named
+# arrays: the two geometries plainly do not hold the same number of slabs --
+# the runs of one need at most 7.0 where the other needs 12.9 -- and nothing
+# in the plan distinguishes them, so the larger has to be charged to both.
+# TORCH_BODY_CALIBRATION_BAND says what that costs the smaller.
+TORCH_BODY_VIEW_SLABS = 14
+
 # The band the modeled peak must land in against the measured peak.  The
 # lower bound is the one that matters: a ledger that under-predicts would let
 # a doomed run start, which is the failure this module exists to prevent.
 CALIBRATION_BAND = (1.00, 1.30)
+# The same band for a reconstruction whose projection bodies are torch bodies.
+# It is far wider than the one above for two reasons, both measured rather
+# than assumed.  One slab count has to cover two geometries that hold
+# different numbers of slabs, since nothing in the plan distinguishes them.
+# And two of the measured two-device runs peaked twice as high on one device
+# as on the other from identical shards, which a per-device model built from
+# shapes alone cannot reproduce: it must cover the higher device, so it
+# over-charges the lower one by that factor.  The widest over-charge measured
+# is 5.74x, on the lower device of one of those two runs.
+TORCH_BODY_CALIBRATION_BAND = (1.00, 5.80)
 
 
 class MemoryPreflightError(RuntimeError):
@@ -184,11 +238,23 @@ class LedgerPlan:
     # ── knobs and model choices ──────────────────────────────────────────────
     forward_band: int = None
     back_band: int = None
+    # The pixel-column batch the forward's column gather assembles at once,
+    # or None when the forward walks slice bands instead.  One field rather
+    # than a flag and a width, so the two can never disagree, and resolved by
+    # the model in plan_from_model rather than re-derived here.
+    column_pixel_batch: int = None
     qggmrf_cylinders: int = QGGMRF_CYLINDERS_COMPILED
     # (direction, num_pixels, band_cols) -> (view_batch, bytes_per_view), with
     # direction in {'forward', 'back'}.  Defaults to a no-charge model so a
     # hand-built plan can exercise the state terms alone.
     view_charge: object = None
+    # Which of 'forward' and 'back' bind a torch body -- a body that declares
+    # no per-view cost of its own, so the ledger prices its views itself (see
+    # TORCH_BODY_VIEW_SLABS).  The two directions are named separately because
+    # a model may bind a hand-written kernel one way and a torch body the
+    # other.  Empty means both directions declare their own cost, which is
+    # what a hand-built plan gets: its charge reads exactly as before.
+    torch_body_directions: tuple = ()
 
     @property
     def n_devices(self):
@@ -250,38 +316,114 @@ def estimate_peak_device_bytes(plan):
         return (plan.band_length(i, 'back') if plan.rows_track_slices
                 else num_rows_dev)
 
+    def column_gather_slices():
+        """The slice extent one column-gather call is handed: the WHOLE
+        device-form slice axis, padded tail included, because the gathered
+        cylinder spans every slice-owner at once."""
+        return sum(int(block[0]) for block in plan.slice_blocks)
+
+    def forward_call_pixels(num_pixels):
+        """How many pixel columns ONE forward call is handed: every pixel of
+        the pass by default, and one column batch on the column-gather path,
+        which is what makes that path's per-call terms fall."""
+        if plan.column_pixel_batch:
+            return min(int(num_pixels), int(plan.column_pixel_batch))
+        return int(num_pixels)
+
     def forward_cols(i):
         """The forward call's band_cols: its voxel columns."""
-        return (int(plan.recon_shape[2]) if n == 1
-                else plan.band_length(i, 'forward'))
+        if n == 1:
+            return int(plan.recon_shape[2])
+        if plan.column_pixel_batch:
+            return column_gather_slices()
+        return plan.band_length(i, 'forward')
+
+    def band_slices(i, direction):
+        """The slice extent one projection call is handed: the whole slice
+        axis at one device, this owner's slice band under sharding, and the
+        whole device-form axis again on the column-gather path."""
+        if n == 1:
+            return int(plan.recon_shape[2])
+        if direction == 'forward' and plan.column_pixel_batch:
+            return column_gather_slices()
+        return plan.band_length(i, direction)
+
+    def torch_body_batch(i, direction, num_pixels):
+        """What one view batch of a TORCH BODY holds.
+
+        The body sweeps two axes -- the detector rows and the slice band it
+        was handed -- and every array in its interpolation loop spans the
+        view batch, the pixels, and whichever of those two axes is wider.
+        It holds TORCH_BODY_VIEW_SLABS of them at once, where the driver's
+        nominal charge prices one.
+
+        The view batch itself stays the driver's own choice: only what that
+        batch is charged changes here, so the ledger and the driver still
+        agree on how many views one body call takes.
+        """
+        if plan.view_charge is None:
+            return 0
+        cols = back_cols(i) if direction == 'back' else forward_cols(i)
+        view_batch = int(plan.view_charge(direction, int(num_pixels), cols)[0])
+        width = max(int(plan.sino_rows), int(band_slices(i, direction)))
+        return (TORCH_BODY_VIEW_SLABS * view_batch * int(num_pixels)
+                * width * _F32_BYTES)
 
     def back_batch(i, num_pixels):
         if not is_view_owner(i):
             return 0
+        if 'back' in plan.torch_body_directions:
+            return torch_body_batch(i, 'back', num_pixels)
         return plan.batch_bytes('back', num_pixels, back_cols(i))
 
     def forward_batch(i, num_pixels):
         if not is_view_owner(i):
             return 0
-        return plan.batch_bytes('forward', num_pixels, forward_cols(i))
+        # A call's own pixel count, which is the pass's on the banded path
+        # and one column batch on the column-gather path.
+        call_pixels = forward_call_pixels(num_pixels)
+        if 'forward' in plan.torch_body_directions:
+            return torch_body_batch(i, 'forward', call_pixels)
+        return plan.batch_bytes('forward', call_pixels, forward_cols(i))
 
     def band_reduce(i, num_pixels):
         """The back reduce's co-residency on a slice-owner.
 
-        ``sum_band_to_owner`` moves ALL n partials onto the owner before the
-        summation loop begins, so the owner holds n arrays of one band plus
-        the running total.  At three devices and above the old and the new
-        total coexist during a rebind, so the count is n + 2 there.  Because
-        one band is the whole shard by default, this term is very nearly
-        INDEPENDENT of the device count: it reads 1.5x a full-volume cylinder
-        set at both two and four devices.  Adding devices shrinks the
-        persistent set and leaves this where it was, which is why the
-        slice-band knob is the remedy the error message names for it.
+        ``sum_band_to_owner`` streams: it forms the running total for a band
+        once on the owner, then adds each arriving partial one row slab at a
+        time and frees the slab before the next one arrives.  At the widest
+        instant the owner holds
+
+          * the bands of its shard it has already reduced this pass and is
+            holding for the concatenation, at most ``shard - band`` slices,
+          * the running total for the band it is on, one band,
+          * the partial it produced itself, which the driver keeps alive
+            across the reduce, one band,
+          * one slab per arriving partial, each bounded by
+            ``_sharding.REDUCE_SLAB_BYTES``.
+
+        That is ``shard + band`` slices of cylinder plus a bounded slab term,
+        which at the default band -- the whole shard -- is TWO
+        cylinder-shards.  So it now falls as 1/n with the device count.  The
+        old materialize-then-sum form held n whole bands plus the running
+        totals, which is the same number of bytes at every device count: it
+        measured 1.5x a full-volume cylinder set at both two and four
+        devices, and adding devices did not move it.
+
+        The slab term does not shrink with the device count, but it is a
+        fixed number of bytes rather than a share of the volume.  When a band
+        is smaller than one slab the whole band moves in one piece, which is
+        what the reduce always did, and this reads as the n + 1 bands that
+        then really are live.
         """
         if n == 1 or not is_slice_owner(i):
             return 0
-        copies = n + 1 if n == 2 else n + 2
-        return copies * int(num_pixels) * plan.band_length(i, 'back') * _F32_BYTES
+        band = plan.band_length(i, 'back')
+        shard = plan.slice_blocks[i][0]
+        row_bytes = int(band) * _F32_BYTES
+        slab_rows = _sharding.reduce_slab_rows(int(num_pixels), row_bytes)
+        return (int(num_pixels) * (int(shard) + int(band)) * _F32_BYTES
+                + (n - 1) * slab_rows * row_bytes)
 
     def back_view_batches(i, num_pixels):
         """How many batches one worker's view loop runs, or None when this
@@ -363,7 +505,15 @@ def estimate_peak_device_bytes(plan):
         per-band pieces AND their concatenation (a row-aligned geometry, one
         whose detector row r comes from recon slice r), or the running partial
         AND the incoming one (a two-fan geometry such as cone, where one slice
-        projects onto many detector rows), so it pays twice."""
+        projects onto many detector rows), so it pays twice.
+
+        The COLUMN-GATHER forward holds one rather than two: its batches add
+        into the owner's block from inside the projector's view loop, so there
+        is no separate incoming block to hold beside it.  The charge stays at
+        two anyway.  It is shared with the banded path, which really does hold
+        both, and the ledger's rule is that it may charge more than a run needs
+        but never less -- so the column-gather path is deliberately over-charged
+        by one block here rather than given a term of its own."""
         if not is_view_owner(i):
             return 0
         return sino_dev(i) if n == 1 else 2 * sino_dev(i)
@@ -377,10 +527,35 @@ def estimate_peak_device_bytes(plan):
         the copy is a full cylinder-shard on each device, on top of the
         device's own shard.  Without this term the model falls below the
         measured peak on a large cone reconstruction at four devices.
+
+        The column-gather path broadcasts no band at all, so this term is
+        zero there and ``forward_column_cylinder`` charges what it holds
+        instead.
         """
-        if n == 1 or not is_view_owner(i):
+        if n == 1 or not is_view_owner(i) or plan.column_pixel_batch:
             return 0
         return cyl(i, num_pixels)
+
+    def forward_column_cylinder(i, num_pixels):
+        """The gathered cylinder the column-gather forward assembles.
+
+        ``_sharding.gather_column_band`` moves one batch of pixel columns
+        from every slice-owner and concatenates them, so what a view-owner
+        holds is that batch by the WHOLE device-form slice axis -- and,
+        unlike the band copy it replaces, that does not grow with the shard,
+        so it does not grow with the problem at a fixed batch.  Three are live
+        at the widest instant, because the driver gathers one batch ahead of
+        the projection that reads it; see COLUMN_GATHER_RESIDENTS for which
+        three.
+
+        Measured 2026-08-10 on four H100s, job mg10: ONE such cylinder read
+        7.9, 15.8 and 31.5 MiB at batches 2048, 4096 and 8192 at 1008 slices,
+        which is the closed form exactly.
+        """
+        if n == 1 or not is_view_owner(i) or not plan.column_pixel_batch:
+            return 0
+        return (COLUMN_GATHER_RESIDENTS * forward_call_pixels(num_pixels)
+                * column_gather_slices() * _F32_BYTES)
 
     def forward_view_batches(i, num_pixels):
         """How many batches one owner's forward view loop runs, or None when
@@ -391,7 +566,7 @@ def estimate_peak_device_bytes(plan):
         if real_views <= 0 or plan.view_charge is None:
             return None
         view_batch = int(plan.view_charge(
-            'forward', int(num_pixels), forward_cols(i))[0])
+            'forward', forward_call_pixels(num_pixels), forward_cols(i))[0])
         return max(1, -(-int(real_views) // max(1, view_batch)))
 
     def forward_block_rows(i):
@@ -414,33 +589,44 @@ def estimate_peak_device_bytes(plan):
         """The view block the loop holds BESIDES the one the batch prices.
 
         ``Projectors.sparse_forward_project_view_range`` is ``block =
-        fwd_body(...)`` then ``out[...] = block``, with no release: python
-        evaluates the next call before it rebinds ``block``, so the loop holds
-        the outgoing block and the incoming one -- ``min(2, view_batches)``
-        blocks.  The back loop would hold the same two if it did not release
-        its block explicitly.
+        fwd_body(...)`` then ``out[...] = block`` (or ``out[...].add_(block)``
+        when the caller accumulates), with no release: python evaluates the next
+        call before it rebinds ``block``, so the loop holds the outgoing block
+        and the incoming one -- ``min(2, view_batches)`` blocks.  Which of the
+        two arms runs does not change that count.  The back loop would hold the
+        same two if it did not release its block explicitly.
 
-        ONE of those two is already inside ``forward batch``.  A forward
-        body's output plane scales with the view batch, so each body's
-        ``_view_batch_cost`` charges it per view and says so; the back body's
-        cost model does not, its output being call-fixed at any batch.  This
-        term is therefore the REMAINDER -- one block while the loop runs more
-        than a single batch, and nothing when it runs one, which is the whole
-        live set there.
+        ONE of those two is already inside ``forward batch`` when the body
+        declares its own cost.  A forward kernel body's output plane scales
+        with the view batch, so its ``_view_batch_cost`` charges it per view
+        and says so; the back body's cost model does not, its output being
+        call-fixed at any batch.  Against a declared cost this term is
+        therefore the REMAINDER -- one block while the loop runs more than a
+        single batch, and nothing when it runs one, which is the whole live
+        set there.
+
+        A TORCH BODY declares nothing, and what the ledger charges for it in
+        its place is the body's INTERNAL slab set, which does not include the
+        output plane.  Nothing is already paid for there, so both blocks are
+        charged.
 
         The batch follows the pixel count of THIS call, so the subset phases
-        must pass their own subset size rather than the full index count.
+        must pass their own subset size rather than the full index count --
+        and on the column-gather path a call's pixel count is one column
+        batch, which raises the view batch and with it this block.
         """
         if not is_view_owner(i):
             return 0
         batches = forward_view_batches(i, num_pixels)
         live = 2 if batches is None else min(2, batches)
+        already_paid = 0 if 'forward' in plan.torch_body_directions else 1
         view_batch = 1
         if plan.view_charge is not None:
-            view_batch = plan.view_charge('forward', num_pixels,
+            view_batch = plan.view_charge('forward',
+                                          forward_call_pixels(num_pixels),
                                           forward_cols(i))[0]
-        return ((live - 1) * int(view_batch) * forward_block_rows(i)
-                * num_channels * _F32_BYTES)
+        return ((live - already_paid) * int(view_batch)
+                * forward_block_rows(i) * num_channels * _F32_BYTES)
 
     # ── the persistent set ───────────────────────────────────────────────────
     # One sinogram-shaped weights term, never two: when the caller supplies
@@ -573,6 +759,8 @@ def estimate_peak_device_bytes(plan):
             ('init recon', per_dev(recon_dev)),
             ('voxel gather', per_dev(lambda i: cyl(i, p_full))),
             ('broadcast band', per_dev(lambda i: forward_band_copy(i, p_full))),
+            ('column cylinder', per_dev(
+                lambda i: forward_column_cylinder(i, p_full))),
             ('forward output', per_dev(forward_fixed)),
             ('forward block', per_dev(lambda i: forward_block(i, p_full))),
             ('forward batch', per_dev(lambda i: forward_batch(i, p_full))),
@@ -701,6 +889,8 @@ def estimate_peak_device_bytes(plan):
                     lambda i: sino_dev(i) if n > 1 and is_view_owner(i) else 0)),
                 ('broadcast band', per_dev(
                     lambda i: forward_band_copy(i, p_sub))),
+                ('column cylinder', per_dev(
+                    lambda i: forward_column_cylinder(i, p_sub))),
                 ('forward block', per_dev(lambda i: forward_block(i, p_sub))),
                 ('forward batch', per_dev(lambda i: forward_batch(i, p_sub))),
             ],
@@ -820,9 +1010,32 @@ def plan_from_model(model, devices, partition_sequence=None, weights=None,
         hessian_masked=model.get_params('use_ror_mask') is not False,
         forward_band=getattr(model, 'forward_project_slice_band', None),
         back_band=getattr(model, 'back_project_slice_band', None),
+        # Both read from the model's own resolvers rather than re-derived
+        # here: a charge that re-implements a driver rule is a charge that
+        # can be left behind when the rule moves.
+        column_pixel_batch=(model._forward_pixel_batch()
+                            if model._column_gather_forward() else None),
         qggmrf_cylinders=qggmrf_cylinder_count(model),
         view_charge=charge,
+        torch_body_directions=torch_body_directions(model),
     )
+
+
+def torch_body_directions(model):
+    """Which projection directions this model runs as a torch body.
+
+    A hand-written kernel body carries a ``_view_batch_cost`` attribute
+    stating what one of its views holds; general torch code carries nothing,
+    and the ledger prices those views itself (see TORCH_BODY_VIEW_SLABS).
+    The two directions are asked separately, because a model may bind a
+    kernel one way and a torch body the other, and because a kernel that is
+    unavailable on this machine falls back to the torch body it replaced --
+    the charge has to follow the body that will actually run.
+    """
+    fwd_body, back_body = model._view_batch_bodies()
+    return tuple(name for name, body in (('forward', fwd_body),
+                                         ('back', back_body))
+                 if getattr(body, '_view_batch_cost', None) is None)
 
 
 def _model_view_charge(model, n_devices):
@@ -974,9 +1187,11 @@ def format_shortfall(ledger, rows, num_devices_tried, closest_count=None,
             + closest,
         '', 'Remedies, most effective first:',
         '  model.back_project_slice_band = <slices>   '
-        '# the band reduce barely shrinks with more',
+        '# shrinks every back projection transient',
         '                                             '
-        '# devices; this is its only lever',
+        '# that is sized by a band, on top of what',
+        '                                             '
+        '# more devices already save',
         '  model.view_batch_size = <views>            '
         '# caps the projector batch transient',
         '  model.set_params(granularity=[...])        '
@@ -1046,8 +1261,11 @@ def calibration_report(ledger, devices):
     return rows
 
 
-def format_calibration(rows):
-    low, high = CALIBRATION_BAND
+def format_calibration(rows, band=None):
+    """The calibration table.  ``band`` defaults to CALIBRATION_BAND; a
+    reconstruction whose projection bodies are torch bodies is judged against
+    TORCH_BODY_CALIBRATION_BAND instead."""
+    low, high = band or CALIBRATION_BAND
     lines = ['memory ledger calibration (this mode owns '
              'torch.cuda.max_memory_allocated)',
              f'{"device":>10}{"modeled":>14}{"measured":>14}'

@@ -127,6 +127,91 @@ def maybe_compile(fn, enabled, instance_key=None):
     return guarded
 
 
+# ── the minimum pixel width a compiled body is called at ─────────────────────
+# A model may declare that its compiled bodies must not be called with fewer
+# than N pixels (``min_compiled_pixel_width``, see TomographyModel).  The two
+# wrappers below pad a narrower call up to N and undo the padding on the way
+# out.  They are applied OUTSIDE torch.compile, around the callable
+# maybe_compile returns, so the padding is ordinary python that dynamo never
+# traces -- padding inside the body would be traced and specialized with it,
+# which is exactly what has to be avoided.
+#
+# Why they exist (measured 2026-08-11, linux CPU, torch 2.13.0): inductor
+# miscompiles the one-pixel specialization of both fused parallel-beam bodies.
+# A one-pixel call puts that pixel's horizontal-fan footprint one whole
+# detector channel away from where the same pixel lands in a call with more
+# pixels -- 6.56e-02 relative error on the forward (the pixel's mass at
+# channels {4, 5} instead of {3, 4}) and 5.04e-02 on the back, on a seeded
+# 8x6x8 test cell.  Eager is correct at one pixel (1.05e-07), every width of
+# two or more is correct compiled, and a one-pixel call is correct once the
+# process has compiled the body at a larger width, so what is wrong is the
+# one-pixel compile itself.  The cone bodies do not have the defect, and macOS
+# inductor compiles the same one-pixel body correctly.  One-pixel calls are
+# ordinary: sparse_forward_project with a single index makes one, and the
+# column gather's pixel batching makes one whenever a batch, or the remainder
+# of a batch, is a single pixel.
+#
+# The driver's view-batch charge is computed from the REAL pixel count, before
+# the padding: it prices the transient of a call this small at a batch far
+# below any cap, so the one padded column cannot move it.
+
+
+def _callable_name(fn, fallback):
+    """A readable name for a wrapped callable, for the wrapper's own name."""
+    return getattr(fn, '__name__', fallback)
+
+
+def forward_at_min_pixel_width(compiled, min_width):
+    """The forward body with narrow pixel batches padded to ``min_width``.
+
+    The padded columns carry zero values at a repeated -- hence in-range --
+    pixel index.  The forward output has no pixel axis: the fan bins each
+    pixel's weighted row into the detector channels with index_add_, so a
+    zero-valued column adds exactly 0.0 wherever it lands and the padded call
+    returns bit-identical values with nothing to slice off (verified against
+    the eager body).
+    """
+    def forward_padded(values, pixel_indices, *args, **kwargs):
+        width = int(pixel_indices.shape[0])
+        if width == 0 or width >= min_width:
+            return compiled(values, pixel_indices, *args, **kwargs)
+        pad = min_width - width
+        wide_values = torch.cat(
+            [values, values.new_zeros((pad,) + tuple(values.shape[1:]))])
+        wide_indices = torch.cat([pixel_indices,
+                                  pixel_indices[-1:].repeat(pad)])
+        return compiled(wide_values, wide_indices, *args, **kwargs)
+
+    forward_padded.__name__ = f'padded_{_callable_name(compiled, "forward")}'
+    return forward_padded
+
+
+def back_at_min_pixel_width(compiled, min_width):
+    """The back body with narrow pixel batches padded to ``min_width``.
+
+    The back output DOES carry the pixel axis, so here the padding repeats the
+    last real pixel index and the extra rows are sliced off again.  Every
+    output row is computed from its own pixel alone (the fan gathers per pixel
+    and sums over views), so the rows that stay are the rows the narrow call
+    would have produced -- exactly, not to a tolerance (verified against the
+    eager body, at coeff_power 1 and 2).
+    """
+    def back_padded(sino_batch, pixel_indices, *args, **kwargs):
+        width = int(pixel_indices.shape[0])
+        if width == 0 or width >= min_width:
+            return compiled(sino_batch, pixel_indices, *args, **kwargs)
+        pad = min_width - width
+        wide_indices = torch.cat([pixel_indices,
+                                  pixel_indices[-1:].repeat(pad)])
+        block = compiled(sino_batch, wide_indices, *args, **kwargs)
+        # Cloned rather than returned as a view, so the caller's output owns
+        # its memory and does not keep the padded block alive.
+        return block[:width].clone()
+
+    back_padded.__name__ = f'padded_{_callable_name(compiled, "back")}'
+    return back_padded
+
+
 def compile_serialized():
     """The process-wide compile lock, as a context manager -- for HAND-WRITTEN
     kernel paths only::
@@ -258,11 +343,30 @@ class Projectors:
         fwd_body, back_body = model._view_batch_bodies()
         use_compile = model.compile_enabled
         n_dev = model.sino_placement.n_devices
+        min_width = int(getattr(model, 'min_compiled_pixel_width', 1))
+
+        def bind(body, pad_narrow, i):
+            """One device's bound body: compiled, then wrapped when the model
+            declares a minimum pixel width AND the binding really did compile.
+
+            The identity test is the whole gate.  maybe_compile hands back the
+            function itself when compilation is off and when the body is a
+            hand-written kernel (``_mbirtorch_no_compile``); neither can be
+            miscompiled, so neither needs the workaround, and leaving them
+            alone keeps the two things callers read off a bound body -- its
+            identity and its ``_view_batch_cost`` attribute -- exactly as they
+            were.  Every driver, plain and sharded, reads its body from these
+            two lists, so this is the one place per direction to wrap."""
+            bound = maybe_compile(body, use_compile, instance_key=i)
+            if min_width > 1 and bound is not body:
+                bound = pad_narrow(bound, min_width)
+            return bound
+
         self._fwd_body_per_dev = [
-            maybe_compile(fwd_body, use_compile, instance_key=i)
+            bind(fwd_body, forward_at_min_pixel_width, i)
             for i in range(n_dev)]
         self._back_body_per_dev = [
-            maybe_compile(back_body, use_compile, instance_key=i)
+            bind(back_body, back_at_min_pixel_width, i)
             for i in range(n_dev)]
         # View parameters, read from the CURRENT params at every projector
         # build (create_projectors re-runs on reconfigure/recompile, closing
@@ -351,13 +455,25 @@ class Projectors:
 
     def sparse_forward_project_view_range(self, band_values, pixel_indices,
                                           view_range, slice_start=0,
-                                          dev_index=0, plan=None):
+                                          dev_index=0, plan=None,
+                                          accumulate_into=None):
         """Forward-project voxel values into ONE view-owner's sinogram block:
         the single forward loop -- the single-device full-range form is the
         adapter below over (0, num_views).  The geometry body owns all geometry,
         layout, and output orientation; this loop owns view slicing, the
         transient budget, and assembly (output sized lazily from the first
         block, so the driver never derives geometry-specific shapes).
+
+        ``accumulate_into`` lets a caller that runs this loop repeatedly -- the
+        column-gather forward, once per pixel batch -- add straight into the
+        block it is building instead of receiving a fresh one to add itself.
+        That merges two full-block passes into one and drops one full-block
+        allocation per call; see the accumulation comment in
+        ``TomographyModel._sparse_forward_project_columns`` for why it is worth
+        doing and why the values do not move.  The parameter is added HERE, on
+        a plain python method, and not to the geometry body: the bodies are
+        torch.compile'd per device with shape-keyed caches, so a new argument
+        there would recompile every one of them.
 
         Args:
             band_values: (P, cols) voxel cylinders (or a slice band), on this
@@ -371,6 +487,9 @@ class Projectors:
             dev_index (int): which per-device compiled instance to use.
             plan: the memoization slot for a future sorted/CSR stream variant
                 (per pixel-subset x view-range); unused today.
+            accumulate_into: an existing block of the shape this call returns.
+                Given one, the loop ADDS into it and returns it; given None
+                (every other caller), it allocates the block and writes.
 
         Returns:
             (v1 - v0, rows_or_band, num_channels) on the input's device.
@@ -382,7 +501,12 @@ class Projectors:
         vb_size = self._effective_view_batch(fwd_body, pixel_indices.shape[0],
                                              band_values.shape[-1], args)
         view_params = self._view_params_per_dev[dev_index]
-        out = None
+        out = accumulate_into
+        # Whether this call adds into a block it was handed or fills one of its
+        # own, decided ONCE here rather than per view batch: an accumulating
+        # call adds every batch, including the first, because the block already
+        # holds earlier calls' work.
+        adding = out is not None
         for v in range(v0, v1, vb_size):
             view_params_batch = view_params[v:min(v + vb_size, v1)]
             block = fwd_body(
@@ -391,7 +515,14 @@ class Projectors:
             if out is None:
                 out = torch.empty((v1 - v0,) + tuple(block.shape[1:]),
                                   dtype=block.dtype, device=block.device)
-            out[v - v0:v - v0 + block.shape[0]] = block
+            rows = slice(v - v0, v - v0 + block.shape[0])
+            # View batches cover DISJOINT rows of the block, so neither arm
+            # sums anything across this loop -- assignment and addition touch
+            # each row exactly once either way.
+            if adding:
+                out[rows].add_(block)
+            else:
+                out[rows] = block
         return out
 
     def sparse_back_project_view_range(self, local_sino, pixel_indices,

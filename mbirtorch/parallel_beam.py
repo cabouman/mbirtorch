@@ -157,6 +157,31 @@ class ParallelBeamModel(TomographyModel):
     # automatic device count (see _widening_floors).
     _floor_family = 'parallel'
 
+    # Never call the compiled parallel bodies with a single pixel: on linux
+    # with torch 2.13.0, CPU inductor miscompiles that one-pixel case in both
+    # bodies and lands the pixel's footprint one detector channel off (6.56e-02
+    # relative error on the forward, 5.04e-02 on the back; eager is right, and
+    # so is every width of two or more).  The driver pads a one-pixel call to
+    # two and takes the padding back out, outside the compiled region --
+    # projectors.forward_at_min_pixel_width holds the full measurement and the
+    # argument that the padding cannot change a value.  Cone beam does not need
+    # this and does not declare it.
+    min_compiled_pixel_width = 2
+
+    # Parallel takes the multi-device forward's column gather for a reason of
+    # its own: the forward kernel runs about twice as efficiently per slice on
+    # a full-width block of values as on the shard-width blocks the banded
+    # walk hands it at more than one device, and the gather hands it full
+    # width whatever the device count (measured 2026-08-10 on one H100, at
+    # 0.0411 ms per slice on a 1008-wide block against 0.0823 on a 504-wide
+    # one with the device count held at one).  Cone declares the same
+    # attribute because a slice band buys its kernel nothing at all; see
+    # TomographyModel._column_gather_forward for what else has to hold before
+    # the path runs.  It runs by default since its speed, value, and memory
+    # gates passed (2026-08-11, four H100s); forward_column_gather = False
+    # restores the banded walk.
+    column_gather_geometry = True
+
     def get_psf_radius(self):
         """Computes the integer radius of the PSF kernel for parallel beam
         projection: the maximum number of detector channels on either side of

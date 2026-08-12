@@ -2,12 +2,25 @@
 goldens against mbirjax (single ops, FBP, auto geometry, and seeded
 convergence parity), a recon smoke, and 2-shard vs 1-device parity.
 
-Iterated-comparison gates for this geometry are set from its MEASURED parity
-floor, not copied from other geometries: at the dividing case (16 views,
-elevations to 29 deg) the seeded 3-iteration recon differs from mbirjax by
-1.2e-3 max, decaying to 4.2e-4 by 10 iterations -- trajectory float noise
-around one fixed point, the same recorded pattern as parallel 1024.  Traces
-(fm_rmse, alpha) match at 3e-6 / 2e-5.  Gates: traces tight, volumes 5e-3.
+The two seeded-reconstruction gates are each set from the parity MEASURED at
+the configuration that gate runs on, rather than sharing one number, because
+the two configurations differ by more than an order of magnitude:
+
+  * The GOLDEN configuration (24 views, elevations to +-0.4 rad) matches
+    mbirjax to 1.1e-5 max on the volume at 3 iterations, decaying to 6.8e-6
+    by 10.  Its volume gate is 2e-4, about 18x the measured value.
+  * The SHARDED comparison runs the dividing case (16 views, elevations to
+    29 deg), where three VCD iterations amplify float summation-order
+    differences of order 1e-7 into 9.4e-4 between 2 shards and 1 device --
+    trajectory float noise around one fixed point, the same recorded pattern
+    as parallel 1024, and the same size as this configuration's own 1.2e-3
+    difference from mbirjax at 3 iterations (4.2e-4 by 10).  Its volume gate
+    stays 5e-3, a 5.3x margin over that measurement.
+
+The golden test's per-iteration traces (alpha, fm_rmse) measure about 6.5e-6
+and 4.7e-6 and are gated further above that than the volume is: a trace is one
+scalar per iteration, so a single late step size can move without the
+reconstruction moving with it.
 """
 
 import glob
@@ -90,8 +103,15 @@ def test_multiaxis_recon_smoke(device):
 
 
 def test_multiaxis_sharded_recon_matches_single_device():
-    """2 CPU shards vs 1 device on the same seeded problem, gated at this
-    geometry's measured parity floor (see the module docstring)."""
+    """2 CPU shards vs 1 device on the same seeded problem.
+
+    This runs the dividing configuration, where the reconstruction
+    trajectory amplifies float summation-order differences: the measured
+    spread is 9.4e-4, so the 5e-3 gate below is a 5.3x margin.  That is a
+    much looser number than the golden test's, and deliberately so -- see
+    the module docstring for why the two configurations cannot share one
+    tolerance.
+    """
     ref_m = _small_ma(['cpu'])
     rs = ref_m.get_params('recon_shape')
     phantom = mbirtorch.gen_translation_phantom(rs, 'dots', None, fill_rate=0.05)
@@ -174,6 +194,15 @@ def test_multiaxis_fbp(golden, ma_model):
 @pytest.mark.goldens
 @ma_golden
 def test_multiaxis_recon_convergence_parity(golden, ma_model):
+    """Seeded 3-iteration parity with mbirjax on the GOLDEN configuration.
+
+    The volume gate is set from what this configuration measures, not from
+    the sharded test's number: 24 views with elevations to +-0.4 rad agree
+    with mbirjax to 1.1e-5 at 3 iterations and 6.8e-6 at 10, so 2e-4 is
+    about 18x the measurement -- room for another platform's arithmetic,
+    while still catching a regression an order of magnitude smaller than the
+    5e-3 this test used to share with the sharded comparison.
+    """
     np.random.seed(int(golden["recon_seed"]))
     recon, rd = ma_model.recon(golden["ma_sino"], max_iterations=3,
                                stop_threshold_change_pct=0.0, logfile_path=None)
@@ -187,4 +216,4 @@ def test_multiaxis_recon_convergence_parity(golden, ma_model):
           f"fm rel = {fm_rel:.2e}, final rel_max = {final_rel:.2e}")
     assert alpha_rel < 1e-2
     assert fm_rel < 1e-3
-    assert final_rel < 5e-3
+    assert final_rel < 2e-4

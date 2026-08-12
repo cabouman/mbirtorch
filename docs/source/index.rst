@@ -99,12 +99,10 @@ MBIRTorch: High-performance tomographic reconstruction
    dev_sharding_overview
    dev_projector_kernels
    dev_api
+   dev_maintenance
 
 .. PENDING(dashboard): restore dev_performance_dashboard to the toctree above
    when that page lands (held at Greg's request).
-.. PENDING(maintenance): restore dev_maintenance to the toctree above when the
-   release workflow is implemented and the page is rewritten around it
-   (release_workflow.md, "Releasing, once set up").
 
 
 .. _PyTorch: https://pytorch.org/docs/stable/index.html

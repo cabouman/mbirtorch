@@ -122,52 +122,56 @@ FLOORS = {
     ('parallel', 2): Floor(
         family='parallel', count=2, elements=88_080_384, cell=(512, 448, 384),
         against=1,
-        bracket=Bracket(losing_cell=(384, 336, 288), losing_speedup=0.64,
-                        winning_cell=(512, 448, 384), winning_speedup=1.23),
-        spread=0.09623, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
-        measured='2026-08-10', commit='a880d9c',
+        bracket=Bracket(losing_cell=(384, 336, 288), losing_speedup=0.80,
+                        winning_cell=(512, 448, 384), winning_speedup=1.21),
+        spread=0.05155, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-11', commit='4a222c7',
         largest_tested=297_271_296,
-        note='unchanged by the 2026-08-10 refresh.  The spread comes from '
-             'the 384-class n=1 runs, the noisiest in the family; at the '
-             'floor shape itself n=2 wins by 1.23x'),
+        note='unchanged by the 2026-08-11 refresh, which re-measured '
+             'every row under the column-gather forward default.  The '
+             '384-class shape still loses at 0.80x, and the floor shape '
+             'wins by 1.21x'),
     ('parallel', 4): Floor(
-        family='parallel', count=4, elements=1_023_934_464,
-        cell=(1024, 1008, 992), against=2,
-        bracket=Bracket(losing_cell=(768, 672, 576), losing_speedup=0.74,
-                        winning_cell=(1024, 1008, 992), winning_speedup=1.67),
-        spread=0.008199, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
-        measured='2026-08-10', commit='a880d9c',
+        family='parallel', count=4, elements=297_271_296,
+        cell=(768, 672, 576), against=2,
+        bracket=Bracket(losing_cell=None, losing_speedup=None,
+                        winning_cell=(768, 672, 576), winning_speedup=1.10),
+        spread=0.02116, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-11', commit='4a222c7',
         largest_tested=1_023_934_464,
-        note='measured against n=2, which still wins at the 768-class '
-             'shape'),
+        note='the floor MOVED DOWN, from the 1024-class shape to the '
+             '768-class, under the column-gather forward: four devices '
+             'now clear two by 1.10x at the 768-class shape and by 1.47x '
+             'at the 1024-class.  No losing shape is recorded because no '
+             'smaller shape was tried once the 768-class won; if this '
+             'admission is wrong, the cost is bounded by the 1.10x '
+             'margin against its 2.1 percent spread'),
     ('cone', 2): Floor(
         family='cone', count=2, elements=88_080_384, cell=(512, 448, 384),
         against=1,
-        bracket=Bracket(losing_cell=None, losing_speedup=None,
-                        winning_cell=(512, 448, 384), winning_speedup=1.02),
-        spread=0.005233, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
-        measured='2026-08-10', commit='a880d9c',
-        largest_tested=1_023_934_464,
-        note='the FIRST admission size ever measured for this entry: '
-             'before the 2026-08-10 refresh, no size had one.  MARGINAL, '
-             'on a 1.02x win clearing a 0.52 percent spread, and with no '
-             'losing shape recorded because no smaller shape was tried '
-             'once the 512-class shape won.  If this admission is wrong, '
-             'the cost is a few percent, by the measured asymmetry'),
+        bracket=Bracket(losing_cell=(384, 336, 288), losing_speedup=0.78,
+                        winning_cell=(512, 448, 384), winning_speedup=1.21),
+        spread=0.02342, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-11', commit='4a222c7',
+        largest_tested=297_271_296,
+        note='unchanged, and no longer marginal: the admission that '
+             'cleared by 1.02x on 2026-08-10 clears by 1.21x under the '
+             'column-gather forward, and this refresh recorded the '
+             'losing shape the first measurement never tried'),
     ('cone', 4): Floor(
         family='cone', count=4, elements=1_023_934_464,
-        cell=(1024, 1008, 992), against=1,
-        bracket=Bracket(losing_cell=(768, 672, 576), losing_speedup=0.98,
-                        winning_cell=(1024, 1008, 992), winning_speedup=1.16),
-        spread=0.003432, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
-        measured='2026-08-10', commit='a880d9c',
+        cell=(1024, 1008, 992), against=2,
+        bracket=Bracket(losing_cell=(768, 672, 576), losing_speedup=0.95,
+                        winning_cell=(1024, 1008, 992), winning_speedup=1.45),
+        spread=0.01853, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-11', commit='4a222c7',
         largest_tested=1_023_934_464,
-        note='the refresh narrowed the bracket from 512-to-1024 down to '
-             '768-to-1024; the floor did not move.  Measured against '
-             'n=1, because cone n=2 was not admitted anywhere when this '
-             'row was set.  Now that cone n=2 has a floor, the crossover '
-             'rule means the next refresh re-derives this row against '
-             'n=2'),
+        note='the floor did not move, but this refresh re-derived it '
+             'against n=2, as the crossover rule requires now that cone '
+             'n=2 is admitted -- the change the previous entry '
+             'anticipated.  At the floor shape n=4 clears n=2 by 1.45x, '
+             'and the 768-class shape sits just under admission at '
+             '0.95x, so the bracket is tight'),
 }
 
 # ── the projection-cost inputs the floors were measured against ──────────────
@@ -175,13 +179,20 @@ FLOORS = {
 #: module-level chunk constants and the budget class attributes these files
 #: carry are exactly the kind of tuning that moves a crossover without
 #: touching any function this table names, so a function-level hash would
-#: miss them.
-COST_INPUT_FILES = ('triton_parallel.py', 'triton_cone.py', 'projectors.py')
+#: miss them.  ``_sharding.py`` is here because it holds the cross-device
+#: transfer primitives the multi-device drivers are built from, and how much
+#: those move is most of what a wider device count costs.
+COST_INPUT_FILES = ('triton_parallel.py', 'triton_cone.py', 'projectors.py',
+                    '_sharding.py')
 
 #: Methods of TomographyModel that drive the multi-device projections.  The
 #: rest of that module moves for reasons unrelated to projection cost, so the
-#: hash is taken over these two sources rather than the whole file.
+#: hash is taken over these sources rather than the whole file.  The column
+#: gather is a third driver rather than a branch of the first, so it is named
+#: here in its own right; leaving it out would let the pixel batch it walks
+#: change without anything noticing.
 COST_INPUT_METHODS = ('_sparse_forward_project_sharded',
+                      '_sparse_forward_project_columns',
                       '_sparse_back_project_sharded')
 
 #: sha256 of each cost input as of the measurement above -- the recorded
@@ -190,10 +201,14 @@ COST_INPUT_METHODS = ('_sparse_forward_project_sharded',
 BLESSED_COST_HASHES = {
     'TomographyModel._sparse_back_project_sharded':
         '8a39fb4d97a9573933520ce780eae5dd2097e5a068caa3ee2178114ba8989772',
+    'TomographyModel._sparse_forward_project_columns':
+        '73f545dbd63188d6668a59d1707200a9cd065a0fbed3fcd929d713af77e01993',
     'TomographyModel._sparse_forward_project_sharded':
-        'f2a1fff6d1ea2627abfa4d02f1b5ad08e80383f4eef6bd037e4743c200b9f7b2',
+        '546201c90075a19f5ffe055c2becee6716417aa52e9e5f178885e7a68aae60f3',
+    '_sharding.py':
+        '424ada53243fa9f486cf139ee8564d21162ea791b9ef59ed949d0fa8a85d9b35',
     'projectors.py':
-        '6977a6181accbaee9235246ce2cc59f17869d9666daae91a3748b2c21f143cf6',
+        '68e812790a963b92519169fe4a04e667c587ff70919ed574533e4c52c891698a',
     'triton_cone.py':
         '8d3820c2101f8d3fbb7823f2d9b6e6e6253164bd14a2c276d167d9ba0a135154',
     'triton_parallel.py':
@@ -214,7 +229,7 @@ STALE_SINCE = None
 #: green the test leaves this behind, and the test says so.  Recomputed and
 #: printed by ``refresh_widening_floors.py --bless``.
 TABLE_CHECKSUM = \
-    'aa728b2070772ef627874d3bfc11206088ee3666f8e240319e50bea777596886'
+    'e68d1c7fb7e0d6a25e62f1053e562ce851651a12f70992c38fb7485e019613ae'
 
 
 # ── the env knob ─────────────────────────────────────────────────────────────
