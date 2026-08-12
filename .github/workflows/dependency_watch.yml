@@ -49,6 +49,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -o pipefail
           BRANCH="${{ steps.watch.outputs.branch }}"
           # A pull request in any state for this branch is a standing answer.
           if [ "$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" \
