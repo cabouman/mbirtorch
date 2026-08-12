@@ -21,40 +21,48 @@ The same tests run automatically on every push and pull request.
 Releasing a New Version
 -----------------------
 
-This is only available for registered maintainers.
-
-The tag must always equal ``v`` + ``__version__``; the upload fails otherwise.
-The example below releases version 0.2.0.
+This is only available for registered maintainers.  It requires the ``gh``
+command, logged in to GitHub.  The example below releases version 0.2.0.
 
 Releasing to TestPyPI
 +++++++++++++++++++++
 
-1. In ``mbirtorch/__init__.py``, set ``__version__ = "0.2.0rc1"``.
-   Commit this to the ``prerelease`` branch.
+1. Publish a release candidate to TestPyPI::
 
-2. On GitHub, draft a new release: tag ``v0.2.0rc1``, target ``prerelease``.
-   Check "Set as a pre-release", and publish.  This uploads to TestPyPI.
+       dev_scripts/release.sh 0.2.0rc1
 
-3. Check the TestPyPI upload::
+2. Check the TestPyPI upload::
 
        dev_scripts/check_published_wheel.sh --testpypi --version 0.2.0rc1
 
-   If it fails, fix the problem, set ``__version__ = "0.2.0rc2"``, and repeat
-   from step 2.
+   If it fails, fix the problem and repeat from step 1 with ``0.2.0rc2``.
 
 Releasing to PyPI
 +++++++++++++++++
 
-4. Set ``__version__ = "0.2.0"`` and commit to ``prerelease``.  Open a pull
-   request from ``prerelease`` to ``main`` and merge it when the checks pass.
+3. Open the release pull request::
 
-5. Draft a new release: tag ``v0.2.0``, target ``main``, and publish.  Then
-   approve the ``pypi`` environment on the workflow run page.  This uploads
-   to PyPI.
+       dev_scripts/release.sh 0.2.0
 
-6. Check the PyPI upload::
+   Merge it on GitHub when the checks pass.
+
+4. Publish the release::
+
+       dev_scripts/release.sh 0.2.0 --publish
+
+   Then approve the ``pypi`` environment on the workflow run page.  This
+   uploads to PyPI.
+
+5. Check the PyPI upload::
 
        dev_scripts/check_published_wheel.sh --version 0.2.0
+
+Each ``release.sh`` stage sets ``__version__`` in ``mbirtorch/__init__.py``,
+commits, and creates the matching ``v``-prefixed tag; the upload fails if the
+tag and ``__version__`` ever disagree.  The manual procedure behind the
+script: edit ``__version__``, commit to ``prerelease``, and draft a GitHub
+release with tag ``v`` + ``__version__`` — target ``prerelease`` with "Set as
+a pre-release" checked for an rc, target ``main`` for a final version.
 
 The documentation rebuilds automatically: ``latest`` follows ``main``, and
 ``stable`` follows the highest release tag.
