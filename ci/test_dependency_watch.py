@@ -9,7 +9,8 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from dependency_watch import (parse_torch_index, parse_version_file,
-                              parse_pyproject, divergence, branch_name)
+                              parse_pyproject, parse_runner_manifest,
+                              divergence, branch_name)
 
 INDEX_HTML = """
 <html><body>
@@ -55,6 +56,30 @@ def test_parse_pyproject_floors():
     python_floor, torch_floor = parse_pyproject(PYPROJECT_TOML)
     assert python_floor == "3.11"
     assert torch_floor == "2.13"
+
+
+RUNNER_MANIFEST_JSON = """[
+  {"version": "3.15.0-rc.2", "stable": false},
+  {"version": "3.14.2", "stable": true},
+  {"version": "3.14.0", "stable": true},
+  {"version": "3.13.9", "stable": true},
+  {"version": "3.12.12", "stable": true},
+  {"version": "3.11.14", "stable": true}
+]"""
+
+
+def test_parse_runner_manifest_stable_minors_only():
+    minors = parse_runner_manifest(RUNNER_MANIFEST_JSON)
+    assert minors == {"3.11", "3.12", "3.13", "3.14"}   # 3.15 rc excluded
+
+
+def test_version_on_torch_index_but_not_on_runners_is_not_proposed():
+    d = divergence("2.13.0", ["3.11", "3.12", "3.13", "3.14", "3.15"],
+                   ["3.11", "3.12"], "3.11", "2.13",
+                   runner_minors={"3.11", "3.12", "3.13", "3.14"})
+    assert d["not_on_runners"] == ["3.15"]        # informational only
+    assert d["additions"] == ["3.13", "3.14"]
+    assert branch_name(d) == "nightly/python-matrix-add-3.13-3.14"
 
 
 def test_multi_version_addition_with_below_floor_exclusion():

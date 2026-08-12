@@ -21,6 +21,11 @@ import sys
 import urllib.request
 
 CPU_INDEX_URL = "https://download.pytorch.org/whl/cpu/torch/"
+# The Python versions GitHub's hosted runners can install (setup-python's
+# source of truth).  A version torch supports but the runners lack cannot
+# be tested and must not be proposed.
+RUNNER_MANIFEST_URL = ("https://raw.githubusercontent.com/actions/"
+                       "python-versions/main/versions-manifest.json")
 REMOTE_RAW = "https://raw.githubusercontent.com/cabouman/mbirtorch/prerelease/"
 VERSION_FILE = ".github/python-versions.json"
 PYPROJECT = "pyproject.toml"
@@ -76,6 +81,22 @@ def parse_torch_index(html):
     return newest, sorted(files[newest], key=lambda v: int(v.split(".")[1]))
 
 
+def parse_runner_manifest(text):
+    """The Python versions GitHub's runners install, as minors like "3.12".
+    Only entries marked stable count; release candidates do not make a
+    version testable."""
+    minors = set()
+    for entry in json.loads(text):
+        if not entry.get("stable"):
+            continue
+        parts = str(entry.get("version", "")).split(".")
+        if len(parts) >= 2 and parts[0] == "3" and parts[1].isdigit():
+            minors.add(f"3.{parts[1]}")
+    if not minors:
+        raise ValueError("no stable Python versions found in the runner manifest")
+    return minors
+
+
 def parse_version_file(text):
     """The matrix from the version file.  Returns (test_list, docs_version)."""
     data = json.loads(text)
@@ -101,12 +122,18 @@ def _minor(v):
     return tuple(int(x) for x in v.split(".")[:2])
 
 
-def divergence(torch_release, torch_list, matrix, python_floor, torch_floor):
-    """The divergence, as a dict.  Versions below the Python floor are
-    reported informationally and never proposed."""
+def divergence(torch_release, torch_list, matrix, python_floor, torch_floor,
+               runner_minors=None):
+    """The divergence, as a dict.  Versions below the Python floor, and
+    versions absent from ``runner_minors`` (the versions GitHub's runners
+    install), are reported informationally and never proposed."""
     below_floor = [v for v in torch_list if _minor(v) < _minor(python_floor)]
     eligible = [v for v in torch_list if _minor(v) >= _minor(python_floor)]
     additions = [v for v in eligible if v not in matrix]
+    not_on_runners = []
+    if runner_minors is not None:
+        not_on_runners = [v for v in additions if v not in runner_minors]
+        additions = [v for v in additions if v in runner_minors]
     removals = [v for v in matrix if v not in torch_list]
     torch_newest_minor = ".".join(str(x) for x in _minor(torch_release))
     torch_advance = (torch_newest_minor
@@ -118,6 +145,7 @@ def divergence(torch_release, torch_list, matrix, python_floor, torch_floor):
         "python_floor": python_floor,
         "torch_floor": torch_floor,
         "below_floor": below_floor,
+        "not_on_runners": not_on_runners,
         "additions": additions,
         "removals": removals,
         "torch_advance": torch_advance,
@@ -256,6 +284,15 @@ def main(argv=None):
     print(f"dependency-watch: torch {torch_release} supports {torch_list}")
 
     try:
+        runner_minors = parse_runner_manifest(fetch(RUNNER_MANIFEST_URL))
+    except (OSError, urllib.error.URLError, ValueError) as e:
+        print(f"dependency-watch: RUNNER MANIFEST NOT READ "
+              f"({RUNNER_MANIFEST_URL}): {e}")
+        print("dependency-watch: verdict UNKNOWN (cannot tell which versions "
+              "the runners install; this is not 'no divergence')")
+        return 1
+
+    try:
         matrix, docs_version = parse_version_file(read(vf_source))
     except (OSError, urllib.error.URLError) as e:
         print(f"dependency-watch: VERSION FILE NOT READ ({vf_source}): {e}")
@@ -265,13 +302,17 @@ def main(argv=None):
     print(f"dependency-watch: matrix {matrix}, docs {docs_version} ({vf_source})")
 
     python_floor, torch_floor = parse_pyproject(read(pp_source))
-    d = divergence(torch_release, torch_list, matrix, python_floor, torch_floor)
+    d = divergence(torch_release, torch_list, matrix, python_floor, torch_floor,
+                   runner_minors=runner_minors)
 
     if args.json:
         print(json.dumps(d, indent=2))
     if d["below_floor"]:
         print(f"dependency-watch: below the {python_floor} floor, not proposed: "
               f"{d['below_floor']}")
+    if d["not_on_runners"]:
+        print(f"dependency-watch: torch supports but GitHub runners do not "
+              f"install yet, not proposed: {d['not_on_runners']}")
     if d["any"]:
         print(f"dependency-watch: DIVERGENCE -> branch {branch_name(d)}")
         if d["additions"]:
