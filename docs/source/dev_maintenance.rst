@@ -31,6 +31,12 @@ Releasing to TestPyPI
 
        dev_scripts/release.sh 0.X.Yrc1
 
+   What this does:
+
+   * Sets ``__version__`` to 0.X.Yrc1, commits, and pushes to ``prerelease``.
+   * Creates a GitHub pre-release with tag ``v0.X.Yrc1``.
+   * CI builds the package and uploads it to TestPyPI.  No approval needed.
+
 2. Check the TestPyPI upload::
 
        dev_scripts/check_published_wheel.sh --testpypi --version 0.X.Yrc1
@@ -44,14 +50,29 @@ Releasing to PyPI
 
        dev_scripts/release.sh 0.X.Y
 
-   Merge it on GitHub when the checks pass.
+   What this does:
+
+   * Sets ``__version__`` to 0.X.Y, commits, and pushes to ``prerelease``.
+   * Opens the pull request from ``prerelease`` to ``main``.
+   * Nothing is uploaded anywhere.
+
+   Merge the pull request on GitHub when the checks pass.
 
 4. Publish the release::
 
        dev_scripts/release.sh 0.X.Y --publish
 
-   Then approve the ``pypi`` environment on the workflow run page.  This
-   uploads to PyPI.
+   What this does:
+
+   * Checks that ``main`` contains ``__version__ = 0.X.Y``; stops if the
+     pull request is not merged yet.
+   * Creates a GitHub release with tag ``v0.X.Y`` on ``main``.
+   * CI builds the package, then pauses and waits for your approval.
+
+   To approve: on GitHub, open the Actions tab, click the running release
+   workflow, click "Review deployments", check the "pypi" box, and click
+   "Approve and deploy".  The upload to PyPI then runs.  This manual
+   approval is the last stop before PyPI, where uploads are permanent.
 
 5. Check the PyPI upload::
 
