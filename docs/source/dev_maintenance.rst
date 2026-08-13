@@ -22,40 +22,40 @@ Releasing a New Version
 -----------------------
 
 This is only available for registered maintainers.  It requires the ``gh``
-command, logged in to GitHub.  The example below releases version 0.2.0.
+command, logged in to GitHub.  The example below releases version 0.X.Y.
 
 Releasing to TestPyPI
 +++++++++++++++++++++
 
 1. Publish a release candidate to TestPyPI::
 
-       dev_scripts/release.sh 0.2.0rc1
+       dev_scripts/release.sh 0.X.Yrc1
 
 2. Check the TestPyPI upload::
 
-       dev_scripts/check_published_wheel.sh --testpypi --version 0.2.0rc1
+       dev_scripts/check_published_wheel.sh --testpypi --version 0.X.Yrc1
 
-   If it fails, fix the problem and repeat from step 1 with ``0.2.0rc2``.
+   If it fails, fix the problem and repeat from step 1 with ``0.X.Yrc2``.
 
 Releasing to PyPI
 +++++++++++++++++
 
 3. Open the release pull request::
 
-       dev_scripts/release.sh 0.2.0
+       dev_scripts/release.sh 0.X.Y
 
    Merge it on GitHub when the checks pass.
 
 4. Publish the release::
 
-       dev_scripts/release.sh 0.2.0 --publish
+       dev_scripts/release.sh 0.X.Y --publish
 
    Then approve the ``pypi`` environment on the workflow run page.  This
    uploads to PyPI.
 
 5. Check the PyPI upload::
 
-       dev_scripts/check_published_wheel.sh --version 0.2.0
+       dev_scripts/check_published_wheel.sh --version 0.X.Y
 
 Each ``release.sh`` stage sets ``__version__`` in ``mbirtorch/__init__.py``,
 commits, and creates the matching ``v``-prefixed tag; the upload fails if the
