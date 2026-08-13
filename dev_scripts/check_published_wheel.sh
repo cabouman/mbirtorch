@@ -52,6 +52,8 @@ fi
 
 cp -R tests "$WORK/tests"
 rm -rf "$WORK/tests/goldens" "$WORK/tests/__pycache__"
+# Register the goldens mark (normally done by pyproject.toml, absent here).
+printf '[pytest]\nmarkers =\n    goldens: opt-in cross-framework parity tests\n' > "$WORK/pytest.ini"
 
 cd "$WORK"
 "$PY" -m pytest -n 4 -m "not goldens" tests
