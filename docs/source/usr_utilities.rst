@@ -67,7 +67,27 @@ Cache Management
 ----------------
 
 MBIRTorch keeps one on-disk cache, of compiled ``torch.compile`` artifacts, so that a fresh
-process reuses prior compilations instead of recompiling.  This section has no MBIRJAX
-counterpart; the MBIRJAX analog is its JAX compilation cache.
+process reuses prior compilations instead of recompiling.  These are stored in
+`~/.mbirtorch/torch_cache`.  The cache exists to make cold starts fast -- with it, a
+fresh process reuses prior compilations instead of recompiling (roughly 14 s
+down to 2 s for a first small reconstruction).  It grows with the number of
+distinct compiled shapes and typically stays in the tens of megabytes; it is
+never cleaned automatically.  To remove it:
+
+.. code-block:: python
+
+    import mbirtorch
+    mbirtorch.clear_cache()   # deletes ~/.mbirtorch entirely (recreated empty)
+
+
+The location can be redirected by setting the `TORCHINDUCTOR_CACHE_DIR`
+environment variable before the first compile (e.g. to node-local or scratch
+storage on a cluster, where home quotas are tight); `clear_cache()` does not
+touch a redirected location.
+
+Everything else the package caches is in-memory only and is freed with the
+objects that hold it (e.g. the per-model pixel-index cache); nothing besides
+`~/.mbirtorch` is written to disk.
+
 
 .. autofunction:: mbirtorch.utilities.clear_cache
