@@ -17,6 +17,11 @@ build:
       # from PyPI, which on Linux is the CUDA build -- several GB of nvidia-* wheels
       # that exceed RTD's build disk and time limits.  Autodoc only needs to import
       # the package, so the CPU wheel is sufficient.
+      #
+      # RTD seeds the environment with an old pip that rejects wheels whose
+      # metadata spells the name with an underscore (typing_extensions broke
+      # the 2026-08-12 build), so upgrade pip first.
+      - pip install --upgrade pip
       - pip install torch --index-url https://download.pytorch.org/whl/cpu
 
 # Build the Sphinx docs.

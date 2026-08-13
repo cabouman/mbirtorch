@@ -1,8 +1,9 @@
 name: CI
 on:
+  # Tests run on pull requests, not on every push: the pull-request run
+  # gates merging, and releases have their own checks (TestPyPI rc +
+  # check_published_wheel.sh).
   pull_request:
-    branches: [prerelease, main]
-  push:
     branches: [prerelease, main]
   # Explicit dispatch exists for the dependency watch: pull requests opened
   # with the built-in token start no workflow runs on their own, so the watch

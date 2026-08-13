@@ -3,6 +3,13 @@ import os
 import pytest
 import torch
 
+# Start CUDA before any test runs.  torch checks every device in
+# range(device_count()) at the first CUDA use, and tests below fake
+# device_count, so a first use inside one of them asks for a device that does
+# not exist and fails.
+if torch.cuda.is_available():
+    torch.zeros(1, device="cuda")
+
 
 def available_devices():
     devices = ["cpu"]

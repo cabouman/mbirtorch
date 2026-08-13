@@ -21,28 +21,69 @@ The same tests run automatically on every push and pull request.
 Releasing a New Version
 -----------------------
 
-This is only available for registered maintainers.
+This is only available for registered maintainers.  It requires the ``gh``
+command, logged in to GitHub.  The example below releases version 0.X.Y.
 
-1. Update ``__version__`` in ``mbirtorch/__init__.py`` and merge to
-   ``prerelease``.  This is the only place the version number is written.
+Releasing to TestPyPI
++++++++++++++++++++++
 
-2. On GitHub, draft a new release: tag ``vX.Y.ZrcN``, target ``prerelease``,
-   check "Set as a pre-release", and publish.  This uploads to TestPyPI.
+1. Publish a release candidate to TestPyPI::
 
-3. Check the TestPyPI upload::
+       dev_scripts/release.sh 0.X.Yrc1
 
-       dev_scripts/check_published_wheel.sh --testpypi --version X.Y.ZrcN
+   What this does:
 
-4. Open a pull request from ``prerelease`` to ``main`` and merge it when the
-   checks pass.
+   * Sets ``__version__`` to 0.X.Yrc1, commits, and pushes to ``prerelease``.
+   * Creates a GitHub pre-release with tag ``v0.X.Yrc1``.
+   * CI builds the package and uploads it to TestPyPI.  No approval needed.
 
-5. Draft a new release: tag ``vX.Y.Z``, target ``main``, and publish.  Then
-   approve the ``pypi`` environment on the workflow run page.  This uploads
-   to PyPI.
+2. Check the TestPyPI upload::
 
-6. Check the PyPI upload::
+       dev_scripts/check_published_wheel.sh --testpypi --version 0.X.Yrc1
 
-       dev_scripts/check_published_wheel.sh --version X.Y.Z
+   If it fails, fix the problem and repeat from step 1 with ``0.X.Yrc2``.
+
+Releasing to PyPI
++++++++++++++++++
+
+3. Open the release pull request::
+
+       dev_scripts/release.sh 0.X.Y
+
+   What this does:
+
+   * Sets ``__version__`` to 0.X.Y, commits, and pushes to ``prerelease``.
+   * Opens the pull request from ``prerelease`` to ``main``.
+   * Nothing is uploaded anywhere.
+
+   Merge the pull request on GitHub when the checks pass.
+
+4. Publish the release::
+
+       dev_scripts/release.sh 0.X.Y --publish
+
+   What this does:
+
+   * Checks that ``main`` contains ``__version__ = 0.X.Y``; stops if the
+     pull request is not merged yet.
+   * Creates a GitHub release with tag ``v0.X.Y`` on ``main``.
+   * CI builds the package, then pauses and waits for your approval.
+
+   To approve: on GitHub, open the Actions tab, click the running release
+   workflow, click "Review deployments", check the "pypi" box, and click
+   "Approve and deploy".  The upload to PyPI then runs.  This manual
+   approval is the last stop before PyPI, where uploads are permanent.
+
+5. Check the PyPI upload::
+
+       dev_scripts/check_published_wheel.sh --version 0.X.Y
+
+Each ``release.sh`` stage sets ``__version__`` in ``mbirtorch/__init__.py``,
+commits, and creates the matching ``v``-prefixed tag; the upload fails if the
+tag and ``__version__`` ever disagree.  The manual procedure behind the
+script: edit ``__version__``, commit to ``prerelease``, and draft a GitHub
+release with tag ``v`` + ``__version__`` — target ``prerelease`` with "Set as
+a pre-release" checked for an rc, target ``main`` for a final version.
 
 The documentation rebuilds automatically: ``latest`` follows ``main``, and
 ``stable`` follows the highest release tag.

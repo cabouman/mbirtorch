@@ -45,9 +45,6 @@ MBIRTorch: High-performance tomographic reconstruction
       Based on PyTorch_, MBIRTorch can easily run on CPU or GPU.
 
 
-.. PENDING(dashboard): point the Developer Docs card below back at
-   dev_performance_dashboard when that page lands (held at Greg's request).
-
 .. grid:: 3
 
     .. grid-item-card:: :material-regular:`rocket_launch;2em` Getting Started
@@ -65,7 +62,7 @@ MBIRTorch: High-performance tomographic reconstruction
     .. grid-item-card:: :material-regular:`laptop_chromebook;2em` Developer Docs
       :class-card: developer-docs
       :columns: 12 6 6 4
-      :link: dev_sharding_overview
+      :link: dev_performance_dashboard
       :link-type: doc
 
 
@@ -96,13 +93,11 @@ MBIRTorch: High-performance tomographic reconstruction
    :maxdepth: 4
    :caption: Developer Guide
 
+   dev_performance_dashboard
    dev_sharding_overview
    dev_projector_kernels
    dev_api
    dev_maintenance
-
-.. PENDING(dashboard): restore dev_performance_dashboard to the toctree above
-   when that page lands (held at Greg's request).
 
 
 .. _PyTorch: https://pytorch.org/docs/stable/index.html
