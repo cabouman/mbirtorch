@@ -166,15 +166,8 @@ def multi_threshold_otsu(image, classes=2, num_bins=1024, valid_mask=None):
     number of classes by minimizing the intra-class variance. It returns `classes - 1` thresholds
     that can be used to partition the image intensity range into `classes` distinct segments.
 
-    The histogram is computed on the host; a torch tensor input is gathered to the host first.
-    A sharded volume (a ``Shards`` container) is instead histogrammed where it sits, shard by
-    shard, and only the count tables travel.  That path bins in float32 on the device rather
-    than in numpy's float64-plus-edge-correction, so its thresholds are expected to agree with
-    the unsharded ones but are not guaranteed to (see ``_sharded_masked_histogram``); it also
-    raises rather than binning a volume whose valid entries are all one value.
-
     Args:
-        image (np.ndarray or torch.Tensor):
+        image (np.ndarray, torch.Tensor, or Shards):
             Input image of floating-point values.
         classes (int, optional):
             Number of classes to divide the image into. Must be ≥ 2. Defaults to 2.
@@ -340,11 +333,14 @@ def segment_plastic_metal(recon, num_metal, radial_margin=None, top_margin=None,
         num_real_slices (int or None, optional): Real slice count (see ``apply_cylindrical_mask``).
 
     Returns:
-        Tuple[ndarray, List[ndarray], float, List[float]]:
-            - plastic_mask (ndarray): Binary mask for plastic regions.
-            - metal_masks (List[ndarray]): List of binary masks for each metal region.
-            - plastic_scale (float): Scaling factor for plastic region.
-            - metal_scales (List[float]): List of scaling factors for each metal region.
+        tuple: ``(plastic_mask, metal_masks, plastic_scale, metal_scales)``.  Each mask has the same
+        type as ``recon``: numpy in gives numpy out, tensor in gives tensor out, ``Shards`` in gives
+        ``Shards`` out.
+
+            - plastic_mask (np.ndarray, torch.Tensor, or Shards): Binary mask for plastic regions.
+            - metal_masks (list): One binary mask per metal region, each in the same form as ``recon``.
+            - plastic_scale (float): Scaling factor for the plastic region.
+            - metal_scales (list of float): One scaling factor per metal region.
     """
     if num_metal <= 0:
         raise ValueError("num_metal must be positive")

@@ -89,13 +89,17 @@ class QGGMRFDenoiser(TomographyModel):
     standard deviation sigma_noise, the result of :meth:`denoise` applied to
     X + W is the MAP estimate of the denoised image using the qGGMRF prior.
 
-    :meth:`denoise` has two paths: on a single device the whole sweep runs
-    through one compiled in-place update; across several devices (set with
-    ``configure_devices``) the image is slice-sharded and each device updates
-    its own shard, with the qGGMRF halos carrying the cross-boundary prior
-    term.  The automatic device count does not apply to the denoiser: it
-    never reaches the reconstruction path where that choice is made, so
-    multi-device denoising is explicit via ``configure_devices``.
+    The denoiser runs on one device by default.  Multi-device denoising is
+    explicit: call ``configure_devices`` first, and the image is then divided
+    across the devices by slice.  The automatic device count that ``recon``
+    uses does not apply here.
+
+    Args:
+        image_shape (tuple of int): shape of the images to denoise
+            (3-dimensional).  To denoise a 2D image, use shape (1, m, n).
+        compile_mode (str, optional): 'auto' (default) compiles the
+            computational kernels with torch.compile; 'off' runs without
+            compilation.
     """
 
     def __init__(self, image_shape, compile_mode='auto'):
@@ -218,8 +222,9 @@ class QGGMRFDenoiser(TomographyModel):
                 (slice-sharded across several devices).
 
         Returns:
-            (denoised_image, denoiser_dict): the denoised volume and the
-            recon-params dict.
+            (denoised_image, denoiser_dict): the denoised volume, and a dict
+            with entries 'recon_params', 'recon_log', 'notes', and
+            'model_params' (as in :meth:`TomographyModel.get_recon_dict`).
 
         Example:
             >>> denoiser = mbirtorch.QGGMRFDenoiser(noisy_image.shape)
@@ -462,39 +467,33 @@ class QGGMRFDenoiser(TomographyModel):
 
 def median_filter3d(x, max_block_gb=4.0, return_min_max=False):
     """
-    Apply a 27‑point (3x3x3) median filter to a 3‑D array using replicated
-    (edge) boundary conditions.  Optionally return the min and max in each 27 point neighborhood.
-
-    The volume is processed in d0‑blocks to limit peak device memory.  Each block is padded with
-    a one‑voxel halo; halos duplicate the nearest edge voxel so that the result
-    matches NumPy's `"edge"` mode.
+    Apply a 27-point (3x3x3) median filter to a 3-D array using replicated
+    (edge) boundary conditions.  Optionally also return the min and max of
+    each 27-point neighborhood.
 
     Args:
         x (ndarray or tensor): Input array.
-        max_block_gb (float. optional): A rough upper bound on the amount of memory in GB to use for the filtering.  Defaults to 4.0.
-        return_min_max (bool, optional): If true, the output is a tuple of median, min, max.
+        max_block_gb (float, optional): A rough upper bound on the amount of
+            memory in GB to use for the filtering.  Defaults to 4.0.
+        return_min_max (bool, optional): If True, the output is a tuple
+            (median, min, max).
 
     Returns:
+        ndarray or tensor (or tuple of 3): An array of the same shape and
+        dtype as ``x`` containing the median-filtered result, numpy for
+        numpy input and tensor for tensor input.
 
-        ndarray or tensor (or tuple of 3): An array of the same shape and dtype as *x* containing the
-        median‑filtered result, on the same array module as the input.
+    Note:
+        The array is processed in blocks along axis 0 so that roughly
+        ``max_block_gb`` of temporary data exists at once.  If axis 0 is
+        short relative to another axis, swapping axis 0 with the long axis
+        first may use less memory.
 
-    Notes
-    -----
-    * The function automatically splits the 0‑dimension into blocks so that at
-      most roughly ``max_block_gb`` of temporary data are materialised.
-      If the array is large and the 0 dimension is small relative to another dimension, it may be more memory efficient
-      to swap axis 0 with the long axis before applying median_filter3d.
-    * Within each block the filter is computed by rolling the data in all 26
-      neighbour directions, stacking the 27 volumes, and taking
-      the median along the new axis.
-
-    Examples
-    --------
-    >>> import numpy as np
-    >>> import mbirtorch
-    >>> vol = np.arange(27.).reshape(3, 3, 3)
-    >>> mbirtorch.median_filter3d(vol)
+    Example:
+        >>> import numpy as np
+        >>> import mbirtorch
+        >>> vol = np.arange(27.).reshape(3, 3, 3)
+        >>> mbirtorch.median_filter3d(vol)
     """
     import torch.nn.functional as F
     from .tomography_model import _resolve_device

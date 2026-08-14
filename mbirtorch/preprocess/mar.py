@@ -90,13 +90,14 @@ def _ps_view_mask(mask, x):
 
 def gen_huber_weights(weights, sino_error, T=1.0, delta=1.0, epsilon=1e-6):
     """
-    This function generates generalized Huber weights based on the method described in the referenced notes.
-    It adds robustness by treating any element where ``|sino_error / weights| > T`` as an outlier,
-    down-weighting it according to the generalized Huber function.
+    Generate generalized Huber weights that down-weight outliers in ``sino_error``.
 
-    The function returns new `ghuber_weights`.
+    The per-element standard deviation is ``std = 1 / sqrt(weights)``.  A single global factor
+    ``alpha = ||sino_error|| / ||std||`` rescales it, and an element counts as an outlier when
+    ``|sino_error / (alpha * std)| > T``.  Each outlier is down-weighted by the generalized Huber
+    function; all other elements get weight 1.
 
-    Typically, to obtain the final robust weights, the `ghuber_weights` should be multiplied by the original `weights`:
+    Typically, to obtain the final robust weights, the returned weights should be multiplied by the original `weights`:
 
         final_weights = weights * ghuber_weights
 
@@ -106,7 +107,7 @@ def gen_huber_weights(weights, sino_error, T=1.0, delta=1.0, epsilon=1e-6):
         sino_error: ndarray or tensor of shape (views, rows, cols):
             Sinogram error array representing deviations from the model.
         T: float, optional (default=1.0):
-            Threshold parameter; values greater than T are treated as outliers.
+            Outlier threshold on the normalized error ``|sino_error / (alpha * std)|``.
         delta: float, optional (default=1.0):
             Controls the strength of the generalized Huber function (delta=1 corresponds to the conventional Huber).
         epsilon: float, optional (default=1e-6):
@@ -172,7 +173,9 @@ def BH_correction(sino, alpha, batch_size=64, devices=None):
         batch_size (int, optional, default=64):
             Number of views to process in a single batch.
         devices (sequence, optional):
-            Accepted for interface compatibility; the batches run on a single device.
+            Devices to spread the view batches over.  The views are split into contiguous blocks,
+            one per device, and the blocks are processed at the same time.  None (the default) runs
+            everything on a single device.
 
     Returns:
         corrected_sino: ndarray of shape (views, rows, cols)
@@ -868,7 +871,9 @@ def recon_plastic_metal(ct_model, sino, weights, num_BH_iterations=3, num_constr
     and reconstruction, refining the image over several iterations to suppress metal-induced artifacts.
 
     Args:
-        ct_model: MBIRTORCH cone beam model instance with `direct_recon` and `recon` methods.
+        ct_model: Any mbirtorch model that provides `direct_recon` and `recon`.  For a cone beam
+            model the reconstruction passes use `split_sino_recon`; for every other geometry they
+            use `recon`.  The function has been used mainly with cone beam models.
         sino (ndarray):  Input sinogram data to be corrected.
         weights (ndarray): Transmission weights used in the reconstruction algorithm.
         num_BH_iterations (int, optional): Number of correction-reconstruction iterations. Defaults to 3.
@@ -884,8 +889,8 @@ def recon_plastic_metal(ct_model, sino, weights, num_BH_iterations=3, num_constr
             to set a positive floor in the denominator, preventing division by near-zero or negative values. Defaults to 0.1.
         verbose (int, optional): Verbosity level for printing intermediate information. Defaults to 0.
         output_sharded (bool, optional): Choose the form of the returned reconstruction.  If False
-            (default), return an ordinary host NumPy array.  If True, return the device tensor for a
-            following on-device step.
+            (default), return an ordinary host NumPy array.  If True, return the model's device form:
+            a tensor on a single-device model, or a ``Shards`` container on a multi-device model.
         max_iterations (int, optional): Maximum MBIR iterations per reconstruction pass. Defaults to 15.
         logfile_path (str, optional): Same as in the TomographyModel.recon() method.  The BH passes'
             logs are merged into this single file, each under a section header.
@@ -894,8 +899,10 @@ def recon_plastic_metal(ct_model, sino, weights, num_BH_iterations=3, num_constr
             (see segment_plastic_metal).
 
     Returns:
-         numpy array or tensor: The final corrected reconstruction after iterative beam hardening
-         correction -- a host NumPy array by default, or a device tensor if ``output_sharded=True``.
+         numpy array, tensor, or Shards: The final corrected reconstruction after iterative beam
+         hardening correction.  It is a host NumPy array by default.  With ``output_sharded=True``
+         it is the model's device form: a tensor on a single-device model, or a ``Shards`` container
+         on a multi-device model.
 
     Example:
         >>> recon = recon_plastic_metal(

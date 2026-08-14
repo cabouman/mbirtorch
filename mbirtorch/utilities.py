@@ -183,7 +183,7 @@ def load_data_hdf5(file_path):
     It also loads any associated attributes and returns them as a dict.
 
     Args:
-        file_path (str): Path to the HDF5 file containing the reconstructed volume.
+        file_path (str): Path to the HDF5 file containing the array.
 
     Returns:
         tuple: (array, data_dict)
@@ -192,7 +192,8 @@ def load_data_hdf5(file_path):
 
     Raises:
         FileNotFoundError: If the file does not exist.
-        ValueError: If more than one dataset is not found in the file.
+        ValueError: If the file contains more than one dataset.
+        IndexError: If the file contains no dataset.
 
     Example:
         >>> import mbirtorch
@@ -291,11 +292,8 @@ def save_data_hdf5(file_path, array, array_name='array', attributes_dict=None):
     The resulting structure has a single dataset with one array and associated text attributes.
     These can be retrieved using :func:`load_data_hdf5`.
 
-    A sharded volume (a ``Shards`` container) is gathered SLAB BY SLAB rather than up front,
-    so the peak host footprint is one slab and not the whole volume -- which is the point of
-    the streaming design and would otherwise be lost exactly where it matters most.  The file
-    is byte-identical to the gather-first version: same slab order, same concatenation axis,
-    same padding crop, same dtype (see ``_to_host``).
+    Large arrays and sharded volumes (a ``Shards`` container) are written one slab at a time,
+    so no full copy of the array is built on the host.
 
     Args:
         file_path (str): Full path to the output HDF5 file. Directories will be created if they do not exist.
@@ -394,7 +392,7 @@ def export_recon_hdf5(file_path, recon, recon_dict=None, remove_flash=False, rad
     Export a 3D reconstruction volume to an HDF5 file with optional post-processing.
 
     This function works with numpy arrays, torch tensors, and sharded volumes (a ``Shards``
-    container): a sharded volume is gathered to the host at this file boundary and any
+    container).  A sharded volume is copied to the host and written one slab at a time, and any
     zero-padding of its slice axis is cropped, so the file equals the single-device export.
     The function also transposes the reconstruction to right-hand coordinates (slice, col, row),
     and writes the reconstruction and optional metadata to an HDF5 file.
@@ -469,14 +467,12 @@ def _resolve_geometry_class(geometry_type):
 
 def build_model(required_params, optional_params=None, regularization=None):
     """
-    Construct a model from parameter dicts and compute its reconstruction geometry.
+    Construct a model from the parameter dicts returned by
+    :meth:`~mbirtorch.TomographyModel.get_all_params`.
 
-    The single place the ``construct -> set_params -> auto_set_recon_geometry`` sequence lives, so a
-    caller never forgets the final ``auto_set_recon_geometry`` (which would leave the reconstruction
-    grid sized with default detector pitches).  Because ``required_params`` carries ``geometry_type``
-    (see :meth:`~mbirtorch.TomographyModel.get_all_params`), the correct model class is resolved here
-    and ``(required_params, optional_params)`` is a self-contained model description -- calling this
-    reads like calling the constructor through the new interface.
+    The model class is taken from the ``geometry_type`` entry of ``required_params``.  The model is
+    constructed, the optional parameters and regularization are applied, and the reconstruction
+    geometry is set with ``auto_set_recon_geometry``.
 
     Args:
         required_params (dict): The model constructor's arguments, including ``geometry_type`` (as
@@ -720,8 +716,8 @@ def stitch_arrays(array_list, overlap, axis=2, ramp_overlap=None):
     between adjacent arrays.
 
     This behaves like a concatenate except that for each adjacent pair, the
-    first `overlap_length` elements of the second array and the last
-    `overlap_length` elements of the current result are combined by a piece-wise linear cross‑fade.
+    first `overlap` elements of the second array and the last
+    `overlap` elements of the current result are combined by a piece-wise linear cross‑fade.
 
     All non‑`axis` dimensions must match across inputs.
 
@@ -730,7 +726,7 @@ def stitch_arrays(array_list, overlap, axis=2, ramp_overlap=None):
             built on the inputs' own array module, so host (NumPy) inputs stitch on the host (no
             gather to a single device) and device tensors stitch on-device.
         overlap (int): Number of elements overlapped between arrays.
-            Must be `>= 1` and not exceed the length of any input along `axis`.
+            Must not exceed the length of any input along `axis`.
         axis (int, optional): Axis along which to stitch. Defaults to 2.
         ramp_overlap (int, optional): Target number of blended (0 < w < 1) elements. Defaults to None.
 
@@ -739,14 +735,14 @@ def stitch_arrays(array_list, overlap, axis=2, ramp_overlap=None):
         out, tensor in -> on-device out). Its shape equals the input shape with the
         length along `axis` equal to:
 
-            sum(len_k) - (len(array_list) - 1) * overlap_length
+            sum(len_k) - (len(array_list) - 1) * overlap
 
         where `len_k` are the lengths of each input along `axis`.
 
     Raises:
         ValueError: If fewer than two arrays are provided, if non‑`axis`
             dimensions differ, or if any array is shorter than
-            `overlap_length` along `axis`.
+            `overlap` along `axis`.
 
     Example:
         >>> import numpy as np
@@ -838,7 +834,9 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
     Each geometry names its per-view parameters differently, and the copy uses whichever name the model's own
     constructor takes: ``new_angles`` for the three angle-based geometries (a 1D vector for parallel and cone, a
     (num_views, 2) array of (azimuth, elevation) pairs for multiaxis) and ``new_translation_vectors`` for
-    TranslationModel.  Passing the argument that does not apply to the given model raises rather than being ignored.
+    TranslationModel.  Passing ``new_translation_vectors`` for an angle-based model raises ValueError, and passing
+    ``new_angles`` or ``new_helical_z_shifts`` for a TranslationModel raises ValueError.  Passing
+    ``new_helical_z_shifts`` for a ParallelBeamModel or MultiAxisParallelModel is silently ignored.
 
     If the user explicitly set the devices on ct_model with configure_devices, the copy
     gets the same devices.  Otherwise the copy chooses its own devices when it is used.
@@ -849,7 +847,7 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
             ConeBeamModel, or a (num_views, 2) array of (azimuth, elevation) pairs for MultiAxisParallelModel.
             If None, then use the angles in ct_model. Defaults to None.
         new_helical_z_shifts (ndarray of float, optional): 1D vector of per-view axial shifts in ALU for ConeBeamModel.
-            Defaults to None.
+            Ignored for ParallelBeamModel and MultiAxisParallelModel.  Defaults to None.
         new_num_det_rows (int, optional): Number of detector rows in the new model.
             If None, then use the num_det_rows in ct_model. Defaults to None.
         new_num_det_cols (int, optional): Number of detector columns in the new model.
@@ -1089,15 +1087,15 @@ def get_ct_model(geometry_type, sinogram_shape, angles=None, source_detector_dis
 
     Args:
         geometry_type (str): 'parallel', 'cone', 'multiaxis' or 'translation'
-        sinogram_shape (tuple list of int): (num_views, num_rows, num_channels)
+        sinogram_shape (tuple of int): (num_views, num_rows, num_channels)
         angles (ndarray of float, optional): Projection angles in radians -- a 1D vector for 'parallel' and 'cone', or a
             (num_views, 2) array of (azimuth, elevation) pairs for 'multiaxis'.  Not used by 'translation', which takes
             translation_vectors instead.  Defaults to None.
         source_detector_dist (float or None, optional): Distance in ALU from source to detector.  Defaults to None for geometries that don't need this.
         source_iso_dist (float or None, optional): Distance in ALU from source to iso.  Defaults to None for geometries that don't need this.
-        helical_z_shifts (ndarray, optional):
-            Per-view axial shifts (ALU), same length as angles.
-            Required when use_helical=True.
+        helical_z_shifts (ndarray, optional): Per-view axial shifts in ALU, same length as angles.
+            Used only by geometry_type 'cone', where it gives a helical scan.  For 'parallel' and
+            'multiaxis' it is ignored with a warning.  Defaults to None.
         translation_vectors (ndarray of float, optional): (num_views, 3) array of object translations (x, y, z) in ALU.
             Required for geometry_type 'translation' and unused by the others.  Defaults to None.
 
@@ -1176,10 +1174,10 @@ def generate_3d_shepp_logan_reference(phantom_shape):
     Kak AC, Slaney M. Principles of computerized tomographic imaging. Page.102. IEEE Press, New York, 1988. https://engineering.purdue.edu/~malcolm/pct/CTI_Ch03.pdf
 
     Args:
-        phantom_shape (tuple or list of ints): num_rows, num_cols, num_slices
+        phantom_shape (tuple or list of ints): (num_rows, num_cols, num_slices)
 
     Return:
-        out_image: 3D array, num_slices*num_rows*num_cols
+        out_image: 3D numpy array with shape (num_rows, num_cols, num_slices)
 
     Note:
         This function produces 6 intermediate arrays that each have shape phantom_shape, so if phantom_shape is
@@ -1215,7 +1213,11 @@ def generate_3d_shepp_logan_reference(phantom_shape):
                                gamma=el_paras['gamma'] / 180.0 * np.pi,
                                gray_level=el_paras['gray_level'])
 
-    return image.transpose((1, 0, 2))
+    # The meshgrid already puts y on axis 0 (rows) and x on axis 1 (cols), so
+    # the image is in (rows, cols, slices) order.  mbirjax applies a final
+    # transpose((1, 0, 2)) here, which swaps rows and columns; that transpose
+    # was identified as a bug (2026-08-14) and is deliberately not applied.
+    return image
 
 
 def gen_translation_phantom(recon_shape, option, text, fill_rate=0.05, font_size=20, text_row_indices=None,
@@ -1226,15 +1228,19 @@ def gen_translation_phantom(recon_shape, option, text, fill_rate=0.05, font_size
     Args:
         recon_shape (tuple[int, int, int]): Shape of the reconstruction volume.
         option (str): Phantom type to generate. Options are 'dots' or 'text'.
-        text (list[str]): List of ASCII text strings to render.
-        fill_rate (float, optional): Fill rate of the reconstruction volume. Default is 0.05.
-        font_size (int, optional): Font size of the ASCII words. Default is 20.
-        text_row_indices (list[int], optional): List of row indices where each text string should be placed. Default is None.
-                                           If None, words are automatically distributed evenly across the first dimension.
-                                           Must have the same length as 'words' if provided.
-        horizontal_offset (int, optional): Horizontal offset of the text to be rendered. Positive value shifts the phantom right. Default is 0.
-        vertical_offset (int, optional): Vertical offset of the text to be rendered. Positive value shifts the phantom up. Default is 0.
-        voxel_slice_aspect (float, optional): Ratio between slice voxel spacing and column voxel spacing. Default is 1.0.
+        text (list[str]): List of ASCII text strings to render. Used by 'text' only.
+        fill_rate (float, optional): Fill rate of the reconstruction volume. Used by 'dots' only. Default is 0.05.
+        font_size (int, optional): Font size of the ASCII text. Used by 'text' only. Default is 20.
+        text_row_indices (list[int], optional): List of row indices where each string in 'text' should be placed.
+                                           Used by 'text' only. Default is None.
+                                           If None, the strings are automatically distributed evenly across the first dimension.
+                                           Must have the same length as 'text' if provided.
+        horizontal_offset (int, optional): Horizontal offset of the text to be rendered. Positive value shifts the phantom right.
+                                           Used by 'text' only. Default is 0.
+        vertical_offset (int, optional): Vertical offset of the text to be rendered. Positive value shifts the phantom up.
+                                           Used by 'text' only. Default is 0.
+        voxel_slice_aspect (float, optional): Ratio between slice voxel spacing and column voxel spacing.
+                                           Used by 'text' only. Default is 1.0.
 
     Returns:
         np.ndarray: Generated phantom volume.
@@ -1539,7 +1545,6 @@ def generate_demo_data(
     num_det_rows=96,
     delta_det_row=1,
     num_det_channels=128,
-    delta_det_channel=1,
     num_x_translations=7,
     num_z_translations=7,
     x_spacing=22,
@@ -1568,11 +1573,11 @@ def generate_demo_data(
 
     Args:
         object_type (str, optional): One of 'shepp-logan' or 'cube'.  Defaults to 'shepp-logan'.
-        model_type (str, optional): One of 'parallel' or 'cone'.  Defaults to 'cone'.  The
-            translation geometry is not available yet, and asking for it raises
-            NotImplementedError.
+        model_type (str, optional): One of 'parallel', 'cone', 'translation' or 'multiaxis'.  Defaults to 'cone'.
         num_views (int, optional):  Number of views in the output sinogram.  Defaults to 64. Ignored when model_type is 'translation'
         num_det_rows (int, optional): Number of rows (vertical) in the output sinogram.  Defaults to 96.
+        delta_det_row (float, optional): Detector row pitch in ALU.  Used only to compute the helical
+            trajectory, so it has no effect unless model_type is 'cone' and use_helical is True.  Defaults to 1.
         num_det_channels (int, optional): Number of channels (horizontal) in the output sinogram.  Defaults to 128.
         num_x_translations (int, optional): Number of horizontal translations for translation mode.  Defaults to 7.
         num_z_translations (int, optional): Number of vertical translations for translation mode.  Defaults to 7.
@@ -1591,7 +1596,8 @@ def generate_demo_data(
             constant tilt of every view out of the horizontal plane, in degrees.
             Defaults to 0.0.
         voxel_row_aspect (float, optional): Aspect ratio for recon rows relative to columns.  Defaults to 1.0.
-        voxel_slice_aspect (float, optional): Aspect ratio for recon slices relative to rows.  Defaults to 1.0.
+        voxel_slice_aspect (float, optional): Ratio of the slice voxel spacing to the in-plane voxel spacing
+            delta_voxel, so that delta_voxel_slice = voxel_slice_aspect * delta_voxel.  Defaults to 1.0.
         target_max_attenuation (float, optional): Target max sinogram attenuation for Shepp-Logan phantom.  Defaults to None, for which each voxel is in the range [0, 1].  May not be accurate if any detector or voxel dimensions are not 1.
         devices (sequence of devices, optional): Devices to run the generation on.  Defaults to None,
             which uses the model's automatic selection.  This only affects where the work runs, not
@@ -1602,7 +1608,11 @@ def generate_demo_data(
             - object: the phantom volume, shape recon_shape = (num_rows, num_cols, num_slices).
               A host numpy float32 array, for either object type.
             - sinogram: shape (num_views, num_det_rows, num_det_channels).
-            - params (dict): contains 'angles' and, for 'cone', also 'source_detector_dist' and 'source_iso_dist'.
+            - params (dict): the geometry parameters used for the simulation.  For model_type
+              'parallel', 'cone' and 'multiaxis' it contains 'angles' plus the voxel aspect ratios;
+              'cone' adds 'source_detector_dist', 'source_iso_dist' and 'use_curved_detector', and a
+              helical cone scan also adds 'helical_z_shifts'; 'multiaxis' adds 'elevation_degrees'.
+              For model_type 'translation' it contains 'translation_vectors' only.
 
         sinogram is always a host NumPy array (what ``recon`` prefers).
     """

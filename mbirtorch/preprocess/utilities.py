@@ -49,16 +49,17 @@ def compute_sino_transmission(obj_scan, blank_scan, dark_scan, defective_pixel_a
     Args:
         obj_scan (ndarray):
             A 3D object scan of shape (num_views, num_det_rows, num_det_channels).
-        blank_scan (ndarray, optional):
+        blank_scan (ndarray):
             A 3D blank scan of shape (num_blank_scans, num_det_rows, num_det_channels).
             If `num_blank_scans > 1`, a pixel-wise mean will be computed.
-        dark_scan (ndarray, optional):
+        dark_scan (ndarray):
             A 3D dark scan of shape (num_dark_scans, num_det_rows, num_det_channels).
             If `num_dark_scans > 1`, a pixel-wise mean will be computed.
-        defective_pixel_array (ndarray, optional):
+        defective_pixel_array (ndarray or tuple, optional):
             An array of defective pixel indices, one (row_idx, channel_idx) pair per row;
             these pixels are treated as defective in every view.
-            If `None`, invalid pixels are inferred from `NaN` or `inf` values.
+            Defaults to the empty tuple `()`, meaning no known defective pixels; invalid pixels
+            are then inferred from `NaN` or `inf` values alone. Do not pass `None`.
         batch_size (int):
             Number of views to process in each GPU batch.
 
@@ -138,29 +139,21 @@ def _zinger_fill(sino, zinger_threshold, num_passes=3):
 
 
 def interpolate_defective_pixels(sino, defective_pixel_array=(), num_passes=3):
-    """Replace defective / non-finite sinogram pixels with the mean of their finite 3x3 in-view neighbors.
+    """Replace defective and non-finite sinogram pixels with the mean of their finite 3x3 in-view neighbors.
 
-    Invalid pixels are the non-finite entries (NaN / +-inf -- e.g. the transmission's ``obj/blank <= 0``
-    pixels) plus any pixel listed in ``defective_pixel_array`` (the same detector coords in every view).
-    They are marked NaN and then filled by ``num_passes`` dense neighborhood-mean passes: each pass
-    replaces every NaN that has >=1 finite neighbor with the mean of its finite 3x3 in-view neighbors, so
-    a NaN region shrinks inward by one pixel per pass.  ``num_passes`` thus bounds the largest fillable
-    dead-pixel cluster (radius ``num_passes``); any pixel still NaN afterward triggers a warning and is
-    set to 0.
-
-    The computation is dense and fixed-shape (sliding-window box sums -- no per-NaN gather), so device
-    memory stays at a small multiple of the batch.  The fill uses the neighbor MEAN (not median): for
-    dead pixels surrounded by valid data the two are nearly identical, and they affect <1% of pixels.
+    A pixel is invalid if its value is NaN or +-inf, or if it is listed in ``defective_pixel_array``.
+    Each of the ``num_passes`` fill passes replaces every invalid pixel that has at least one finite
+    neighbor, so ``num_passes`` is the largest fillable radius of a cluster of invalid pixels.  Any
+    pixel still invalid after the last pass triggers a warning and is set to 0.
 
     Args:
         sino (tensor, float): (num_views, num_det_rows, num_det_channels).
-        defective_pixel_array (array or tuple): shared (det_row, det_channel) coords of defective pixels,
-            or () for none.  (The transmission caller already NaN-marks these; re-marking here is cheap
-            and keeps this function correct when called on its own.)
-        num_passes (int): number of dense fill passes = max fillable dead-pixel cluster radius.
+        defective_pixel_array (array or tuple): (det_row, det_channel) coordinates of pixels that are
+            defective in every view, or () for none.
+        num_passes (int): number of fill passes.
 
     Returns:
-        tensor, float: sinogram with invalid pixels interpolated (any unfillable ones set to 0).
+        tensor, float: sinogram with invalid pixels interpolated, and any unfillable ones set to 0.
     """
     num_views, num_rows, num_channels = sino.shape
 
@@ -235,16 +228,14 @@ def _rotation_kernel(sino_batch, det_rotation):
 def correct_det_rotation(sino, det_rotation=0.0, batch_size=30):
     """
     Correct sinogram data to account for detector rotation, using batch processing and GPU acceleration.
-    Weights are not modified.
 
     Args:
         sino (numpy.ndarray): Sinogram data with 3D shape (num_views, num_det_rows, num_det_channels).
-        det_rotation (optional, float): tilt angle between the rotation axis and the detector columns in radians.
+        det_rotation (float, optional): tilt angle between the rotation axis and the detector columns in radians.
         batch_size (int): Number of views to process in each batch to avoid memory overload.
 
     Returns:
-        - A numpy.ndarray containing the corrected sinogram data if weights is None.
-        - A tuple (sino_corrected, weights) if weights is not None.
+        numpy.ndarray: The corrected sinogram, with the same shape as `sino`.
     """
 
     return pipeline.map_view_batches(sino, lambda b: _rotation_kernel(b, det_rotation), batch_size)
@@ -524,7 +515,7 @@ def crop_view_data(obj_scan, blank_scan, dark_scan, crop_pixels_sides=0, crop_pi
     Raises:
         AssertionError: If any crop amount is negative, or if
             `crop_pixels_top + crop_pixels_bottom >= num_det_rows`, or if
-            `2 * crop_pixels_sides >= num_det_channels`.
+            `crop_pixels_sides >= num_det_channels // 2`.
 
     Notes:
         This function supports both singleton and multi-view `blank_scan`/`dark_scan`. Cropping is applied
@@ -577,11 +568,10 @@ def _normalize_to_float32(img: np.ndarray) -> np.ndarray:
 
 def read_tif_img(img_path):
     """
-    Reads a scan image from a TIFF file. Supports both 2D and 3D TIFFs.
+    Read a TIFF image and return it as a float32 array with the shape stored in the file.
 
-    This function loads a TIFF image using `tifffile.imread()`, then calls _normalize_to_float32() to normalizes it to float32 format if the
-    input is of integer type. If the image has more than two dimensions (e.g., 3D volumes or RGB channels),
-    the returned array preserves that shape.
+    An integer-valued image is scaled to the range [0, 1] by dividing by the largest value its
+    integer type can hold. A floating-point image is cast to float32 without scaling.
 
     Args:
         img_path (str): Path to the image file. The file must be readable by `tifffile`.
@@ -872,37 +862,30 @@ def detect_blank_margins(sino, safety_buffer=20, max_views_to_use=20):
 
 def apply_detector_crop(required_params, optional_params, crop_top, crop_bottom, crop_left, crop_right):
     """
-    Update the geometry for a detector-region crop: shrink the sinogram shape and shift the
-    detector offsets by the amount the crop moves the detector center.
+    Update the geometry for a detector crop: shrink the sinogram shape and shift the detector
+    offsets by the amount the crop moves the detector center.
 
-    This is the single source of the crop-to-geometry bookkeeping, so a manual (configuration) crop
-    and the automatic margin crop stay consistent and asymmetric crops are correct for every
-    geometry.  It is *detector-plane only*: it updates ``sinogram_shape`` and, for the geometries
-    that have them, ``det_row_offset`` / ``det_channel_offset``.  It deliberately does not set
-    ``recon_slice_offset``: for cone geometry ``auto_set_recon_geometry`` (which every reader runs,
-    via ``build_model``) re-derives it from the scan, and the other geometries either have no
-    ``recon_slice_offset`` or keep it at its default, so a detector crop never needs to touch it.
-
-    The caller slices the array with the SAME crop amounts -- the raw scans in the configuration
-    crop path, the computed sinogram in the automatic crop path -- while this function owns the
-    geometry, so the array and the geometry can never drift.
+    This function changes only the parameters, not the data.  The caller must slice the array with
+    the same crop amounts.
 
     Args:
-        required_params (dict): Constructor parameters, read for ``sinogram_shape`` (the returned copy
-            has it reduced by the crop).
-        optional_params (dict): Parameters applied with ``set_params``; in the returned copy,
-            ``det_row_offset`` / ``det_channel_offset`` are compensated when present for this geometry,
-            using the detector pitches ``delta_det_row`` / ``delta_det_channel`` (each defaulting to
-            1.0, the model default, when a reader leaves it unset).
+        required_params (dict): Constructor parameters, read for ``sinogram_shape``.
+        optional_params (dict): Parameters applied with ``set_params``.  ``det_row_offset`` and
+            ``det_channel_offset`` are compensated when the geometry has them, using the detector
+            pitches ``delta_det_row`` and ``delta_det_channel`` (each 1.0 if unset).
         crop_top (int): Detector rows removed from the top.
         crop_bottom (int): Detector rows removed from the bottom.
         crop_left (int): Detector channels removed from the left.
         crop_right (int): Detector channels removed from the right.
 
     Returns:
-        tuple: new ``(required_params, optional_params)`` dicts -- copies of the inputs (which are left
-        unchanged) with the reduced ``sinogram_shape`` and the compensated detector offsets.  There is
-        no in-place side effect, so callers must use the returned dicts.
+        tuple: new ``(required_params, optional_params)`` dicts, with the reduced ``sinogram_shape``
+        and the compensated detector offsets.  The input dicts are not modified, so the caller must
+        use the returned dicts.
+
+    Raises:
+        AssertionError: If any crop amount is negative, or if ``crop_top + crop_bottom >= num_det_rows``,
+            or if ``crop_left + crop_right >= num_det_channels``.
     """
     num_views, num_det_rows, num_det_channels = required_params['sinogram_shape']
     # Guard the geometry path independently of the array path (crop_view_data has the matching assert):
@@ -1560,35 +1543,25 @@ def correct_zinger_pixels(sino, zinger_pixel_ratio=0.1, num_passes=3, batch_size
 
 
 def save_cone_preprocessing(file_path, sinogram, cone_beam_params, optional_params, weights=None):
-    """Save a preprocessed sinogram and its geometry parameters for a two-stage (preprocess -> recon)
-    workflow.
+    """Save a preprocessed sinogram and its geometry parameters to an HDF5 file.
 
-    This lets preprocessing run once and write its result to disk, so reconstruction can be launched as
-    a separate process -- useful for debugging (inspect/reuse the preprocessed sinogram) and so the
-    memory-tight recon starts with a clean GPU allocator.  Reload with :func:`load_cone_preprocessing` and
-    rebuild the model with ``mbirtorch.build_model(cone_beam_params, optional_params)``.
+    Use this to run preprocessing once and reconstruct in a separate step.  Reload with
+    :func:`load_cone_preprocessing` and rebuild the model with
+    ``mbirtorch.build_model(cone_beam_params, optional_params)``.
 
-    Only the GEOMETRY/preprocessing parameters are saved (the two dicts above); regularization
-    parameters (sharpness, sigma_x, snr_db, ...) are deliberately NOT saved -- they are a recon-time
-    choice and are set in the recon stage (iterating on them without re-preprocessing is the point of
-    the split).  For full model persistence (geometry + regularization), use the parameter-handler
-    save/load instead.
-
-    The sinogram, any array-valued parameters (e.g. ``angles``), and ``weights`` (if given) are stored
-    as HDF5 datasets; the remaining scalar parameters are stored as one JSON attribute.  The sinogram
-    (and weights) are written as float32.
+    Only the parameters in the two dicts are saved.  Regularization parameters such as sharpness,
+    sigma_x, and snr_db are not saved; set them at recon time.  For geometry plus regularization,
+    use the parameter-handler save and load instead.
 
     Args:
-        file_path (str): Output HDF5 path (parent directories are created).
-        sinogram (ndarray or tensor): The preprocessed sinogram (gathered to the host and cast to
-            float32 before writing).
-        cone_beam_params (dict): Parameters for the model constructor (e.g. the ``required_params``
-            from ``TomographyModel.get_all_params``).
+        file_path (str): Output HDF5 path.  Parent directories are created.
+        sinogram (ndarray or tensor): The preprocessed sinogram.  It is written as float32.
+        cone_beam_params (dict): Parameters for the model constructor, for example the
+            ``required_params`` from ``TomographyModel.get_all_params``.
         optional_params (dict): Parameters applied via ``set_params`` after construction.
-        weights (ndarray or tensor, optional): Custom reconstruction weights to save alongside the
-            sinogram.  Defaults to None -- omit them when the recon will regenerate standard weights with
-            ``gen_weights`` (cheaper to recompute than to store a second full-size array); pass them only
-            when they are custom and worth preserving.
+        weights (ndarray or tensor, optional): Custom reconstruction weights, written as float32.
+            Defaults to None.  Omit them when the recon will regenerate standard weights with
+            ``gen_weights``.
 
     Returns:
         None
@@ -1627,13 +1600,18 @@ def load_cone_preprocessing(file_path):
         file_path (str): Path to the HDF5 file written by :func:`save_cone_preprocessing`.
 
     Returns:
-        tuple: ``(sinogram, cone_beam_params, optional_params, weights)`` -- a host NumPy sinogram, the
-        two parameter dicts (ready for ``mbirtorch.build_model(cone_beam_params, optional_params)`` when the
-        save was made from :meth:`~mbirtorch.TomographyModel.get_all_params` dicts, which record the
-        ``geometry_type`` entry ``build_model`` needs; for saves made without it, construct
-        ``ConeBeamModel(**cone_beam_params)`` directly), and
-        ``weights`` (a host NumPy array if custom weights were
-        saved, else ``None`` -- in which case the recon should regenerate them with ``gen_weights``).
+        tuple: ``(sinogram, cone_beam_params, optional_params, weights)``.
+
+            - ``sinogram`` (numpy.ndarray): the saved sinogram, on the host.
+            - ``cone_beam_params`` (dict): constructor parameters.
+            - ``optional_params`` (dict): ``set_params`` parameters.
+            - ``weights`` (numpy.ndarray or None): the saved weights, or None if none were saved.
+              If None, regenerate them with ``gen_weights``.
+
+        Pass the two dicts to ``mbirtorch.build_model(cone_beam_params, optional_params)``.  That
+        works when the save came from :meth:`~mbirtorch.TomographyModel.get_all_params`, which
+        records the ``geometry_type`` entry ``build_model`` needs.  Otherwise construct
+        ``ConeBeamModel(**cone_beam_params)`` directly.
     """
     import json
     params = {'cone_beam_params': {}, 'optional_params': {}}

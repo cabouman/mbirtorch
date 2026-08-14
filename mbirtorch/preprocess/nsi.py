@@ -38,7 +38,7 @@ def get_sino_and_model(dataset_dir, *, downsample_factor=(1, 1), subsample_view_
     Returns:
         tuple: ``(sino, model)`` where
 
-            - ``sino`` (jax array): the computed sinogram, shape (num_views, num_det_rows, num_det_channels).
+            - ``sino`` (numpy.ndarray): the computed sinogram, shape (num_views, num_det_rows, num_det_channels).
             - ``model`` (ConeBeamModel): a model with its reconstruction geometry already set.
 
     Example:
@@ -86,7 +86,7 @@ def _compute_sino_and_params(dataset_dir, downsample_factor=(1, 1), subsample_vi
     Returns:
         tuple: ``(sino, required_params, optional_params)`` where
 
-            - ``sino`` (jax array): Sinogram of shape (num_views, num_det_rows, num_det_channels).
+            - ``sino`` (numpy.ndarray): Sinogram of shape (num_views, num_det_rows, num_det_channels).
             - ``required_params`` (dict): ConeBeamModel constructor arguments plus a ``geometry_type``
               entry, so ``build_model`` can resolve the model class.
             - ``optional_params`` (dict): Parameters to be applied via ``set_params()``.
@@ -165,7 +165,7 @@ def load_scans_and_params(dataset_dir, view_id_start=0, view_id_end=None, subsam
             - ``**/*.defect`` (defective pixel information)
 
         view_id_start (int, optional): view index corresponding to the first view.
-        view_id_end (int, optional): view index corresponding to the last view. If None, this will be equal to the total number of object scan images in ``obj_scan_dir``.
+        view_id_end (int, optional): view index one past the last view. If None, this is set to the number of views recorded in the ``.nsipro`` config file.
         subsample_view_factor (int, optional): view subsample factor.
         verbose (int, optional): Verbosity level. Defaults to 1.
         offset_correction (bool): Whether to apply detector offset correction using values from the Geometry Report. Defaults to True.

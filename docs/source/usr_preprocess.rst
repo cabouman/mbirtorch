@@ -91,7 +91,6 @@ MAR utilities
 .. currentmodule:: mbirtorch.preprocess
 
 .. autofunction:: gen_huber_weights
-.. autofunction:: recon_plastic_metal
 .. autofunction:: BH_correction
 .. autofunction:: fit_beam_hardening_curve
 .. autofunction:: fit_inverse_beam_hardening_curve

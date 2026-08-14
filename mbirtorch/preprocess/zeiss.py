@@ -46,7 +46,7 @@ def get_sino_and_model(dataset_dir, *, downsample_factor=(1, 1), subsample_view_
     Returns:
         tuple: ``(sino, model)`` where
 
-            - ``sino`` (jax array): the computed sinogram, shape (num_views, num_det_rows, num_channels).
+            - ``sino`` (numpy.ndarray): the computed sinogram, shape (num_views, num_det_rows, num_channels).
             - ``model`` (ParallelBeamModel or ConeBeamModel): a CT model with its reconstruction geometry already set.
               (``'ultra'`` -> parallel; ``'versa'`` -> cone; ``'unknown'`` -> cone)
 
@@ -159,19 +159,20 @@ def load_scans_and_params(dataset_dir, subsample_view_factor, verbose=1):
         Portions of this code are adapted from the DXchange library: https://github.com/data-exchange/dxchange
 
     Args:
-        dataset_dir (str): Path to a Zeiss scan directory (expect a `.txrm` file). Expected structure:
-            - ``ImageData*/Image*`` (scan data)
-            - ``**/**`` (Zeiss metadata/parameters)
-        subsample_view_factor (int, optional): view subsample factor.
+        dataset_dir (str): Path to the Zeiss ``.txrm`` file itself, not to a directory. The scan data
+            and the geometry parameters are both read from that file.
+        subsample_view_factor (int): view subsample factor. Every n-th view is read.
         verbose (int, optional): Verbosity level. Defaults to 1.
 
     Returns:
-        tuple: (obj_scan, blank_scan, dark_scan, zeiss_params, zeiss_params)
+        tuple: (obj_scan, blank_scan, dark_scan, zeiss_params)
 
             - obj_scan (numpy.ndarray): 3D object scan with shape ``(num_views, num_det_rows, num_channels)``.
-            - blank_scan (numpy.ndarray): 3D blank scan with shape ``(1, num_det_rows, num_channels)``.
-            - dark_scan (numpy.ndarray): 3D dark scan with shape ``(1, num_det_rows, num_channels)``.
-                If no dark scan is available, returns a zero array of the same shape.
+            - blank_scan (numpy.ndarray): 3D blank scan with shape ``(num_reference, num_det_rows, num_channels)``,
+              where ``num_reference`` is the number of reference images stored in the file.
+            - dark_scan (numpy.ndarray): 3D array of zeros with the shape of ``obj_scan``. The ``.txrm``
+              format carries no dark scan, so one is never loaded.
+            - zeiss_params (dict): Geometry parameters for ``convert_zeiss_to_mbirjax_params``.
     """
     ### automatically parse the paths to Zeiss scans from dataset_dir
     data_dir = _parse_filenames_from_dataset_dir(dataset_dir)
@@ -662,13 +663,13 @@ def correct_sino_shifts(sino, zeiss_params, downsample_factor, subsample_view_fa
     and the padding is removed afterward.
 
     Args:
-        sino (numpy array or jax array): 3D sinogram data with shape (num_views, num_det_rows, num_det_channels).
+        sino (numpy.ndarray): 3D sinogram data with shape (num_views, num_det_rows, num_det_channels).
         zeiss_params (dict): parameters stored in Zeiss txrm file.
         downsample_factor (Tuple[int, int], optional): Downsample factors for detector rows and channels. Defaults to (1, 1).
         subsample_view_factor (int, optional): Factor by which to subsample views. Defaults to 1.
 
     Returns:
-        corrected_sino (numpy array or jax array): 3D sinogram data after alignment
+        corrected_sino (numpy.ndarray): 3D sinogram data after alignment
     """
     # Get sinogram view offset
     # OUT-OF-PLACE scaling: the slice of a numpy array is a VIEW, so an in-place /= here would

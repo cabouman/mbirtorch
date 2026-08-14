@@ -103,10 +103,24 @@ def _resolve_device(device):
 
 
 class TomographyModel(ParameterHandler):
-    """Base class: geometry classes supply their per-view-batch projection
-    bodies (``_view_batch_bodies`` / ``_view_batch_args``), the psf radius,
-    and the auto recon geometry; this class owns the projection wrappers and
-    the VCD loop."""
+    """
+    Base class for all tomography geometries.  It provides projection
+    (:meth:`forward_project`, :meth:`back_project`), reconstruction
+    (:meth:`recon`, :meth:`prox_map`, :meth:`direct_recon`), device
+    configuration (:meth:`configure_devices`), and parameter handling.
+    Users construct a geometry subclass (for example ``ConeBeamModel`` or
+    ``ParallelBeamModel``) rather than this class.
+
+    Constructor args common to all geometries:
+
+    * sinogram_shape (tuple of int): (num_views, num_det_rows,
+      num_det_channels).
+    * view_batch_size (int, optional): views per projection call.  None
+      (default) lets each projection method choose.
+    * compile_mode (str, optional): 'auto' (default) compiles the
+      computational kernels with torch.compile; 'off' runs without
+      compilation.
+    """
 
     def __init__(self, sinogram_shape, view_batch_size=None,
                  compile_mode='auto', **kwargs):
@@ -296,13 +310,12 @@ class TomographyModel(ParameterHandler):
         Args:
             sinogram (numpy or tensor): 3D sinogram data with shape
                 (num_views, num_det_rows, num_det_channels).
-            filter_name (string or None, optional): The name of the filter to
-                use.  Defaults to None, in which case the geometry-specific
-                method chooses a default, typically 'ramp'.
+            filter_name (string, optional): The name of the filter to use.
+                Every geometry's implementation defaults to 'ramp'.
             output_sharded (bool, optional): If False (default), return a
-                numpy array.  If True, return the internal device form
-                (slice shards on a multi-device model; on a single-device
-                model the output is the same tensor either way).
+                numpy array.  If True, return the device form: a torch
+                tensor on a single device, or a Shards container (one
+                tensor per device) on a multi-device model.
 
         Returns:
             recon (numpy or tensor): The reconstructed volume.
@@ -325,9 +338,10 @@ class TomographyModel(ParameterHandler):
         implementation raise ``NotImplementedError``.
 
         Args:
-            sino (ndarray): Full sinogram of shape (num_views, num_rows, num_cols).
-            weights (ndarray, optional): Sinogram weights with the same shape
-                as ``sino``.
+            sino (numpy or tensor): Full sinogram of shape
+                (num_views, num_rows, num_cols).
+            weights (numpy or tensor, optional): Sinogram weights with the
+                same shape as ``sino``.
             half_overlap (int, optional): Number of overlapping detector rows
                 kept past the split in each half.  Defaults to 5.
             init_recon (optional): Same as in :meth:`recon`.
@@ -347,6 +361,9 @@ class TomographyModel(ParameterHandler):
             Tuple[np.ndarray, dict]: the reconstructed volume, and a metadata
             dictionary with the recon and model parameters for each half plus
             ``'split_params'`` (the overlaps and any alignment shift used).
+            If the split would leave either half too thin, the method warns,
+            performs a standard :meth:`recon` instead, and returns that
+            result's dictionary (no per-half entries).
         """
         raise NotImplementedError(
             f'split_sino_recon is not implemented for {type(self).__name__}.')
@@ -894,8 +911,9 @@ class TomographyModel(ParameterHandler):
         shapes, so call this after any geometry change.
 
         Args:
-            num_devices (int, optional): number of CUDA devices to use.
-                Defaults to 1.
+            num_devices (int, optional): number of devices to use.  1 (the
+                default) uses the model's default device (cuda, mps, or
+                cpu); values above 1 require that many CUDA devices.
             devices (list, optional): explicit device list.  Overrides
                 num_devices.
         """
@@ -1213,22 +1231,17 @@ class TomographyModel(ParameterHandler):
         """Place a sinogram (and optionally weights) in the model's device
         form, once.
 
-        The device form is the view-sharded layout the reconstruction methods
-        use internally: the sinogram is distributed across the configured
-        devices, and when the view count (or, for parallel beam, the
-        row-tracking slice count) does not divide the device count it is
-        zero-padded to the next multiple.  The padding is exactly inert -- it
-        cannot affect the results.  Each device receives only its own block,
-        with zero tails built on the device, so no padded host copy is ever
-        created.
+        The device form is the layout the reconstruction methods use
+        internally: the sinogram is divided across the configured devices by
+        view, zero-padded when the view count does not divide the device
+        count.  The padding cannot affect the results.
 
-        Calling this is OPTIONAL: every reconstruction method applies the same
-        placement automatically to a plain input.  Use it to pay the
+        Calling this is OPTIONAL: every reconstruction method applies the
+        same placement automatically to a plain input.  Use it to pay the
         host-to-device transfer once when running several reconstructions on
-        the same large sinogram -- a prepared array passes through the entry
-        placement untouched.  If the device configuration changes afterwards,
-        the prepared array no longer matches and the entry placement raises
-        with instructions to re-run this method.
+        the same large sinogram.  If the device configuration changes
+        afterwards, the prepared array no longer matches, and the
+        reconstruction methods raise an error; re-run this method to fix it.
 
         Args:
             sinogram (numpy or tensor): sinogram in the model's sinogram_shape.
@@ -1521,17 +1534,17 @@ class TomographyModel(ParameterHandler):
 
     def forward_project(self, recon, output_sharded=False):
         """
-        Perform a full forward projection at all voxels in the region of
-        reconstruction (the pixels selected by the ROR mask; see
-        ``vcd_utils.get_2d_ror_mask``).
+        Perform a full forward projection.  With the ``use_ror_mask``
+        parameter True (the default) the projection covers the pixels inside
+        the region-of-reconstruction mask; with it False, every pixel.
 
         Args:
             recon (numpy or tensor): 3D volume with shape
                 (num_recon_rows, num_recon_cols, num_recon_slices).
-            output_sharded (bool, optional): If False (default), return a numpy
-                array.  If True, return the device tensor (the mbirjax argument
-                name, kept for API compatibility; here it means "skip the numpy
-                exit").
+            output_sharded (bool, optional): If False (default), return a
+                numpy array.  If True, return the device form: a torch
+                tensor on a single device, or a Shards container (one
+                tensor per device) on a multi-device model.
 
         Returns:
             The sinogram, shape (num_views, num_det_rows, num_det_channels).
@@ -1551,14 +1564,18 @@ class TomographyModel(ParameterHandler):
 
     def back_project(self, sinogram, output_sharded=False):
         """
-        Perform a full back projection at all voxels in the region of
-        reconstruction (zeros outside the ROR mask).
+        Perform a full back projection.  With the ``use_ror_mask`` parameter
+        True (the default) the result is zero outside the
+        region-of-reconstruction mask; with it False, every pixel is
+        computed.
 
         Args:
             sinogram (numpy or tensor): 3D array with shape
                 (num_views, num_det_rows, num_det_channels).
-            output_sharded (bool, optional): If False (default), return a numpy
-                array.  If True, return the device tensor.
+            output_sharded (bool, optional): If False (default), return a
+                numpy array.  If True, return the device form: a torch
+                tensor on a single device, or a Shards container (one
+                tensor per device) on a multi-device model.
 
         Returns:
             The back projection, shape (num_recon_rows, num_recon_cols,
@@ -2607,15 +2624,16 @@ class TomographyModel(ParameterHandler):
         init_recon to the output of the previous recon; this continues the
         partition sequence from where the previous recon left off.
 
-        Device use: on CUDA this spreads the reconstruction across the
-        available devices, using every device that can hold its share.  The
-        share is judged by a memory check that runs before the first large
-        allocation, so a layout that cannot fit is refused in seconds rather
-        than part way through.  Nothing needs to change in a calling script.
-        ``configure_devices(num_devices=n)`` fixes the count instead, and
-        ``configure_devices(num_devices=1)`` is the reproducibility pin.  The
-        environment variable ``MBIRTORCH_NUM_DEVICES`` pins it process-wide,
-        which is what a test suite or a nightly should use.
+        Device use: on CUDA with several devices, this chooses a device
+        count automatically.  Two rules make the choice: measured speed
+        thresholds decide how many devices are worth using at this problem
+        size, and a memory check confirms the chosen layout fits before the
+        first large allocation.  Nothing needs to change in a calling
+        script.  ``configure_devices(num_devices=n)`` fixes the count
+        instead, and ``configure_devices(num_devices=1)`` pins the run to
+        one device for reproducibility.  The environment variable
+        ``MBIRTORCH_NUM_DEVICES`` pins the count process-wide, which is
+        what a test suite or a nightly should use.
 
         Reproducibility note: the pixel partitions are drawn from numpy's
         global random number generator, so reconstructions vary slightly from
@@ -2641,9 +2659,10 @@ class TomographyModel(ParameterHandler):
                 user's home directory).  If None or empty, no log file is written.
                 Defaults to '~/.mbirtorch/logs/recon.log'.
             print_logs (bool, optional): If true then print logs to console.  Defaults to True.
-            output_sharded (bool, optional): If False (default), return a numpy
-                array; if True, return the device tensor (the mbirjax argument
-                name, kept for API compatibility).
+            output_sharded (bool, optional): If False (default), return a
+                numpy array.  If True, return the device form: a torch
+                tensor on a single device, or a Shards container (one
+                tensor per device) on a multi-device model.
 
         Returns:
             (recon, recon_dict): the reconstruction volume, and a dict
@@ -2684,8 +2703,7 @@ class TomographyModel(ParameterHandler):
 
         notes = 'Reconstruction completed: {}\n\n'.format(datetime.datetime.now())
         recon_dict = self.get_recon_dict(recon_params, notes=notes)
-        # output_sharded keeps the device tensor (the mbirjax parameter; here
-        # it means "skip the numpy exit").
+        # output_sharded=True keeps the device form (no numpy exit).
         return (recon if output_sharded else self._gather_recon(recon)), recon_dict
 
     def _iteration_stats(self, error_sinogram, flat_recon, sigma_y, weights,
@@ -2776,9 +2794,10 @@ class TomographyModel(ParameterHandler):
                 writing to the log that call opened, so the whole loop lands in
                 one file.
             print_logs (bool, optional): If true then print logs to console.  Defaults to True.
-            output_sharded (bool, optional): If False (default), return a numpy
-                array; if True, return the device tensor (the mbirjax argument
-                name, kept for API compatibility).
+            output_sharded (bool, optional): If False (default), return a
+                numpy array.  If True, return the device form: a torch
+                tensor on a single device, or a Shards container (one
+                tensor per device) on a multi-device model.
 
         Returns:
             (recon, recon_dict): the reconstruction volume, and a dict
@@ -2833,8 +2852,7 @@ class TomographyModel(ParameterHandler):
 
         notes = 'Proximal map completed: {}\n\n'.format(datetime.datetime.now())
         recon_dict = self.get_recon_dict(recon_params, notes=notes)
-        # output_sharded keeps the device tensor (the mbirjax parameter; here
-        # it means "skip the numpy exit").
+        # output_sharded=True keeps the device form (no numpy exit).
         return (recon if output_sharded else self._gather_recon(recon)), recon_dict
 
     @staticmethod
@@ -2882,16 +2900,16 @@ class TomographyModel(ParameterHandler):
         dicts partition the parameters so a caller can reconstruct or serialize the model and choose
         which parts to apply:
 
-        * **required_params** -- the arguments the model constructor takes (from its ``__init__``
-          signature), with the view-dependent arguments reconstructed from storage (e.g. cone's
-          ``angles`` and ``helical_z_shifts`` are unpacked from the stored ``view_params_array``),
-          plus a ``geometry_type`` entry so the model class can be resolved.
+        * **required_params** -- the geometry arguments the model constructor takes, with the
+          view-dependent arguments reconstructed from storage (e.g. cone's ``angles`` and
+          ``helical_z_shifts``), plus a ``geometry_type`` entry so the model class can be
+          resolved.  The execution-environment constructor arguments (``view_batch_size``,
+          ``compile_mode``) are not model parameters and are excluded.
         * **optional_params** -- the remaining geometry/detector parameters that are applied with
           ``set_params`` (detector pitches, offsets, ``delta_voxel``, ``recon_shape``, voxel aspects).
-        * **regularization** -- the recon-time regularization knobs (``sigma_y``, ``sigma_x``,
+        * **regularization** -- the regularization parameters (``sigma_y``, ``sigma_x``,
           ``sigma_prox``, ``snr_db``, ``sharpness``, ``auto_regularize_flag``), separated so a
-          consumer such as ``save_cone_preprocessing`` can drop them and let them be re-chosen at
-          reconstruction time.
+          consumer can drop them and let them be re-chosen at reconstruction time.
 
         Returns:
             tuple: ``(required_params, optional_params, regularization)`` -- three dicts of values.
@@ -2936,9 +2954,11 @@ class TomographyModel(ParameterHandler):
 
     def get_recon_dict(self, recon_params=None, notes=None, save_log=True, save_model=True, str_format=False):
         """
-        Encapsulate the recon parameters, logs, notes, and optionally all model parameters to a text-based dict
-        with entries 'recon_params', 'recon_log', 'notes', and optionally 'model_params'.  This dict can be used with
+        Collect the recon parameters, logs, notes, and optionally all model parameters into a dict
+        with entries 'recon_params', 'recon_log', 'notes', and 'model_params'.  This dict can be used with
         :func:`mbirtorch.view_utils.slice_viewer` and :meth:`TomographyModel.save_recon_hdf5`.
+        By default the entries hold their original values; str_format=True serializes each top-level
+        entry to a string.
 
         Args:
             recon_params (dict, optional): dict of reconstruction parameters. Defaults to None.
@@ -2996,7 +3016,8 @@ class TomographyModel(ParameterHandler):
 
         Args:
             filepath (str or Path): Path to the output HDF5 file. Should typically end with a .h5 extension.
-            recon (array-like): The reconstruction volume as a NumPy array or torch tensor.
+            recon (array-like): The reconstruction volume as a NumPy array, torch tensor, or the
+                sharded device form from ``recon(..., output_sharded=True)``.
             recon_dict (dict or None, optional): The dictionary of recon attributes from :meth:`get_recon_dict`
 
         Raises:
@@ -3027,7 +3048,8 @@ class TomographyModel(ParameterHandler):
         Returns:
             (recon, recon_dict)
                 - recon (ndarray): The array saved by save_recon_hdf5()
-                - recon_dict (dict): A dict with the attributes for the data array as in :meth:`get_recon_dict`
+                - recon_dict (dict): A dict with the same entries as :meth:`get_recon_dict`, with
+                  each value as the string it was stored as in the HDF5 attributes
 
         Raises:
             FileNotFoundError: If the file does not exist.

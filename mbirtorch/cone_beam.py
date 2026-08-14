@@ -767,6 +767,19 @@ class ConeBeamModel(TomographyModel):
         Perform FDK reconstruction: standard filtering, then the exact adjoint
         of the forward projector as the backprojection.
 
+        Args:
+            sinogram (numpy or tensor): 3D sinogram data with shape
+                (num_views, num_det_rows, num_det_channels).
+            filter_name (string, optional): The name of the filter to use.
+                Defaults to 'ramp'.
+            output_sharded (bool, optional): If False (default), return a
+                numpy array.  If True, return the device form: a torch
+                tensor on a single device, or a Shards container (one
+                tensor per device) on a multi-device model.
+
+        Returns:
+            recon (numpy or tensor): The reconstructed volume.
+
         Note:
             FDK assumes equally spaced views over the full angular range and
             applies no short-scan redundancy weighting; for helical scans it is
@@ -811,16 +824,18 @@ class ConeBeamModel(TomographyModel):
         by splitting the detector rows into two overlapping halves, reconstructing each half separately,
         and stitching the reconstructions together.
 
-        The function can be called with the same arguments as TomographyModel.recon(), and it should return a
-        reconstruction which is approximately equal to the reconstruction returned by TomographyModel.recon().
+        The arguments mirror TomographyModel.recon(), and the result is approximately equal to the
+        reconstruction recon() returns.  Two differences: ``output_sharded`` is not accepted, and
+        ``compute_prior_loss`` is accepted but unused.
 
         Args:
-            sino (ndarray): Full sinogram of shape (num_views, num_rows, num_cols).
-            weights (ndarray, optional): Optional sinogram weights with the same shape as `sino`.
+            sino (numpy or tensor): Full sinogram of shape (num_views, num_rows, num_cols).
+            weights (numpy or tensor, optional): Optional sinogram weights with the same shape as `sino`.
             half_overlap (int): Number of overlapping detector rows past the iso row per half (when
                 recon slices are coarser than the iso-mapped rows, the row overlap is scaled up so
-                it still spans ``half_overlap`` slices).  The recon overlap is derived from it by
-                the geometry formula above.
+                it still spans ``half_overlap`` slices).  The reconstruction overlap is derived
+                from it, widened by the cone divergence so every slice the kept rows can see is
+                representable.
             init_recon (optional): Same as in the recon method.
             max_iterations (int, optional): Same as in the recon method.
             stop_threshold_change_pct (float, optional): Same as in the recon method.
@@ -838,6 +853,9 @@ class ConeBeamModel(TomographyModel):
             Tuple[np.ndarray, dict]: the reconstructed volume (numpy array), and a
                 metadata dictionary containing recon and model parameters for each
                 half, plus 'split_params' (the overlaps and any alignment shift used).
+                If the split would leave either half too thin, the method warns,
+                performs a standard recon() instead, and returns that result's
+                dictionary (no per-half entries).
 
         Raises:
             ValueError: If inputs are missing or shapes are inconsistent, if half_overlap < 2,
