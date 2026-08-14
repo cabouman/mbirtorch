@@ -899,13 +899,14 @@ def recon_plastic_metal(ct_model, sino, weights, num_BH_iterations=3, num_constr
             (see segment_plastic_metal).
 
     Returns:
-         numpy array, tensor, or Shards: The final corrected reconstruction after iterative beam
-         hardening correction.  It is a host NumPy array by default.  With ``output_sharded=True``
-         it is the model's device form: a tensor on a single-device model, or a ``Shards`` container
-         on a multi-device model.
+         (recon, recon_dict): The final corrected reconstruction after iterative beam hardening
+         correction, and the reconstruction dictionary from its final reconstruction pass.  The
+         reconstruction is a host NumPy array by default.  With ``output_sharded=True`` it is the
+         model's device form: a tensor on a single-device model, or a ``Shards`` container on a
+         multi-device model.
 
     Example:
-        >>> recon = recon_plastic_metal(
+        >>> recon, recon_dict = recon_plastic_metal(
         ...     ct_model, sino, weights,
         ...     num_BH_iterations=3,
         ...     stop_threshold_change_pct=0.2,
@@ -938,10 +939,10 @@ def recon_plastic_metal(ct_model, sino, weights, num_BH_iterations=3, num_constr
 
     # Do a regular recon if num_metal == 0
     if num_metal == 0:
-        recon, _ = recon_function(sino, weights=weights, max_iterations=max_iterations,
-                                  stop_threshold_change_pct=stop_threshold_change_pct,
-                                  logfile_path=logfile_path)
-        return to_output_form(recon)
+        recon, recon_dict = recon_function(sino, weights=weights, max_iterations=max_iterations,
+                                           stop_threshold_change_pct=stop_threshold_change_pct,
+                                           logfile_path=logfile_path)
+        return to_output_form(recon), recon_dict
 
     # Continue with beam hardening and segmentation
     if verbose >= 1:
@@ -971,7 +972,7 @@ def recon_plastic_metal(ct_model, sino, weights, num_BH_iterations=3, num_constr
             # gather per BH pass; the engine builds its own device-form init).
             init = (ct_model._gather_recon(recon)
                     if isinstance(recon, _sharding.Shards) else recon)
-            recon, _ = recon_function(corrected_sinogram, weights=weights, init_recon=init,
+            recon, recon_dict = recon_function(corrected_sinogram, weights=weights, init_recon=init,
                                       max_iterations=max_iterations,
                                       stop_threshold_change_pct=stop_threshold_change_pct,
                                       logfile_path=pass_log_paths[i])
@@ -990,4 +991,4 @@ def recon_plastic_metal(ct_model, sino, weights, num_BH_iterations=3, num_constr
             labels = ['recon_plastic_metal: BH pass {}'.format(i + 1) for i in range(num_BH_iterations)]
             mt.merge_log_files(log_path, zip(labels, pass_log_paths))
 
-    return to_output_form(recon)
+    return to_output_form(recon), recon_dict

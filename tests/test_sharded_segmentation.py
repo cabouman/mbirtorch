@@ -196,13 +196,13 @@ def test_sharded_bh_correction_matches_single_device():
     amplify float differences)."""
     ref_model, sino, vol = _small_mar_case(['cpu'])
     np.random.seed(0)          # the VCD pixel orderings come from the global RNG
-    ref = mtp.recon_plastic_metal(ref_model, sino, None, num_metal=1,
+    ref, _ = mtp.recon_plastic_metal(ref_model, sino, None, num_metal=1,
                                   num_BH_iterations=2, max_iterations=2,
                                   verbose=0, logfile_path=None)
 
     sh_model, _, _ = _small_mar_case(['cpu', 'cpu'])
     np.random.seed(0)
-    out = mtp.recon_plastic_metal(sh_model, sino, None, num_metal=1,
+    out, _ = mtp.recon_plastic_metal(sh_model, sino, None, num_metal=1,
                                   num_BH_iterations=2, max_iterations=2,
                                   verbose=0, logfile_path=None)
 

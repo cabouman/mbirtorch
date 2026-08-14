@@ -118,7 +118,7 @@ def test_mar_corrected_sino(golden, mar_model):
 def test_mar_recon_measured(golden, mar_model):
     # Recon in the loop: parity is measured and printed, gated loosely.
     np.random.seed(11)
-    out = mtp.recon_plastic_metal(mar_model, golden["mar_sino"].copy(),
+    out, _ = mtp.recon_plastic_metal(mar_model, golden["mar_sino"].copy(),
                                   golden["mar_weights"].copy(), num_BH_iterations=1,
                                   max_iterations=5, num_metal=1, verbose=0)
     err = _rel_max(out, golden["mar_recon_out"])
