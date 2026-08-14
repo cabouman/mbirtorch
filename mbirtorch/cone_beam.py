@@ -814,15 +814,6 @@ class ConeBeamModel(TomographyModel):
         The function can be called with the same arguments as TomographyModel.recon(), and it should return a
         reconstruction which is approximately equal to the reconstruction returned by TomographyModel.recon().
 
-        Each half keeps ``half_overlap`` detector rows past the iso row, and its reconstruction
-        extends ``half_overlap_recon`` slices past the split, where half_overlap_recon =
-        ceil(half_overlap_sino * (1 + R/SID) * rho) + 2 with rho = delta_det_row/(magnification *
-        delta_voxel_slice) and R the recon-support radius.  The (1 + R/SID) factor makes every
-        slice the kept rows can SEE representable (the cone-divergence bound of
-        auto_set_recon_geometry, evaluated at the iso ray); without it each half is axially
-        truncated at its extension end, which shows up as alternating stripes at the stitch seam
-        on real scans.
-
         Args:
             sino (ndarray): Full sinogram of shape (num_views, num_rows, num_cols).
             weights (ndarray, optional): Optional sinogram weights with the same shape as `sino`.
@@ -839,15 +830,9 @@ class ConeBeamModel(TomographyModel):
             logfile_path (str, optional): Same as in the TomographyModel.recon() method.  The two
                 halves' logs are merged into this single file, each under a section header.
             print_logs (bool, optional): Same as in the TomographyModel.recon() method.
-            align_split_grid (bool, optional): If True, align the recon split slice with the
-                sinogram cut row: first by choosing the cut row (effective only when rho != 1,
-                where the row and slice grids are incommensurate), then by shifting the whole
-                recon grid by the sub-slice residual (at most half a slice).  Alignment removes
-                the seam-stripe driver outright, but the shifted output samples the object at
-                z-positions up to delta_voxel_slice/2 away from what recon() would use -- an
-                equally valid reconstruction that is NOT registration-identical to recon(), which
-                is why it is opt-in.  The applied shift is reported in the returned dictionary
-                under 'split_params'.  Defaults to False.
+            align_split_grid (bool, optional): If True, shift the recon slice grid by up to
+                half a slice to align the split with the sinogram cut, which removes seam
+                stripes.  Defaults to False.
 
         Returns:
             Tuple[np.ndarray, dict]: the reconstructed volume (numpy array), and a

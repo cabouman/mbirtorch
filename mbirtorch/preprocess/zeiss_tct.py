@@ -25,7 +25,7 @@ def get_sino_and_model(dataset_dir, *, crop_pixels_sides=0, crop_pixels_top=0, c
     stale (default-pitch) reconstruction grid.
 
     Unlike the other scanner readers, this one returns ``weights``: a data-specific mask (from
-    :func:`compute_weight`) that zeros the dark detector-boundary regions of the TCT detector.  Pass it
+    ``compute_weight``) that zeros the dark detector-boundary regions of the TCT detector.  Pass it
     to ``model.recon(sino, weights=weights)``.
 
     Args:

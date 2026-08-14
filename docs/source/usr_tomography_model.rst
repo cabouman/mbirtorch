@@ -27,6 +27,8 @@ Reconstruction and Projection
 
 .. automethod:: mbirtorch.TomographyModel.back_project
 
+.. automethod:: mbirtorch.TomographyModel.split_sino_recon
+
 
 Parameter Handling
 ------------------

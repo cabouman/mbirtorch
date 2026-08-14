@@ -352,6 +352,48 @@ class TomographyModel(ParameterHandler):
         """
         raise NotImplementedError
 
+    def split_sino_recon(self, sino, weights=None, half_overlap=5, init_recon=None,
+                         max_iterations=15, stop_threshold_change_pct=0.2,
+                         first_iteration=0, compute_prior_loss=False,
+                         logfile_path='~/.mbirtorch/logs/recon.log', print_logs=True,
+                         align_split_grid=False):
+        """
+        Perform MBIR reconstruction with about half the memory of :meth:`recon`
+        by splitting the detector rows into two overlapping halves,
+        reconstructing each half separately, and stitching the results.  The
+        output is approximately equal to the output of :meth:`recon`.
+
+        The split arithmetic is geometry specific, and split_sino_recon may
+        not be available for all geometries; geometries without an
+        implementation raise ``NotImplementedError``.
+
+        Args:
+            sino (ndarray): Full sinogram of shape (num_views, num_rows, num_cols).
+            weights (ndarray, optional): Sinogram weights with the same shape
+                as ``sino``.
+            half_overlap (int, optional): Number of overlapping detector rows
+                kept past the split in each half.  Defaults to 5.
+            init_recon (optional): Same as in :meth:`recon`.
+            max_iterations (int, optional): Same as in :meth:`recon`.
+            stop_threshold_change_pct (float, optional): Same as in :meth:`recon`.
+            first_iteration (int, optional): Same as in :meth:`recon`.
+            compute_prior_loss (bool, optional): Accepted for interface
+                compatibility; not currently used.
+            logfile_path (str, optional): Same as in :meth:`recon`.  The two
+                halves' logs are merged into this single file.
+            print_logs (bool, optional): Same as in :meth:`recon`.
+            align_split_grid (bool, optional): If True, shift the recon slice
+                grid by up to half a slice to align the split with the
+                sinogram cut, which removes seam stripes.  Defaults to False.
+
+        Returns:
+            Tuple[np.ndarray, dict]: the reconstructed volume, and a metadata
+            dictionary with the recon and model parameters for each half plus
+            ``'split_params'`` (the overlaps and any alignment shift used).
+        """
+        raise NotImplementedError(
+            f'split_sino_recon is not implemented for {type(self).__name__}.')
+
     # ── projection wrappers (numpy at the public boundary) ────────────────────
     def sparse_forward_project(self, voxel_values, pixel_indices):
         """Cylinders at ``pixel_indices`` -> full sinogram.  This is the ONE
@@ -1408,7 +1450,7 @@ class TomographyModel(ParameterHandler):
 
     def _memory_remedies(self):
         """Extra remedy lines for this geometry's preflight message."""
-        if hasattr(self, 'split_sino_recon'):
+        if type(self).split_sino_recon is not TomographyModel.split_sino_recon:
             return ['  model.split_sino_recon(...)                '
                     '# reconstructs in halves; nearly doubles the',
                     '                                             '
