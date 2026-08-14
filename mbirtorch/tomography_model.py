@@ -871,43 +871,33 @@ class TomographyModel(ParameterHandler):
 
     # ── device configuration (the mbirjax configure_devices seam) ─────────────
     def configure_devices(self, num_devices=1, devices=None):
-        """Set the device layout, and take it out of the library's hands.
+        """
+        Set the compute devices the model uses.
 
-        This is the ONE place a device choice is expressed.  The model
-        constructors take no device argument, so every explicit choice comes
-        through here: a count (``num_devices=n``), or a list
-        (``devices=['cpu']``, ``['mps']``, ``['cuda:1']``, or several CUDA
-        devices).
+        Specify either a CUDA device count (``num_devices=n``) or an explicit
+        device list (``devices=['cpu']``, ``['mps']``, or
+        ``['cuda:0', 'cuda:1']``).  With more than one device, the sinogram
+        is divided across the devices by view and the reconstruction by
+        slice.
 
-        Without a call to this method, the model resolves its device lazily,
-        preferring cuda, then mps, then cpu.  On CUDA with two or more visible
-        devices it then spreads a reconstruction across the devices that can
-        hold their share, judged by a memory check that runs before the first
-        large allocation.  ``configure_devices(num_devices=1)`` is the
-        reproducibility pin, and the ``MBIRTORCH_NUM_DEVICES`` environment
-        variable pins the count process-wide for a suite or a nightly.
-        Results can differ slightly with the device count, and the difference
-        decays as iterations proceed.
+        Without a call to this method, the model chooses its devices
+        automatically: it prefers cuda, then mps, then cpu, and on CUDA it
+        may spread a reconstruction across several devices (see
+        :meth:`recon`).  Calling this method turns the automatic choice off
+        permanently for this model, so ``configure_devices(num_devices=1)``
+        pins a run to one device for reproducibility.  The
+        ``MBIRTORCH_NUM_DEVICES`` environment variable pins the count for a
+        whole process.  Results can differ slightly with the device count,
+        and the difference decays as iterations proceed.
 
-        It rebuilds the sino (view-axis) and recon (slice-axis) placements
-        over ``num_devices`` CUDA devices, or over the explicit device list.
+        The device layout is built from the current sinogram and recon
+        shapes, so call this after any geometry change.
 
-        The placements' real sizes come from the CURRENT params
-        (sinogram_shape / recon_shape), so call this after any geometry
-        change -- and note the mbirjax stale-bind lesson: this RECREATES the
-        projectors so nothing keeps a stale single-device binding.
-
-        A single device (the default) restores the trivial placements and
-        the unchanged n=1 path.
-
-        Calling this at all takes the layout out of the library's hands: the
-        count given here is the count used, the memory preflight no longer
-        second-guesses it, and the automatic device-count choice never runs
-        again on this model.  ``num_devices=1`` is therefore the way to pin a
-        run to one device for reproducibility.
-
-        Without such a call, a CUDA model spreads a reconstruction across the
-        devices that can hold their share; see :meth:`recon`.
+        Args:
+            num_devices (int, optional): number of CUDA devices to use.
+                Defaults to 1.
+            devices (list, optional): explicit device list.  Overrides
+                num_devices.
         """
         self.device_layout_is_automatic = False
         # An earlier automatic settle may have left rejected counts behind.
