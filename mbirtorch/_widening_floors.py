@@ -122,56 +122,57 @@ FLOORS = {
     ('parallel', 2): Floor(
         family='parallel', count=2, elements=88_080_384, cell=(512, 448, 384),
         against=1,
-        bracket=Bracket(losing_cell=(384, 336, 288), losing_speedup=0.80,
-                        winning_cell=(512, 448, 384), winning_speedup=1.21),
-        spread=0.05155, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
-        measured='2026-08-11', commit='4a222c7',
+        bracket=Bracket(losing_cell=(384, 336, 288), losing_speedup=0.75,
+                        winning_cell=(512, 448, 384), winning_speedup=1.26),
+        spread=0.005912, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-13', commit='8381a0b',
         largest_tested=297_271_296,
-        note='unchanged by the 2026-08-11 refresh, which re-measured '
-             'every row under the column-gather forward default.  The '
-             '384-class shape still loses at 0.80x, and the floor shape '
-             'wins by 1.21x'),
+        note='unchanged by the 2026-08-13 refresh, which re-measured '
+             'every row after the copy-stream and transient-memory '
+             'commits moved the projection-cost code.  The margins are '
+             'slightly wider than on 2026-08-11 (0.75x losing, 1.26x '
+             'winning) and the spread is far tighter, at 0.6 percent '
+             'against 5.2'),
     ('parallel', 4): Floor(
         family='parallel', count=4, elements=297_271_296,
         cell=(768, 672, 576), against=2,
-        bracket=Bracket(losing_cell=None, losing_speedup=None,
-                        winning_cell=(768, 672, 576), winning_speedup=1.10),
-        spread=0.02116, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
-        measured='2026-08-11', commit='4a222c7',
+        bracket=Bracket(losing_cell=(512, 448, 384), losing_speedup=0.69,
+                        winning_cell=(768, 672, 576), winning_speedup=1.03),
+        spread=0.004687, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-13', commit='8381a0b',
         largest_tested=1_023_934_464,
-        note='the floor MOVED DOWN, from the 1024-class shape to the '
-             '768-class, under the column-gather forward: four devices '
-             'now clear two by 1.10x at the 768-class shape and by 1.47x '
-             'at the 1024-class.  No losing shape is recorded because no '
-             'smaller shape was tried once the 768-class won; if this '
-             'admission is wrong, the cost is bounded by the 1.10x '
-             'margin against its 2.1 percent spread'),
+        note='the floor held at the 768-class shape it moved down to on '
+             '2026-08-11, and this refresh supplied the losing shape that '
+             'entry lacked: the 512-class loses at 0.69x.  The admission '
+             'is the tightest in the table, at 1.03x against a 0.5 '
+             'percent spread, so this row is the one to watch on the next '
+             'refresh'),
     ('cone', 2): Floor(
         family='cone', count=2, elements=88_080_384, cell=(512, 448, 384),
         against=1,
-        bracket=Bracket(losing_cell=(384, 336, 288), losing_speedup=0.78,
-                        winning_cell=(512, 448, 384), winning_speedup=1.21),
-        spread=0.02342, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
-        measured='2026-08-11', commit='4a222c7',
+        bracket=Bracket(losing_cell=(384, 336, 288), losing_speedup=0.77,
+                        winning_cell=(512, 448, 384), winning_speedup=1.30),
+        spread=0.1141, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-13', commit='8381a0b',
         largest_tested=297_271_296,
-        note='unchanged, and no longer marginal: the admission that '
-             'cleared by 1.02x on 2026-08-10 clears by 1.21x under the '
-             'column-gather forward, and this refresh recorded the '
-             'losing shape the first measurement never tried'),
+        note='unchanged, and the margin keeps widening: 1.02x on '
+             '2026-08-10, 1.21x on 2026-08-11, 1.30x here.  The 11.4 '
+             'percent spread is the largest in the table and comes from '
+             'the 384-class losing cell, which is small enough that '
+             'per-subset host costs dominate; the winning cell itself '
+             'ran at 1.0 percent'),
     ('cone', 4): Floor(
         family='cone', count=4, elements=1_023_934_464,
         cell=(1024, 1008, 992), against=2,
         bracket=Bracket(losing_cell=(768, 672, 576), losing_speedup=0.95,
-                        winning_cell=(1024, 1008, 992), winning_speedup=1.45),
-        spread=0.01853, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
-        measured='2026-08-11', commit='4a222c7',
+                        winning_cell=(1024, 1008, 992), winning_speedup=1.72),
+        spread=0.006576, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-13', commit='8381a0b',
         largest_tested=1_023_934_464,
-        note='the floor did not move, but this refresh re-derived it '
-             'against n=2, as the crossover rule requires now that cone '
-             'n=2 is admitted -- the change the previous entry '
-             'anticipated.  At the floor shape n=4 clears n=2 by 1.45x, '
-             'and the 768-class shape sits just under admission at '
-             '0.95x, so the bracket is tight'),
+        note='unchanged, and the margin grew from 1.45x to 1.72x while '
+             'the 768-class shape stayed just under admission at 0.95x.  '
+             'This floor sits at the top of the ladder, so a refresh can '
+             'confirm it but cannot lower it without a larger cell'),
 }
 
 # ── the projection-cost inputs the floors were measured against ──────────────
@@ -202,13 +203,13 @@ BLESSED_COST_HASHES = {
     'TomographyModel._sparse_back_project_sharded':
         '8a39fb4d97a9573933520ce780eae5dd2097e5a068caa3ee2178114ba8989772',
     'TomographyModel._sparse_forward_project_columns':
-        '73f545dbd63188d6668a59d1707200a9cd065a0fbed3fcd929d713af77e01993',
+        '7891079005e2e893b598327af1ac425696c0d51a288d92a285272187e8925157',
     'TomographyModel._sparse_forward_project_sharded':
         '546201c90075a19f5ffe055c2becee6716417aa52e9e5f178885e7a68aae60f3',
     '_sharding.py':
-        '424ada53243fa9f486cf139ee8564d21162ea791b9ef59ed949d0fa8a85d9b35',
+        'ad5138462c34f5aeb46b5f65b49e609638b6fa6ec9a8345185ed878074fe5a62',
     'projectors.py':
-        '68e812790a963b92519169fe4a04e667c587ff70919ed574533e4c52c891698a',
+        '82565070c0b10de0daf1835abcb84df796a265046402ed67f26305945ef2818e',
     'triton_cone.py':
         '8d3820c2101f8d3fbb7823f2d9b6e6e6253164bd14a2c276d167d9ba0a135154',
     'triton_parallel.py':
@@ -229,7 +230,7 @@ STALE_SINCE = None
 #: green the test leaves this behind, and the test says so.  Recomputed and
 #: printed by ``refresh_widening_floors.py --bless``.
 TABLE_CHECKSUM = \
-    'e68d1c7fb7e0d6a25e62f1053e562ce851651a12f70992c38fb7485e019613ae'
+    '62c5d8963c70d481dc7a35fa4a59e01446e225336066c6d7628fd75e0184d3a0'
 
 
 # ── the env knob ─────────────────────────────────────────────────────────────
