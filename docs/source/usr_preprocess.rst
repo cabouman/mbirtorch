@@ -53,7 +53,6 @@ Zeiss translation tomography functions
 .. currentmodule:: mbirtorch.preprocess.zeiss_tct
 
 .. autofunction:: get_sino_and_model
-.. autofunction:: compute_weight
 .. autofunction:: load_scans_and_params
 
 
