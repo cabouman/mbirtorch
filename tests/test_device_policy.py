@@ -887,3 +887,109 @@ def test_the_device_line_does_not_call_the_count_it_is_using_rejected(
     assert '4 used, chosen past its speed floor' in line
     assert '1 rejected,' in line
     assert '4 rejected' not in line
+
+
+# ── the settled layout ───────────────────────────────────────────────────────
+# The automatic choice is made once per model and kept: settling records the
+# (sinogram_shape, recon_shape) pair it decided from, later calls reuse the
+# layout while those shapes hold, and only a shape change re-decides.  The
+# poison budget below is the discriminator: a call that consults any budget
+# raises, so a passing test proves the settled path ran no search.
+def poison_budgets(monkeypatch):
+    def no_budget(_device):
+        raise AssertionError('a settled call consulted a device budget')
+    monkeypatch.setattr(_memory_ledger, 'device_budget_bytes', no_budget)
+
+
+def test_a_settled_model_does_not_redecide_when_free_memory_moves(
+        monkeypatch, unpinned, no_speed_guard):
+    model = make_model((16, 8, 16))
+    with_four_visible(monkeypatch, model)
+    model._apply_device_policy()
+    placement = model.sino_placement
+    assert placement.n_devices == 4
+    poison_budgets(monkeypatch)
+    model._apply_device_policy()
+    # The same layout, and the SAME placement object: a re-decision would
+    # reinstall the placements and invalidate every Shards a caller holds.
+    assert model.sino_placement is placement
+
+
+def test_a_shape_change_redecides_at_the_new_shapes(monkeypatch, unpinned,
+                                                    no_speed_guard):
+    model = make_model((16, 8, 16))
+    with_four_visible(monkeypatch, model)
+    model._apply_device_policy()
+    assert model.sino_placement.n_devices == 4
+    # Two of the four devices fill up between the calls.  A settled model
+    # ignores that by design; a shape change must not, because the
+    # decision's inputs are new.
+    monkeypatch.setattr(
+        _memory_ledger, 'device_budget_bytes',
+        lambda d: 1024 if (d.index or 0) >= 2 else 64 * GB)
+    model.set_params(no_warning=True, sinogram_shape=(16, 12, 16))
+    model._apply_device_policy()
+    assert model.sino_placement.n_devices == 2
+
+
+def test_a_nonshape_recompile_param_keeps_the_settled_layout(
+        monkeypatch, unpinned, no_speed_guard):
+    """A recompile-flagged parameter that leaves the shapes alone must not
+    re-decide.  Re-deciding on every recompile would unsettle the layout on
+    a detector-offset edit, and on the sigma_noise the denoiser sets at
+    every call."""
+    model = make_model((16, 8, 16))
+    with_four_visible(monkeypatch, model)
+    model._apply_device_policy()
+    poison_budgets(monkeypatch)
+    model.set_params(no_warning=True, det_channel_offset=0.5)
+    model._apply_device_policy()
+    assert model.sino_placement.n_devices == 4
+
+
+def test_configure_devices_overrides_a_settled_layout(monkeypatch, unpinned,
+                                                      no_speed_guard):
+    model = make_model((16, 8, 16))
+    with_four_visible(monkeypatch, model)
+    model._apply_device_policy()
+    assert model.sino_placement.n_devices == 4
+    model.configure_devices(devices=['cpu'])
+    assert model._settled_shapes is None
+    poison_budgets(monkeypatch)
+    model._apply_device_policy()
+    assert model.sino_placement.n_devices == 1
+
+
+# ── the calibration scope ────────────────────────────────────────────────────
+def test_calibration_resets_once_per_reconstruction(monkeypatch):
+    """The counters reset where the report that reads them lives, so the
+    nested direct_recon inside a cone reconstruction cannot clear the peak
+    mid-run."""
+    resets = []
+    monkeypatch.setenv('MBIRTORCH_MEMORY_CALIBRATION', '1')
+    monkeypatch.setattr(_memory_ledger, 'calibration_start',
+                        lambda devices: resets.append(list(devices)))
+    model = make_cone_model((8, 6, 8))
+    sinogram = np.zeros((8, 6, 8), dtype=np.float32)
+    sinogram[:, 3, 4] = 1.0
+    np.random.seed(0)
+    model.recon(sinogram, max_iterations=2)
+    assert len(resets) == 1
+
+
+def test_a_standalone_direct_recon_does_not_open_a_calibration_scope(
+        monkeypatch):
+    """A direct reconstruction before the recon must neither reset the
+    counters itself nor suppress the recon's own reset."""
+    resets = []
+    monkeypatch.setenv('MBIRTORCH_MEMORY_CALIBRATION', '1')
+    monkeypatch.setattr(_memory_ledger, 'calibration_start',
+                        lambda devices: resets.append(list(devices)))
+    model = make_cone_model((8, 6, 8))
+    sinogram = np.zeros((8, 6, 8), dtype=np.float32)
+    sinogram[:, 3, 4] = 1.0
+    model.direct_recon(sinogram)
+    assert resets == []
+    np.random.seed(0)
+    model.recon(sinogram, max_iterations=2)
+    assert len(resets) == 1

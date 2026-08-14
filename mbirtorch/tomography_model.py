@@ -163,6 +163,14 @@ class TomographyModel(ParameterHandler):
         # With no such call the model resolves 'auto' and, on CUDA with two
         # or more visible devices, takes the automatic widening path.
         self.device_layout_is_automatic = True
+        # The (sinogram_shape, recon_shape) pair the current automatic layout
+        # was decided from, or None while no automatic decision is in force.
+        # _apply_device_policy compares it against the current shapes on
+        # every call: equal shapes reuse the settled layout without a new
+        # search, and different shapes clear this record and re-decide.
+        # configure_devices clears it too, so a pinned model carries no
+        # settled record.
+        self._settled_shapes = None
         # Device counts the automatic choice turned down, and why, for the run
         # log's device line.  Empty when the layout was never searched.
         self.device_choice_rejections = []
@@ -177,7 +185,9 @@ class TomographyModel(ParameterHandler):
         # (view_batch_size above, and the slice-band attributes the banded
         # drivers read).  The margin covers what the closed-form ledger cannot
         # see: allocator fragmentation, and library workspaces CUDA allocates
-        # outside torch's allocator.
+        # outside torch's allocator.  The preflight runs when the automatic
+        # layout is decided, so setting skip_memory_preflight after a model
+        # has settled changes nothing until a shape change re-decides.
         self.skip_memory_preflight = False
         self.memory_preflight_margin = 0.15
         # The last ledger built, and the last calibration comparison, for a
@@ -1170,6 +1180,10 @@ class TomographyModel(ParameterHandler):
         # They explain a search this layout did not come from, so the run log
         # must not carry them into a run the caller placed by hand.
         self.device_choice_rejections = []
+        # The settled record is likewise the automatic path's; a pinned model
+        # must not carry one.  The explicit branch never reads it, so this
+        # keeps the two states consistent rather than changing behavior.
+        self._settled_shapes = None
         if devices is None:
             if num_devices == 1:
                 devices = [self.torch_device]
@@ -1226,6 +1240,15 @@ class TomographyModel(ParameterHandler):
     def _candidate_devices(self, num_devices):
         return [torch.device(f'cuda:{i}') for i in range(num_devices)]
 
+    def _shape_pair(self):
+        """The (sinogram_shape, recon_shape) tuple pair the automatic policy
+        records at settle time and compares on every later call.  These two
+        shapes are what the memory ledger's plan is built from, so a change
+        in either invalidates a settled decision."""
+        sinogram_shape, recon_shape = self.get_params(['sinogram_shape',
+                                                       'recon_shape'])
+        return tuple(sinogram_shape), tuple(recon_shape)
+
     def _apply_device_policy(self, **call_arrays):
         """Settle the device layout for the reconstruction about to run, and
         return the ledger for the layout settled on.
@@ -1243,20 +1266,26 @@ class TomographyModel(ParameterHandler):
         construction-time choice could have handed it a layout it could not
         run.  The 2026-08 prerelease gave the denoiser a real sharded loop, so
         that constraint is gone.  What is true today is narrower: the denoiser
-        never enters :meth:`vcd_recon`, the sole call site of this method, so
+        never enters the reconstruction entries that call this method, so
         it reaches several devices only through an explicit
         :meth:`configure_devices` call -- and the first branch below already
         treats an explicit layout as the caller's, neither searched nor
-        reduced.  Whether the denoiser should instead become a consumer of the
-        automatic policy is an open entry-point question; it is not settled
-        here, and nothing in this method assumes either answer.
+        reduced.  The denoiser is to join the automatic policy once it has a
+        ledger and floors of its own; until then, nothing in this method
+        assumes either state.
 
-        The choice is re-evaluated on every entry while the layout is still
-        automatic, because a long-lived model in a Plug-and-Play loop can
-        outlive the conditions its first choice was made under.  The
-        placements are rebuilt only when the chosen count differs from the
-        current one, so an unchanged count costs a closed-form pass and one
-        free-memory query per device.
+        The choice is made ONCE per model and kept.  Settling records the
+        (sinogram_shape, recon_shape) pair it was decided from, and while
+        those shapes hold, every later call returns the settled layout
+        without a search.  The layout therefore never moves mid-pipeline, so
+        sharded arrays a caller still holds -- a prepared sinogram, a
+        precomputed Hessian, a Plug-and-Play loop's previous output -- stay
+        valid.  A shape change invalidates the ledger inputs the decision
+        came from, so it clears the record and the next call re-decides.  A
+        change in free device memory never re-decides; the remedy for changed
+        conditions is :meth:`configure_devices` or a new model.  The
+        ``MBIRTORCH_NUM_DEVICES`` pin is read when the model settles, so
+        changing it later moves only models that have not settled yet.
 
         Capacity is not the only rule here.  On the unpinned automatic branch
         the candidate ORDER comes from the widening speed floors
@@ -1280,6 +1309,19 @@ class TomographyModel(ParameterHandler):
             ledger = self._build_memory_ledger(**call_arrays) if calibrating \
                 else None
             return self._arm_calibration(ledger)
+
+        if self._settled_shapes is not None:
+            if self._settled_shapes == self._shape_pair():
+                # The automatic choice for these shapes is settled: reuse it
+                # without a search, as the pinned branch above reuses an
+                # explicit one.  The ledger runs only for the calibration
+                # mode.
+                ledger = self._build_memory_ledger(**call_arrays) \
+                    if calibrating else None
+                return self._arm_calibration(ledger)
+            # The shapes changed, so the settled decision's inputs are gone:
+            # drop the record and re-decide below.
+            self._settled_shapes = None
 
         pinned = _memory_ledger.pinned_device_count()
         visible = torch.cuda.device_count() if torch.cuda.is_available() else 0
@@ -1469,18 +1511,28 @@ class TomographyModel(ParameterHandler):
         if rejected and self.get_params('verbose') >= 2:
             for count, why in rejected:
                 self.logger.debug(f'  device count {count} rejected: {why}')
+        # Record the shapes this decision came from.  While they hold, later
+        # policy calls reuse the layout instead of re-deciding; a shape
+        # change clears the record (see _apply_device_policy).
+        self._settled_shapes = self._shape_pair()
         return self._arm_calibration(ledger)
 
     def _arm_calibration(self, ledger):
-        """Record the ledger and, under the calibration mode, take ownership
-        of the peak counter it is about to compare against."""
+        """Record the ledger for a harness to read; under the calibration
+        mode, build one when the caller had none, so a policy return always
+        carries a ledger to compare against.
+
+        The peak-counter reset the calibration mode compares against lives in
+        :meth:`vcd_recon`, beside the report that reads the counters.  A
+        reset here would run on every policy return, and the nested return
+        inside a reconstruction (vcd_recon -> direct_recon -> policy) would
+        clear the peak after the sinogram and weights were already placed,
+        under-measuring the run."""
         if ledger is not None:
             self.last_memory_ledger = ledger
-        if _memory_ledger.calibration_enabled():
-            if ledger is None:
-                ledger = self._build_memory_ledger()
-                self.last_memory_ledger = ledger
-            _memory_ledger.calibration_start(self.sino_placement.devices)
+        if _memory_ledger.calibration_enabled() and ledger is None:
+            ledger = self._build_memory_ledger()
+            self.last_memory_ledger = ledger
         return ledger
 
     # ── array placement (entry) and gathering (exit) ──────────────────────────
@@ -2937,15 +2989,21 @@ class TomographyModel(ParameterHandler):
 
         # Settle the device layout BEFORE the first large allocation.  On a
         # CUDA model whose layout the caller has not fixed, this is where the
-        # reconstruction spreads across the devices that can hold their share;
-        # everywhere else it is a no-op that only the calibration mode
-        # observes.  The ledger it returns is the model of the layout settled
-        # on, and it is what the calibration mode compares against the
-        # measured peak.
+        # reconstruction spreads across the devices that can hold their
+        # share; everywhere else it returns without changing the layout.  The
+        # ledger it returns is the model of the layout settled on, and it is
+        # what the calibration mode compares against the measured peak.
         memory_ledger = self._apply_device_policy(
             partition_sequence=partition_sequence, weights=weights,
             init_recon=init_recon, fm_hessian=fm_hessian,
             prox_input=prox_input, init_error_sinogram=init_error_sinogram)
+        if _memory_ledger.calibration_enabled():
+            # The measured run begins here, so this is where the peak
+            # counters reset -- one reset per reconstruction, owned by the
+            # same function that reads the counters at the end.  A reset
+            # inside the policy would also run on the nested direct_recon
+            # call below and clear the peak mid-run.
+            _memory_ledger.calibration_start(self.sino_placement.devices)
         # The layout is final here, so this is where the log can name the
         # devices the run will actually use.
         self._log_device_report()
