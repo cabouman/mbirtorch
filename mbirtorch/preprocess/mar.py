@@ -860,7 +860,7 @@ def correct_sino_plastic_metal(ct_model, measured_sino, recon, num_metal=1, orde
 
 
 def recon_plastic_metal(ct_model, sino, weights, num_BH_iterations=3, num_constraint_update_iter=10, stop_threshold_change_pct=0.2,
-                        num_metal=1, order=3, alpha=1, beta=0.002, gamma=0.1, verbose=0, output_sharded=False,
+                        num_metal=1, order=3, alpha=1, beta=0.002, gamma=0.1, verbose=0,
                         max_iterations=15, logfile_path='~/.mbirtorch/logs/recon.log',
                         radial_margin=None, top_margin=None, bottom_margin=None):
     """
@@ -874,8 +874,10 @@ def recon_plastic_metal(ct_model, sino, weights, num_BH_iterations=3, num_constr
         ct_model: Any mbirtorch model that provides `direct_recon` and `recon`.  For a cone beam
             model the reconstruction passes use `split_sino_recon`; for every other geometry they
             use `recon`.  The function has been used mainly with cone beam models.
-        sino (ndarray):  Input sinogram data to be corrected.
-        weights (ndarray): Transmission weights used in the reconstruction algorithm.
+        sino (numpy or tensor):  Input sinogram data to be corrected.  A tensor is converted to
+            numpy at entry.
+        weights (numpy or tensor): Transmission weights used in the reconstruction algorithm.  A
+            tensor is converted to numpy at entry.
         num_BH_iterations (int, optional): Number of correction-reconstruction iterations. Defaults to 3.
         num_constraint_update_iter (int, optional): Number of iterations for updating constraints.
             At each iteration, the most violated constraints are activated and the quadratic program is re-solved via OSQP.
@@ -888,9 +890,6 @@ def recon_plastic_metal(ct_model, sino, weights, num_BH_iterations=3, num_constr
         gamma (float, optional): Stabilization factor used in plastic correction. Multiplies the mean of `s_p`
             to set a positive floor in the denominator, preventing division by near-zero or negative values. Defaults to 0.1.
         verbose (int, optional): Verbosity level for printing intermediate information. Defaults to 0.
-        output_sharded (bool, optional): Choose the form of the returned reconstruction.  If False
-            (default), return an ordinary host NumPy array.  If True, return the model's device form:
-            a tensor on a single-device model, or a ``Shards`` container on a multi-device model.
         max_iterations (int, optional): Maximum MBIR iterations per reconstruction pass. Defaults to 15.
         logfile_path (str, optional): Same as in the TomographyModel.recon() method.  The BH passes'
             logs are merged into this single file, each under a section header.
@@ -900,10 +899,8 @@ def recon_plastic_metal(ct_model, sino, weights, num_BH_iterations=3, num_constr
 
     Returns:
          (recon, recon_dict): The final corrected reconstruction after iterative beam hardening
-         correction, and the reconstruction dictionary from its final reconstruction pass.  The
-         reconstruction is a host NumPy array by default.  With ``output_sharded=True`` it is the
-         model's device form: a tensor on a single-device model, or a ``Shards`` container on a
-         multi-device model.
+         correction as a host NumPy array, and the reconstruction dictionary from its final
+         reconstruction pass.
 
     Example:
         >>> recon, recon_dict = recon_plastic_metal(
@@ -922,6 +919,15 @@ def recon_plastic_metal(ct_model, sino, weights, num_BH_iterations=3, num_constr
     if num_metal < 0:
         raise ValueError("num_metal must be >= 0")
 
+    # Host input only (API specification): a tensor is converted at entry.
+    if isinstance(sino, torch.Tensor):
+        sino = sino.detach().cpu().numpy()
+    sino = np.asarray(sino)
+    if weights is not None:
+        if isinstance(weights, torch.Tensor):
+            weights = weights.detach().cpu().numpy()
+        weights = np.asarray(weights)
+
     # Use split sino recon for cone beam when the model provides it (it splits on the host so the
     # full sinogram is never device-resident); otherwise use the standard recon with a device-form
     # output so the next correction consumes it with no gather/re-upload.
@@ -930,11 +936,8 @@ def recon_plastic_metal(ct_model, sino, weights, num_BH_iterations=3, num_constr
     else:
         recon_function = functools.partial(ct_model.recon, output_sharded=True)
 
-    # Deliver the user-requested output form (a host recon, e.g. from split_sino_recon, is already
-    # in the gathered form).
+    # The output is always a host numpy array (API specification).
     def to_output_form(r):
-        if output_sharded:
-            return ct_model._shard_recon(r)
         return r if isinstance(r, np.ndarray) else ct_model._gather_recon(r)
 
     # Do a regular recon if num_metal == 0
