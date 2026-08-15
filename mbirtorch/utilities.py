@@ -1740,10 +1740,18 @@ def generate_demo_data(
     # sinogram share one layout.  None leaves the automatic selection in place.
     if devices is not None:
         ct_model_for_generation.configure_devices(devices=list(devices))
-    # Name where the layout came from.  This entry decides a device set outside
-    # the reconstruction device policy, so without the word the run log cannot
-    # tell a set the caller named from the one the library fell back to -- and
-    # the two can differ from the devices the recon that consumes this sinogram
+    # Settle the layout before projecting, so the generation spreads over the
+    # devices the widening speed floors admit rather than running whole on the
+    # lead one.  The capacity preflight is skipped for this model alone: it
+    # exists for one forward projection and is deleted below, so it has no
+    # reconstruction lifetime to size for, and an overflow the preflight would
+    # have caught arrives as the allocator's error instead.  A pinned model
+    # returns from the call at once, so no branch guards it.
+    ct_model_for_generation.skip_memory_preflight = True
+    ct_model_for_generation._apply_device_policy()
+    # Name where the layout came from.  Without the word the run log cannot
+    # tell a set the caller named from the one the policy chose here -- and
+    # either can differ from the devices the recon that consumes this sinogram
     # goes on to use.
     device_provenance = 'requested' if devices is not None else 'default'
 

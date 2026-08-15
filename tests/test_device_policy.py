@@ -1179,6 +1179,94 @@ def test_configure_devices_clears_the_settled_workload_too(
     assert model._settled_workload is None
 
 
+# ── the generation model ─────────────────────────────────────────────────────
+# generate_demo_data builds a model of its own to project the phantom through,
+# and that model settles like any other reconstruction entry.  It is the one
+# model that settles with the capacity preflight skipped: it lives for a single
+# projection and is deleted before the function returns, so there is no
+# reconstruction lifetime to size it for.  The function's own name for it is
+# gone by the time a test could read it, so these tests capture the instance as
+# it is built.
+DEMO_SHAPE = dict(num_views=8, num_det_rows=8, num_det_channels=12)
+
+
+def capture_generation_model(monkeypatch, geometry, budget=64 * GB):
+    """Record the model generate_demo_data builds, with the fabricated
+    four-device visibility the rest of this file uses.
+
+    The model is placed on the CPU as it is constructed, before the generation
+    reaches its own set_params calls, so the fabricated visibility cannot pull
+    a real allocation onto a device this host lacks.
+
+    Returns:
+        list: empty until the generation runs, then holding the one model.
+    """
+    built = []
+    construct = getattr(mbirtorch, geometry)
+
+    def build_and_record(*args, **kwargs):
+        model = construct(*args, **kwargs)
+        model.set_params(no_warning=True, verbose=0)
+        model._install_device_layout(['cpu'])
+        with_four_visible(monkeypatch, model, budget=budget)
+        built.append(model)
+        return model
+
+    monkeypatch.setattr(mbirtorch, geometry, build_and_record)
+    return built
+
+
+def test_the_generation_model_projects_on_the_layout_it_settles(
+        monkeypatch, unpinned, no_speed_guard):
+    """The E1 gap, closed: with no devices= the phantom projection spreads over
+    the devices that fit, rather than running whole on the lead one."""
+    built = capture_generation_model(monkeypatch, 'ParallelBeamModel')
+    _phantom, sinogram, _params = mbirtorch.generate_demo_data(
+        model_type='parallel', object_type='cube', **DEMO_SHAPE)
+    model, = built
+    assert model.device_layout_is_automatic is True
+    assert model.sino_placement.n_devices == 4
+    assert sinogram.shape == (8, 8, 12)
+    assert np.all(np.isfinite(sinogram)) and sinogram.max() > 0
+
+
+def test_a_requested_device_list_still_pins_the_generation(monkeypatch,
+                                                           unpinned,
+                                                           no_speed_guard):
+    """devices= stays an explicit pin.  Four devices are visible with ample
+    room, so the automatic path would have taken all four; the projection runs
+    on the two the caller named."""
+    built = capture_generation_model(monkeypatch, 'ParallelBeamModel')
+    _phantom, sinogram, _params = mbirtorch.generate_demo_data(
+        model_type='parallel', object_type='cube',
+        devices=['cpu', 'cpu'], **DEMO_SHAPE)
+    model, = built
+    assert model.device_layout_is_automatic is False
+    assert model.sino_placement.n_devices == 2
+    assert np.all(np.isfinite(sinogram)) and sinogram.max() > 0
+
+
+def test_the_generation_settles_with_the_capacity_check_skipped(
+        monkeypatch, unpinned, no_speed_guard):
+    """The skip itself.  Every device has a kilobyte, which no plan fits, and
+    the generation runs anyway on the first count the candidate order offers.
+    """
+    built = capture_generation_model(monkeypatch, 'ParallelBeamModel',
+                                     budget=1024)
+    _phantom, sinogram, _params = mbirtorch.generate_demo_data(
+        model_type='parallel', object_type='cube', **DEMO_SHAPE)
+    model, = built
+    assert model.skip_memory_preflight is True
+    assert model.sino_placement.n_devices == 4
+    assert np.all(np.isfinite(sinogram))
+    # The check was skipped, not passed: with the skip taken away and the
+    # settled record cleared, the same model at the same budget is refused.
+    model.skip_memory_preflight = False
+    model._settled_shapes = None
+    with pytest.raises(MemoryPreflightError):
+        model._apply_device_policy()
+
+
 # ── the calibration scope ────────────────────────────────────────────────────
 def test_calibration_resets_once_per_reconstruction(monkeypatch):
     """The counters reset where the report that reads them lives, so the
