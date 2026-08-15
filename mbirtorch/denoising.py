@@ -360,14 +360,17 @@ class QGGMRFDenoiser(TomographyModel):
             return total
 
         # Flat (num_pixels, local_slices) shards; residual = image - init.
+        # The pixel count is named rather than inferred: a shard that owns no
+        # slices has no elements, and reshape cannot infer a row count from an
+        # empty tensor whose column count is also zero.
+        num_pixels = int(image_shape[0]) * int(image_shape[1])
         flat_image = _sharding.Shards(
-            [t.reshape(-1, t.shape[-1]).clone().contiguous()
+            [t.reshape(num_pixels, t.shape[-1]).clone().contiguous()
              for t in init_sh.tensors], pl)
         flat_error = _sharding.Shards(
-            [(a.reshape(-1, a.shape[-1]) - b).contiguous()
+            [(a.reshape(num_pixels, a.shape[-1]) - b).contiguous()
              for a, b in zip(image_sh.tensors, flat_image.tensors)], pl)
 
-        interface_masks = self._qggmrf_interface_masks()
         grad_hess = [maybe_compile(_qggmrf.qggmrf_gradient_and_hessian_at_indices,
                                    self.compile_enabled, instance_key=i)
                      for i in range(n)]
@@ -402,9 +405,7 @@ class QGGMRFDenoiser(TomographyModel):
                             grad, hess = grad_hess[j](
                                 flat_image.tensors[j], image_shape, idx[j],
                                 qggmrf_params, left_halo=halos['left'][j],
-                                right_halo=halos['right'][j],
-                                interface_mask=(None if interface_masks is None
-                                                else interface_masks[j]))
+                                right_halo=halos['right'][j])
                             cur_error = flat_error.tensors[j][idx[j]]
                             forward_grad = -fm_constant * cur_error
                             delta = -((forward_grad + grad) / (1.0 + hess))

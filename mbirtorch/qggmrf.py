@@ -75,7 +75,7 @@ def get_2_b_tilde(delta, b_for_delta, qggmrf_params):
 
 def qggmrf_gradient_and_hessian_at_indices(flat_recon, recon_shape, pixel_indices,
                                            qggmrf_params, left_halo=None,
-                                           right_halo=None, interface_mask=None):
+                                           right_halo=None):
     """
     Calculate the gradient and hessian at each index location in a reconstructed
     image using the surrogate function for the qGGMRF prior.
@@ -103,16 +103,6 @@ def qggmrf_gradient_and_hessian_at_indices(flat_recon, recon_shape, pixel_indice
             boundary condition, reproducing the single-device result exactly.
         right_halo (tensor or None): as left_halo for the slice immediately
             AFTER this shard.
-        interface_mask (tensor or None): optional (num_local_slices + 1,)
-            float mask multiplying the slice-to-slice differences; entry j is
-            the interface between local slices j-1 and j (0 and n are the
-            boundary interfaces).  A 0 entry decouples the two slices it
-            joins exactly as the reflected boundary does at a true edge (the
-            Hessian keeps its b_tilde(0) term).  Used when the slice axis is
-            padded for sharding: zeroing every interface whose higher-index
-            GLOBAL slice is padded reproduces the reflected boundary at the
-            last REAL slice and keeps the padded slices' gradient exactly
-            zero.  None (the default) applies no masking.
 
     Returns:
         tuple of two tensors (first_derivative, second_derivative), each of shape
@@ -139,11 +129,6 @@ def qggmrf_gradient_and_hessian_at_indices(flat_recon, recon_shape, pixel_indice
     delta = torch.cat((cylinders[:, :1] - left_val,
                        cylinders[:, 1:] - cylinders[:, :-1],
                        right_val - cylinders[:, -1:]), dim=1)  # (N, S+1)
-    if interface_mask is not None:
-        # Reflected BC at a true edge IS a zero boundary delta, so this is
-        # the same condition applied at an arbitrary interface; the Hessian
-        # still receives the b_tilde(0) term from a masked interface.
-        delta = delta * interface_mask
 
     # Compute the primary quantity used for the gradient and Hessian.
     # Use b_for_delta = 1 here and scale by the slice-direction b below.

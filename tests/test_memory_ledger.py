@@ -31,10 +31,8 @@ def make_plan(n_devices=1, num_views=64, num_rows=32, num_channels=32,
         sinogram_shape=(num_views, num_rows, num_channels),
         recon_shape=recon,
         devices=devices,
-        view_blocks=[(e - s, v) for _d, (s, e), v
-                     in sino_placement.padded_shard_ranges()],
-        slice_blocks=[(e - s, v) for _d, (s, e), v
-                      in recon_placement.padded_shard_ranges()],
+        view_blocks=[e - s for _d, (s, e) in sino_placement.shard_ranges()],
+        slice_blocks=[e - s for _d, (s, e) in recon_placement.shard_ranges()],
         sino_rows=num_rows,
         rows_track_slices=rows_track_slices,
         num_pixels_full=num_pixels_full,
@@ -1197,10 +1195,8 @@ def _measured_arm_ledger(arm):
         sinogram_shape=sinogram_shape,
         recon_shape=recon_shape,
         devices=devices,
-        view_blocks=[(e - s, v) for _d, (s, e), v
-                     in sino.padded_shard_ranges()],
-        slice_blocks=[(e - s, v) for _d, (s, e), v
-                      in recon.padded_shard_ranges()],
+        view_blocks=[e - s for _d, (s, e) in sino.shard_ranges()],
+        slice_blocks=[e - s for _d, (s, e) in recon.shard_ranges()],
         sino_rows=sinogram_shape[1],
         rows_track_slices=False,
         num_pixels_full=num_pixels,

@@ -61,7 +61,9 @@ def apply_row_filter(block, filter_arr, row_weight=None):
     # the valid slice is filtered[C-1 : C-1+C].
     start = n_channels - 1
     out = torch.empty_like(rows)
-    batch = min(ROW_FILTER_BATCH, total_rows)
+    # Never zero: a view-shard that owns no views has no rows to filter, and
+    # a loop step of zero is an error even where the range it walks is empty.
+    batch = max(1, min(ROW_FILTER_BATCH, total_rows))
     for r0 in range(0, total_rows, batch):
         window = rows[r0:r0 + batch]
         if row_weight is not None:

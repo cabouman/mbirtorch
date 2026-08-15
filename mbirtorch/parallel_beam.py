@@ -148,8 +148,7 @@ class ParallelBeamModel(TomographyModel):
         return 1.0
 
     # Parallel beam ties detector row r to recon slice r 1:1 (see the base
-    # attribute): the banded drivers take the row-aligned path and a padded
-    # slice axis pads the detector-row axis with it.
+    # attribute): the banded drivers take the row-aligned path.
     rows_track_slices = True
 
     # The measured set of widening speed floors that governs this geometry's

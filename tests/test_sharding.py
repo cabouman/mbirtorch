@@ -14,21 +14,21 @@ from mbirtorch._sharding import (Placement, Shards, broadcast_band_to_views,
                                  run_per_device, sum_band_to_owner)
 
 
-def test_placement_ranges_and_padding():
+def test_placement_ranges_split_evenly_within_one():
     p = Placement(["cpu", "cpu"], axis=0, real_size=7)
     assert p.n_devices == 2 and not p.is_trivial
-    assert p.padded_size == 8 and p.is_padded
-    ranges = p.padded_shard_ranges()
-    assert [(s, e) for _, (s, e), _ in ranges] == [(0, 4), (4, 8)]
-    assert [v for _, _, v in ranges] == [4, 3]      # last shard: 3 real + 1 pad
-    mask = p.real_mask(3)
-    assert mask.shape == (8, 1, 1)
-    assert mask.sum() == 7 and not mask[7, 0, 0]
+    # A size the device count does not divide splits into blocks that differ
+    # in length by one, with the longer block first.
+    assert [r for _, r in p.shard_ranges()] == [(0, 4), (4, 7)]
+    # An explicit size overrides the placement's own.
+    assert [r for _, r in p.shard_ranges(6)] == [(0, 3), (3, 6)]
 
     q = Placement(["cpu"], axis=-1, real_size=5)
-    assert q.is_trivial and not q.is_padded and q.real_mask(2) is None
-    with pytest.raises(ValueError, match="evenly shard"):
-        p.shard_ranges(7)
+    assert q.is_trivial and [r for _, r in q.shard_ranges()] == [(0, 5)]
+
+    # No size to split, and none on the placement, is an error that says so.
+    with pytest.raises(ValueError, match="needs an axis length"):
+        Placement(["cpu"], axis=0).shard_ranges()
 
 
 def test_shards_gather_roundtrip():
@@ -89,7 +89,7 @@ def test_the_streamed_reduce_leaves_the_sharded_back_projection_unchanged(
     """
     import mbirtorch
     from mbirtorch import _sharding
-    sino_shape = (9, 7, 8)                       # padded slices, 2 devices
+    sino_shape = (9, 7, 8)                       # 7 slices over 2 devices
     angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
 
     def build(devices):
@@ -145,8 +145,8 @@ def test_real_cross_device_transfer_cpu_mps():
 
 def test_model_shard_and_gather_roundtrip():
     # configure_devices widens the placements; _shard_sinogram/_shard_recon then split a
-    # real-shape array into padded per-device shards and the gathers crop the
-    # padding back -- a lossless round trip.  Two 'virtual' CPU devices keep
+    # real-shape array into per-device shards and the gathers concatenate them
+    # back -- a lossless round trip.  Two 'virtual' CPU devices keep
     # this runnable everywhere.
     import mbirtorch
     from mbirtorch._sharding import Shards
@@ -161,7 +161,7 @@ def test_model_shard_and_gather_roundtrip():
     sh = m._shard_sinogram(sino)
     assert isinstance(sh, Shards) and len(sh.tensors) == 2
     assert sh.tensors[0].shape[0] == 5           # 10 views split evenly
-    assert np.allclose(m._gather_sinogram(sh), sino)
+    assert np.array_equal(m._gather_sinogram(sh), sino)
     assert m._shard_sinogram(sh) is sh           # pass-through when placed
 
     rs = tuple(m.get_params('recon_shape'))
@@ -169,7 +169,7 @@ def test_model_shard_and_gather_roundtrip():
     rh = m._shard_recon(recon)
     assert isinstance(rh, Shards)
     # slice axis 6 -> 3+3, and a NON-dividing case (7 detector rows -> 7
-    # recon slices over 2 devices) pads with inert zeros:
+    # recon slices over 2 devices) splits 4+3:
     m2 = mbirtorch.ParallelBeamModel((10, 7, 8), np.linspace(0, np.pi, 10,
                                      endpoint=False))
     m2.configure_devices(devices=["cpu"])
@@ -178,9 +178,8 @@ def test_model_shard_and_gather_roundtrip():
     r9 = np.random.RandomState(2).rand(*tuple(m2.get_params('recon_shape'))
                                        ).astype(np.float32)
     rh9 = m2._shard_recon(r9)
-    assert rh9.placement.is_padded
-    assert float(rh9.tensors[-1][..., -1].abs().max()) == 0.0   # zero tail
-    assert np.allclose(m2._gather_recon(rh9), r9)               # crop restores
+    assert [int(t.shape[-1]) for t in rh9.tensors] == [4, 3]
+    assert np.array_equal(m2._gather_recon(rh9), r9)            # lossless
 
     # The banded drivers consume shards directly.
     assert isinstance(m.sparse_back_project(sino, np.arange(4)), Shards)
@@ -321,34 +320,14 @@ def test_qggmrf_halos_match_full_volume():
                   / max(float(ref_h.abs().max()), 1e-30))
     assert rel_g < 1e-6 and rel_h < 1e-6, (rel_g, rel_h)
 
-    # An all-ones interface mask is a no-op; zeroing interface j decouples
-    # slices j-1 and j exactly like a reflected edge there.
-    mask = torch.ones(5)
-    g1, h1 = qggmrf.qggmrf_gradient_and_hessian_at_indices(
-        shards.tensors[0], (rows, cols, S), idx, params, right_halo=rh[0],
-        interface_mask=mask)
-    rel_1 = float((g1 - parts[0][0]).abs().max()
-                  / max(float(parts[0][0].abs().max()), 1e-30))
-    assert rel_1 < 1e-6, rel_1
-    mask4 = mask.clone(); mask4[-1] = 0.0
-    g2, _ = qggmrf.qggmrf_gradient_and_hessian_at_indices(
-        shards.tensors[0], (rows, cols, S), idx, params, right_halo=rh[0],
-        interface_mask=mask4)
-    g_ref, _ = qggmrf.qggmrf_gradient_and_hessian_at_indices(
-        shards.tensors[0], (rows, cols, S), idx, params)
-    rel_2 = float((g2 - g_ref).abs().max()
-                  / max(float(g_ref.abs().max()), 1e-30))
-    assert rel_2 < 1e-6, rel_2
-
 
 def test_qggmrf_halos_treat_a_shard_with_no_slices_as_absent():
     """A shard that holds no slices sends no halo and receives none.
 
     The last shard that owns slices therefore gets None on its right, which
     the prior maps to the reflected boundary condition at the last real
-    slice.  No split produces such a shard yet, because a padded block always
-    holds at least one slice, so the shards here are built by hand: widths 2,
-    3, and 0 over three devices.
+    slice.  The shards here are built by hand rather than through a model, so
+    the case is stated directly: widths 2, 3, and 0 over three devices.
     """
     from mbirtorch._sharding import Placement, Shards, exchange_qggmrf_halos
     rng = np.random.RandomState(23)
@@ -462,10 +441,10 @@ def test_cone_sharded_fdk_matches_single_device():
         assert rel < 1e-5, (shifts is None, rel)
 
 
-def test_padded_placement_roundtrip_with_row_pad():
-    # Non-dividing view AND slice axes on two virtual CPU devices: the device
-    # form pads views 9->10 and (parallel row<->slice tie) rows/slices 7->8,
-    # zero-filled; the gathers crop both axes back to the real counts.
+def test_uneven_placement_roundtrip():
+    # Non-dividing view AND slice axes on two virtual CPU devices: the 9
+    # views split 5 + 4, and (parallel row<->slice tie) the 7 slices split
+    # 4 + 3.  The gathers put both axes back together unchanged.
     import mbirtorch
     sino_shape = (9, 7, 8)
     angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
@@ -473,16 +452,12 @@ def test_padded_placement_roundtrip_with_row_pad():
     m.configure_devices(devices=["cpu"])
     m.set_params(no_warning=True, verbose=0)
     m.configure_devices(devices=["cpu", "cpu"])
-    assert m.sino_placement.is_padded and m.recon_placement.is_padded
     rng = np.random.default_rng(3)
     sino = rng.standard_normal(sino_shape).astype(np.float32)
 
     prepared = m.prepare_sino_for_devices(sino)
     shapes = [tuple(t.shape) for t in prepared.tensors]
-    assert shapes == [(5, 8, 8), (5, 8, 8)]
-    # The zero tails: last device's padded view, and every device's row tail.
-    assert float(torch.abs(prepared.tensors[1][-1]).sum()) == 0.0
-    assert all(float(torch.abs(t[:, 7:]).sum()) == 0.0 for t in prepared.tensors)
+    assert shapes == [(5, 7, 8), (4, 7, 8)]
     back = m._gather_sinogram(prepared)
     assert back.shape == sino_shape
     assert np.array_equal(back, sino)    # copies only, so exactly equal
@@ -490,21 +465,21 @@ def test_padded_placement_roundtrip_with_row_pad():
     again = m._shard_sinogram(prepared)
     assert again is prepared
 
-    # Weights ride the same seam: padded entries are weightless.
+    # Weights ride the same seam.
     _, w = m.prepare_sino_for_devices(sino, weights=np.abs(sino) + 0.5)
-    assert float(torch.abs(w.tensors[1][-1]).sum()) == 0.0
+    assert [tuple(t.shape) for t in w.tensors] == shapes
 
-    # Recon-side padding: slice axis 7 -> 8, last shard's tail zero.
+    # Recon side: the slice axis 7 splits 4 + 3.
     recon_shape = tuple(m.get_params('recon_shape'))
     vol = rng.standard_normal(recon_shape).astype(np.float32)
     placed = m._shard_recon(vol)
-    assert float(torch.abs(placed.tensors[1][..., -1]).sum()) == 0.0
+    assert [int(t.shape[-1]) for t in placed.tensors] == [4, 3]
     assert np.array_equal(m._gather_recon(placed), vol)
 
 
-def test_padded_banded_projectors_match_single_device():
-    # Forward and back through the banded drivers on padded axes must equal
-    # the single-device values on the REAL entries (padding inert).
+def test_uneven_banded_projectors_match_single_device():
+    # Forward and back through the banded drivers on non-dividing axes must
+    # equal the single-device values.
     import mbirtorch
     sino_shape = (9, 7, 8)
     angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
@@ -531,14 +506,13 @@ def test_padded_banded_projectors_match_single_device():
     bp_2 = m2._gather_recon(m2.back_project(sino, output_sharded=True))
     rel = np.max(np.abs(bp_2 - bp_ref)) / np.max(np.abs(bp_ref))
     assert rel < 1e-5, rel
-    # The padded slice tail of the device form itself is zero (the forced-
-    # zero invariant the prior relies on).
+    # Each device holds its own share of the slice axis: 4 + 3.
     bp_dev = m2.back_project(sino, output_sharded=True)
-    assert float(torch.abs(bp_dev.tensors[-1][..., -1]).sum()) == 0.0
+    assert [int(t.shape[-1]) for t in bp_dev.tensors] == [4, 3]
 
 
-def test_padded_sharded_vcd_recon_matches_single_device():
-    # The decisive padded gate: a seeded recon with non-dividing views AND
+def test_uneven_sharded_vcd_recon_matches_single_device():
+    # The decisive uneven gate: a seeded recon with non-dividing views AND
     # slices on two virtual CPUs reproduces the single-device run (weighted
     # and constant-weight paths).
     import mbirtorch
@@ -571,13 +545,13 @@ def test_padded_sharded_vcd_recon_matches_single_device():
     rel = np.max(np.abs(out - ref)) / max(np.max(np.abs(ref)), 1e-30)
     fm1 = np.array(ref_dict['recon_params']['fm_rmse'])
     fm2 = np.array(out_dict['recon_params']['fm_rmse'])
-    print(f"padded sharded vcd: recon rel_max {rel:.2e}, fm diff "
+    print(f"uneven sharded vcd: recon rel_max {rel:.2e}, fm diff "
           f"{np.max(np.abs(fm1 - fm2)):.2e}")
     assert rel < 5e-4, rel
     rel_fm = np.max(np.abs(fm2 - fm1)) / max(np.max(np.abs(fm1)), 1e-30)
     assert rel_fm < 1e-4, rel_fm
 
-    # Constant weights: the padded ones Hessian seam.
+    # Constant weights: the ones-Hessian seam.
     m3 = build()
     np.random.seed(48)
     ref_u, _ = m3.recon(sino, max_iterations=2, stop_threshold_change_pct=0.0)
@@ -591,17 +565,17 @@ def test_padded_sharded_vcd_recon_matches_single_device():
 
 def test_fully_idle_device_refused():
     # A device idle on ONE axis is legal (the thin-volume and sparse-view
-    # extensions); a device with no real views AND no real slices would do
-    # nothing at all and is refused.  5 views on 4 devices (slices real
-    # everywhere) now configures; 3 views x 3 slices on 8 devices does not.
+    # extensions); a device with no views AND no slices would do nothing at
+    # all and is refused.  3 views on 4 devices (slices everywhere) still
+    # configures; 3 views x 3 slices on 8 devices does not.
     import mbirtorch
-    sino_shape = (5, 8, 8)
+    sino_shape = (3, 8, 8)
     angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
     m = mbirtorch.ParallelBeamModel(sino_shape, angles)
     m.configure_devices(devices=["cpu"])
     m.set_params(no_warning=True, verbose=0)
     m.configure_devices(devices=["cpu"] * 4)   # empty VIEW shard: allowed
-    assert m.sino_placement.padded_shard_ranges()[-1][2] == 0
+    assert [e - s for _d, (s, e) in m.sino_placement.shard_ranges()][-1] == 0
 
     m2 = mbirtorch.ParallelBeamModel((3, 3, 8),
                                      np.linspace(0, np.pi, 3, endpoint=False))
@@ -611,14 +585,14 @@ def test_fully_idle_device_refused():
         m2.configure_devices(devices=["cpu"] * 8)
         raise AssertionError("expected ValueError for a fully idle device")
     except ValueError as e:
-        assert 'no real views AND no real slices' in str(e)
+        assert 'no views AND no slices' in str(e)
 
 
 def test_cone_sharded_vcd_recon_matches_single_device():
     # The cone VCD loop on two devices: the DC-damping profile now splits per
     # shard (dev_index seam), so the multi-device guard is gone.  A seeded
-    # recon at a dividing cell and at a PADDED (non-dividing slices) cell
-    # reproduces the single-device run.
+    # recon at a dividing cell and at a non-dividing cell reproduces the
+    # single-device run.
     import mbirtorch
     for cell in ((8, 8, 8), (9, 7, 8)):
         angles = np.linspace(0, 2 * np.pi, cell[0], endpoint=False)
@@ -640,7 +614,6 @@ def test_cone_sharded_vcd_recon_matches_single_device():
 
         m2 = build()
         m2.configure_devices(devices=["cpu", "cpu"])
-        assert m2.recon_placement.is_padded == (rs[2] % 2 != 0)
         np.random.seed(53)
         out, _ = m2.recon(sino, max_iterations=3, stop_threshold_change_pct=0.0)
         rel = np.max(np.abs(out - ref)) / max(np.max(np.abs(ref)), 1e-30)
@@ -650,8 +623,8 @@ def test_cone_sharded_vcd_recon_matches_single_device():
 
 def test_sub_band_streaming_matches_unstreamed():
     # Force 2-slice sub-bands through both banded drivers (the default
-    # bounds give one band at test sizes) on a padded parallel cell AND a
-    # cone cell: values must match the single-device references exactly at
+    # bounds give one band at test sizes) on a non-dividing parallel cell AND
+    # a cone cell: values must match the single-device references exactly at
     # the banded drivers' established tolerances -- streaming is a pure
     # partition of the work.
     import mbirtorch
@@ -725,11 +698,10 @@ def test_the_back_driver_returns_an_empty_block_for_an_owner_with_no_slices(
     """A slice-owner with no slices gets a (num_pixels, 0) block, while the
     owner that holds the slices gets the single-device values.
 
-    The stub is here because no real placement produces a zero-extent block:
-    the padding gives every owner at least one entry, so this case arrives
-    only once the split changes.  The stub hands the driver the block layout
-    that change produces -- one owner covering every real slice, and a last
-    owner covering none.
+    The stub is here because the balanced split gives these two owners three
+    slices each.  The layout below -- one owner covering every slice and a
+    last owner covering none -- therefore has to be handed to the driver
+    directly.
     """
     import mbirtorch
     sino_shape = (8, 6, 8)
@@ -745,9 +717,10 @@ def test_the_back_driver_returns_an_empty_block_for_an_owner_with_no_slices(
 
     m.configure_devices(devices=["cpu"] * 2)
     rp, num_slices = m.recon_placement, rs[2]
-    monkeypatch.setattr(rp, 'padded_shard_ranges',
-                        lambda: [(rp.devices[0], (0, num_slices), num_slices),
-                                 (rp.devices[1], (num_slices, num_slices), 0)])
+    monkeypatch.setattr(
+        rp, 'shard_ranges',
+        lambda size=None: [(rp.devices[0], (0, num_slices)),
+                           (rp.devices[1], (num_slices, num_slices))])
     back = m.sparse_back_project(sino, idx)
     assert back.tensors[1].shape == (len(idx), 0)
     assert back.tensors[1].dtype == back.tensors[0].dtype
@@ -778,7 +751,7 @@ def test_move_shard_small_and_scalar_tensors():
 def test_thin_volume_more_devices_than_slices():
     # The thin-volume extension (beyond mbirjax): more devices than slices is
     # a legal layout -- the extra devices carry views (the dominant compute
-    # and memory) while their all-padded slice shards stay exactly inert.
+    # and memory) while their slice shards hold no slices at all.
     # Seeded n=4 vcd vs n=1 on a 3-slice parallel cell and a 3-row cone cell.
     import mbirtorch
     sino_shape = (16, 3, 16)
@@ -804,7 +777,7 @@ def test_thin_volume_more_devices_than_slices():
 
     m2 = build()
     m2.configure_devices(devices=["cpu"] * 4)   # 4 devices, 3 slices
-    assert m2.recon_placement.padded_shard_ranges()[-1][2] == 0
+    assert [e - s for _d, (s, e) in m2.recon_placement.shard_ranges()][-1] == 0
     np.random.seed(61)
     out, _ = m2.recon(sino, weights=weights, max_iterations=3,
                       stop_threshold_change_pct=0.0)
@@ -835,7 +808,7 @@ def test_thin_volume_more_devices_than_slices():
     cref, _ = c1.recon(csino, max_iterations=2, stop_threshold_change_pct=0.0)
     c2 = cbuild()
     c2.configure_devices(devices=["cpu"] * 4)
-    assert c2.recon_placement.padded_shard_ranges()[-1][2] == 0
+    assert [e - s for _d, (s, e) in c2.recon_placement.shard_ranges()][-1] == 0
     np.random.seed(62)
     cout, _ = c2.recon(csino, max_iterations=2, stop_threshold_change_pct=0.0)
     crel = np.max(np.abs(cout - cref)) / max(np.max(np.abs(cref)), 1e-30)
@@ -846,9 +819,9 @@ def test_thin_volume_more_devices_than_slices():
 def test_sparse_view_more_devices_than_views():
     # The sparse-view extension: more devices than views is a legal layout --
     # the extra devices hold slice shards and run the prior and updates (the
-    # dominant work with few views) while their all-padded view shards stay
-    # exactly inert.  Seeded n=4 vcd vs n=1 on a 3-view parallel cell and a
-    # 3-view cone cell.
+    # dominant work with few views) while their view shards hold no views at
+    # all.  Seeded n=4 vcd vs n=1 on a 3-view parallel cell and a 3-view cone
+    # cell.
     import mbirtorch
     sino_shape = (3, 16, 16)
     angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
@@ -872,14 +845,14 @@ def test_sparse_view_more_devices_than_views():
 
     m2 = build()
     m2.configure_devices(devices=["cpu"] * 4)   # 4 devices, 3 views
-    assert m2.sino_placement.padded_shard_ranges()[-1][2] == 0
+    assert [e - s for _d, (s, e) in m2.sino_placement.shard_ranges()][-1] == 0
     np.random.seed(71)
     out, _ = m2.recon(sino, weights=weights, max_iterations=3,
                       stop_threshold_change_pct=0.0)
     rel = np.max(np.abs(out - ref)) / max(np.max(np.abs(ref)), 1e-30)
     print(f"sparse-view parallel n4 vs n1: rel {rel:.2e}")
     # Tolerance calibrated to THIS cell's inherent multi-device floor: with
-    # DIVIDING views (16) and no padding at all, the same cell reads
+    # DIVIDING views (16), the same cell reads
     # 1.8e-3 at n=2 and 1.9e-3 at n=4 (staged-halo staleness within a
     # partition pass plus cross-device float reorders -- the mbirjax
     # structure).  The sparse-view layout adds nothing beyond that floor.
@@ -907,7 +880,7 @@ def test_sparse_view_more_devices_than_views():
     cref, _ = c1.recon(csino, max_iterations=2, stop_threshold_change_pct=0.0)
     c2 = cbuild()
     c2.configure_devices(devices=["cpu"] * 4)
-    assert c2.sino_placement.padded_shard_ranges()[-1][2] == 0
+    assert [e - s for _d, (s, e) in c2.sino_placement.shard_ranges()][-1] == 0
     np.random.seed(72)
     cout, _ = c2.recon(csino, max_iterations=2, stop_threshold_change_pct=0.0)
     crel = np.max(np.abs(cout - cref)) / max(np.max(np.abs(cref)), 1e-30)
@@ -993,27 +966,25 @@ def test_column_gather_matches_single_device_at_every_batch(monkeypatch):
             assert rel < 1e-5, (n, batch, rel)
 
 
-def test_column_gather_holds_the_adjoint_and_the_padded_forms(monkeypatch):
+def test_column_gather_holds_the_adjoint_on_uneven_axes(monkeypatch):
     # The back driver is untouched, so the pair must stay adjoint with the
-    # gather on -- on a padded cell (9 views, 7 rows over 2 devices pads both
-    # axes), where the gathered cylinder carries the inert padded slice tail.
+    # gather on -- on a cell whose axes do not divide (9 views and 7 slices
+    # over 2 devices), where the shards differ in length.
     # The environment is cleared first, for the reason above.
     from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
     monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
     m, idx, vals, sino, ref_fwd, ref_back = _cone_column_case(
         ["cpu", "cpu"], cell=(9, 7, 8), pixel_batch=4)
-    assert m.recon_placement.is_padded and m.sino_placement.is_padded
     fwd = m.sparse_forward_project(vals, idx)
     back = m.sparse_back_project(sino, idx)
-    real = vals.shape[1]
     rel = (np.max(np.abs(m._gather_sinogram(fwd) - ref_fwd))
            / max(np.max(np.abs(ref_fwd)), 1e-30))
     assert rel < 1e-5, rel
-    rel_b = (np.max(np.abs(back.gather()[:, :real] - ref_back))
+    rel_b = (np.max(np.abs(back.gather() - ref_back))
              / max(np.max(np.abs(ref_back)), 1e-30))
     assert rel_b < 1e-5, rel_b
     lhs = float(np.sum(m._gather_sinogram(fwd) * sino))
-    rhs = float(np.sum(vals * back.gather()[:, :real]))
+    rhs = float(np.sum(vals * back.gather()))
     assert abs(lhs - rhs) / max(abs(rhs), 1e-30) < 1e-4, (lhs, rhs)
 
 
@@ -1021,7 +992,7 @@ def test_column_gather_replaces_the_band_broadcast(monkeypatch):
     # The mechanics witness.  With the gather on, the cone forward must call
     # gather_column_band and must NOT broadcast a band; each gather takes one
     # piece per slice-owner and yields a cylinder that is the batch wide and
-    # the WHOLE device-form slice axis tall; and each projector call runs at
+    # the WHOLE slice axis tall; and each projector call runs at
     # slice_start=0 over that whole axis for the owner's own views.  The
     # environment is cleared first, for the reason above.
     from mbirtorch import _sharding as sharding
@@ -1030,7 +1001,7 @@ def test_column_gather_replaces_the_band_broadcast(monkeypatch):
     batch, n = 4, 2
     m, idx, vals, _sino, _ref_fwd, _ref_back = _cone_column_case(
         ["cpu"] * n, pixel_batch=batch)
-    slices = m.recon_placement.padded_size
+    slices = m.recon_placement.real_size
     gathers, broadcasts, calls = [], [], []
     real_gather = sharding.gather_column_band
 
@@ -1067,15 +1038,14 @@ def test_column_gather_replaces_the_band_broadcast(monkeypatch):
         assert shape == (p1 - p0, slices)       # the batch, at every slice
         assert p1 - p0 <= batch
     # One projector call per (pixel batch, view-owner), each over the whole
-    # slice axis anchored at 0 and over that owner's own real views.
+    # slice axis anchored at 0 and over that owner's own views.
     assert len(calls) == n * expected_batches
     spans = [(v0, v1) for _, _, (v0, v1), _ in calls]
     for cyl_shape, n_pixels, (v0, v1), slice_start in calls:
         assert slice_start == 0 and cyl_shape[1] == slices
         assert n_pixels == cyl_shape[0] and v1 > v0
-    assert set(spans) == {
-        (v0, v0 + valid) for _d, (v0, _v1), valid
-        in m.sino_placement.padded_shard_ranges() if valid > 0}
+    assert set(spans) == {span for _d, span in m.sino_placement.shard_ranges()
+                          if span[1] > span[0]}
 
 
 def test_the_column_gather_runs_one_batch_ahead_of_the_projection(monkeypatch):
@@ -1410,17 +1380,15 @@ def test_parallel_column_gather_gathers_columns_and_sizes_its_rows_by_them(
     # The mechanics witness, plus the row-aligned fact the banded walk used to
     # supply by construction.  With the gather on, the parallel forward calls
     # gather_column_band and broadcasts no band; each cylinder is one pixel
-    # batch by the WHOLE device-form slice axis; each projector call runs at
+    # batch by the WHOLE slice axis; each projector call runs at
     # slice_start=0 over that whole axis for the owner's own views; and the
     # block that comes back is as TALL as the cylinder, because a row-aligned
-    # body sizes its output by the values it was handed.  That last one is why
-    # the assembled shard carries the device form's padded row count and not
-    # the real detector rows.
+    # body sizes its output by the values it was handed.
     from mbirtorch import _sharding as sharding
     batch, n = 4, 2
     m, idx, vals, _sino, _ref_fwd, _rb = _parallel_column_case(
         ["cpu"] * n, pixel_batch=batch)
-    slices = m.recon_placement.padded_size
+    slices = m.recon_placement.real_size
     channels = int(m.get_params('sinogram_shape')[2])
     gathers, calls = [], []
     real_gather = sharding.gather_column_band
@@ -1461,48 +1429,39 @@ def test_parallel_column_gather_gathers_columns_and_sizes_its_rows_by_them(
         assert slice_start == 0 and cyl_shape[1] == slices
         assert block_shape == (v1 - v0, slices, channels)
     assert set((v0, v1) for _c, (v0, v1), _s, _b in calls) == {
-        (v0, v0 + valid) for _d, (v0, _v1), valid
-        in m.sino_placement.padded_shard_ranges() if valid > 0}
+        span for _d, span in m.sino_placement.shard_ranges()
+        if span[1] > span[0]}
     # And the shard the driver assembles carries those same rows.
     assert all(tuple(t.shape[1:]) == (slices, channels) for t in fwd.tensors)
 
 
-def test_parallel_column_gather_holds_the_padded_and_sparse_view_forms(
+def test_parallel_column_gather_holds_the_uneven_and_sparse_view_forms(
         monkeypatch):
     # The environment is cleared first, for the reason above.
     from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
     monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
-    # The two forms where a row-aligned geometry's DEVICE shape differs from
-    # its problem shape.  A padded slice axis pads the sinogram's detector
-    # rows with it, so every block this driver assembles -- including the
-    # empty one it builds for a view-owner with no real views -- has to be the
-    # padded row count.  Sized at the real detector rows instead, which is the
-    # count a row-RANGE geometry's blocks carry, the shards do not concatenate
-    # at all.
-    for shape, devs in (((9, 7, 8), 2),        # both axes padded
-                        ((3, 7, 8), 4)):       # padded rows, an empty owner
+    # Two layouts a row-aligned geometry has to assemble correctly: one whose
+    # axes do not divide the device count, and one with more devices than
+    # views.  Every block this driver assembles -- including the empty one it
+    # builds for a view-owner with no views -- has to carry the detector row
+    # count, or the shards do not concatenate at all.
+    for shape, devs in (((9, 7, 8), 2),        # neither axis divides
+                        ((3, 7, 8), 4)):       # an owner with no views
         m, idx, vals, sino, ref_fwd, ref_back = _parallel_column_case(
             ["cpu"] * devs, sino_shape=shape, pixel_batch=10 ** 6)
-        assert m.recon_placement.is_padded and m.sino_placement.is_padded
         real_rows = shape[1]
         fwd = m.sparse_forward_project(vals, idx)
-        assert all(t.shape[1] == m.recon_placement.padded_size
-                   for t in fwd.tensors), shape
-        # The padded row tail stays identically zero, as the entry fill left
-        # it: the gathered cylinder's padded slice tail is zero, and a
-        # row-aligned body maps those columns straight to those rows.
-        assert max(float(t[:, real_rows:].abs().max()) for t in fwd.tensors) \
-            == 0.0, shape
+        assert all(t.shape[1] == real_rows for t in fwd.tensors), shape
         rel = (np.max(np.abs(m._gather_sinogram(fwd) - ref_fwd))
                / max(np.max(np.abs(ref_fwd)), 1e-30))
         assert rel < 1e-5, (shape, rel)
         # The back driver is untouched, so the pair stays adjoint.
         back = m.sparse_back_project(sino, idx)
-        rel_b = (np.max(np.abs(back.gather()[:, :vals.shape[1]] - ref_back))
+        rel_b = (np.max(np.abs(back.gather() - ref_back))
                  / max(np.max(np.abs(ref_back)), 1e-30))
         assert rel_b < 1e-5, (shape, rel_b)
         lhs = float(np.sum(m._gather_sinogram(fwd) * sino))
-        rhs = float(np.sum(vals * back.gather()[:, :vals.shape[1]]))
+        rhs = float(np.sum(vals * back.gather()))
         assert abs(lhs - rhs) / max(abs(rhs), 1e-30) < 1e-4, (shape, lhs, rhs)
 
 
@@ -1591,12 +1550,11 @@ def test_column_gather_batch_accumulation_matches_the_shape_it_replaces(
                         prior = np.asarray(m._gather_sinogram(
                             m.sparse_forward_project(vals, idx)))
                     assert np.array_equal(fused, prior), (name, n, batch)
-                    # Every view-owner with real views accumulates on all but
-                    # its first batch, so the new arm ran once per (owner,
+                    # Every view-owner that holds views accumulates on all
+                    # but its first batch, so the new arm ran once per (owner,
                     # batch) less one batch per owner.
-                    owners = sum(1 for _d, (_v0, _v1), valid
-                                 in m.sino_placement.padded_shard_ranges()
-                                 if valid > 0)
+                    owners = sum(1 for _d, (v0, v1)
+                                 in m.sino_placement.shard_ranges() if v1 > v0)
                     assert len(accumulating) == owners * (batches - 1), (
                         name, n, batch, len(accumulating), owners, batches)
 

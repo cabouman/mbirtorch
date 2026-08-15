@@ -46,9 +46,10 @@ usually needs only:
   the sinogram's row axis and the bodies can assert the seam defaults.  A geometry
   where one slice spreads over a range of detector rows (cone beam) must honor
   ``slice_start`` and ``band_slices`` explicitly.
-* **Inert padding** -- any per-slice or per-view operation must be written against the
-  device-form (padded) length, not the real count.  This is the one subtlety that must
-  be correct for sharding.
+* **Uneven shards** -- a device count need not divide the sharded axis, so any
+  per-slice or per-view operation must be written against the length of the block it
+  is handed, and must accept a block of length zero.  This is the one subtlety that
+  must be correct for sharding.
 
 :class:`~mbirtorch.ParallelBeamModel` (row-aligned) and :class:`~mbirtorch.ConeBeamModel`
 (banded, with ``slice_start`` honored throughout) are the two worked examples to study.

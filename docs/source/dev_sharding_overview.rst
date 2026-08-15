@@ -12,11 +12,11 @@ control it), see :doc:`usr_multi_gpu`.
 
 **Scope.**  Sharding runs within a single process across the chosen devices
 (multiple GPUs, or CPU devices).  It works for all of the library's
-geometries: parallel-beam, cone-beam, translation, and multi-axis parallel.  A key invariant is that **the padding never changes the result**:
-when a count does not divide evenly the data is zero-padded to equal shares and
-the padding is kept exactly inert.  Results can still differ slightly with the
-device count, and the difference decays as iterations proceed.  Multi-node
-execution is out of scope.
+geometries: parallel-beam, cone-beam, translation, and multi-axis parallel.  A
+device count need not divide the axis it splits: the blocks then differ in
+length by at most one, and no data is padded.  Results can still differ slightly
+with the device count, and the difference decays as iterations proceed.
+Multi-node execution is out of scope.
 As in MBIRJAX, the device layout is chosen automatically -- on CUDA with two or
 more visible devices, a reconstruction spreads across the devices that can hold
 their share.  :meth:`~mbirtorch.TomographyModel.configure_devices` is the
@@ -59,8 +59,9 @@ Device layout is described by a single object, ``Placement`` (in
 
 * the list of ``devices``;
 * which array ``axis`` is sharded;
-* the ``real_size`` of that axis and the ``padded_size`` (rounded up to a
-  multiple of the device count).
+* the ``real_size`` of that axis, which ``shard_ranges`` splits into one
+  contiguous block per device.  The blocks differ in length by at most one, and
+  the longer blocks come first.
 
 A model carries two placements -- ``recon_placement`` (slice axis) and
 ``sino_placement`` (view axis) -- and these are the **single source of truth**
@@ -78,16 +79,14 @@ plain container instead: it holds the tensors, checks on construction that each
 shard really lives on its placement's device, and exposes ``gather()`` as the host
 exit.  The drivers and the VCD loop operate on the per-device tensors directly.
 
-Padding is **exactly inert** (entry zero-fill, projector output masks, and the
-prior-interface mask all keep it from affecting any result), which is what makes
-the output independent of the device count.
-
-One layout is refused: a device holding no real data on **either** axis, since it
-would do no work.  A device idle on only one axis is legal and useful, and this is
-a deliberate extension beyond MBIRJAX.  With fewer slices than devices the extra
-devices still project their views, which dominates there; with fewer views than
-devices they still hold slice shards and run the prior and updates, which dominate
-there (``_check_no_empty_shard`` in ``tomography_model.py``).
+One layout is refused: a device holding no data on **either** axis, since it
+would do no work.  That happens exactly when the device count exceeds both the
+view count and the slice count.  A device idle on only one axis is legal and
+useful, and this is a deliberate extension beyond MBIRJAX.  With fewer slices
+than devices the extra devices still project their views, which dominates there;
+with fewer views than devices they still hold slice shards and run the prior and
+updates, which dominate there (``_check_no_empty_shard`` in
+``tomography_model.py``).
 
 
 Forward and back projection by bands
@@ -283,7 +282,7 @@ The correctness gates for the sharding invariants are in ``tests/test_sharding.p
 (23 tests).  The strongest of them compare against a single-device reference:
 the banded projectors, the cone FDK, and the full VCD reconstruction must each
 match the single-device result, and must still match when the axes do not divide
-evenly and padding is present.  The adjoint property is checked directly on the
+evenly and the shards differ in length.  The adjoint property is checked directly on the
 banded pair, the halo exchange is checked against a full-volume prior, and the
 awkward layouts (more devices than slices, more devices than views, a fully idle
 device) each have their own test.

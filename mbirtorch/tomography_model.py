@@ -141,7 +141,6 @@ class TomographyModel(ParameterHandler):
         # initialize_recon once.
         self.prox_data = None
         # Device-layout caches (see _invalidate_device_caches).
-        self._qggmrf_interface_masks_cache = None
         self._dc_damping_cache = None
         self.dev2dev_safe = True     # probed for real in configure_devices
         # False once configure_devices is called: an explicit layout is the
@@ -637,20 +636,20 @@ class TomographyModel(ParameterHandler):
 
     def _banded_setup(self, pixel_indices):
         """Shared setup for the banded sharded projectors: per-owner view
-        spans (real views only -- a padded view has no angle), recon band
-        ranges, and the pixel indices placed once per device."""
+        spans, recon band ranges, and the pixel indices placed once per
+        device."""
         sp, rp = self.sino_placement, self.recon_placement
         if type(self)._view_batch_bodies is TomographyModel._view_batch_bodies:
             raise NotImplementedError(
                 f'{type(self).__name__} has no per-view-batch projection '
                 'bodies, so the banded multi-device drivers cannot run.')
-        # (start, start + n_valid) real-view spans plus each owner's full
-        # (padded) block length, in device order; band_ranges carry each
-        # slice-owner's real count so the drivers can skip all-padding bands
-        # (an owner may own NO real slices -- the thin-volume extension).
-        view_spans = [(v0, v0 + n_valid, v1 - v0)
-                      for _, (v0, v1), n_valid in sp.padded_shard_ranges()]
-        band_ranges = rp.padded_shard_ranges()
+        # Half-open (start, end) view spans and slice-band ranges, in device
+        # order.  A span can be empty: with more devices than views, or more
+        # devices than slices, the trailing devices own nothing on that axis
+        # (the sparse-view and thin-volume extensions), and the drivers below
+        # check for that.
+        view_spans = [span for _d, span in sp.shard_ranges()]
+        band_ranges = rp.shard_ranges()
         idx_per_dev = [torch.as_tensor(pixel_indices, dtype=torch.int64).to(d)
                        for d in sp.devices]
         return sp, rp, view_spans, band_ranges, idx_per_dev
@@ -660,8 +659,7 @@ class TomographyModel(ParameterHandler):
         order, broadcast each band to every view-owner, forward-project each
         owner's OWN views (one producer per detector row -- no reduce), and
         concatenate the row-bands into per-view-owner sinogram shards.  A
-        trivial placement is the plain driver, wrapped.  Padded views are
-        never projected; their tails are zero-filled after assembly."""
+        trivial placement is the plain driver, wrapped."""
         if voxel_shards.placement.is_trivial:
             return _sharding.Shards(
                 [self.projector_functions._sparse_forward_project_single_device(
@@ -680,30 +678,18 @@ class TomographyModel(ParameterHandler):
         num_pixels = int(idx_per[0].shape[0])
         fixed_band = getattr(self, 'forward_project_slice_band', None)
         # Bands go only to view-owners that project something: an owner with
-        # no real views (the sparse-view extension) receives no copies and
+        # no views (the sparse-view extension) receives no copies and
         # produces empty row-bands, so its block assembles as pure zeros.
         proj_devs = [d for i, d in enumerate(sp.devices)
                      if view_spans[i][1] > view_spans[i][0]]
         with self._band_pool(sp.n_devices) as pool:
-            for oi, (odev, (s0, s1), band_valid) in enumerate(band_ranges):  # oi = owner index, odev = owner device
+            for oi, (odev, (s0, s1)) in enumerate(band_ranges):  # oi = owner index, odev = owner device
                 # Stream the owner's shard in sub-bands: each broadcast copy
-                # and per-band transient is band-sized, not shard-sized.
+                # and per-band transient is band-sized, not shard-sized.  An
+                # owner with no slices yields no sub-bands at all.
                 band_len = self._slice_band_length(
                     s1 - s0, sp.n_devices, num_pixels, fixed_band)
                 for (l0, l1) in self._balanced_slice_bounds(s1 - s0, band_len):
-                    if l0 >= band_valid:
-                        # An all-padding sub-band (zero voxels) contributes
-                        # nothing: skip the broadcast and the projector call.
-                        # The aligned form still owes its detector rows --
-                        # append them as zeros so the row tiling stays exact.
-                        if aligned:
-                            for i in range(sp.n_devices):
-                                nv = view_spans[i][1] - view_spans[i][0]
-                                view_bands[i].append(torch.zeros(
-                                    (nv, l1 - l0, num_channels),
-                                    dtype=voxel_shards.dtype,
-                                    device=sp.devices[i]))
-                        continue
                     band = voxel_shards.tensors[oi][:, l0:l1]
                     copies = _sharding.broadcast_band_to_views(
                         band, proj_devs, self.dev2dev_safe)
@@ -716,7 +702,7 @@ class TomographyModel(ParameterHandler):
                             sp.devices,
                             lambda i, d: (
                                 pf.sparse_forward_project_view_range(
-                                    copies[d], idx_per[i], view_spans[i][:2],
+                                    copies[d], idx_per[i], view_spans[i],
                                     dev_index=i)
                                 if view_spans[i][1] > view_spans[i][0] else
                                 torch.zeros((0, l1 - l0, num_channels),
@@ -733,7 +719,7 @@ class TomographyModel(ParameterHandler):
                             sp.devices,
                             lambda i, d: (
                                 pf.sparse_forward_project_view_range(
-                                    copies[d], idx_per[i], view_spans[i][:2],
+                                    copies[d], idx_per[i], view_spans[i],
                                     slice_start=s0 + l0, dev_index=i)
                                 if view_spans[i][1] > view_spans[i][0] else
                                 torch.zeros((0, num_rows, num_channels),
@@ -755,14 +741,6 @@ class TomographyModel(ParameterHandler):
                        for b in view_bands]
         else:
             tensors = partial_shards
-        if sp.is_padded:
-            # Zero-fill each owner's padded view tail up to its block length
-            # (built on the owner device; only the last owner has a tail).
-            tensors = [
-                t if t.shape[0] == block else torch.cat(
-                    [t, torch.zeros((block - t.shape[0],) + tuple(t.shape[1:]),
-                                    dtype=t.dtype, device=t.device)])
-                for t, (_v0, _v1, block) in zip(tensors, view_spans)]
         return _sharding.Shards(tensors, sp)
 
     def _sparse_forward_project_columns(self, voxel_shards, pixel_indices):
@@ -783,9 +761,9 @@ class TomographyModel(ParameterHandler):
         pf = self.projector_functions
         num_channels = int(self.get_params('sinogram_shape')[2])
         # Block height per call.  A row-aligned body sizes its output by the
-        # gathered cylinder (the padded device-form slice axis); a two-fan
-        # body returns the real detector rows.
-        num_rows = (int(rp.padded_size) if self.rows_track_slices
+        # gathered cylinder, which spans the whole slice axis; a two-fan body
+        # returns the detector rows.
+        num_rows = (int(rp.real_size) if self.rows_track_slices
                     else int(self.get_params('sinogram_shape')[1]))
         num_pixels = int(idx_per[0].shape[0])
         shards = voxel_shards.tensors        # in device = global slice order
@@ -794,9 +772,9 @@ class TomographyModel(ParameterHandler):
                         for p0 in range(0, num_pixels, pixel_batch)]
 
         def worker(i, dev):
-            v0, v1, _block = view_spans[i]
+            v0, v1 = view_spans[i]
             if v1 <= v0:
-                # A view-owner with no real views (the sparse-view extension)
+                # A view-owner with no views (the sparse-view extension)
                 # produces an empty block, which assembles as pure zeros.
                 return torch.zeros((0, num_rows, num_channels),
                                    dtype=voxel_shards.dtype, device=dev)
@@ -861,14 +839,6 @@ class TomographyModel(ParameterHandler):
             # are still in flight, and the shards they read must not be
             # overwritten under them.
             _sharding.close_copy_streams(gather_devices)
-        if sp.is_padded:
-            # The banded form's own tail fill: zero-fill each owner's padded
-            # view tail up to its block length.
-            tensors = [
-                t if t.shape[0] == block else torch.cat(
-                    [t, torch.zeros((block - t.shape[0],) + tuple(t.shape[1:]),
-                                    dtype=t.dtype, device=t.device)])
-                for t, (_v0, _v1, block) in zip(tensors, view_spans)]
         return _sharding.Shards(tensors, sp)
 
     def _sparse_back_project_sharded(self, sino_shards, pixel_indices,
@@ -876,9 +846,7 @@ class TomographyModel(ParameterHandler):
         """The banded sharded back (the forward's adjoint): every view-owner
         back-projects its views onto each slice band (a PARTIAL (P, L) each),
         and the partials sum onto the band's slice-owner.  A trivial
-        placement is the plain driver, wrapped.  Only real views are
-        projected, and the padded slice tail is re-zeroed after the reduce
-        (a gather DOES land real data in padded positions)."""
+        placement is the plain driver, wrapped."""
         if sino_shards.placement.is_trivial:
             return _sharding.Shards(
                 [self.projector_functions._sparse_back_project_single_device(
@@ -892,22 +860,15 @@ class TomographyModel(ParameterHandler):
         num_pixels = int(idx_per[0].shape[0])
         fixed_band = getattr(self, 'back_project_slice_band', None)
         with self._band_pool(sp.n_devices) as pool:
-            for oi, (odev, (s0, s1), band_valid) in enumerate(band_ranges):
+            for oi, (odev, (s0, s1)) in enumerate(band_ranges):
                 # Stream the owner's band in sub-bands: each view-owner
-                # partial and the owner's reduce gather are band-sized.
+                # partial and the owner's reduce gather are band-sized.  An
+                # owner with no slices yields no sub-bands at all.
                 band_len = self._slice_band_length(
                     s1 - s0, sp.n_devices, num_pixels, fixed_band)
                 owner_parts = []
                 for (l0, l1) in self._balanced_slice_bounds(s1 - s0, band_len):
-                    if l0 >= band_valid:
-                        # All-padding sub-band: its result is forced to zero
-                        # after the reduce anyway, so produce the zeros
-                        # directly on the owner and skip the projector pass.
-                        owner_parts.append(torch.zeros(
-                            (num_pixels, l1 - l0),
-                            dtype=sino_shards.dtype, device=odev))
-                        continue
-                    # A view-owner with no real views (sparse-view extension)
+                    # A view-owner with no views (sparse-view extension)
                     # contributes nothing: skip its projector call and drop
                     # it from the band reduce.
                     if aligned:
@@ -916,9 +877,8 @@ class TomographyModel(ParameterHandler):
                             lambda i, d: (
                                 pf.sparse_back_project_view_range(
                                     sino_shards.tensors[i][
-                                        :view_spans[i][1] - view_spans[i][0],
-                                        s0 + l0:s0 + l1, :],
-                                    idx_per[i], view_spans[i][:2],
+                                        :, s0 + l0:s0 + l1, :],
+                                    idx_per[i], view_spans[i],
                                     coeff_power=coeff_power, dev_index=i)
                                 if view_spans[i][1] > view_spans[i][0]
                                 else None),
@@ -928,9 +888,8 @@ class TomographyModel(ParameterHandler):
                             sp.devices,
                             lambda i, d: (
                                 pf.sparse_back_project_view_range(
-                                    sino_shards.tensors[i][
-                                        :view_spans[i][1] - view_spans[i][0]],
-                                    idx_per[i], view_spans[i][:2],
+                                    sino_shards.tensors[i],
+                                    idx_per[i], view_spans[i],
                                     slice_start=s0 + l0, band_slices=l1 - l0,
                                     coeff_power=coeff_power, dev_index=i)
                                 if view_spans[i][1] > view_spans[i][0]
@@ -952,11 +911,6 @@ class TomographyModel(ParameterHandler):
                 else:
                     recon_tensors.append(owner_parts[0] if len(owner_parts) == 1
                                          else torch.cat(owner_parts, dim=1))
-        if rp.is_padded:
-            for oi, (_dev, (s0, s1), n_valid) in enumerate(
-                    rp.padded_shard_ranges()):
-                if n_valid < s1 - s0:
-                    recon_tensors[oi][:, n_valid:] = 0
         return _sharding.Shards(recon_tensors, rp)
 
     def _full_indices(self):
@@ -1019,55 +973,29 @@ class TomographyModel(ParameterHandler):
 
     def _check_no_empty_shard(self):
         """Refuse a device layout that would leave a device idle on BOTH
-        axes.  A device that is all-padding on ONE axis is legal: thin
-        volumes and sparse views still give it work, and the padding
-        invariants keep the empty axis inert.  A device that is all-padding
-        on both axes would do nothing, so that layout is refused."""
+        axes.  A device with views but no slices, or slices but no views, is
+        legal: sparse views and thin volumes still give it work.  A device
+        with neither would do nothing, so that layout is refused.
+
+        A device owns nothing on an axis only when the device count exceeds
+        that axis length, so the rule is exactly a device count above both
+        the view count and the slice count."""
         sp, rp = self.sino_placement, self.recon_placement
-        if sp.padded_size is None or rp.padded_size is None:
+        if sp.real_size is None or rp.real_size is None:
             return
-        sino_valid = [n for _, _, n in sp.padded_shard_ranges()]
-        recon_valid = [n for _, _, n in rp.padded_shard_ranges()]
-        for i, (sv, rv) in enumerate(zip(sino_valid, recon_valid)):
-            if sv <= 0 and rv <= 0:
-                raise ValueError(
-                    f'{sp.n_devices} devices would leave device {i} with no '
-                    f'real views AND no real slices ({sp.real_size} views, '
-                    f'{rp.real_size} slices); use at most '
-                    f'{max(sp.real_size, rp.real_size)} devices for this '
-                    f'geometry.')
+        if sp.n_devices > sp.real_size and sp.n_devices > rp.real_size:
+            raise ValueError(
+                f'{sp.n_devices} devices would leave at least one device with '
+                f'no views AND no slices ({sp.real_size} views, '
+                f'{rp.real_size} slices); use at most '
+                f'{max(sp.real_size, rp.real_size)} devices for this '
+                f'geometry.')
 
     def _invalidate_device_caches(self):
         """Drop every cache keyed to the device layout or geometry, so no
         consumer can bind stale device-resident state."""
         self.prox_data = None
-        self._qggmrf_interface_masks_cache = None
         self._dc_damping_cache = None
-
-    def _qggmrf_interface_masks(self):
-        """Per-device qGGMRF interface masks for a padded slice axis, or None.
-
-        Interface j of a shard starting at global slice g0 is valid iff
-        ``g0 + j < num_real_slices``; masking reproduces the reflected
-        boundary at the last REAL slice even mid-shard.  Built once and
-        cached: per-subset builds would re-pay a host->device transfer
-        thousands of times.
-
-        Returns:
-            list ((local_slices+1,) float32 tensor per device), or None.
-        """
-        if not self.recon_placement.is_padded:
-            return None
-        if self._qggmrf_interface_masks_cache is None:
-            real = self.recon_placement.real_size
-            masks = []
-            for dev, (s0, s1), _n_valid in \
-                    self.recon_placement.padded_shard_ranges():
-                mask = ((s0 + np.arange(s1 - s0 + 1)) < real)
-                masks.append(torch.as_tensor(mask.astype(np.float32),
-                                             device=dev))
-            self._qggmrf_interface_masks_cache = masks
-        return self._qggmrf_interface_masks_cache
 
     # ── device configuration (the mbirjax configure_devices seam) ─────────────
     def configure_devices(self, num_devices=1, devices=None):
@@ -1370,18 +1298,12 @@ class TomographyModel(ParameterHandler):
         return []
 
     def _layout_is_valid(self, devices):
-        """Whether ``devices`` passes the empty-shard rules, without mutating
-        anything: the same predicate :meth:`_check_no_empty_shard` applies,
-        evaluated on candidate placements."""
+        """Whether ``devices`` passes the empty-shard rule, without mutating
+        anything: the same rule :meth:`_check_no_empty_shard` applies,
+        evaluated on a candidate device count."""
         sinogram_shape, recon_shape = self.get_params(['sinogram_shape',
                                                        'recon_shape'])
-        sino = _sharding.Placement(devices, axis=0,
-                                   real_size=int(sinogram_shape[0]))
-        recon = _sharding.Placement(devices, axis=-1,
-                                    real_size=int(recon_shape[2]))
-        return not any(sv <= 0 and rv <= 0 for sv, rv in zip(
-            [n for _d, _r, n in sino.padded_shard_ranges()],
-            [n for _d, _r, n in recon.padded_shard_ranges()]))
+        return len(devices) <= max(int(sinogram_shape[0]), int(recon_shape[2]))
 
     def _layout_capacity(self, devices, ledger, call_arrays):
         """Whether ``ledger``'s modeled peak fits ``devices``, and the rows to
@@ -1493,8 +1415,8 @@ class TomographyModel(ParameterHandler):
     # alone.
     def _shard_sinogram(self, sinogram):
         """Place a sinogram-like array (sinogram or weights) in its device
-        form: float32 on the model device, view axis checked, zero-padded
-        and view-sharded on a multi-device placement."""
+        form: float32 on the model device, view axis checked, and
+        view-sharded on a multi-device placement."""
         num_views = self.get_params('sinogram_shape')[0]
         if isinstance(sinogram, _sharding.Shards):
             if sinogram.placement is not self.sino_placement:
@@ -1510,8 +1432,7 @@ class TomographyModel(ParameterHandler):
                     f'{sinogram.shape[0]}, but the model expects {num_views} views.')
             return sinogram
         return self._split_to_shards(sinogram, self.sino_placement, num_views,
-                                     what='sinogram (view axis)',
-                                     row_pad=self._sino_row_padding())
+                                     what='sinogram (view axis)')
 
     # Whether detector row r ties to recon slice r 1:1 (parallel beam:
     # True).  False is the base so a geometry that forgets to declare
@@ -1533,29 +1454,13 @@ class TomographyModel(ParameterHandler):
     # permissive measured set.
     _floor_family = None
 
-    def _sino_row_padding(self):
-        """Detector-row padding spec for the sinogram device form, or None.
-
-        A geometry whose kernels tie rows to slices 1:1 must present the
-        same padded length on both axes, so the row axis pads with the
-        sharded slice axis (zero-filled, inert).
-
-        Returns:
-            (row_axis, real_rows, padded_rows) when active, else None.
-        """
-        if not (self.rows_track_slices and self.recon_placement.is_padded):
-            return None
-        real_rows = int(self.get_params('sinogram_shape')[1])
-        return 1, real_rows, self.recon_placement.padded_size
-
     def prepare_sino_for_devices(self, sinogram, weights=None):
         """Place a sinogram (and optionally weights) in the model's device
         form, once.
 
         The device form is the layout the reconstruction methods use
         internally: the sinogram is divided across the configured devices by
-        view, zero-padded when the view count does not divide the device
-        count.  The padding cannot affect the results.
+        view.
 
         Calling this is OPTIONAL: every reconstruction method applies the
         same placement automatically to a plain input.  Use it to pay the
@@ -1566,9 +1471,7 @@ class TomographyModel(ParameterHandler):
 
         Args:
             sinogram (numpy or tensor): sinogram in the model's sinogram_shape.
-            weights (numpy or tensor, optional): weights of the same shape;
-                the zero-filled padding makes padded entries weightless as
-                well.
+            weights (numpy or tensor, optional): weights of the same shape.
 
         Returns:
             The prepared sinogram, or a (sinogram, weights) tuple when weights
@@ -1600,91 +1503,37 @@ class TomographyModel(ParameterHandler):
         return self._split_to_shards(recon, self.recon_placement, num_slices,
                                      what='reconstruction (slice axis)')
 
-    def _split_to_shards(self, x, placement, real_size, what='array',
-                         row_pad=None):
+    def _split_to_shards(self, x, placement, real_size, what='array'):
         """Split an array into per-device shard tensors (the n>1 body of
         _shard_sinogram / _shard_recon): each device gets its contiguous
-        block of the sharded axis; a non-dividing axis zero-pads on the LAST
-        shard.  Accepts the real length (pads) or the already-padded
-        device-form length; a mixed shape is refused as stale.  Zero tails
-        are built ON the receiving device, never as a padded host copy.
-        ``row_pad`` = (row_axis, real_rows, padded_rows) serves the
-        rows-track-slices sinogram only; None everywhere else."""
+        block of the sharded axis.  The blocks differ in length by at most
+        one, and a device count above the axis length leaves the trailing
+        devices with empty blocks."""
         x = torch.as_tensor(x, dtype=torch.float32)
         axis = placement.axis % x.ndim
-        padded_size = (placement.padded_size if placement.padded_size
-                       is not None else real_size)
-        if row_pad is not None:
-            row_axis, real_rows, padded_rows = row_pad
-            row_axis %= x.ndim
-            rows_are_padded = x.shape[row_axis] == padded_rows
-            rows_are_real = x.shape[row_axis] == real_rows
-        else:
-            rows_are_padded = rows_are_real = True
-        if x.shape[axis] == padded_size and rows_are_padded:
-            # Already the device form (e.g. a prepare_sino_for_devices
-            # output): split the equal blocks, nothing further to pad.
-            tensors = []
-            for dev, (start, end) in placement.shard_ranges(padded_size):
-                idx = [slice(None)] * x.ndim
-                idx[axis] = slice(start, end)
-                tensors.append(x[tuple(idx)].to(dev))
-        else:
-            if x.shape[axis] != real_size or not rows_are_real:
-                raise ValueError(
-                    f'Cannot place the {what}: got shape {tuple(x.shape)}, '
-                    f'but the model expects size {real_size} on axis {axis} '
-                    f'(or the prepared device-form size {padded_size}).  If '
-                    'the device configuration changed since '
-                    'prepare_sino_for_devices, re-run it.')
-            tensors = []
-            for dev, (start, end), n_valid in placement.padded_shard_ranges():
-                parts = []
-                if n_valid > 0:
-                    idx = [slice(None)] * x.ndim
-                    idx[axis] = slice(start, start + n_valid)
-                    piece = x[tuple(idx)].to(dev)
-                    if row_pad is not None and padded_rows > real_rows:
-                        tail_shape = list(piece.shape)
-                        tail_shape[row_axis] = padded_rows - real_rows
-                        piece = torch.cat(
-                            [piece, torch.zeros(tail_shape, dtype=piece.dtype,
-                                                device=dev)], dim=row_axis)
-                    parts.append(piece)
-                if end - start > n_valid:
-                    pad_shape = list(x.shape)
-                    pad_shape[axis] = (end - start) - n_valid
-                    if row_pad is not None:
-                        pad_shape[row_axis] = padded_rows
-                    parts.append(torch.zeros(pad_shape, dtype=torch.float32,
-                                             device=dev))
-                tensors.append(parts[0] if len(parts) == 1
-                               else torch.cat(parts, dim=axis))
+        if x.shape[axis] != real_size:
+            raise ValueError(
+                f'Cannot place the {what}: got shape {tuple(x.shape)}, '
+                f'but the model expects size {real_size} on axis {axis}.')
+        tensors = []
+        for dev, (start, end) in placement.shard_ranges(real_size):
+            idx = [slice(None)] * x.ndim
+            idx[axis] = slice(start, end)
+            tensors.append(x[tuple(idx)].to(dev))
         return _sharding.Shards(tensors, placement)
 
     def _gather_sinogram(self, sinogram):
-        """Return a sinogram-like array as a host numpy array.  Shards are
-        concatenated on the view axis and any zero-filled padded views (and,
-        for parallel beam, padded detector rows) are CROPPED back to the real
-        counts, so padded entries never leak into user-facing arrays (the
-        mbirjax gather contract)."""
+        """Return a sinogram-like array as a host numpy array, with the
+        shards concatenated on the view axis."""
         if isinstance(sinogram, _sharding.Shards):
             out = self._gather_shards(sinogram)
-            row_pad = self._sino_row_padding()
-            if row_pad is not None:
-                row_axis, real_rows, padded_rows = row_pad
-                row_axis %= out.ndim
-                if out.shape[row_axis] == padded_rows:
-                    idx = [slice(None)] * out.ndim
-                    idx[row_axis] = slice(0, real_rows)
-                    out = out[tuple(idx)]
         else:
             out = sinogram.detach().cpu().numpy()
         return out
 
     def _gather_recon(self, recon):
-        """Return a recon-like array as a host numpy array; the padded-slice
-        crop of :meth:`_gather_sinogram` applies on the slice axis."""
+        """Return a recon-like array as a host numpy array, with the shards
+        concatenated on the slice axis."""
         if isinstance(recon, _sharding.Shards):
             out = self._gather_shards(recon)
         else:
@@ -1700,13 +1549,10 @@ class TomographyModel(ParameterHandler):
             recon = torch.full(tuple(recon_shape), float(value),
                                dtype=torch.float32, device=self.torch_device)
         else:
-            tensors = []
-            for d, (s, e), n_valid in \
-                    self.recon_placement.padded_shard_ranges():
-                t = torch.zeros(tuple(recon_shape[:2]) + (e - s,),
-                                dtype=torch.float32, device=d)
-                t[..., :n_valid] = float(value)   # padded slices stay zero
-                tensors.append(t)
+            tensors = [
+                torch.full(tuple(recon_shape[:2]) + (e - s,), float(value),
+                           dtype=torch.float32, device=d)
+                for d, (s, e) in self.recon_placement.shard_ranges()]
             recon = _sharding.Shards(tensors, self.recon_placement)
         return recon
 
@@ -1763,8 +1609,11 @@ class TomographyModel(ParameterHandler):
         _shard_recon and made contiguous for the in-place row updates --
         for either state layout."""
         if isinstance(recon, _sharding.Shards):
+            # The row count is named rather than inferred: a shard that owns
+            # no slices has no elements, and reshape cannot infer a row count
+            # from an empty tensor whose column count is also zero.
             flat = _sharding.Shards(
-                [t.reshape((-1, t.shape[-1])).contiguous()
+                [t.reshape((math.prod(t.shape[:-1]), t.shape[-1])).contiguous()
                  for t in recon.tensors], recon.placement)
         else:
             flat = self._shard_recon(
@@ -1776,8 +1625,8 @@ class TomographyModel(ParameterHandler):
         state layout (read-only in the loop, so no contiguity forcing)."""
         if isinstance(fm_hessian, _sharding.Shards):
             flat = _sharding.Shards(
-                [t.reshape((-1, t.shape[-1])) for t in fm_hessian.tensors],
-                fm_hessian.placement)
+                [t.reshape((math.prod(t.shape[:-1]), t.shape[-1]))
+                 for t in fm_hessian.tensors], fm_hessian.placement)
         else:
             flat = fm_hessian.reshape((-1, fm_hessian.shape[-1]))
         return flat
@@ -1795,14 +1644,7 @@ class TomographyModel(ParameterHandler):
         return recon
 
     def _gather_shards(self, shards):
-        out = shards.gather()
-        p = shards.placement
-        if p.is_padded:
-            axis = p.axis % out.ndim
-            idx = [slice(None)] * out.ndim
-            idx[axis] = slice(0, p.real_size)
-            out = out[tuple(idx)]
-        return out
+        return shards.gather()
 
     def _as_shards(self, x, placement):
         """The uniform per-device container view of a device-form array: a
@@ -1826,31 +1668,18 @@ class TomographyModel(ParameterHandler):
         return out
 
     def _sino_ones_device_form(self, sino_like=None):
-        """All-ones sinogram in the device form, with padded entries ZERO --
-        a bare torch.ones would silently add padded mass to the
-        constant-weights Hessian.  ``sino_like`` supplies only the dtype."""
+        """All-ones sinogram in the device form, one block of ones per
+        device.  ``sino_like`` supplies only the dtype."""
         dtype = torch.float32 if sino_like is None else sino_like.dtype
         if self.sino_placement.is_trivial:
             return torch.ones(tuple(self.get_params('sinogram_shape')),
                               dtype=dtype, device=self.torch_device)
         shape = list(self.get_params('sinogram_shape'))
-        row_pad = self._sino_row_padding()
         tensors = []
-        for dev, (start, end), n_valid in \
-                self.sino_placement.padded_shard_ranges():
+        for dev, (start, end) in self.sino_placement.shard_ranges():
             local = list(shape)
             local[0] = end - start
-            if row_pad is not None:
-                row_axis, real_rows, padded_rows = row_pad
-                local[row_axis % len(local)] = padded_rows
-            t = torch.ones(local, dtype=dtype, device=dev)
-            if n_valid < end - start:
-                t[n_valid:] = 0
-            if row_pad is not None and padded_rows > real_rows:
-                idx = [slice(None)] * len(local)
-                idx[row_axis % len(local)] = slice(real_rows, None)
-                t[tuple(idx)] = 0
-            tensors.append(t)
+            tensors.append(torch.ones(local, dtype=dtype, device=dev))
         return _sharding.Shards(tensors, self.sino_placement)
 
     def forward_project(self, recon, output_sharded=False):
@@ -1874,8 +1703,12 @@ class TomographyModel(ParameterHandler):
         recon = self._shard_recon(recon)
         indices = self.full_indices_device()
         if isinstance(recon, _sharding.Shards):
+            # The row count is named rather than inferred: a shard that owns
+            # no slices has no elements, and reshape cannot infer a row count
+            # from an empty tensor whose column count is also zero.
+            num_pixels = int(recon_shape[0]) * int(recon_shape[1])
             flat = _sharding.Shards(
-                [t.reshape(-1, t.shape[-1])[indices.to(t.device)]
+                [t.reshape(num_pixels, t.shape[-1])[indices.to(t.device)]
                  for t in recon.tensors], recon.placement)
             sinogram = self.sparse_forward_project(flat, indices)
         else:
@@ -1943,8 +1776,8 @@ class TomographyModel(ParameterHandler):
         """
         sinogram_shape, recon_shape = self.get_params(['sinogram_shape', 'recon_shape'])
         if weights is None:
-            # Unit weights built through the device-form seam (ones in the
-            # real views/rows, zero in any inert padding), for either layout.
+            # Unit weights built through the device-form seam, for either
+            # layout.
             weights = self._sino_ones_device_form()
         elif (not isinstance(weights, _sharding.Shards)
               and tuple(weights.shape) != tuple(sinogram_shape)):
@@ -2391,8 +2224,6 @@ class TomographyModel(ParameterHandler):
         # None halo means the reflected boundary at a true volume edge,
         # which is every entry on a single device.
         halos = {'left': [None] * num_devices, 'right': [None] * num_devices}
-        # Interface masks keep a padded slice tail out of the prior.
-        interface_masks = self._qggmrf_interface_masks()
 
         def stage_halos(flat_shards):
             halos['left'], halos['right'] = _sharding.exchange_qggmrf_halos(
@@ -2420,9 +2251,7 @@ class TomographyModel(ParameterHandler):
                     grad, hess = qggmrf_grad_hess[i](
                         flat_recon.tensors[i], recon_shape, pixel_indices_per_device[i],
                         qggmrf_params, left_halo=halos['left'][i],
-                        right_halo=halos['right'][i],
-                        interface_mask=(None if interface_masks is None
-                                        else interface_masks[i]))
+                        right_halo=halos['right'][i])
                 else:
                     # Proximal map prior: pointwise, so the Hessian is a scalar.
                     grad = _qggmrf.prox_gradient_at_indices(
@@ -2741,8 +2570,6 @@ class TomographyModel(ParameterHandler):
         # fast path) skips the back projection; it is read-only in the loop.
         if fm_hessian is None:
             if constant_weights:
-                # The ones array is zero over any padding, so padding
-                # contributes nothing to the Hessian back projection.
                 hess_weights = self._sino_ones_device_form(error_sinogram)
             else:
                 hess_weights = weights
@@ -2802,9 +2629,9 @@ class TomographyModel(ParameterHandler):
                  delta_sumsq_partition) = self.vcd_partition_iterator(
                     vcd_subset_updater, flat_recon, error_sinogram, partition)
 
-                # real_sino_size == error_sinogram.numel() except under
-                # padding, where the padded entries are identically zero and
-                # must not dilute the RMSE.
+                # The element count is passed rather than read off the array:
+                # a sharded error sinogram is a list of per-device tensors, and
+                # the statistics normalize by the total.
                 fm_loss_i, recon_l1, es_rmse = self._iteration_stats(
                     error_sinogram, flat_recon, sigma_y, weights,
                     constant_weights, num_real_elements=loss_num_real,
@@ -2830,8 +2657,8 @@ class TomographyModel(ParameterHandler):
                             ['qggmrf_nbr_wts', 'sigma_x', 'p', 'q', 'T'])
                         b = _qggmrf.get_b_from_nbr_wts(qggmrf_nbr_wts)
                         qggmrf_params = (b, sigma_x, p, q, T)
-                        # Evaluate the prior loss on the REAL volume (padded
-                        # slices would add spurious boundary terms).
+                        # Evaluate the prior loss on the assembled volume, so
+                        # the inter-slice terms cross the shard boundaries.
                         real_recon_size = math.prod(recon_shape)
                         loss_recon = self._gather_recon(flat_recon).reshape(
                             tuple(recon_shape))

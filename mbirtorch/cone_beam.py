@@ -431,10 +431,9 @@ class ConeBeamModel(TomographyModel):
     def _dc_damping_slice_profile(self):
         """The per-slice damping vectors s_k, split per device, or None if
         disabled.  Circular: s_k from t_k = L |z_k| / (R dz); helical:
-        view-averaged.  The full profile is computed on the host, any padded
-        slice tail is filled with 1.0 (no damping -- inert, matching the
-        forced-zero padded slices), and each device gets its own slice band
-        plus its own compiled damping instance (per-device instances, like
+        view-averaged.  The full profile is computed on the host, and each
+        device gets its own slice band plus its own compiled damping instance
+        (per-device instances, like
         the subset updater's other compiled units).  Cached against the parameters
         and the device layout; _invalidate_device_caches drops it.
 
@@ -453,7 +452,7 @@ class ConeBeamModel(TomographyModel):
         rp = self.recon_placement
         key = (tuple(cfg), tuple(recon_shape), dv, slice_aspect, oz, R,
                float(z_shifts.min()), float(z_shifts.max()),
-               tuple(str(d) for d in rp.devices), rp.padded_size)
+               tuple(str(d) for d in rp.devices), rp.real_size)
         cache = getattr(self, '_dc_damping_cache', None)
         if cache is not None and cache[0] == key:
             return cache[1]
@@ -472,11 +471,11 @@ class ConeBeamModel(TomographyModel):
         else:
             t = L * np.abs(z[:, None] - z_shifts[None, :]) / (R * dz)
             s_prof = profile(t).mean(axis=1)
-        total = rp.padded_size if rp.padded_size is not None else nz
-        if total > nz:
-            s_prof = np.concatenate([s_prof, np.ones(total - nz)])
         profiles, fns = [], []
-        for i, (dev, (s0, s1)) in enumerate(rp.shard_ranges(total)):
+        # The slice count is passed explicitly: a single-device model that was
+        # never reconfigured carries no real_size on its placement, and DC
+        # damping runs on that path.
+        for i, (dev, (s0, s1)) in enumerate(rp.shard_ranges(nz)):
             profiles.append(torch.as_tensor(
                 s_prof[s0:s1].astype(np.float32), device=dev))
             fns.append(maybe_compile(_dc_damped_update_direction,
@@ -901,8 +900,7 @@ class ConeBeamModel(TomographyModel):
             weights = np.asarray(weights)
         if init_recon is not None and isinstance(init_recon, torch.Tensor):
             # Same host-side treatment as sino/weights: host slicing keeps only one half's arrays
-            # device-resident at a time, and _gather_recon crops any zero-padded slices of a
-            # device-form volume so the bottom-half slice picks up real slices, not padding.
+            # device-resident at a time.
             init_recon = self._gather_recon(init_recon)
 
         # Get parameters for later use

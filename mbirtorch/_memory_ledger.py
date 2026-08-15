@@ -214,9 +214,9 @@ class LedgerPlan:
     sinogram_shape: tuple                 # (V, R, C), the problem's shape
     recon_shape: tuple                    # (Rr, Rc, S), the problem's shape
     devices: list                         # one entry per device, in order
-    view_blocks: list                     # (padded_views, real_views) per device
-    slice_blocks: list                    # (padded_slices, real_slices) per device
-    sino_rows: int                        # the DEVICE-form detector row count
+    view_blocks: list                     # views held, per device
+    slice_blocks: list                    # slices held, per device
+    sino_rows: int                        # the detector row count
     rows_track_slices: bool
     # ── pixel counts ─────────────────────────────────────────────────────────
     num_pixels_full: int                  # the ROR-masked set
@@ -275,9 +275,9 @@ class LedgerPlan:
     def band_length(self, dev_index, direction):
         """The slice-band length one owner streams, matching
         ``TomographyModel._slice_band_length``: the whole shard by default."""
-        padded_slices = self.slice_blocks[dev_index][0]
+        local_slices = self.slice_blocks[dev_index]
         fixed = self.forward_band if direction == 'forward' else self.back_band
-        return min(int(fixed), padded_slices) if fixed else padded_slices
+        return min(int(fixed), local_slices) if fixed else local_slices
 
 
 def estimate_peak_device_bytes(plan):
@@ -301,19 +301,19 @@ def estimate_peak_device_bytes(plan):
     rows_recon, cols_recon = int(plan.recon_shape[0]), int(plan.recon_shape[1])
 
     def sino_dev(i):
-        return plan.view_blocks[i][0] * num_rows_dev * num_channels * _F32_BYTES
+        return plan.view_blocks[i] * num_rows_dev * num_channels * _F32_BYTES
 
     def recon_dev(i):
-        return rows_recon * cols_recon * plan.slice_blocks[i][0] * _F32_BYTES
+        return rows_recon * cols_recon * plan.slice_blocks[i] * _F32_BYTES
 
     def cyl(i, num_pixels):
-        return int(num_pixels) * plan.slice_blocks[i][0] * _F32_BYTES
+        return int(num_pixels) * plan.slice_blocks[i] * _F32_BYTES
 
     def is_view_owner(i):
-        return plan.view_blocks[i][1] > 0
+        return plan.view_blocks[i] > 0
 
     def is_slice_owner(i):
-        return plan.slice_blocks[i][1] > 0
+        return plan.slice_blocks[i] > 0
 
     def per_dev(fn):
         return [int(fn(i)) for i in range(n)]
@@ -328,9 +328,9 @@ def estimate_peak_device_bytes(plan):
 
     def column_gather_slices():
         """The slice extent one column-gather call is handed: the WHOLE
-        device-form slice axis, padded tail included, because the gathered
-        cylinder spans every slice-owner at once."""
-        return sum(int(block[0]) for block in plan.slice_blocks)
+        slice axis, because the gathered cylinder spans every slice-owner at
+        once."""
+        return sum(int(block) for block in plan.slice_blocks)
 
     def forward_call_pixels(num_pixels):
         """How many pixel columns ONE forward call is handed: every pixel of
@@ -429,7 +429,7 @@ def estimate_peak_device_bytes(plan):
         if n == 1 or not is_slice_owner(i):
             return 0
         band = plan.band_length(i, 'back')
-        shard = plan.slice_blocks[i][0]
+        shard = plan.slice_blocks[i]
         row_bytes = int(band) * _F32_BYTES
         slab_rows = _sharding.reduce_slab_rows(int(num_pixels), row_bytes)
         return (int(num_pixels) * (int(shard) + int(band)) * _F32_BYTES
@@ -438,12 +438,12 @@ def estimate_peak_device_bytes(plan):
     def back_view_batches(i, num_pixels):
         """How many batches one worker's view loop runs, or None when this
         plan prices no batch (a hand-built plan with no cost model)."""
-        real_views = plan.view_blocks[i][1]
-        if real_views <= 0 or plan.view_charge is None:
+        local_views = plan.view_blocks[i]
+        if local_views <= 0 or plan.view_charge is None:
             return None
         view_batch = int(plan.view_charge(
             'back', int(num_pixels), back_cols(i))[0])
-        return max(1, -(-int(real_views) // max(1, view_batch)))
+        return max(1, -(-int(local_views) // max(1, view_batch)))
 
     def back_fixed(i, num_pixels):
         """The back view loop's live cylinder-shards.
@@ -572,12 +572,12 @@ def estimate_peak_device_bytes(plan):
         this plan prices no batch (a hand-built plan with no cost model).
         The counterpart of ``back_view_batches`` above, using the forward's
         own cost model."""
-        real_views = plan.view_blocks[i][1]
-        if real_views <= 0 or plan.view_charge is None:
+        local_views = plan.view_blocks[i]
+        if local_views <= 0 or plan.view_charge is None:
             return None
         view_batch = int(plan.view_charge(
             'forward', forward_call_pixels(num_pixels), forward_cols(i))[0])
-        return max(1, -(-int(real_views) // max(1, view_batch)))
+        return max(1, -(-int(local_views) // max(1, view_batch)))
 
     def forward_block_rows(i):
         """The DETECTOR-ROW extent of one forward view block.
@@ -667,7 +667,7 @@ def estimate_peak_device_bytes(plan):
         The batch is a fixed row count, so this term does not fall with the
         device count.
         """
-        rows_in_shard = plan.view_blocks[i][0] * int(plan.sino_rows)
+        rows_in_shard = plan.view_blocks[i] * int(plan.sino_rows)
         batch = min(tomography_utils.ROW_FILTER_BATCH, rows_in_shard)
         # channels + (2 * channels - 1) taps - 1, the linear convolution
         # length apply_row_filter transforms at.
@@ -1060,18 +1060,12 @@ def plan_from_model(model, devices, workload='recon', partition_sequence=None,
                                          real_size=sinogram_shape[0])
     recon_placement = _sharding.Placement(devices, axis=-1,
                                           real_size=recon_shape[2])
-    view_blocks = [(end - start, n_valid)
-                   for _d, (start, end), n_valid
-                   in sino_placement.padded_shard_ranges()]
-    slice_blocks = [(end - start, n_valid)
-                    for _d, (start, end), n_valid
-                    in recon_placement.padded_shard_ranges()]
-    # A row-aligned geometry presents the same padded length on the detector
-    # row axis as on the sharded slice axis.
+    view_blocks = [end - start for _d, (start, end)
+                   in sino_placement.shard_ranges()]
+    slice_blocks = [end - start for _d, (start, end)
+                    in recon_placement.shard_ranges()]
     rows_track_slices = bool(getattr(model, 'rows_track_slices', False))
-    sino_rows = (recon_placement.padded_size
-                 if rows_track_slices and recon_placement.is_padded
-                 else sinogram_shape[1])
+    sino_rows = sinogram_shape[1]
 
     granularity = list(model.get_params('granularity'))
     if partition_sequence is None:

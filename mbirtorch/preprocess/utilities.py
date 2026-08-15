@@ -743,9 +743,9 @@ def apply_cylindrical_mask(recon, radial_margin=0, top_margin=0, bottom_margin=0
         radial_margin (int): Margin to subtract from the cylinder radius in pixels.
         top_margin (int): Number of top slices to set to zero along the Z-axis.
         bottom_margin (int): Number of bottom slices to set to zero along the Z-axis.
-        num_real_slices (int or None): Number of REAL slices when ``recon`` is a device-form volume whose
-            slice axis is zero-padded (see the recon placement).  The bottom margin is applied at the end
-            of the real slices, not the padded end.  None (default) means all slices are real.
+        num_real_slices (int or None): Slice index the bottom margin ends at, for a volume whose
+            last slices are to be left alone.  None (default) puts the bottom margin at the end of
+            the volume.
 
     Returns:
         np.ndarray or torch.Tensor: Masked 3D volume of the same shape and array module as `recon`.
@@ -763,8 +763,7 @@ def apply_cylindrical_mask(recon, radial_margin=0, top_margin=0, bottom_margin=0
         pl = recon.placement
         num_real = pl.real_size if num_real_slices is None else num_real_slices
         out = []
-        for t, (_dev, (s0, s1)) in zip(recon.tensors,
-                                       pl.shard_ranges(pl.padded_size)):
+        for t, (_dev, (s0, s1)) in zip(recon.tensors, pl.shard_ranges()):
             masked = apply_cylindrical_mask(t, radial_margin=radial_margin)
             lo = max(s0, 0)
             hi = min(s1, top_margin)
@@ -802,8 +801,8 @@ def apply_cylindrical_mask(recon, radial_margin=0, top_margin=0, bottom_margin=0
     recon = recon * circular_mask[:, :, None]
 
     # Zero top/bottom margins in place on that new array (no second full-volume copy -> 2x not 3x).
-    # The bottom margin ends at the REAL slice count: on a slice-padded device-form volume, [-b:] would
-    # zero the (already-zero) padding instead of the real bottom slices.
+    # The bottom margin ends at num_real_slices, so a caller that wants the last slices left alone
+    # can say where the margin belongs.
     num_real_slices = recon.shape[2] if num_real_slices is None else num_real_slices
     if top_margin > 0:
         recon[:, :, :top_margin] = 0

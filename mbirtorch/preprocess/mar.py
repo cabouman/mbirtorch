@@ -34,9 +34,12 @@ def _ps_sum(fn, *xs):
 
 
 def _ps_max(fn, x):
-    """float: fn (a scalar reduction) maximized across the pieces."""
+    """float: fn (a scalar reduction) maximized across the pieces.
+
+    A piece with no elements is skipped: a device may own no views, and a
+    reduction has no value to return there."""
     if isinstance(x, _sharding.Shards):
-        return max(float(fn(t)) for t in x.tensors)
+        return max(float(fn(t)) for t in x.tensors if t.numel() > 0)
     return float(fn(x))
 
 
@@ -51,7 +54,7 @@ def _ps_item(x, idx):
     """float: the value at a global (view, row, col) index."""
     if isinstance(x, _sharding.Shards):
         pl = x.placement
-        for t, (_d, (v0, v1)) in zip(x.tensors, pl.shard_ranges(pl.padded_size)):
+        for t, (_d, (v0, v1)) in zip(x.tensors, pl.shard_ranges()):
             if v0 <= idx[0] < v1:
                 return float(t[idx[0] - v0, idx[1], idx[2]])
         raise IndexError(f'view {idx[0]} outside the sharded axis')
@@ -66,26 +69,15 @@ def _ps_argmin3d(x):
         return _argmin_3d(x)
     pl = x.placement
     best_idx, best_val = None, None
-    for t, (_d, (v0, _v1)) in zip(x.tensors, pl.shard_ranges(pl.padded_size)):
+    for t, (_d, (v0, _v1)) in zip(x.tensors, pl.shard_ranges()):
+        if t.numel() == 0:
+            # A device may own no views, and an argmin has no answer there.
+            continue
         (v, r, c), val = _argmin_3d(t)
         if best_val is None or float(val) < best_val:
             best_idx, best_val = (v + v0, r, c), float(val)
     return best_idx, best_val
 
-
-def _ps_view_mask(mask, x):
-    """The (num_views, 1, 1) host view mask in x's form: sliced per piece onto
-    its device, or one tensor.  None passes through."""
-    if mask is None:
-        return None
-    mask = np.asarray(mask)
-    if isinstance(x, _sharding.Shards):
-        pl = x.placement
-        parts = [torch.as_tensor(mask[v0:v1], device=t.device)
-                 for t, (_d, (v0, v1)) in zip(x.tensors,
-                                              pl.shard_ranges(pl.padded_size))]
-        return _sharding.Shards(parts, pl)
-    return torch.as_tensor(mask, device=x.device)
 
 def gen_huber_weights(weights, sino_error, T=1.0, delta=1.0, epsilon=1e-6):
     """
@@ -251,12 +243,6 @@ def _est_plastic_metal_sinos_from_recon(recon, num_metal, ct_model,
     # 1+num_metal forward projections below consume the SAME device recon.
     recon = ct_model._shard_recon(recon)
 
-    # Slice-padding info: valid_mask (True on real slices; None when unpadded) and num_real_slices
-    # let the segmentation exclude any padded slices from its statistics and masks.
-    pl = ct_model.recon_placement
-    ndim = recon.tensors[0].ndim if isinstance(recon, _sharding.Shards) else recon.ndim
-    valid_mask = pl.real_mask(ndim)
-
     # --- Segment plastic and metal regions in the reconstruction ---
     # plastic_mask: Mask for plastic regions.
     # metal_masks: List of masks for each metal.
@@ -264,7 +250,7 @@ def _est_plastic_metal_sinos_from_recon(recon, num_metal, ct_model,
     # metal_scales: List of scaling factors for each metal region.
     plastic_mask, metal_masks, plastic_scale, metal_scales = mtp.segment_plastic_metal(
         recon, num_metal=num_metal, radial_margin=radial_margin, top_margin=top_margin,
-        bottom_margin=bottom_margin, valid_mask=valid_mask, num_real_slices=pl.real_size)
+        bottom_margin=bottom_margin)
 
     # --- Forward project and scale plastic ---
     # Keep the OUTPUT on-device (output_sharded=True): the whole correction below runs on these
@@ -370,7 +356,7 @@ def _argmin_3d(x):
 _METAL_SUPPORT_FLOOR = 1e-3
 
 
-def _find_most_violated_constraints(measured_sino, plastic_sino_est, metal_sino_est, theta, H_exponent_list, num_cross_terms, view_mask=None):
+def _find_most_violated_constraints(measured_sino, plastic_sino_est, metal_sino_est, theta, H_exponent_list, num_cross_terms):
     """
     Compute the most violated constraints for the beam hardening model.
 
@@ -379,9 +365,7 @@ def _find_most_violated_constraints(measured_sino, plastic_sino_est, metal_sino_
         2. Residual positivity:       y[i] − H_m[i,:] θ_m ≥ 0
 
     This function evaluates the indices and values of the entries that most violate
-    the constraints.  When the sinogram is zero-padded on the view axis, ``view_mask`` (1 on real
-    views, 0 on padded, broadcasting over the sinogram) excludes the padded views from the argmin so
-    a padded entry is never selected as a constraint.
+    the constraints.
 
     The residual argmin is further restricted to pixels where some metal estimate exceeds
     ``_METAL_SUPPORT_FLOOR``: where every metal estimate is (near) zero the row H_m[i,:] is (near)
@@ -419,19 +403,8 @@ def _find_most_violated_constraints(measured_sino, plastic_sino_est, metal_sino_
     Sp = _ps_map(build_sp, plastic_sino_est, *metal_sino_est)
     y_minus_Sm = _ps_map(build_y_minus_sm, measured_sino, plastic_sino_est, *metal_sino_est)
 
-    # Lower-bound violator: minimize Sp and y-Sm over the REAL views (padded views set to +inf so they
-    # can't win the argmin).
-    def mask_sp(sp, vm=None):
-        if vm is None:
-            return sp
-        inf = torch.tensor(float('inf'), dtype=sp.dtype, device=sp.device)
-        return torch.where(vm, sp, inf)
-
-    Sp_masked = Sp if view_mask is None else _ps_map(mask_sp, Sp, view_mask)
-
     # Residual argmin restricted to the metal support (see the docstring): pixels where every metal
     # estimate is <= the floor cannot be moved by theta, so they must never become constraints.
-    # Padded views have all-zero metal estimates, so this mask also excludes them.
     def mask_residual(ym, *ms):
         support = torch.zeros_like(ym, dtype=torch.bool)
         for metal in ms:
@@ -440,7 +413,7 @@ def _find_most_violated_constraints(measured_sino, plastic_sino_est, metal_sino_
         return torch.where(support, ym, inf)
 
     ymSm_masked = _ps_map(mask_residual, y_minus_Sm, *metal_sino_est)
-    idx_min_Sp, v_min_Sp = _ps_argmin3d(Sp_masked)
+    idx_min_Sp, v_min_Sp = _ps_argmin3d(Sp)
     idx_min_residual, v_min_residual = _ps_argmin3d(ymSm_masked)
 
     return idx_min_Sp, v_min_Sp, idx_min_residual, v_min_residual
@@ -545,7 +518,7 @@ def _compute_entry_for_OSQP(plastic_sino_est, metal_sino_est, measured_sino, H_e
 
     return P, q
 
-def _estimate_BH_model_params(plastic_sino_est, metal_sino_est, measured_sino, H_exponent_list, num_cross_terms, alpha, beta, num_constraint_update_iter=10, tolerance=-1e-5, view_mask=None):
+def _estimate_BH_model_params(plastic_sino_est, metal_sino_est, measured_sino, H_exponent_list, num_cross_terms, alpha, beta, num_constraint_update_iter=10, tolerance=-1e-5):
     """
     Estimate polynomial beam hardening model parameters with iterative constraints search.
 
@@ -598,7 +571,7 @@ def _estimate_BH_model_params(plastic_sino_est, metal_sino_est, measured_sino, H
 
     for iter in range(num_constraint_update_iter):
         # Find the (view, row, col) indices and values of the points that most violate each constraint
-        idx_min_Sp, v_min_Sp, idx_min_residual, v_min_residual = _find_most_violated_constraints(measured_sino, plastic_sino_est, metal_sino_est, theta, H_exponent_list, num_cross_terms, view_mask=view_mask)
+        idx_min_Sp, v_min_Sp, idx_min_residual, v_min_residual = _find_most_violated_constraints(measured_sino, plastic_sino_est, metal_sino_est, theta, H_exponent_list, num_cross_terms)
 
         # (1) Hp θp ≥ 0  ->  (-Hp) θ ≤ 0
         if v_min_Sp < tolerance and (idx_min_Sp not in C_p):
@@ -643,7 +616,7 @@ def _estimate_BH_model_params(plastic_sino_est, metal_sino_est, measured_sino, H
     return theta
 
 
-def _correct_plastic_sinogram(measured_sino, plastic_sino_est, metal_sino_est, theta, H_exponent_list, num_cross_terms, num_metal_terms, p_normalization, gamma, view_mask=None, num_real_pixels=None):
+def _correct_plastic_sinogram(measured_sino, plastic_sino_est, metal_sino_est, theta, H_exponent_list, num_cross_terms, num_metal_terms, p_normalization, gamma):
     """
     Perform beam hardening correction on the plastic sinogram.
 
@@ -660,8 +633,7 @@ def _correct_plastic_sinogram(measured_sino, plastic_sino_est, metal_sino_est, t
     The correction is applied as:
         corrected_plastic = p_normalization * max(y - H_metal·θ_m, 0) / (max(H_plastic·θ_p, γ * mean(H_plastic·θ_p))
     The stabilization term involving γ prevents division by near-zero or negative values, reducing streaks
-    and numerical instability.  (``view_mask`` / ``num_real_pixels`` restrict the mean to the real views
-    when the sinogram is zero-padded on the view axis.)
+    and numerical instability.
 
     Args:
         measured_sino (tensor): Measured sinogram.
@@ -701,27 +673,20 @@ def _correct_plastic_sinogram(measured_sino, plastic_sino_est, metal_sino_est, t
 
     # Central plastic coefficient, used to define a stabilization floor.  The MEAN (rather than the
     # median) is a cheap reduction; over the sinogram support the two are close, and this only sets a
-    # floor.  When the sinogram is zero-padded on the view axis, exclude the padded views via
-    # view_mask so they don't drag the mean toward 0.
+    # floor.
     #
     # The two forms below are NOT interchangeable, so the branch is on the form
     # of Sp rather than on convenience.  One tensor keeps the pre-sharding
-    # reduction exactly: torch.mean (or the masked float32 sum), a 0-d float32
-    # Sp_floor, and torch.maximum against it.  The float32-sum / float64-divide
-    # form exists only to combine per-piece partials that cannot be reduced in
-    # one kernel, so it is reserved for the sharded branch; using it on one
-    # device would move the divide to float64 and silently change a
-    # single-device result that this port promises to leave alone.
+    # reduction exactly: torch.mean, a 0-d float32 Sp_floor, and torch.maximum
+    # against it.  The float32-sum / float64-divide form exists only to combine
+    # per-piece partials that cannot be reduced in one kernel, so it is
+    # reserved for the sharded branch; using it on one device would move the
+    # divide to float64 and silently change a single-device result that this
+    # port promises to leave alone.
     if not isinstance(Sp, _sharding.Shards):
-        if view_mask is None:
-            mean_plastic_coef = torch.mean(Sp)
-        else:
-            mean_plastic_coef = torch.sum(Sp * view_mask) / float(num_real_pixels)
-    elif view_mask is None:
-        mean_plastic_coef = _ps_sum(torch.sum, Sp) / _ps_numel(Sp)
+        mean_plastic_coef = torch.mean(Sp)
     else:
-        mean_plastic_coef = (_ps_sum(lambda sp, vm: torch.sum(sp * vm), Sp, view_mask)
-                             / float(num_real_pixels))
+        mean_plastic_coef = _ps_sum(torch.sum, Sp) / _ps_numel(Sp)
     Sp_floor = gamma * mean_plastic_coef
 
     # A negative mean would be non-physical and may indicate instability in the algorithm
@@ -803,21 +768,11 @@ def correct_sino_plastic_metal(ct_model, measured_sino, recon, num_metal=1, orde
     # Put the measured sinogram in the model's device form.
     measured_sino = ct_model.prepare_sino_for_devices(measured_sino)
 
-    # Real-view mask (True on real views, False on padded; None when unpadded), plus the real pixel
-    # count -- used to exclude padded views from the statistical reductions (the Sp mean floor and the
-    # constraint argmins).  The mask takes the sinogram's form (per piece when sharded).
-    pl = ct_model.sino_placement
-    view_mask = _ps_view_mask(pl.real_mask(3), measured_sino)
-    if view_mask is None:
-        num_real_pixels = None
-    else:
-        num_real_pixels = pl.real_size * (_ps_numel(measured_sino) // pl.padded_size)
-
     # Get normalized sinogram p and [m_0, m_1, ...].
     plastic_sino_est, metal_sino_est = _est_plastic_metal_sinos_from_recon(
         recon, num_metal, ct_model, radial_margin=radial_margin, top_margin=top_margin,
         bottom_margin=bottom_margin)
-    plastic_sino_scale = _ps_max(lambda t: torch.max(torch.abs(t)), plastic_sino_est)   # max over padded 0s is unaffected
+    plastic_sino_scale = _ps_max(lambda t: torch.max(torch.abs(t)), plastic_sino_est)
     metal_sino_scale = [_ps_max(lambda t: torch.max(torch.abs(t)), arr) for arr in metal_sino_est]
     # An empty (all-zero) plastic or metal estimate would silently fill the normalized sinogram with
     # NaNs and fail far downstream.  Check the scales explicitly and fail fast with an actionable
@@ -836,12 +791,11 @@ def correct_sino_plastic_metal(ct_model, measured_sino, recon, num_metal=1, orde
                       for arr, norm in zip(metal_sino_est, metal_sino_scale)]
 
     # Estimate beam hardening model parameters theta
-    theta = _estimate_BH_model_params(plastic_sino_est, metal_sino_est, measured_sino, H_exponent_list, num_cross_terms, alpha, beta, num_constraint_update_iter, view_mask=view_mask)
+    theta = _estimate_BH_model_params(plastic_sino_est, metal_sino_est, measured_sino, H_exponent_list, num_cross_terms, alpha, beta, num_constraint_update_iter)
 
     # Compute the corrected plastic sinogram
     plastic_sino_corrected = _correct_plastic_sinogram(measured_sino, plastic_sino_est, metal_sino_est, theta, H_exponent_list,
-                                                       num_cross_terms, num_metal_terms, float(plastic_sino_scale), gamma,
-                                                       view_mask=view_mask, num_real_pixels=num_real_pixels)
+                                                       num_cross_terms, num_metal_terms, float(plastic_sino_scale), gamma)
 
     # Compute and apply the scaling of the corrected plastic sino
     plastic_sino_corrected_scale = _estimate_plastic_scaling(plastic_sino_est, metal_sino_est, measured_sino, plastic_sino_corrected)

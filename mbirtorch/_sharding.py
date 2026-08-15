@@ -50,15 +50,14 @@ class Placement:
     from each device to the contiguous block (shard) of the array it owns,
     determined by a sharded axis and a device list.
 
-    The placement also answers "what is on the devices?" for its sharded
-    axis: when ``real_size`` (the problem-owned axis length, from the model
-    params) is given and does not divide the device count, the DEVICE form of
-    the axis is the next multiple of the device count (``padded_size``), with
-    the tail zero-filled and kept exactly inert by the model (entry zero-fill
-    + masking).  Problem-owned shapes stay in the model params; the padded
-    device shape lives only here.  (Verbatim mbirjax semantics; the jax mesh
-    and NamedSharding serve its SPMD compiler and have no counterpart in this
-    explicit-placement design.)
+    The device form of the sharded axis is exactly as long as the problem's
+    own axis.  Each device owns one contiguous block, the block lengths
+    differ by at most one, and the longer blocks come first.  A device count
+    larger than the axis length leaves the trailing devices with empty
+    blocks.  (mbirjax pads the axis to a multiple of the device count,
+    because a jax NamedSharding partitions one global array and requires
+    equal blocks.  Here the device form is a list of per-device tensors, so
+    blocks of unequal length are allowed and no padding is needed.)
 
     Args:
         devices (sequence of torch.device or str): the devices this array
@@ -69,10 +68,8 @@ class Placement:
             where used).  Recon-like -> the slice axis (-1); sino-like -> the
             view axis (0).
         real_size (int or None): the problem-owned length of the sharded axis
-            (e.g. num_views for a sino placement).  When given,
-            ``padded_size`` is the device-form length (the smallest multiple
-            of the device count >= real_size); when None, padding is
-            unknown/unsupported and only the divisible case is valid.
+            (e.g. num_views for a sino placement).  When given, it is the
+            axis length :meth:`shard_ranges` splits by default.
     """
 
     def __init__(self, devices, axis, real_size=None):
@@ -81,11 +78,6 @@ class Placement:
             raise ValueError("Placement requires at least one device.")
         self.axis = axis
         self.real_size = int(real_size) if real_size is not None else None
-        if self.real_size is None:
-            self.padded_size = None
-        else:
-            n = len(self.devices)
-            self.padded_size = ((self.real_size + n - 1) // n) * n
 
     @property
     def n_devices(self):
@@ -96,64 +88,35 @@ class Placement:
         """True when this placement is a single device (1 shard)."""
         return len(self.devices) == 1
 
-    @property
-    def is_padded(self):
-        """True when the device form of the sharded axis is longer than the
-        problem's real axis (real_size does not divide the device count)."""
-        return self.padded_size is not None and self.padded_size > self.real_size
-
-    def real_mask(self, ndim):
-        """Broadcastable indicator of the REAL entries of a device-form array
-        under this placement.
-
-        Returns None when nothing is padded (the common case -- callers use
-        None as "no masking needed").  Otherwise returns a host NumPy boolean
-        array of rank ``ndim`` that is ``padded_size`` long on this
-        placement's shard axis and 1 elsewhere, True on the real entries and
-        False on the zero-filled padding, for excluding padding from
-        statistical reductions.
-        """
-        if not self.is_padded:
-            return None
-        mask_shape = [1] * ndim
-        mask_shape[self.axis % ndim] = self.padded_size
-        return (np.arange(self.padded_size) < self.real_size).reshape(mask_shape)
-
-    def shard_ranges(self, size):
+    def shard_ranges(self, size=None):
         """The half-open axis range each device owns when an axis of length
-        ``size`` is split into equal contiguous blocks (one per device).
+        ``size`` is split into contiguous blocks, one per device.
+
+        The block lengths differ by at most one, and the longer blocks come
+        first.  That is ``numpy.array_split``'s convention, which the index
+        arithmetic below uses directly, and it matches the convention the
+        slice bands already follow.  A size smaller than the device count
+        gives the trailing devices empty ranges.
 
         Args:
-            size (int): the length of the sharded axis to split.  Must be
-                divisible by the device count (the sharding contract).
+            size (int, optional): the length of the sharded axis to split.
+                Defaults to this placement's ``real_size``.
 
         Returns:
             list of (device, (start, end)): the half-open block owned by each
             device, in device order.
         """
-        n = len(self.devices)
-        if size % n != 0:
+        if size is None:
+            size = self.real_size
+        if size is None:
             raise ValueError(
-                f"Cannot evenly shard axis of size {size} across {n} devices.")
-        block = size // n
-        return [(self.devices[i], (i * block, (i + 1) * block)) for i in range(n)]
-
-    def padded_shard_ranges(self):
-        """``shard_ranges`` over the device-form (padded) axis length, plus
-        each shard's count of REAL (problem-owned) entries.
-
-        Returns:
-            list of (device, (start, end), n_valid): the half-open global
-            block each device owns on the padded axis, and how many of its
-            entries are real (the rest, ``end - start - n_valid``, are
-            zero-filled padding at the end of the axis).  Requires
-            ``real_size`` to have been given.
-        """
-        if self.padded_size is None:
-            raise ValueError("padded_shard_ranges requires real_size to be set.")
-        ranges = self.shard_ranges(self.padded_size)
-        return [(dev, (start, end), max(0, min(end, self.real_size) - start))
-                for dev, (start, end) in ranges]
+                'shard_ranges needs an axis length.  This placement was built '
+                'without real_size, so pass the length explicitly, as in '
+                'shard_ranges(num_slices).')
+        blocks = np.array_split(np.arange(int(size)), len(self.devices))
+        bounds = np.cumsum([0] + [len(b) for b in blocks])
+        return [(dev, (int(bounds[i]), int(bounds[i + 1])))
+                for i, dev in enumerate(self.devices)]
 
 
 class Shards:
@@ -164,8 +127,7 @@ class Shards:
     array.  It is
     a plain container -- no arithmetic; the drivers and the VCD loop operate on
     the per-device tensors directly.  ``gather()`` is the host exit
-    (:math:`\\to` numpy, concatenated on the sharded axis, padding NOT
-    cropped -- the model's _gather_sinogram / _gather_recon own the crop).
+    (:math:`\\to` numpy, concatenated on the sharded axis).
     """
 
     def __init__(self, tensors, placement):
@@ -378,13 +340,10 @@ def gather_column_band(shard_tensors, p0, p1, target, dev2dev_safe=True):
     performance reason instead: what it gets back is a full-width block of
     values, which is the width regime its kernel is efficient in.
 
-    The concatenation is in shard order, which is global slice order, and it
-    keeps the device form's padded slice tail rather than trimming it.  The
-    tail is held at zero by the model, a zero voxel contributes nothing
-    through a projection, and the geometry bodies anchor their z geometry on
-    the real slice count from the params rather than on the width of the
-    array they are handed -- so the tail is inert, and trimming it would only
-    force a non-contiguous copy inside the projector.
+    The concatenation is in shard order, which is global slice order, so the
+    assembled cylinder covers the whole slice axis exactly once.  The shards
+    may differ in length, and a shard that owns no slices contributes a
+    zero-width piece, which the concatenation accepts.
 
     This changes which device assembles which voxels, never which device
     produces which sinogram rows, so it has no adjoint of its own: the back

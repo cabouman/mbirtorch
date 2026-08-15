@@ -133,21 +133,10 @@ class ParameterHandler:
 
     def _device_report(self):
         """An 'N x PLATFORM (sharded)' summary of the recon devices, for the
-        recon log, noting any padding of the sharded axes.
-
-        Padding is invisible in the results (it is kept exactly inert), so the
-        log says so rather than leaving the device-form shapes a surprise.
-        """
+        recon log."""
         devices = self.recon_placement.devices
         platform = devices[0].type.upper()
         report = '{} x {} (sharded)'.format(len(devices), platform)
-        if self.sino_placement is not None and self.sino_placement.is_padded:
-            report += ' (views padded {}->{})'.format(
-                self.sino_placement.real_size, self.sino_placement.padded_size)
-        if self.recon_placement.is_padded:
-            report += ' (slices padded {}->{})'.format(
-                self.recon_placement.real_size,
-                self.recon_placement.padded_size)
         # Automatic selection that used fewer than the visible devices: say
         # which counts were turned down and why, so idle hardware is never
         # silent.  Only a layout the library chose can have a search to

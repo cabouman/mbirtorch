@@ -5,7 +5,6 @@ recon_dict, console silencing, and the merged logs of the composite runs
 
 import logging
 import os
-import re
 
 import numpy as np
 import pytest
@@ -113,7 +112,7 @@ def test_prox_map_loop_keeps_one_growing_log(tmp_path, small_parallel_case):
 
 def test_device_report_names_the_settled_layout():
     """The device line reports the layout the run actually uses, in the
-    'N x PLATFORM (sharded)' form, and says when an axis is padded."""
+    'N x PLATFORM (sharded)' form."""
     angles = np.linspace(0, np.pi, 8, endpoint=False)
     model = mbirtorch.ParallelBeamModel((8, 11, 16), angles)
     model.configure_devices(devices=['cpu', 'cpu'])
@@ -123,12 +122,10 @@ def test_device_report_names_the_settled_layout():
     sino = model.forward_project(phantom)
     _, recon_dict = model.recon(sino, max_iterations=1, logfile_path=None)
 
-    # 11 slices over 2 devices pads the slice axis to 12.  The pieces are
-    # asserted rather than the whole sentence, so rewording the line does not
-    # fail a test that is about what the line reports.
+    # The pieces are asserted rather than the whole sentence, so rewording the
+    # line does not fail a test that is about what the line reports.
     line = _device_line(recon_dict['recon_log'])
     assert '2 x CPU' in line
-    assert re.search(r'\b11\b.*\b12\b', line)
 
 
 def test_device_line_reflects_a_layout_chosen_during_the_run(monkeypatch):

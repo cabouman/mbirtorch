@@ -158,18 +158,11 @@ def makedirs(file_path):
 
 def _to_host(array):
     """Move a numpy array, torch tensor (any device), or sharded volume to a
-    host numpy array.  A sharded volume is concatenated on the host and any
-    zero-padding of its sharded axis is cropped, so the result equals the
-    single-device volume."""
+    host numpy array.  A sharded volume is concatenated on the host, so the
+    result equals the single-device volume."""
     if isinstance(array, _sharding.Shards):
         # gather() already returns numpy; do not convert it again.
-        out = array.gather()
-        pl = array.placement
-        if pl.real_size is not None and pl.padded_size > pl.real_size:
-            sel = [slice(None)] * out.ndim
-            sel[pl.axis % out.ndim] = slice(0, pl.real_size)
-            out = out[tuple(sel)]
-        return out
+        return array.gather()
     if hasattr(array, 'detach'):
         return array.detach().cpu().numpy()
     return np.asarray(array)
@@ -217,15 +210,13 @@ def load_data_hdf5(file_path):
 
 def _shard_axis_block(shards, i0, i1):
     """Host copy of the global range [i0, i1) of a sharded volume's SHARDED
-    axis (real coordinates; padding never included), all other axes full.
-    Only this block leaves the devices, so a caller that walks the axis in
-    slabs never holds the whole volume on the host.
+    axis, all other axes full.  Only this block leaves the devices, so a
+    caller that walks the axis in slabs never holds the whole volume on the
+    host.
 
     Shard extents are read off the TENSORS rather than the placement, and the
     dtype off an empty slice -- the rule :func:`_sharded_slab_source` uses --
-    so this holds whether or not ``real_size`` was supplied (a placement built
-    without it has ``padded_size is None``, which the placement-derived form
-    turns into a None-length axis).
+    so this holds whether or not ``real_size`` was supplied.
     """
     pl = shards.placement
     ndim = shards.tensors[0].ndim
@@ -341,12 +332,9 @@ def _sharded_slab_source(shards):
 
     - sharded on axis 0: the slab spans one or more shards' own ranges, so each
       contributing shard hands over just its overlap and they concatenate in
-      shard order -- the same order ``gather`` uses.  Padding rows sit past
-      ``real_size``, and the writer stops at ``out_shape[0]``, so they are never
-      requested.
-    - sharded on any other axis: every shard contributes rows ``[i0:i1]``, they
-      concatenate on the sharded axis, and the padding tail of that axis is
-      cropped per slab exactly as ``_to_host`` crops it once.
+      shard order -- the same order ``gather`` uses.
+    - sharded on any other axis: every shard contributes rows ``[i0:i1]``, and
+      they concatenate on the sharded axis.
     """
     pl = shards.placement
     ndim = shards.tensors[0].ndim
@@ -355,8 +343,7 @@ def _sharded_slab_source(shards):
     # placement, so this holds whether or not real_size was supplied.
     sizes = [int(t.shape[axis]) for t in shards.tensors]
     starts = np.cumsum([0] + sizes)
-    cropped = pl.real_size is not None and pl.padded_size > pl.real_size
-    axis_len = int(pl.real_size) if cropped else int(starts[-1])
+    axis_len = int(starts[-1])
 
     out_shape = list(shards.tensors[0].shape)
     out_shape[axis] = axis_len
@@ -375,14 +362,9 @@ def _sharded_slab_source(shards):
                     parts.append(t[lo - int(s0):hi - int(s0)].detach().cpu().numpy())
             return np.ascontiguousarray(np.concatenate(parts, axis=0))
     else:
-        sel = [slice(None)] * ndim
-        sel[axis] = slice(0, axis_len)
-        crop = tuple(sel)
-
         def produce_slab(i0, i1):
             parts = [t[i0:i1].detach().cpu().numpy() for t in shards.tensors]
-            out = np.concatenate(parts, axis=axis)
-            return np.ascontiguousarray(out[crop] if cropped else out)
+            return np.ascontiguousarray(np.concatenate(parts, axis=axis))
 
     return out_shape, dtype, produce_slab
 
@@ -392,8 +374,8 @@ def export_recon_hdf5(file_path, recon, recon_dict=None, remove_flash=False, rad
     Export a 3D reconstruction volume to an HDF5 file with optional post-processing.
 
     This function works with numpy arrays, torch tensors, and sharded volumes (a ``Shards``
-    container).  A sharded volume is copied to the host and written one slab at a time, and any
-    zero-padding of its slice axis is cropped, so the file equals the single-device export.
+    container).  A sharded volume is copied to the host and written one slab at a time, so the
+    file equals the single-device export.
     The function also transposes the reconstruction to right-hand coordinates (slice, col, row),
     and writes the reconstruction and optional metadata to an HDF5 file.
 

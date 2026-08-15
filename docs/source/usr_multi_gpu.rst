@@ -149,7 +149,7 @@ Behind the scenes
 
 Internally MBIRTorch uses *sharding*: the sinogram is split across the devices by view and the
 reconstruction volume by slice, and the two are combined with a small amount of banded
-communication between devices.  When a count does not divide evenly, the data is zero-padded
-to equal shares and the padding is kept exactly inert, so the padding never changes the
-result.  A reconstruction runs within a single process; multi-node execution is
+communication between devices.  A device count need not divide the sinogram or the
+volume evenly; the shares then differ in size by at most one view or one slice.
+A reconstruction runs within a single process; multi-node execution is
 out of scope.  For the developer-facing architecture, see :doc:`dev_sharding_overview`.
