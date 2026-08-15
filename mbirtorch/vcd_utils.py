@@ -200,17 +200,15 @@ def gen_full_indices(recon_shape, use_ror_mask=True):
     return partition[0]
 
 
-def gen_weights(sinogram, weight_type, ct_model=None):
+def gen_weights(sinogram, weight_type):
     """
     Compute optional weights used in MBIR reconstruction based on the noise model.
 
     The weights should be proportional to the inverse variance of the noise for
     each sinogram entry.  They can be used to improve reconstruction quality.
 
-    Without ct_model, the weights are computed with the input's own array module and stay
-    where the input is: a host (numpy) sinogram yields host weights, and a torch tensor
-    yields a tensor on the same device.  With ct_model, the sinogram is first moved to the
-    model device, so a host sinogram yields weights on the model device.
+    The weights are computed where the input is: a numpy sinogram yields numpy
+    weights, and a torch tensor yields a tensor on the same device.
 
     Args:
         sinogram (ndarray or tensor): 3D array of shape
@@ -220,14 +218,10 @@ def gen_weights(sinogram, weight_type, ct_model=None):
             - 'transmission': Use exponential decay, `exp(-sinogram)`.
             - 'transmission_root': Use square-root decay, `exp(-sinogram / 2)`.
             - 'emission': Use reciprocal decay, `1 / (abs(sinogram) + 0.1)`.
-        ct_model (TomographyModel, optional): if given, the sinogram is first moved to the
-            model device, so the weights are built where the reconstruction will run.  Only
-            single-device models are supported here; a multi-device model does not produce
-            valid weights.  Default None leaves the input where it is.
 
     Returns:
-        ndarray or tensor: weights with the same shape as the input.  Without ct_model they
-        are on the input's own device; with ct_model they are on the model device.
+        ndarray or tensor: weights with the same shape as the input, in the
+        input's form and place.
 
     Raises:
         Exception: If `weight_type` is not one of the supported options.
@@ -237,10 +231,6 @@ def gen_weights(sinogram, weight_type, ct_model=None):
         large (e.g., > 5), as this corresponds to near-zero transmission, which
         is not physically meaningful in typical X-ray imaging.
     """
-    # Optionally place the sinogram in the model's device form first, so the
-    # weights are built where the reconstruction will run.
-    if ct_model is not None:
-        sinogram = ct_model._shard_sinogram(sinogram)
     xp = torch if isinstance(sinogram, torch.Tensor) else np
     if weight_type == 'unweighted':
         weights = xp.ones_like(sinogram)
