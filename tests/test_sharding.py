@@ -317,6 +317,29 @@ def test_qggmrf_halos_match_full_volume():
     assert torch.allclose(g2, g_ref, atol=1e-7)
 
 
+def test_qggmrf_halos_treat_a_shard_with_no_slices_as_absent():
+    """A shard that holds no slices sends no halo and receives none.
+
+    The last shard that owns slices therefore gets None on its right, which
+    the prior maps to the reflected boundary condition at the last real
+    slice.  No split produces such a shard yet, because a padded block always
+    holds at least one slice, so the shards here are built by hand: widths 2,
+    3, and 0 over three devices.
+    """
+    from mbirtorch._sharding import Placement, Shards, exchange_qggmrf_halos
+    rng = np.random.RandomState(23)
+    num_pixels, S = 7, 5
+    flat = torch.as_tensor(rng.rand(num_pixels, S).astype(np.float32))
+    p = Placement(["cpu"] * 3, axis=-1, real_size=S)
+    shards = Shards([flat[:, 0:2], flat[:, 2:5], flat[:, 5:5]], p)
+    lh, rh = exchange_qggmrf_halos(shards)
+    # The boundary between the two shards that own slices carries the same
+    # values it carries when no shard is empty.
+    assert torch.equal(lh[1], flat[:, 1]) and torch.equal(rh[0], flat[:, 2])
+    assert lh[0] is None and rh[1] is None   # volume start, last real slice
+    assert lh[2] is None and rh[2] is None   # the shard with no slices
+
+
 def test_sharded_vcd_recon_matches_single_device():
     # The whole multi-device VCD loop, end to end: a seeded 4-iteration recon on two
     # virtual CPU devices must reproduce the single-device run -- same
@@ -651,6 +674,61 @@ def test_sub_band_streaming_matches_unstreamed():
     cbp = c2._gather_recon(c2.back_project(csino, output_sharded=True))
     assert np.max(np.abs(cfwd - cfwd_ref)) / np.max(np.abs(cfwd_ref)) < 1e-5
     assert np.max(np.abs(cbp - cbp_ref)) / np.max(np.abs(cbp_ref)) < 1e-5
+
+
+def test_balanced_slice_bounds_tile_the_extent_and_stop_at_an_empty_shard():
+    # The band tiling both banded drivers walk.  A slice-owner with no slices
+    # arrives with an extent of 0 and a band length of 0, which the ceil
+    # division cannot take, so the answer there is no bands and the drivers'
+    # loops run zero times.
+    import mbirtorch
+    bounds = mbirtorch.TomographyModel._balanced_slice_bounds
+    assert bounds(0, 0) == [] and bounds(0, 4) == []
+    assert bounds(-2, 0) == [] and bounds(-2, 4) == []
+    for extent, band_len in [(1, 1), (1, 4), (6, 2), (7, 3), (5, 5), (9, 4)]:
+        b = bounds(extent, band_len)
+        lengths = [e - s for s, e in b]
+        assert b[0][0] == 0 and b[-1][1] == extent       # covers [0, extent)
+        assert all(b[k][1] == b[k + 1][0] for k in range(len(b) - 1))
+        assert max(lengths) <= band_len
+        assert max(lengths) - min(lengths) <= 1
+
+
+def test_the_back_driver_returns_an_empty_block_for_an_owner_with_no_slices(
+        monkeypatch):
+    """A slice-owner with no slices gets a (num_pixels, 0) block, while the
+    owner that holds the slices gets the single-device values.
+
+    The stub is here because no real placement produces a zero-extent block:
+    the padding gives every owner at least one entry, so this case arrives
+    only once the split changes.  The stub hands the driver the block layout
+    that change produces -- one owner covering every real slice, and a last
+    owner covering none.
+    """
+    import mbirtorch
+    sino_shape = (8, 6, 8)
+    angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
+    m = mbirtorch.ParallelBeamModel(sino_shape, angles)
+    m.configure_devices(devices=["cpu"])
+    m.set_params(no_warning=True, verbose=0)
+    rs = tuple(m.get_params('recon_shape'))
+    rng = np.random.RandomState(17)
+    idx = np.sort(rng.choice(rs[0] * rs[1], size=20, replace=False))
+    sino = rng.rand(*sino_shape).astype(np.float32)
+    ref = m.sparse_back_project(sino, idx).cpu().numpy()
+
+    m.configure_devices(devices=["cpu"] * 2)
+    rp, num_slices = m.recon_placement, rs[2]
+    monkeypatch.setattr(rp, 'padded_shard_ranges',
+                        lambda: [(rp.devices[0], (0, num_slices), num_slices),
+                                 (rp.devices[1], (num_slices, num_slices), 0)])
+    back = m.sparse_back_project(sino, idx)
+    assert back.tensors[1].shape == (len(idx), 0)
+    assert back.tensors[1].dtype == back.tensors[0].dtype
+    owned = back.tensors[0].cpu().numpy()
+    assert owned.shape == (len(idx), num_slices)
+    rel = np.max(np.abs(owned - ref)) / np.max(np.abs(ref))
+    assert rel < 1e-5, rel
 
 
 def test_move_shard_small_and_scalar_tensors():

@@ -620,7 +620,12 @@ class TomographyModel(ParameterHandler):
         """Tile ``[0, extent)`` into balanced bands no longer than
         ``band_len``: the fewest bands, lengths as equal as possible
         (differing by at most 1), non-overlapping -- no slice is ever
-        recomputed."""
+        recomputed.  An extent that is not positive gives no bands at all,
+        so a caller's loop over the result runs zero times."""
+        if extent <= 0:
+            # A shard with no slices arrives here with a band length of 0 as
+            # well, so the ceil division below would divide by zero.
+            return []
         num_bands = -(-extent // band_len)            # ceil division
         base, rem = divmod(extent, num_bands)
         bounds, start = [], 0
@@ -938,8 +943,15 @@ class TomographyModel(ParameterHandler):
                     # run_per_device call.  Without it, this band's partial
                     # stays live on every device through the next projection.
                     partials = None
-                recon_tensors.append(owner_parts[0] if len(owner_parts) == 1
-                                     else torch.cat(owner_parts, dim=1))
+                if not owner_parts:
+                    # An owner with no slices produced no bands, so there is
+                    # nothing to concatenate.  No part exists to take a dtype
+                    # and a device from, so both are named here.
+                    recon_tensors.append(torch.zeros(
+                        (num_pixels, 0), dtype=sino_shards.dtype, device=odev))
+                else:
+                    recon_tensors.append(owner_parts[0] if len(owner_parts) == 1
+                                         else torch.cat(owner_parts, dim=1))
         if rp.is_padded:
             for oi, (_dev, (s0, s1), n_valid) in enumerate(
                     rp.padded_shard_ranges()):

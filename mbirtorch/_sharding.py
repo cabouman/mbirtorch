@@ -605,6 +605,11 @@ def exchange_qggmrf_halos(recon_shards, dev2dev_safe=True):
     prior maps to the reflected boundary condition -- so a single shard
     reproduces the single-device result exactly.
 
+    A shard that holds no slices counts as absent.  Such a shard gets None
+    on both of its sides.  The neighbor that does hold slices also gets None
+    in that direction, so the prior applies the reflected boundary condition
+    at the last real slice.
+
     Args:
         recon_shards (Shards): the slice-sharded flat recon, each tensor
             (num_pixels, local_slices).
@@ -612,13 +617,22 @@ def exchange_qggmrf_halos(recon_shards, dev2dev_safe=True):
 
     Returns:
         (left_halos, right_halos): lists in device order, entries (num_pixels,)
-        tensors on the receiving shard's device, or None at the true edges.
+        tensors on the receiving shard's device, or None at a true edge and at
+        a boundary with a shard that holds no slices.
     """
     tensors = recon_shards.tensors
     devs = recon_shards.placement.devices
     n = len(tensors)
+    # A boundary carries a halo only when the shards on both of its sides
+    # hold slices.  A shard with no slices comes last, because the slice axis
+    # is split with the longer blocks first, so no halo ever has to come
+    # from beyond one.
+    joined = [t.shape[1] > 0 and u.shape[1] > 0
+              for t, u in zip(tensors[:-1], tensors[1:])]
     left = [None] + [move_shard(tensors[i][:, -1].contiguous(), devs[i + 1],
-                                dev2dev_safe) for i in range(n - 1)]
+                                dev2dev_safe) if joined[i] else None
+                     for i in range(n - 1)]
     right = [move_shard(tensors[i + 1][:, 0].contiguous(), devs[i],
-                        dev2dev_safe) for i in range(n - 1)] + [None]
+                        dev2dev_safe) if joined[i] else None
+             for i in range(n - 1)] + [None]
     return left, right
