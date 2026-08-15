@@ -763,7 +763,7 @@ class TomographyModel(ParameterHandler):
         # Block height per call.  A row-aligned body sizes its output by the
         # gathered cylinder, which spans the whole slice axis; a two-fan body
         # returns the detector rows.
-        num_rows = (int(rp.real_size) if self.rows_track_slices
+        num_rows = (int(rp.axis_len) if self.rows_track_slices
                     else int(self.get_params('sinogram_shape')[1]))
         num_pixels = int(idx_per[0].shape[0])
         shards = voxel_shards.tensors        # in device = global slice order
@@ -958,14 +958,14 @@ class TomographyModel(ParameterHandler):
         """Recompile hook: rebuild the placements from the CURRENT params
         (preserving the configured devices), then recreate the projectors.
         Without this a geometry-changing set_params left the placements'
-        real sizes stale, silently truncating sharded arrays."""
+        axis lengths stale, silently truncating sharded arrays."""
         devices = self.sino_placement.devices
         sinogram_shape, recon_shape = self.get_params(
             ['sinogram_shape', 'recon_shape'])
         self.sino_placement = _sharding.Placement(
-            devices, axis=0, real_size=int(sinogram_shape[0]))
+            devices, axis=0, axis_len=int(sinogram_shape[0]))
         self.recon_placement = _sharding.Placement(
-            devices, axis=-1, real_size=int(recon_shape[2]))
+            devices, axis=-1, axis_len=int(recon_shape[2]))
         self._check_no_empty_shard()
         self._invalidate_device_caches()
         if self._projector_functions is not None:
@@ -981,14 +981,14 @@ class TomographyModel(ParameterHandler):
         that axis length, so the rule is exactly a device count above both
         the view count and the slice count."""
         sp, rp = self.sino_placement, self.recon_placement
-        if sp.real_size is None or rp.real_size is None:
+        if sp.axis_len is None or rp.axis_len is None:
             return
-        if sp.n_devices > sp.real_size and sp.n_devices > rp.real_size:
+        if sp.n_devices > sp.axis_len and sp.n_devices > rp.axis_len:
             raise ValueError(
                 f'{sp.n_devices} devices would leave at least one device with '
-                f'no views AND no slices ({sp.real_size} views, '
-                f'{rp.real_size} slices); use at most '
-                f'{max(sp.real_size, rp.real_size)} devices for this '
+                f'no views AND no slices ({sp.axis_len} views, '
+                f'{rp.axis_len} slices); use at most '
+                f'{max(sp.axis_len, rp.axis_len)} devices for this '
                 f'geometry.')
 
     def _invalidate_device_caches(self):
@@ -1059,9 +1059,9 @@ class TomographyModel(ParameterHandler):
         self.torch_device = devices[0]
         sinogram_shape, recon_shape = self.get_params(['sinogram_shape', 'recon_shape'])
         self.sino_placement = _sharding.Placement(
-            devices, axis=0, real_size=int(sinogram_shape[0]))
+            devices, axis=0, axis_len=int(sinogram_shape[0]))
         self.recon_placement = _sharding.Placement(
-            devices, axis=-1, real_size=int(recon_shape[2]))
+            devices, axis=-1, axis_len=int(recon_shape[2]))
         self._check_no_empty_shard()
         # One empirical probe per configuration (the L40S device_put lesson):
         # route transfers through host memory if a direct copy ever corrupts.
@@ -1503,7 +1503,7 @@ class TomographyModel(ParameterHandler):
         return self._split_to_shards(recon, self.recon_placement, num_slices,
                                      what='reconstruction (slice axis)')
 
-    def _split_to_shards(self, x, placement, real_size, what='array'):
+    def _split_to_shards(self, x, placement, axis_len, what='array'):
         """Split an array into per-device shard tensors (the n>1 body of
         _shard_sinogram / _shard_recon): each device gets its contiguous
         block of the sharded axis.  The blocks differ in length by at most
@@ -1511,12 +1511,12 @@ class TomographyModel(ParameterHandler):
         devices with empty blocks."""
         x = torch.as_tensor(x, dtype=torch.float32)
         axis = placement.axis % x.ndim
-        if x.shape[axis] != real_size:
+        if x.shape[axis] != axis_len:
             raise ValueError(
                 f'Cannot place the {what}: got shape {tuple(x.shape)}, '
-                f'but the model expects size {real_size} on axis {axis}.')
+                f'but the model expects size {axis_len} on axis {axis}.')
         tensors = []
-        for dev, (start, end) in placement.shard_ranges(real_size):
+        for dev, (start, end) in placement.shard_ranges(axis_len):
             idx = [slice(None)] * x.ndim
             idx[axis] = slice(start, end)
             tensors.append(x[tuple(idx)].to(dev))
@@ -1840,10 +1840,8 @@ class TomographyModel(ParameterHandler):
         if self.get_params('auto_regularize_flag'):
             # Estimate the regularization stats from a view subsample (see
             # subsample_views) -- both cheap and independent of sinogram size.
-            num_real_views = self.get_params('sinogram_shape')[0]
-            small_sinogram = self.subsample_views(sinogram, num_real_views=num_real_views)
-            small_weights = 1 if weights is None else self.subsample_views(
-                weights, num_real_views=num_real_views)
+            small_sinogram = self.subsample_views(sinogram)
+            small_weights = 1 if weights is None else self.subsample_views(weights)
 
             sino_indicator = self._get_sino_indicator(small_sinogram,
                                                       verbose=self.get_params('verbose'))
@@ -1921,17 +1919,16 @@ class TomographyModel(ParameterHandler):
                         auto_regularize_flag=True)
 
     @staticmethod
-    def subsample_views(array, max_views_to_use=20, num_real_views=None):
+    def subsample_views(array, max_views_to_use=20):
         """Return an evenly-spaced subsample of about ``max_views_to_use``
         views (axis 0) as a host numpy array.  The statistical sinogram
         estimates run on such a subsample.  The stride depends only on the
         view count, so a second call with the same arguments subsamples a
-        companion array (e.g. weights) the same way.  ``num_real_views``
-        restricts the sampling to ``array[:num_real_views]``."""
-        num_views = array.shape[0] if num_real_views is None else num_real_views
+        companion array (e.g. weights) the same way."""
+        num_views = array.shape[0]
         max_views_to_use = min(max_views_to_use, num_views)
         step_size = max(num_views // max_views_to_use, 1)
-        return np.array(array[:num_views][::step_size])
+        return np.array(array[::step_size])
 
     @staticmethod
     def _get_sino_indicator(sinogram, verbose=1):
@@ -2535,7 +2532,7 @@ class TomographyModel(ParameterHandler):
 
         # math.prod uses exact Python integers; np.prod would silently wrap
         # past 2^31 elements.
-        real_sino_size = math.prod(sinogram_shape)
+        total_sino_size = math.prod(sinogram_shape)
 
         # Initialize the diagonal of the Hessian of the forward model: the back
         # projection of the weights with squared coefficients (constant weights
@@ -2607,7 +2604,7 @@ class TomographyModel(ParameterHandler):
                 # the statistics normalize by the total.
                 fm_loss_i, recon_l1, es_rmse = self._iteration_stats(
                     error_sinogram, flat_recon, sigma_y, weights,
-                    constant_weights, float(real_sino_size))
+                    constant_weights, float(total_sino_size))
                 fm_rmse[i] = float(fm_loss_i)
                 recon_l1_f = float(recon_l1)
                 # A zero recon gives nan (matching mbirjax) rather than
@@ -2631,18 +2628,18 @@ class TomographyModel(ParameterHandler):
                         qggmrf_params = (b, sigma_x, p, q, T)
                         # Evaluate the prior loss on the assembled volume, so
                         # the inter-slice terms cross the shard boundaries.
-                        real_recon_size = math.prod(recon_shape)
+                        total_recon_size = math.prod(recon_shape)
                         loss_recon = self._gather_recon(flat_recon).reshape(
                             tuple(recon_shape))
                         pm_loss[i] = _qggmrf.qggmrf_loss(loss_recon, qggmrf_params)
-                        pm_loss[i] /= real_recon_size
+                        pm_loss[i] /= total_recon_size
                         # Each loss is scaled by its element count, but the
                         # optimization uses unscaled values.  Remove the
                         # scaling, add, then scale by the average element
                         # count of the two.
-                        total_loss = ((fm_rmse[i] * real_sino_size
-                                       + pm_loss[i] * real_recon_size)
-                                      / (0.5 * (real_sino_size + real_recon_size)))
+                        total_loss = ((fm_rmse[i] * total_sino_size
+                                       + pm_loss[i] * total_recon_size)
+                                      / (0.5 * (total_sino_size + total_recon_size)))
                         iter_output += ', Prior loss={:.4f}, Weighted total loss={:.4f}'.format(
                             pm_loss[i], total_loss)
                     self.logger.info(iter_output)
@@ -2834,12 +2831,12 @@ class TomographyModel(ParameterHandler):
         return (recon if output_sharded else self._gather_recon(recon)), recon_dict
 
     def _iteration_stats(self, error_sinogram, flat_recon, sigma_y, weights,
-                         constant_weights, real_sino_size):
+                         constant_weights, total_sino_size):
         """Per-iteration logging stats (fm loss, recon L1, error-sino RMSE).
         A single-device state delegates to the fused _vcd_iteration_stats
         with bit-identical results.  A per-device state combines per-shard
         sums on the host, which is the loop's one host synchronization point
-        per iteration.  ``real_sino_size`` is the whole sinogram's element
+        per iteration.  ``total_sino_size`` is the whole sinogram's element
         count, which no single shard can supply."""
         if (isinstance(error_sinogram, _sharding.Shards)
                 and not error_sinogram.placement.is_trivial):
@@ -2861,12 +2858,12 @@ class TomographyModel(ParameterHandler):
             if weights_shards is None:
                 avg_weight = 1.0
             else:
-                avg_weight = sum(b for _, b, _ in parts) / real_sino_size
-            fm_loss = ((weighted_sq / (avg_weight * real_sino_size)) ** 0.5
+                avg_weight = sum(b for _, b, _ in parts) / total_sino_size
+            fm_loss = ((weighted_sq / (avg_weight * total_sino_size)) ** 0.5
                        / sigma_y)
             recon_l1 = sum(
                 float(torch.sum(torch.abs(t))) for t in flat_shards.tensors)
-            es_rmse = (sq / real_sino_size) ** 0.5
+            es_rmse = (sq / total_sino_size) ** 0.5
         else:
             if isinstance(error_sinogram, _sharding.Shards):
                 # The trivial one-shard container unwraps (aliasing) to the

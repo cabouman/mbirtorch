@@ -25,8 +25,8 @@ def make_plan(n_devices=1, num_views=64, num_rows=32, num_channels=32,
               rows_track_slices=False, **kwargs):
     """A hand-built plan: no model, no device, no CUDA."""
     devices = ['cpu'] * n_devices
-    sino_placement = _sharding.Placement(devices, axis=0, real_size=num_views)
-    recon_placement = _sharding.Placement(devices, axis=-1, real_size=recon[2])
+    sino_placement = _sharding.Placement(devices, axis=0, axis_len=num_views)
+    recon_placement = _sharding.Placement(devices, axis=-1, axis_len=recon[2])
     return LedgerPlan(
         sinogram_shape=(num_views, num_rows, num_channels),
         recon_shape=recon,
@@ -1189,8 +1189,8 @@ def _measured_arm_ledger(arm):
     sinogram_shape, recon_shape, num_pixels, measured = MEASURED_ARMS[arm]
     n_devices = len(measured)
     devices = ['cpu'] * n_devices
-    sino = _sharding.Placement(devices, axis=0, real_size=sinogram_shape[0])
-    recon = _sharding.Placement(devices, axis=-1, real_size=recon_shape[2])
+    sino = _sharding.Placement(devices, axis=0, axis_len=sinogram_shape[0])
+    recon = _sharding.Placement(devices, axis=-1, axis_len=recon_shape[2])
     plan = LedgerPlan(
         sinogram_shape=sinogram_shape,
         recon_shape=recon_shape,

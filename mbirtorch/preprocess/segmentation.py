@@ -351,7 +351,7 @@ def segment_plastic_metal(recon, num_metal, radial_margin=None, top_margin=None,
     # Size-relative default margins: the former fixed 10 at production sizes, smaller for small
     # volumes so the mask never carves off a large fraction of the field of view.
     shape = recon.tensors[0].shape if is_shards else recon.shape
-    num_slices = recon.placement.real_size if is_shards else recon.shape[2]
+    num_slices = recon.placement.axis_len if is_shards else recon.shape[2]
     if radial_margin is None:
         radial_margin = max(2, min(10, min(shape[0], shape[1]) // 25))
     if top_margin is None:

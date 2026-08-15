@@ -216,17 +216,17 @@ def _shard_axis_block(shards, i0, i1):
 
     Shard extents are read off the TENSORS rather than the placement, and the
     dtype off an empty slice -- the rule :func:`_sharded_slab_source` uses --
-    so this holds whether or not ``real_size`` was supplied.
+    so this holds whether or not ``axis_len`` was supplied.
     """
     pl = shards.placement
     ndim = shards.tensors[0].ndim
     axis = pl.axis % ndim
     sizes = [int(t.shape[axis]) for t in shards.tensors]
     starts = np.cumsum([0] + sizes)
-    real_end = int(pl.real_size) if pl.real_size is not None else int(starts[-1])
+    axis_end = int(pl.axis_len) if pl.axis_len is not None else int(starts[-1])
     pieces = []
     for t, s0, s1 in zip(shards.tensors, starts[:-1], starts[1:]):
-        lo, hi = max(i0, int(s0)), min(i1, min(int(s1), real_end))
+        lo, hi = max(i0, int(s0)), min(i1, min(int(s1), axis_end))
         if lo < hi:
             sel = [slice(None)] * ndim
             sel[axis] = slice(lo - int(s0), hi - int(s0))
@@ -236,14 +236,14 @@ def _shard_axis_block(shards, i0, i1):
 
 def _sharded_host_shape_dtype(shards):
     """The shape and numpy dtype of a sharded volume's host form (sharded
-    axis at its real size), computed without gathering anything.  Same extent
+    axis at its full length), computed without gathering anything.  Same extent
     and dtype rules as :func:`_shard_axis_block`."""
     pl = shards.placement
     ndim = shards.tensors[0].ndim
     axis = pl.axis % ndim
     shape = [int(v) for v in shards.tensors[0].shape]
     total = sum(int(t.shape[axis]) for t in shards.tensors)
-    shape[axis] = int(pl.real_size) if pl.real_size is not None else total
+    shape[axis] = int(pl.axis_len) if pl.axis_len is not None else total
     np_dtype = shards.tensors[0][:0].detach().cpu().numpy().dtype
     return tuple(shape), np_dtype
 
@@ -340,7 +340,7 @@ def _sharded_slab_source(shards):
     ndim = shards.tensors[0].ndim
     axis = pl.axis % ndim
     # Shard extents along the sharded axis, read off the tensors rather than the
-    # placement, so this holds whether or not real_size was supplied.
+    # placement, so this holds whether or not axis_len was supplied.
     sizes = [int(t.shape[axis]) for t in shards.tensors]
     starts = np.cumsum([0] + sizes)
     axis_len = int(starts[-1])

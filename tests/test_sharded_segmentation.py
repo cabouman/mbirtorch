@@ -31,7 +31,7 @@ def _test_volume():
 def _as_shards(vol, n_shards):
     """Split the volume's slice axis over n CPU shards, as the engine does."""
     placement = _sharding.Placement(['cpu'] * n_shards, axis=-1,
-                                    real_size=vol.shape[2])
+                                    axis_len=vol.shape[2])
     tensors = [torch.as_tensor(vol[:, :, s0:s1].copy())
                for _dev, (s0, s1) in placement.shard_ranges()]
     return _sharding.Shards(tensors, placement)
@@ -103,7 +103,7 @@ def test_save_data_hdf5_writes_shards_without_gathering_first(tmp_path):
 def _view_sharded(vol, n_shards):
     """The other sharded axis: split axis 0 (a sino-like placement)."""
     placement = _sharding.Placement(['cpu'] * n_shards, axis=0,
-                                    real_size=vol.shape[0])
+                                    axis_len=vol.shape[0])
     tensors = [torch.as_tensor(vol[s0:s1].copy())
                for _dev, (s0, s1) in placement.shard_ranges()]
     return _sharding.Shards(tensors, placement)
@@ -208,7 +208,7 @@ def test_sharded_save_and_export_stream_by_slab(tmp_path, monkeypatch):
     monkeypatch.setattr(utilities, '_HDF5_SLAB_BYTES', 256)
 
     def as_shards(vol, axis, n):
-        pl = _sharding.Placement(['cpu'] * n, axis=axis, real_size=vol.shape[axis])
+        pl = _sharding.Placement(['cpu'] * n, axis=axis, axis_len=vol.shape[axis])
         tensors = []
         for _d, (s0, s1) in pl.shard_ranges():
             cut = [slice(None)] * vol.ndim

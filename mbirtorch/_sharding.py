@@ -67,17 +67,17 @@ class Placement:
             the devices (may be negative; resolved against an array's rank
             where used).  Recon-like -> the slice axis (-1); sino-like -> the
             view axis (0).
-        real_size (int or None): the problem-owned length of the sharded axis
-            (e.g. num_views for a sino placement).  When given, it is the
-            axis length :meth:`shard_ranges` splits by default.
+        axis_len (int or None): the length of the sharded axis (e.g.
+            num_views for a sino placement).  When given, it is the axis
+            length :meth:`shard_ranges` splits by default.
     """
 
-    def __init__(self, devices, axis, real_size=None):
+    def __init__(self, devices, axis, axis_len=None):
         self.devices = [torch.device(d) for d in devices]
         if len(self.devices) < 1:
             raise ValueError("Placement requires at least one device.")
         self.axis = axis
-        self.real_size = int(real_size) if real_size is not None else None
+        self.axis_len = int(axis_len) if axis_len is not None else None
 
     @property
     def n_devices(self):
@@ -88,32 +88,32 @@ class Placement:
         """True when this placement is a single device (1 shard)."""
         return len(self.devices) == 1
 
-    def shard_ranges(self, size=None):
+    def shard_ranges(self, axis_len=None):
         """The half-open axis range each device owns when an axis of length
-        ``size`` is split into contiguous blocks, one per device.
+        ``axis_len`` is split into contiguous blocks, one per device.
 
         The block lengths differ by at most one, and the longer blocks come
         first.  That is ``numpy.array_split``'s convention, which the index
         arithmetic below uses directly, and it matches the convention the
-        slice bands already follow.  A size smaller than the device count
-        gives the trailing devices empty ranges.
+        slice bands already follow.  An axis length smaller than the device
+        count gives the trailing devices empty ranges.
 
         Args:
-            size (int, optional): the length of the sharded axis to split.
-                Defaults to this placement's ``real_size``.
+            axis_len (int, optional): the length of the sharded axis to
+                split.  Defaults to this placement's ``axis_len``.
 
         Returns:
             list of (device, (start, end)): the half-open block owned by each
             device, in device order.
         """
-        if size is None:
-            size = self.real_size
-        if size is None:
+        if axis_len is None:
+            axis_len = self.axis_len
+        if axis_len is None:
             raise ValueError(
                 'shard_ranges needs an axis length.  This placement was built '
-                'without real_size, so pass the length explicitly, as in '
+                'without axis_len, so pass the length explicitly, as in '
                 'shard_ranges(num_slices).')
-        blocks = np.array_split(np.arange(int(size)), len(self.devices))
+        blocks = np.array_split(np.arange(int(axis_len)), len(self.devices))
         bounds = np.cumsum([0] + [len(b) for b in blocks])
         return [(dev, (int(bounds[i]), int(bounds[i + 1])))
                 for i, dev in enumerate(self.devices)]

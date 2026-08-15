@@ -203,11 +203,11 @@ BLESSED_COST_HASHES = {
     'TomographyModel._sparse_back_project_sharded':
         'f73fa28f32d2393fac3f06139d8ddeccc55260fceb28bbca7f102334839fb5a4',
     'TomographyModel._sparse_forward_project_columns':
-        '325399abe039f3594882bb474b9aad8e6f2db275bfde25bc5c2e32ba5f912111',
+        '70a2e2156a6b64cd44cb7b7a061ae514d3b43ef2e0580d55e503d1b7fb94f298',
     'TomographyModel._sparse_forward_project_sharded':
         '9b75c174555688a3fedba931a22de7dcf6236827fde3b5dc8ca27820728cd8fc',
     '_sharding.py':
-        '651af9e36e008ed65b3039427e2f8b772f0e6c50b23aad591d3a574b3c4b24bd',
+        '734baed72bcdeb8eace2f2bb89abd71bc32847fee0b87d78bbc2724ff121b4b7',
     'projectors.py':
         '82565070c0b10de0daf1835abcb84df796a265046402ed67f26305945ef2818e',
     'triton_cone.py':
@@ -230,7 +230,7 @@ STALE_SINCE = None
 #: green the test leaves this behind, and the test says so.  Recomputed and
 #: printed by ``refresh_widening_floors.py --bless``.
 TABLE_CHECKSUM = \
-    'da307855f4347d700193fff707dbd9d36386ac29b5d25882ef4cb800f57641d8'
+    '308d430f3f0ed714d7e7be7786dda4f7fe6904feb5b93c94b2f5539c89053970'
 
 
 # ── the env knob ─────────────────────────────────────────────────────────────

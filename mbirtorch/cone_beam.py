@@ -452,7 +452,7 @@ class ConeBeamModel(TomographyModel):
         rp = self.recon_placement
         key = (tuple(cfg), tuple(recon_shape), dv, slice_aspect, oz, R,
                float(z_shifts.min()), float(z_shifts.max()),
-               tuple(str(d) for d in rp.devices), rp.real_size)
+               tuple(str(d) for d in rp.devices), rp.axis_len)
         cache = getattr(self, '_dc_damping_cache', None)
         if cache is not None and cache[0] == key:
             return cache[1]
@@ -473,7 +473,7 @@ class ConeBeamModel(TomographyModel):
             s_prof = profile(t).mean(axis=1)
         profiles, fns = [], []
         # The slice count is passed explicitly: a single-device model that was
-        # never reconfigured carries no real_size on its placement, and DC
+        # never reconfigured carries no axis_len on its placement, and DC
         # damping runs on that path.
         for i, (dev, (s0, s1)) in enumerate(rp.shard_ranges(nz)):
             profiles.append(torch.as_tensor(

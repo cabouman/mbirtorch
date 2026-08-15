@@ -59,8 +59,8 @@ Device layout is described by a single object, ``Placement`` (in
 
 * the list of ``devices``;
 * which array ``axis`` is sharded;
-* the ``real_size`` of that axis, which ``shard_ranges`` splits into one
-  contiguous block per device.  The blocks differ in length by at most one, and
+* the ``axis_len``, the length of that axis, which ``shard_ranges`` splits into
+  one contiguous block per device.  The blocks differ in length by at most one, and
   the longer blocks come first.
 
 A model carries two placements -- ``recon_placement`` (slice axis) and

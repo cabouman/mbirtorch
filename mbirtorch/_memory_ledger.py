@@ -1045,7 +1045,7 @@ def plan_from_model(model, devices, workload='recon', partition_sequence=None,
     The device list is an argument rather than a reading of the model's own
     placement, because the widening rule prices counts the model is not
     configured for.  The placements are rebuilt here from the current params,
-    so a geometry change cannot leave a stale real size behind.
+    so a geometry change cannot leave a stale axis length behind.
 
     ``workload`` names the call the plan is for: ``'recon'`` (the default)
     prices a full reconstruction, and ``'direct'`` prices a direct
@@ -1057,9 +1057,9 @@ def plan_from_model(model, devices, workload='recon', partition_sequence=None,
     devices = [torch.device(d) for d in devices]
 
     sino_placement = _sharding.Placement(devices, axis=0,
-                                         real_size=sinogram_shape[0])
+                                         axis_len=sinogram_shape[0])
     recon_placement = _sharding.Placement(devices, axis=-1,
-                                          real_size=recon_shape[2])
+                                          axis_len=recon_shape[2])
     view_blocks = [end - start for _d, (start, end)
                    in sino_placement.shard_ranges()]
     slice_blocks = [end - start for _d, (start, end)

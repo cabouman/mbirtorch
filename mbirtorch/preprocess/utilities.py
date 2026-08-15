@@ -758,7 +758,7 @@ def apply_cylindrical_mask(recon, radial_margin=0, top_margin=0, bottom_margin=0
     # global slice ranges, so each shard zeroes its own overlap with them.
     if isinstance(recon, _sharding.Shards):
         pl = recon.placement
-        num_slices = pl.real_size
+        num_slices = pl.axis_len
         out = []
         for t, (_dev, (s0, s1)) in zip(recon.tensors, pl.shard_ranges()):
             masked = apply_cylindrical_mask(t, radial_margin=radial_margin)

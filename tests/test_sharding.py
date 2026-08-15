@@ -15,15 +15,15 @@ from mbirtorch._sharding import (Placement, Shards, broadcast_band_to_views,
 
 
 def test_placement_ranges_split_evenly_within_one():
-    p = Placement(["cpu", "cpu"], axis=0, real_size=7)
+    p = Placement(["cpu", "cpu"], axis=0, axis_len=7)
     assert p.n_devices == 2 and not p.is_trivial
-    # A size the device count does not divide splits into blocks that differ
-    # in length by one, with the longer block first.
+    # An axis length the device count does not divide splits into blocks that
+    # differ in length by one, with the longer block first.
     assert [r for _, r in p.shard_ranges()] == [(0, 4), (4, 7)]
-    # An explicit size overrides the placement's own.
+    # An explicit axis length overrides the placement's own.
     assert [r for _, r in p.shard_ranges(6)] == [(0, 3), (3, 6)]
 
-    q = Placement(["cpu"], axis=-1, real_size=5)
+    q = Placement(["cpu"], axis=-1, axis_len=5)
     assert q.is_trivial and [r for _, r in q.shard_ranges()] == [(0, 5)]
 
     # No size to split, and none on the placement, is an error that says so.
@@ -32,7 +32,7 @@ def test_placement_ranges_split_evenly_within_one():
 
 
 def test_shards_gather_roundtrip():
-    p = Placement(["cpu", "cpu"], axis=0, real_size=6)
+    p = Placement(["cpu", "cpu"], axis=0, axis_len=6)
     full = np.arange(24, dtype=np.float32).reshape(6, 4)
     parts = [torch.as_tensor(full[s:e]) for _, (s, e) in p.shard_ranges(6)]
     sh = Shards(parts, p)
@@ -54,7 +54,7 @@ def test_the_split_is_balanced_and_the_gather_keeps_every_element():
     """
     for size, count in [(7, 2), (6, 2), (5, 4), (9, 4), (3, 4), (1, 3),
                         (0, 2), (12, 3), (17, 5)]:
-        p = Placement(["cpu"] * count, axis=0, real_size=size)
+        p = Placement(["cpu"] * count, axis=0, axis_len=size)
         ranges = [r for _, r in p.shard_ranges()]
         lengths = [e - s for s, e in ranges]
         assert len(ranges) == count, (size, count)
@@ -337,7 +337,7 @@ def test_qggmrf_halos_match_full_volume():
     ref_g, ref_h = qggmrf.qggmrf_gradient_and_hessian_at_indices(
         flat, (rows, cols, S), idx, params)
 
-    p = Placement(["cpu", "cpu"], axis=-1, real_size=S)
+    p = Placement(["cpu", "cpu"], axis=-1, axis_len=S)
     shards = Shards([flat[:, s:e] for _, (s, e) in p.shard_ranges(S)], p)
     lh, rh = exchange_qggmrf_halos(shards)
     assert lh[0] is None and rh[-1] is None
@@ -366,7 +366,7 @@ def test_qggmrf_halos_treat_a_shard_with_no_slices_as_absent():
     rng = np.random.RandomState(23)
     num_pixels, S = 7, 5
     flat = torch.as_tensor(rng.rand(num_pixels, S).astype(np.float32))
-    p = Placement(["cpu"] * 3, axis=-1, real_size=S)
+    p = Placement(["cpu"] * 3, axis=-1, axis_len=S)
     shards = Shards([flat[:, 0:2], flat[:, 2:5], flat[:, 5:5]], p)
     lh, rh = exchange_qggmrf_halos(shards)
     # The boundary between the two shards that own slices carries the same
@@ -433,7 +433,7 @@ def test_sharded_vcd_recon_matches_single_device():
 
 def test_placements_refresh_on_geometry_change():
     # Panel finding: a geometry-changing set_params after configure_devices
-    # left the placements' real sizes stale, and the placement functions silently
+    # left the placements' axis lengths stale, and the placement functions silently
     # TRUNCATED sharded arrays.  The recompile hook now rebuilds placements
     # from the current shapes.
     import mbirtorch
@@ -445,8 +445,8 @@ def test_placements_refresh_on_geometry_change():
     m.set_params(sinogram_shape=(12, 10, 8),
                  angles=np.linspace(0, np.pi, 12, endpoint=False))
     m.auto_set_recon_geometry()
-    assert m.sino_placement.real_size == 12
-    assert m.recon_placement.real_size == m.get_params('recon_shape')[2]
+    assert m.sino_placement.axis_len == 12
+    assert m.recon_placement.axis_len == m.get_params('recon_shape')[2]
     sino = np.random.RandomState(0).rand(12, 10, 8).astype(np.float32)
     sh = m._shard_sinogram(sino)
     # Splitting and gathering only copies, so the round trip is exact.
@@ -801,8 +801,8 @@ def test_the_back_driver_returns_an_empty_block_for_an_owner_with_no_slices(
     rp, num_slices = m.recon_placement, rs[2]
     monkeypatch.setattr(
         rp, 'shard_ranges',
-        lambda size=None: [(rp.devices[0], (0, num_slices)),
-                           (rp.devices[1], (num_slices, num_slices))])
+        lambda axis_len=None: [(rp.devices[0], (0, num_slices)),
+                               (rp.devices[1], (num_slices, num_slices))])
     back = m.sparse_back_project(sino, idx)
     assert back.tensors[1].shape == (len(idx), 0)
     assert back.tensors[1].dtype == back.tensors[0].dtype
@@ -1102,7 +1102,7 @@ def test_column_gather_replaces_the_band_broadcast(monkeypatch):
     batch, n = 4, 2
     m, idx, vals, _sino, _ref_fwd, _ref_back = _cone_column_case(
         ["cpu"] * n, pixel_batch=batch)
-    slices = m.recon_placement.real_size
+    slices = m.recon_placement.axis_len
     gathers, broadcasts, calls = [], [], []
     real_gather = sharding.gather_column_band
 
@@ -1489,7 +1489,7 @@ def test_parallel_column_gather_gathers_columns_and_sizes_its_rows_by_them(
     batch, n = 4, 2
     m, idx, vals, _sino, _ref_fwd, _rb = _parallel_column_case(
         ["cpu"] * n, pixel_batch=batch)
-    slices = m.recon_placement.real_size
+    slices = m.recon_placement.axis_len
     channels = int(m.get_params('sinogram_shape')[2])
     gathers, calls = [], []
     real_gather = sharding.gather_column_band
