@@ -201,13 +201,13 @@ COST_INPUT_METHODS = ('_sparse_forward_project_sharded',
 #: ``python dev_scripts/refresh_widening_floors.py --bless``.
 BLESSED_COST_HASHES = {
     'TomographyModel._sparse_back_project_sharded':
-        '8a39fb4d97a9573933520ce780eae5dd2097e5a068caa3ee2178114ba8989772',
+        'f73fa28f32d2393fac3f06139d8ddeccc55260fceb28bbca7f102334839fb5a4',
     'TomographyModel._sparse_forward_project_columns':
-        '7891079005e2e893b598327af1ac425696c0d51a288d92a285272187e8925157',
+        '325399abe039f3594882bb474b9aad8e6f2db275bfde25bc5c2e32ba5f912111',
     'TomographyModel._sparse_forward_project_sharded':
-        '546201c90075a19f5ffe055c2becee6716417aa52e9e5f178885e7a68aae60f3',
+        '9b75c174555688a3fedba931a22de7dcf6236827fde3b5dc8ca27820728cd8fc',
     '_sharding.py':
-        'ad5138462c34f5aeb46b5f65b49e609638b6fa6ec9a8345185ed878074fe5a62',
+        '651af9e36e008ed65b3039427e2f8b772f0e6c50b23aad591d3a574b3c4b24bd',
     'projectors.py':
         '82565070c0b10de0daf1835abcb84df796a265046402ed67f26305945ef2818e',
     'triton_cone.py':
@@ -230,7 +230,7 @@ STALE_SINCE = None
 #: green the test leaves this behind, and the test says so.  Recomputed and
 #: printed by ``refresh_widening_floors.py --bless``.
 TABLE_CHECKSUM = \
-    '62c5d8963c70d481dc7a35fa4a59e01446e225336066c6d7628fd75e0184d3a0'
+    'da307855f4347d700193fff707dbd9d36386ac29b5d25882ef4cb800f57641d8'
 
 
 # ── the env knob ─────────────────────────────────────────────────────────────

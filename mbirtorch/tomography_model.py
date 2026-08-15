@@ -1845,16 +1845,6 @@ class TomographyModel(ParameterHandler):
             small_weights = 1 if weights is None else self.subsample_views(
                 weights, num_real_views=num_real_views)
 
-            # Likewise crop padded detector ROWS (a device-form input whose row
-            # axis pads with the recon slices) -- the zero rows would bias the
-            # indicator/sigma stats.  A no-op until a sharding port pads arrays;
-            # kept now so padded inputs can never silently bias the estimates.
-            num_real_rows = self.get_params('sinogram_shape')[1]
-            if small_sinogram.shape[1] != num_real_rows:
-                small_sinogram = small_sinogram[:, :num_real_rows]
-                if weights is not None:
-                    small_weights = small_weights[:, :num_real_rows]
-
             sino_indicator = self._get_sino_indicator(small_sinogram,
                                                       verbose=self.get_params('verbose'))
             self._check_lateral_truncation(sino_indicator)
@@ -2056,8 +2046,7 @@ class TomographyModel(ParameterHandler):
 
     # ── loss / stats (mirrors get_forward_model_loss + _vcd_iteration_stats) ──
     @staticmethod
-    def get_forward_model_loss(error_sinogram, sigma_y, weights=None, normalize=True,
-                               num_real_elements=None):
+    def get_forward_model_loss(error_sinogram, sigma_y, weights=None, normalize=True):
         """
         Calculate the forward model loss from the error sinogram and weights,
         where error_sinogram = measured_sinogram - forward_proj(recon).
@@ -2069,9 +2058,6 @@ class TomographyModel(ParameterHandler):
             normalize (bool, optional): If True (default), return the
                 weight-normalized RMSE form; otherwise the unnormalized
                 weighted squared error.
-            num_real_elements (int, optional): the REAL element count when
-                error_sinogram carries zero-filled padding.  Default None
-                uses error_sinogram.numel().
 
         Returns:
             The loss as a device scalar tensor.
@@ -2080,48 +2066,36 @@ class TomographyModel(ParameterHandler):
             weights = 1
             avg_weight = 1
         elif np.ndim(weights) == 0:
-            # A true scalar (python or 0-d): the average weight is itself,
-            # independent of the element count -- so also exact on padded runs.
+            # A true scalar (python or 0-d): the average weight is itself.
             avg_weight = weights
-        elif num_real_elements is None:
+        else:
             # Array-likes (numpy included -- a numpy array is not a torch
             # tensor, and a tensor-only test would route it to the scalar
             # branch, returning a sinogram-shaped 'loss').
             weights = torch.as_tensor(weights, dtype=torch.float32,
                                       device=error_sinogram.device)
             avg_weight = torch.mean(weights)
-        else:
-            # Weights ARRAY in a padded device form: the padded entries are
-            # identically zero, so summing and dividing by the REAL count gives
-            # exactly the average over the real elements.
-            weights = torch.as_tensor(weights, dtype=torch.float32,
-                                      device=error_sinogram.device)
-            avg_weight = torch.sum(weights) / float(num_real_elements)
         if normalize:
             weighted_sq_sum = torch.sum(error_sinogram * error_sinogram * weights)
-            denom = (float(error_sinogram.numel()) if num_real_elements is None
-                     else float(num_real_elements))
-            loss = torch.sqrt(weighted_sq_sum / (avg_weight * denom)) / sigma_y
+            loss = torch.sqrt(weighted_sq_sum
+                              / (avg_weight * float(error_sinogram.numel()))) / sigma_y
         else:
             loss = (1.0 / (2 * sigma_y ** 2)) * torch.sum(
                 (error_sinogram * error_sinogram) * weights)
         return loss
 
     @staticmethod
-    def _vcd_iteration_stats(error_sinogram, flat_recon, sigma_y, weights=None,
-                             num_real_elements=None, real_sino_size=None):
+    def _vcd_iteration_stats(error_sinogram, flat_recon, sigma_y, weights=None):
         """Per-iteration VCD logging stats: (fm_loss, recon_l1, es_rmse).
 
-        ``num_real_elements``/``real_sino_size`` are the REAL element count when
-        the error sinogram carries zero-filled padding (see
-        get_forward_model_loss); padded entries must not dilute the RMSE.
-        Both default to None (unpadded), which uses the array's own size."""
+        Both statistics normalize by the error sinogram's own element count,
+        which is the whole sinogram: this form runs on a single device, where
+        one array holds every element."""
         fm_loss = TomographyModel.get_forward_model_loss(
-            error_sinogram, sigma_y, weights, num_real_elements=num_real_elements)
+            error_sinogram, sigma_y, weights)
         recon_l1 = torch.sum(torch.abs(flat_recon))
-        denom = (float(error_sinogram.numel()) if real_sino_size is None
-                 else float(real_sino_size))
-        es_rmse = torch.sqrt(torch.sum(error_sinogram * error_sinogram) / denom)
+        es_rmse = torch.sqrt(torch.sum(error_sinogram * error_sinogram)
+                             / float(error_sinogram.numel()))
         return fm_loss, recon_l1, es_rmse
 
     def get_forward_lin_quad(self, weighted_error_sinogram, delta_sinogram, weights,
@@ -2562,7 +2536,6 @@ class TomographyModel(ParameterHandler):
         # math.prod uses exact Python integers; np.prod would silently wrap
         # past 2^31 elements.
         real_sino_size = math.prod(sinogram_shape)
-        loss_num_real = None
 
         # Initialize the diagonal of the Hessian of the forward model: the back
         # projection of the weights with squared coefficients (constant weights
@@ -2634,8 +2607,7 @@ class TomographyModel(ParameterHandler):
                 # the statistics normalize by the total.
                 fm_loss_i, recon_l1, es_rmse = self._iteration_stats(
                     error_sinogram, flat_recon, sigma_y, weights,
-                    constant_weights, num_real_elements=loss_num_real,
-                    real_sino_size=float(real_sino_size))
+                    constant_weights, float(real_sino_size))
                 fm_rmse[i] = float(fm_loss_i)
                 recon_l1_f = float(recon_l1)
                 # A zero recon gives nan (matching mbirjax) rather than
@@ -2862,13 +2834,13 @@ class TomographyModel(ParameterHandler):
         return (recon if output_sharded else self._gather_recon(recon)), recon_dict
 
     def _iteration_stats(self, error_sinogram, flat_recon, sigma_y, weights,
-                         constant_weights, num_real_elements=None,
-                         real_sino_size=None):
+                         constant_weights, real_sino_size):
         """Per-iteration logging stats (fm loss, recon L1, error-sino RMSE).
         A single-device state delegates to the fused _vcd_iteration_stats
         with bit-identical results.  A per-device state combines per-shard
         sums on the host, which is the loop's one host synchronization point
-        per iteration."""
+        per iteration.  ``real_sino_size`` is the whole sinogram's element
+        count, which no single shard can supply."""
         if (isinstance(error_sinogram, _sharding.Shards)
                 and not error_sinogram.placement.is_trivial):
             error_shards, flat_shards = error_sinogram, flat_recon
@@ -2902,9 +2874,7 @@ class TomographyModel(ParameterHandler):
                 error_sinogram = error_sinogram.tensors[0]
                 flat_recon = flat_recon.tensors[0]
             fm_loss, recon_l1, es_rmse = TomographyModel._vcd_iteration_stats(
-                error_sinogram, flat_recon, sigma_y, weights,
-                num_real_elements=num_real_elements,
-                real_sino_size=real_sino_size)
+                error_sinogram, flat_recon, sigma_y, weights)
         return fm_loss, recon_l1, es_rmse
 
     def prox_map(self, prox_input, sinogram, sigma_prox=None, weights=None,

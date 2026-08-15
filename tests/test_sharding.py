@@ -41,6 +41,35 @@ def test_shards_gather_roundtrip():
         Shards(parts[:1], p)
 
 
+def test_the_split_is_balanced_and_the_gather_keeps_every_element():
+    """The four properties of the split, over sizes and device counts that
+    test_placement_ranges_split_evenly_within_one does not reach.
+
+    Three properties describe the blocks themselves.  They tile the axis with
+    no gap and no overlap, their lengths differ by at most one, and the longer
+    blocks come first.  The fourth property is about the gather: a Shards built
+    on an uneven split concatenates back to the original array with nothing
+    dropped.  The sizes below include device counts above the axis length,
+    because that is the only way a block of length zero arises.
+    """
+    for size, count in [(7, 2), (6, 2), (5, 4), (9, 4), (3, 4), (1, 3),
+                        (0, 2), (12, 3), (17, 5)]:
+        p = Placement(["cpu"] * count, axis=0, real_size=size)
+        ranges = [r for _, r in p.shard_ranges()]
+        lengths = [e - s for s, e in ranges]
+        assert len(ranges) == count, (size, count)
+        assert ranges[0][0] == 0 and ranges[-1][1] == size, (size, count)
+        assert all(ranges[k][1] == ranges[k + 1][0]
+                   for k in range(count - 1)), (size, count)
+        assert sum(lengths) == size, (size, count)
+        assert max(lengths) - min(lengths) <= 1, (size, count, lengths)
+        assert lengths == sorted(lengths, reverse=True), (size, count, lengths)
+
+        full = np.arange(3 * size, dtype=np.float32).reshape(size, 3)
+        sh = Shards([torch.as_tensor(full[s:e]) for s, e in ranges], p)
+        assert np.array_equal(sh.gather(), full), (size, count)
+
+
 def test_banded_adjoint_pair_values():
     # broadcast then reduce reproduces a single-device sum exactly on the
     # virtual 2-CPU placement (transfers are no-ops; the pattern is real).
@@ -50,7 +79,10 @@ def test_banded_adjoint_pair_values():
     assert all(torch.equal(c, band) for c in copies.values())
     partials = [torch.rand(5, 3) for _ in owners]
     total = sum_band_to_owner(partials, owners[0])
-    assert torch.allclose(total, partials[0] + partials[1])
+    ref_total = partials[0] + partials[1]
+    rel = float((total - ref_total).abs().max()
+                / max(float(ref_total.abs().max()), 1e-30))
+    assert rel < 1e-6, rel
 
 
 def test_the_streamed_reduce_matches_the_one_shot_sum_exactly(monkeypatch):
@@ -129,7 +161,8 @@ def test_real_cross_device_transfer_cpu_mps():
     band = torch.rand(64, 16)
     copies = broadcast_band_to_views(band, [torch.device(d) for d in devs])
     assert copies[torch.device("mps")].device.type == "mps"
-    assert torch.allclose(copies[torch.device("mps")].cpu(), band)
+    # A broadcast copies bytes, so the round trip is exact, not merely close.
+    assert torch.equal(copies[torch.device("mps")].cpu(), band)
     partials = [copies[torch.device("cpu")] * 2.0,
                 copies[torch.device("mps")] * 3.0]
     total = sum_band_to_owner(partials, torch.device("cpu"))
@@ -138,9 +171,9 @@ def test_real_cross_device_transfer_cpu_mps():
     rel = float((total - ref_total).abs().max()
                 / max(float(ref_total.abs().max()), 1e-30))
     assert rel < 1e-6, rel
-    # The host-bounce fallback path is value-correct too.
+    # The host-bounce fallback path copies bytes as well, so it is exact too.
     bounced = move_shard(band.to("mps"), torch.device("cpu"), dev2dev_safe=False)
-    assert torch.allclose(bounced, band)
+    assert torch.equal(bounced, band)
 
 
 def test_model_shard_and_gather_roundtrip():
@@ -416,7 +449,8 @@ def test_placements_refresh_on_geometry_change():
     assert m.recon_placement.real_size == m.get_params('recon_shape')[2]
     sino = np.random.RandomState(0).rand(12, 10, 8).astype(np.float32)
     sh = m._shard_sinogram(sino)
-    assert np.allclose(m._gather_sinogram(sh), sino)   # lossless again
+    # Splitting and gathering only copies, so the round trip is exact.
+    assert np.array_equal(m._gather_sinogram(sh), sino)
 
 
 def test_cone_sharded_fdk_matches_single_device():
@@ -586,6 +620,54 @@ def test_fully_idle_device_refused():
         raise AssertionError("expected ValueError for a fully idle device")
     except ValueError as e:
         assert 'no views AND no slices' in str(e)
+
+
+def test_five_views_and_five_slices_configure_and_recon_on_four_devices():
+    """A layout the padded split refused and the balanced split admits.
+
+    Under the pad, five views and five slices over four devices left the last
+    device with two padded views and two padded slices, so it owned no real
+    data on either axis and the empty-shard rule refused the layout.  The
+    balanced split gives that device one view and one slice instead, so the
+    layout is legal.  This is the one user-visible change in behavior from
+    removing the pad.  No other test reaches it, because a layout the old rule
+    refused could not appear in the suite at all.
+
+    The configure_devices call below is the acceptance assertion, since it
+    raises on a refused layout.  The recon that follows shows that the layout
+    also reproduces the single-device values.
+    """
+    import mbirtorch
+    sino_shape = (5, 5, 8)
+    angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
+
+    def build():
+        m = mbirtorch.ParallelBeamModel(sino_shape, angles)
+        m.configure_devices(devices=["cpu"])
+        m.set_params(no_warning=True, verbose=0)
+        return m
+
+    m1 = build()
+    rs = tuple(m1.get_params('recon_shape'))
+    assert rs[2] == 5                    # parallel beam ties slices to rows
+    phantom = np.zeros(rs, dtype=np.float32)
+    phantom[1:-1, 1:-1, 1:-1] = 1.0
+    sino = m1.forward_project(phantom)
+    np.random.seed(83)
+    ref, _ = m1.recon(sino, max_iterations=2, stop_threshold_change_pct=0.0)
+
+    m4 = build()
+    m4.configure_devices(devices=["cpu"] * 4)
+    # Both axes split 2, 1, 1, 1, so no device is empty on either axis.
+    assert [e - s for _d, (s, e)
+            in m4.sino_placement.shard_ranges()] == [2, 1, 1, 1]
+    assert [e - s for _d, (s, e)
+            in m4.recon_placement.shard_ranges()] == [2, 1, 1, 1]
+    np.random.seed(83)
+    out, _ = m4.recon(sino, max_iterations=2, stop_threshold_change_pct=0.0)
+    rel = np.max(np.abs(out - ref)) / max(np.max(np.abs(ref)), 1e-30)
+    print(f"five views and five slices on four devices: rel {rel:.2e}")
+    assert rel < 5e-4, rel
 
 
 def test_cone_sharded_vcd_recon_matches_single_device():
@@ -784,10 +866,21 @@ def test_thin_volume_more_devices_than_slices():
     rel = np.max(np.abs(out - ref)) / max(np.max(np.abs(ref)), 1e-30)
     print(f"thin parallel n4 vs n1: rel {rel:.2e}")
     assert rel < 5e-4, rel
-    # The empty shard's device form stayed identically zero.
+    # The device form of the same run, one iteration long.  The fourth device
+    # owns no slices, so its block is zero-length on the slice axis and full
+    # size on the other two.  The three devices that do own slices carry the
+    # single-device values.
+    np.random.seed(63)
+    ref1, _ = m1.recon(sino, weights=weights, max_iterations=1,
+                       stop_threshold_change_pct=0.0)
+    np.random.seed(63)
     dev_recon, _ = m2.recon(sino, weights=weights, max_iterations=1,
                             stop_threshold_change_pct=0.0, output_sharded=True)
-    assert float(torch.abs(dev_recon.tensors[-1]).sum()) == 0.0
+    assert tuple(dev_recon.tensors[-1].shape) == (rs[0], rs[1], 0)
+    assert dev_recon.tensors[-1].dtype == dev_recon.tensors[0].dtype
+    rel1 = (np.max(np.abs(m2._gather_recon(dev_recon) - ref1))
+            / max(np.max(np.abs(ref1)), 1e-30))
+    assert rel1 < 5e-4, rel1
 
     cell = (8, 3, 8)
     cangles = np.linspace(0, 2 * np.pi, cell[0], endpoint=False)
@@ -857,9 +950,17 @@ def test_sparse_view_more_devices_than_views():
     # partition pass plus cross-device float reorders -- the mbirjax
     # structure).  The sparse-view layout adds nothing beyond that floor.
     assert rel < 5e-3, rel
-    # The empty view-owner's sinogram block stays identically zero.
+    # The fourth device owns no views, so its sinogram block is zero-length on
+    # the view axis and full size on the detector axes.  The three devices that
+    # do own views carry the single-device values.  A forward projection is a
+    # single pass through the projectors, so it gates at 1e-5 rather than at
+    # the iterated level above.
     fwd_dev = m2.forward_project(phantom, output_sharded=True)
-    assert float(torch.abs(fwd_dev.tensors[-1]).sum()) == 0.0
+    assert tuple(fwd_dev.tensors[-1].shape) == (0,) + sino_shape[1:]
+    assert fwd_dev.tensors[-1].dtype == fwd_dev.tensors[0].dtype
+    rel_fwd = (np.max(np.abs(m2._gather_sinogram(fwd_dev) - sino))
+               / max(np.max(np.abs(sino)), 1e-30))
+    assert rel_fwd < 1e-5, rel_fwd
 
     cell = (3, 8, 8)
     cangles = np.linspace(0, 2 * np.pi, cell[0], endpoint=False)

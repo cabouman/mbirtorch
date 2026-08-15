@@ -725,22 +725,18 @@ class ConeBeamModel(TomographyModel):
                 w = torch.as_tensor(w_full[s0:s1].astype(np.float32), device=dev)
                 tensors.append(recon.tensors[i] * w[None, None, :])
             return _sharding.Shards(tensors, rp)
-        num_real_slices = recon_shape[2]
-        k = np.arange(recon.shape[2])
-        z_k = delta_voxel_slice * (k - (num_real_slices - 1) / 2.0) + recon_slice_offset
+        num_slices = recon_shape[2]
+        k = np.arange(num_slices)
+        z_k = delta_voxel_slice * (k - (num_slices - 1) / 2.0) + recon_slice_offset
         det_half_height_iso = 0.5 * num_rows * delta_det_row / M_0
         visible = np.abs(z_k[:, None] - helical_z_shifts[None, :]) <= det_half_height_iso
         coverage = np.sum(visible, axis=1)
         z_weight = np.where(coverage > 0, num_views / np.maximum(coverage, 1), 0.0)
-        # Padded device-form slices (k >= num_real_slices) are identically zero
-        # by the forced-zero invariant and must remain so.  A no-op until a
-        # sharding port pads the slice axis (recon.shape[2] == recon_shape[2]).
-        z_weight = np.where(k < num_real_slices, z_weight, 0.0)
         w = torch.as_tensor(z_weight.astype(np.float32), device=recon.device)
         return recon * w[None, None, :]
 
     def _helical_z_weight_row(self, sinogram):
-        """The full (num_real_slices,) helical z-weight row in global slice
+        """The full (num_slices,) helical z-weight row in global slice
         coordinates (the shared math of helical_fdk_z_weight, from params
         only, host numpy)."""
         num_views, num_rows, _ = self.get_params('sinogram_shape')
@@ -751,9 +747,9 @@ class ConeBeamModel(TomographyModel):
              'recon_slice_offset', 'delta_det_row'])
         M_0 = self.get_magnification()
         delta_voxel_slice = voxel_slice_aspect * delta_voxel
-        num_real_slices = recon_shape[2]
-        k = np.arange(num_real_slices)
-        z_k = delta_voxel_slice * (k - (num_real_slices - 1) / 2.0) \
+        num_slices = recon_shape[2]
+        k = np.arange(num_slices)
+        z_k = delta_voxel_slice * (k - (num_slices - 1) / 2.0) \
             + recon_slice_offset
         det_half_height_iso = 0.5 * num_rows * delta_det_row / M_0
         visible = np.abs(z_k[:, None] - helical_z_shifts[None, :]) \

@@ -724,7 +724,7 @@ def project_vector_to_vector(u1, u2):
     return u1_proj
 
 
-def apply_cylindrical_mask(recon, radial_margin=0, top_margin=0, bottom_margin=0, num_real_slices=None):
+def apply_cylindrical_mask(recon, radial_margin=0, top_margin=0, bottom_margin=0):
     """
     Applies a cylindrical mask to a 3D reconstruction volume.
 
@@ -743,9 +743,6 @@ def apply_cylindrical_mask(recon, radial_margin=0, top_margin=0, bottom_margin=0
         radial_margin (int): Margin to subtract from the cylinder radius in pixels.
         top_margin (int): Number of top slices to set to zero along the Z-axis.
         bottom_margin (int): Number of bottom slices to set to zero along the Z-axis.
-        num_real_slices (int or None): Slice index the bottom margin ends at, for a volume whose
-            last slices are to be left alone.  None (default) puts the bottom margin at the end of
-            the volume.
 
     Returns:
         np.ndarray or torch.Tensor: Masked 3D volume of the same shape and array module as `recon`.
@@ -761,7 +758,7 @@ def apply_cylindrical_mask(recon, radial_margin=0, top_margin=0, bottom_margin=0
     # global slice ranges, so each shard zeroes its own overlap with them.
     if isinstance(recon, _sharding.Shards):
         pl = recon.placement
-        num_real = pl.real_size if num_real_slices is None else num_real_slices
+        num_slices = pl.real_size
         out = []
         for t, (_dev, (s0, s1)) in zip(recon.tensors, pl.shard_ranges()):
             masked = apply_cylindrical_mask(t, radial_margin=radial_margin)
@@ -769,8 +766,8 @@ def apply_cylindrical_mask(recon, radial_margin=0, top_margin=0, bottom_margin=0
             hi = min(s1, top_margin)
             if hi > lo:
                 masked[:, :, lo - s0:hi - s0] = 0
-            lo = max(s0, num_real - bottom_margin)
-            hi = min(s1, num_real)
+            lo = max(s0, num_slices - bottom_margin)
+            hi = min(s1, num_slices)
             if hi > lo:
                 masked[:, :, lo - s0:hi - s0] = 0
             out.append(masked)
@@ -801,13 +798,10 @@ def apply_cylindrical_mask(recon, radial_margin=0, top_margin=0, bottom_margin=0
     recon = recon * circular_mask[:, :, None]
 
     # Zero top/bottom margins in place on that new array (no second full-volume copy -> 2x not 3x).
-    # The bottom margin ends at num_real_slices, so a caller that wants the last slices left alone
-    # can say where the margin belongs.
-    num_real_slices = recon.shape[2] if num_real_slices is None else num_real_slices
     if top_margin > 0:
         recon[:, :, :top_margin] = 0
     if bottom_margin > 0:
-        recon[:, :, num_real_slices - bottom_margin:num_real_slices] = 0
+        recon[:, :, num_slices - bottom_margin:num_slices] = 0
 
     return recon
 
