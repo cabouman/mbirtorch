@@ -395,6 +395,13 @@ class MultiAxisParallelModel(TomographyModel):
             geometry, so this direct reconstruction is only approximate; it is
             intended as an initializer for the iterative ``recon()``.
         """
+        # Settle the device layout before the first large allocation, as
+        # recon() does: a no-op when the user already chose devices;
+        # otherwise the automatic selection runs here, so a bare FBP call
+        # spreads across the GPUs instead of landing whole on one.  The
+        # workload tells the memory check to price this reconstruction rather
+        # than the full recon the device count is chosen for.
+        self._apply_device_policy(workload='direct')
         filtered_sinogram = self.fbp_filter(sinogram, filter_name=filter_name,
                                             output_sharded=True)
         recon = self.back_project(filtered_sinogram, output_sharded=True)

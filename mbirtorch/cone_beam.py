@@ -776,8 +776,10 @@ class ConeBeamModel(TomographyModel):
         # recon() does: a no-op when the user already chose devices;
         # otherwise the automatic selection runs here, so a bare FDK call
         # spreads across the GPUs instead of landing whole on one (the A2
-        # gap that failed the full-resolution MAR runs).
-        self._apply_device_policy()
+        # gap that failed the full-resolution MAR runs).  The workload tells
+        # the memory check to price this reconstruction rather than the full
+        # recon the device count is chosen for.
+        self._apply_device_policy(workload='direct')
         # Place once at entry so the filter receives device-form data (a no-op
         # when already placed; a single device is the trivial 1-shard case).
         # The pipeline then stays on-device throughout -- fdk_filter then

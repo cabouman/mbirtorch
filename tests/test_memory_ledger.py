@@ -812,6 +812,88 @@ def test_calibration_band_verdicts():
     assert ' ok ' in text or text.count('ok') >= 1
 
 
+# ── the direct workload ──────────────────────────────────────────────────────
+# A direct reconstruction is the filter and one back projection.  It is priced
+# as its own plan because the policy checks capacity against the call in
+# progress, while still choosing the device count for a full recon.
+def test_the_direct_plan_is_the_filter_and_one_back_projection():
+    """The phases a direct reconstruction really runs, and nothing else.
+
+    The filter holds the placed sinogram, the copy it writes, and its own row
+    batch; the back projection reads that copy and scatters into the volume.
+    No prior, no hessian, no partitions and no loop exist while it runs.
+    """
+    sino_bytes = 64 * 32 * 32 * 4
+    ledger = estimate_peak_device_bytes(make_plan(workload='direct'))
+    assert [p.name for p in ledger.phases] == [
+        'direct recon (filter)', 'direct recon (back loop)',
+        'direct recon (scatter)']
+    terms = dict(_named(ledger, 'direct recon (filter)').terms)
+    assert terms['sinogram'][0] == sino_bytes
+    assert terms['filtered sinogram'][0] == sino_bytes
+    assert terms['filter row batch'][0] > 0
+    assert terms['library workspace'][0] == \
+        _memory_ledger.FIXED_DEVICE_OVERHEAD_BYTES
+    # The partitions are the full plan's: a direct reconstruction builds no
+    # partition sequence, so the lead device does not carry one.
+    assert 'partitions (lead device)' not in terms
+    scatter = dict(_named(ledger, 'direct recon (scatter)').terms)
+    assert scatter['scatter buffer'][0] == 32 * 32 * 32 * 4
+
+
+def test_the_direct_plan_costs_less_than_the_full_one_at_the_same_shapes():
+    """The whole point of the narrowed check.  A grid much larger than the
+    masked set makes the hessian dominate the full plan, so the phases the
+    direct plan drops have to move the peak and not merely the phase list."""
+    shape = dict(recon=(64, 64, 32), num_pixels_full=800)
+    full = estimate_peak_device_bytes(make_plan(**shape))
+    direct = estimate_peak_device_bytes(make_plan(workload='direct', **shape))
+    assert direct.peak_bytes(0) < full.peak_bytes(0)
+    for gone in ('hessian', 'subset', 'per-iteration statistics',
+                 'initial forward projection'):
+        assert not _has(direct, gone)
+
+
+def test_the_direct_plan_splits_its_back_projection_like_the_full_one():
+    """Same charges, so the same two consecutive sub-steps: the workers
+    project and the reduce gathers, and the reduce's co-residency is charged
+    where a direct reconstruction really pays it."""
+    ledger = estimate_peak_device_bytes(make_plan(n_devices=2,
+                                                  workload='direct'))
+    workers = _sub(ledger, 'direct recon (back loop)', 2, 'back workers')
+    reduce_phase = _sub(ledger, 'direct recon (back loop)', 2, 'band reduce')
+    assert dict(reduce_phase.terms)['band reduce'][0] > 0
+    for i in (0, 1):
+        both = max(workers.per_device[i], reduce_phase.per_device[i])
+        assert both < workers.per_device[i] + reduce_phase.per_device[i]
+        assert ledger.peak_bytes(i) >= both
+
+
+def test_the_filter_batch_follows_the_rows_it_actually_walks():
+    """apply_row_filter walks ROW_FILTER_BATCH detector rows at a time, so the
+    charge is capped by that batch and not by the shard: a shard with fewer
+    rows than one batch is charged for the rows it has."""
+    from mbirtorch.tomography_utils import ROW_FILTER_BATCH
+
+    small = estimate_peak_device_bytes(make_plan(
+        workload='direct', num_views=4, num_rows=8))       # 32 rows in all
+    large = estimate_peak_device_bytes(make_plan(
+        workload='direct', num_views=1024, num_rows=8))    # far past the batch
+    per_row_small = dict(_named(small, 'filter').terms)['filter row batch'][0]
+    per_row_large = dict(_named(large, 'filter').terms)['filter row batch'][0]
+    assert per_row_large == per_row_small * ROW_FILTER_BATCH // 32
+
+
+def test_a_recon_check_covers_a_direct_one_but_not_the_reverse():
+    """The full plan charges everything the direct plan charges, so a layout
+    checked for a recon needs no direct check.  Nothing else is claimed."""
+    assert _memory_ledger.workload_covers('recon', 'direct')
+    assert _memory_ledger.workload_covers('direct', 'direct')
+    assert _memory_ledger.workload_covers('recon', 'recon')
+    assert not _memory_ledger.workload_covers('direct', 'recon')
+    assert not _memory_ledger.workload_covers(None, 'recon')
+
+
 # ── the model-facing plan ────────────────────────────────────────────────────
 def test_plan_from_model_reads_the_current_params_and_a_candidate_layout():
     angles = np.linspace(0, np.pi, 8, endpoint=False)
@@ -827,6 +909,10 @@ def test_plan_from_model_reads_the_current_params_and_a_candidate_layout():
     assert set(plan.granularities) <= set(model.get_params('granularity'))
     ledger = estimate_peak_device_bytes(plan)
     assert ledger.peak_bytes(0) > 0
+    # A plan is for a full reconstruction unless the caller says otherwise.
+    assert plan.workload == 'recon'
+    assert _memory_ledger.plan_from_model(
+        model, ['cpu', 'cpu'], workload='direct').workload == 'direct'
 
 
 def test_full_index_count_matches_the_index_array_and_caches():

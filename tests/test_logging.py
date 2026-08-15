@@ -144,8 +144,17 @@ def test_device_line_reflects_a_layout_chosen_during_the_run(monkeypatch):
         tuple(model.get_params('recon_shape')))
     sino = model.forward_project(phantom)
 
+    # The stand-in widens ONCE, as the real policy does: it settles at the
+    # top of the run and every later call on the same shapes -- including the
+    # one the nested direct reconstruction makes -- returns the settled
+    # layout.  Re-installing on each call would re-place arrays the run is
+    # already holding.
+    settled = []
+
     def widen(**call_arrays):
-        model._install_device_layout(['cpu', 'cpu'])
+        if not settled:
+            model._install_device_layout(['cpu', 'cpu'])
+            settled.append(True)
         return None
 
     monkeypatch.setattr(model, '_apply_device_policy', widen)

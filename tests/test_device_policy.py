@@ -960,6 +960,225 @@ def test_configure_devices_overrides_a_settled_layout(monkeypatch, unpinned,
     assert model.sino_placement.n_devices == 1
 
 
+# ── the direct reconstructions ───────────────────────────────────────────────
+# fbp_recon and fdk_recon settle the layout themselves, so a direct
+# reconstruction spreads across the devices instead of landing whole on the
+# lead one.  All four geometries are covered here: cone has made the call
+# since commit 72208bb and the other three gained it with this increment.
+def _automatic_parallel(shape=(8, 6, 8)):
+    angles = np.linspace(0, np.pi, shape[0], endpoint=False)
+    return mbirtorch.ParallelBeamModel(shape, angles)
+
+
+def _automatic_cone(shape=(8, 6, 8)):
+    angles = np.linspace(0, 2 * np.pi, shape[0], endpoint=False)
+    return mbirtorch.ConeBeamModel(shape, angles,
+                                   source_detector_dist=4.0 * shape[2],
+                                   source_iso_dist=2.0 * shape[2])
+
+
+def _automatic_translation():
+    """Translation geometry needs a source far enough from the object for the
+    automatic recon shape to exist, so it carries its own size -- the one
+    test_translation.py reconstructs at -- rather than the shared toy shape.
+    The floors section's ``_translation_no_family`` lays its views out on a
+    grid sized for the measured cells, which no toy shape divides."""
+    vectors = mbirtorch.gen_translation_vectors(4, 4, x_spacing=3.0,
+                                                z_spacing=2.0)
+    return mbirtorch.TranslationModel((vectors.shape[0], 40, 32), vectors,
+                                      source_detector_dist=128.0,
+                                      source_iso_dist=32.0)
+
+
+DIRECT_RECONS = [
+    (_automatic_parallel, 'fbp_recon'),
+    (_automatic_cone, 'fdk_recon'),
+    # The multiaxis constructor is the floors section's, at a toy shape.
+    (lambda: _multiaxis_no_family((8, 6, 8)), 'fbp_recon'),
+    (_automatic_translation, 'fdk_recon'),
+]
+DIRECT_RECON_IDS = ['parallel', 'cone', 'multiaxis', 'translation']
+
+
+def _automatic_on_cpu(make, verbose=0):
+    """A model the caller has never placed, put on the CPU the way the
+    automatic path itself does.
+
+    ``_install_device_layout`` carries no policy, so the layout stays the
+    library's to choose, while the fabricated CUDA visibility below cannot
+    pull real allocations onto a device this host lacks.
+    """
+    model = make()
+    model.set_params(no_warning=True, verbose=verbose)
+    model._install_device_layout(['cpu'])
+    assert model.device_layout_is_automatic is True
+    return model
+
+
+def _impulse_sinogram(model):
+    shape = tuple(int(s) for s in model.get_params('sinogram_shape'))
+    sinogram = np.zeros(shape, dtype=np.float32)
+    sinogram[:, shape[1] // 2, shape[2] // 2] = 1.0
+    return sinogram
+
+
+@pytest.mark.parametrize("make,method", DIRECT_RECONS, ids=DIRECT_RECON_IDS)
+def test_a_bare_direct_recon_settles_the_layout_and_spreads(
+        monkeypatch, unpinned, no_speed_guard, make, method):
+    """The A2 gap, closed for every geometry: a direct reconstruction on a
+    model with no explicit layout uses the devices that fit, exactly as recon
+    does, rather than running whole on the lead device."""
+    model = _automatic_on_cpu(make)
+    with_four_visible(monkeypatch, model)
+    recon = getattr(model, method)(_impulse_sinogram(model))
+    assert model.sino_placement.n_devices == 4
+    assert recon.shape == tuple(model.get_params('recon_shape'))
+    assert np.all(np.isfinite(recon))
+
+
+@pytest.mark.parametrize("make,method", DIRECT_RECONS[2:],
+                         ids=DIRECT_RECON_IDS[2:])
+def test_an_unmeasured_geometry_takes_the_parallel_floors_into_its_direct_recon(
+        monkeypatch, unpinned, caplog, make, method):
+    """Neither multiaxis nor translation names a ``_floor_family``, so the
+    parallel floors govern the count their direct reconstruction settles on.
+
+    These shapes are far below every parallel floor, so with the floors in
+    force the reconstruction holds at one device although four are free, and
+    the log says whose floors it borrowed.
+    """
+    model = _automatic_on_cpu(make, verbose=2)
+    with_four_visible(monkeypatch, model)
+    assert model._floor_family is None
+    with caplog.at_level('DEBUG', logger=model.logger.name):
+        getattr(model, method)(_impulse_sinogram(model))
+    assert model.sino_placement.n_devices == 1
+    assert 'names no _floor_family' in caplog.text
+    assert 'parallel widening speed floors' in caplog.text
+
+
+# ── the check against the work in progress ───────────────────────────────────
+# The device COUNT is chosen with the full recon plan, because the settled
+# layout serves the model's whole life.  The capacity check that can REFUSE is
+# made against the call in progress, so a direct reconstruction is not turned
+# away for a recon it is not going to run.
+def budget_between_the_two_plans(monkeypatch, model):
+    """A per-device budget no full recon fits at any count, and that a direct
+    reconstruction fits at four devices.
+
+    Both peaks come from the model's own ledger, so the test fixes the
+    RELATION between the two plans rather than a number that would have to be
+    rewritten whenever a charge moves.
+    """
+    def devices(count):
+        return [torch.device('cpu', i) for i in range(count)]
+
+    direct = model._build_memory_ledger(devices=devices(4),
+                                        workload='direct').peak_bytes(0)
+    recon = [model._build_memory_ledger(devices=devices(n)).peak_bytes(0)
+             for n in (1, 2, 3, 4)]
+    budget = int(1.20 * direct)               # clears the 0.15 margin
+    assert budget < min(recon)                # and no count fits a recon
+    monkeypatch.setattr(_memory_ledger, 'device_budget_bytes',
+                        lambda d: budget)
+    return budget
+
+
+def test_a_geometry_too_large_for_a_recon_still_runs_a_direct_recon(
+        monkeypatch, unpinned, no_speed_guard):
+    """The cost §2.3 records, removed.  Every device count is short for a full
+    recon here, and the direct reconstruction that was going to run is not
+    refused for it -- it runs, on the widest count that holds it."""
+    model = _automatic_on_cpu(lambda: _automatic_parallel((128, 64, 128)))
+    with_four_visible(monkeypatch, model)
+    budget_between_the_two_plans(monkeypatch, model)
+    recon = model.fbp_recon(_impulse_sinogram(model))
+    assert model.sino_placement.n_devices == 4
+    assert np.all(np.isfinite(recon))
+    # The count in use is not reported as a rejection, and the line says why
+    # it was taken.
+    reasons = dict(model.device_choice_rejections)
+    assert 'chosen for the direct reconstruction in progress' in reasons[4]
+    assert '4 used, chosen for the direct reconstruction' in \
+        model._device_report()
+
+
+def test_a_recon_on_that_same_model_is_refused_by_the_preflight(
+        monkeypatch, unpinned, no_speed_guard):
+    """The other half of the rule.  The layout settled under the narrower
+    check, so the recon that does not fit it must be refused HERE, with the
+    message and the remedies, rather than reaching the allocator."""
+    model = _automatic_on_cpu(lambda: _automatic_parallel((128, 64, 128)))
+    with_four_visible(monkeypatch, model)
+    budget_between_the_two_plans(monkeypatch, model)
+    model._apply_device_policy(workload='direct')     # what fbp_recon does
+    assert model.sino_placement.n_devices == 4
+    assert model._settled_workload == 'direct'
+
+    with pytest.raises(MemoryPreflightError) as excinfo:
+        model.recon(_impulse_sinogram(model), max_iterations=1)
+    message = str(excinfo.value)
+    assert 'more memory' in message
+    assert 'dominant phase' in message
+    assert 'skip_memory_preflight' in message
+
+
+def test_a_direct_recon_on_a_recon_settled_model_repeats_no_check(
+        monkeypatch, unpinned, no_speed_guard):
+    """The nested direct reconstruction inside vcd_recon arrives here on every
+    run.  The recon plan charges everything the direct plan charges, so the
+    settled layout has already been checked for it and the poisoned budget
+    must not be consulted."""
+    model = make_model((16, 8, 16))
+    with_four_visible(monkeypatch, model)
+    model._apply_device_policy()
+    assert model._settled_workload == 'recon'
+    poison_budgets(monkeypatch)
+    model._apply_device_policy(workload='direct')
+    assert model.sino_placement.n_devices == 4
+
+
+def test_a_recon_after_a_direct_settle_rechecks_once_and_then_stops(
+        monkeypatch, unpinned, no_speed_guard):
+    """The narrowed check costs one extra preflight, not one per call.
+
+    A layout settled under a direct reconstruction was checked against what
+    that reconstruction allocates, so the first recon re-runs the check on it.
+    The layout does not move -- the same placement object survives, so shards
+    a caller holds stay valid -- and passing records the recon as the workload
+    the layout is known to hold, which the poisoned budget then proves.
+    """
+    model = _automatic_on_cpu(lambda: _automatic_parallel((128, 64, 128)))
+    with_four_visible(monkeypatch, model)
+    budget_between_the_two_plans(monkeypatch, model)
+    model._apply_device_policy(workload='direct')
+    placement = model.sino_placement
+    assert model._settled_workload == 'direct'
+
+    # Room appears (the neighbor that was using the GPUs has exited).
+    monkeypatch.setattr(_memory_ledger, 'device_budget_bytes',
+                        lambda d: 64 * GB)
+    model._apply_device_policy()
+    assert model.sino_placement is placement
+    assert model._settled_workload == 'recon'
+    poison_budgets(monkeypatch)
+    model._apply_device_policy()
+
+
+def test_configure_devices_clears_the_settled_workload_too(
+        monkeypatch, unpinned, no_speed_guard):
+    """A model the caller has placed carries no settled record of either kind.
+    The explicit branch reads neither, so a record left behind would only be a
+    state that can disagree with the layout in use."""
+    model = make_model((16, 8, 16))
+    with_four_visible(monkeypatch, model)
+    model._apply_device_policy()
+    assert model._settled_workload == 'recon'
+    model.configure_devices(devices=['cpu'])
+    assert model._settled_shapes is None
+    assert model._settled_workload is None
+
+
 # ── the calibration scope ────────────────────────────────────────────────────
 def test_calibration_resets_once_per_reconstruction(monkeypatch):
     """The counters reset where the report that reads them lives, so the

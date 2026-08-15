@@ -34,8 +34,11 @@ would need and takes the largest *preferred* count whose per-device share fits, 
 safety margin; if none of them fits, it falls back through the set-aside counts rather
 than refusing to run.  So a reconstruction that genuinely needs four GPUs still gets
 them.  If no layout fits at all, the reconstruction fails immediately with the shortfall
-named, rather than failing mid-run with an out-of-memory error.  Two model attributes
-tune the memory check: ``model.skip_memory_preflight = True`` runs without it, and
+named, rather than failing mid-run with an out-of-memory error.  A direct reconstruction
+(``fbp_recon``, ``fdk_recon``) is checked against what it alone allocates, which is far
+less than an iterative ``recon``, so it still runs on a problem too large for one; the
+``recon`` itself is then the call that is refused.  Two model attributes tune the memory
+check: ``model.skip_memory_preflight = True`` runs without it, and
 ``model.memory_preflight_margin`` (default 0.15) is the fraction by which the estimate is
 padded before it is compared with the free memory.  Note that skipping the preflight
 skips the *memory* rule only; the speed floors still order the choice.

@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
-from . import _sharding
+from . import _sharding, tomography_utils
 
 _F32_BYTES = 4
 _INT64_BYTES = 8
@@ -223,7 +223,12 @@ class LedgerPlan:
     num_pixels_grid: int                  # the unmasked grid (the hessian's)
     granularities: tuple                  # subset counts the sequence visits
     partition_granularities: tuple        # every subset count built up front
-    # ── what this call supplies ──────────────────────────────────────────────
+    # ── what this call runs and supplies ─────────────────────────────────────
+    # Which call the plan prices: 'recon' for a full reconstruction, 'direct'
+    # for a direct reconstruction alone.  A direct reconstruction holds far
+    # less -- no prior, no hessian, no partitions, no loop state -- so the two
+    # are separate plans rather than one plan with the extra terms zeroed.
+    workload: str = 'recon'
     weights_supplied: bool = False
     fm_hessian_supplied: bool = False
     init_recon_supplied: bool = False
@@ -282,6 +287,11 @@ def estimate_peak_device_bytes(plan):
     only on ``plan``.  That is what lets the widening rule price a device
     count the model is not configured for, and what lets the tests run the
     whole model on CPU.
+
+    Which phases are emitted follows ``plan.workload``: a full reconstruction
+    by default, and the filter and single back projection of a direct
+    reconstruction under ``'direct'``.  Both share the charges below, so the
+    two plans cannot drift apart.
 
     Returns:
         Ledger: the phases and their per-device bytes.
@@ -628,6 +638,45 @@ def estimate_peak_device_bytes(plan):
         return ((live - already_paid) * int(view_batch)
                 * forward_block_rows(i) * num_channels * _F32_BYTES)
 
+    # ── the direct recon's filter ────────────────────────────────────────────
+    # Charged only by the 'direct' plan: inside a full reconstruction the
+    # filter runs between phases that hold more than it does.
+    def filter_row_weights(i):
+        """The FDK cosine pre-weight, one detector plane per device.
+
+        ``fdk_filter`` builds it and ``_apply_direct_recon_filter`` copies it
+        onto every device (``row_weight.to(d)``).  The FBP filters pass none,
+        so this over-charges them by one detector plane, which is one view of
+        the sinogram.
+        """
+        return int(plan.sino_rows) * num_channels * _F32_BYTES
+
+    def filter_row_batch(i):
+        """What one batch of the filter's row loop holds.
+
+        ``tomography_utils.apply_row_filter`` walks the shard
+        ROW_FILTER_BATCH detector rows at a time, convolving in frequency
+        space.  At the widest instant -- inside the inverse transform -- one
+        batch holds the pre-weighted window, the window's real FFT, its
+        product with the filter's transform, and the inverse transform's
+        output.  The two frequency arrays are complex over the zero-padded
+        length, and the inverse is real over that same length; the filtered
+        sinogram the batches write into is charged separately, as the array
+        it is.
+
+        The batch is a fixed row count, so this term does not fall with the
+        device count.
+        """
+        rows_in_shard = plan.view_blocks[i][0] * int(plan.sino_rows)
+        batch = min(tomography_utils.ROW_FILTER_BATCH, rows_in_shard)
+        # channels + (2 * channels - 1) taps - 1, the linear convolution
+        # length apply_row_filter transforms at.
+        padded = 3 * num_channels - 2
+        per_row = (num_channels * _F32_BYTES
+                   + 2 * (padded // 2 + 1) * (2 * _F32_BYTES)
+                   + padded * _F32_BYTES)
+        return batch * per_row
+
     # ── the persistent set ───────────────────────────────────────────────────
     # One sinogram-shaped weights term, never two: when the caller supplies
     # weights the hessian's weight array is a bare ALIAS of them, and when it
@@ -668,12 +717,14 @@ def estimate_peak_device_bytes(plan):
 
     # The partitions and the index cache are built before the reconstruction
     # starts and live on the lead device for its whole duration, so they are a
-    # base under EVERY phase, not only the loop.
+    # base under EVERY phase, not only the loop.  The workspace term is named
+    # separately because it is the only one of the two a direct reconstruction
+    # also carries.
+    workspace_term = ('library workspace', [FIXED_DEVICE_OVERHEAD_BYTES] * n)
     constant_terms = [
         ('partitions (lead device)',
          persistent.pop('partitions (lead device)')),
-        ('library workspace',
-         [FIXED_DEVICE_OVERHEAD_BYTES] * n),
+        workspace_term,
     ]
     constant_base = [sum(vals[i] for _name, vals in constant_terms)
                      for i in range(n)]
@@ -716,6 +767,46 @@ def estimate_peak_device_bytes(plan):
                        base=base, base_terms=base_terms),
                 _phase(f'{name} [band reduce]', reduce_terms, n,
                        base=base, base_terms=base_terms)]
+
+    # ── the direct plan ──────────────────────────────────────────────────────
+    # A direct reconstruction is the filter and one back projection, and this
+    # is all of it.  It builds no prior, no hessian diagonal, no partition
+    # sequence and no reconstruction loop, so the only thing under its phases
+    # is the library's own workspace, and the phases themselves are the ones
+    # the full plan gives the same code.
+    #
+    # The device count is still chosen for a full recon; this plan is what the
+    # capacity check that can REFUSE is made against.  See
+    # TomographyModel._apply_device_policy.
+    if plan.workload == 'direct':
+        p_full = plan.num_pixels_full
+        base_terms = [workspace_term]
+        base = list(workspace_term[1])
+        # The sinogram is placed at entry (_shard_sinogram) and the filter
+        # writes a second array of the same shape (apply_row_filter's `out`),
+        # which is the input the back projection then reads.
+        residents = [
+            ('sinogram', per_dev(sino_dev)),
+            ('filtered sinogram', per_dev(sino_dev)),
+        ]
+        filter_terms = residents + [
+            ('filter row weights', per_dev(filter_row_weights)),
+            ('filter row batch', per_dev(filter_row_batch)),
+        ]
+        scatter_terms = residents + [
+            ('back cylinders', per_dev(lambda i: cyl(i, p_full))),
+            ('scatter buffer', per_dev(recon_dev)),
+        ]
+        if plan.helical:
+            scatter_terms.append(('helical z-weight', per_dev(recon_dev)))
+        phases.append(_phase('direct recon (filter)', filter_terms, n,
+                             base=base, base_terms=base_terms))
+        phases.extend(back_phases('direct recon (back loop)', residents,
+                                  p_full, base, base_terms))
+        phases.append(_phase('direct recon (scatter)', scatter_terms, n,
+                             base=base, base_terms=base_terms))
+        return Ledger(devices=list(plan.devices), phases=phases,
+                      num_pixels_full=int(plan.num_pixels_full))
 
     # ── phase B: the direct reconstruction ───────────────────────────────────
     # Runs only when no initial reconstruction was supplied.  Its full-index
@@ -946,15 +1037,20 @@ def qggmrf_cylinder_count(model):
     return QGGMRF_CYLINDERS_COMPILED
 
 
-def plan_from_model(model, devices, partition_sequence=None, weights=None,
-                    init_recon=None, fm_hessian=None, prox_input=None,
-                    init_error_sinogram=None):
+def plan_from_model(model, devices, workload='recon', partition_sequence=None,
+                    weights=None, init_recon=None, fm_hessian=None,
+                    prox_input=None, init_error_sinogram=None):
     """Build a :class:`LedgerPlan` for ``model`` over a CANDIDATE device list.
 
     The device list is an argument rather than a reading of the model's own
     placement, because the widening rule prices counts the model is not
     configured for.  The placements are rebuilt here from the current params,
     so a geometry change cannot leave a stale real size behind.
+
+    ``workload`` names the call the plan is for: ``'recon'`` (the default)
+    prices a full reconstruction, and ``'direct'`` prices a direct
+    reconstruction -- the filter and one back projection, with none of the
+    prior, hessian, partition and loop state a full reconstruction holds.
     """
     sinogram_shape = tuple(int(s) for s in model.get_params('sinogram_shape'))
     recon_shape = tuple(int(s) for s in model.get_params('recon_shape'))
@@ -992,6 +1088,7 @@ def plan_from_model(model, devices, partition_sequence=None, weights=None,
         sinogram_shape=sinogram_shape,
         recon_shape=recon_shape,
         devices=devices,
+        workload=workload,
         view_blocks=view_blocks,
         slice_blocks=slice_blocks,
         sino_rows=int(sino_rows),
@@ -1019,6 +1116,18 @@ def plan_from_model(model, devices, partition_sequence=None, weights=None,
         view_charge=charge,
         torch_body_directions=torch_body_directions(model),
     )
+
+
+def workload_covers(checked, incoming):
+    """Whether a layout already checked for ``checked`` needs no fresh check
+    before ``incoming`` runs on it.
+
+    The recon plan charges every array the direct plan charges and a great
+    deal besides, so a layout that passed a recon check passes a direct one.
+    Nothing beyond that pair is claimed: a plan added later is unrelated to
+    these until it has been priced against them.
+    """
+    return checked == incoming or (checked, incoming) == ('recon', 'direct')
 
 
 def torch_body_directions(model):

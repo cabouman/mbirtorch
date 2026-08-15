@@ -361,6 +361,13 @@ class ParallelBeamModel(TomographyModel):
         Returns:
             recon (numpy or tensor): the reconstructed volume.
         """
+        # Settle the device layout before the first large allocation, as
+        # recon() does: a no-op when the user already chose devices;
+        # otherwise the automatic selection runs here, so a bare FBP call
+        # spreads across the GPUs instead of landing whole on one.  The
+        # workload tells the memory check to price this reconstruction rather
+        # than the full recon the device count is chosen for.
+        self._apply_device_policy(workload='direct')
         # Place once at entry so the filter receives device-form data (a no-op
         # when already placed; a single device is the trivial 1-shard case).
         sinogram = self._shard_sinogram(sinogram)

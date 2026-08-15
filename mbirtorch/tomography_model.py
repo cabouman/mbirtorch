@@ -171,6 +171,11 @@ class TomographyModel(ParameterHandler):
         # configure_devices clears it too, so a pinned model carries no
         # settled record.
         self._settled_shapes = None
+        # The workload the settled layout's capacity check was made against
+        # ('recon' or 'direct').  A call that allocates more than that check
+        # priced re-runs the check on the settled layout, so a reconstruction
+        # can never reach the allocator with no preflight behind it.
+        self._settled_workload = None
         # Device counts the automatic choice turned down, and why, for the run
         # log's device line.  Empty when the layout was never searched.
         self.device_choice_rejections = []
@@ -359,6 +364,15 @@ class TomographyModel(ParameterHandler):
 
         Returns:
             recon (numpy or tensor): The reconstructed volume.
+
+        Note:
+            An implementation settles the device layout before its first large
+            allocation, with ``self._apply_device_policy(workload='direct')``
+            as its first statement.  Without that call a direct reconstruction
+            on a model whose layout the caller has not fixed runs whole on the
+            lead device; with it, the memory check prices the direct
+            reconstruction rather than the full recon the device count is
+            chosen for.
         """
         raise NotImplementedError
 
@@ -1184,6 +1198,7 @@ class TomographyModel(ParameterHandler):
         # must not carry one.  The explicit branch never reads it, so this
         # keeps the two states consistent rather than changing behavior.
         self._settled_shapes = None
+        self._settled_workload = None
         if devices is None:
             if num_devices == 1:
                 devices = [self.torch_device]
@@ -1221,12 +1236,14 @@ class TomographyModel(ParameterHandler):
             self.create_projectors()
 
     # ── the memory ledger and the automatic device count ──────────────────────
-    def _build_memory_ledger(self, devices=None, **call_arrays):
+    def _build_memory_ledger(self, devices=None, workload='recon',
+                             **call_arrays):
         """The modeled per-device peak for one candidate device list.
 
         ``devices`` prices a CANDIDATE list rather than the model's current
         one, which is what lets the automatic choice evaluate a layout the
-        model is not in.  None means the current placement.
+        model is not in.  None means the current placement.  ``workload``
+        names the call to price; see :func:`_memory_ledger.plan_from_model`.
 
         The ledger math is device-agnostic, so this builds one for any
         backend.  WHETHER to consult one is the policy's decision, not this
@@ -1235,7 +1252,8 @@ class TomographyModel(ParameterHandler):
         devices = list(self.sino_placement.devices if devices is None
                        else devices)
         return _memory_ledger.estimate_peak_device_bytes(
-            _memory_ledger.plan_from_model(self, devices, **call_arrays))
+            _memory_ledger.plan_from_model(self, devices, workload=workload,
+                                           **call_arrays))
 
     def _candidate_devices(self, num_devices):
         return [torch.device(f'cuda:{i}') for i in range(num_devices)]
@@ -1249,9 +1267,14 @@ class TomographyModel(ParameterHandler):
                                                        'recon_shape'])
         return tuple(sinogram_shape), tuple(recon_shape)
 
-    def _apply_device_policy(self, **call_arrays):
+    def _apply_device_policy(self, workload='recon', **call_arrays):
         """Settle the device layout for the reconstruction about to run, and
         return the ledger for the layout settled on.
+
+        ``workload`` names the call in progress: ``'recon'`` (the default) for
+        a full reconstruction, ``'direct'`` for a direct reconstruction.  It
+        tells the ledger what is about to be allocated; it is not a way for a
+        caller to overrule the policy.
 
         This is the one site where the automatic device count is chosen, and
         it is deliberately not model construction.  Two reasons carry that.
@@ -1296,6 +1319,18 @@ class TomographyModel(ParameterHandler):
         construction: a count the caller named is not the library's to
         second-guess.
 
+        Two decisions are made from two different plans.  The COUNT is chosen
+        with the full recon plan, because the settled layout serves the
+        model's whole life and the most demanding call it may later carry is a
+        full ``recon``.  The capacity check that can REFUSE is made against
+        the plan for the call in progress, so a direct reconstruction is not
+        turned away for a reconstruction it is not running: when no count fits
+        a full recon, the search settles on the first candidate that fits the
+        work in progress and refuses only when nothing fits even that.  The
+        workload whose check the layout passed is recorded beside the shapes,
+        and a later call that allocates more than it re-runs the check on the
+        settled layout -- the layout does not move, only the check runs.
+
         Note that the halves of ``split_sino_recon`` arrive HERE.  Since the
         2026-08 prerelease change they inherit no explicit layout from the
         parent unless the parent had one, so each half chooses for itself --
@@ -1312,16 +1347,30 @@ class TomographyModel(ParameterHandler):
 
         if self._settled_shapes is not None:
             if self._settled_shapes == self._shape_pair():
-                # The automatic choice for these shapes is settled: reuse it
-                # without a search, as the pinned branch above reuses an
-                # explicit one.  The ledger runs only for the calibration
-                # mode.
-                ledger = self._build_memory_ledger(**call_arrays) \
-                    if calibrating else None
+                if _memory_ledger.workload_covers(self._settled_workload,
+                                                  workload):
+                    # The automatic choice for these shapes is settled and the
+                    # settled check already covers this call: reuse the layout
+                    # without a search, as the pinned branch above reuses an
+                    # explicit one.  The ledger runs only for the calibration
+                    # mode, and it prices a full reconstruction because that
+                    # is the scope the measured peak covers.
+                    ledger = self._build_memory_ledger(**call_arrays) \
+                        if calibrating else None
+                    return self._arm_calibration(ledger)
+                # This call allocates more than the settled check priced, so
+                # the check runs again -- on the settled layout, which does
+                # not move.
+                ledger = self._check_settled_capacity(workload, call_arrays)
+                # It passed, so the record now names the workload the layout
+                # is known to hold, and a later call of the same kind repeats
+                # no check: the preflight stays a once-per-model cost.
+                self._settled_workload = workload
                 return self._arm_calibration(ledger)
             # The shapes changed, so the settled decision's inputs are gone:
             # drop the record and re-decide below.
             self._settled_shapes = None
+            self._settled_workload = None
 
         pinned = _memory_ledger.pinned_device_count()
         visible = torch.cuda.device_count() if torch.cuda.is_available() else 0
@@ -1365,21 +1414,55 @@ class TomographyModel(ParameterHandler):
             if not self._layout_is_valid(devices):
                 rejected.append((count, 'a device would own no real data'))
                 continue
+            # Priced as a full recon whatever this call is: the count chosen
+            # here has to suit the largest workload the model may later run.
             ledger = self._build_memory_ledger(devices=devices, **call_arrays)
             if ledger is None or self.skip_memory_preflight:
                 # Nothing to check against, or the caller has forced the run.
                 return self._settle(devices, ledger, rejected)
-            budgets = [_memory_ledger.device_budget_bytes(d) for d in devices]
-            credits = _memory_ledger.resident_credits(
-                devices, list(call_arrays.values()))
-            fits, rows = _memory_ledger.layout_fits(
-                ledger, budgets, credits, margin=self.memory_preflight_margin)
+            fits, rows = self._layout_capacity(devices, ledger, call_arrays)
             if fits:
                 return self._settle(devices, ledger, rejected)
             shortfall = max((d - b) for _dev, d, b in rows if b is not None)
             rejected.append((count, f'{shortfall / 2 ** 30:.2f} GB short'))
             if best is None or shortfall < best[0]:
                 best = (shortfall, ledger, rows, count)
+
+        if workload != 'recon' and best is not None:
+            # No count fits a full recon, and this call is not running one.
+            # The check that can refuse is made against the work in progress,
+            # in the same candidate order, so the count is still the one the
+            # floors and capacity prefer.  Only what it is checked against
+            # changes.  The shortfall reported below then describes the check
+            # that actually refused, so the search starts its record over.
+            best = None
+            for count in candidates:
+                devices = (self._candidate_devices(count) if count > 1
+                           else [self.torch_device])
+                if not self._layout_is_valid(devices):
+                    continue
+                ledger = self._build_memory_ledger(
+                    devices=devices, workload=workload, **call_arrays)
+                fits, rows = self._layout_capacity(devices, ledger,
+                                                   call_arrays)
+                if fits:
+                    # The first pass recorded this count as refused, priced
+                    # for a recon this call is not running, and the device
+                    # line must not call the count in use rejected.  A
+                    # speed-floor note pending for the same count goes with
+                    # it: both explain this choice, and the note below names
+                    # the rule that admitted the count.
+                    self._speed_floor_fallback = None
+                    rejected = [(c, why) for c, why in rejected
+                                if c != count]
+                    rejected.append(
+                        (count, f'chosen for the {workload} reconstruction '
+                                'in progress: no device count fits a full '
+                                'recon at this size'))
+                    return self._settle(devices, ledger, rejected, workload)
+                shortfall = max((d - b) for _dev, d, b in rows if b is not None)
+                if best is None or shortfall < best[0]:
+                    best = (shortfall, ledger, rows, count)
 
         # Nothing fits, including a single device.  The answer to "which
         # count" is "none", so fail here with the dominant phase named rather
@@ -1471,9 +1554,49 @@ class TomographyModel(ParameterHandler):
             [n for _d, _r, n in sino.padded_shard_ranges()],
             [n for _d, _r, n in recon.padded_shard_ranges()]))
 
-    def _settle(self, devices, ledger, rejected):
+    def _layout_capacity(self, devices, ledger, call_arrays):
+        """Whether ``ledger``'s modeled peak fits ``devices``, and the rows to
+        report it with.  The one place a budget reading is compared with a
+        modeled demand, so the search, the narrower second pass and the
+        settled re-check all ask the question the same way."""
+        budgets = [_memory_ledger.device_budget_bytes(d) for d in devices]
+        credits = _memory_ledger.resident_credits(
+            devices, list(call_arrays.values()))
+        return _memory_ledger.layout_fits(
+            ledger, budgets, credits, margin=self.memory_preflight_margin)
+
+    def _check_settled_capacity(self, workload, call_arrays):
+        """Run the capacity check for ``workload`` on the layout already
+        settled, and return the ledger it priced.
+
+        The layout does not move here: the model has settled and a caller may
+        be holding shards of it.  What this can do is refuse, which is the
+        point.  A model that settled under a direct reconstruction was checked
+        against what that reconstruction allocates, so without this a later
+        ``recon`` would reach the allocator with none of the preflight's
+        message and remedies behind it.
+        """
+        if self.skip_memory_preflight:
+            # The caller has forced the run, here as in the search.
+            return None
+        devices = list(self.sino_placement.devices)
+        ledger = self._build_memory_ledger(devices=devices, workload=workload,
+                                           **call_arrays)
+        fits, rows = self._layout_capacity(devices, ledger, call_arrays)
+        if fits:
+            return ledger
+        raise _memory_ledger.MemoryPreflightError(
+            _memory_ledger.format_shortfall(
+                ledger, rows, num_devices_tried=[len(devices)],
+                closest_count=len(devices),
+                remedies=self._memory_remedies()))
+
+    def _settle(self, devices, ledger, rejected, workload='recon'):
         """Install the chosen layout when it differs from the current one, log
-        the choice, and enable the calibration mode."""
+        the choice, and enable the calibration mode.
+
+        ``workload`` is the plan ``ledger`` was priced with, which is the
+        workload the settled layout has been checked for."""
         chosen, current = len(devices), self.sino_placement.n_devices
         # The search records a speed-floor note the moment it REACHES a held
         # count, before the outcome is known.  A count it then settles on was
@@ -1513,8 +1636,11 @@ class TomographyModel(ParameterHandler):
                 self.logger.debug(f'  device count {count} rejected: {why}')
         # Record the shapes this decision came from.  While they hold, later
         # policy calls reuse the layout instead of re-deciding; a shape
-        # change clears the record (see _apply_device_policy).
+        # change clears the record (see _apply_device_policy).  The workload
+        # beside them is the one the capacity check was made against, so a
+        # later call that allocates more re-runs that check.
         self._settled_shapes = self._shape_pair()
+        self._settled_workload = workload
         return self._arm_calibration(ledger)
 
     def _arm_calibration(self, ledger):
