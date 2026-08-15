@@ -4,7 +4,7 @@ The partition generators are numpy-for-numpy ports with the SAME global
 np.random call sequence as mbirjax, so a seeded mbirtorch recon draws the
 identical subsets (and subset order) as a seeded mbirjax recon -- the property
 the cross-framework convergence-parity gate rests on.  Not ported: the grid
-and blue-noise partition variants and the MAR weights.
+and blue-noise partition variants.
 """
 
 import warnings
@@ -200,16 +200,15 @@ def gen_full_indices(recon_shape, use_ror_mask=True):
     return partition[0]
 
 
-def gen_weights(sinogram, weight_type, ct_model=None):
+def gen_weights(sinogram, weight_type):
     """
     Compute optional weights used in MBIR reconstruction based on the noise model.
 
     The weights should be proportional to the inverse variance of the noise for
     each sinogram entry.  They can be used to improve reconstruction quality.
 
-    The result is computed with the input's OWN array module, so it stays where
-    the input is: a host (numpy) sinogram yields host weights; a torch tensor
-    yields a tensor on the same device.
+    The weights are computed where the input is: a numpy sinogram yields numpy
+    weights, and a torch tensor yields a tensor on the same device.
 
     Args:
         sinogram (ndarray or tensor): 3D array of shape
@@ -219,14 +218,10 @@ def gen_weights(sinogram, weight_type, ct_model=None):
             - 'transmission': Use exponential decay, `exp(-sinogram)`.
             - 'transmission_root': Use square-root decay, `exp(-sinogram / 2)`.
             - 'emission': Use reciprocal decay, `1 / (abs(sinogram) + 0.1)`.
-        ct_model (TomographyModel, optional): if given, the sinogram is first
-            placed in the model's device form (``_shard_sinogram``), so the
-            weights are built on the model device -- and,
-            under a future sharding port, per shard.  Default None leaves the
-            input where it is.
 
     Returns:
-        ndarray or tensor: weights with the same shape and residence as the input.
+        ndarray or tensor: weights with the same shape as the input, in the
+        input's form and place.
 
     Raises:
         Exception: If `weight_type` is not one of the supported options.
@@ -236,10 +231,6 @@ def gen_weights(sinogram, weight_type, ct_model=None):
         large (e.g., > 5), as this corresponds to near-zero transmission, which
         is not physically meaningful in typical X-ray imaging.
     """
-    # Optionally place the sinogram in the model's device form first, so the
-    # weights are built where the reconstruction will run.
-    if ct_model is not None:
-        sinogram = ct_model._shard_sinogram(sinogram)
     xp = torch if isinstance(sinogram, torch.Tensor) else np
     if weight_type == 'unweighted':
         weights = xp.ones_like(sinogram)
@@ -314,6 +305,8 @@ def gen_weights_mar(ct_model, sinogram, init_recon=None, metal_threshold=None, b
     If not provided, the metal segmentation is generated directly from the sinogram.
 
     Args:
+        ct_model (TomographyModel): The model used to forward project the metal mask.  It is used
+            only when ``init_recon`` is given.
         sinogram (ndarray): 3D array containing sinogram with shape (num_views, num_det_rows, num_det_channels).
         init_recon (ndarray, optional): An initial reconstruction used to identify metal voxels. If not provided, Otsu's method is used to directly segment sinogram into metal regions.
         metal_threshold (float, optional): Values in ``init_recon`` above ``metal_threshold`` are classified as metal. If not provided, Otsu's method is used to segment ``init_recon``.

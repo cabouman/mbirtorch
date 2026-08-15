@@ -25,7 +25,7 @@ def get_sino_and_model(dataset_dir, *, crop_pixels_sides=0, crop_pixels_top=0, c
     stale (default-pitch) reconstruction grid.
 
     Unlike the other scanner readers, this one returns ``weights``: a data-specific mask (from
-    :func:`compute_weight`) that zeros the dark detector-boundary regions of the TCT detector.  Pass it
+    ``compute_weight``) that zeros the dark detector-boundary regions of the TCT detector.  Pass it
     to ``model.recon(sino, weights=weights)``.
 
     Args:
@@ -40,7 +40,7 @@ def get_sino_and_model(dataset_dir, *, crop_pixels_sides=0, crop_pixels_top=0, c
     Returns:
         tuple: ``(sino, model, weights)`` where
 
-            - ``sino`` (jax array): the computed sinogram, shape (num_views, num_det_rows, num_channels).
+            - ``sino`` (numpy.ndarray): the computed sinogram, shape (num_views, num_det_rows, num_channels).
             - ``model`` (TranslationModel): a model with its reconstruction geometry already set.
             - ``weights`` (numpy.ndarray): a 3D weight mask (same shape as ``sino``) that excludes the
               dark detector boundary.
@@ -138,8 +138,8 @@ def load_scans_and_params(dataset_dir, verbose=1):
         tuple: ``(obj_scan, blank_scan, dark_scan, zeiss_params)``
 
             - ``obj_scan`` (numpy.ndarray): 3D object scan with shape ``(num_views, num_det_rows, num_channels)``.
-            - ``blank_scan`` (numpy.ndarray): 3D blank scan with shape ``(1, num_det_rows, num_channels)``.
-            - ``dark_scan`` (numpy.ndarray): 3D dark scan with shape ``(1, num_det_rows, num_channels)``.
+            - ``blank_scan`` (numpy.ndarray): 3D blank scan with shape ``(num_blank_scans, num_det_rows, num_channels)``, where ``num_blank_scans`` is the number of ``.xrm`` files in the ``blank_scan`` subfolder.
+            - ``dark_scan`` (numpy.ndarray): 3D dark scan with shape ``(num_dark_scans, num_det_rows, num_channels)``, where ``num_dark_scans`` is the number of ``.xrm`` files in the ``dark_scan`` subfolder. If that subfolder is missing or empty, a zero array with the shape of ``blank_scan`` is returned.
             - ``zeiss_params`` (dict): Required parameters for ``convert_zeiss_to_mbirjax_params`` (e.g., geometry vectors, spacings, and angles).
     """
     ### automatically parse the paths to Zeiss scans from dataset—dir

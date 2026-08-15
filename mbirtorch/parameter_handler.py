@@ -20,6 +20,9 @@ from ._utils import Param
 
 
 class ParameterHandler:
+    """Store and access model parameters.  ``TomographyModel`` inherits its
+    parameter interface -- ``get_params``, ``set_params``, and
+    ``print_params`` -- from this class."""
 
     def __init__(self):
         self.params = _utils.get_default_params()
@@ -199,10 +202,12 @@ class ParameterHandler:
         The mbirjax special-case semantics are reproduced exactly:
 
         - Directly setting a regularization parameter (``sigma_y``, ``sigma_x``,
-          or ``sigma_prox``) DISABLES auto-regularization (with a warning unless
-          ``no_warning``), so the user's value is actually used by ``recon``.
-        - Setting ``sharpness`` or ``snr_db`` RE-ENABLES a disabled
-          auto-regularization (with a warning), so those parameters take effect.
+          or ``sigma_prox``) disables auto-regularization and warns, so the
+          user's value is actually used by ``recon``.  With ``no_warning=True``
+          neither happens: the value is stored and auto-regularization stays
+          on.  (The automatic setters use that path internally.)
+        - Setting ``sharpness`` or ``snr_db`` re-enables a disabled
+          auto-regularization, with a warning unless ``no_warning``.
         - An unknown parameter name raises ValueError listing the valid names,
           except under ``no_warning`` (the construction path), where it is
           ADDED as a new recompile-flagged parameter (how the geometry's own

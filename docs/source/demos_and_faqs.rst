@@ -118,7 +118,7 @@ If you have no GPU, all processing is done on the CPU.
 
 If your reconstruction is still too large, then for a parallel beam system you can select a subset of rows of your
 sinogram, reconstruct them separately, and then concatenate them at the end.  If you have a cone beam system, you can
-reconstruct a subset of the central slices or use :meth:`~mbirtorch.ConeBeamModel.split_sino_recon`.  For cone beam you can
+reconstruct a subset of the central slices or use :meth:`~mbirtorch.TomographyModel.split_sino_recon`.  For cone beam you can
 also make sure axial padding is disabled (``axial_pad_fraction=0``, the default -- see
 :ref:`ConeBeamModelDocs`) if that padding is what pushes you over the memory limit.
 

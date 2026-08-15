@@ -1,4 +1,3 @@
-import functools
 import os
 import warnings
 
@@ -90,13 +89,14 @@ def _ps_view_mask(mask, x):
 
 def gen_huber_weights(weights, sino_error, T=1.0, delta=1.0, epsilon=1e-6):
     """
-    This function generates generalized Huber weights based on the method described in the referenced notes.
-    It adds robustness by treating any element where ``|sino_error / weights| > T`` as an outlier,
-    down-weighting it according to the generalized Huber function.
+    Generate generalized Huber weights that down-weight outliers in ``sino_error``.
 
-    The function returns new `ghuber_weights`.
+    The per-element standard deviation is ``std = 1 / sqrt(weights)``.  A single global factor
+    ``alpha = ||sino_error|| / ||std||`` rescales it, and an element counts as an outlier when
+    ``|sino_error / (alpha * std)| > T``.  Each outlier is down-weighted by the generalized Huber
+    function; all other elements get weight 1.
 
-    Typically, to obtain the final robust weights, the `ghuber_weights` should be multiplied by the original `weights`:
+    Typically, to obtain the final robust weights, the returned weights should be multiplied by the original `weights`:
 
         final_weights = weights * ghuber_weights
 
@@ -106,7 +106,7 @@ def gen_huber_weights(weights, sino_error, T=1.0, delta=1.0, epsilon=1e-6):
         sino_error: ndarray or tensor of shape (views, rows, cols):
             Sinogram error array representing deviations from the model.
         T: float, optional (default=1.0):
-            Threshold parameter; values greater than T are treated as outliers.
+            Outlier threshold on the normalized error ``|sino_error / (alpha * std)|``.
         delta: float, optional (default=1.0):
             Controls the strength of the generalized Huber function (delta=1 corresponds to the conventional Huber).
         epsilon: float, optional (default=1e-6):
@@ -172,7 +172,9 @@ def BH_correction(sino, alpha, batch_size=64, devices=None):
         batch_size (int, optional, default=64):
             Number of views to process in a single batch.
         devices (sequence, optional):
-            Accepted for interface compatibility; the batches run on a single device.
+            Devices to spread the view batches over.  The views are split into contiguous blocks,
+            one per device, and the blocks are processed at the same time.  None (the default) runs
+            everything on a single device.
 
     Returns:
         corrected_sino: ndarray of shape (views, rows, cols)
@@ -854,133 +856,3 @@ def correct_sino_plastic_metal(ct_model, measured_sino, recon, num_metal=1, orde
 
     corrected_sino = _ps_map(combine, plastic_sino_corrected, *metal_sino_est)
     return ct_model._gather_sinogram(corrected_sino)
-
-
-def recon_plastic_metal(ct_model, sino, weights, num_BH_iterations=3, num_constraint_update_iter=10, stop_threshold_change_pct=0.2,
-                        num_metal=1, order=3, alpha=1, beta=0.002, gamma=0.1, verbose=0, output_sharded=False,
-                        max_iterations=15, logfile_path='~/.mbirtorch/logs/recon.log',
-                        radial_margin=None, top_margin=None, bottom_margin=None):
-    """
-    Perform iterative metal artifact reduction using plastic-metal beam hardening correction.  If num_metal is 0,
-    then this performs a standard MBIR recon.
-
-    This function alternates between adaptive beam hardening correction (via `correct_sino_plastic_metal`)
-    and reconstruction, refining the image over several iterations to suppress metal-induced artifacts.
-
-    Args:
-        ct_model: MBIRTORCH cone beam model instance with `direct_recon` and `recon` methods.
-        sino (ndarray):  Input sinogram data to be corrected.
-        weights (ndarray): Transmission weights used in the reconstruction algorithm.
-        num_BH_iterations (int, optional): Number of correction-reconstruction iterations. Defaults to 3.
-        num_constraint_update_iter (int, optional): Number of iterations for updating constraints.
-            At each iteration, the most violated constraints are activated and the quadratic program is re-solved via OSQP.
-        stop_threshold_change_pct (float, optional): Relative change threshold (%) for early stopping in MBIR. Defaults to 0.2.
-        num_metal (int, optional): Number of metal materials to segment and correct for. Defaults to 1.
-        order (int, optional): Maximum total degree of the beam hardening correction polynomial. Defaults to 3.
-        alpha (float, optional): Degree-dependent scaling factor for regularization weights. Higher values penalize
-            higher-order terms more strongly. Defaults to 1.
-        beta (float, optional): Regularization strength for ridge regression. Defaults to 0.002.
-        gamma (float, optional): Stabilization factor used in plastic correction. Multiplies the mean of `s_p`
-            to set a positive floor in the denominator, preventing division by near-zero or negative values. Defaults to 0.1.
-        verbose (int, optional): Verbosity level for printing intermediate information. Defaults to 0.
-        output_sharded (bool, optional): Choose the form of the returned reconstruction.  If False
-            (default), return an ordinary host NumPy array.  If True, return the device tensor for a
-            following on-device step.
-        max_iterations (int, optional): Maximum MBIR iterations per reconstruction pass. Defaults to 15.
-        logfile_path (str, optional): Same as in the TomographyModel.recon() method.  The BH passes'
-            logs are merged into this single file, each under a section header.
-        radial_margin, top_margin, bottom_margin (int or None, optional): Segmentation mask margins
-            used when classifying plastic/metal; None (default) = size-relative
-            (see segment_plastic_metal).
-
-    Returns:
-         numpy array or tensor: The final corrected reconstruction after iterative beam hardening
-         correction -- a host NumPy array by default, or a device tensor if ``output_sharded=True``.
-
-    Example:
-        >>> recon = recon_plastic_metal(
-        ...     ct_model, sino, weights,
-        ...     num_BH_iterations=3,
-        ...     stop_threshold_change_pct=0.2,
-        ...     num_metal=1,
-        ...     order=3,
-        ...     alpha=1,
-        ...     beta=0.005,
-        ...     verbose=1
-        ... )
-        >>> mt.slice_viewer(recon)
-    """
-    # Check for nonnegative num_metals
-    if num_metal < 0:
-        raise ValueError("num_metal must be >= 0")
-
-    # Use split sino recon for cone beam when the model provides it (it splits on the host so the
-    # full sinogram is never device-resident); otherwise use the standard recon with a device-form
-    # output so the next correction consumes it with no gather/re-upload.
-    if 'cone' in ct_model.get_params('geometry_type') and hasattr(ct_model, 'split_sino_recon'):
-        recon_function = ct_model.split_sino_recon
-    else:
-        recon_function = functools.partial(ct_model.recon, output_sharded=True)
-
-    # Deliver the user-requested output form (a host recon, e.g. from split_sino_recon, is already
-    # in the gathered form).
-    def to_output_form(r):
-        if output_sharded:
-            return ct_model._shard_recon(r)
-        return r if isinstance(r, np.ndarray) else ct_model._gather_recon(r)
-
-    # Do a regular recon if num_metal == 0
-    if num_metal == 0:
-        recon, _ = recon_function(sino, weights=weights, max_iterations=max_iterations,
-                                  stop_threshold_change_pct=stop_threshold_change_pct,
-                                  logfile_path=logfile_path)
-        return to_output_form(recon)
-
-    # Continue with beam hardening and segmentation
-    if verbose >= 1:
-        print("\n************ Perform initial FDK reconstruction  **************")
-    recon = ct_model.direct_recon(sino, output_sharded=True)
-
-    # Each BH pass logs to its own temp file; merged into logfile_path afterward
-    # (in finally, so any pass logs written before a failure are preserved).
-    if logfile_path:
-        log_path = os.path.expanduser(logfile_path)
-        pass_log_paths = [log_path + '.pass{}'.format(i + 1) for i in range(num_BH_iterations)]
-    else:
-        log_path, pass_log_paths = None, [None] * num_BH_iterations
-    try:
-        for i in range(num_BH_iterations):
-            # Estimate Corrected Sinogram
-            if verbose >= 1:
-                print(f"\n************ Correct sino plastic metal {i + 1}  **************")
-            corrected_sinogram = correct_sino_plastic_metal(ct_model, sino, recon, num_metal=num_metal, order=order, alpha=alpha, beta=beta, gamma=gamma, num_constraint_update_iter=num_constraint_update_iter,
-                                                            radial_margin=radial_margin, top_margin=top_margin, bottom_margin=bottom_margin)
-
-            # Reconstruct Corrected Sinogram
-            if verbose >= 1:
-                print(f"\n************ Perform MBIR reconstruction {i + 1} **************")
-            # The recon entry points validate a user-supplied init_recon as a
-            # host/tensor array, so a sharded recon is gathered first (one
-            # gather per BH pass; the engine builds its own device-form init).
-            init = (ct_model._gather_recon(recon)
-                    if isinstance(recon, _sharding.Shards) else recon)
-            recon, _ = recon_function(corrected_sinogram, weights=weights, init_recon=init,
-                                      max_iterations=max_iterations,
-                                      stop_threshold_change_pct=stop_threshold_change_pct,
-                                      logfile_path=pass_log_paths[i])
-
-            if verbose >= 2:
-                print(f"\n************ BH Iteration {i + 1}: Display plastic and metal mask **************")
-                plastic_mask, metal_masks, plastic_scale, metal_scales = mtp.segment_plastic_metal(
-                    recon, num_metal, radial_margin=radial_margin, top_margin=top_margin,
-                    bottom_margin=bottom_margin)
-                labels = ['Plastic Mask'] + [f'Metal {j + 1} Mask' for j in range(len(metal_masks))]
-                mt.slice_viewer(plastic_mask, *metal_masks, vmin=0, vmax=1.0,
-                                slice_label=labels,
-                                title=f'Iteration {i + 1}: Comparison of Plastic and Metal Masks')
-    finally:
-        if log_path:
-            labels = ['recon_plastic_metal: BH pass {}'.format(i + 1) for i in range(num_BH_iterations)]
-            mt.merge_log_files(log_path, zip(labels, pass_log_paths))
-
-    return to_output_form(recon)

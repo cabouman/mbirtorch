@@ -115,13 +115,12 @@ class ParallelBeamModel(TomographyModel):
         angles (ndarray):
             A 1D array of projection angles, in radians, specifying the angle of
             each projection relative to the origin.
-        view_batch_size (int or None): views per body call in the batched
-            drivers (the single memory/speed knob).  None (default) means
-            automatic: 64 for the torch bodies -- the long-standing default
-            -- and the swept view chunk of a hand-written Triton kernel body
-            where one is selected.  An explicit integer applies to every
-            body, and the driver's transient budget may cap the realized
-            batch below it either way.
+        view_batch_size (int or None, optional): number of views processed
+            per projection call.  Smaller values reduce peak memory and may
+            reduce speed.  None (default) chooses automatically.
+        compile_mode (str, optional): 'auto' (default) compiles the
+            computational kernels with torch.compile; 'off' runs without
+            compilation.
 
     Example:
         >>> import numpy as np, mbirtorch
@@ -355,8 +354,10 @@ class ParallelBeamModel(TomographyModel):
             sinogram (numpy or tensor): input with shape
                 (num_views, num_rows, num_channels).
             filter_name (string, optional): Name of the filter.  Defaults to "ramp".
-            output_sharded (bool, optional): If False (default), return numpy;
-                if True, return the device tensor.
+            output_sharded (bool, optional): If False (default), return a
+                numpy array.  If True, return the device form: a torch
+                tensor on a single device, or a Shards container (one
+                tensor per device) on a multi-device model.
 
         Returns:
             recon (numpy or tensor): the reconstructed volume.

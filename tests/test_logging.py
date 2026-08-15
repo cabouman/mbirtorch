@@ -306,7 +306,7 @@ def test_recon_plastic_metal_merges_pass_logs(tmp_path, small_cone_case):
     weights = mbirtorch.gen_weights(sino / max(1e-6, sino.max()),
                                     weight_type='transmission_root')
     logpath = os.path.join(str(tmp_path), 'mar.log')
-    mtp.recon_plastic_metal(model, sino, weights, num_BH_iterations=2, max_iterations=1,
+    model.recon_plastic_metal(sino, weights, num_BH_iterations=2, max_iterations=1,
                             num_metal=1, verbose=0, logfile_path=logpath)
     content = open(logpath).read()
     assert '======== recon_plastic_metal: BH pass 1 ========' in content

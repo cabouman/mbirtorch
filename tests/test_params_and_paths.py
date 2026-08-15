@@ -276,14 +276,13 @@ def test_placement_functions_validate_and_place():
     assert isinstance(model._gather_recon(rec), np.ndarray)
 
 
-def test_gen_weights_ct_model_places_on_device():
-    model = _small_model()
-    sino = np.ones(tuple(model.get_params('sinogram_shape')), dtype=np.float32)
-    w = mbirtorch.gen_weights(sino, 'transmission_root', ct_model=model)
-    assert torch.is_tensor(w)
+def test_gen_weights_matches_input_form():
+    sino = np.ones((4, 6, 8), dtype=np.float32)
     w_host = mbirtorch.gen_weights(sino, 'transmission_root')
     assert isinstance(w_host, np.ndarray)
-    assert np.allclose(w.cpu().numpy(), w_host)
+    w_tensor = mbirtorch.gen_weights(torch.as_tensor(sino), 'transmission_root')
+    assert torch.is_tensor(w_tensor)
+    assert np.allclose(w_tensor.cpu().numpy(), w_host)
 
 
 def test_clear_cache_empties_and_recreates(tmp_path):

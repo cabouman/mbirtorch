@@ -55,10 +55,9 @@ def _rel_max(out, ref):
     return float(np.max(np.abs(out - ref)) / max(np.max(np.abs(ref)), 1e-30))
 
 
-@pytest.mark.goldens
-def test_reference_phantom_matches_exactly(golden):
-    out = mbirtorch.generate_3d_shepp_logan_reference((32, 30, 28))
-    assert np.array_equal(out, golden["ref_phantom"])
+# The mbirjax parity test for generate_3d_shepp_logan_reference was dropped
+# 2026-08-14: mbirjax's version transposes rows and columns (a bug), and the
+# mbirtorch version was corrected, so the two no longer match.
 
 
 @pytest.mark.goldens

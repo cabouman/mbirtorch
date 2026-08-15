@@ -280,9 +280,10 @@ def main():
     vcls_inds, vcls_value = mbirjax.get_opt_views(vcls_model, vcls_ref, num_selected_views=5,
                                                   r_1=0.05, seed=3)
 
-    # Demo-data utilities: the reference phantom on a non-cubic shape, demo data for the
-    # parallel, cone, and helical-cone paths, and the recon shapes get_ct_model produces.
-    ref_phantom = mbirjax.generate_3d_shepp_logan_reference((32, 30, 28))
+    # Demo-data utilities: demo data for the parallel, cone, and helical-cone
+    # paths, and the recon shapes get_ct_model produces.  (The reference-phantom
+    # parity entry was dropped 2026-08-14: mbirjax's phantom transposes rows and
+    # columns, and mbirtorch corrected that.)
 
     demo_cases = {}
     for tag, kwargs in [('par', dict(model_type='parallel')),
@@ -388,7 +389,6 @@ def main():
         split_recon=np.asarray(split_recon, dtype=np.float32),
         split_overlap_sino=np.int64(split_params['half_overlap_sino']),
         split_overlap_recon=np.int64(split_params['half_overlap_recon']),
-        ref_phantom=ref_phantom.astype(np.float64),
         gcm_shapes=gcm_shapes,
         **demo_cases,
     )

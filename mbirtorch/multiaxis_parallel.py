@@ -385,13 +385,26 @@ class MultiAxisParallelModel(TomographyModel):
 
     def fbp_recon(self, sinogram, filter_name="ramp", output_sharded=False):
         """
-        Perform FBP reconstruction: ramp-filter the sinogram, then the exact
+        Perform FBP reconstruction: filter the sinogram, then apply the exact
         adjoint of the forward projector as the backprojection.
+
+        Args:
+            sinogram (numpy or tensor): 3D sinogram data with shape
+                (num_views, num_det_rows, num_det_channels).
+            filter_name (string, optional): The name of the filter to use.
+                Defaults to 'ramp'.
+            output_sharded (bool, optional): If False (default), return a
+                numpy array.  If True, return the device form: a torch
+                tensor on a single device, or a Shards container (one
+                tensor per device) on a multi-device model.
+
+        Returns:
+            recon (numpy or tensor): The reconstructed volume.
 
         Note:
             The pi/num_views weight assumes equally spaced azimuths, and the
-            geometry is treated as stacked 2-D FBP (elevation approximated in
-            the filter).  Multiaxis parallel beam is typically a limited-angle
+            geometry is treated as stacked 2-D FBP: the filter ignores
+            elevation.  Multiaxis parallel beam is typically a limited-angle
             geometry, so this direct reconstruction is only approximate; it is
             intended as an initializer for the iterative ``recon()``.
         """
