@@ -134,7 +134,10 @@ def test_real_cross_device_transfer_cpu_mps():
                 copies[torch.device("mps")] * 3.0]
     total = sum_band_to_owner(partials, torch.device("cpu"))
     assert total.device.type == "cpu"
-    assert torch.allclose(total, band * 5.0, atol=1e-6)
+    ref_total = band * 5.0
+    rel = float((total - ref_total).abs().max()
+                / max(float(ref_total.abs().max()), 1e-30))
+    assert rel < 1e-6, rel
     # The host-bounce fallback path is value-correct too.
     bounced = move_shard(band.to("mps"), torch.device("cpu"), dev2dev_safe=False)
     assert torch.allclose(bounced, band)
@@ -212,12 +215,18 @@ def test_banded_projectors_match_single_device():
     m, idx, vals, sino, ref_fwd, ref_back, ref_back2 = _banded_case(["cpu", "cpu"])
     fwd = m.sparse_forward_project(vals, idx)
     assert isinstance(fwd, Shards)
-    assert np.allclose(m._gather_sinogram(fwd), ref_fwd, atol=1e-6)
+    rel = (np.max(np.abs(m._gather_sinogram(fwd) - ref_fwd))
+           / max(np.max(np.abs(ref_fwd)), 1e-30))
+    assert rel < 1e-5, rel
     back = m.sparse_back_project(sino, idx)
     assert isinstance(back, Shards)
-    assert np.allclose(back.gather(), ref_back, atol=1e-5)
+    rel = (np.max(np.abs(back.gather() - ref_back))
+           / max(np.max(np.abs(ref_back)), 1e-30))
+    assert rel < 1e-5, rel
     back2 = m.sparse_back_project(sino, idx, coeff_power=2)
-    assert np.allclose(back2.gather(), ref_back2, atol=1e-5)
+    rel = (np.max(np.abs(back2.gather() - ref_back2))
+           / max(np.max(np.abs(ref_back2)), 1e-30))
+    assert rel < 1e-5, rel
 
 
 def test_banded_projectors_adjoint():
@@ -235,9 +244,13 @@ def test_banded_projectors_real_two_devices():
     m, idx, vals, sino, ref_fwd, ref_back, _ = _banded_case(["cpu", "mps"])
     fwd = m.sparse_forward_project(vals, idx)
     assert fwd.tensors[1].device.type == "mps"
-    assert np.allclose(m._gather_sinogram(fwd), ref_fwd, atol=1e-4)
+    rel = (np.max(np.abs(m._gather_sinogram(fwd) - ref_fwd))
+           / max(np.max(np.abs(ref_fwd)), 1e-30))
+    assert rel < 1e-5, rel
     back = m.sparse_back_project(sino, idx)
-    assert np.allclose(back.gather(), ref_back, atol=1e-4)
+    rel = (np.max(np.abs(back.gather() - ref_back))
+           / max(np.max(np.abs(ref_back)), 1e-30))
+    assert rel < 1e-5, rel
 
 
 def _cone_banded_case(devices, cell=(8, 8, 8)):
@@ -265,9 +278,13 @@ def test_cone_banded_projectors_match_single_device():
     # a sum reorder, so float noise only).
     m, idx, vals, sino, ref_fwd, ref_back = _cone_banded_case(["cpu", "cpu"])
     fwd = m.sparse_forward_project(vals, idx)
-    assert np.allclose(m._gather_sinogram(fwd), ref_fwd, atol=1e-5)
+    rel = (np.max(np.abs(m._gather_sinogram(fwd) - ref_fwd))
+           / max(np.max(np.abs(ref_fwd)), 1e-30))
+    assert rel < 1e-5, rel
     back = m.sparse_back_project(sino, idx)
-    assert np.allclose(back.gather(), ref_back, atol=1e-5)
+    rel = (np.max(np.abs(back.gather() - ref_back))
+           / max(np.max(np.abs(ref_back)), 1e-30))
+    assert rel < 1e-5, rel
     lhs = float(np.sum(m._gather_sinogram(fwd) * sino))
     rhs = float(np.sum(vals * back.gather()))
     assert abs(lhs - rhs) / max(abs(rhs), 1e-30) < 1e-4
@@ -298,8 +315,11 @@ def test_qggmrf_halos_match_full_volume():
         left_halo=lh[i], right_halo=rh[i]) for i in range(2)]
     g = torch.cat([pg for pg, _ in parts], dim=1)
     h = torch.cat([ph for _, ph in parts], dim=1)
-    assert torch.allclose(g, ref_g, atol=1e-6)
-    assert torch.allclose(h, ref_h, atol=1e-6)
+    rel_g = float((g - ref_g).abs().max()
+                  / max(float(ref_g.abs().max()), 1e-30))
+    rel_h = float((h - ref_h).abs().max()
+                  / max(float(ref_h.abs().max()), 1e-30))
+    assert rel_g < 1e-6 and rel_h < 1e-6, (rel_g, rel_h)
 
     # An all-ones interface mask is a no-op; zeroing interface j decouples
     # slices j-1 and j exactly like a reflected edge there.
@@ -307,14 +327,18 @@ def test_qggmrf_halos_match_full_volume():
     g1, h1 = qggmrf.qggmrf_gradient_and_hessian_at_indices(
         shards.tensors[0], (rows, cols, S), idx, params, right_halo=rh[0],
         interface_mask=mask)
-    assert torch.allclose(g1, parts[0][0], atol=1e-7)
+    rel_1 = float((g1 - parts[0][0]).abs().max()
+                  / max(float(parts[0][0].abs().max()), 1e-30))
+    assert rel_1 < 1e-6, rel_1
     mask4 = mask.clone(); mask4[-1] = 0.0
     g2, _ = qggmrf.qggmrf_gradient_and_hessian_at_indices(
         shards.tensors[0], (rows, cols, S), idx, params, right_halo=rh[0],
         interface_mask=mask4)
     g_ref, _ = qggmrf.qggmrf_gradient_and_hessian_at_indices(
         shards.tensors[0], (rows, cols, S), idx, params)
-    assert torch.allclose(g2, g_ref, atol=1e-7)
+    rel_2 = float((g2 - g_ref).abs().max()
+                  / max(float(g_ref.abs().max()), 1e-30))
+    assert rel_2 < 1e-6, rel_2
 
 
 def test_qggmrf_halos_treat_a_shard_with_no_slices_as_absent():
@@ -380,7 +404,8 @@ def test_sharded_vcd_recon_matches_single_device():
     print(f"sharded vcd: recon rel_max {rel:.2e}, fm diff "
           f"{np.max(np.abs(fm1 - fm2)):.2e}")
     assert rel < 5e-4, rel
-    assert np.allclose(fm1, fm2, rtol=1e-3, atol=1e-4)
+    rel_fm = np.max(np.abs(fm2 - fm1)) / max(np.max(np.abs(fm1)), 1e-30)
+    assert rel_fm < 1e-4, rel_fm
 
     # Unweighted path (constant weights -> sharded ones Hessian seam).
     m3 = build()
@@ -460,7 +485,7 @@ def test_padded_placement_roundtrip_with_row_pad():
     assert all(float(torch.abs(t[:, 7:]).sum()) == 0.0 for t in prepared.tensors)
     back = m._gather_sinogram(prepared)
     assert back.shape == sino_shape
-    assert np.allclose(back, sino, atol=1e-7)
+    assert np.array_equal(back, sino)    # copies only, so exactly equal
     # A prepared (device-form) array re-enters _shard_sinogram unchanged.
     again = m._shard_sinogram(prepared)
     assert again is prepared
@@ -474,7 +499,7 @@ def test_padded_placement_roundtrip_with_row_pad():
     vol = rng.standard_normal(recon_shape).astype(np.float32)
     placed = m._shard_recon(vol)
     assert float(torch.abs(placed.tensors[1][..., -1]).sum()) == 0.0
-    assert np.allclose(m._gather_recon(placed), vol, atol=1e-7)
+    assert np.array_equal(m._gather_recon(placed), vol)
 
 
 def test_padded_banded_projectors_match_single_device():
@@ -549,7 +574,8 @@ def test_padded_sharded_vcd_recon_matches_single_device():
     print(f"padded sharded vcd: recon rel_max {rel:.2e}, fm diff "
           f"{np.max(np.abs(fm1 - fm2)):.2e}")
     assert rel < 5e-4, rel
-    assert np.allclose(fm1, fm2, rtol=1e-3, atol=1e-4)
+    rel_fm = np.max(np.abs(fm2 - fm1)) / max(np.max(np.abs(fm1)), 1e-30)
+    assert rel_fm < 1e-4, rel_fm
 
     # Constant weights: the padded ones Hessian seam.
     m3 = build()
@@ -945,7 +971,7 @@ def test_gather_column_band_moves_across_real_devices():
               full[:, 4:].contiguous().to("mps")]
     cyl = gather_column_band(shards, 8, 16, torch.device("mps"))
     assert cyl.device.type == "mps"
-    assert torch.allclose(cyl.cpu(), full[8:16], atol=1e-6)
+    assert torch.equal(cyl.cpu(), full[8:16])  # copies only, so exact
 
 
 def test_column_gather_matches_single_device_at_every_batch(monkeypatch):
@@ -980,8 +1006,12 @@ def test_column_gather_holds_the_adjoint_and_the_padded_forms(monkeypatch):
     fwd = m.sparse_forward_project(vals, idx)
     back = m.sparse_back_project(sino, idx)
     real = vals.shape[1]
-    assert np.allclose(m._gather_sinogram(fwd), ref_fwd, atol=1e-5)
-    assert np.allclose(back.gather()[:, :real], ref_back, atol=1e-5)
+    rel = (np.max(np.abs(m._gather_sinogram(fwd) - ref_fwd))
+           / max(np.max(np.abs(ref_fwd)), 1e-30))
+    assert rel < 1e-5, rel
+    rel_b = (np.max(np.abs(back.gather()[:, :real] - ref_back))
+             / max(np.max(np.abs(ref_back)), 1e-30))
+    assert rel_b < 1e-5, rel_b
     lhs = float(np.sum(m._gather_sinogram(fwd) * sino))
     rhs = float(np.sum(vals * back.gather()[:, :real]))
     assert abs(lhs - rhs) / max(abs(rhs), 1e-30) < 1e-4, (lhs, rhs)
@@ -1128,7 +1158,8 @@ def test_the_column_gather_runs_one_batch_ahead_of_the_projection(monkeypatch):
     assert recorded == n                       # one sequence per view-owner
     # The prefetch moves WHEN a gather is issued and nothing else, so the
     # values are the ones the path already produced.
-    assert np.allclose(fwd, ref_fwd, atol=1e-5)
+    rel = np.max(np.abs(fwd - ref_fwd)) / max(np.max(np.abs(ref_fwd)), 1e-30)
+    assert rel < 1e-5, rel
 
     # And the values hold across batch widths that force several batches,
     # including one that leaves a short final batch (30 pixels over 7).
@@ -1231,7 +1262,8 @@ def test_the_banded_walk_is_what_runs_with_the_switch_off(geometry,
     monkeypatch.setattr(sharding, "gather_column_band", refuse)
     fwd = m._gather_sinogram(m.sparse_forward_project(vals, idx))
     assert broadcasts
-    assert np.allclose(fwd, ref_fwd, atol=1e-5)
+    rel = np.max(np.abs(fwd - ref_fwd)) / max(np.max(np.abs(ref_fwd)), 1e-30)
+    assert rel < 1e-5, rel
 
 
 def test_column_gather_recon_matches_single_device(monkeypatch):
@@ -1461,11 +1493,14 @@ def test_parallel_column_gather_holds_the_padded_and_sparse_view_forms(
         # row-aligned body maps those columns straight to those rows.
         assert max(float(t[:, real_rows:].abs().max()) for t in fwd.tensors) \
             == 0.0, shape
-        assert np.allclose(m._gather_sinogram(fwd), ref_fwd, atol=1e-5), shape
+        rel = (np.max(np.abs(m._gather_sinogram(fwd) - ref_fwd))
+               / max(np.max(np.abs(ref_fwd)), 1e-30))
+        assert rel < 1e-5, (shape, rel)
         # The back driver is untouched, so the pair stays adjoint.
         back = m.sparse_back_project(sino, idx)
-        assert np.allclose(back.gather()[:, :vals.shape[1]], ref_back,
-                           atol=1e-5)
+        rel_b = (np.max(np.abs(back.gather()[:, :vals.shape[1]] - ref_back))
+                 / max(np.max(np.abs(ref_back)), 1e-30))
+        assert rel_b < 1e-5, (shape, rel_b)
         lhs = float(np.sum(m._gather_sinogram(fwd) * sino))
         rhs = float(np.sum(vals * back.gather()[:, :vals.shape[1]]))
         assert abs(lhs - rhs) / max(abs(rhs), 1e-30) < 1e-4, (shape, lhs, rhs)
