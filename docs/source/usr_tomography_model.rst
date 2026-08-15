@@ -29,7 +29,7 @@ Reconstruction and Projection
 
 .. automethod:: mbirtorch.TomographyModel.split_sino_recon
 
-.. autofunction:: mbirtorch.preprocess.recon_plastic_metal
+.. automethod:: mbirtorch.TomographyModel.recon_plastic_metal
 
 
 Parameter Handling
