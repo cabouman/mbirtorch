@@ -1,15 +1,30 @@
 """Phantom generation, ported from mbirjax.utilities (the low-dynamic-range
 Shepp-Logan used by the demos).
 
-The build is plain numpy: the phantom is a host-side reference object in
-mbirjax too (its jax machinery there exists only to bound peak memory at very
-large sizes, not needed here yet).  The ellipsoid definitions and the
-attenuation-scale formula are copied verbatim.
+The low-dynamic-range phantom is built one band of slices at a time.  A band is
+a contiguous range of slices, and each band is built on one device with its rows
+split into blocks, so no step of the build holds a phantom-sized temporary.  A
+build with more than one device gives each device one band, and the bands run
+concurrently.  The result is always gathered to a host numpy array, because the
+phantom is a reference object rather than something a reconstruction operates
+on.  The ellipsoid definitions and the attenuation-scale formula are copied
+verbatim from mbirjax.
 
-Boundary note for cross-framework comparisons: each ellipsoid is a <= 1
-threshold on a float quadratic, so voxels exactly at an ellipsoid boundary can
-flip between frameworks (f32 vs f64 grid arithmetic).  The golden test
-therefore allows a small fraction of differing boundary voxels.
+The coordinate grids and the phantom are both float32, and each band builds its
+own grids with torch on its own device.  float32 is the dtype mbirjax computes
+in, and every backend supports it, so no device is excluded from the build.
+
+Within one backend the build is exact.  Each axis gets one coordinate vector of
+the full axis length, and a band or a row block takes a slice of that vector.  A
+voxel's coordinates therefore do not depend on how the build was divided, so
+neither the device count nor the block size changes any voxel value.
+
+Two backends can differ on a few voxels.  Each ellipsoid is a <= 1 threshold on
+a float quadratic, and float32 rounding is hardware dependent, so a voxel within
+rounding distance of an ellipsoid boundary can land inside on one backend and
+outside on another.  Such a voxel differs by one ellipsoid coefficient, and
+every other voxel agrees exactly.  The golden test allows a small fraction of
+these voxels; tests/test_phantom.py states the budget and its reasoning.
 """
 
 import os
@@ -18,6 +33,8 @@ import warnings
 from enum import Enum
 
 import numpy as np
+import torch
+
 from . import _sharding
 
 
@@ -50,15 +67,30 @@ def clear_cache(_root=None):
     return root
 
 
+def _as_float32(mask):
+    """A boolean mask as float32, for a numpy array or for a torch tensor.
+
+    :func:`add_ellipsoid` runs on both kinds of array, and this cast is the one
+    step the two libraries spell differently.
+    """
+    if torch.is_tensor(mask):
+        return mask.to(torch.float32)
+    return mask.astype(np.float32)
+
+
 def add_ellipsoid(current_volume, grids, z_locations, x0, y0, z0, a, b, c,
                   angle=0, intensity=1.0):
     """
     Add an ellipsoid to an existing volume.
 
+    The volume, the grids and ``z_locations`` are either all numpy arrays or all
+    torch tensors on one device.  Every step is elementwise, so the two forms
+    produce the same values from the same coordinates.
+
     Args:
-        current_volume (ndarray): 3D volume, (rows, cols, slices).
+        current_volume (ndarray or Tensor): 3D volume, (rows, cols, slices).
         grids (tuple): (x_grid, y_grid) in-plane coordinate grids, (rows, cols).
-        z_locations (ndarray): 1D array of z coordinates of the slices.
+        z_locations (ndarray or Tensor): 1D array of z coordinates of the slices.
         x0, y0, z0 (float): ellipsoid center.
         a, b, c (float): x, y, z radii.
         angle (float): rotation of the ellipsoid in the xy plane around
@@ -66,11 +98,13 @@ def add_ellipsoid(current_volume, grids, z_locations, x0, y0, z0, a, b, c,
         intensity (float): the constant value of the ellipsoid to be added.
 
     Returns:
-        ndarray: current_volume + ellipsoid.
+        ndarray or Tensor: current_volume + ellipsoid, matching the input type.
     """
     x_grid, y_grid = grids
-    cos_angle = np.cos(np.deg2rad(angle))
-    sin_angle = np.sin(np.deg2rad(angle))
+    # Python floats rather than numpy scalars, so that the multiplications below
+    # stay in the array library the grids came from.
+    cos_angle = float(np.cos(np.deg2rad(angle)))
+    sin_angle = float(np.sin(np.deg2rad(angle)))
     Xr = cos_angle * (x_grid - x0) + sin_angle * (y_grid - y0)
     Yr = -sin_angle * (x_grid - x0) + cos_angle * (y_grid - y0)
 
@@ -78,7 +112,7 @@ def add_ellipsoid(current_volume, grids, z_locations, x0, y0, z0, a, b, c,
     xy_norm = Xr ** 2 / a ** 2 + Yr ** 2 / b ** 2
     z_norm = (z_locations - z0) ** 2 / c ** 2
     inside = (xy_norm[:, :, None] + z_norm[None, None, :]) <= 1
-    return current_volume + intensity * inside.astype(np.float32)
+    return current_volume + intensity * _as_float32(inside)
 
 
 def _add_shepp_logan_ellipsoids(phantom, grids, z_locations):
@@ -114,13 +148,162 @@ def _shepp_logan_attenuation_scale(phantom_shape, target_max_attenuation):
     return (target_max_attenuation / longest_path_voxels) / interior_intensity
 
 
-def generate_3d_shepp_logan_low_dynamic_range(phantom_shape,
+def _phantom_devices(devices):
+    """The devices the phantom build runs on.
+
+    The phantom follows the preprocessing rule, so ``devices=None`` means every
+    permitted device.  Permitted means every visible CUDA device, capped by
+    MBIRTORCH_NUM_DEVICES when that variable is set, and an explicit list
+    overrides the default.  ``permitted_devices`` implements that rule, so this
+    function calls it rather than repeating it.  What puts the phantom in the
+    preprocessing category is that one band is bounded work at any phantom size.
+    No memory estimate and no device policy enter the choice.
+
+    Every device the rule names then builds a band.  The build is float32, which
+    every backend supports, so no device type is substituted for another here.
+    """
+    from .preprocess import pipeline
+    return pipeline.permitted_devices(devices)
+
+
+def _phantom_block_rows(band_shape, max_block_gb):
+    """The number of rows in one block of a band build, from ``max_block_gb``.
+
+    Only one block is live at a time, and while it is live the build holds a few
+    arrays of the block's own size.  Those arrays are the float32 sum of the
+    coordinate terms, the boolean result of comparing that sum against 1, the
+    same result as float32, and the running float32 block.  No step holds all of
+    them at once, and the heaviest step comes to about thirteen bytes per voxel.
+    Four float32 copies, sixteen bytes per voxel, bound that, and four copies is
+    the budget mbirjax uses for the same purpose.
+    """
+    n_rows, n_cols, n_band = band_shape
+    band_bytes = n_rows * n_cols * n_band * 4
+    num_blocks = max(1, int(np.ceil(4 * band_bytes / (max_block_gb * 1024 ** 3))))
+    return max(1, -(-n_rows // num_blocks))          # ceil(n_rows / num_blocks)
+
+
+def _shepp_logan_band(phantom_shape, slice_range, device, max_block_gb, scale=1.0):
+    """Build the slices ``[start, stop)`` of the phantom on one device.
+
+    Every voxel of the phantom depends only on its own coordinates, so a band of
+    slices can be built by itself and needs nothing from the other bands.  The
+    rows of the band are split into blocks and built one block at a time, which
+    is what bounds the temporaries the build holds.  ``scale`` multiplies each
+    block, so the scaled phantom never exists as a separate array.
+
+    Returns:
+        Tensor: a float32 tensor of shape (rows, cols, stop - start) on
+        ``device``.
+    """
+    n_rows, n_cols, n_slices = phantom_shape
+    start, stop = slice_range
+    if stop <= start:
+        # A device count above the slice axis leaves the trailing devices with
+        # no slices at all.  Their band is empty, and the gather concatenates an
+        # empty band like any other.
+        return torch.zeros((n_rows, n_cols, 0), dtype=torch.float32, device=device)
+
+    # One float32 coordinate vector per axis, built with torch on this device.
+    # Each vector covers its whole axis, and the band and the row blocks below
+    # take slices of it.  Slicing a full-axis vector is what makes a band's
+    # values equal the same slices of a build that took the whole axis at once,
+    # and a block's values equal the same rows of an unblocked build.
+    x_axis = torch.linspace(-1, 1, n_rows, dtype=torch.float32, device=device)
+    y_axis = torch.linspace(-1, 1, n_cols, dtype=torch.float32, device=device)
+    z_band = torch.linspace(-1, 1, n_slices, dtype=torch.float32,
+                            device=device)[start:stop]
+
+    # A float32 scale, so that scaling a block matches scaling the whole phantom.
+    scale32 = float(np.float32(scale))
+    band = torch.empty((n_rows, n_cols, stop - start), dtype=torch.float32,
+                       device=device)
+    block_rows = _phantom_block_rows((n_rows, n_cols, stop - start), max_block_gb)
+    for row_start in range(0, n_rows, block_rows):
+        row_stop = min(row_start + block_rows, n_rows)
+        # The last block is short whenever the block size does not divide the
+        # rows.  mbirjax pads the rows up to a whole number of equal blocks
+        # because lax.map requires them; here the loop simply runs one short
+        # block, so there are no padded rows to crop off afterwards.
+        grids = torch.meshgrid(x_axis[row_start:row_stop], y_axis, indexing='ij')
+        block = _add_shepp_logan_ellipsoids(
+            torch.zeros((row_stop - row_start, n_cols, stop - start),
+                        dtype=torch.float32, device=device), grids, z_band)
+        if scale32 != 1.0:
+            block = block * scale32
+        band[row_start:row_stop] = block
+    return band
+
+
+def _generate_3d_shepp_logan_blocked(phantom_shape, device, max_block_gb, scale=1.0):
+    """Build the phantom on one device, with the rows in blocks.
+
+    The whole slice axis is one band here, so this is the single-device form of
+    :func:`_shepp_logan_band`.  Only the loop structure separates it from a
+    build that takes all the rows at once, so the two give identical values.
+    """
+    band = _shepp_logan_band(phantom_shape, (0, phantom_shape[2]), device,
+                             max_block_gb, scale)
+    phantom = _to_host(band)
+    del band                    # the phantom is a host array; free the device one
+    return phantom
+
+
+def _generate_3d_shepp_logan_sharded(phantom_shape, devices, max_block_gb, scale=1.0):
+    """Build the phantom with the slices split into one band per device.
+
+    The slice axis is the axis a reconstruction shards on, and the bands here
+    are the blocks :meth:`Placement.shard_ranges` gives that axis.  Those blocks
+    are contiguous, they differ in length by at most one, and the longer ones
+    come first.  mbirjax pads the axis up to a multiple of the device count
+    instead, because a jax global array requires equal blocks.  The bands here
+    are separate per-device tensors, so they take their own lengths and sum to
+    the slice axis exactly.  Nothing is padded and nothing is cropped.
+
+    The bands run in one thread per device.  mbirjax loops over its devices
+    without a thread pool, since dispatching a jax computation returns
+    immediately and the devices then run concurrently on their own.  A torch
+    call runs where it is issued, so the threads are what make the bands
+    concurrent here.
+    """
+    placement = _sharding.Placement(devices, axis=-1, axis_len=phantom_shape[2])
+    band_ranges = [slice_range for _, slice_range in placement.shard_ranges()]
+    bands = _sharding.run_per_device(
+        devices,
+        lambda i, device: _shepp_logan_band(phantom_shape, band_ranges[i], device,
+                                            max_block_gb, scale))
+    shards = _sharding.Shards(bands, placement)
+    phantom = _to_host(shards)
+    del bands, shards           # the phantom is a host array; free the device ones
+    return phantom
+
+
+def generate_3d_shepp_logan_low_dynamic_range(phantom_shape, devices=None,
+                                              max_block_gb=4.0,
                                               target_max_attenuation=None):
     """
     Generates a 3D Shepp-Logan phantom with specified dimensions.
 
+    The phantom is a reference object, so it is always returned as a host numpy
+    array.  The build itself runs on devices.  Each device builds one contiguous
+    band of slices, the bands are then gathered to the host, and the device
+    arrays are freed.  Every voxel depends only on its own coordinates, so the
+    bands exchange nothing and the phantom does not depend on the device count.
+
     Args:
         phantom_shape (tuple): Phantom shape in (rows, columns, slices).
+        devices (sequence of devices, optional): Devices to build the phantom
+            across.  Defaults to None, which uses every permitted device: every
+            visible CUDA device, capped by MBIRTORCH_NUM_DEVICES when that
+            variable is set.  This is the rule the preprocessing functions
+            follow, and the phantom follows it because one band is bounded work
+            at any phantom size.  More than one device gives a band per device;
+            one device gives a single band covering every slice.  Every device
+            type can build the phantom, because the build is float32.
+        max_block_gb (float, optional): Rough upper bound in GB on the temporary
+            memory one row block of a band uses.  Defaults to 4.0.  It bounds a
+            band of any length, so it applies to a multi-device build as well as
+            to a single-device one.
         target_max_attenuation (float, optional): If given, scale the phantom so
             that the peak line integral through it (its forward projection) is
             roughly this value, independent of the array shape.  Without it, the
@@ -131,23 +314,15 @@ def generate_3d_shepp_logan_low_dynamic_range(phantom_shape,
     Returns:
         numpy.ndarray: a float32 array of shape ``phantom_shape`` with the voxel
         intensities of the phantom.
-
-    Note:
-        The build holds a few phantom-sized transients, so very large shapes use
-        proportionally more peak memory (mbirjax's blocked/sharded builds exist
-        for that regime and are not ported).
     """
-    n_rows, n_cols, n_slices = phantom_shape
-    x_grid, y_grid = np.meshgrid(np.linspace(-1, 1, n_rows),
-                                 np.linspace(-1, 1, n_cols), indexing='ij')
-    z_locations = np.linspace(-1, 1, n_slices)
-
-    phantom = _add_shepp_logan_ellipsoids(
-        np.zeros(phantom_shape, dtype=np.float32), (x_grid, y_grid), z_locations)
-    if target_max_attenuation is not None:
-        phantom = phantom * np.float32(
-            _shepp_logan_attenuation_scale(phantom_shape, target_max_attenuation))
-    return phantom.astype(np.float32)
+    scale = 1.0 if target_max_attenuation is None \
+        else _shepp_logan_attenuation_scale(phantom_shape, target_max_attenuation)
+    devices = _phantom_devices(devices)
+    if len(devices) > 1:
+        return _generate_3d_shepp_logan_sharded(phantom_shape, devices,
+                                                max_block_gb, scale)
+    return _generate_3d_shepp_logan_blocked(phantom_shape, devices[0],
+                                            max_block_gb, scale)
 
 
 def makedirs(file_path):
