@@ -1,5 +1,5 @@
-"""ConeBeamModel, ported from mbirjax.cone_beam: flat and curved detectors,
-circular and helical scans, the multi-device banding seams, and DC damping.
+"""ConeBeamModel: flat and curved detectors, circular and helical scans, the
+multi-device banding seams, and DC damping.
 
 Structure: cone projection is two separable fans.  The HORIZONTAL fan maps a
 voxel to detector channels exactly as in parallel beam, except the projected
@@ -14,8 +14,9 @@ column onto the recon slices with the weight rule
 
     A = clip((W_p_r + 1) / 2 - |m_p - m|, 0, min(1, W_p_r)) / cos_phi
 
-(validity-masked, then raised to coeff_power -- the mbirjax
-vertical_fan_band_gather rule, including its historical arithmetic order).
+(validity-masked, then raised to coeff_power).  The order of the arithmetic in
+the gather is deliberate; the golden-value tests (tests/test_vs_goldens.py)
+depend on it, so do not rearrange it.
 
 The drivers batch over views like the parallel drivers; the dominant
 transients are (view_batch, P, S) and (view_batch, P, R), so the effective
@@ -37,10 +38,10 @@ _F32 = torch.float32
 
 # (a, b, p, c) for the slice damping s_k = (c t^p + a b^p)/(t^p + b^p),
 # t_k = L |z_k| / (R dz) -- the "C4" preconditioner.  Not a public parameter;
-# for sweeps set ct_model._dc_damping = (a, b, p, c) or None.  ON by default,
-# matching mbirjax (the update direction is a positive definite reshaping of
-# the gradient, so the MAP fixed point is unchanged; only the trajectory
-# differs -- and the convergence-parity gate requires matching trajectories).
+# for sweeps set ct_model._dc_damping = (a, b, p, c) or None.  ON by default:
+# the update direction is a positive definite reshaping of the gradient, so
+# the MAP fixed point is unchanged and only the trajectory differs.  The
+# convergence tests depend on that trajectory, so do not change this default.
 _DC_DAMPING_DEFAULT = (0.25, 100.0, 0.7, 0.5)
 
 
@@ -60,8 +61,7 @@ def _cone_pixel_xy_mag(pixel_indices, angles, num_rows, num_cols, delta_voxel,
     """Rotated in-plane coordinates and the per-pixel magnification.
 
     Returns x (Vb, P), y (Vb, P), pixel_mag (Vb, P).  The magnification
-    expression 1 / (1/M - y/SDD) is valid even at SDD = inf (mbirjax's
-    geometry_xyz_to_uv_mag).
+    expression 1 / (1/M - y/SDD) is valid even at SDD = inf.
     """
     row_index = (pixel_indices // num_cols).to(_F32)
     col_index = (pixel_indices % num_cols).to(_F32)
@@ -541,7 +541,7 @@ class ConeBeamModel(TomographyModel):
         voxel-per-detector radius (the forward vertical tap radius).  The
         directions deliberately use DIFFERENT vertical radii -- forward
         gathers voxels per detector row (bp radius), back gathers rows per
-        voxel (psf radius) -- inherited from mbirjax.
+        voxel (psf radius).
 
         Returns:
             (psf_radius, bp_psf_radius) ints.
@@ -592,7 +592,7 @@ class ConeBeamModel(TomographyModel):
         The xy width is the detector field of view at iso; the axial height is
         the detector height at iso swept over any helical travel, plus per-end
         padding scaled by ``axial_pad_fraction`` (a fraction of 1 pads each end
-        to the deepest z reached by any measured ray).  Verbatim mbirjax math.
+        to the deepest z reached by any measured ray).
         """
         delta_det_row, delta_det_channel = self.get_params(
             ['delta_det_row', 'delta_det_channel'])
@@ -703,7 +703,7 @@ class ConeBeamModel(TomographyModel):
 
     def helical_fdk_z_weight(self, recon, sinogram):
         """Scale each helical FDK slice by the inverse of the fraction of the
-        scan in which the slice is in view of the detector (verbatim mbirjax)."""
+        scan in which the slice is in view of the detector."""
         num_views, num_rows, num_channels = self.get_params('sinogram_shape')
         helical_z_shifts = np.asarray(self.get_params('view_params_array'))[:, 1]
         (delta_voxel, voxel_slice_aspect, recon_shape, recon_slice_offset,

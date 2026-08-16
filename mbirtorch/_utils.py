@@ -1,9 +1,8 @@
 """Parameter defaults and small shared helpers.
 
-Ported from mbirjax._utils: the Param dataclass and the default parameter
-dictionaries are copied verbatim (same names, values, and recompile flags) so
-the two packages stay parameter-compatible.  The jax-specific OOM-marker and
-ParamNames-literal tooling is not ported.
+Defines the Param dataclass and the default parameter dictionaries.  The
+names, values, and recompile flags of those defaults are fixed by an external
+reference and must not be changed here.
 """
 
 import copy
@@ -22,7 +21,7 @@ class Param:
         return f"Param(val={self.val}, recompile_flag={self.recompile_flag})"
 
 
-# The values below are copied from mbirjax._utils (2026-08-04) and must track it.
+# The names, values, and recompile flags below are fixed; do not change them here.
 _forward_model_defaults_dict = {
     'geometry_type': Param(None, False),
     'file_format': Param(FILE_FORMAT_NUMBER, False),

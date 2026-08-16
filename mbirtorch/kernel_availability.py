@@ -1,11 +1,11 @@
 """Once-per-process availability probe for the hand-written (Triton) kernel
 paths, and the per-kernel value self-checks.
 
-Modeled on mbirjax's pallas ``availability()`` gate: the kernel paths are an
-OPTIMIZATION, so an environment that cannot run them must fall back to the
-torch.compile paths silently -- but not silently-unexplained.  The probe
-returns (usable, reason), and the reason string is the record of WHY a node is
-not using the custom kernels (the same question a benchmark asks first).
+The kernel paths are an OPTIMIZATION, so an environment that cannot run them
+must fall back to the torch.compile paths silently -- but not
+silently-unexplained.  The probe returns (usable, reason), and the reason
+string is the record of WHY a node is not using the custom kernels (the same
+question a benchmark asks first).
 
 The probe compiles and runs a trivial kernel end to end rather than trusting
 version checks: it is the toolchain, not the version number, that breaks.  It

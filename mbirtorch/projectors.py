@@ -33,8 +33,7 @@ _F32 = torch.float32
 # specialization per shape guard), and the VCD loop's shape set is small (one
 # subset size per partition granularity, plus the full-index size).  A compile
 # failure falls back to eager silently-but-recorded, so exotic
-# backends/toolchains keep working (the same availability philosophy as
-# mbirjax's pallas gate).
+# backends/toolchains keep working.
 _COMPILE_CACHE = {}
 _COMPILE_ERRORS = {}
 # Serializes COMPILE EVENTS process-wide: triton/inductor compilation is not
@@ -245,12 +244,10 @@ class Projectors:
     assembles outputs sized lazily from the first block.  One geometry class
     therefore never subclasses this driver.
 
-    Center-consistency contract (adapted from mbirjax's rounding-fix design):
-    forward and back consume the SAME deterministic center computation for each
-    (view, pixel), so the pair stays exactly adjoint even at rounding ties.  In
-    mbirjax the centers are computed once outside the jitted programs (an XLA
-    miscompile workaround); here there is no compiler hazard, and recomputing
-    the same deterministic chain per call preserves the consistency property.
+    Center-consistency contract: forward and back consume the SAME
+    deterministic center computation for each (view, pixel), so the pair stays
+    exactly adjoint even at rounding ties.  The centers are recomputed by that
+    same chain on every call rather than cached, which preserves the property.
     """
 
     # Rough per-batch transient budget for the fan kernels' (Vb, P, cols)
@@ -295,15 +292,13 @@ class Projectors:
     #     it.  The driver loop is shaped as a two-axis tile walk with an
     #     accumulating forward precisely so the pixel loop drops in without
     #     touching the geometry contract.
-    #     Pixel chunking here means mbirjax's TWO-axis tiling (its
-    #     _sparse_forward/_back_project drivers): forward sums partial
-    #     sinograms over PIXEL batches around the view loop
-    #     (sum_function_in_batches), back concatenates per-PIXEL-batch outputs
-    #     inside the view-sum loop (concatenate_function_in_batches), with a
-    #     jointly chosen (view_batch, pixel_batch) tile.  These drivers tile
-    #     views only; the joint tile choice needs a 2-D budget rule and gate
-    #     measurement (tile shape moved mbirjax kernels several-fold in its
-    #     campaign), so it belongs with the kernel work.
+    #     Pixel chunking here means TWO-axis tiling: forward sums partial
+    #     sinograms over PIXEL batches around the view loop, back concatenates
+    #     per-PIXEL-batch outputs inside the view-sum loop, with a jointly
+    #     chosen (view_batch, pixel_batch) tile.  These drivers tile views
+    #     only; the joint tile choice needs a 2-D budget rule and its own
+    #     measurements (tile shape has changed kernel run time several-fold in
+    #     earlier work), so it belongs with the kernel work.
     VIEW_BATCH_TRANSIENT_BUDGET_BYTES = 2 * 2**30
     VIEW_BATCH_TRANSIENT_FLOOR_BYTES = 256 * 2**20
     VIEW_BATCH_SINO_MULTIPLE = 8

@@ -110,7 +110,7 @@ def _compute_sino_and_params(dataset_dir, downsample_factor=(1, 1), subsample_vi
         crop_pixels_top = max(crop_pixels_top, crop_pixels_bottom)
         crop_pixels_bottom = max(crop_pixels_bottom, crop_pixels_top)
 
-    cone_beam_params, optional_params = convert_nsi_to_mbirjax_params(nsi_params, downsample_factor=downsample_factor,
+    cone_beam_params, optional_params = convert_nsi_to_mbirtorch_params(nsi_params, downsample_factor=downsample_factor,
                                                                       crop_pixels_sides=crop_pixels_sides,
                                                                       crop_pixels_top=crop_pixels_top,
                                                                       crop_pixels_bottom=crop_pixels_bottom)
@@ -177,7 +177,7 @@ def load_scans_and_params(dataset_dir, view_id_start=0, view_id_end=None, subsam
             - obj_scan (numpy.ndarray): 3D object scan with shape (num_views, num_det_rows, num_det_channels).
             - blank_scan (numpy.ndarray): 3D blank scan with shape (1, num_det_rows, num_det_channels).
             - dark_scan (numpy.ndarray): 3D dark scan with shape (1, num_det_rows, num_det_channels).
-            - nsi_params (dict): Required parameters needed for ``convert_nsi_to_mbirjax_params()`` (e.g., geometry vectors, spacings, and angles).
+            - nsi_params (dict): Geometry parameters read from the NSI config file (e.g., geometry vectors, spacings, and angles).
             - defective_pixel_array (numpy.ndarray | tuple): If a defective-pixel file is present, an (N, 2) integer array of (detector_row_idx, detector_channel_idx) pairs; otherwise an empty tuple ``()``.
     """
     ### automatically parse the paths to NSI metadata and scans from dataset_dir
@@ -397,7 +397,7 @@ def load_scans_and_params(dataset_dir, view_id_start=0, view_id_end=None, subsam
     return obj_scan, blank_scan, dark_scan, nsi_params, defective_pixel_array
 
 
-def convert_nsi_to_mbirjax_params(nsi_params, downsample_factor=(1, 1), crop_pixels_sides=0, crop_pixels_top=0, crop_pixels_bottom=0):
+def convert_nsi_to_mbirtorch_params(nsi_params, downsample_factor=(1, 1), crop_pixels_sides=0, crop_pixels_top=0, crop_pixels_bottom=0):
     """
     Convert geometry parameters from nsi into mbirtorch format, including modification to reflect crop and downsample.
 

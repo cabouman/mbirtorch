@@ -1,15 +1,14 @@
 """qGGMRF prior: gradient and Hessian-diagonal at pixel indices.
 
-Ported from mbirjax.qggmrf (single-device path; the sharded halo/mask
-machinery is not ported).  The formulas are FCI Figure 8.5 /
-Table 8.1, and ``b_tilde`` deliberately has ONE implementation
-(``b_tilde_by_definition``), matching the mbirjax structure after its
-qggmrf-flake fix: the clip floor lives only there.
+This is the single-device path; the sharded halo exchange lives in
+_sharding.py.  The formulas are FCI Figure 8.5 / Table 8.1.  ``b_tilde`` has ONE
+implementation (``b_tilde_by_definition``), so the clip floor lives in exactly
+one place.
 
-Shapes: the jax version vmaps per cylinder and per slice; here the same math
-is written directly batched -- per-cylinder over (N, S) arrays and per-slice
-via flat gathers -- which is value-identical (the ops are elementwise on the
-same operands; validated against the mbirjax goldens at ~1e-7 rel-max).
+Shapes: the math is written directly batched -- per-cylinder over (N, S)
+arrays and per-slice via flat gathers.  The operations are elementwise on the
+same operands, so the batched form is value-identical to a per-cylinder loop.
+The golden-value tests (tests/test_vs_goldens.py) hold it to ~1e-7 rel-max.
 """
 
 import numpy as np
@@ -36,10 +35,10 @@ def b_tilde_by_definition(delta, sigma_x, p, q, T):
 
     This is the ONE b_tilde implementation (the reference form): the
     production gradient/Hessian path delegates here via :func:`get_2_b_tilde`,
-    so the two can never diverge (mbirjax previously carried two
-    separately-coded forms that disagreed by up to ~3e-3 near ``delta -> 0``
-    because they floored the removable 0/0 singularity differently).  The
-    floor is a clip of ``|delta|`` at ``T * sigma_x * eps_f32``: exact above
+    so the two can never diverge.  Two separately-coded forms would disagree by
+    up to ~3e-3 near ``delta -> 0``, because the removable 0/0 singularity can
+    be floored in more than one way.  The floor is a clip of ``|delta|`` at
+    ``T * sigma_x * eps_f32``: exact above
     the floor, and for ``p = 2`` equal to the analytic ``rho''(0)/2`` to
     ~1e-6; below the floor the surrogate weight ``b_tilde * delta^2`` is
     ~1e-14, numerically inert in a reconstruction.
@@ -200,7 +199,7 @@ def qggmrf_loss(full_recon, qggmrf_params):
     Computes the loss for the qGGMRF prior for a given recon.  This is meant
     only for relatively small recons for debugging and demo purposes (the
     verbose compute_prior_loss path of vcd_recon); it runs host-side in numpy
-    on the gathered volume, verbatim mbirjax math.
+    on the gathered volume.
 
     Args:
         full_recon (ndarray): 3D volume, (rows, cols, slices).

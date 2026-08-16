@@ -1,20 +1,18 @@
-"""QGGMRFDenoiser, ported from mbirjax.denoising.
+"""QGGMRFDenoiser: a qGGMRF proximal-map image denoiser.
 
-The denoiser uses the recon framework to implement a qGGMRF proximal-map
-denoiser: the forward model is the IDENTITY (the residual image plays the role
-of the error sinogram), so no projectors exist and the VCD subset update
-reduces to the closed-form below.  The mbirjax jit/fori_loop machinery is
-replaced by a plain python loop over the (sequential, unshuffled) subsets of
-ONE fixed partition -- the mbirjax denoiser iterates subsets in order, unlike
-vcd_recon's per-iteration shuffle, so a seeded partition makes the
-whole sweep deterministic.
+The denoiser uses the recon framework: the forward model is the IDENTITY (the
+residual image plays the role of the error sinogram), so no projectors exist
+and the VCD subset update reduces to the closed-form below.  A plain python
+loop runs over the subsets of ONE fixed partition, in order.  Unlike
+vcd_recon, which reshuffles each iteration, the denoiser never reshuffles, so
+a seeded partition makes the whole sweep deterministic.
 
-Two paths, as in mbirjax: on one device the whole sweep runs through the
-compiled in-place update below; across several devices the image is
-slice-sharded and the sweep runs shard by shard, with the qGGMRF halos
-staged once per pass and the four line-search sums combined on the lead
-device into one step size.  Both paths keep the line search on device, so
-neither forces a host synchronization per subset.
+There are two paths.  On one device the whole sweep runs through the compiled
+in-place update below.  Across several devices the image is slice-sharded and
+the sweep runs shard by shard, with the qGGMRF halos staged once per pass and
+the four line-search sums combined on the lead device into one step size.
+Both paths keep the line search on device, so neither forces a host
+synchronization per subset.
 """
 
 import datetime
@@ -37,8 +35,11 @@ _F32_EPS = float(np.finfo(np.float32).eps)
 def vcd_subset_denoiser(flat_image, flat_error_image, pixel_indices,
                         fm_constant, qggmrf_params, image_shape):
     """One VCD subset update for the identity forward model (the analog of
-    vcd_subset_updater; verbatim mbirjax math).  Mutates both state tensors in
-    place and returns (flat_image, flat_error_image, ell1, alpha)."""
+    vcd_subset_updater).  Mutates both state tensors in place and returns
+    (flat_image, flat_error_image, ell1, alpha).
+
+    The formulas and their order of operations are fixed by the golden-value
+    tests (tests/test_denoiser.py); do not rearrange them."""
     # qGGMRF prior - compute the gradient and Hessian at each pixel in the set.
     prior_grad, prior_hess = _qggmrf.qggmrf_gradient_and_hessian_at_indices(
         flat_image, image_shape, pixel_indices, qggmrf_params)
@@ -154,7 +155,7 @@ class QGGMRFDenoiser(TomographyModel):
     def estimate_image_noise_std(self, image):
         """
         Estimate the noise standard deviation from the image (two passes of
-        support-indicator + neighbor-difference std, as in mbirjax).
+        support-indicator + neighbor-difference std).
         """
         image = np.asarray(image)
         num_pts_to_use = np.minimum(5_000_000, image.size)
@@ -397,7 +398,7 @@ class QGGMRFDenoiser(TomographyModel):
         try:
             with torch.no_grad():
                 for i in range(max_iters):
-                    # Halos once per pass, as in mbirjax's sharded denoiser.
+                    # Exchange the halos once per pass.
                     halos['left'], halos['right'] = _sharding.exchange_qggmrf_halos(
                         flat_image, self.dev2dev_safe)
                     ell1_accum = 0.0

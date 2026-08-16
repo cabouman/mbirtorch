@@ -1,18 +1,15 @@
 """TomographyModel: the VCD reconstruction loop, FBP, and projector wrappers.
 
-Ported from mbirjax.tomography_model: the VCD loop (numpy partitions, subset updater, on-device line search,
-positivity), FBP via torch.fft, the auto-regularization chain, the placement
+The module holds the VCD loop (numpy partitions, subset updater, on-device
+line search, positivity), FBP via torch.fft, the auto-regularization chain, the
 placement and gather functions, the multi-device VCD loop, and the public
-numpy-at-the-boundary API.  The loop's working state is uniformly per-device (:class:`_sharding.Shards`;
-a single device is the trivial one-shard case, following mbirjax's
-everything-is-sharded principle).  Deliberately not (yet) ported: the tile
-policy, save/load, and the memory-management machinery jax needed (donation
-and .delete() become plain in-place ops here; the checkpoint-resume path
-mutates the caller arrays in place, advertised, instead of donating).
+numpy-at-the-boundary API.  The loop's working state is always per-device
+(:class:`_sharding.Shards`); a single device is the one-shard case.  The
+checkpoint-resume path mutates the caller's arrays in place.
 
-Value-parity intent: every formula follows the mbirjax source read 2026-08-04,
-in the same order of operations, so a seeded run matches a seeded mbirjax run
-iteration for iteration (the convergence-parity gate in tests/test_vs_goldens).
+The order of operations in every formula is deliberate.  The golden-value tests
+(tests/test_vs_goldens.py) require a seeded run to reproduce iteration for
+iteration, so do not reorder the arithmetic.
 """
 
 import contextlib
@@ -56,8 +53,8 @@ _COLUMN_GATHER_OFF_VALUES = ('0', 'false', 'no', 'off')
 # state tensors in place but returns them; call sites rebind through the
 # returns.
 def _diagonal_update_direction(forward_grad, prior_grad, forward_hess, prior_hess):
-    # The base preconditioned direction (the mbirjax module-level jitted helper's
-    # torch analog), fused so the sums and divide are one kernel.
+    # The base preconditioned direction, fused so the sums and the divide are
+    # one kernel.
     return -((forward_grad + prior_grad) / (forward_hess + prior_hess))
 
 
@@ -194,8 +191,8 @@ class TomographyModel(ParameterHandler):
         self.set_params(no_compile=True, no_warning=True,
                         sinogram_shape=tuple(int(s) for s in sinogram_shape))
 
-        # Geometry-derived defaults (recon_shape, delta_voxel), then the
-        # projectors, then a validity check -- the mbirjax construction order.
+        # Construct in this order: geometry-derived defaults (recon_shape,
+        # delta_voxel), then the projectors, then a validity check.
         self.auto_set_recon_geometry(no_compile=True, no_warning=True)
         self.verify_valid_params()
 
@@ -1009,7 +1006,7 @@ class TomographyModel(ParameterHandler):
         self.prox_data = None
         self._dc_damping_cache = None
 
-    # ── device configuration (the mbirjax configure_devices seam) ─────────────
+    # ── device configuration ──────────────────────────────────────────────────
     def configure_devices(self, num_devices=1, devices=None):
         """
         Set the compute devices the model uses.
@@ -2421,7 +2418,8 @@ class TomographyModel(ParameterHandler):
         if hasattr(vcd_subset_updater, 'stage_halos'):
             vcd_subset_updater.stage_halos(flat_recon)
         # Loop over the subsets of the partition, using random subset_indices to
-        # order them (the same np.random call as mbirjax, for trace parity).
+        # order them.  Keep this np.random call as written: any change to the
+        # random sequence changes the iteration trace the tests compare against.
         ell1_for_partition = 0
         alpha_sum = 0
         delta_sumsq_partition = 0
@@ -2558,13 +2556,12 @@ class TomographyModel(ParameterHandler):
         # The sinogram is fully folded into error_sinogram.  Dropping the
         # reference frees any device copy made here before the loop.
         sinogram = None
-        # Placement invariant at the loop boundary (mirrors mbirjax): the
-        # error sinogram is in the sino device form -- a no-op re-placement
-        # on a single device.
+        # Placement invariant at the loop boundary: the error sinogram is in
+        # the sino device form -- a no-op re-placement on a single device.
         error_sinogram = self._shard_sinogram(error_sinogram)
 
         if prox_input is not None:
-            # mbirjax validates the prox input's shape before flattening; a
+            # Validate the prox input's shape before flattening: a
             # size-compatible but mis-shaped input (e.g. a transposed volume)
             # must fail loudly rather than silently reshape.
             if tuple(prox_input.shape) != tuple(recon_shape):
@@ -2655,8 +2652,7 @@ class TomographyModel(ParameterHandler):
                     constant_weights, float(total_sino_size))
                 fm_rmse[i] = float(fm_loss_i)
                 recon_l1_f = float(recon_l1)
-                # A zero recon gives nan (matching mbirjax) rather than
-                # raising ZeroDivisionError.
+                # A zero recon gives nan rather than raising ZeroDivisionError.
                 nmae_update[i] = (float(ell1_for_partition) / recon_l1_f
                                   if recon_l1_f else float('nan'))
                 alpha_values[i] = float(alpha)

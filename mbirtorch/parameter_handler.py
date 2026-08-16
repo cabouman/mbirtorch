@@ -1,10 +1,10 @@
-"""Parameter storage and access, ported (lean) from mbirjax.parameter_handler.
+"""Parameter storage and access.
 
-The public surface the reconstruction methods and users rely on is kept: ``get_params`` (one
-name or a list), ``set_params(**kwargs)`` with mbirjax's recompile and
-auto-regularization semantics, ``verify_valid_params``, ``print_params``, and
-the shared geometry-params namedtuple cache.  Not yet ported: YAML save/load
-and the ParamNames Literal typing machinery.
+The public surface is ``get_params`` (one name or a list),
+``set_params(**kwargs)`` with its recompile and auto-regularization semantics,
+``verify_valid_params``, ``print_params``, and the shared geometry-params
+namedtuple cache.  Not implemented: YAML save/load and the ParamNames Literal
+typing machinery.
 """
 
 import io
@@ -108,12 +108,11 @@ class ParameterHandler:
         only once the reconstruction is about to start; see that method.
         """
         # log_buffer, not logger, is what says "setup_logger has never run".
-        # mbirjax tests self.logger here, which works there because its logger
-        # stays None until setup.  TomographyModel fills that slot at
-        # construction with a console-only logger for messages that happen
-        # before a recon starts, so testing it would skip setup on every
-        # resumed run (first_iteration > 0) and drop the log entirely.  Only
-        # setup_logger ever creates the buffer.
+        # TomographyModel fills the logger slot at construction with a
+        # console-only logger for messages that happen before a recon starts,
+        # so testing self.logger here would skip setup on every resumed run
+        # (first_iteration > 0) and drop the log entirely.  Only setup_logger
+        # ever creates the buffer.
         if first_iteration == 0 or self.log_buffer is None:
             self.setup_logger(logfile_path=logfile_path, print_logs=print_logs)
         from . import __version__
@@ -122,11 +121,10 @@ class ParameterHandler:
     def _log_device_report(self):
         """Log the devices the reconstruction will actually use.
 
-        Called once the device layout is final.  mbirjax logs this in the run
-        header, which it can do because its layout is fixed when the model is
-        built.  Here the automatic layout is chosen when a reconstruction
-        starts, so a header-time report would name the placement the run was
-        about to leave, and a widened run would log '1 x CUDA'.
+        Called once the device layout is final.  The report cannot go in the
+        run header, because the automatic layout is chosen when a
+        reconstruction starts: a header-time report would name the placement
+        the run was about to leave, and a widened run would log '1 x CUDA'.
         """
         self.logger.info('Reconstruction devices: {}'.format(
             self._device_report()))
@@ -174,8 +172,8 @@ class ParameterHandler:
 
     @staticmethod
     def normalize_scalar(val):
-        """Convert numpy scalar types to plain python scalars (mbirjax's
-        normalize_scalar); arrays and other values pass through."""
+        """Convert numpy scalar types to plain python scalars; arrays and
+        other values pass through."""
         if isinstance(val, np.generic):
             return val.item()
         return val
@@ -188,7 +186,7 @@ class ParameterHandler:
         geometry-related parameters are modified, it triggers a rebuild of the
         projector system unless suppressed via the `no_compile` flag.
 
-        The mbirjax special-case semantics are reproduced exactly:
+        Four special cases apply:
 
         - Directly setting a regularization parameter (``sigma_y``, ``sigma_x``,
           or ``sigma_prox``) disables auto-regularization and warns, so the
@@ -201,7 +199,7 @@ class ParameterHandler:
           except under ``no_warning`` (the construction path), where it is
           ADDED as a new recompile-flagged parameter (how the geometry's own
           parameters, e.g. ``angles``, enter).
-        - No validity check runs here: like mbirjax, validation is deferred to
+        - No validity check runs here.  Validation is deferred to
           reconstruction entry (``verify_valid_params`` in ``vcd_recon``), so
           multi-step geometry changes (set a new sinogram shape, then call
           ``auto_set_recon_geometry``) work without a transiently-inconsistent
@@ -226,7 +224,7 @@ class ParameterHandler:
             recompile_flag = True
             if key in self.params:
                 recompile_flag = self.params[key].recompile_flag
-            elif not no_warning:   # disabled for initialization, as in mbirjax
+            elif not no_warning:   # disabled for initialization
                 error_message = '{} is not a recognized parameter'.format(key)
                 error_message += '\nValid parameters are: \n'
                 for valid_key in self.params.keys():
@@ -279,7 +277,7 @@ class ParameterHandler:
 
     def verify_valid_params(self):
         """Check parameter consistency; geometry classes extend this.  Called at
-        reconstruction entry (not from set_params), matching mbirjax."""
+        reconstruction entry, not from set_params."""
         sinogram_shape = self.get_params('sinogram_shape')
         if len(sinogram_shape) != 3:
             raise ValueError(f'sinogram_shape must be (views, rows, channels); '
@@ -312,9 +310,8 @@ class ParameterHandler:
         print('----')
 
     # ── shared geometry-params namedtuple cache ───────────────────────────────
-    # The namedtuple CLASS is cached per field-name tuple (module-level), matching
-    # mbirjax's make_geometry_params.  In torch there is no jit-cache reason, but a
-    # shared class keeps equality and repr behavior consistent across instances.
+    # The namedtuple CLASS is cached per field-name tuple (module-level).  A shared
+    # class keeps equality and repr behavior consistent across instances.
     _geometry_param_classes = {}
 
     @classmethod

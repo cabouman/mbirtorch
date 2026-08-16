@@ -63,7 +63,7 @@ Differentiable Projectors
 -------------------------
 
 See :ref:`AutogradDocs` for the projectors exposed as differentiable PyTorch operations, for
-use inside a deep-learning pipeline.  This section has no MBIRJAX counterpart.
+use inside a deep-learning pipeline.
 
 .. autosummary::
 
@@ -126,6 +126,6 @@ It also includes functions for processing cone beam and parallel beam data to re
 
 The ``preprocess`` subpackage loads lazily: ``import mbirtorch`` does not pull in its
 dependency stack, and ``import mbirtorch.preprocess`` or the first attribute access loads
-it.  This is a deliberate improvement over MBIRJAX, which imports its preprocess eagerly.
+it.
 
 It also includes functions for optimal view selection.

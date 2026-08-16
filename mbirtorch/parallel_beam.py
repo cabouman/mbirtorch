@@ -1,6 +1,6 @@
-"""ParallelBeamModel, ported from mbirjax.parallel_beam.
+"""ParallelBeamModel: reconstruction for parallel-beam scanner geometry.
 
-The geometry math (compute_proj_data) is reproduced exactly, vectorized over a
+The geometry math (compute_proj_data) is vectorized over a
 batch of views: detector row r maps to recon slice r, and the horizontal fan's
 inputs are the continuous channel coordinate n_p, its rounded center, the
 projected width W_p_c, and the weight scale (in-plane voxel area over the
@@ -26,7 +26,7 @@ def _parallel_hfan_math(pixel_indices, view_params_batch, num_rows, num_cols,
     row_index = (pixel_indices // num_cols).to(_F32)
     col_index = (pixel_indices % num_cols).to(_F32)
     # Compute the un-rotated coordinates relative to iso.  Note the change in
-    # order from (i, j) to (y, x) (recon_ij_to_x in mbirjax).
+    # order from (i, j) to (y, x).
     y_tilde = delta_voxel_row * (row_index - (num_rows - 1) / 2.0)
     x_tilde = delta_voxel * (col_index - (num_cols - 1) / 2.0)
 
@@ -193,7 +193,7 @@ class ParallelBeamModel(TomographyModel):
     def auto_set_recon_geometry(self, no_compile=False, no_warning=False):
         """Compute the default recon size using the internal parameters
         delta_det_channel and delta_det_row plus the number of channels from the
-        sinogram (verbatim mbirjax math).  Run this after changing geometry
+        sinogram.  Run this after changing geometry
         parameters such as ``delta_det_channel``; it resets ``recon_shape`` and
         ``delta_voxel`` to reasonable values."""
         delta_det_row, delta_det_channel = self.get_params(
@@ -311,8 +311,7 @@ class ParallelBeamModel(TomographyModel):
                 (num_views, num_rows, num_channels).
             filter_name (string, optional): Name of the filter.  Defaults to "ramp".
             output_sharded (bool, optional): If False (default), return numpy;
-                if True, return the device tensor (the mbirjax argument name,
-                kept for API compatibility).
+                if True, return the device tensor.
 
         Returns:
             The filtered sinogram.
@@ -339,8 +338,6 @@ class ParallelBeamModel(TomographyModel):
         the adjoint of the forward projector to perform the backprojection.
         This is different from many implementations, in which the
         backprojection is not exactly the adjoint of the forward projection.
-        For a detailed theoretical derivation, see the zip file linked at
-        https://mbirjax.readthedocs.io/en/latest/theory.html
 
         Note:
             FBP assumes the view angles are EQUALLY SPACED over the full angular

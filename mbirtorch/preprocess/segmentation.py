@@ -71,9 +71,7 @@ def _sharded_masked_histogram(shards, valid_mask, num_bins):
     maximizes between-class variance over bins whose counts are in the
     millions at production scale, so a handful of displaced counts is not
     expected to move a boundary -- but "expected not to" is the claim, not
-    "cannot".  mbirjax records the same divergence in its own port and deems
-    it irrelevant at Otsu's granularity; this is at parity with that, not
-    stricter than it.
+    "cannot".
 
     Returns:
         (hist, bin_edges): host numpy arrays in the single-array path's dtypes

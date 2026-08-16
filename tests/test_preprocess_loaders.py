@@ -52,7 +52,7 @@ def _tct_params():
 
 
 def test_nsi_symmetric_crop_is_byte_identical():
-    conv = mtp.nsi.convert_nsi_to_mbirjax_params
+    conv = mtp.nsi.convert_nsi_to_mbirtorch_params
     p = _nsi_params()
     _, base = conv(p, (1, 1), 0, 0, 0)
     cb, op = conv(p, (1, 1), 3, 5, 5)                    # symmetric sides + top == bottom
@@ -63,7 +63,7 @@ def test_nsi_symmetric_crop_is_byte_identical():
 
 
 def test_nsi_asymmetric_crop_shifts_row_offset():
-    conv = mtp.nsi.convert_nsi_to_mbirjax_params
+    conv = mtp.nsi.convert_nsi_to_mbirtorch_params
     p = _nsi_params()
     _, base = conv(p, (1, 1), 0, 0, 0)
     cb, op = conv(p, (1, 1), 0, 10, 0)                   # crop_top=10, crop_bottom=0
@@ -73,7 +73,7 @@ def test_nsi_asymmetric_crop_shifts_row_offset():
 
 
 def test_nsi_offset_shift_uses_raw_pitch_independent_of_downsample():
-    conv = mtp.nsi.convert_nsi_to_mbirjax_params
+    conv = mtp.nsi.convert_nsi_to_mbirtorch_params
     p = _nsi_params()
     _, base = conv(p, (1, 1), 0, 0, 0)
     raw_pitch = base['delta_det_row']
@@ -87,7 +87,7 @@ def test_nsi_offset_shift_uses_raw_pitch_independent_of_downsample():
 
 
 def test_zeiss_symmetric_crop_is_byte_identical():
-    conv = mtp.zeiss.convert_zeiss_to_mbirjax_params
+    conv = mtp.zeiss.convert_zeiss_to_mbirtorch_params
     p = _zeiss_params()
     _, base, _ = conv(p, (1, 1), 0, 0, 0)
     gp, op, _ = conv(p, (1, 1), 3, 5, 5)
@@ -97,7 +97,7 @@ def test_zeiss_symmetric_crop_is_byte_identical():
 
 
 def test_zeiss_asymmetric_crop_shifts_row_offset():
-    conv = mtp.zeiss.convert_zeiss_to_mbirjax_params
+    conv = mtp.zeiss.convert_zeiss_to_mbirtorch_params
     p = _zeiss_params()
     _, base, _ = conv(p, (1, 1), 0, 0, 0)
     gp, op, _ = conv(p, (1, 1), 0, 10, 0)
@@ -107,7 +107,7 @@ def test_zeiss_asymmetric_crop_shifts_row_offset():
 
 
 def test_zeiss_tct_symmetric_crop_is_byte_identical():
-    conv = mtp.zeiss_tct.convert_zeiss_to_mbirjax_params
+    conv = mtp.zeiss_tct.convert_zeiss_to_mbirtorch_params
     p = _tct_params()
     _, base = conv(p, 0, 0, 0)
     tp, op = conv(p, 3, 5, 5)                                # sides=3, top=bottom=5 (symmetric)
@@ -117,7 +117,7 @@ def test_zeiss_tct_symmetric_crop_is_byte_identical():
 
 
 def test_zeiss_tct_asymmetric_crop_shifts_row_offset():
-    conv = mtp.zeiss_tct.convert_zeiss_to_mbirjax_params
+    conv = mtp.zeiss_tct.convert_zeiss_to_mbirtorch_params
     p = _tct_params()
     _, base = conv(p, 0, 0, 0)
     tp, op = conv(p, 0, 10, 0)                               # sides=0, top=10, bottom=0 (asymmetric)
@@ -173,7 +173,7 @@ def test_auto_crop_sino_consistent_and_survives_build_model():
 @pytest.mark.skipif(not os.path.exists(_npz_path), reason="no preprocess goldens")
 def test_nsi_convert_golden_parity():
     golden = np.load(_npz_path)
-    cb, op = mtp.nsi.convert_nsi_to_mbirjax_params(_nsi_params(), (2, 2), 3, 5, 5)
+    cb, op = mtp.nsi.convert_nsi_to_mbirtorch_params(_nsi_params(), (2, 2), 3, 5, 5)
     out = np.array([cb['sinogram_shape'][1], cb['sinogram_shape'][2],
                     cb['source_detector_dist'], cb['source_iso_dist'],
                     op['det_row_offset'], op['det_channel_offset'],

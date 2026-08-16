@@ -1,9 +1,8 @@
 """mbirtorch-side wrapper for the slice viewer.
 
 The viewer module itself (mbirtorch/viewer.py) is package-independent: it
-imports only numpy, matplotlib, and (lazily) h5py, so the identical file can
-later serve mbirjax.  This wrapper supplies the mbirtorch-specific
-conversions on the way in: torch tensors (including CUDA and MPS tensors)
+imports only numpy, matplotlib, and (lazily) h5py.  This wrapper supplies the
+mbirtorch-specific conversions on the way in: torch tensors (including CUDA and MPS tensors)
 become numpy arrays, and rich data dicts -- e.g. the recon_dict returned by
 :meth:`TomographyModel.recon` -- are serialized to dicts of display strings.
 """

@@ -24,22 +24,20 @@ receives
     A = weight_scale * clip((W_p_c + 1) / 2 - |n_p - n|, 0, min(1, W_p_c))
 
 -- the trapezoid overlap of the projected voxel with detector cell n --
-zeroed outside the detector.  Values match mbirjax's kernels by
-construction (validated cross-framework at <= 1.6e-6 rel-max on the
-goldens).
+zeroed outside the detector.  The weights reproduce the golden reference
+to <= 1.6e-6 rel-max.
 
-Torch semantics note: jax DROPS out-of-bounds scatter indices and CLAMPS
-out-of-bounds gathers, and mbirjax's per-tap loops rely on both.  Torch
-index ops assert on out-of-bounds instead, so every tap here uses the
+Torch semantics note: torch index ops assert on out-of-bounds indices
+rather than dropping or clamping them, so every tap here uses the
 zero-the-weight, clamp-the-index pattern: the weight is zeroed where the
 unclipped tap fell outside the detector, then the index is clamped in
 range.  This convention is load-bearing beyond correctness: a sorted/CSR
 consumer's static stream bound (taps per view == psf_width * P exactly)
 rests on no tap ever being dropped.
 
-Layout note (from mbirjax): the forward fan produces CHANNEL-MAJOR
-partial views, (channels, cols), so the scatter writes contiguous rows
-rather than strided columns; the geometry BODY transposes to the
+Layout note: the forward fan produces CHANNEL-MAJOR partial views,
+(channels, cols), so the scatter writes contiguous rows rather than
+strided columns; the geometry BODY transposes to the
 sinogram's (rows, channels) layout on return.  The back fan likewise
 gathers from channel-major views (the body transposes each view batch up
 front).
@@ -75,8 +73,7 @@ def tap_weights(n_p, n, W_p_c, weight_scale, num_channels):
 
 def fan_forward_batch(hfan_data, values, num_channels, psf_radius):
     """Forward horizontal fan for one view batch: bin weighted per-pixel rows
-    into their detector channels (the per-tap scatter-add loop, mbirjax's
-    portable formulation).
+    into their detector channels with a per-tap scatter-add loop.
 
     Args:
         hfan_data: (n_p, centers, W_p_c, weight_scale) for this view batch;

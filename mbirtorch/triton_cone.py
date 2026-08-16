@@ -9,8 +9,7 @@ has the same signature as the torch body it replaces
 view-range loop, its lazy assembly, the banded seams (``slice_start``,
 ``band_slices``, ``dev_index``) and the ``plan`` slot all pass through
 unchanged, and the torch bodies stay compiled in everywhere as the value
-reference and the fallback -- exactly as mbirjax keeps its XLA path beside
-pallas.
+reference and the fallback.
 
 Both kernels stand on the same two eager precomputes, which is why one module
 covers both directions: the hfan contract of horizontal_fan.py (n_p, centers,
@@ -40,7 +39,7 @@ before the sorted-stream specialization (measure, then specialize).
 
 Three arithmetic deviations from the torch bodies, all inherited from the
 pallas cone kernels and all covered by the design's value gate (rel 1e-5 on
-the gradient path, 1e-4 at coeff_power=2, the mbirjax rounding carve-out):
+the gradient path, 1e-4 at coeff_power=2, with the rounding carve-out):
 
   - The cone-angle divisor is formed as ``inv_cos_phi = sqrt(1 + (v/SDD)^2)``
     and MULTIPLIED, where the torch bodies divide by ``cos(atan2(v, SDD))``.
@@ -274,7 +273,7 @@ def _cone_back_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
             m_tap_i = m_tap.to(tl.int32)
             w_row = tl.maximum((w_p_r[:, None] + 1.0) / 2.0
                                - _tl_abs(m - m_tap), 0.0)
-            # coeff_power is applied AFTER the divisor (the mbirjax rule).
+            # coeff_power is applied AFTER the divisor; do not rearrange.
             w_row = tl.minimum(w_row, l_max_r) * inv_cos_phi
             w_row = tl.where((m_tap_i >= 0) & (m_tap_i < num_rows), w_row, 0.0)
             if COEFF_POWER == 2:

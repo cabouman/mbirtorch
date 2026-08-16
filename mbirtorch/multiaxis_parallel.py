@@ -1,5 +1,5 @@
-"""MultiAxisParallelModel, ported from mbirjax.multiaxis_parallel: parallel
-beam with a per-view elevation (tilt) angle.  Each view has two angles --
+"""MultiAxisParallelModel: parallel beam with a per-view elevation (tilt)
+angle.  Each view has two angles --
 azimuth (the standard tomography rotation about z) and elevation (the tilt of
 the ray out of the xy plane).  Parallel beam laminography is a special case;
 at zero elevation the geometry is mathematically equivalent to parallel beam.
@@ -244,8 +244,8 @@ class MultiAxisParallelModel(TomographyModel):
         if np.any(np.abs(angles[:, 1]) > np.pi / 4):
             warnings.warn("One or more elevation angles exceed 45 degrees. "
                           "This may degrade approximation quality.")
-        # geometry_type is the class-identity string, as in mbirjax, so
-        # save/load resolves the class by name.
+        # geometry_type is the class-identity string, so save/load resolves
+        # the class by name.
         super().__init__(sinogram_shape,
                          view_batch_size=view_batch_size, compile_mode=compile_mode,
                          geometry_type=str(type(self)),
