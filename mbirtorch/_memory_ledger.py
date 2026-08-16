@@ -116,6 +116,64 @@ DENOISE_APPLY_CYLINDERS = 3
 # from.  The two end devices hold one halo rather than two, and this charges
 # them four as well.
 DENOISE_HALO_COLUMNS = 4
+# The ell-1 statistics -- the denoiser's per pass, the reconstruction's per
+# iteration -- reduce a recon-shaped array a chunk at a time so that no whole
+# array of absolute values is allocated.  These two set the chunk.  They live
+# here, beside the charge that models them, because a second definition
+# elsewhere could drift from this one and quietly mis-price the phase; the
+# reduction itself is image_ell1 just below, for the same reason.
+# The size is the measured knee on both backends; image_ell1 documents the
+# measurement and why the fused torch.linalg.vector_norm is not used instead.
+# The cap bounds the kernel launches for a very large array; past it the chunk
+# grows again, which the charge follows.
+ELL1_CHUNK_BYTES = 16 * 2 ** 20
+ELL1_MAX_CHUNKS = 1024
+
+
+def image_ell1(flat_image):
+    """The ell-1 norm of a recon-shaped array, without a recon-shaped
+    temporary.
+
+    ``torch.sum(torch.abs(x))`` allocates a whole array of absolute values
+    before it reduces.  Reducing a chunk at a time bounds the temporary to one
+    chunk, so it stops scaling with the array.
+
+    Considered but rejected: ``torch.linalg.vector_norm(x, ord=1)``, which
+    allocates nothing at all.  On CPU it accumulates float32 sequentially
+    where ``torch.sum`` sums pairwise, so its error grows with the element
+    count.  On MPS it is accurate but runs the reduction about 34 times
+    slower than ``sum(abs)``.
+
+    Chunking keeps torch's pairwise summation inside each chunk and adds only
+    the chunk totals, so it tracks the unchunked value to about 1e-7 at every
+    size measured.
+
+    An array below one chunk is reduced whole, which is the arithmetic this
+    replaced, so small problems -- the goldens among them -- are unchanged bit
+    for bit.
+    """
+    n_bytes = flat_image.numel() * flat_image.element_size()
+    n_chunks = min(ELL1_MAX_CHUNKS, max(1, round(n_bytes / ELL1_CHUNK_BYTES)))
+    if n_chunks == 1:
+        return torch.sum(torch.abs(flat_image))
+    return torch.stack([torch.sum(torch.abs(chunk)) for chunk
+                        in torch.chunk(flat_image, n_chunks, dim=0)]).sum()
+
+
+def ell1_chunk_bytes(image_bytes):
+    """What one chunk of image_ell1 holds, for an array of ``image_bytes``.
+
+    An array small enough to want a single chunk is reduced whole, so the
+    temporary is the array itself; that is the unchunked case and it is only
+    reached below this module's chunk size, where one extra copy is small in
+    absolute terms.
+    """
+    image_bytes = int(image_bytes)
+    n_chunks = min(ELL1_MAX_CHUNKS,
+                   max(1, round(image_bytes / ELL1_CHUNK_BYTES)))
+    if n_chunks == 1:
+        return image_bytes, 1
+    return math.ceil(image_bytes / n_chunks), n_chunks
 
 # Library workspace that torch allocates through its own caching allocator,
 # and that the ledger's array enumeration therefore cannot see.  Measured as
@@ -932,11 +990,21 @@ def estimate_peak_device_bytes(plan):
                     f'denoise subset {name} (granularity {granularity})',
                     residents + terms, n, base=base, base_terms=base_terms))
         # The convergence test reads the working image's ell-1 norm once per
-        # pass, and the absolute value it reduces is a whole image-shaped
-        # array on every device.
+        # pass.  image_ell1 reduces the image a chunk at a time, so the
+        # absolute values it forms are one chunk rather than a whole
+        # image.  Written as sum(abs) over the whole image this was a fourth
+        # image-shaped resident and the denoiser's widest phase; at any size
+        # that chunks, the peak now falls on the qGGMRF prior instead.
+        # The chunk totals the reduction stacks, and the per-shard partials
+        # combine_on_lead moves onto the lead device, are 0-d scalars and are
+        # not charged -- the same treatment the line-search sums above get,
+        # and far below the resolution of the workspace term.
+        def ell1_chunk(i):
+            return ell1_chunk_bytes(recon_dev(i))[0]
+
         phases.append(_phase(
             'denoise per-pass statistics',
-            residents + [('image magnitude', per_dev(recon_dev))], n,
+            residents + [('ell-1 chunk', per_dev(ell1_chunk))], n,
             base=base, base_terms=base_terms))
         return Ledger(devices=list(plan.devices), phases=phases,
                       num_pixels_full=int(plan.num_pixels_full))
@@ -1075,13 +1143,29 @@ def estimate_peak_device_bytes(plan):
     # This phase has to be charged rather than assumed small: on an unweighted
     # run it is the peak.  Its transient measures EXACTLY two sinogram-shaped
     # arrays at the largest sizes tested, which is the two squared-error
-    # products; the recon L1 fuses into its own reduction and materializes
-    # nothing.
-    phases.append(_phase(
-        'per-iteration statistics',
-        [('squared-error products', per_dev(lambda i: 2 * sino_dev(i)))],
-        n, base=persistent_total,
-        base_terms=constant_terms + list(persistent.items())))
+    # products.
+    #
+    # The recon L1 is charged BESIDE those rather than folded into them,
+    # because the two are consecutive and not co-live: the squared-error
+    # products are dead before the L1 runs, and the L1's own temporary is dead
+    # before the RMSE product.  So the phase holds whichever is larger, which
+    # the per-device maximum below picks.  Sizes tested had two sinograms
+    # larger, which is why this used to charge them alone; a geometry whose
+    # recon exceeds two sinograms is the case that missed.  image_ell1 now
+    # bounds the L1's temporary to one chunk, so what could have been a whole
+    # second recon is the chunk instead.
+    stats_sub_phases = (
+        ('squared error',
+         ('squared-error products', per_dev(lambda i: 2 * sino_dev(i)))),
+        ('recon ell-1',
+         ('recon ell-1 chunk',
+          per_dev(lambda i: ell1_chunk_bytes(recon_dev(i))[0]))),
+    )
+    stats_base_terms = constant_terms + list(persistent.items())
+    for name, term in stats_sub_phases:
+        phases.append(_phase(f'per-iteration statistics ({name})', [term], n,
+                             base=persistent_total,
+                             base_terms=stats_base_terms))
 
     # ── phase E: the subset step, per granularity in the sequence ────────────
     prior_cylinders = PROX_CYLINDERS if plan.prox else plan.qggmrf_cylinders

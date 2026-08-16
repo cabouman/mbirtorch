@@ -2120,7 +2120,20 @@ class TomographyModel(ParameterHandler):
         one array holds every element."""
         fm_loss = TomographyModel.get_forward_model_loss(
             error_sinogram, sigma_y, weights)
-        recon_l1 = torch.sum(torch.abs(flat_recon))
+        # Chunked: sum(abs) over the whole recon allocated a second
+        # recon-shaped array here.  See _memory_ledger.image_ell1.
+        #
+        # This value NORMALIZES the NMAE, and the NMAE percent change is the
+        # early-stopping rule, so the chunked summation order can move the
+        # stopping statistic in its last digits.  At a knife edge against the
+        # default 0.2% threshold that is one iteration more or fewer.  The
+        # movement is within the iterated-comparison tolerance class the
+        # project already accepts (measured ~1e-7 relative against a float64
+        # reference, where the run-to-run floor of a recon is ~2e-7), so it is
+        # accepted rather than avoided -- but it is a stopping-rule effect and
+        # not only a logging one.  No golden covers it: every recon test runs
+        # with stop_threshold_change_pct=0.0, which disables early stopping.
+        recon_l1 = _memory_ledger.image_ell1(flat_recon)
         es_rmse = torch.sqrt(torch.sum(error_sinogram * error_sinogram)
                              / float(error_sinogram.numel()))
         return fm_loss, recon_l1, es_rmse
@@ -2892,7 +2905,8 @@ class TomographyModel(ParameterHandler):
             fm_loss = ((weighted_sq / (avg_weight * total_sino_size)) ** 0.5
                        / sigma_y)
             recon_l1 = sum(
-                float(torch.sum(torch.abs(t))) for t in flat_shards.tensors)
+                float(_memory_ledger.image_ell1(t))
+                for t in flat_shards.tensors)
             es_rmse = (sq / total_sino_size) ** 0.5
         else:
             if isinstance(error_sinogram, _sharding.Shards):

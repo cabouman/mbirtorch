@@ -98,9 +98,9 @@ def test_resume_drops_the_initialization_phases_entirely():
                    for n in names)
     # What survives is the loop: the subset steps and the per-iteration
     # statistics, which run on every iteration however the state was reached.
-    assert all('subset' in n or n == 'per-iteration statistics'
+    assert all('subset' in n or n.startswith('per-iteration statistics')
                for n in names)
-    assert 'per-iteration statistics' in names
+    assert any(n.startswith('per-iteration statistics') for n in names)
 
 
 def test_hessian_phase_uses_the_unmasked_grid_count():
@@ -361,16 +361,60 @@ def test_per_iteration_statistics_are_charged():
     """Charged as zero by the first ledger, and measured as the peak of an
     unweighted run once the residency fixes shrank the other phases.
 
-    The transient is two sinogram-shaped squared-error products.  The recon
-    L1 fuses into its own reduction and materializes nothing.
+    The squared-error transient is two sinogram-shaped products.
     """
     sino_bytes = 64 * 32 * 32 * 4
     ledger = estimate_peak_device_bytes(make_plan())
-    stats = _named(ledger, 'per-iteration statistics')
+    stats = _named(ledger, 'per-iteration statistics (squared error)')
     assert dict(stats.terms)['squared-error products'][0] == 2 * sino_bytes
     # It carries the persistent set, like every other in-loop phase.
     assert dict(stats.terms)['error sinogram'][0] == sino_bytes
     assert dict(stats.terms)['flat recon'][0] > 0
+
+
+def test_the_recon_ell_1_is_charged_beside_the_squared_error_products():
+    """The recon L1 does allocate, and is charged as its own sub-phase.
+
+    This phase used to charge the squared-error products alone, on the reading
+    that the L1 "fuses into its own reduction and materializes nothing".  It
+    does not: ``sum(abs(flat_recon))`` allocated a whole second recon.  The
+    sizes that were measured simply had two sinograms larger, so the miss did
+    not show.  The two are consecutive rather than co-live, so both are
+    emitted and the per-device maximum picks.
+    """
+    ledger = estimate_peak_device_bytes(make_plan())
+    ell1 = _named(ledger, 'per-iteration statistics (recon ell-1)')
+    squared = _named(ledger, 'per-iteration statistics (squared error)')
+    charged = dict(ell1.terms)['recon ell-1 chunk'][0]
+    assert charged > 0
+    assert 'squared-error products' not in dict(ell1.terms)
+    assert 'recon ell-1 chunk' not in dict(squared.terms)
+    # Both carry the persistent set, as every in-loop phase does.
+    assert dict(ell1.terms)['error sinogram'][0] > 0
+
+
+def test_the_recon_ell_1_chunk_stops_following_the_recon():
+    """A recon far larger than two sinograms is the geometry the old charge
+    missed.  image_ell1 bounds the transient to a chunk, so the charge no
+    longer scales with the recon."""
+    target = _memory_ledger.ELL1_CHUNK_BYTES
+    # Few views, big recon: two sinograms are much smaller than one recon.
+    plan = make_plan(recon=(512, 512, 512), num_views=8,
+                     num_rows=64, num_channels=64,
+                     num_pixels_full=512 * 512)
+    ledger = estimate_peak_device_bytes(plan)
+    terms = dict(_named(ledger,
+                        'per-iteration statistics (recon ell-1)').terms)
+    squared = dict(_named(ledger,
+                          'per-iteration statistics (squared error)').terms)
+    recon_bytes = terms['flat recon'][0]
+    chunk = terms['recon ell-1 chunk'][0]
+    # The geometry the old charge missed: one recon dwarfs two sinograms, so
+    # charging the sinogram products alone would have set the phase far too low.
+    assert recon_bytes > 100 * squared['squared-error products'][0]
+    # And the chunk does not follow the recon.
+    assert chunk <= recon_bytes / 16
+    assert 0.5 * target <= chunk <= 2 * target
 
 
 # ── the back projection's two sub-steps ──────────────────────────────────────
@@ -1064,17 +1108,101 @@ def test_the_denoise_partition_is_held_whole_on_every_device():
         == 0
 
 
-def test_the_denoise_statistics_phase_holds_one_more_image():
-    """The convergence test reduces ``abs(working image)``, which is a whole
-    image-shaped array on every device and is the denoiser's widest instant
-    at the shipped granularity."""
+def test_the_denoise_statistics_phase_holds_one_chunk_not_one_image():
+    """The convergence test reduces the working image a chunk at a time, so at
+    any size worth chunking it holds a chunk and not a fourth image.
+
+    As ``sum(abs(working image))`` it held a whole image of absolute values and
+    was the denoiser's widest instant.  Bounded to a chunk, the peak falls on
+    the qGGMRF prior's working set instead, so this asserts which phase is the
+    peak and not merely what the statistic costs.
+    """
+    ledger = estimate_peak_device_bytes(
+        make_denoise_plan(image=(512, 512, 512)))
+    stats = _named(ledger, 'denoise per-pass statistics')
+    placement = _named(ledger, 'denoise state placement')
+    charged = dict(stats.terms)['ell-1 chunk'][0]
+    assert charged == _memory_ledger.ELL1_CHUNK_BYTES
+    # The chunk is the whole of what this phase adds to the state.
+    assert stats.per_device[0] - placement.per_device[0] == charged
+    # The peak moved off this phase and onto the prior.
+    prior = _named(ledger, 'denoise subset prior')
+    assert ledger.peak_bytes(0) == prior.per_device[0]
+    assert prior.per_device[0] > stats.per_device[0]
+
+
+def test_the_denoise_statistics_chunk_stops_following_the_image():
+    """The point of the chunking: the statistic's transient stays near one
+    chunk as the image grows, where every other denoise term scales with it.
+    """
+    target = _memory_ledger.ELL1_CHUNK_BYTES
+    small = estimate_peak_device_bytes(
+        make_denoise_plan(image=(256, 256, 256)))
+    big = estimate_peak_device_bytes(make_denoise_plan(image=(640, 640, 640)))
+
+    def chunk(led):
+        return dict(_named(led, 'per-pass statistics').terms)['ell-1 chunk'][0]
+
+    # The image grows about fifteenfold over this pair; the chunk does not
+    # move off the target, because the chunk COUNT absorbs the growth.
+    assert 256 ** 3 * 15 < 640 ** 3
+    for led in (small, big):
+        assert 0.5 * target <= chunk(led) <= 2 * target
+    assert chunk(big) < 1.1 * chunk(small)
+    # The prior, which does scale, really does grow over the same pair.
+    def prior(led):
+        return dict(_named(led, 'denoise subset prior').terms)[
+            'prior cylinders'][0]
+
+    assert prior(big) > 15 * prior(small)
+
+
+def test_the_denoise_statistics_reduce_a_small_image_whole():
+    """Below one chunk the reduction runs unchunked, so the ledger charges the
+    whole image -- the arithmetic and the cost the chunked form replaced.  An
+    extra image is small in absolute terms at these sizes, which is why the
+    unchunked case is left alone."""
     image_bytes = 32 * 32 * 32 * 4
+    assert image_bytes < _memory_ledger.ELL1_CHUNK_BYTES
     ledger = estimate_peak_device_bytes(make_denoise_plan())
     stats = _named(ledger, 'denoise per-pass statistics')
-    assert dict(stats.terms)['image magnitude'][0] == image_bytes
-    placement = _named(ledger, 'denoise state placement')
-    assert stats.per_device[0] - placement.per_device[0] == image_bytes
-    assert ledger.peak_bytes(0) == stats.per_device[0]
+    assert dict(stats.terms)['ell-1 chunk'][0] == image_bytes
+
+
+def test_the_ledger_chunk_matches_what_the_reduction_really_allocates():
+    """The anti-drift gate on the two constants.
+
+    ``image_ell1`` and ``ell1_chunk_bytes`` share ELL1_CHUNK_BYTES, but they
+    are still two pieces of arithmetic that could disagree.  This runs the
+    real reduction and reads the largest array it actually allocates, so the
+    charge is checked against the allocation rather than against a restatement
+    of the same formula.  Both the denoise and the recon branches price their
+    ell-1 with ell1_chunk_bytes, so this covers both.
+    """
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    from mbirtorch._memory_ledger import image_ell1
+
+    class Biggest(TorchDispatchMode):
+        def __init__(self):
+            self.nbytes = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            out = func(*args, **(kwargs or {}))
+            for t in (out if isinstance(out, (tuple, list)) else [out]):
+                if isinstance(t, torch.Tensor):
+                    self.nbytes = max(self.nbytes,
+                                      t.numel() * t.element_size())
+            return out
+
+    # One chunked size and one below the chunk, so both branches are checked.
+    for num_pixels, num_slices in ((256 * 256, 256), (32 * 32, 32)):
+        image = torch.zeros(num_pixels, num_slices, dtype=torch.float32)
+        image_bytes = image.numel() * image.element_size()
+        with Biggest() as seen:
+            image_ell1(image)
+        predicted, _n_chunks = _memory_ledger.ell1_chunk_bytes(image_bytes)
+        assert seen.nbytes == predicted, (image_bytes, seen.nbytes, predicted)
 
 
 def test_a_denoise_check_covers_nothing_but_another_denoise():

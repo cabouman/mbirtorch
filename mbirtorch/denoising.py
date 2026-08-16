@@ -26,6 +26,7 @@ from . import _sharding
 
 from . import qggmrf as _qggmrf
 from . import vcd_utils
+from ._memory_ledger import image_ell1
 from ._utils import recon_param_names
 from .projectors import maybe_compile
 from .tomography_model import TomographyModel
@@ -302,7 +303,10 @@ class QGGMRFDenoiser(TomographyModel):
                         ell1_accum = ell1_accum + ell1_subset
                         alpha_accum = alpha_accum + alpha_subset
 
-                    nmae = float(ell1_accum) / float(torch.sum(torch.abs(flat_image)))
+                    # Chunked rather than sum(abs) over the whole image: see
+                    # image_ell1 for the temporary this avoids and for why the
+                    # fused norm is not used instead.
+                    nmae = float(ell1_accum) / float(image_ell1(flat_image))
                     nmae_update[i] = nmae
                     alpha_values[i] = float(alpha_accum) / partition.shape[0]
                     num_iters += 1
@@ -448,7 +452,10 @@ class QGGMRFDenoiser(TomographyModel):
                     # The three host reads per pass, all at this one
                     # synchronization point: the convergence test and the two
                     # logged histories need Python numbers.
-                    image_l1 = combine_on_lead([torch.sum(torch.abs(t))
+                    # Chunked per shard, for the reason image_ell1 gives: it
+                    # spares each device an image-shaped array of absolute
+                    # values at the pass's one synchronization point.
+                    image_l1 = combine_on_lead([image_ell1(t)
                                                 for t in flat_image.tensors])
                     nmae = float(ell1_accum) / float(image_l1)
                     nmae_update[i] = nmae

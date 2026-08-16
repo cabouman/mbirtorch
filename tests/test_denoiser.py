@@ -6,8 +6,11 @@ import os
 
 import numpy as np
 import pytest
+import torch
 
 import mbirtorch
+from mbirtorch import _memory_ledger
+from mbirtorch._memory_ledger import image_ell1
 
 GOLDEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "goldens")
 _paths = sorted(glob.glob(os.path.join(GOLDEN_DIR, "golden_*.npz")))
@@ -66,6 +69,40 @@ def test_denoise_reduces_noise(device):
     err_noisy = np.linalg.norm(noisy - clean)
     err_den = np.linalg.norm(denoised - clean)
     assert err_den < 0.6 * err_noisy, (err_den, err_noisy)
+
+
+def test_image_ell1_is_accurate_at_a_size_that_chunks(device):
+    """The reduction behind the reported nmae, checked where the goldens
+    cannot check it.
+
+    The golden image is far below one chunk, so the goldens only ever exercise
+    the unchunked branch.  This runs an image large enough to chunk and scores
+    the result against a float64 reference over the same float32 values, so it
+    measures the reduction's own arithmetic rather than the denoiser's.  The
+    statistic is gated at 1e-3 relative, and this must hold with room to
+    spare: a reduction that accumulates float32 sequentially instead of
+    pairwise drifts past that gate as the element count grows, which is why
+    torch.linalg.vector_norm is not used here.
+    """
+    shape = (256, 256, 256)
+    torch.manual_seed(11)
+    flat = torch.randn(shape[0] * shape[1], shape[2])
+    assert flat.numel() * flat.element_size() > _memory_ledger.ELL1_CHUNK_BYTES
+    reference = float(flat.double().abs().sum())
+
+    value = float(image_ell1(flat.to(device)))
+    rel = abs(value - reference) / abs(reference)
+    print(f"image_ell1 on {device}: rel vs float64 = {rel:.2e}")
+    assert rel < 1e-5
+
+
+def test_image_ell1_leaves_a_small_image_bit_for_bit():
+    """Below one chunk the reduction is the sum(abs) it replaced, so small
+    problems -- every golden among them -- cannot move at all."""
+    small = torch.randn(32 * 32, 32)
+    assert (small.numel() * small.element_size()
+            < _memory_ledger.ELL1_CHUNK_BYTES)
+    assert float(image_ell1(small)) == float(torch.sum(torch.abs(small)))
 
 
 def test_sharded_denoise_matches_single_device():
