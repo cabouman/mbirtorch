@@ -1,15 +1,13 @@
-"""Phantom generation, ported from mbirjax.utilities (the low-dynamic-range
-Shepp-Logan used by the demos).
+"""Phantom generation: the low-dynamic-range Shepp-Logan used by the demos.
 
-The build is plain numpy: the phantom is a host-side reference object in
-mbirjax too (its jax machinery there exists only to bound peak memory at very
-large sizes, not needed here yet).  The ellipsoid definitions and the
-attenuation-scale formula are copied verbatim.
+The build is plain numpy, because the phantom is a host-side reference object.
+The ellipsoid definitions and the attenuation-scale formula are fixed values
+that the golden tests depend on.
 
-Boundary note for cross-framework comparisons: each ellipsoid is a <= 1
-threshold on a float quadratic, so voxels exactly at an ellipsoid boundary can
-flip between frameworks (f32 vs f64 grid arithmetic).  The golden test
-therefore allows a small fraction of differing boundary voxels.
+Boundary note: each ellipsoid is a <= 1 threshold on a float quadratic, so
+voxels exactly at an ellipsoid boundary can flip with the grid precision (f32
+vs f64).  The golden test therefore allows a small fraction of differing
+boundary voxels.
 """
 
 import os
@@ -83,7 +81,7 @@ def add_ellipsoid(current_volume, grids, z_locations, x0, y0, z0, a, b, c,
 
 def _add_shepp_logan_ellipsoids(phantom, grids, z_locations):
     """Add the nine standard low-dynamic-range Shepp-Logan ellipsoids to
-    ``phantom`` (definitions copied verbatim from mbirjax)."""
+    ``phantom``.  The definitions are fixed; the golden tests depend on them."""
     phantom = add_ellipsoid(phantom, grids, z_locations, 0, 0, 0, 0.69, 0.92, 0.9, intensity=1)
     # Smaller ellipsoids and other structures
     phantom = add_ellipsoid(phantom, grids, z_locations, 0, 0.0184, 0, 0.6624, 0.874, 0.88, intensity=-0.8)
@@ -105,9 +103,8 @@ _MAIN_ELLIPSOID_SEMI_AXES = (0.69, 0.92, 0.9)
 
 def _shepp_logan_attenuation_scale(phantom_shape, target_max_attenuation):
     """Intensity scale so the peak forward projection of the phantom is
-    ~``target_max_attenuation`` (verbatim mbirjax formula; assumes
-    ``delta_voxel ~= 1``, since the phantom cannot see the projector's voxel
-    spacing)."""
+    ~``target_max_attenuation`` (assumes ``delta_voxel ~= 1``, since the
+    phantom cannot see the projector's voxel spacing)."""
     longest_path_voxels = max(s * n for s, n in
                               zip(_MAIN_ELLIPSOID_SEMI_AXES, phantom_shape))
     interior_intensity = 0.28  # approximate average intensity along the center
@@ -134,8 +131,7 @@ def generate_3d_shepp_logan_low_dynamic_range(phantom_shape,
 
     Note:
         The build holds a few phantom-sized transients, so very large shapes use
-        proportionally more peak memory (mbirjax's blocked/sharded builds exist
-        for that regime and are not ported).
+        proportionally more peak memory.
     """
     n_rows, n_cols, n_slices = phantom_shape
     x_grid, y_grid = np.meshgrid(np.linspace(-1, 1, n_rows),
@@ -1196,9 +1192,10 @@ def generate_3d_shepp_logan_reference(phantom_shape):
                                gray_level=el_paras['gray_level'])
 
     # The meshgrid already puts y on axis 0 (rows) and x on axis 1 (cols), so
-    # the image is in (rows, cols, slices) order.  mbirjax applies a final
-    # transpose((1, 0, 2)) here, which swaps rows and columns; that transpose
-    # was identified as a bug (2026-08-14) and is deliberately not applied.
+    # the image is in (rows, cols, slices) order.  An earlier implementation
+    # applied a final transpose((1, 0, 2)) here, which swaps rows and columns;
+    # that transpose was identified as a bug (2026-08-14) and is deliberately
+    # not applied.
     return image
 
 
@@ -1426,8 +1423,7 @@ def gen_cube_phantom(recon_shape, device=None):
     phantom_rows = num_recon_rows // 4  # Phantom height
     phantom_cols = num_recon_cols // 4  # Phantom width
 
-    # Allocate phantom memory.  float32 explicitly: mbirjax's jnp.array does
-    # this downcast for free (jax defaults to 32-bit), torch.as_tensor keeps
+    # Allocate phantom memory.  float32 explicitly: torch.as_tensor keeps
     # whatever numpy gave it, and float64 both doubles the memory and is
     # unsupported on mps.
     phantom = np.zeros((num_recon_rows, num_recon_cols, num_recon_slices),
@@ -1759,9 +1755,9 @@ def generate_demo_data(
         phantom_core = generate_3d_shepp_logan_low_dynamic_range(
             phantom_shape, target_max_attenuation=target_max_attenuation)
     elif object_type == ObjectType.CUBE:
-        # gen_cube_phantom returns a tensor, as its mbirjax counterpart returns
-        # a jax array.  This function promises host numpy for both object
-        # types, so convert here rather than hand back two different things.
+        # gen_cube_phantom returns a tensor.  This function promises host numpy
+        # for both object types, so convert here rather than hand back two
+        # different things.
         phantom_core = gen_cube_phantom(phantom_shape).cpu().numpy()
     else:
         raise ValueError(f'Invalid object type. Expected one of {[o.value for o in ObjectType]}, got {object_type}')

@@ -4,8 +4,8 @@ This module is package-independent by design: it imports numpy, matplotlib,
 and (lazily, only for HDF5 file access) h5py, and nothing else.  A host
 package wraps the public entry point to supply its own conversions -- a
 tensor-to-numpy shim, serialization of rich data dicts to plain-string dicts,
-and an optional HDF5 save function -- so the identical file can serve both
-mbirtorch and mbirjax.
+and an optional HDF5 save function -- so the identical file can serve any
+host package.
 
 The module has two layers.  ``VolumeStack`` is the pure-numpy data model:
 volumes, axis permutations, slice positions, intensity range, difference
@@ -28,7 +28,7 @@ __all__ = ['SliceViewer', 'VolumeStack', 'slice_viewer']
 # Shape of the placeholder volume shown for a dataset passed as None.
 PLACEHOLDER_SHAPE = (20, 20, 20)
 
-# --- appearance constants (values follow the mbirjax viewer) ---
+# --- appearance constants ---
 TOOLTIP_FONT_SIZE = 9
 TOOLTIP_BOX_ALPHA = 0.9
 TOOLTIP_OFFSET = (10, 10)
@@ -556,9 +556,9 @@ class VolumeStack:
 def _save_data_hdf5(file_path, array, array_name='volume', attributes_dict=None):
     """Default save function: one HDF5 dataset with string attributes.
 
-    Matches the file layout of mbirjax's ``save_data_hdf5`` (a single named
-    dataset whose attributes hold the data dict), so files round-trip through
-    :meth:`VolumeStack.read_file_array`.  Host packages can inject a richer
+    The layout is a single named dataset whose attributes hold the data dict,
+    so files round-trip through :meth:`VolumeStack.read_file_array`.
+    Host packages can inject a richer
     writer through ``slice_viewer(..., save_fn=...)``.
     """
     import h5py
@@ -685,7 +685,7 @@ def _tk_range_dialog(current_vmin, current_vmax):
     return result['value']
 
 
-# Keys always offered by the save-time dict editor (the mbirjax set).
+# Keys always offered by the save-time dict editor.
 DICT_EDITOR_KEYS = ('model_params', 'notes', 'recon_log', 'recon_params')
 
 
@@ -1471,8 +1471,7 @@ class SliceViewer:
     def _menu_items(self, i):
         """(label, callback) pairs for volume ``i``'s context menu.
 
-        Labels and order follow the mbirjax right-click menu; a None
-        callback (Cancel) just closes the menu.
+        A None callback (Cancel) just closes the menu.
         """
         stack = self.stack
         items = []

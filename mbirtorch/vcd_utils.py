@@ -1,10 +1,10 @@
-"""Partitions, masks, and weights, ported from mbirjax.vcd_utils.
+"""Partitions, masks, and weights.
 
-The partition generators are numpy-for-numpy ports with the SAME global
-np.random call sequence as mbirjax, so a seeded mbirtorch recon draws the
-identical subsets (and subset order) as a seeded mbirjax recon -- the property
-the cross-framework convergence-parity gate rests on.  Not ported: the grid
-and blue-noise partition variants.
+The partition generators run in numpy and draw from the global np.random
+state.  That call sequence is deliberate: the golden-value tests
+(tests/test_vs_goldens.py) and restart reproducibility depend on a seeded run
+drawing the identical subsets in the identical order.  Do not reorder the
+calls.  Not implemented: the grid and blue-noise partition variants.
 """
 
 import warnings
@@ -85,7 +85,7 @@ def get_support_radius(recon_shape, delta_voxel_row, delta_voxel_col, use_ror_ma
     farthest updatable pixels sit at the ends of the longer grid axis (half the
     larger physical width); with the mask disabled (or custom) the conservative
     half-diagonal is used.  Overestimating only pads slightly; underestimating
-    reintroduces truncation artifacts.  (Verbatim mbirjax.vcd_utils math.)"""
+    reintroduces truncation artifacts."""
     num_rows, num_cols = recon_shape[:2]
     half_width_row = 0.5 * num_rows * delta_voxel_row
     half_width_col = 0.5 * num_cols * delta_voxel_col
@@ -100,9 +100,9 @@ def gen_pixel_partition(recon_shape, num_subsets, use_ror_mask=True):
     use in tomographic reconstruction algorithms.  The function ensures that each
     subset contains an equal number of pixels, suitable for VCD reconstruction.
 
-    Verbatim numpy port of mbirjax.vcd_utils.gen_pixel_partition, including its
-    np.random call sequence (permutation, then choice) and its single-subset
-    RNG skip -- the cross-framework trace-parity mechanism.
+    The np.random call sequence here (permutation, then choice) and the
+    single-subset RNG skip are deliberate; seeded runs must reproduce exactly.
+    Do not reorder the calls.
 
     Args:
         recon_shape (tuple): Shape of recon in (rows, columns, slices).
@@ -264,7 +264,7 @@ def estimate_background_cluster_boundaries(sinogram):
     """
     Estimate background cluster left and right boundaries from the sinogram
     histogram.  This function assumes that the background takes on values near
-    zero.  (Verbatim numpy port of the mbirjax.utilities function.)
+    zero.
 
     Args:
         sinogram (ndarray): 3D array with shape

@@ -1,7 +1,6 @@
-"""Device placement, safe transfer, and per-device threaded execution --
-ported from the mbirjax._sharding package (placement.py, transfer.py,
-thread_execution.py).  A single process drives every device, bands move
-device-to-device, and one python thread per device issues the work -- the
+"""Device placement, safe transfer, and per-device threaded execution.
+A single process drives every device, bands move device-to-device, and one
+python thread per device issues the work -- the
 substrate the jax fbp-filter parallelism study selected and the torch
 substrate spikes revalidated (measurements in the plans repo).
 
@@ -54,10 +53,8 @@ class Placement:
     own axis.  Each device owns one contiguous block, the block lengths
     differ by at most one, and the longer blocks come first.  A device count
     larger than the axis length leaves the trailing devices with empty
-    blocks.  (mbirjax pads the axis to a multiple of the device count,
-    because a jax NamedSharding partitions one global array and requires
-    equal blocks.  Here the device form is a list of per-device tensors, so
-    blocks of unequal length are allowed and no padding is needed.)
+    blocks.  The axis is never padded: the device form is a list of
+    per-device tensors, so blocks of unequal length are allowed.
 
     Args:
         devices (sequence of torch.device or str): the devices this array
@@ -160,7 +157,7 @@ class Shards:
         return np.concatenate(parts, axis=self.placement.axis % parts[0].ndim)
 
 
-# ── safe transfer (the mbirjax transfer.py port) ──────────────────────────────
+# ── safe transfer ─────────────────────────────────────────────────────────────
 # jax's device_put silently corrupted device-resident transfers on some GPUs
 # (L40S); torch's tensor.to() has no known analog, but the empirical probe is
 # kept as near-free paranoia: we test the actual hardware once per device set
@@ -502,7 +499,7 @@ def wait_for_column_band(target, ready):
         torch.cuda.current_stream(torch.device(target)).wait_event(ready)
 
 
-# ── per-device threaded execution (the mbirjax thread_execution.py port) ──────
+# ── per-device threaded execution ─────────────────────────────────────────────
 def device_pool(n):
     """A reusable thread pool for repeated :func:`run_per_device` calls.
 

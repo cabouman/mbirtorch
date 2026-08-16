@@ -12,7 +12,7 @@ cone-beam, translation, and multi-axis parallel.
 The default: spread across the visible GPUs
 -------------------------------------------
 
-As in MBIRJAX, multi-device reconstruction is **automatic**.  On a machine with two or more
+Multi-device reconstruction is **automatic**.  On a machine with two or more
 CUDA devices, a reconstruction spreads across them with no change to your script::
 
     recon, recon_dict = model.recon(sinogram)   # uses the GPUs that fit
@@ -111,8 +111,7 @@ Tips for efficiency
   a memory lever: a measured 2-device run at the 1024 class saved about 0.5 GB of per-device
   peak for about 2 percent more time at the 252-slice band, and narrower bands saved slightly
   more memory for more time.  Leave it unset unless a run is memory-constrained.
-* **More devices is often slower.**  See the next section; this matters more in MBIRTorch
-  than the equivalent advice does in MBIRJAX.
+* **More devices is often slower.**  See the next section.
 
 What to expect from more GPUs
 -----------------------------

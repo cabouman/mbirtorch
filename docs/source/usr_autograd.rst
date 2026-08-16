@@ -6,7 +6,6 @@ Differentiable Projectors
 
 MBIRTorch exposes its forward and back projectors as differentiable PyTorch operations, so
 the physics operator can be inserted into a deep-learning pipeline like any other layer.
-This page has no MBIRJAX counterpart.
 
 The forward and back projectors are an exact adjoint pair by construction, so each is the
 correct autograd backward of the other, and no autodiff through the kernel internals is

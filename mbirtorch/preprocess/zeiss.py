@@ -100,7 +100,7 @@ def _compute_sino_and_params(dataset_dir, downsample_factor=(1, 1), subsample_vi
         print("\n\n########## Loading object, blank, dark scans, and geometry parameters from Zeiss dataset directory")
     obj_scan, blank_scan, dark_scan, zeiss_params = load_scans_and_params(dataset_dir, subsample_view_factor)
 
-    geometry_params, optional_params, zeiss_metadata = convert_zeiss_to_mbirjax_params(zeiss_params, downsample_factor=downsample_factor,
+    geometry_params, optional_params, zeiss_metadata = convert_zeiss_to_mbirtorch_params(zeiss_params, downsample_factor=downsample_factor,
                                                                           crop_pixels_sides=crop_pixels_sides,
                                                                           crop_pixels_top=crop_pixels_top,
                                                                           crop_pixels_bottom=crop_pixels_bottom,
@@ -140,7 +140,7 @@ def _compute_sino_and_params(dataset_dir, downsample_factor=(1, 1), subsample_vi
         print('dark_scan shape = ', dark_scan.shape)
 
     # Normalize for build_model: resolve the geometry class from the Zeiss scanner type, mirroring
-    # convert_zeiss_to_mbirjax_params -- 'ultra' -> parallel-beam, everything else (versa, or an
+    # convert_zeiss_to_mbirtorch_params -- 'ultra' -> parallel-beam, everything else (versa, or an
     # undetermined 'unknown' for which classify_zeiss_system already warns it is assuming cone) -> cone.
     scanner_type = zeiss_metadata['scanner_type']
     if scanner_type == 'ultra':
@@ -172,7 +172,7 @@ def load_scans_and_params(dataset_dir, subsample_view_factor, verbose=1):
               where ``num_reference`` is the number of reference images stored in the file.
             - dark_scan (numpy.ndarray): 3D array of zeros with the shape of ``obj_scan``. The ``.txrm``
               format carries no dark scan, so one is never loaded.
-            - zeiss_params (dict): Geometry parameters for ``convert_zeiss_to_mbirjax_params``.
+            - zeiss_params (dict): Geometry parameters read from the ``.txrm`` file.
     """
     ### automatically parse the paths to Zeiss scans from dataset_dir
     data_dir = _parse_filenames_from_dataset_dir(dataset_dir)
@@ -321,7 +321,7 @@ def load_scans_and_params(dataset_dir, subsample_view_factor, verbose=1):
     return obj_scan, blank_scan, dark_scan, zeiss_params
 
 
-def convert_zeiss_to_mbirjax_params(zeiss_params, downsample_factor=(1, 1), crop_pixels_sides=0, crop_pixels_top=0, crop_pixels_bottom=0, alu_unit='mm'):
+def convert_zeiss_to_mbirtorch_params(zeiss_params, downsample_factor=(1, 1), crop_pixels_sides=0, crop_pixels_top=0, crop_pixels_bottom=0, alu_unit='mm'):
     """
     Convert geometry parameters from zeiss into mbirtorch format, including modifications to reflect crop.
 

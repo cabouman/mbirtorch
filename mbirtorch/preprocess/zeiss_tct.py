@@ -84,7 +84,7 @@ def _compute_sino_and_params(dataset_dir, crop_pixels_sides=0, crop_pixels_top=0
         print("\n\n########## Loading object, blank, dark scans, and geometry parameters from Zeiss dataset directory")
     obj_scan, blank_scan, dark_scan, zeiss_params = load_scans_and_params(dataset_dir, verbose=verbose)
 
-    translation_params, optional_params = convert_zeiss_to_mbirjax_params(zeiss_params,
+    translation_params, optional_params = convert_zeiss_to_mbirtorch_params(zeiss_params,
                                                                           crop_pixels_sides=crop_pixels_sides,
                                                                           crop_pixels_top=crop_pixels_top,
                                                                           crop_pixels_bottom=crop_pixels_bottom,
@@ -140,7 +140,7 @@ def load_scans_and_params(dataset_dir, verbose=1):
             - ``obj_scan`` (numpy.ndarray): 3D object scan with shape ``(num_views, num_det_rows, num_channels)``.
             - ``blank_scan`` (numpy.ndarray): 3D blank scan with shape ``(num_blank_scans, num_det_rows, num_channels)``, where ``num_blank_scans`` is the number of ``.xrm`` files in the ``blank_scan`` subfolder.
             - ``dark_scan`` (numpy.ndarray): 3D dark scan with shape ``(num_dark_scans, num_det_rows, num_channels)``, where ``num_dark_scans`` is the number of ``.xrm`` files in the ``dark_scan`` subfolder. If that subfolder is missing or empty, a zero array with the shape of ``blank_scan`` is returned.
-            - ``zeiss_params`` (dict): Required parameters for ``convert_zeiss_to_mbirjax_params`` (e.g., geometry vectors, spacings, and angles).
+            - ``zeiss_params`` (dict): Geometry parameters read from the ``.xrm`` files (e.g., geometry vectors, spacings, and angles).
     """
     ### automatically parse the paths to Zeiss scans from dataset—dir
     obj_scan_dir, blank_scan_dir, dark_scan_dir = _parse_filenames_from_dataset_dir(dataset_dir)
@@ -293,7 +293,7 @@ def load_scans_and_params(dataset_dir, verbose=1):
     return obj_scan, blank_scan, dark_scan, zeiss_params
 
 
-def convert_zeiss_to_mbirjax_params(zeiss_params, crop_pixels_sides=0, crop_pixels_top=0, crop_pixels_bottom=0, alu_unit='mm'):
+def convert_zeiss_to_mbirtorch_params(zeiss_params, crop_pixels_sides=0, crop_pixels_top=0, crop_pixels_bottom=0, alu_unit='mm'):
     """
     Convert geometry parameters from zeiss into mbirtorch format, including modifications to reflect crop.
 

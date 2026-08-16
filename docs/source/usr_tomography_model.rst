@@ -35,10 +35,9 @@ Reconstruction and Projection
 Parameter Handling
 ------------------
 
-``TomographyModel`` inherits its parameter accessors from ``ParameterHandler``.  MBIRJAX
-exports that class at package level, so its ``automodule`` documented it implicitly;
-mbirtorch does not export it, so it is documented explicitly here.  This also supplies the
-cross-reference target that ``:show-inheritance:`` needs on every model class.
+``TomographyModel`` inherits its parameter accessors from ``ParameterHandler``.  That class
+is not exported at package level, so it is documented explicitly here.  This also supplies
+the cross-reference target that ``:show-inheritance:`` needs on every model class.
 
 .. autoclass:: mbirtorch.parameter_handler.ParameterHandler
 
