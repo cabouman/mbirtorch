@@ -166,10 +166,10 @@ class TomographyModel(ParameterHandler):
         self._speed_floor_fallback = None
         self._speed_floor_held = None
         # Memory-preflight knobs; the margin covers what the ledger cannot
-        # see (fragmentation, non-torch CUDA workspaces).
-        # The preflight runs when the automatic
-        # layout is decided, so setting skip_memory_preflight after a model
-        # has settled changes nothing until a shape change re-decides.
+        # see (fragmentation, non-torch CUDA workspaces).  The preflight
+        # runs when the automatic layout is decided, so setting
+        # skip_memory_preflight after that changes nothing until a shape
+        # change re-decides the layout.
         self.skip_memory_preflight = False
         self.memory_preflight_margin = 0.15
         # These two exist for a harness to read.  Nothing in the library
@@ -1121,9 +1121,10 @@ class TomographyModel(ParameterHandler):
 
         This is the one site where the automatic device count is chosen.
         The choice happens at recon time, not construction, because the
-        free-memory reading is only current here.  It is re-evaluated on
-        every entry while the layout is automatic, and the placements are
-        rebuilt only when the chosen count changes.  On the unpinned branch
+        free-memory reading is only current here.  The choice is made once
+        per model: later calls return the same layout, and the search runs
+        again only when the model's sinogram or reconstruction shape
+        changes.  On the unpinned branch
         the candidate ORDER comes from the widening speed floors
         (:meth:`_speed_ordered_candidates`), and capacity still wins when
         nothing admitted fits.  Explicit layouts and process-wide pins skip
@@ -1483,9 +1484,11 @@ class TomographyModel(ParameterHandler):
         afterwards, the prepared array no longer matches, and the
         reconstruction methods raise an error; re-run this method to fix it.
 
-        This function can raise
-        :class:`~mbirtorch._memory_ledger.MemoryPreflightError` for a problem
-        too large for available devices.
+        On a model whose device layout is still automatic, this call also
+        decides the layout, and every later reconstruction on the model
+        reuses it.  The decision runs the memory check, so the call can raise
+        ``MemoryPreflightError`` for a problem
+        too large for the available devices.
 
         Args:
             sinogram (numpy or tensor): sinogram in the model's sinogram_shape.
@@ -1796,9 +1799,11 @@ class TomographyModel(ParameterHandler):
             Diagonal of the Hessian matrix with the same shape as the recon.
 
         Note:
-            This function runs the memory check, so it can raise
-            :class:`~mbirtorch._memory_ledger.MemoryPreflightError` for a
-            problem too large for available devices.
+            On a model whose device layout is still automatic, this call also
+            decides the layout, and every later reconstruction on the model
+            reuses it.  The decision runs the memory check, so the call can
+            raise ``MemoryPreflightError`` for
+            a problem too large for the available devices.
         """
         # Settle before the full sinogram of weights and the full volume are
         # built.  Both are sized by the model, so on an unsettled model they

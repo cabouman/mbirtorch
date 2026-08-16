@@ -17,6 +17,10 @@ CUDA devices, a reconstruction spreads across them with no change to your script
 
     recon, recon_dict = model.recon(sinogram)   # uses the GPUs that fit
 
+The automatic choice is made once per model, at its first reconstruction.  Later
+reconstructions on the same model reuse the layout, and the choice runs again only when
+the model's sinogram or reconstruction shape changes.
+
 The automatic choice applies two rules, in this order.
 
 **Speed first.**  More devices is not always faster: below a certain problem size the

@@ -334,13 +334,14 @@ def gen_weights_mar(ct_model, sinogram, init_recon=None, metal_threshold=None, b
         (ndarray): Weights used in reconstruction, with the same array shape as ``sinogram``
 
     Note:
-        Only the ``init_recon`` branch uses the devices.  On that branch, and on
-        a model whose layout the caller has not fixed, this call settles that
-        layout before it forward projects.  Settling runs the memory check, so
-        the call can raise
-        :class:`~mbirtorch._memory_ledger.MemoryPreflightError` for a problem no
-        device count holds.  The Otsu branch works on the host throughout and
-        leaves the layout alone.
+        Only the ``init_recon`` branch uses the devices.  On that branch, and
+        on a model whose device layout is still automatic, this call also
+        decides the layout before it forward projects, and every later
+        reconstruction on the model reuses it.  The decision runs the memory
+        check, so the call can raise
+        ``MemoryPreflightError`` for a problem
+        too large for the available devices.  The Otsu branch works on the
+        host throughout and leaves the layout alone.
     """
     import mbirtorch.preprocess as mtp
 
