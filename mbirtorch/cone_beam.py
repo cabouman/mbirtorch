@@ -890,10 +890,9 @@ class ConeBeamModel(TomographyModel):
         if (isinstance(sino, _sharding.Shards)
                 or isinstance(weights, _sharding.Shards)):
             raise ValueError(
-                'split_sino_recon does not accept a sinogram or weights that '
-                'have been placed on the devices.  Each half builds its own '
-                'model and uses its own device layout, so this method '
-                'works from the host (numpy or tensor) arrays throughout.')
+                'split_sino_recon does not accept a sinogram or weights '
+                'in sharded form.  Pass the host (numpy or tensor) sinogram and the '
+                'host weights.')
         if not (hasattr(sino, "ndim") and sino.ndim == 3):
             raise AssertionError("sino must be a 3D array shaped (num_views, num_rows, num_cols).")
         if weights is not None and getattr(weights, "shape", None) != sino.shape:

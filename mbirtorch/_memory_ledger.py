@@ -85,6 +85,38 @@ APPLY_CYLINDERS = 2
 # keeps: it may charge more than a run needs but never less.
 COLUMN_GATHER_RESIDENTS = 3
 
+# ── the denoiser's own counts ────────────────────────────────────────────────
+# QGGMRFDenoiser runs its own sweep, so its per-subset counts are read from
+# denoising.py rather than shared with the reconstruction counts above.  Only
+# the prior's count is shared, because the denoiser calls the same qGGMRF
+# kernel the reconstruction calls.
+#
+# How many subset cylinders the denoiser holds once that kernel has returned.
+# The single-device updater, vcd_subset_denoiser, holds eight at its widest
+# instant, which is the residual update at the end.  Those eight are the
+# prior gradient, the prior hessian, the gathered residual, the forward
+# gradient, the unscaled update direction, the direction scaled by the step
+# size, the second scaled copy the residual update forms, and the updated
+# residual itself.
+#
+# The sharded worker, terms_worker, holds seven.  Its widest instant is the
+# division that forms the direction, where it holds the prior gradient, the
+# prior hessian, the gathered residual, the forward gradient, the two
+# operands of that division, and its result.  Eight is charged on both paths,
+# because the ledger may charge more than a run needs but never less.
+DENOISE_DIRECTION_CYLINDERS = 8
+# How many the state application holds: the direction the subset produced,
+# the direction scaled by the step size, and one temporary -- the negated
+# step the residual subtracts, or the absolute value the ell-1 sum reduces.
+DENOISE_APPLY_CYLINDERS = 3
+# How many qGGMRF boundary columns one device holds while the sharded sweep
+# exchanges halos.  The exchange rebinds the pass's halos only after it
+# returns, so a device holds the two columns the previous pass left, the one
+# this exchange has already received, and the outgoing column the move copies
+# from.  The two end devices hold one halo rather than two, and this charges
+# them four as well.
+DENOISE_HALO_COLUMNS = 4
+
 # Library workspace that torch allocates through its own caching allocator,
 # and that the ledger's array enumeration therefore cannot see.  Measured as
 # a FLAT 32 to 33 MiB across problem sizes whose peaks span 2.26 GiB to 26.68
@@ -225,9 +257,12 @@ class LedgerPlan:
     partition_granularities: tuple        # every subset count built up front
     # ── what this call runs and supplies ─────────────────────────────────────
     # Which call the plan prices: 'recon' for a full reconstruction, 'direct'
-    # for a direct reconstruction alone.  A direct reconstruction holds far
-    # less -- no prior, no hessian, no partitions, no loop state -- so the two
-    # are separate plans rather than one plan with the extra terms zeroed.
+    # for a direct reconstruction alone, 'denoise' for one QGGMRFDenoiser
+    # sweep.  Each holds a different set of arrays.  A direct reconstruction
+    # builds no prior, no hessian, no partitions and no loop state, and a
+    # denoise builds no projector, no view batch and no hessian at all.  They
+    # are therefore separate plans rather than one plan with the extra terms
+    # zeroed.
     workload: str = 'recon'
     weights_supplied: bool = False
     fm_hessian_supplied: bool = False
@@ -289,9 +324,10 @@ def estimate_peak_device_bytes(plan):
     whole model on CPU.
 
     Which phases are emitted follows ``plan.workload``: a full reconstruction
-    by default, and the filter and single back projection of a direct
-    reconstruction under ``'direct'``.  Both share the charges below, so the
-    two plans cannot drift apart.
+    by default, the filter and single back projection of a direct
+    reconstruction under ``'direct'``, and one denoiser sweep under
+    ``'denoise'``.  All three share the charges below, so the plans cannot
+    drift apart.
 
     Returns:
         Ledger: the phases and their per-device bytes.
@@ -808,6 +844,103 @@ def estimate_peak_device_bytes(plan):
         return Ledger(devices=list(plan.devices), phases=phases,
                       num_pixels_full=int(plan.num_pixels_full))
 
+    # ── the denoise plan ─────────────────────────────────────────────────────
+    # One QGGMRFDenoiser sweep, and this is all of it.  The denoiser's forward
+    # model is the identity, so it has no projectors at all; its
+    # create_projectors is a no-op.  Nothing here therefore charges a view
+    # batch, a projection body, a hessian diagonal or a weights array.  Its
+    # sinogram shape IS its image shape, so every term below is image-shaped
+    # and none is sinogram-shaped.  It fixes one partition rather than a
+    # sequence, so it builds exactly the granularities this plan names.
+    #
+    # The arrays are split by SLICE, which is how _shard_recon places a
+    # recon-shaped array.  Every term therefore follows slice_blocks and none
+    # follows view_blocks.
+    if plan.workload == 'denoise':
+        base_terms = [workspace_term]
+        base = list(workspace_term[1])
+
+        def halo_columns(i):
+            """The qGGMRF boundary columns one device holds across a pass.
+
+            ``_sharding.exchange_qggmrf_halos`` gives each shard the image
+            slice just beyond each of its boundaries, as a ``(num_pixels,)``
+            column on the shard's own device.  A single device runs the
+            compiled sweep instead and exchanges nothing, so the term is zero
+            there.  See DENOISE_HALO_COLUMNS for which columns are counted.
+            """
+            if n == 1:
+                return 0
+            return (DENOISE_HALO_COLUMNS * int(plan.num_pixels_grid)
+                    * _F32_BYTES)
+
+        def partition_indices(i):
+            """The subset partition, which EVERY device holds whole.
+
+            The sharded sweep copies the whole partition onto each device
+            once rather than splitting it, because a subset's indices address
+            the in-slice pixel grid and every shard updates those same pixels
+            in its own slices.  One partition of g subsets is
+            ``g x ceil(P / g)`` int64 values.  Charged from the partitions
+            this plan BUILDS, which for a denoiser is the one partition the
+            sweep visits and no other.
+            """
+            return sum(
+                int(g) * math.ceil(plan.num_pixels_full / max(1, int(g)))
+                * _INT64_BYTES for g in plan.partition_granularities)
+
+        # What the sweep holds from the moment its state exists until it
+        # returns.  The denoiser places the input image, clones it into the
+        # working image, and forms the residual between the two, so three
+        # image-shaped arrays are live throughout.  A caller-supplied initial
+        # image is a fourth.  By default that argument aliases the input image
+        # and costs nothing.
+        #
+        # The reshape into flat (pixels, slices) form allocates nothing more.
+        # A shard arrives from its cross-device copy contiguous, and a
+        # single-device image is contiguous as placed, so the reshape is a
+        # view on either path.
+        residents = [
+            ('input image', per_dev(recon_dev)),
+            ('init image', per_dev(
+                lambda i: recon_dev(i) if plan.init_recon_supplied else 0)),
+            ('working image', per_dev(recon_dev)),
+            ('residual', per_dev(recon_dev)),
+            ('subset indices', per_dev(partition_indices)),
+            ('qggmrf halos', per_dev(halo_columns)),
+        ]
+        phases.append(_phase('denoise state placement', residents, n,
+                             base=base, base_terms=base_terms))
+        for granularity in plan.granularities:
+            p_sub = math.ceil(plan.num_pixels_full / max(1, int(granularity)))
+            # The prior and the update direction are consecutive rather than
+            # co-live.  The kernel's own working set is dead before the
+            # direction is formed, and the two arrays that survive the call
+            # are the prior gradient and hessian, which both counts include.
+            # The per-device maximum over phases picks between them.
+            sub_phases = (
+                ('prior', [('prior cylinders', per_dev(
+                    lambda i: plan.qggmrf_cylinders * cyl(i, p_sub)))]),
+                ('update direction', [('direction cylinders', per_dev(
+                    lambda i: DENOISE_DIRECTION_CYLINDERS * cyl(i, p_sub)))]),
+                ('state application', [
+                    ('direction and scaled direction', per_dev(
+                        lambda i: DENOISE_APPLY_CYLINDERS * cyl(i, p_sub)))]),
+            )
+            for name, terms in sub_phases:
+                phases.append(_phase(
+                    f'denoise subset {name} (granularity {granularity})',
+                    residents + terms, n, base=base, base_terms=base_terms))
+        # The convergence test reads the working image's ell-1 norm once per
+        # pass, and the absolute value it reduces is a whole image-shaped
+        # array on every device.
+        phases.append(_phase(
+            'denoise per-pass statistics',
+            residents + [('image magnitude', per_dev(recon_dev))], n,
+            base=base, base_terms=base_terms))
+        return Ledger(devices=list(plan.devices), phases=phases,
+                      num_pixels_full=int(plan.num_pixels_full))
+
     # ── phase B: the direct reconstruction ───────────────────────────────────
     # Runs only when no initial reconstruction was supplied.  Its full-index
     # back projection is the largest single projection of the run.
@@ -1048,13 +1181,29 @@ def plan_from_model(model, devices, workload='recon', partition_sequence=None,
     so a geometry change cannot leave a stale axis length behind.
 
     ``workload`` names the call the plan is for: ``'recon'`` (the default)
-    prices a full reconstruction, and ``'direct'`` prices a direct
-    reconstruction -- the filter and one back projection, with none of the
-    prior, hessian, partition and loop state a full reconstruction holds.
+    prices a full reconstruction, ``'direct'`` prices a direct reconstruction
+    -- the filter and one back projection, with none of the prior, hessian,
+    partition and loop state a full reconstruction holds -- and ``'denoise'``
+    prices one QGGMRFDenoiser sweep.
+
+    A denoiser is read differently in three places, because it is built
+    differently.  It has no projectors, so no per-view cost model is built and
+    no projection body is asked what it costs.  Asking would raise, because a
+    denoiser defines no bodies.  It also builds one partition rather than a
+    sequence, so the plan names the single granularity the sweep visits.  And
+    its sinogram shape is its image shape, which is checked here rather than
+    assumed.  A plan built from a model where the two differ would price the
+    wrong arrays.
     """
     sinogram_shape = tuple(int(s) for s in model.get_params('sinogram_shape'))
     recon_shape = tuple(int(s) for s in model.get_params('recon_shape'))
     devices = [torch.device(d) for d in devices]
+    denoising = workload == 'denoise'
+    if denoising and sinogram_shape != recon_shape:
+        raise ValueError(
+            "the 'denoise' workload prices a QGGMRFDenoiser, whose "
+            'sinogram_shape is its image shape.  This model has '
+            f'sinogram_shape {sinogram_shape} and recon_shape {recon_shape}.')
 
     sino_placement = _sharding.Placement(devices, axis=0,
                                          axis_len=sinogram_shape[0])
@@ -1070,13 +1219,24 @@ def plan_from_model(model, devices, workload='recon', partition_sequence=None,
     granularity = list(model.get_params('granularity'))
     if partition_sequence is None:
         partition_sequence = list(model.get_params('partition_sequence'))
-    visited = sorted({granularity[int(k)] for k in partition_sequence
-                      if int(k) < len(granularity)})
+    if denoising:
+        # A denoise sweep builds and visits ONE partition: the one the FIRST
+        # entry of the sequence names.  A reconstruction walks the whole
+        # sequence and builds every granularity in the list, so reading the
+        # sequence the reconstruction's way would charge partitions the
+        # denoiser never builds and subset phases it never runs.
+        index = int(partition_sequence[0]) if len(partition_sequence) else 0
+        visited = [granularity[index]] if index < len(granularity) else []
+        built = list(visited)
+    else:
+        visited = sorted({granularity[int(k)] for k in partition_sequence
+                          if int(k) < len(granularity)})
+        built = list(granularity)
 
     num_pixels_full = int(model.full_index_count())
     num_pixels_grid = recon_shape[0] * recon_shape[1]
 
-    charge = _model_view_charge(model, len(devices))
+    charge = None if denoising else _model_view_charge(model, len(devices))
 
     return LedgerPlan(
         sinogram_shape=sinogram_shape,
@@ -1090,7 +1250,7 @@ def plan_from_model(model, devices, workload='recon', partition_sequence=None,
         num_pixels_full=num_pixels_full,
         num_pixels_grid=num_pixels_grid,
         granularities=tuple(visited) or (granularity[0],),
-        partition_granularities=tuple(granularity),
+        partition_granularities=tuple(built) or (granularity[0],),
         weights_supplied=weights is not None,
         fm_hessian_supplied=fm_hessian is not None,
         init_recon_supplied=init_recon is not None,
@@ -1103,12 +1263,15 @@ def plan_from_model(model, devices, workload='recon', partition_sequence=None,
         back_band=getattr(model, 'back_project_slice_band', None),
         # Both read from the model's own resolvers rather than re-derived
         # here: a charge that re-implements a driver rule is a charge that
-        # can be left behind when the rule moves.
-        column_pixel_batch=(model._forward_pixel_batch()
-                            if model._column_gather_forward() else None),
+        # can be left behind when the rule moves.  A denoiser has no forward
+        # projection to resolve, so neither is asked.
+        column_pixel_batch=(None if denoising else
+                            (model._forward_pixel_batch()
+                             if model._column_gather_forward() else None)),
         qggmrf_cylinders=qggmrf_cylinder_count(model),
         view_charge=charge,
-        torch_body_directions=torch_body_directions(model),
+        torch_body_directions=(() if denoising
+                               else torch_body_directions(model)),
     )
 
 
@@ -1120,6 +1283,12 @@ def workload_covers(checked, incoming):
     deal besides, so a layout that passed a recon check passes a direct one.
     Nothing beyond that pair is claimed: a plan added later is unrelated to
     these until it has been priced against them.
+
+    ``'denoise'`` is one such plan.  It covers nothing and is covered by
+    nothing, because it holds arrays neither of the other two holds.  A
+    denoise holds three image-shaped arrays at once, where a reconstruction
+    holds one recon beside its sinogram-shaped set.  Equality below is what
+    lets one denoise follow another with no fresh check.
     """
     return checked == incoming or (checked, incoming) == ('recon', 'direct')
 

@@ -35,6 +35,14 @@ allocator state.  One sinogram per cell is generated once, at ONE device, and
 every arm of that cell loads it; otherwise the arms would reconstruct
 different arrays and the comparison would not be controlled.
 
+THE DENOISER FAMILY differs in three ways, and every one of them follows from
+the denoiser having no projectors.  Its staged input is a noisy phantom rather
+than a forward projection, its timed call is ``denoise`` rather than ``recon``,
+and its device count is set with ``configure_devices`` rather than with the
+environment pin -- ``denoise`` makes no automatic device-count decision, and
+the pin acts only through that decision.  Its cell is an IMAGE shape, because
+QGGMRFDenoiser sets its sinogram shape equal to its image shape.
+
 THE CROSSOVER RULE.  A count's floor is its crossover against the best smaller
 ADMITTED count, not against n=1 unconditionally: parallel n=4 must beat n=2.
 The admitted set is read off the CURRENT table, so the comparison count can
@@ -48,9 +56,11 @@ takes the CONSERVATIVE end -- the larger cell.
 WHICH CELLS RUN.  For a finite floor: the ladder cells bracketing it -- one
 below, the floor's own, one above.  For a sentinel: the 512-, 768- and
 1024-class cells, looking for the admission size that has never been found.
-A sentinel becomes a finite floor when its count clears 1.0x by more than the
-measured spread, and the script prints the proposed floor.  Sizes above a
-row's ``largest_tested`` are not measured here and are reported as such.
+A family the table has no rows for at all takes those same probe cells,
+looking for its first admission size; see UNTABLED_FAMILIES.  A sentinel
+becomes a finite floor when its count clears 1.0x by more than the measured
+spread, and the script prints the proposed floor.  Sizes above a row's
+``largest_tested`` are not measured here and are reported as such.
 
 Run:
     python dev_scripts/refresh_widening_floors.py            # a 4-GPU node
@@ -104,6 +114,35 @@ SENTINEL_PROBES = [(512, 448, 384), (768, 672, 576), (1024, 1008, 992)]
 #: Tiny stand-ins so --smoke exercises every path in seconds on a CPU.
 SMOKE_LADDER = [(8, 12, 16), (12, 12, 16), (16, 12, 16)]
 
+#: Floor families the table has no rows for yet, and the device counts to
+#: measure for each.  The FLOORS table gains a family only through a paste of
+#: this script's output, so a family that has never been measured cannot be
+#: planned from the table: it is named here instead, and the first refresh
+#: that clears one prints its first rows.  Remove a family from here in the
+#: same change that pastes its rows in, so it is planned from the table
+#: afterwards like every other.
+UNTABLED_FAMILIES = {'denoiser': (2, 4)}
+
+#: What a family's floor counts, for a family whose metric is not the plain
+#: sinogram element count.  Printed with the plan and again under the pasted
+#: rows, because the row's own note is where this has to end up and a note is
+#: the one field a machine cannot fill in.
+FAMILY_METRIC_NOTES = {
+    'denoiser': ('QGGMRFDenoiser sets its sinogram shape equal to its image '
+                 'shape, so a denoiser floor is read in IMAGE VOXELS where '
+                 'every other family reads sinogram elements.  Say so in the '
+                 "row's note."),
+}
+
+
+def planned_rows():
+    """Every ``(family, count)`` a refresh measures: the table's rows, plus
+    the counts named for the families the table has no rows for."""
+    rows = set(wf.FLOORS)
+    for family, counts in UNTABLED_FAMILIES.items():
+        rows.update((family, int(count)) for count in counts)
+    return sorted(rows)
+
 
 def elements(cell):
     return int(cell[0]) * int(cell[1]) * int(cell[2])
@@ -140,14 +179,17 @@ def build_plan(smoke=False):
     families that have no measured rows at all."""
     ladder = SMOKE_LADDER if smoke else LADDER
     rows = []
-    for (family, count) in sorted(wf.FLOORS):
-        floor = wf.FLOORS[(family, count)]
+    for (family, count) in planned_rows():
+        floor = wf.FLOORS.get((family, count))
         against = comparison_count(family, count)
         arms = sorted({1, against, count})
-        if floor.elements is None:
+        if floor is None or floor.elements is None:
+            # No admission size is known: a row that has never been measured
+            # and a sentinel row are searched the same way, at the probe
+            # cells, because neither says where its crossover is.
             cells = (ladder[-len(SENTINEL_PROBES):] if smoke
                      else list(SENTINEL_PROBES))
-            role = 'sentinel probe'
+            role = 'first measurement' if floor is None else 'sentinel probe'
         else:
             at = cell_named(floor.elements, ladder)
             if at is None:                       # smoke, or a moved ladder
@@ -220,8 +262,14 @@ def print_plan(plan, smoke):
         len(plan), len(cells), arms, len(cells)))
     top = elements(ladder[-1])
     for (family, count) in sorted({(r['family'], r['count']) for r in plan}):
-        floor = wf.FLOORS[(family, count)]
-        if floor.elements is None:
+        floor = wf.FLOORS.get((family, count))
+        if floor is None:
+            print('  NOTE {} n={}: the FLOORS table has no row for this '
+                  'family yet, so this run is looking for its first '
+                  'admission size at the {} cells above.  Until a row is '
+                  'pasted in, the {} floors govern it.'.format(
+                      family, count, len(SENTINEL_PROBES), wf.DEFAULT_FAMILY))
+        elif floor.elements is None:
             print('  NOTE {} n={}: SENTINEL.  Measured at the {} cells '
                   'above; sizes above largest_tested ({:,} sinogram '
                   'elements) are NOT measured by this plan.'.format(
@@ -232,6 +280,9 @@ def print_plan(plan, smoke):
                   'so the bracket has no cell above it -- a refresh can '
                   'confirm the floor but cannot lower it without a larger '
                   'cell.'.format(family, count))
+    planned = {row['family'] for row in plan}
+    for family in sorted(planned & set(FAMILY_METRIC_NOTES)):
+        print('  METRIC {}: {}'.format(family, FAMILY_METRIC_NOTES[family]))
     missing = unmeasured_families()
     if missing:
         # The None key sorts first: a class that declares no family is taking
@@ -252,7 +303,20 @@ def print_plan(plan, smoke):
 
 
 # ── the worker: one arm, one subprocess ──────────────────────────────────────
-def _build_model(family, cell, device):
+#: The noise standard deviation the denoiser family is measured at, as a
+#: fraction of the phantom's unit dynamic range.  It is passed to ``denoise``
+#: rather than estimated, so no arm spends time on the host-side estimate,
+#: which does no device work and would add a size-dependent constant to every
+#: reading.
+DENOISE_SIGMA = 0.1
+
+
+def _build_model(family, cell, device, n_dev=None):
+    """The model one arm times.
+
+    ``n_dev`` is the arm's device count.  It matters only for the denoiser
+    family, which is placed explicitly; see the denoiser branch below.
+    """
     import numpy as np
 
     import mbirtorch
@@ -266,6 +330,24 @@ def _build_model(family, cell, device):
     elif family == 'parallel':
         angles = np.linspace(0, np.pi, num_views, endpoint=False)
         model = mbirtorch.ParallelBeamModel(tuple(cell), angles)
+    elif family == 'denoiser':
+        # The denoiser's input is an image, not a sinogram, and its
+        # sinogram_shape is set equal to that image shape, so the cell IS the
+        # image shape here.  Its floors are therefore read in image voxels
+        # where every other family's are read in sinogram elements, and the
+        # rows the refresh prints have to record that.
+        model = mbirtorch.QGGMRFDenoiser(tuple(cell))
+        if device == 'cuda':
+            # The denoiser places its image only where it is told.  denoise
+            # makes no automatic device-count decision, and the environment
+            # pin acts only through that decision, so the pin would leave
+            # every arm on one device.  The arm's count is configured
+            # explicitly instead, which is the interface the denoiser
+            # documents for multi-device work.  Each arm reports
+            # realized_devices, so a count that did not take is visible in
+            # the run output.
+            model.configure_devices(
+                devices=['cuda:{}'.format(i) for i in range(n_dev or 1)])
     else:
         # Falling through to parallel beam here would time parallel beam and
         # record the result under this family's name, which is the one way a
@@ -278,35 +360,48 @@ def _build_model(family, cell, device):
         # CPU/MPS only: the env pin is a CUDA mechanism (the policy
         # short-circuits below two visible devices), so the smoke has to place
         # the model by hand.  On CUDA nothing is configured, which keeps the
-        # model on the automatic branch the pin acts through.
+        # model on the automatic branch the pin acts through.  The denoiser
+        # branch above is the exception, and it is placed there.
         model.configure_devices(devices=[device])
     model.set_params(no_warning=True, verbose=0)
     return model
 
 
-def _sino_path(family, cell):
+def _input_path(family, cell):
+    """Where one cell's staged input array lives: a sinogram for the
+    projection families, a noisy image for the denoiser."""
     return os.path.join(RESULTS_DIR, '_sino_{}_{}x{}x{}.npy'.format(
         family, *cell))
 
 
 def generate(cfg):
-    """Stage one sinogram per cell, at ONE device, so every arm of that cell
-    reconstructs the same array."""
+    """Stage one input array per cell, at ONE device, so every arm of that
+    cell works on the same array.
+
+    A projection family's input is the forward projection of a phantom.  The
+    denoiser has no projectors, so its input is that phantom plus seeded
+    gaussian noise -- the array a denoiser is actually given.
+    """
     import numpy as np
 
     import mbirtorch
 
     model = _build_model(cfg['family'], cfg['cell'],
-                         'cpu' if cfg['device'] != 'cuda' else 'cuda')
+                         'cpu' if cfg['device'] != 'cuda' else 'cuda',
+                         n_dev=1)
     recon_shape = tuple(model.get_params('recon_shape'))
     phantom = mbirtorch.generate_3d_shepp_logan_low_dynamic_range(recon_shape)
-    sinogram = np.asarray(_to_numpy(model.forward_project(phantom)),
-                          dtype=np.float32)
+    if cfg['family'] == 'denoiser':
+        noise = np.random.RandomState(SEED).randn(*recon_shape)
+        staged = np.asarray(phantom + DENOISE_SIGMA * noise, dtype=np.float32)
+    else:
+        staged = np.asarray(_to_numpy(model.forward_project(phantom)),
+                            dtype=np.float32)
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    np.save(_sino_path(cfg['family'], cfg['cell']),
-            np.ascontiguousarray(sinogram))
+    np.save(_input_path(cfg['family'], cfg['cell']),
+            np.ascontiguousarray(staged))
     return dict(cfg, role='generator', recon_shape=list(recon_shape),
-                sino_shape=list(sinogram.shape))
+                sino_shape=list(staged.shape))
 
 
 def _to_numpy(x):
@@ -328,19 +423,33 @@ def measure(cfg):
     import numpy as np
     import torch
 
-    model = _build_model(cfg['family'], cfg['cell'], cfg['device'])
-    sinogram = np.load(_sino_path(cfg['family'], cfg['cell']))
-    weights = np.exp(-sinogram / (2 * np.max(sinogram))).astype(np.float32)
+    family = cfg['family']
+    model = _build_model(family, cfg['cell'], cfg['device'],
+                         n_dev=cfg.get('n_dev'))
+    staged = np.load(_input_path(family, cfg['cell']))
+    weights = (None if family == 'denoiser' else
+               np.exp(-staged / (2 * np.max(staged))).astype(np.float32))
 
     def one():
         np.random.seed(SEED)
-        recon, _info = model.recon(sinogram, weights=weights,
-                                   max_iterations=ITERATIONS,
-                                   stop_threshold_change_pct=0.0)
+        if family == 'denoiser':
+            # The denoiser's own entry point; recon raises on it.  The
+            # iteration count and the exact-iteration stop match the
+            # reconstruction call below, so both families are timed over the
+            # same amount of work per run.
+            out, _info = model.denoise(staged, sigma_noise=DENOISE_SIGMA,
+                                       max_iterations=ITERATIONS,
+                                       stop_threshold_change_pct=0.0)
+        else:
+            out, _info = model.recon(staged, weights=weights,
+                                     max_iterations=ITERATIONS,
+                                     stop_threshold_change_pct=0.0)
         if cfg['device'] == 'cuda':
-            for device in model.sino_placement.devices:
+            # Both placements name the same device list; the recon one is
+            # named because it is the one the denoiser divides its image on.
+            for device in model.recon_placement.devices:
                 torch.cuda.synchronize(device)
-        return _to_numpy(recon)
+        return _to_numpy(out)
 
     start = time.perf_counter()
     out = one()
@@ -353,7 +462,7 @@ def measure(cfg):
     median = statistics.median(warm)
     return dict(cfg, role='arm', cold_s=cold, warm_all=warm, warm_s=median,
                 spread=(max(warm) - min(warm)) / median,
-                realized_devices=len(model.sino_placement.devices),
+                realized_devices=len(model.recon_placement.devices),
                 recon_checksum=float(np.sum(np.abs(out), dtype=np.float64)))
 
 
@@ -450,7 +559,9 @@ def verdict(plan, measured):
     spread, which is what keeps one noisy cell from moving a floor.
     """
     out = {}
-    for (family, count) in sorted(wf.FLOORS):
+    # Read off the PLAN rather than the table, so a family the table has no
+    # rows for is judged too.
+    for (family, count) in sorted({(r['family'], r['count']) for r in plan}):
         cells = [tuple(row['cell']) for row in plan
                  if row['family'] == family and row['count'] == count]
         against = comparison_count(family, count)
@@ -467,7 +578,7 @@ def verdict(plan, measured):
 
 def print_verdict(verdicts):
     for (family, count), record in sorted(verdicts.items()):
-        floor = wf.FLOORS[(family, count)]
+        floor = wf.FLOORS.get((family, count))
         print('\n===== {} n={}  (crossover against n={}) ====='.format(
             family, count, record['against']))
         for cell, ratio, spread, wins in record['rows']:
@@ -481,7 +592,14 @@ def print_verdict(verdicts):
         largest = max(elements(c) for c, _r, _s, _w in record['rows'])
         winner = record['winner']
         proposed = elements(winner) if winner else None
-        if winner is None and floor.elements is None:
+        # A family with no table row is in the same state as a sentinel: no
+        # admission size is known for it.  The two are reported separately so
+        # the reader can tell a first measurement from a re-measurement.
+        if winner is None and floor is None:
+            print('  no admission size in these cells -> {} n={} still has '
+                  'no row; sizes above {:,} elements are unmeasured.'.format(
+                      family, count, largest))
+        elif winner is None and floor.elements is None:
             print('  no admission size in these cells -> the row stays a '
                   'SENTINEL; sizes above {:,} sinogram elements are still '
                   'unmeasured.'.format(largest))
@@ -489,6 +607,11 @@ def print_verdict(verdicts):
             print('  NOTHING WON: the floor is above every cell measured '
                   '({:,} sinogram elements).  Re-run with a larger ladder; '
                   'this run cannot place a floor.'.format(largest))
+        elif floor is None:
+            print('  FIRST FLOOR: n={} beats 1.0x by more than its spread at '
+                  '{}.  Proposed floor: {:,} elements.  Paste the row below, '
+                  'then drop {!r} from UNTABLED_FAMILIES.'.format(
+                      count, winner, proposed, family))
         elif floor.elements is None:
             print('  SENTINEL CLEARED: n={} beats 1.0x by more than its '
                   'spread at {}.  Proposed finite floor: {:,} sinogram '
@@ -547,6 +670,14 @@ def print_table(verdicts, commit):
     print('\nCheck MEASURED_GPU and MEASURED_CONFIG still describe this run, '
           'and rewrite each note by hand: a note is the one field a machine '
           'cannot fill in.')
+    for family in sorted({f for f, _c in verdicts} & set(FAMILY_METRIC_NOTES)):
+        print('\n{}: {}'.format(family, FAMILY_METRIC_NOTES[family]))
+    new = sorted({f for f, _c in verdicts} & set(UNTABLED_FAMILIES))
+    if new:
+        print('\nThese families are new to the table: {}.  Drop each from '
+              "UNTABLED_FAMILIES in this script once its rows are pasted in, "
+              'so it is planned from the table afterwards.'.format(
+                  ', '.join(new)))
 
 
 def head_commit():

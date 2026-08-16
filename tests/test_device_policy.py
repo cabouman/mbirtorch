@@ -1339,12 +1339,11 @@ def test_split_sino_recon_refuses_a_placed_sinogram():
     with pytest.raises(ValueError) as excinfo:
         model.split_sino_recon(prepared, weights=weights, half_overlap=3)
     message = str(excinfo.value)
-    assert 'placed on the devices' in message
-    assert 'settles its own device layout' in message
-    assert 'Pass the host sinogram and the host weights' in message
+    assert 'does not accept' in message
+    assert 'sharded form' in message
     # The weights are checked with the sinogram, so a host sinogram carrying
     # placed weights is refused too.
-    with pytest.raises(ValueError, match='placed on the devices'):
+    with pytest.raises(ValueError, match='sharded form'):
         model.split_sino_recon(sinogram, weights=placed_weights, half_overlap=3)
 
 
@@ -1361,10 +1360,10 @@ def test_recon_plastic_metal_refuses_a_placed_sinogram(monkeypatch):
     with pytest.raises(ValueError) as excinfo:
         model.recon_plastic_metal(prepared, weights, num_metal=0)
     message = str(excinfo.value)
-    assert 'placed on the devices' in message
-    assert 'hands a host sinogram to each reconstruction pass' in message
-    assert 'Pass the host sinogram and the host weights' in message
-    with pytest.raises(ValueError, match='placed on the devices'):
+    assert 'in sharded form' in message
+    assert 'Pass the host (numpy or tensor) sinogram and the host weights' \
+        in message
+    with pytest.raises(ValueError, match='in sharded form'):
         model.recon_plastic_metal(sinogram, placed_weights, num_metal=0)
 
     # A plain tensor is still converted to host numpy at entry.  The

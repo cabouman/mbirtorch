@@ -892,6 +892,279 @@ def test_a_recon_check_covers_a_direct_one_but_not_the_reverse():
     assert not _memory_ledger.workload_covers(None, 'recon')
 
 
+# ── the denoise workload ─────────────────────────────────────────────────────
+# One QGGMRFDenoiser sweep.  The denoiser has no projectors at all, its
+# sinogram shape is its image shape, and it fixes one partition, so it is
+# priced as its own plan rather than as a reconstruction with terms zeroed.
+DENOISE_PHASES = [
+    'denoise state placement',
+    'denoise subset prior (granularity 16)',
+    'denoise subset update direction (granularity 16)',
+    'denoise subset state application (granularity 16)',
+    'denoise per-pass statistics',
+]
+
+
+def make_denoise_plan(image=(32, 32, 32), num_pixels_full=None, **kwargs):
+    """A hand-built denoiser plan.
+
+    The sinogram shape IS the image shape, as QGGMRFDenoiser sets it, and the
+    pixel set is the whole unmasked grid, which is what the denoiser's
+    ``use_ror_mask=False`` default keeps.  The granularity is the denoiser's
+    own fixed 16.
+    """
+    rows, cols, slices = image
+    kwargs.setdefault('granularities', (16,))
+    kwargs.setdefault('num_views', rows)
+    return make_plan(workload='denoise', num_rows=cols, num_channels=slices,
+                     recon=image,
+                     num_pixels_full=(rows * cols if num_pixels_full is None
+                                      else num_pixels_full),
+                     **kwargs)
+
+
+def test_the_denoise_plan_is_the_state_and_the_subset_sweep():
+    """The phases a denoiser really runs, and nothing else.
+
+    It places the image, clones it into the working image and forms the
+    residual; then per subset it runs the qGGMRF prior, forms the update
+    direction, and applies it; then once per pass it reads the working
+    image's ell-1 norm.  Nothing else exists while it runs.
+    """
+    image_bytes = 32 * 32 * 32 * 4
+    ledger = estimate_peak_device_bytes(make_denoise_plan())
+    assert [p.name for p in ledger.phases] == DENOISE_PHASES
+    terms = dict(_named(ledger, 'denoise state placement').terms)
+    assert terms['input image'][0] == image_bytes
+    assert terms['working image'][0] == image_bytes
+    assert terms['residual'][0] == image_bytes
+    assert terms['library workspace'][0] == \
+        _memory_ledger.FIXED_DEVICE_OVERHEAD_BYTES
+    # The initial image aliases the input unless the caller supplies one.
+    assert terms['init image'][0] == 0
+    supplied = estimate_peak_device_bytes(
+        make_denoise_plan(init_recon_supplied=True))
+    assert dict(_named(supplied, 'denoise state placement').terms)[
+        'init image'][0] == image_bytes
+    assert supplied.peak_bytes(0) - ledger.peak_bytes(0) == image_bytes
+
+
+def test_the_denoise_plan_charges_no_projector_or_hessian_term():
+    """The three sets of charges a denoiser must not carry.
+
+    Its ``create_projectors`` is a no-op, so no view batch, no projection
+    block and no assembled projection output exists.  It builds no hessian
+    diagonal and no weights array.  And it builds one partition rather than a
+    sequence, so no term follows a granularity it never visits.
+    """
+    ledger = estimate_peak_device_bytes(make_denoise_plan(n_devices=2))
+    charged = {name for phase in ledger.phases for name, _vals in phase.terms}
+    for absent in ('batch', 'block', 'forward', 'back', 'hessian', 'weights',
+                   'sinogram', 'scatter', 'band', 'partitions'):
+        assert not any(absent in name for name in charged), (absent, charged)
+    # And the view axis never enters: the same plan with every view on one
+    # device reads identically, because only the slice split is used.
+    lopsided = estimate_peak_device_bytes(
+        make_denoise_plan(n_devices=2, num_views=1))
+    assert lopsided.per_device_peaks() == ledger.per_device_peaks()
+
+
+def test_the_denoise_working_set_follows_the_subset_size():
+    """A coarser partition means a bigger subset, and a bigger subset means a
+    bigger working set: every per-subset term is the subset's pixel count by
+    the device's slices."""
+    coarse = estimate_peak_device_bytes(make_denoise_plan(granularities=(4,)))
+    fine = estimate_peak_device_bytes(make_denoise_plan(granularities=(64,)))
+    for fragment, term in (('prior', 'prior cylinders'),
+                           ('update direction', 'direction cylinders'),
+                           ('state application',
+                            'direction and scaled direction')):
+        big = dict(_named(coarse, fragment).terms)[term][0]
+        small = dict(_named(fine, fragment).terms)[term][0]
+        assert big > small, fragment
+        # Exactly the subset ratio: ceil(1024/4) against ceil(1024/64).
+        assert big == small * (1024 // 4) // (1024 // 64), fragment
+    assert coarse.peak_bytes(0) > fine.peak_bytes(0)
+
+
+def test_the_denoise_prior_is_charged_at_the_shared_qggmrf_count():
+    """The denoiser calls the same prior kernel a reconstruction calls, so it
+    is priced by the same cylinder count and not by one of its own."""
+    p_sub = math.ceil(1024 / 16)
+    for cylinders in (_memory_ledger.QGGMRF_CYLINDERS_COMPILED,
+                      _memory_ledger.QGGMRF_CYLINDERS_EAGER):
+        ledger = estimate_peak_device_bytes(
+            make_denoise_plan(qggmrf_cylinders=cylinders))
+        charged = dict(_named(ledger, 'denoise subset prior').terms)[
+            'prior cylinders'][0]
+        assert charged == cylinders * p_sub * 32 * 4
+
+
+def test_the_denoise_charges_follow_the_slice_split():
+    """The denoiser divides its image by SLICE, so every term is the device's
+    own slice block and no term follows the view axis."""
+    # 30 slices over four devices: 8, 8, 7, 7.
+    ledger = estimate_peak_device_bytes(
+        make_denoise_plan(image=(32, 32, 30), n_devices=4))
+    blocks = [8, 8, 7, 7]
+    for phase in ledger.phases:
+        terms = dict(phase.terms)
+        assert terms['input image'] == [32 * 32 * b * 4 for b in blocks]
+        assert terms['working image'] == terms['input image']
+        assert terms['residual'] == terms['input image']
+    prior = dict(_named(ledger, 'denoise subset prior').terms)[
+        'prior cylinders']
+    p_sub = math.ceil(1024 / 16)
+    assert prior == [_memory_ledger.QGGMRF_CYLINDERS_COMPILED * p_sub * b * 4
+                     for b in blocks]
+    # And the peak falls with the device count, since every image-shaped term
+    # is a share of the volume.
+    one = estimate_peak_device_bytes(make_denoise_plan(image=(32, 32, 32)))
+    four = estimate_peak_device_bytes(make_denoise_plan(image=(32, 32, 32),
+                                                        n_devices=4))
+    assert four.peak_bytes(0) < one.peak_bytes(0)
+
+
+def test_the_denoise_halos_exist_only_on_a_sharded_sweep():
+    """The sharded sweep stages one boundary column per shard side; a single
+    device runs the compiled sweep and exchanges nothing.
+
+    The column count is written out here rather than read from the module, so
+    that changing the constant alone cannot move the charge without this test
+    noticing.
+    """
+    grid = 32 * 32
+    one = estimate_peak_device_bytes(make_denoise_plan())
+    two = estimate_peak_device_bytes(make_denoise_plan(n_devices=2))
+    assert dict(_named(one, 'denoise subset prior').terms)['qggmrf halos'] \
+        == [0]
+    assert dict(_named(two, 'denoise subset prior').terms)['qggmrf halos'] \
+        == [4 * grid * 4] * 2
+    # A halo is a column of the in-slice grid, so it does not shrink with the
+    # device count the way the image-shaped terms do.
+    four = estimate_peak_device_bytes(make_denoise_plan(n_devices=4))
+    assert dict(_named(four, 'denoise subset prior').terms)['qggmrf halos'] \
+        == [4 * grid * 4] * 4
+
+
+def test_the_denoise_partition_is_held_whole_on_every_device():
+    """The sharded sweep copies the whole partition onto each device, because
+    a subset's indices address the in-slice grid that every shard shares.
+
+    A reconstruction charges its partitions to the lead device alone, so this
+    is the one place the two plans differ in WHERE a term lands rather than
+    in how large it is.
+    """
+    ledger = estimate_peak_device_bytes(make_denoise_plan(n_devices=2))
+    charged = dict(_named(ledger, 'denoise subset prior').terms)[
+        'subset indices']
+    assert charged == [16 * math.ceil(1024 / 16) * 8] * 2
+    recon = estimate_peak_device_bytes(make_plan(n_devices=2))
+    assert dict(_named(recon, 'prior').terms)['partitions (lead device)'][1] \
+        == 0
+
+
+def test_the_denoise_statistics_phase_holds_one_more_image():
+    """The convergence test reduces ``abs(working image)``, which is a whole
+    image-shaped array on every device and is the denoiser's widest instant
+    at the shipped granularity."""
+    image_bytes = 32 * 32 * 32 * 4
+    ledger = estimate_peak_device_bytes(make_denoise_plan())
+    stats = _named(ledger, 'denoise per-pass statistics')
+    assert dict(stats.terms)['image magnitude'][0] == image_bytes
+    placement = _named(ledger, 'denoise state placement')
+    assert stats.per_device[0] - placement.per_device[0] == image_bytes
+    assert ledger.peak_bytes(0) == stats.per_device[0]
+
+
+def test_a_denoise_check_covers_nothing_but_another_denoise():
+    """A denoise holds arrays neither of the other plans holds, so no check
+    substitutes for it and it substitutes for none."""
+    assert _memory_ledger.workload_covers('denoise', 'denoise')
+    for other in ('recon', 'direct', None):
+        assert not _memory_ledger.workload_covers(other, 'denoise')
+        assert not _memory_ledger.workload_covers('denoise', other)
+
+
+def test_plan_from_model_prices_a_denoiser_without_its_projectors():
+    """The round trip: a live denoiser to a plan to a ledger.
+
+    The projector reads are the reason this needs a branch of its own.  A
+    denoiser's ``create_projectors`` is a no-op, so it defines no per-view
+    projection bodies, and the recon plan's cost-model read raises on it --
+    which is asserted here, so the branch cannot be quietly removed.
+    """
+    denoiser = mbirtorch.QGGMRFDenoiser((16, 16, 12), compile_mode='off')
+    denoiser.configure_devices(devices=['cpu'])
+    denoiser.set_params(no_warning=True, verbose=0)
+
+    with pytest.raises(NotImplementedError, match='projection bodies'):
+        _memory_ledger.plan_from_model(denoiser, ['cpu'])
+
+    plan = _memory_ledger.plan_from_model(denoiser, ['cpu', 'cpu'],
+                                          workload='denoise')
+    assert plan.workload == 'denoise'
+    assert plan.n_devices == 2
+    assert denoiser.recon_placement.n_devices == 1    # the model is untouched
+    # The denoiser's sinogram shape IS its image shape.
+    assert plan.sinogram_shape == plan.recon_shape == (16, 16, 12)
+    assert plan.num_pixels_full == denoiser.full_index_count() == 16 * 16
+    assert plan.num_pixels_grid == 16 * 16
+    # No projector was asked anything, so no cost model and no body reached
+    # the plan.
+    assert plan.view_charge is None
+    assert plan.torch_body_directions == ()
+    assert plan.column_pixel_batch is None
+    # The one fixed partition the denoiser builds.
+    assert plan.granularities == (16,)
+    assert plan.partition_granularities == (16,)
+    ledger = estimate_peak_device_bytes(plan)
+    assert [p.name for p in ledger.phases] == DENOISE_PHASES
+    assert ledger.peak_bytes(0) > 0
+    assert ledger.peak_bytes(0) == ledger.peak_bytes(1)   # an even slice split
+
+
+def test_plan_from_model_visits_only_the_partition_the_denoiser_builds():
+    """A denoise sweep builds ONE partition, the one the first entry of the
+    sequence names, so the plan may not read the sequence the way a
+    reconstruction does.
+
+    A reconstruction walks the whole sequence and builds every granularity in
+    the list.  Reading it that way here would charge partitions the denoiser
+    never builds and emit subset phases it never runs.
+    """
+    denoiser = mbirtorch.QGGMRFDenoiser((16, 16, 12), compile_mode='off')
+    denoiser.configure_devices(devices=['cpu'])
+    denoiser.set_params(no_warning=True, verbose=0,
+                        granularity=[8, 16, 32], partition_sequence=[1, 2])
+    plan = _memory_ledger.plan_from_model(denoiser, ['cpu'],
+                                          workload='denoise')
+    assert plan.granularities == (16,)          # granularity[sequence[0]]
+    assert plan.partition_granularities == (16,)
+    ledger = estimate_peak_device_bytes(plan)
+    assert [p.name for p in ledger.phases] == DENOISE_PHASES
+    # The partition charge is that one partition, not the three the list names.
+    assert dict(_named(ledger, 'denoise subset prior').terms)[
+        'subset indices'][0] == 16 * math.ceil(16 * 16 / 16) * 8
+
+
+def test_a_denoise_plan_needs_a_model_whose_shapes_agree():
+    """The assumption the plan rests on, checked rather than assumed.
+
+    Every term in the denoise plan is image-shaped.  A model whose sinogram
+    shape differs from its image shape is not a denoiser, and pricing one
+    with this plan would charge the wrong arrays, so it is refused by name.
+    """
+    angles = np.linspace(0, np.pi, 8, endpoint=False)
+    model = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
+    model.configure_devices(devices=['cpu'])
+    model.set_params(no_warning=True, verbose=0)
+    assert tuple(model.get_params('sinogram_shape')) != \
+        tuple(model.get_params('recon_shape'))
+    with pytest.raises(ValueError, match='sinogram_shape is its image shape'):
+        _memory_ledger.plan_from_model(model, ['cpu'], workload='denoise')
+
+
 # ── the model-facing plan ────────────────────────────────────────────────────
 def test_plan_from_model_reads_the_current_params_and_a_candidate_layout():
     angles = np.linspace(0, np.pi, 8, endpoint=False)
