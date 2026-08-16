@@ -68,9 +68,10 @@ Device Configuration
 
 On a machine with multiple GPUs, MBIRTorch automatically divides a reconstruction across
 them to increase the available memory and reduce reconstruction time -- with no change to
-your script, and for every geometry.  A memory check before each reconstruction picks the
-largest device count whose shares fit.  The methods below give explicit control over which
-devices are used.  Per-device memory use is reported by ``mbirtorch.get_memory_stats()``.
+your script, and for every geometry.  The device count is chosen once per model, when its
+first reconstruction starts: measured speed thresholds decide how many devices are worth
+using, and a memory check confirms the layout fits.  The methods below give explicit
+control over which devices are used.  Per-device memory use is reported by ``mbirtorch.get_memory_stats()``.
 See :doc:`usr_multi_gpu` for a full discussion.
 
 .. automethod:: mbirtorch.TomographyModel.configure_devices
