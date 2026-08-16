@@ -13,7 +13,7 @@ import scipy
 from . import pipeline
 
 
-def _transmission_kernel(obj_batch, blank_minus_dark, dark_scan_mean, flat_indices, defective_pixel_array):
+def _transmission_kernel(obj_batch, blank_minus_dark, dark_scan_mean, flat_indices):
     """Per-view-batch transmission kernel (pure device-tensor op).
 
     Computes ``-log`` of the dark-corrected, blank-normalized object scan, sets shared defective
@@ -31,7 +31,10 @@ def _transmission_kernel(obj_batch, blank_minus_dark, dark_scan_mean, flat_indic
     if flat_indices is not None:
         # Shared defective pixels (same in every view) -> NaN for the neighborhood fill.
         sino_batch = put_in_slice(sino_batch, flat_indices, float('nan'))
-    return interpolate_defective_pixels(sino_batch, defective_pixel_array)
+    # Any remaining non-finite value (e.g. an infinite ratio from a zero blank
+    # pixel) also becomes NaN, so the fill removes it too.
+    sino_batch = torch.where(torch.isfinite(sino_batch), sino_batch, nan)
+    return _fill_nan_pixels(sino_batch)
 
 
 def compute_sino_transmission(obj_scan, blank_scan, dark_scan, defective_pixel_array=(), batch_size=90,
@@ -86,7 +89,7 @@ def compute_sino_transmission(obj_scan, blank_scan, dark_scan, defective_pixel_a
     sino = pipeline.map_view_batches(
         obj_scan,
         lambda obj_batch: _transmission_kernel(obj_batch, blank_minus_dark, dark_scan_mean,
-                                               flat_indices, defective_pixel_array),
+                                               flat_indices),
         batch_size, devices=pipeline.permitted_devices(devices))
     print("Sinogram computation complete.")
     return sino
@@ -151,14 +154,18 @@ def interpolate_defective_pixels(sino, defective_pixel_array=(), num_passes=3):
     pixel still invalid after the last pass triggers a warning and is set to 0.
 
     Args:
-        sino (tensor, float): (num_views, num_det_rows, num_det_channels).
+        sino (numpy, float): (num_views, num_det_rows, num_det_channels).  A tensor is converted
+            to numpy at entry.
         defective_pixel_array (array or tuple): (det_row, det_channel) coordinates of pixels that are
             defective in every view, or () for none.
         num_passes (int): number of fill passes.
 
     Returns:
-        tensor, float: sinogram with invalid pixels interpolated, and any unfillable ones set to 0.
+        numpy, float: sinogram with invalid pixels interpolated, and any unfillable ones set to 0.
     """
+    if isinstance(sino, torch.Tensor):
+        sino = sino.detach().cpu().numpy()
+    sino = torch.as_tensor(np.asarray(sino, dtype=np.float32))
     num_views, num_rows, num_channels = sino.shape
 
     # Mark every invalid pixel NaN: non-finite values, plus the known shared defective pixels.
@@ -171,7 +178,7 @@ def interpolate_defective_pixels(sino, defective_pixel_array=(), num_passes=3):
         sino = put_in_slice(sino, defective_flat, float('nan'))
 
     # Dense neighborhood-mean fill, a fixed number of passes (shared with the zinger correction).
-    return _fill_nan_pixels(sino, num_passes)
+    return _fill_nan_pixels(sino, num_passes).numpy()
 
 
 def _rotation_kernel(sino_batch, det_rotation):
@@ -464,7 +471,7 @@ def scan_to_sino(obj_scan, blank_scan, dark_scan, defective_pixel_array=(),
         if do_downsample:
             obj_batch = _downsample_obj_kernel(obj_batch, obj_flat_indices, new_size1, new_size2, block_shape)
         sino_batch = _transmission_kernel(obj_batch, blank_minus_dark, dark_scan_mean,
-                                          trans_flat_indices, defective_pixel_array)
+                                          trans_flat_indices)
         if do_rotation:
             sino_batch = _rotation_kernel(sino_batch, det_rotation)
         return sino_batch

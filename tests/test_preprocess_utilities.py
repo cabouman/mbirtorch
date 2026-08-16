@@ -71,10 +71,11 @@ def test_transmission_batch_invariance(golden):
 
 
 def test_interpolate_defective_pixels(golden):
-    out = mtp.interpolate_defective_pixels(torch.as_tensor(golden["corrupt"].copy()),
+    out = mtp.interpolate_defective_pixels(golden["corrupt"].copy(),
                                            defective_pixel_array=golden["defective"].copy(),
                                            num_passes=3)
-    err = _rel_max(out.numpy(), golden["interp"])
+    assert isinstance(out, np.ndarray)
+    err = _rel_max(out, golden["interp"])
     print(f"interpolate rel_max = {err:.2e}")
     assert err < 1e-5
 
