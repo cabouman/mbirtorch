@@ -91,10 +91,12 @@ class QGGMRFDenoiser(TomographyModel):
     standard deviation sigma_noise, the result of :meth:`denoise` applied to
     X + W is the MAP estimate of the denoised image using the qGGMRF prior.
 
-    The denoiser runs on one device by default.  Multi-device denoising is
-    explicit: call ``configure_devices`` first, and the image is then divided
-    across the devices by slice.  The automatic device count that ``recon``
-    uses does not apply here.
+    :meth:`denoise` settles the device layout through the same
+    once-per-model automatic policy ``recon`` uses, sized by the denoiser's
+    own memory plan rather than by a reconstruction it will never run.
+    ``configure_devices`` pins a layout explicitly, and an explicit layout is
+    never second-guessed.  On a multi-device layout the image is divided
+    across the devices by slice.
 
     Args:
         image_shape (tuple of int): shape of the images to denoise
@@ -103,6 +105,14 @@ class QGGMRFDenoiser(TomographyModel):
             computational kernels with torch.compile; 'off' runs without
             compilation.
     """
+
+    # The measured widening speed floors that govern this class's automatic
+    # device count (see _widening_floors).  Both denoiser rows are sentinels:
+    # sharded denoising lost at every size probed up to a billion image
+    # voxels, so the automatic path holds a denoiser at one device and only
+    # capacity widens it.  The family's floors are read in IMAGE VOXELS,
+    # because this class's sinogram shape is its image shape.
+    _floor_family = 'denoiser'
 
     def __init__(self, image_shape, compile_mode='auto'):
         if len(image_shape) != 3:
@@ -203,6 +213,11 @@ class QGGMRFDenoiser(TomographyModel):
         sigma_noise is None, it is estimated from the image.  Denoising strength
         can also be adjusted with the ``sharpness`` parameter (default 0.0).
 
+        The first call settles the model's device layout, so it may raise the
+        memory preflight's :class:`MemoryPreflightError` when no device count
+        holds the sweep.  ``MBIRTORCH_NUM_DEVICES`` caps the automatic count,
+        and ``configure_devices`` fixes it outright.
+
         Args:
             image (numpy or tensor): the 3D volume to be denoised.
             sigma_noise (float, optional): estimated noise std in the image.
@@ -233,7 +248,12 @@ class QGGMRFDenoiser(TomographyModel):
             >>> denoised_image, d = denoiser.denoise(noisy_image, sigma_noise=0.1)
         """
         self._log_run_header(first_iteration, logfile_path, print_logs)
-        self._log_device_report()   # the layout is explicit or the default; final either way
+        # Settle the device layout before the image is placed.  The denoiser
+        # prices its own plan: it has no projectors, so a recon-sized plan
+        # would charge arrays it never allocates.  init_image rides along so a
+        # caller-supplied initial image is priced as the fourth resident image.
+        self._apply_device_policy(workload='denoise', init_recon=init_image)
+        self._log_device_report()
 
         # The noise and regularization estimates below index the image on the
         # host; a sharded input supplies a host copy for them (statistics

@@ -120,8 +120,9 @@ SMOKE_LADDER = [(8, 12, 16), (12, 12, 16), (16, 12, 16)]
 #: planned from the table: it is named here instead, and the first refresh
 #: that clears one prints its first rows.  Remove a family from here in the
 #: same change that pastes its rows in, so it is planned from the table
-#: afterwards like every other.
-UNTABLED_FAMILIES = {'denoiser': (2, 4)}
+#: afterwards like every other.  The denoiser left this set on 2026-08-16,
+#: when the mg16 refresh gave it its first (sentinel) rows.
+UNTABLED_FAMILIES = {}
 
 #: What a family's floor counts, for a family whose metric is not the plain
 #: sinogram element count.  Printed with the plan and again under the pasted
@@ -338,14 +339,15 @@ def _build_model(family, cell, device, n_dev=None):
         # rows the refresh prints have to record that.
         model = mbirtorch.QGGMRFDenoiser(tuple(cell))
         if device == 'cuda':
-            # The denoiser places its image only where it is told.  denoise
-            # makes no automatic device-count decision, and the environment
-            # pin acts only through that decision, so the pin would leave
-            # every arm on one device.  The arm's count is configured
-            # explicitly instead, which is the interface the denoiser
-            # documents for multi-device work.  Each arm reports
-            # realized_devices, so a count that did not take is visible in
-            # the run output.
+            # The arm's count is configured explicitly.  This is the
+            # protocol the family's rows were first measured under
+            # (2026-08-16, before denoise called the device policy), and it
+            # still pins correctly now that denoise does: an explicit
+            # layout is never second-guessed.  The environment pin would
+            # work today too -- a pin bypasses the floors -- but keeping
+            # the explicit list keeps the measured protocol unchanged
+            # across refreshes.  Each arm reports realized_devices, so a
+            # count that did not take is visible in the run output.
             model.configure_devices(
                 devices=['cuda:{}'.format(i) for i in range(n_dev or 1)])
     else:

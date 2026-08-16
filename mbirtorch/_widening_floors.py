@@ -28,8 +28,10 @@ just-large-enough problem at a smaller count costs a few percent.
 call it -- records a count with no admission size at or below the largest
 size tested.  It is not a permanent refusal: it excludes that count
 everywhere until a refresh finds an admission size, and it carries
-``largest_tested`` so the refresh knows where to start.  No row is in that
-state today.  A count with no row inherits the row of the next MEASURED count
+``largest_tested`` so the refresh knows where to start.  Both denoiser rows
+are in that state today: sharded denoising lost at every size probed, so the
+automatic path holds a denoiser at one device and only capacity widens it.
+A count with no row inherits the row of the next MEASURED count
 above it (n=3 is governed by the n=4 floor, as is any count above 4), and a
 model declaring no ``_floor_family`` gets the parallel floors, the more
 permissive measured set, with the reason string and the verbose-2 log both
@@ -113,66 +115,92 @@ Floor = namedtuple('Floor', ('family', 'count', 'elements', 'cell', 'against',
                              'commit', 'largest_tested', 'note'))
 
 # ── the measured table ───────────────────────────────────────────────────────
-# The measured sinogram shapes, each named for its view count:
-#     384-class  (384, 336, 288)     =    37,158,912 sinogram elements
-#     512-class  (512, 448, 384)     =    88,080,384 sinogram elements
-#     768-class  (768, 672, 576)     =   297,271,296 sinogram elements
-#    1024-class  (1024, 1008, 992)   = 1,023,934,464 sinogram elements
+# The measured shapes, each named for its view count.  For the projection
+# families these are sinogram shapes; for the denoiser the same tuples are
+# IMAGE shapes, because its sinogram shape is its image shape.
+#     384-class  (384, 336, 288)     =    37,158,912 elements
+#     512-class  (512, 448, 384)     =    88,080,384 elements
+#     768-class  (768, 672, 576)     =   297,271,296 elements
+#    1024-class  (1024, 1008, 992)   = 1,023,934,464 elements
 FLOORS = {
     ('parallel', 2): Floor(
         family='parallel', count=2, elements=88_080_384, cell=(512, 448, 384),
         against=1,
-        bracket=Bracket(losing_cell=(384, 336, 288), losing_speedup=0.75,
+        bracket=Bracket(losing_cell=(384, 336, 288), losing_speedup=0.74,
                         winning_cell=(512, 448, 384), winning_speedup=1.26),
-        spread=0.005912, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
-        measured='2026-08-13', commit='8381a0b',
+        spread=0.01794, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-16', commit='dba9652',
         largest_tested=297_271_296,
-        note='unchanged by the 2026-08-13 refresh, which re-measured '
-             'every row after the copy-stream and transient-memory '
-             'commits moved the projection-cost code.  The margins are '
-             'slightly wider than on 2026-08-11 (0.75x losing, 1.26x '
-             'winning) and the spread is far tighter, at 0.6 percent '
-             'against 5.2'),
+        note='refreshed on the merged, unpadded-split tree (mg16, job '
+             '15304592) and unchanged: 0.74x losing and 1.26x winning, '
+             'the same bracket as 2026-08-13 to within the run spread'),
     ('parallel', 4): Floor(
         family='parallel', count=4, elements=297_271_296,
         cell=(768, 672, 576), against=2,
-        bracket=Bracket(losing_cell=(512, 448, 384), losing_speedup=0.69,
-                        winning_cell=(768, 672, 576), winning_speedup=1.03),
-        spread=0.004687, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
-        measured='2026-08-13', commit='8381a0b',
+        bracket=Bracket(losing_cell=(512, 448, 384), losing_speedup=0.68,
+                        winning_cell=(768, 672, 576), winning_speedup=1.02),
+        spread=0.0111, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-16', commit='dba9652',
         largest_tested=1_023_934_464,
-        note='the floor held at the 768-class shape it moved down to on '
-             '2026-08-11, and this refresh supplied the losing shape that '
-             'entry lacked: the 512-class loses at 0.69x.  The admission '
-             'is the tightest in the table, at 1.03x against a 0.5 '
-             'percent spread, so this row is the one to watch on the next '
+        note='the tightest admission in the table again: 1.02x at the '
+             '768-class against a 1.1 percent spread, with the 512-class '
+             'losing at 0.68x.  Still the row to watch on the next '
              'refresh'),
     ('cone', 2): Floor(
         family='cone', count=2, elements=88_080_384, cell=(512, 448, 384),
         against=1,
-        bracket=Bracket(losing_cell=(384, 336, 288), losing_speedup=0.77,
-                        winning_cell=(512, 448, 384), winning_speedup=1.30),
-        spread=0.1141, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
-        measured='2026-08-13', commit='8381a0b',
+        bracket=Bracket(losing_cell=(384, 336, 288), losing_speedup=0.80,
+                        winning_cell=(512, 448, 384), winning_speedup=1.29),
+        spread=0.05138, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-16', commit='dba9652',
         largest_tested=297_271_296,
-        note='unchanged, and the margin keeps widening: 1.02x on '
-             '2026-08-10, 1.21x on 2026-08-11, 1.30x here.  The 11.4 '
-             'percent spread is the largest in the table and comes from '
-             'the 384-class losing cell, which is small enough that '
-             'per-subset host costs dominate; the winning cell itself '
-             'ran at 1.0 percent'),
+        note='unchanged by the mg16 refresh: the same floor with nearly '
+             'the same bracket as 2026-08-13 (0.80x losing, 1.29x '
+             'winning), so neither the prerelease merge nor the pad '
+             'removal moved this crossover'),
     ('cone', 4): Floor(
         family='cone', count=4, elements=1_023_934_464,
         cell=(1024, 1008, 992), against=2,
-        bracket=Bracket(losing_cell=(768, 672, 576), losing_speedup=0.95,
-                        winning_cell=(1024, 1008, 992), winning_speedup=1.72),
-        spread=0.006576, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
-        measured='2026-08-13', commit='8381a0b',
+        bracket=Bracket(losing_cell=(768, 672, 576), losing_speedup=0.96,
+                        winning_cell=(1024, 1008, 992), winning_speedup=1.71),
+        spread=0.04207, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-16', commit='dba9652',
         largest_tested=1_023_934_464,
-        note='unchanged, and the margin grew from 1.45x to 1.72x while '
-             'the 768-class shape stayed just under admission at 0.95x.  '
-             'This floor sits at the top of the ladder, so a refresh can '
-             'confirm it but cannot lower it without a larger cell'),
+        note='unchanged at the top of the ladder, margin 1.71x, with the '
+             '768-class still just under admission at 0.96x.  A refresh '
+             'can confirm this floor but cannot lower it without a '
+             'larger cell'),
+    ('denoiser', 2): Floor(
+        family='denoiser', count=2, elements=None, cell=None,
+        against=1,
+        bracket=Bracket(losing_cell=(1024, 1008, 992), losing_speedup=0.65,
+                        winning_cell=None, winning_speedup=None),
+        spread=0.02309, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-16', commit='dba9652',
+        largest_tested=1_023_934_464,
+        note='first measurement of the family, and a sentinel: sharded '
+             'denoising LOST at every probe cell, 0.58x at the 512-class '
+             'rising to 0.65x at the 1024-class.  A denoise sweep is '
+             'seconds long and its per-subset host syncs dominate, so a '
+             'split has nothing to amortize at these sizes.  Read in '
+             'IMAGE VOXELS: the denoiser sinogram shape is its image '
+             'shape.  The timed call is denoise with sigma_noise '
+             'supplied, not recon, at the shared warm-median protocol.  '
+             'The ratio rises with size, so a larger ladder may yet find '
+             'admission; capacity still widens a denoise that cannot fit '
+             'one device'),
+    ('denoiser', 4): Floor(
+        family='denoiser', count=4, elements=None, cell=None,
+        against=1,
+        bracket=Bracket(losing_cell=(1024, 1008, 992), losing_speedup=0.59,
+                        winning_cell=None, winning_speedup=None),
+        spread=0.02309, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-16', commit='dba9652',
+        largest_tested=1_023_934_464,
+        note='a sentinel like n=2, losing 0.44x to 0.59x across the '
+             'probes, measured against n=1 because no smaller denoiser '
+             'count is admitted.  Read in image voxels; the n=2 note '
+             'records the mechanism'),
 }
 
 # ── the projection-cost inputs the floors were measured against ──────────────
@@ -207,11 +235,11 @@ BLESSED_COST_HASHES = {
     'TomographyModel._sparse_forward_project_sharded':
         '9b75c174555688a3fedba931a22de7dcf6236827fde3b5dc8ca27820728cd8fc',
     '_sharding.py':
-        '734baed72bcdeb8eace2f2bb89abd71bc32847fee0b87d78bbc2724ff121b4b7',
+        '3afe5c538dade99efd39fbeeaf32fd688a9fb9672a095014ec7789f9e5af9077',
     'projectors.py':
-        '82565070c0b10de0daf1835abcb84df796a265046402ed67f26305945ef2818e',
+        '2c2c44fe308df095aa962febc42101673394c997f0f488da95adea1c20300c6b',
     'triton_cone.py':
-        '8d3820c2101f8d3fbb7823f2d9b6e6e6253164bd14a2c276d167d9ba0a135154',
+        '36e72e6f0f6f3ca768c52d7b92715f75e7ad005372f2cdad50fc0bf60e003411',
     'triton_parallel.py':
         '78fc531463124e634950c97bb3ebb40fd69bc9cce1e42073a4b7345ba50ca9f1',
 }
@@ -230,7 +258,7 @@ STALE_SINCE = None
 #: green the test leaves this behind, and the test says so.  Recomputed and
 #: printed by ``refresh_widening_floors.py --bless``.
 TABLE_CHECKSUM = \
-    '308d430f3f0ed714d7e7be7786dda4f7fe6904feb5b93c94b2f5539c89053970'
+    '091bd6255de989c35ec429e81bb4a881e20d90c216103d9592ca4863c38bea0d'
 
 
 # ── the env knob ─────────────────────────────────────────────────────────────

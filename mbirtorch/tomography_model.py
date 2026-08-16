@@ -1112,9 +1112,10 @@ class TomographyModel(ParameterHandler):
         return the ledger for the layout settled on.
 
         ``workload`` names the call in progress: ``'recon'`` (the default) for
-        a full reconstruction, ``'direct'`` for a direct reconstruction.  It
-        tells the ledger what is about to be allocated; it is not a way for a
-        caller to overrule the policy.
+        a full reconstruction, ``'direct'`` for a direct reconstruction, and
+        ``'denoise'`` for one QGGMRFDenoiser sweep.  It tells the ledger what
+        is about to be allocated; it is not a way for a caller to overrule the
+        policy.
 
         This is the one site where the automatic device count is chosen.
         The choice happens at recon time, not construction, because the
@@ -1129,12 +1130,21 @@ class TomographyModel(ParameterHandler):
         themselves at their own sinogram size.
         """
         calibrating = _memory_ledger.calibration_enabled()
+        # The workload a candidate layout is SIZED for is the largest one this
+        # model may ever run, not the call in progress: the count chosen here
+        # is kept for the model's whole life.  For every projection model that
+        # is a full reconstruction.  A QGGMRFDenoiser can never run one -- its
+        # recon raises NotImplementedError -- so the denoise sweep itself is
+        # its largest workload, and pricing a recon plan on it would raise as
+        # well, since it has no projection bodies to price.
+        sizing = 'denoise' if workload == 'denoise' else 'recon'
         if not self.device_layout_is_automatic:
             # An explicit layout is the caller's; the ledger runs only when
             # the calibration mode asks for it.
-            ledger = self._build_memory_ledger(**call_arrays) if calibrating \
-                else None
-            return self._arm_calibration(ledger)
+            ledger = self._build_memory_ledger(workload=sizing,
+                                               **call_arrays) \
+                if calibrating else None
+            return self._arm_calibration(ledger, sizing)
 
         if self._settled_shapes is not None:
             if self._settled_shapes == self._shape_pair():
@@ -1144,11 +1154,14 @@ class TomographyModel(ParameterHandler):
                     # settled check already covers this call: reuse the layout
                     # without a search, as the pinned branch above reuses an
                     # explicit one.  The ledger runs only for the calibration
-                    # mode, and it prices a full reconstruction because that
-                    # is the scope the measured peak covers.
-                    ledger = self._build_memory_ledger(**call_arrays) \
+                    # mode, and it prices the sizing workload -- a full
+                    # reconstruction for a projection model, the denoise sweep
+                    # for a denoiser -- because that is the scope the measured
+                    # peak covers.
+                    ledger = self._build_memory_ledger(workload=sizing,
+                                                       **call_arrays) \
                         if calibrating else None
-                    return self._arm_calibration(ledger)
+                    return self._arm_calibration(ledger, sizing)
                 # This call allocates more than the settled check priced, so
                 # the check runs again -- on the settled layout, which does
                 # not move.
@@ -1157,7 +1170,7 @@ class TomographyModel(ParameterHandler):
                 # is known to hold, and a later call of the same kind repeats
                 # no check: the preflight stays a once-per-model cost.
                 self._settled_workload = workload
-                return self._arm_calibration(ledger)
+                return self._arm_calibration(ledger, sizing)
             # The shapes changed, so the settled decision's inputs are gone:
             # drop the record and re-decide below.
             self._settled_shapes = None
@@ -1168,7 +1181,7 @@ class TomographyModel(ParameterHandler):
         if visible < 2:
             # No layout to choose; the allocator's own error covers a
             # single-device overflow, and the n=1 path stays free of new cost.
-            return self._arm_calibration(None)
+            return self._arm_calibration(None, sizing)
 
         if pinned is not None:
             # A process-wide pin is as explicit as a configure_devices call.
@@ -1196,27 +1209,33 @@ class TomographyModel(ParameterHandler):
             if not self._layout_is_valid(devices):
                 rejected.append((count, 'a device would own no real data'))
                 continue
-            # Priced as a full recon whatever this call is: the count chosen
-            # here has to suit the largest workload the model may later run.
-            ledger = self._build_memory_ledger(devices=devices, **call_arrays)
+            # Priced at the sizing workload whatever this call is: the count
+            # chosen here has to suit the largest workload the model may later
+            # run, which is a full recon for a projection model and the
+            # denoise sweep for a denoiser.
+            ledger = self._build_memory_ledger(devices=devices,
+                                               workload=sizing, **call_arrays)
             if ledger is None or self.skip_memory_preflight:
                 # Nothing to check against, or the caller has forced the run.
-                return self._settle(devices, ledger, rejected)
+                return self._settle(devices, ledger, rejected, sizing)
             fits, rows = self._layout_capacity(devices, ledger, call_arrays)
             if fits:
-                return self._settle(devices, ledger, rejected)
+                return self._settle(devices, ledger, rejected, sizing)
             shortfall = max((d - b) for _dev, d, b in rows if b is not None)
             rejected.append((count, f'{shortfall / 2 ** 30:.2f} GB short'))
             if best is None or shortfall < best[0]:
                 best = (shortfall, ledger, rows, count)
 
-        if workload != 'recon' and best is not None:
-            # No count fits a full recon, and this call is not running one.
-            # The check that can refuse is made against the work in progress,
-            # in the same candidate order, so the count is still the one the
-            # floors and capacity prefer.  Only what it is checked against
-            # changes.  The shortfall reported below then describes the check
-            # that actually refused, so the search starts its record over.
+        if workload != sizing and best is not None:
+            # No count fits the sizing workload, and this call is not running
+            # one.  The check that can refuse is made against the work in
+            # progress, in the same candidate order, so the count is still the
+            # one the floors and capacity prefer.  Only what it is checked
+            # against changes.  The shortfall reported below then describes the
+            # check that actually refused, so the search starts its record
+            # over.  When the call in progress IS the sizing plan -- a denoise
+            # -- the first pass already checked the work in progress, so there
+            # is nothing narrower to retry and a refusal is final.
             best = None
             for count in candidates:
                 devices = (self._candidate_devices(count) if count > 1
@@ -1400,12 +1419,16 @@ class TomographyModel(ParameterHandler):
         # later call that allocates more re-runs that check.
         self._settled_shapes = self._shape_pair()
         self._settled_workload = workload
-        return self._arm_calibration(ledger)
+        return self._arm_calibration(ledger, workload)
 
-    def _arm_calibration(self, ledger):
+    def _arm_calibration(self, ledger, workload='recon'):
         """Record the ledger for a harness to read; under the calibration
         mode, build one when the caller had none, so a policy return always
         carries a ledger to compare against.
+
+        ``workload`` is the plan to build that missing ledger with: a
+        denoiser has no projection bodies, so a recon plan on one would raise
+        rather than price anything.
 
         The peak-counter reset the calibration mode compares against lives in
         :meth:`vcd_recon`, beside the report that reads the counters.  A
@@ -1416,7 +1439,7 @@ class TomographyModel(ParameterHandler):
         if ledger is not None:
             self.last_memory_ledger = ledger
         if _memory_ledger.calibration_enabled() and ledger is None:
-            ledger = self._build_memory_ledger()
+            ledger = self._build_memory_ledger(workload=workload)
             self.last_memory_ledger = ledger
         return ledger
 

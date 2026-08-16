@@ -1529,6 +1529,10 @@ def test_a_torch_body_pays_for_both_forward_blocks():
 # per-device measured peak bytes).  Measured 2026-08-10 on four H100s (job
 # mg8) -- the two geometries with no hand-written kernels, at one, two and
 # four devices, weighted, from a supplied sinogram with no initial volume.
+# The ma512_n4 row was re-measured 2026-08-16 under mg8's protocol (slurm
+# 15304566, h016), because it is the one arm whose split changed when the
+# sharding pad was removed: 510 recon slices over four devices were padded to
+# four blocks of 128 and are now cut 128, 128, 127, 127.
 MEASURED_ARMS = {
     'ma1024_n1': ((1024, 1008, 992), (992, 992, 1148), 771240,
                   [37310451712]),
@@ -1541,7 +1545,7 @@ MEASURED_ARMS = {
     'ma512_n2': ((512, 448, 384), (384, 384, 510), 115164,
                  [9492893184, 9452805632]),
     'ma512_n4': ((512, 448, 384), (384, 384, 510), 115164,
-                 [3768753664, 3757754368, 3757754368, 3757981696]),
+                 [3768088064, 3754872832, 3756371968, 3755782144]),
     'tct2k_n1': ((256, 1900, 3000), (118, 360, 240), 42480,
                  [29262431744]),
     'tct2k_n2': ((256, 1900, 3000), (118, 360, 240), 42480,

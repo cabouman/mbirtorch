@@ -1522,3 +1522,153 @@ def test_a_standalone_direct_recon_does_not_open_a_calibration_scope(
     np.random.seed(0)
     model.recon(sinogram, max_iterations=2)
     assert len(resets) == 1
+
+
+# ── the denoiser under the policy ────────────────────────────────────────────
+# denoise settles its layout through the same policy a reconstruction uses.
+# What differs is the plan the candidates are priced with: a denoiser has no
+# projectors and can never run a recon, so its own sweep is the largest
+# workload it will ever hold, and pricing a recon plan on it raises instead.
+#
+# These tests RUN the sweep, so their candidate devices are plain cpu devices
+# rather than the indexed fakes ``as_automatic`` builds: an indexed cpu device
+# settles fine but cannot hold a tensor.
+DENOISE_CELL = (8, 10, 13)   # 13 slices over 3 devices split 5/4/4
+
+
+def automatic_denoiser(monkeypatch, image_shape=DENOISE_CELL, num_devices=3,
+                       budget=64 * GB):
+    """A denoiser the caller has never placed, with ``num_devices`` fabricated
+    devices visible and room on every one of them.
+
+    The CPU layout is installed the way the automatic path installs one, so
+    the fabricated visibility cannot pull a real allocation onto a device this
+    host lacks while the layout stays the library's to choose.
+    """
+    denoiser = mbirtorch.QGGMRFDenoiser(image_shape)
+    denoiser.set_params(no_warning=True, verbose=0)
+    denoiser._install_device_layout(['cpu'])
+    assert denoiser.device_layout_is_automatic is True
+    denoiser._candidate_devices = lambda n: [torch.device('cpu')] * n
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
+    monkeypatch.setattr(torch.cuda, 'device_count', lambda: num_devices)
+    monkeypatch.setattr(_memory_ledger, 'device_budget_bytes',
+                        lambda d: budget)
+    return denoiser
+
+
+def noisy_image(shape=DENOISE_CELL, seed=4):
+    """A seeded noisy block, so a sharded run and a single-device run see the
+    same problem."""
+    clean = np.zeros(shape, dtype=np.float32)
+    clean[1:-1, 2:-2, 2:-2] = 1.0
+    noise = np.random.RandomState(seed).randn(*shape).astype(np.float32)
+    return clean + 0.1 * noise
+
+
+def run_denoise(denoiser, image, sigma_noise=0.1, max_iterations=2):
+    np.random.seed(0)
+    denoised, _ = denoiser.denoise(image, sigma_noise=sigma_noise,
+                                   max_iterations=max_iterations,
+                                   stop_threshold_change_pct=0.0,
+                                   logfile_path=None, print_logs=False)
+    return denoised
+
+
+def test_denoise_settles_an_automatic_layout_and_matches_single_device(
+        monkeypatch, unpinned, no_speed_guard):
+    """A denoiser the caller has not placed spreads over the devices that fit,
+    exactly as a reconstruction does, and the sharded sweep returns what one
+    device returns (gated at the level test_denoiser.py uses for the same
+    comparison)."""
+    denoiser = automatic_denoiser(monkeypatch)
+    image = noisy_image()
+    out = run_denoise(denoiser, image)
+    assert denoiser.recon_placement.n_devices == 3
+    assert denoiser.device_layout_is_automatic is True
+
+    single = mbirtorch.QGGMRFDenoiser(DENOISE_CELL)
+    single.configure_devices(devices=['cpu'])
+    single.set_params(no_warning=True, verbose=0)
+    ref = run_denoise(single, image)
+    rel = float(np.max(np.abs(out - ref)) / np.max(np.abs(ref)))
+    assert rel <= 1e-4
+
+
+def test_denoise_prices_the_denoiser_plan_not_a_recon(monkeypatch, unpinned,
+                                                      no_speed_guard):
+    """The plan the search priced is the denoiser's own.  A recon plan on a
+    model with no projection bodies raises before it prices anything, so a
+    call that completes at all is the claim; the settled record and the phase
+    names name the plan it completed with."""
+    denoiser = automatic_denoiser(monkeypatch)
+    run_denoise(denoiser, noisy_image())
+    assert denoiser._settled_workload == 'denoise'
+    assert denoiser._settled_shapes == (DENOISE_CELL, DENOISE_CELL)
+    assert denoiser.last_memory_ledger is not None
+    assert all(phase.name.startswith('denoise')
+               for phase in denoiser.last_memory_ledger.phases)
+
+
+def test_a_sigma_change_does_not_unsettle_the_denoiser(monkeypatch, unpinned,
+                                                       no_speed_guard):
+    """sigma_noise is recompile-flagged and set on every denoise call, and it
+    leaves the shapes the settled decision came from alone.  The budgets below
+    fit nothing at any count, so a second search would refuse the run rather
+    than complete it on three devices."""
+    denoiser = automatic_denoiser(monkeypatch)
+    image = noisy_image()
+    run_denoise(denoiser, image)
+    monkeypatch.setattr(_memory_ledger, 'device_budget_bytes', lambda d: 1024)
+    run_denoise(denoiser, image, sigma_noise=0.2)
+    assert denoiser.recon_placement.n_devices == 3
+
+
+def test_configure_devices_still_wins_after_a_denoise_settle(
+        monkeypatch, unpinned, no_speed_guard):
+    """An explicit layout overrides a settled automatic one on a denoiser as
+    it does on a reconstruction: three devices were free and the call runs on
+    the one the caller named."""
+    denoiser = automatic_denoiser(monkeypatch)
+    image = noisy_image()
+    run_denoise(denoiser, image)
+    assert denoiser.recon_placement.n_devices == 3
+    denoiser.configure_devices(devices=['cpu'])
+    run_denoise(denoiser, image)
+    assert denoiser.recon_placement.n_devices == 1
+    assert denoiser.device_layout_is_automatic is False
+
+
+def test_calibration_mode_prices_a_denoiser_with_its_own_plan(monkeypatch):
+    """The calibration mode builds a ledger where the policy would otherwise
+    build none, and on an explicitly placed denoiser that build has to be the
+    denoise plan: a recon plan raises for want of a projection body."""
+    monkeypatch.setenv('MBIRTORCH_MEMORY_CALIBRATION', '1')
+    shape = (6, 8, 10)
+    denoiser = mbirtorch.QGGMRFDenoiser(shape)
+    denoiser.configure_devices(devices=['cpu', 'cpu'])
+    denoiser.set_params(no_warning=True, verbose=0)
+    run_denoise(denoiser, noisy_image(shape), max_iterations=1)
+    assert denoiser.last_memory_ledger is not None
+    assert all(phase.name.startswith('denoise')
+               for phase in denoiser.last_memory_ledger.phases)
+
+
+def test_the_denoiser_sentinel_floors_hold_an_automatic_denoiser_at_one_device(
+        monkeypatch, unpinned):
+    """The denoiser's measured rows are both sentinels: sharded denoising
+    lost at every size probed up to a billion image voxels, so however free
+    the devices are, the automatic path keeps a denoiser on one device and
+    the run log says why.  Capacity is the one thing that overrides a
+    sentinel, and that rule's own tests drive it with a synthetic table."""
+    refused, why = _widening_floors.admitted('denoiser', 2, 88_080_384)[0], \
+        _widening_floors.admitted('denoiser', 2, 88_080_384)[1]
+    assert refused is False and 'sentinel' in why
+
+    denoiser = mbirtorch.QGGMRFDenoiser(CELL_512)
+    denoiser.set_params(no_warning=True, verbose=0)
+    with_four_visible(monkeypatch, denoiser)
+    denoiser._apply_device_policy(workload='denoise')
+    assert denoiser.recon_placement.n_devices == 1
+    reasons = dict(denoiser.device_choice_rejections)
+    assert 'sentinel' in reasons[4] and 'sentinel' in reasons[2]

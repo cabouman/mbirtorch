@@ -339,8 +339,8 @@ class ConeBeamModel(TomographyModel):
     _dc_damping = _DC_DAMPING_DEFAULT
 
     # The measured set of widening speed floors that governs this geometry's
-    # automatic device count (see _widening_floors).  Cone's floors sit
-    # higher than parallel's: its n=2 has no measured admission point at all.
+    # automatic device count (see _widening_floors).  Cone's floors sit at or
+    # above parallel's: its n=4 admits only at the top of the measured ladder.
     _floor_family = 'cone'
 
     # Cone is the geometry the multi-device forward's column gather was

@@ -7,7 +7,10 @@ MBIRTorch can spread a single reconstruction across multiple GPUs (or, on a mach
 GPU, across CPU devices).  This **increases the available memory**, so you can reconstruct
 larger volumes than fit on one GPU, and on large problems it **reduces reconstruction
 time**.  It works for all of the library's geometries: parallel-beam,
-cone-beam, translation, and multi-axis parallel.
+cone-beam, translation, and multi-axis parallel.  :class:`~mbirtorch.QGGMRFDenoiser`
+follows the same rules through :meth:`~mbirtorch.QGGMRFDenoiser.denoise`, with one
+practical difference recorded below: its measured speed floors admit no multi-device
+count, so an automatic denoise spreads only when it cannot fit on one device.
 
 The default: spread across the visible GPUs
 -------------------------------------------
@@ -30,7 +33,9 @@ So each device count carries a measured **speed floor** -- a problem size, in si
 elements, below which the automatic path does not prefer that count.  The floors are
 per-geometry, because parallel-beam and cone-beam reach the crossover at different
 sizes.  A geometry without measured floors of its own, such as translation or
-multi-axis parallel, uses the parallel-beam floors and says so in the log.
+multi-axis parallel, uses the parallel-beam floors and says so in the log.  The
+denoiser's per-pixel work is very small, so an automatic denoise stays on one
+device until it no longer fits there; ``configure_devices`` can be used to shard it explicitly.
 
 **Capacity always wins.**  A count below its floor is only set aside, never discarded.
 Before the first large allocation, MBIRTorch estimates the memory each candidate layout
