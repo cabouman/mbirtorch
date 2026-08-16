@@ -163,10 +163,11 @@ def BH_correction(sino, alpha, batch_size=64, devices=None):
             Coefficients for the polynomial correction. The k-th term corresponds to sino^(k+1).
         batch_size (int, optional, default=64):
             Number of views to process in a single batch.
-        devices (sequence, optional):
+        devices (sequence or None, optional):
             Devices to spread the view batches over.  The views are split into contiguous blocks,
-            one per device, and the blocks are processed at the same time.  None (the default) runs
-            everything on a single device.
+            one per device, and the blocks are processed at the same time.  None (the default) uses
+            all visible CUDA devices, capped by ``MBIRTORCH_NUM_DEVICES`` when that is set, or the
+            default device when there are none.
 
     Returns:
         corrected_sino: ndarray of shape (views, rows, cols)
@@ -187,7 +188,8 @@ def BH_correction(sino, alpha, batch_size=64, devices=None):
             corrected = corrected + float(alpha[k]) * torch.pow(sino_batch, k + 1)
         return corrected
 
-    return pipeline.map_view_batches(sino, kernel, batch_size, devices=devices)
+    return pipeline.map_view_batches(sino, kernel, batch_size,
+                                     devices=pipeline.permitted_devices(devices))
 
 
 def _generate_metal_exponent_list(num_metal, max_order):

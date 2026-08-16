@@ -5,9 +5,10 @@ math only).  This module owns the **single** copy of the batching + host<->devic
 in-place-fill scaffolding used by ``compute_sino_transmission`` / ``downsample_view_data`` /
 ``correct_det_rotation`` and the fused ``scan_to_sino``.
 
-The driver supports two modes: a single-device sequential view-batch loop (the default, used by the
-legacy per-stage public functions), and a multi-device view-sharded mode (used by the fused
-``scan_to_sino``) where contiguous view shards run concurrently, one per device.  In both modes the
+The driver supports two modes: a single-device sequential view-batch loop, and a multi-device
+view-sharded mode where contiguous view shards run concurrently, one per device.  The mode follows
+the device list the caller passes in.  A public preprocessing function gets that list from
+``permitted_devices`` below, which by default names every visible CUDA device.  In both modes the
 host output is pre-allocated once and each batch's result is written directly into its view-slice,
 so the host footprint is the input + the single output (~2x) rather than input + per-batch gather +
 concatenate destination (~3x).
@@ -15,8 +16,41 @@ concatenate destination (~3x).
 import numpy as np
 import torch
 
+from .. import _memory_ledger
 from .. import _sharding
 from ..tomography_model import _resolve_device
+
+
+def permitted_devices(devices=None):
+    """The devices a preprocessing function spreads its views over.
+
+    The default is every visible CUDA device, capped by ``MBIRTORCH_NUM_DEVICES`` when that variable
+    is set.  A machine with no visible CUDA device gets its default device instead, so the returned
+    list always names at least one device.  The size of the data does not affect the choice.  One
+    view batch is bounded work at any problem size, so no memory estimate is needed here.
+
+    The environment variable is process-wide.  It is how a test suite or a nightly run fixes the
+    device count, so that results and memory use do not depend on the host.  Preprocessing chooses
+    its own default count, but a variable the caller set is still the caller's, so it caps that
+    default here.
+
+    Args:
+        devices (sequence or None): an explicit list of devices, or None for the default described
+            above.  An explicit list is returned unchanged, and the environment variable does not
+            cap it.
+
+    Returns:
+        list: the devices to pass to :func:`map_view_batches`.
+    """
+    if devices is not None:
+        return list(devices)
+    num_visible = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    pinned = _memory_ledger.pinned_device_count()
+    if pinned is not None:
+        num_visible = min(num_visible, pinned)
+    if num_visible == 0:
+        return [_resolve_device('auto')]
+    return [f'cuda:{i}' for i in range(num_visible)]
 
 
 def _stage_batch(batch, device):

@@ -8,7 +8,6 @@ import torch.nn.functional as F
 import h5py
 import mbirtorch as mt
 from mbirtorch import _sharding
-from mbirtorch import _memory_ledger
 import scipy
 
 from . import pipeline
@@ -35,7 +34,8 @@ def _transmission_kernel(obj_batch, blank_minus_dark, dark_scan_mean, flat_indic
     return interpolate_defective_pixels(sino_batch, defective_pixel_array)
 
 
-def compute_sino_transmission(obj_scan, blank_scan, dark_scan, defective_pixel_array=(), batch_size=90):
+def compute_sino_transmission(obj_scan, blank_scan, dark_scan, defective_pixel_array=(), batch_size=90,
+                              devices=None):
     """
     Compute sinogram from object, blank, and dark scans.
 
@@ -62,6 +62,10 @@ def compute_sino_transmission(obj_scan, blank_scan, dark_scan, defective_pixel_a
             are then inferred from `NaN` or `inf` values alone. Do not pass `None`.
         batch_size (int):
             Number of views to process in each GPU batch.
+        devices (sequence or None):
+            devices to spread the views over.  None (default) uses all visible CUDA devices,
+            capped by ``MBIRTORCH_NUM_DEVICES`` when that is set, or the default device when
+            there are none.
 
     Returns:
         ndarray:
@@ -83,7 +87,7 @@ def compute_sino_transmission(obj_scan, blank_scan, dark_scan, defective_pixel_a
         obj_scan,
         lambda obj_batch: _transmission_kernel(obj_batch, blank_minus_dark, dark_scan_mean,
                                                flat_indices, defective_pixel_array),
-        batch_size)
+        batch_size, devices=pipeline.permitted_devices(devices))
     print("Sinogram computation complete.")
     return sino
 
@@ -225,7 +229,7 @@ def _rotation_kernel(sino_batch, det_rotation):
     return rotated * in_bounds
 
 
-def correct_det_rotation(sino, det_rotation=0.0, batch_size=30):
+def correct_det_rotation(sino, det_rotation=0.0, batch_size=30, devices=None):
     """
     Correct sinogram data to account for detector rotation, using batch processing and GPU acceleration.
 
@@ -233,12 +237,16 @@ def correct_det_rotation(sino, det_rotation=0.0, batch_size=30):
         sino (numpy.ndarray): Sinogram data with 3D shape (num_views, num_det_rows, num_det_channels).
         det_rotation (float, optional): tilt angle between the rotation axis and the detector columns in radians.
         batch_size (int): Number of views to process in each batch to avoid memory overload.
+        devices (sequence or None): devices to spread the views over.  None (default) uses all
+            visible CUDA devices, capped by ``MBIRTORCH_NUM_DEVICES`` when that is set, or the
+            default device when there are none.
 
     Returns:
         numpy.ndarray: The corrected sinogram, with the same shape as `sino`.
     """
 
-    return pipeline.map_view_batches(sino, lambda b: _rotation_kernel(b, det_rotation), batch_size)
+    return pipeline.map_view_batches(sino, lambda b: _rotation_kernel(b, det_rotation), batch_size,
+                                     devices=pipeline.permitted_devices(devices))
 
 
 def correct_background_offset(sino, edge_width=9, option='global'):
@@ -361,7 +369,8 @@ def _downsample_blank_dark(blank_scan, dark_scan, downsample_factor, defective_p
     return blank_scan, dark_scan, defective_pixel_array, flat_indices, new_size1, new_size2, block_shape
 
 
-def downsample_view_data(obj_scan, blank_scan, dark_scan, downsample_factor, defective_pixel_array=(), batch_size=90):
+def downsample_view_data(obj_scan, blank_scan, dark_scan, downsample_factor, defective_pixel_array=(), batch_size=90,
+                         devices=None):
     """
     Performs down-sampling of the scan images in the detector plane.
     This is done for the object, blank_scan, and dark_scan data,
@@ -374,6 +383,9 @@ def downsample_view_data(obj_scan, blank_scan, dark_scan, downsample_factor, def
         downsample_factor (tuple of int): Two integers defining the down-sample factor. Must be ≥ 1 in each dimension.
         defective_pixel_array (ndarray): Array of shape (num_defective_pixels, 2) indicating defective pixel coordinates.
         batch_size (int): Number of views to include in one batch. Controls memory usage.
+        devices (sequence or None): devices to spread the views over.  None (default) uses all
+            visible CUDA devices, capped by ``MBIRTORCH_NUM_DEVICES`` when that is set, or the
+            default device when there are none.
 
     Notes:
         This function supports both singleton blank/dark scans (shape (1, H, W)) and multi-view scans
@@ -396,7 +408,7 @@ def downsample_view_data(obj_scan, blank_scan, dark_scan, downsample_factor, def
     obj_scan = pipeline.map_view_batches(
         obj_scan,
         lambda b: _downsample_obj_kernel(b, obj_flat_indices, new_size1, new_size2, block_shape),
-        batch_size)
+        batch_size, devices=pipeline.permitted_devices(devices))
 
     return obj_scan, blank_scan, dark_scan, defective_pixel_array
 
@@ -423,19 +435,7 @@ def scan_to_sino(obj_scan, blank_scan, dark_scan, defective_pixel_array=(),
     Returns:
         numpy.ndarray: the sinogram, shape (num_views, num_det_rows, num_det_channels).
     """
-    if devices is None:
-        n = torch.cuda.device_count() if torch.cuda.is_available() else 0
-        # The environment pin is process-wide: it is how a suite or a nightly
-        # fixes the device count so results, memory, and float trajectories do
-        # not depend on the host.  Preprocessing chooses its own default count
-        # (all visible devices, the mbirjax rule), but a pin the caller set is
-        # still the caller's, so it caps that default here.  This is only the
-        # pin; the broader question of what rule preprocessing should follow is
-        # an open entry-point item, deliberately not answered here.
-        pinned = _memory_ledger.pinned_device_count()
-        if pinned is not None:
-            n = min(n, pinned)
-        devices = [f'cuda:{i}' for i in range(n)] if n > 0 else None
+    devices = pipeline.permitted_devices(devices)
     obj_flat_indices = new_size1 = new_size2 = block_shape = None
     do_downsample = downsample_factor[0] * downsample_factor[1] > 1
     if do_downsample:
@@ -1523,16 +1523,22 @@ def correct_zinger_pixels(sino, zinger_pixel_ratio=0.1, num_passes=3, batch_size
         zinger_pixel_ratio (float, optional): Ratio used for zinger detection. Defaults to 0.1.
         num_passes (int, optional): Fill passes = max correctable zinger-cluster radius. Defaults to 3.
         batch_size (int, optional): Views per on-device batch. Defaults to 90.
-        devices (sequence or None, optional): Accepted for interface compatibility; single device.
+        devices (sequence or None, optional): devices to spread the views over.  None (default)
+            uses all visible CUDA devices, capped by ``MBIRTORCH_NUM_DEVICES`` when that is set,
+            or the default device when there are none.
         max_views_to_use (int, optional): Views sampled for the threshold estimate. Defaults to 20.
 
     Returns:
         numpy.ndarray: Sinogram with zinger pixels corrected; any pixel still NaN after ``num_passes``
         is set to 0 (with a warning).
     """
+    # The threshold is computed once, on the whole sinogram, BEFORE the views are split across
+    # devices.  A per-shard threshold would be estimated from a different subsample on each device,
+    # so the result would depend on the device count.
     zinger_threshold = _zinger_threshold(sino, zinger_pixel_ratio, max_views_to_use)
     kernel = lambda b: _zinger_fill(b, zinger_threshold, num_passes)
-    return pipeline.map_view_batches(sino, kernel, batch_size, devices=devices)
+    return pipeline.map_view_batches(sino, kernel, batch_size,
+                                     devices=pipeline.permitted_devices(devices))
 
 
 def save_cone_preprocessing(file_path, sinogram, cone_beam_params, optional_params, weights=None):
