@@ -1267,6 +1267,229 @@ def test_the_generation_settles_with_the_capacity_check_skipped(
         model._apply_device_policy()
 
 
+# ── the full-array allocators ────────────────────────────────────────────────
+# Three helpers allocate a whole sinogram or a whole volume before any
+# reconstruction runs: compute_hessian_diagonal, prepare_sino_for_devices, and
+# gen_weights_mar on the branch that forward projects.  Each settles the layout
+# first, so its arrays land on the devices the later reconstructions use rather
+# than whole on the lead one.
+#
+# Settling is what first hands a placed array to the entries below it, so those
+# entries had to learn about the device form before the settle was added.
+# gen_weights, split_sino_recon, and recon_plastic_metal all refuse one: each
+# of the three would have to gather it before doing any work.
+def _placed_cone_case(cell=(12, 24, 16), num_devices=2):
+    """A cone model small enough to reconstruct in a test, placed on virtual
+    CPU devices, with a phantom sinogram on the host.
+
+    The devices are named explicitly, so no fabricated CUDA visibility is
+    involved.
+    """
+    angles = np.linspace(0, 2 * np.pi, cell[0], endpoint=False)
+    model = mbirtorch.ConeBeamModel(cell, angles,
+                                    source_detector_dist=4.0 * cell[2],
+                                    source_iso_dist=2.0 * cell[2])
+    model.configure_devices(devices=['cpu'] * num_devices)
+    model.set_params(no_warning=True, verbose=0)
+    phantom = mbirtorch.generate_3d_shepp_logan_low_dynamic_range(
+        tuple(model.get_params('recon_shape')))
+    sinogram = np.asarray(model.forward_project(phantom))
+    return model, sinogram
+
+
+def test_gen_weights_refuses_a_sinogram_that_is_already_placed():
+    """The silent wrong answer this replaces: a placed sinogram is neither
+    numpy nor a tensor, so the array module resolved to numpy and 'unweighted'
+    came back as a zero-dimensional object array.  The message names the order
+    that works instead."""
+    model, sinogram = _placed_cone_case()
+    prepared = model.prepare_sino_for_devices(sinogram)
+    with pytest.raises(ValueError) as excinfo:
+        mbirtorch.gen_weights(prepared, weight_type='unweighted')
+    message = str(excinfo.value)
+    assert 'placed on the devices' in message
+    assert 'host sinogram first' in message
+    assert 'prepare_sino_for_devices(sinogram, weights)' in message
+
+
+def test_the_supported_order_places_the_weights_with_the_sinogram():
+    """What the rejection points the caller at: weights from the host
+    sinogram, then one prepare call for the pair.  Placing copies, so the
+    placed weights gather back to the plain computation exactly."""
+    model, sinogram = _placed_cone_case()
+    weights = mbirtorch.gen_weights(sinogram, weight_type='transmission')
+    placed_sino, placed_weights = model.prepare_sino_for_devices(
+        sinogram, weights=weights)
+    assert placed_sino.placement.n_devices == 2
+    assert placed_weights.placement.n_devices == 2
+    assert np.array_equal(model._gather_sinogram(placed_weights), weights)
+    assert np.array_equal(model._gather_sinogram(placed_sino), sinogram)
+
+
+def test_split_sino_recon_refuses_a_placed_sinogram():
+    """Each half builds its own model and settles its own device layout, so
+    this method has no use for the parent's device form.  Gathering the input
+    would leave the caller's placed copy resident for the whole call, which is
+    the memory the split exists to save, so the input is refused instead.  A
+    host-array call is covered in test_split_sino.py."""
+    model, sinogram = _placed_cone_case()
+    weights = mbirtorch.gen_weights(sinogram, weight_type='transmission')
+    prepared, placed_weights = model.prepare_sino_for_devices(sinogram,
+                                                              weights=weights)
+    with pytest.raises(ValueError) as excinfo:
+        model.split_sino_recon(prepared, weights=weights, half_overlap=3)
+    message = str(excinfo.value)
+    assert 'placed on the devices' in message
+    assert 'settles its own device layout' in message
+    assert 'Pass the host sinogram and the host weights' in message
+    # The weights are checked with the sinogram, so a host sinogram carrying
+    # placed weights is refused too.
+    with pytest.raises(ValueError, match='placed on the devices'):
+        model.split_sino_recon(sinogram, weights=placed_weights, half_overlap=3)
+
+
+def test_recon_plastic_metal_refuses_a_placed_sinogram(monkeypatch):
+    """This driver applies its corrections on the host and hands a host
+    sinogram to every reconstruction pass, so it has no use for the device
+    form either.  The check goes in front of np.asarray, which would build an
+    OBJECT array from the device form rather than fail.  The tensor coercion
+    it replaces is unchanged, which the last block here checks."""
+    model, sinogram = _placed_cone_case()
+    weights = mbirtorch.gen_weights(sinogram, weight_type='transmission')
+    prepared, placed_weights = model.prepare_sino_for_devices(sinogram,
+                                                              weights=weights)
+    with pytest.raises(ValueError) as excinfo:
+        model.recon_plastic_metal(prepared, weights, num_metal=0)
+    message = str(excinfo.value)
+    assert 'placed on the devices' in message
+    assert 'hands a host sinogram to each reconstruction pass' in message
+    assert 'Pass the host sinogram and the host weights' in message
+    with pytest.raises(ValueError, match='placed on the devices'):
+        model.recon_plastic_metal(sinogram, placed_weights, num_metal=0)
+
+    # A plain tensor is still converted to host numpy at entry.  The
+    # reconstruction pass is stubbed out, so what it was handed is the whole
+    # assertion and no reconstruction runs.
+    seen = {}
+
+    def record_and_return_zeros(sino, weights=None, **kwargs):
+        seen['sino'], seen['weights'] = sino, weights
+        return np.zeros(tuple(model.get_params('recon_shape')),
+                        dtype=np.float32), {}
+
+    monkeypatch.setattr(model, 'split_sino_recon', record_and_return_zeros)
+    recon, _recon_dict = model.recon_plastic_metal(torch.as_tensor(sinogram),
+                                                   torch.as_tensor(weights),
+                                                   num_metal=0)
+    assert isinstance(seen['sino'], np.ndarray)
+    assert isinstance(seen['weights'], np.ndarray)
+    assert np.array_equal(seen['sino'], sinogram)
+    assert np.array_equal(seen['weights'], weights)
+    assert isinstance(recon, np.ndarray)
+
+
+def test_compute_hessian_diagonal_settles_before_it_allocates(
+        monkeypatch, unpinned, no_speed_guard):
+    """A full sinogram of weights and a full volume, both sized by the model.
+    On an unsettled model they landed whole on the lead device; after the
+    settle they are spread, and the values are the single-device ones."""
+    model = _automatic_on_cpu(lambda: _automatic_parallel((16, 8, 16)))
+    with_four_visible(monkeypatch, model)
+    spread = model.compute_hessian_diagonal(output_sharded=True)
+    assert model.sino_placement.n_devices == 4
+    assert len(spread.tensors) == 4
+    # Spread means allocated per device, not built whole and then divided: the
+    # slice axis is 8 long, so each of the four devices holds two slices.
+    assert [int(t.shape[-1]) for t in spread.tensors] == [2, 2, 2, 2]
+
+    reference = make_model((16, 8, 16)).compute_hessian_diagonal()
+    gathered = model._gather_recon(spread)
+    assert gathered.shape == reference.shape
+    rel_max = float(np.max(np.abs(gathered - reference))
+                    / max(float(np.max(np.abs(reference))), 1e-30))
+    print(f"hessian diagonal, 4 devices vs 1: rel_max = {rel_max:.2e}")
+    assert rel_max < 1e-5
+
+
+def test_prepare_sino_for_devices_settles_before_it_places(
+        monkeypatch, unpinned, no_speed_guard):
+    """The whole sinogram, placed once.  Settling first is what makes the
+    placement the final one, so a reconstruction on the same model reuses it
+    instead of re-placing."""
+    model = _automatic_on_cpu(lambda: _automatic_parallel((16, 8, 16)))
+    with_four_visible(monkeypatch, model)
+    sinogram = _impulse_sinogram(model)
+    prepared = model.prepare_sino_for_devices(sinogram)
+    assert model.sino_placement.n_devices == 4
+    # 16 views over four devices, four views each.
+    assert [int(t.shape[0]) for t in prepared.tensors] == [4, 4, 4, 4]
+    assert np.array_equal(model._gather_sinogram(prepared), sinogram)
+    # The placement the sinogram is on is the model's own, so a reconstruction
+    # takes the prepared array as it stands.
+    assert model._shard_sinogram(prepared) is prepared
+
+
+def test_a_pin_after_a_settle_invalidates_the_prepared_sinogram(
+        monkeypatch, unpinned, no_speed_guard):
+    """The configure_devices docstring's new sentence, checked on the helper
+    that returns the array most likely to be held across such a call.  The
+    placement identity check is what reports it."""
+    model = _automatic_on_cpu(lambda: _automatic_parallel((16, 8, 16)))
+    with_four_visible(monkeypatch, model)
+    prepared = model.prepare_sino_for_devices(_impulse_sinogram(model))
+    assert model.sino_placement.n_devices == 4
+    model.configure_devices(devices=['cpu'])
+    with pytest.raises(ValueError, match='different device configuration'):
+        model._shard_sinogram(prepared)
+
+
+def _mar_inputs(model, seed=0):
+    """A sinogram and an initial reconstruction for gen_weights_mar, both on
+    the host.  The values only have to span the metal threshold the tests
+    pass, so they are drawn rather than reconstructed."""
+    rng = np.random.default_rng(seed)
+    sinogram = rng.random(tuple(model.get_params('sinogram_shape'))).astype(np.float32)
+    init_recon = rng.random(tuple(model.get_params('recon_shape'))).astype(np.float32)
+    return sinogram, init_recon
+
+
+def test_gen_weights_mar_settles_on_the_branch_that_projects(
+        monkeypatch, unpinned, no_speed_guard):
+    """The init_recon branch forward projects a full metal mask, which is the
+    allocation the settle protects.  The weights match the single-device
+    ones."""
+    model = _automatic_on_cpu(lambda: _automatic_parallel((16, 8, 16)))
+    with_four_visible(monkeypatch, model)
+    sinogram, init_recon = _mar_inputs(model)
+    weights = mbirtorch.gen_weights_mar(model, sinogram, init_recon=init_recon,
+                                        metal_threshold=0.8)
+    assert model.sino_placement.n_devices == 4
+
+    reference = mbirtorch.gen_weights_mar(make_model((16, 8, 16)), sinogram,
+                                          init_recon=init_recon,
+                                          metal_threshold=0.8)
+    rel_max = float(np.max(np.abs(weights - reference))
+                    / max(float(np.max(np.abs(reference))), 1e-30))
+    print(f"gen_weights_mar, 4 devices vs 1: rel_max = {rel_max:.2e}")
+    assert rel_max < 1e-6
+
+
+def test_the_otsu_branch_of_gen_weights_mar_does_not_settle(
+        monkeypatch, unpinned, no_speed_guard):
+    """Without init_recon the function thresholds the sinogram on the host and
+    never projects, so there is no allocation to settle for.  The poisoned
+    budget is the proof: a settle here would consult one and raise."""
+    model = _automatic_on_cpu(lambda: _automatic_parallel((16, 8, 16)))
+    with_four_visible(monkeypatch, model)
+    sinogram, _init_recon = _mar_inputs(model)
+    poison_budgets(monkeypatch)
+    weights = mbirtorch.gen_weights_mar(model, sinogram)
+    assert model.sino_placement.n_devices == 1
+    assert model._settled_shapes is None
+    assert weights.shape == sinogram.shape
+    assert np.all(np.isfinite(weights))
+
+
 # ── the calibration scope ────────────────────────────────────────────────────
 def test_calibration_resets_once_per_reconstruction(monkeypatch):
     """The counters reset where the report that reads them lives, so the

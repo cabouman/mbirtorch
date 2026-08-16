@@ -362,10 +362,10 @@ class TomographyModel(ParameterHandler):
         implementation raise ``NotImplementedError``.
 
         Args:
-            sino (numpy or tensor): Full sinogram of shape
-                (num_views, num_rows, num_cols).
-            weights (numpy or tensor, optional): Sinogram weights with the
-                same shape as ``sino``.
+            sino (numpy or tensor): Full sinogram of shape (num_views, num_rows, num_cols).  A
+                sharded array is not accepted.
+            weights (numpy or tensor, optional): Optional sinogram weights with the same shape as
+                `sino`.  Not accepted in sharded form, like `sino`.
             half_overlap (int, optional): Number of overlapping detector rows
                 kept past the split in each half.  Defaults to 5.
             init_recon (optional): Same as in :meth:`recon`.
@@ -410,9 +410,10 @@ class TomographyModel(ParameterHandler):
 
         Args:
             sino (numpy or tensor):  Input sinogram data to be corrected.  A tensor is converted to
-                numpy at entry.
+                numpy at entry.  An array in sharded form is not accepted.
             weights (numpy or tensor): Transmission weights used in the reconstruction algorithm.  A
-                tensor is converted to numpy at entry.
+                tensor is converted to numpy at entry.  Not accepted in sharded form, like
+                `sino`.
             num_BH_iterations (int, optional): Number of correction-reconstruction iterations. Defaults to 3.
             num_constraint_update_iter (int, optional): Number of iterations for updating constraints.
                 At each iteration, the most violated constraints are activated and the quadratic program is re-solved via OSQP.
@@ -460,7 +461,18 @@ class TomographyModel(ParameterHandler):
         if num_metal < 0:
             raise ValueError("num_metal must be >= 0")
 
-        # Host input only (API specification): a tensor is converted at entry.
+        # Host input only (API specification).  A tensor is converted at entry,
+        # and an input already placed on the devices is refused.  This driver
+        # works on the host throughout, so a gather here would only leave the
+        # caller's placed copy on the devices for the whole call.  The check
+        # comes before np.asarray, which would build an object array from the
+        # device form rather than fail.
+        if (isinstance(sino, _sharding.Shards)
+                or isinstance(weights, _sharding.Shards)):
+            raise ValueError(
+                'recon_plastic_metal does not accept a sinogram or weights '
+                'in sharded form.  Pass the host (numpy or tensor) sinogram and the '
+                'host weights.')
         if isinstance(sino, torch.Tensor):
             sino = sino.detach().cpu().numpy()
         sino = np.asarray(sino)
@@ -1021,6 +1033,8 @@ class TomographyModel(ParameterHandler):
         The device layout is built from the current sinogram and recon
         shapes, so call this after any geometry change.
 
+        Call this function to set the device layout before any array is placed on the devices.
+
         Args:
             num_devices (int, optional): number of devices to use.  1 (the
                 default) uses the model's default device (cuda, mps, or
@@ -1463,11 +1477,15 @@ class TomographyModel(ParameterHandler):
         view.
 
         Calling this is OPTIONAL: every reconstruction method applies the
-        same placement automatically to a plain input.  Use it to pay the
-        host-to-device transfer once when running several reconstructions on
+        same placement automatically to a plain input.  Use this function to
+        transfer just once when running several reconstructions on
         the same large sinogram.  If the device configuration changes
         afterwards, the prepared array no longer matches, and the
         reconstruction methods raise an error; re-run this method to fix it.
+
+        This function can raise
+        :class:`~mbirtorch._memory_ledger.MemoryPreflightError` for a problem
+        too large for available devices.
 
         Args:
             sinogram (numpy or tensor): sinogram in the model's sinogram_shape.
@@ -1477,6 +1495,9 @@ class TomographyModel(ParameterHandler):
             The prepared sinogram, or a (sinogram, weights) tuple when weights
             were given.
         """
+        # Settle before the sinogram is placed.  Placing first would put the
+        # whole sinogram on the lead device and then need it moved again.
+        self._apply_device_policy()
         sino = self._shard_sinogram(sinogram)
         if weights is None:
             return sino
@@ -1773,7 +1794,16 @@ class TomographyModel(ParameterHandler):
 
         Returns:
             Diagonal of the Hessian matrix with the same shape as the recon.
+
+        Note:
+            This function runs the memory check, so it can raise
+            :class:`~mbirtorch._memory_ledger.MemoryPreflightError` for a
+            problem too large for available devices.
         """
+        # Settle before the full sinogram of weights and the full volume are
+        # built.  Both are sized by the model, so on an unsettled model they
+        # would land whole on the lead device.
+        self._apply_device_policy()
         sinogram_shape, recon_shape = self.get_params(['sinogram_shape', 'recon_shape'])
         if weights is None:
             # Unit weights built through the device-form seam, for either

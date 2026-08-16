@@ -826,8 +826,10 @@ class ConeBeamModel(TomographyModel):
         ``compute_prior_loss`` is accepted but unused.
 
         Args:
-            sino (numpy or tensor): Full sinogram of shape (num_views, num_rows, num_cols).
-            weights (numpy or tensor, optional): Optional sinogram weights with the same shape as `sino`.
+            sino (numpy or tensor): Full sinogram of shape (num_views, num_rows, num_cols).  A
+                sharded array is not accepted.
+            weights (numpy or tensor, optional): Optional sinogram weights with the same shape as
+                `sino`.  Not accepted in sharded form, like `sino`.
             half_overlap (int): Number of overlapping detector rows past the iso row per half (when
                 recon slices are coarser than the iso-mapped rows, the row overlap is scaled up so
                 it still spans ``half_overlap`` slices).  The reconstruction overlap is derived
@@ -856,7 +858,8 @@ class ConeBeamModel(TomographyModel):
 
         Raises:
             ValueError: If inputs are missing or shapes are inconsistent, if half_overlap < 2,
-                or if the geometry has nonzero helical z-shifts.
+                if the geometry has nonzero helical z-shifts, or if `sino` or `weights` is in
+                the sharded form.
             AssertionError: If array dimensions are invalid.
 
         Example:
@@ -869,6 +872,7 @@ class ConeBeamModel(TomographyModel):
             ...                                 source_iso_dist=500.0)
             >>> recon, recon_info = model.split_sino_recon(sino, half_overlap=4)
         """
+        from . import _sharding
         from .utilities import copy_ct_model, stitch_arrays, merge_log_files
 
         # -------- Basic validation --------
@@ -879,6 +883,17 @@ class ConeBeamModel(TomographyModel):
             raise ValueError('helical_z_shifts must be zero.')
         if sino is None:
             raise ValueError("sino must be provided.")
+        # An input already placed on the devices is refused.  Each half settles
+        # a device layout of its own, so this method works from the host array.
+        # Gathering here would leave the caller's placed copy on the devices
+        # for the whole call, which is the memory the split is meant to save.
+        if (isinstance(sino, _sharding.Shards)
+                or isinstance(weights, _sharding.Shards)):
+            raise ValueError(
+                'split_sino_recon does not accept a sinogram or weights that '
+                'have been placed on the devices.  Each half builds its own '
+                'model and uses its own device layout, so this method '
+                'works from the host (numpy or tensor) arrays throughout.')
         if not (hasattr(sino, "ndim") and sino.ndim == 3):
             raise AssertionError("sino must be a 3D array shaped (num_views, num_rows, num_cols).")
         if weights is not None and getattr(weights, "shape", None) != sino.shape:

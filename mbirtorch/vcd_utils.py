@@ -12,6 +12,8 @@ import warnings
 import numpy as np
 import torch
 
+from . import _sharding
+
 
 def get_2d_ror_mask(recon_shape, *, use_ror_mask=True, crop_radius_pixels=0,
                     crop_radius_fraction=0.0):
@@ -208,11 +210,15 @@ def gen_weights(sinogram, weight_type):
     each sinogram entry.  They can be used to improve reconstruction quality.
 
     The weights are computed where the input is: a numpy sinogram yields numpy
-    weights, and a torch tensor yields a tensor on the same device.
+    weights, and a torch tensor yields a tensor on the same device.  A sinogram
+    already placed on the devices is rejected, because the arithmetic here
+    reads host arrays and single tensors only.  Compute the weights from the
+    host sinogram first, then place both at once with
+    :meth:`~mbirtorch.TomographyModel.prepare_sino_for_devices`.
 
     Args:
         sinogram (ndarray or tensor): 3D array of shape
-            (num_views, num_det_rows, num_det_channels).
+            (num_views, num_det_rows, num_det_channels).  A sinogram in sharded form is not accepted.
         weight_type (str): The type of noise model to use for weighting.  One of:
             - 'unweighted': Use uniform weights (all ones).
             - 'transmission': Use exponential decay, `exp(-sinogram)`.
@@ -224,6 +230,7 @@ def gen_weights(sinogram, weight_type):
         input's form and place.
 
     Raises:
+        ValueError: If `sinogram` is in sharded form.
         Exception: If `weight_type` is not one of the supported options.
 
     Note:
@@ -231,6 +238,14 @@ def gen_weights(sinogram, weight_type):
         large (e.g., > 5), as this corresponds to near-zero transmission, which
         is not physically meaningful in typical X-ray imaging.
     """
+    # A placed sinogram would fall through to the numpy branch below and give a
+    # silently wrong answer, so it is refused here instead.
+    if isinstance(sinogram, _sharding.Shards):
+        raise ValueError(
+            'gen_weights does not accept a sinogram that has been placed on '
+            'the devices.  Compute the weights from the host sinogram first, '
+            'then place the sinogram and the weights together with '
+            'ct_model.prepare_sino_for_devices(sinogram, weights).')
     xp = torch if isinstance(sinogram, torch.Tensor) else np
     if weight_type == 'unweighted':
         weights = xp.ones_like(sinogram)
@@ -317,6 +332,15 @@ def gen_weights_mar(ct_model, sinogram, init_recon=None, metal_threshold=None, b
 
     Returns:
         (ndarray): Weights used in reconstruction, with the same array shape as ``sinogram``
+
+    Note:
+        Only the ``init_recon`` branch uses the devices.  On that branch, and on
+        a model whose layout the caller has not fixed, this call settles that
+        layout before it forward projects.  Settling runs the memory check, so
+        the call can raise
+        :class:`~mbirtorch._memory_ledger.MemoryPreflightError` for a problem no
+        device count holds.  The Otsu branch works on the host throughout and
+        leaves the layout alone.
     """
     import mbirtorch.preprocess as mtp
 
@@ -338,6 +362,10 @@ def gen_weights_mar(ct_model, sinogram, init_recon=None, metal_threshold=None, b
         print("metal_threshold = ", metal_threshold)
         # Identify metal voxels
         metal_mask = (np.asarray(init_recon) > metal_threshold).astype(np.float32)
+        # Settle the model's layout before the projection below places the mask
+        # and the sinogram it produces.  Only this branch reaches a device; the
+        # Otsu branch above works on the host throughout.
+        ct_model._apply_device_policy()
         # Forward project metal mask to generate a sinogram mask
         metal_mask_projected = ct_model.forward_project(metal_mask)
 
