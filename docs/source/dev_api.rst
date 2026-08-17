@@ -40,8 +40,8 @@ Most of the machinery is inherited from :ref:`TomographyModelDocs`; a new geomet
 usually needs only:
 
 * **The banded seams.**  The bodies take ``slice_start`` and ``band_slices`` arguments
-  through which the multi-device drivers ask for a band of slices at a time.  A
-  geometry whose detector row ``r`` maps one-to-one to recon slice ``r`` (parallel
+  through which the multi-device back projection asks for a band of slices at a time.
+  A geometry whose detector row ``r`` maps one-to-one to recon slice ``r`` (parallel
   beam) sets the class attribute ``rows_track_slices = True``; its band then rides in
   the sinogram's row axis and the bodies can assert the seam defaults.  A geometry
   where one slice spreads over a range of detector rows (cone beam) must honor

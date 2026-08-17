@@ -109,8 +109,8 @@ def _translation_forward_view_batch(values, pixel_indices, view_params_batch,
     """Translation forward for one view batch: the detector-side vertical fan,
     then the per-pixel horizontal fan scatter.  Returns (Vb, R, C).
 
-    ``slice_start`` supports the banded sharded forward exactly as in cone:
-    ``values`` may be a slice BAND (P, L) with global indices [slice_start,
+    ``slice_start`` supports a slice-BANDED call exactly as in cone:
+    ``values`` may be a band (P, L) with global indices [slice_start,
     slice_start + L); the z geometry stays anchored on the full num_slices
     center and taps outside the band contribute zero.
 
@@ -267,12 +267,6 @@ class TranslationModel(TomographyModel):
         # Smaller line-search cap due to observed instabilities with larger
         # values.
         self.set_params(no_warning=True, max_alpha=1.3)
-
-    # Translation takes the multi-device forward's column gather.  It shares
-    # cone's banded branch and the same band-independent per-call cost, and
-    # the gather was measured faster at every device count on this geometry's
-    # 2K^3 size measurement.
-    column_gather_geometry = True
 
     def _view_batch_bodies(self):
         # No hand-written kernels for translation yet; the compiled torch

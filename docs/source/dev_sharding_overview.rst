@@ -89,26 +89,37 @@ updates, which dominate there (``_check_no_empty_shard`` in
 ``tomography_model.py``).
 
 
-Forward and back projection by bands
--------------------------------------
+The forward's cylinder transfer
+-------------------------------
 
-Within a slice-shard the work can be subdivided once more, into **bands** of
-slices.  Both projectors run a double loop: over slice-shards (outer) and over
-bands (inner).  Banding bounds the size of the transient buffers that arise while
-moving data between the two shardings.
+**Forward projection** (recon → sinogram) is the **cylinder transfer**, on all four
+geometries: parallel-beam, cone-beam, translation and multi-axis parallel.
+Each view-owner walks the pixel axis in batches, collects each batch's
+full-height voxel cylinder from every slice-owner, and makes one projector call
+per batch over its own views and the whole slice range.  When the loop
+finishes, the sinogram is already in the view-sharded layout.
 
-.. figure:: figs/sharding-forward-bands.png
-   :width: 90%
-   :align: center
+What one gather costs is set by the width of the pixel batch and not by the
+device count, so the transient does not grow with the problem at a fixed batch.
+``forward_project_pixel_batch`` on the model sets that batch
+(``transfer_cylinder_batch`` in ``_sharding.py`` and
+``_sparse_forward_project_cylinders`` in ``tomography_model.py``).
 
-   Forward projection: one band is broadcast to every view-owner, each
-   view-owner forward-projects its own views from that band (accumulating), and
-   the result is already a view-sharded sinogram.
+Each geometry took this driver on its own measurement, on four H100s: cone and
+parallel on 2026-08-11, and translation and multi-axis on 2026-08-17, where the
+gather was faster at both device counts measured -- 1.13x to 1.94x on a
+composed reconstruction -- and held a lower per-device peak.  A slice-banded
+forward ran beside it until 2026-08-17 and was removed once all four geometries
+had been measured on the gather.
 
-**Forward projection** (recon → sinogram) broadcasts each band to every
-view-owner; each view-owner forward-projects its own views from that band and
-accumulates into its part of the sinogram.  When the loop finishes, the sinogram
-is already in the view-sharded layout.
+
+Back projection by bands
+-------------------------
+
+Within a slice-shard the back projection's work is subdivided once more, into
+**bands** of slices.  It runs a double loop: over slice-shards (outer) and over
+bands (inner).  Banding bounds the size of the transient buffers that arise
+while moving data between the two shardings.
 
 .. figure:: figs/sharding-back-bands.png
    :width: 90%
@@ -118,15 +129,11 @@ is already in the view-sharded layout.
    contributions are reduced (summed) over views into the recon's slice
    sharding.
 
-**Back projection** (sinogram → recon) is the adjoint: each view-owner
-back-projects into a band, and the per-view contributions are reduced (summed)
-and scattered into the slice-owner that holds those slices -- a reduce-scatter.
-The result is already in the slice-sharded recon layout.
-
-The two directions are the adjoint pair ``broadcast_band_to_views`` (all-gather)
-and ``sum_band_to_owner`` (reduce-scatter).  Broadcast-to-N is the transpose of
-sum-from-N, which is what keeps forward and back projection adjoint under
-sharding.
+**Back projection** (sinogram → recon) is the forward's adjoint: each
+view-owner back-projects into a band, and the per-view contributions are
+reduced (summed) and scattered into the slice-owner that holds those slices --
+a reduce-scatter, ``sum_band_to_owner``.  The result is already in the
+slice-sharded recon layout.
 
 The reduce **streams**.  It forms the running total for a band once on the
 slice-owner and then adds each arriving partial one bounded row slab at a time,
@@ -144,43 +151,12 @@ measured 2 to 23 percent more busy time at parallel 1024 with two devices,
 depending on the walk (an earlier pre-kernel reading of 47 to 66 percent
 overstated the cost).
 MBIRJAX's stream-even-at-one-device rationale is also void here, because a single
-torch device never runs the banded drivers at all -- the trivial path uses the
+torch device never runs the banded driver at all -- the trivial path uses the
 plain projectors.  A smaller band remains a real **memory** lever, since the
-per-band broadcast copy and the per-band partial scale with it; what it sets in
-the reduce is the running total the slabs are added into, the bands already
-reduced this pass being held either way.  Set ``forward_project_slice_band`` or
-``back_project_slice_band`` on the model to opt in (``_slice_band_length`` in
-``tomography_model.py``).
-
-
-The forward's column gather
----------------------------
-
-The banded walk above is not what the forward runs by default any more.  All
-four geometries -- parallel-beam, cone-beam, translation and multi-axis
-parallel -- now take a second forward driver, the **column gather**: each
-view-owner walks the pixel axis in batches, collects each batch's full-height
-voxel cylinder from every slice-owner, and makes one projector call per batch
-over its own views and the whole slice range.  Each geometry was switched over
-on its own measurement, on four H100s: cone and parallel once their speed,
-value and memory gates passed on 2026-08-11, and translation and multi-axis on
-2026-08-17, where the gather was faster at both device counts measured --
-1.13x to 1.94x on a composed reconstruction -- and held a lower per-device
-peak.
-
-The operator does not change: every view-owner still produces its own views'
-whole sinogram block from the same voxels, so the forward stays the adjoint of
-the sharded back, and the **back projection is untouched** -- it walks slice
-bands exactly as described above.  What the pixel batch bounds for the forward
-is what the band bounded, so ``forward_project_slice_band`` has no effect while
-the gather runs; ``forward_project_pixel_batch`` is its counterpart lever.
-Setting ``forward_column_gather = False`` on the model restores the banded
-forward, and the ``MBIRTORCH_FORWARD_COLUMN_GATHER`` environment variable
-forces either shape so one session can run both over the same inputs.  A
-geometry added later runs the banded forward until it declares
-``column_gather_geometry`` on a measurement of its own
-(``_column_gather_forward`` and ``_sparse_forward_project_columns`` in
-``tomography_model.py``).
+per-band partial scales with it; what it sets in the reduce is the running
+total the slabs are added into, the bands already reduced this pass being held
+either way.  Set ``back_project_slice_band`` on the model to opt in
+(``_slice_band_length`` in ``tomography_model.py``).
 
 
 Why cone beam projects whole cylinders
@@ -297,23 +273,23 @@ Where this lives in the code
 -----------------------------
 
 * ``mbirtorch/_sharding.py`` -- ``Placement``, ``Shards``, the transfer
-  primitives, the banded adjoint pair, the halo exchange, and the thread-pool
-  execution helpers.  MBIRJAX splits these across a ``_sharding/`` package; here
-  they are one module.
-* ``mbirtorch/tomography_model.py`` -- the placement chokepoints, the banded
-  sharded drivers, the forward's column gather, the band-length and pixel-batch
-  policies, and the sharded VCD engine.
+  primitives, the forward's cylinder transfer, the back projection's band reduce,
+  the halo exchange, and the thread-pool execution helpers.  MBIRJAX splits
+  these across a ``_sharding/`` package; here they are one module.
+* ``mbirtorch/tomography_model.py`` -- the placement chokepoints, the sharded
+  drivers, the band-length and pixel-batch policies, and the sharded VCD
+  engine.
 * ``mbirtorch/projectors.py`` -- the geometry-agnostic view-range drivers and the
   torch.compile plumbing.
 * ``mbirtorch/horizontal_fan.py`` -- the shared horizontal-fan kernels and the
   fan data contract.
 * the per-geometry view-batch bodies in ``parallel_beam.py`` and ``cone_beam.py``.
 
-The correctness gates for the sharding invariants are in ``tests/test_sharding.py``
-(23 tests).  The strongest of them compare against a single-device reference:
-the banded projectors, the cone FDK, and the full VCD reconstruction must each
-match the single-device result, and must still match when the axes do not divide
-evenly and the shards differ in length.  The adjoint property is checked directly on the
-banded pair, the halo exchange is checked against a full-volume prior, and the
-awkward layouts (more devices than slices, more devices than views, a fully idle
-device) each have their own test.
+The correctness gates for the sharding invariants are in ``tests/test_sharding.py``.
+The strongest of them compare against a single-device reference: the sharded
+projectors, the cone FDK, and the full VCD reconstruction must each match the
+single-device result, and must still match when the axes do not divide evenly
+and the shards differ in length.  The adjoint property is checked directly on
+the projector pair, the halo exchange is checked against a full-volume prior,
+and the awkward layouts (more devices than slices, more devices than views, a
+fully idle device) each have their own test.

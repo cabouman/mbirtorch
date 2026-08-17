@@ -71,19 +71,19 @@ PROX_CYLINDERS = 4
 DIRECTION_CYLINDERS = 7
 # apply_worker holds the direction and the scaled direction.
 APPLY_CYLINDERS = 2
-# How many gathered column cylinders a forward on the column-gather path
-# holds at once (TomographyModel._sparse_forward_project_columns).  The driver
-# issues each batch's gather one batch ahead of the projection that reads it,
-# so at the widest instant -- inside the gather that runs ahead -- a device
-# holds three: the cylinder the projection is about to read, the pieces
-# arriving from the slice-owners for the batch after it, and the concatenation
-# those pieces are assembled into.
+# How many transferred cylinder batches a multi-device forward holds at once
+# (TomographyModel._sparse_forward_project_cylinders).  The driver issues each
+# batch's transfer one batch ahead of the projection that reads it, so at the
+# widest instant -- inside the transfer that runs ahead -- a device holds
+# three: the cylinders the projection is about to read, the pieces arriving
+# from the slice-owners for the batch after it, and the concatenation those
+# pieces are assembled into.
 #
-# The last batch of a pass has nothing to gather ahead of it, and a pass that
-# fits in one batch never gathers ahead at all, so both hold two rather than
-# three.  The charge covers the widest instant, which is the rule the ledger
-# keeps: it may charge more than a run needs but never less.
-COLUMN_GATHER_RESIDENTS = 3
+# The last batch of a pass has nothing to transfer ahead of it, and a pass
+# that fits in one batch never transfers ahead at all, so both hold two rather
+# than three.  The charge covers the widest instant, which is the rule the
+# ledger keeps: it may charge more than a run needs but never less.
+CYLINDER_TRANSFER_RESIDENTS = 3
 
 # ── the denoiser's own counts ────────────────────────────────────────────────
 # QGGMRFDenoiser runs its own sweep, so its per-subset counts are read from
@@ -334,13 +334,13 @@ class LedgerPlan:
     # does not, and neither does an unmasked model.
     hessian_masked: bool = False
     # ── knobs and model choices ──────────────────────────────────────────────
-    forward_band: int = None
     back_band: int = None
-    # The pixel-column batch the forward's column gather assembles at once,
-    # or None when the forward walks slice bands instead.  One field rather
-    # than a flag and a width, so the two can never disagree, and resolved by
-    # the model in plan_from_model rather than re-derived here.
-    column_pixel_batch: int = None
+    # How many pixels one transferred cylinder batch covers in the forward.
+    # Every projection plan carries one, because the cylinder transfer is the
+    # only multi-device forward; a denoise plan has no forward projection and
+    # leaves it None.  Resolved by the model in plan_from_model rather than
+    # re-derived here.
+    pixel_batch: int = None
     qggmrf_cylinders: int = QGGMRF_CYLINDERS_COMPILED
     # (direction, num_pixels, band_cols) -> (view_batch, bytes_per_view), with
     # direction in {'forward', 'back'}.  Defaults to a no-charge model so a
@@ -365,11 +365,12 @@ class LedgerPlan:
             direction, int(num_pixels), int(band_cols))
         return int(view_batch) * int(bytes_per_view)
 
-    def band_length(self, dev_index, direction):
-        """The slice-band length one owner streams, matching
-        ``TomographyModel._slice_band_length``: the whole shard by default."""
+    def band_length(self, dev_index):
+        """The slice-band length one owner streams in the BACK projection,
+        matching ``TomographyModel._slice_band_length``: the whole shard by
+        default.  The forward transfers whole cylinders and walks no bands."""
         local_slices = self.slice_blocks[dev_index]
-        fixed = self.forward_band if direction == 'forward' else self.back_band
+        fixed = self.back_band
         return min(int(fixed), local_slices) if fixed else local_slices
 
 
@@ -417,40 +418,42 @@ def estimate_peak_device_bytes(plan):
         """The back call's band_cols: its local sinogram's row count."""
         if n == 1:
             return int(plan.sinogram_shape[1])
-        return (plan.band_length(i, 'back') if plan.rows_track_slices
+        return (plan.band_length(i) if plan.rows_track_slices
                 else num_rows_dev)
 
-    def column_gather_slices():
-        """The slice extent one column-gather call is handed: the WHOLE
-        slice axis, because the gathered cylinder spans every slice-owner at
-        once."""
+    def whole_slice_extent():
+        """The slice extent one forward call is handed: the WHOLE slice axis,
+        because a transferred cylinder spans every slice-owner at once."""
         return sum(int(block) for block in plan.slice_blocks)
 
     def forward_call_pixels(num_pixels):
-        """How many pixel columns ONE forward call is handed: every pixel of
-        the pass by default, and one column batch on the column-gather path,
-        which is what makes that path's per-call terms fall."""
-        if plan.column_pixel_batch:
-            return min(int(num_pixels), int(plan.column_pixel_batch))
+        """How many pixels ONE forward call is handed: one cylinder batch,
+        capped by the pass, which is what makes the forward's per-call terms
+        fall.  A plan with no batch prices the whole pass; only a hand-built
+        plan is in that state, since every plan built from a model carries the
+        batch."""
+        if plan.pixel_batch:
+            return min(int(num_pixels), int(plan.pixel_batch))
         return int(num_pixels)
 
     def forward_cols(i):
-        """The forward call's band_cols: its voxel columns."""
+        """The forward call's band_cols, which is its slice extent.  One
+        device is handed the whole slice axis, and so is every view-owner
+        under sharding, because a transferred cylinder spans every slice-owner
+        at once."""
         if n == 1:
             return int(plan.recon_shape[2])
-        if plan.column_pixel_batch:
-            return column_gather_slices()
-        return plan.band_length(i, 'forward')
+        return whole_slice_extent()
 
     def band_slices(i, direction):
         """The slice extent one projection call is handed: the whole slice
-        axis at one device, this owner's slice band under sharding, and the
-        whole device-form axis again on the column-gather path."""
+        axis at one device, the whole device-form axis for a sharded forward
+        call, and this owner's slice band for a sharded back call."""
         if n == 1:
             return int(plan.recon_shape[2])
-        if direction == 'forward' and plan.column_pixel_batch:
-            return column_gather_slices()
-        return plan.band_length(i, direction)
+        if direction == 'forward':
+            return whole_slice_extent()
+        return plan.band_length(i)
 
     def torch_body_batch(i, direction, num_pixels):
         """What one view batch of a TORCH BODY holds.
@@ -483,8 +486,8 @@ def estimate_peak_device_bytes(plan):
     def forward_batch(i, num_pixels):
         if not is_view_owner(i):
             return 0
-        # A call's own pixel count, which is the pass's on the banded path
-        # and one column batch on the column-gather path.
+        # A call's own pixel count, which is one cylinder batch under
+        # sharding.
         call_pixels = forward_call_pixels(num_pixels)
         if 'forward' in plan.torch_body_directions:
             return torch_body_batch(i, 'forward', call_pixels)
@@ -522,7 +525,7 @@ def estimate_peak_device_bytes(plan):
         """
         if n == 1 or not is_slice_owner(i):
             return 0
-        band = plan.band_length(i, 'back')
+        band = plan.band_length(i)
         shard = plan.slice_blocks[i]
         row_bytes = int(band) * _F32_BYTES
         slab_rows = _sharding.reduce_slab_rows(int(num_pixels), row_bytes)
@@ -605,61 +608,37 @@ def estimate_peak_device_bytes(plan):
     # Over-charging is bounded too -- CALIBRATION_BAND asks the model to stay
     # within 1.30x of the measurement -- so an unneeded term is also a defect.
     def forward_fixed(i):
-        """The forward's assembled output.  A multi-device owner holds the
-        per-band pieces AND their concatenation (a row-aligned geometry, one
-        whose detector row r comes from recon slice r), or the running partial
-        AND the incoming one (a two-fan geometry such as cone, where one slice
-        projects onto many detector rows), so it pays twice.
+        """The forward's assembled output.
 
-        The COLUMN-GATHER forward holds one rather than two: its batches add
-        into the owner's block from inside the projector's view loop, so there
-        is no separate incoming block to hold beside it.  The charge stays at
-        two anyway.  It is shared with the banded path, which really does hold
-        both, and the ledger's rule is that it may charge more than a run needs
-        but never less -- so the column-gather path is deliberately over-charged
-        by one block here rather than given a term of its own."""
+        A multi-device owner holds ONE such block: its batches add into that
+        block from inside the projector's view loop, so there is no separate
+        incoming block beside it.  TWO are charged anyway, which is a
+        deliberate over-charge of one block.  The ledger's rule is that it may
+        charge more than a run needs but never less, and this term was
+        calibrated against measured peaks at two blocks."""
         if not is_view_owner(i):
             return 0
         return sino_dev(i) if n == 1 else 2 * sino_dev(i)
 
-    def forward_band_copy(i, num_pixels):
-        """The broadcast band the forward leaves resident on every projector.
+    def forward_transferred_cylinders(i, num_pixels):
+        """The cylinder batches the multi-device forward holds.
 
-        ``_sharding.broadcast_band_to_views`` copies the current slice-owner's
-        band onto every view-owner, and the copy stays live for the whole of
-        that band's projection.  One band is the whole shard by default, so
-        the copy is a full cylinder-shard on each device, on top of the
-        device's own shard.  Without this term the model falls below the
-        measured peak on a large cone reconstruction at four devices.
+        ``_sharding.transfer_cylinder_batch`` moves one batch of pixels from
+        every slice-owner and concatenates them, so what a view-owner holds is
+        that batch by the WHOLE device-form slice axis.  That does not grow
+        with the shard, so at a fixed batch it does not grow with the problem.
+        Three are live at the widest instant, because the driver transfers one
+        batch ahead of the projection that reads it; see
+        CYLINDER_TRANSFER_RESIDENTS for which three.
 
-        The column-gather path broadcasts no band at all, so this term is
-        zero there and ``forward_column_cylinder`` charges what it holds
-        instead.
-        """
-        if n == 1 or not is_view_owner(i) or plan.column_pixel_batch:
-            return 0
-        return cyl(i, num_pixels)
-
-    def forward_column_cylinder(i, num_pixels):
-        """The gathered cylinder the column-gather forward assembles.
-
-        ``_sharding.gather_column_band`` moves one batch of pixel columns
-        from every slice-owner and concatenates them, so what a view-owner
-        holds is that batch by the WHOLE device-form slice axis -- and,
-        unlike the band copy it replaces, that does not grow with the shard,
-        so it does not grow with the problem at a fixed batch.  Three are live
-        at the widest instant, because the driver gathers one batch ahead of
-        the projection that reads it; see COLUMN_GATHER_RESIDENTS for which
-        three.
-
-        Measured 2026-08-10 on four H100s, job mg10: ONE such cylinder read
-        7.9, 15.8 and 31.5 MiB at batches 2048, 4096 and 8192 at 1008 slices,
+        Measured 2026-08-10 on four H100s, job mg10: ONE such batch read 7.9,
+        15.8 and 31.5 MiB at pixel batches 2048, 4096 and 8192 at 1008 slices,
         which is the closed form exactly.
         """
-        if n == 1 or not is_view_owner(i) or not plan.column_pixel_batch:
+        if n == 1 or not is_view_owner(i) or not plan.pixel_batch:
             return 0
-        return (COLUMN_GATHER_RESIDENTS * forward_call_pixels(num_pixels)
-                * column_gather_slices() * _F32_BYTES)
+        return (CYLINDER_TRANSFER_RESIDENTS * forward_call_pixels(num_pixels)
+                * whole_slice_extent() * _F32_BYTES)
 
     def forward_view_batches(i, num_pixels):
         """How many batches one owner's forward view loop runs, or None when
@@ -678,14 +657,12 @@ def estimate_peak_device_bytes(plan):
 
         A row-aligned geometry's body sizes its output by the value columns it
         was handed -- ``_parallel_forward_view_batch_triton`` allocates
-        ``(views, channels, num_value_cols)`` -- so a slice band yields the
-        matching row band and the block shrinks with the band.  A TWO-FAN
-        body's output spans the whole detector whatever band the values carry:
-        ``_cone_forward_view_batch_triton`` allocates ``(views, channels,
-        num_rows_r)`` and reads ``num_rows_r`` from the params, because one
-        slice band lights up every row it projects onto.  So the block does
-        NOT shrink with the band there, and charging it at the band instead
-        would under-charge the cone forward by ``(rows - band)`` per view.
+        ``(views, channels, num_value_cols)`` -- and a transferred cylinder
+        carries the whole slice axis, so the block spans every row.  A TWO-FAN
+        body's output spans the whole detector as well, whatever the values
+        carry: ``_cone_forward_view_batch_triton`` allocates ``(views,
+        channels, num_rows_r)`` and reads ``num_rows_r`` from the params,
+        because one slice lights up every row it projects onto.
         """
         return forward_cols(i) if plan.rows_track_slices else plan.sino_rows
 
@@ -715,9 +692,9 @@ def estimate_peak_device_bytes(plan):
         charged.
 
         The batch follows the pixel count of THIS call, so the subset phases
-        must pass their own subset size rather than the full index count --
-        and on the column-gather path a call's pixel count is one column
-        batch, which raises the view batch and with it this block.
+        must pass their own subset size rather than the full index count.
+        Under sharding a call's pixel count is one cylinder batch, which raises
+        the view batch and with it this block.
         """
         if not is_view_owner(i):
             return 0
@@ -1050,9 +1027,8 @@ def estimate_peak_device_bytes(plan):
             ('weights', per_dev(supplied_weights_term)),
             ('init recon', per_dev(recon_dev)),
             ('voxel gather', per_dev(lambda i: cyl(i, p_full))),
-            ('broadcast band', per_dev(lambda i: forward_band_copy(i, p_full))),
-            ('column cylinder', per_dev(
-                lambda i: forward_column_cylinder(i, p_full))),
+            ('transferred cylinders', per_dev(
+                lambda i: forward_transferred_cylinders(i, p_full))),
             ('forward output', per_dev(forward_fixed)),
             ('forward block', per_dev(lambda i: forward_block(i, p_full))),
             ('forward batch', per_dev(lambda i: forward_batch(i, p_full))),
@@ -1195,10 +1171,8 @@ def estimate_peak_device_bytes(plan):
                 ('delta sinogram', per_dev(sino_dev)),
                 ('forward assembly', per_dev(
                     lambda i: sino_dev(i) if n > 1 and is_view_owner(i) else 0)),
-                ('broadcast band', per_dev(
-                    lambda i: forward_band_copy(i, p_sub))),
-                ('column cylinder', per_dev(
-                    lambda i: forward_column_cylinder(i, p_sub))),
+                ('transferred cylinders', per_dev(
+                    lambda i: forward_transferred_cylinders(i, p_sub))),
                 ('forward block', per_dev(lambda i: forward_block(i, p_sub))),
                 ('forward batch', per_dev(lambda i: forward_batch(i, p_sub))),
             ],
@@ -1343,15 +1317,13 @@ def plan_from_model(model, devices, workload='recon', partition_sequence=None,
         positivity=bool(model.get_params('positivity_flag')),
         helical=_is_helical(model),
         hessian_masked=model.get_params('use_ror_mask') is not False,
-        forward_band=getattr(model, 'forward_project_slice_band', None),
         back_band=getattr(model, 'back_project_slice_band', None),
-        # Both read from the model's own resolvers rather than re-derived
-        # here: a charge that re-implements a driver rule is a charge that
-        # can be left behind when the rule moves.  A denoiser has no forward
-        # projection to resolve, so neither is asked.
-        column_pixel_batch=(None if denoising else
-                            (model._forward_pixel_batch()
-                             if model._column_gather_forward() else None)),
+        # Read from the model's own resolver rather than re-derived here: a
+        # charge that re-implements a driver rule is a charge that can be
+        # left behind when the rule moves.  A denoiser has no forward
+        # projection, so it is not asked.
+        pixel_batch=(None if denoising
+                            else model._forward_pixel_batch()),
         qggmrf_cylinders=qggmrf_cylinder_count(model),
         view_charge=charge,
         torch_body_directions=(() if denoising

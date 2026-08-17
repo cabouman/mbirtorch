@@ -170,13 +170,14 @@ def _cone_forward_view_batch(values, pixel_indices, view_params_batch,
     """Cone forward for one view batch: the detector-side vertical fan, then the
     per-pixel horizontal fan scatter.  Returns (Vb, R, C).
 
-    ``slice_start`` supports the banded sharded forward: ``values`` may be a
-    slice BAND (P, L) whose global slice indices are [slice_start,
-    slice_start + L); the z geometry stays anchored on the FULL num_slices
-    center, gathers use band-local storage indices, and taps outside the band
-    contribute zero -- so summing the per-band outputs over a tiling of the
-    slice axis reproduces the unbanded projection exactly.  The default 0
-    with L == num_slices is the unbanded case, bit-identical to before.
+    ``slice_start`` supports a slice-BANDED call: ``values`` may be a band
+    (P, L) whose global slice indices are [slice_start, slice_start + L); the
+    z geometry stays anchored on the FULL num_slices center, gathers use
+    band-local storage indices, and taps outside the band contribute zero --
+    so summing the per-band outputs over a tiling of the slice axis reproduces
+    the unbanded projection exactly.  The default 0 with L == num_slices is
+    the unbanded case, and it is what the sharded forward calls: the cylinder
+    it gathers spans every slice.
 
     ``plan`` is the memoization slot for a future sorted/CSR stream variant
     (per pixel-subset x view-range); unused today."""
@@ -343,14 +344,6 @@ class ConeBeamModel(TomographyModel):
     # above parallel's: its n=4 admits only at the top of the measured ladder.
     _floor_family = 'cone'
 
-    # Cone is the geometry the multi-device forward's column gather was
-    # measured on (see TomographyModel._column_gather_forward for what else
-    # has to hold before it runs, and _sparse_forward_project_columns for the
-    # numbers).  The path runs by default since its speed, value, and memory
-    # gates passed (2026-08-11, four H100s); forward_column_gather = False
-    # restores the banded walk.
-    column_gather_geometry = True
-
     def create_projectors(self):
         super().create_projectors()
         # Warm the DC-damping profile and its per-device compiled instances
@@ -383,7 +376,7 @@ class ConeBeamModel(TomographyModel):
         else:
             back_body = _cone_back_view_batch
         # Selection is layout-independent.  An interim rule once withheld the
-        # forward kernel from sharded layouts: under the banded multi-device
+        # forward kernel from sharded layouts: under the multi-device
         # drivers it disagreed with the torch forward by order one,
         # non-reproducibly, in both geometries.  The defect was the LAUNCH,
         # not the kernel: a Triton launch targets the launching thread's

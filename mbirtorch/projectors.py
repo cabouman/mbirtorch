@@ -147,12 +147,12 @@ def maybe_compile(fn, enabled, instance_key=None):
 # one-pixel compile itself.  The cone bodies do not have the defect, and macOS
 # inductor compiles the same one-pixel body correctly.  One-pixel calls are
 # ordinary: sparse_forward_project with a single index makes one, and the
-# column gather's pixel batching makes one whenever a batch, or the remainder
-# of a batch, is a single pixel.
+# cylinder transfer's pixel batching makes one whenever a batch, or the
+# remainder of a batch, is a single pixel.
 #
 # The driver's view-batch charge is computed from the REAL pixel count, before
 # the padding: it prices the transient of a call this small at a batch far
-# below any cap, so the one padded column cannot move it.
+# below any cap, so the one padded pixel cannot move it.
 
 
 def _callable_name(fn, fallback):
@@ -163,10 +163,10 @@ def _callable_name(fn, fallback):
 def forward_at_min_pixel_width(compiled, min_width):
     """The forward body with narrow pixel batches padded to ``min_width``.
 
-    The padded columns carry zero values at a repeated -- hence in-range --
+    The padded pixels carry zero values at a repeated -- hence in-range --
     pixel index.  The forward output has no pixel axis: the fan bins each
     pixel's weighted row into the detector channels with index_add_, so a
-    zero-valued column adds exactly 0.0 wherever it lands and the padded call
+    zero-valued pixel adds exactly 0.0 wherever it lands and the padded call
     returns bit-identical values with nothing to slice off (verified against
     the eager body).
     """
@@ -425,8 +425,8 @@ class Projectors:
         Args:
             body: the projection body actually bound (kernel or torch).
             num_pixels (int): P, the pixel subset this call projects.
-            band_cols (int): the call's column count -- the forward's voxel
-                columns, or the back's local sinogram row count.
+            band_cols (int): the call's column count -- the forward's slice
+                extent, or the back's local sinogram row count.
             args (dict): the geometry's per-call argument dict.
             n_devices (int, optional): price the budget for a HYPOTHETICAL
                 device count instead of the model's current placement.  Used
@@ -459,16 +459,16 @@ class Projectors:
         transient budget, and assembly (output sized lazily from the first
         block, so the driver never derives geometry-specific shapes).
 
-        ``accumulate_into`` lets a caller that runs this loop repeatedly -- the
-        column-gather forward, once per pixel batch -- add straight into the
-        block it is building instead of receiving a fresh one to add itself.
-        That merges two full-block passes into one and drops one full-block
-        allocation per call; see the accumulation comment in
-        ``TomographyModel._sparse_forward_project_columns`` for why it is worth
-        doing and why the values do not move.  The parameter is added HERE, on
-        a plain python method, and not to the geometry body: the bodies are
-        torch.compile'd per device with shape-keyed caches, so a new argument
-        there would recompile every one of them.
+        ``accumulate_into`` lets a caller that runs this loop repeatedly --
+        the cylinder-transfer forward, once per pixel batch -- add straight
+        into the block it is building instead of receiving a fresh one to add
+        itself.  That merges two full-block passes into one and drops one
+        full-block allocation per call; see the accumulation comment in
+        ``TomographyModel._sparse_forward_project_cylinders`` for why it is
+        worth doing and why the values do not move.  The parameter is added
+        HERE, on a plain python method, and not to the geometry body: the
+        bodies are torch.compile'd per device with shape-keyed caches, so a
+        new argument there would recompile every one of them.
 
         Args:
             band_values: (P, cols) voxel cylinders (or a slice band), on this

@@ -531,25 +531,15 @@ def test_the_finished_own_band_is_one_cylinder_on_every_slice_owner():
     assert terms['finished own band'] == [800 * 16 * 4] * 2
 
 
-def test_the_forward_charges_the_broadcast_band_and_no_margin():
-    """The broadcast band is named from the code: the forward copies the
-    current slice-owner's band onto every view-owner and it stays live for
-    that band's projection.  It does not exist at one device.
-
-    The ledger used to carry a safety margin beside it -- one per-device
-    sinogram shard on every forward phase -- standing in for arrays nobody
-    had enumerated yet.  Those arrays are now charged directly and checked
-    against measurement, so NO phase may carry a margin term: every term must
-    name an array the code allocates.
+def test_no_phase_carries_a_margin_term():
+    """The ledger used to carry a safety margin -- one per-device sinogram
+    shard on every forward phase -- standing in for arrays nobody had
+    enumerated yet.  Those arrays are now charged directly and checked against
+    measurement, so NO phase may carry a margin term: every term must name an
+    array the code allocates.
     """
-    two = estimate_peak_device_bytes(make_plan(n_devices=2))
-    for fragment in ('initial forward projection',
-                     'subset delta forward projection'):
-        terms = dict(_named(two, fragment).terms)
-        assert terms['broadcast band'][0] > 0, fragment
     one = estimate_peak_device_bytes(make_plan(n_devices=1))
-    assert dict(_named(one, 'initial forward projection')
-                .terms)['broadcast band'][0] == 0
+    two = estimate_peak_device_bytes(make_plan(n_devices=2))
     for ledger in (one, two):
         for phase in ledger.phases:
             for name, _vals in phase.terms:
@@ -594,25 +584,22 @@ def test_the_forward_block_count_follows_the_realized_view_batches():
                 .terms)['forward block'][0] == 1 * rows * channels * 4
 
 
-def test_the_forward_block_spans_the_detector_rows_on_a_two_fan_geometry():
-    """A two-fan body's output plane spans the FULL detector rows whatever
-    slice band the values carry, so the block does not shrink with the band;
-    a row-aligned body's does, rows tracking slices one for one.  Charging
-    the two-fan block at the band instead under-charges the cone forward.
+def test_the_forward_block_is_sized_by_the_geometry_it_belongs_to():
+    """A two-fan body's output plane spans the FULL detector rows, so the
+    block follows the row count.  A row-aligned body sizes its output by the
+    values it was handed, which under sharding is a transferred cylinder --
+    the WHOLE slice axis, at every device count.  The two are separated here
+    by a plan whose slice count differs from its detector row count.
     """
-    band = 32 // 2                            # one slice shard of make_plan's
-    rows, channels = 32, 32
-    for aligned, expected in ((True, band), (False, rows)):
-        ledger = estimate_peak_device_bytes(
-            make_plan(n_devices=2, rows_track_slices=aligned))
-        terms = dict(_named(ledger, 'initial forward projection').terms)
-        assert terms['forward block'][0] == expected * channels * 4, aligned
-    # At one device there is no band to differ from: the row-aligned form
-    # hands the body every slice it owns.
-    one = estimate_peak_device_bytes(make_plan(n_devices=1,
-                                               rows_track_slices=True))
-    assert dict(_named(one, 'initial forward projection')
-                .terms)['forward block'][0] == 32 * channels * 4
+    rows, channels, slices = 32, 32, 48
+    for aligned, expected in ((True, slices), (False, rows)):
+        for n in (1, 2, 4):
+            ledger = estimate_peak_device_bytes(
+                make_plan(n_devices=n, rows_track_slices=aligned,
+                          num_rows=rows, recon=(32, 32, slices)))
+            terms = dict(_named(ledger, 'initial forward projection').terms)
+            assert terms['forward block'][0] == expected * channels * 4, \
+                (aligned, n)
 
 
 def test_the_split_lowers_the_multi_device_peak_and_leaves_n1_alone():
@@ -1242,7 +1229,7 @@ def test_plan_from_model_prices_a_denoiser_without_its_projectors():
     # the plan.
     assert plan.view_charge is None
     assert plan.torch_body_directions == ()
-    assert plan.column_pixel_batch is None
+    assert plan.pixel_batch is None
     # The one fixed partition the denoiser builds.
     assert plan.granularities == (16,)
     assert plan.partition_granularities == (16,)
@@ -1472,30 +1459,48 @@ def test_a_torch_body_view_batch_is_charged_at_the_measured_slab_count():
     assert torch_body.peak_bytes(0) > declared.peak_bytes(0)
 
 
-def test_the_torch_body_slab_follows_the_wider_of_rows_and_band():
+def test_the_torch_body_slab_follows_the_wider_of_rows_and_slices():
     """The body allocates arrays at the detector-row extent AND at the slice
-    band; the wider of the two sets the slab.  Under sharding the band is one
-    owner's shard, so a tall volume's slab shrinks with the device count and a
-    wide detector's does not."""
+    extent it was handed; the wider of the two sets the slab.
+
+    The two directions are handed different slice extents.  The forward is
+    handed transferred cylinders, which span the whole slice axis at every
+    device count, so its slab does not shrink as devices are added.  The back
+    is handed one owner's slice band, so a tall volume's back slab does shrink
+    with the device count.
+    """
     def charge(direction, num_pixels, band_cols):
         return 1, 1
 
-    def batch(rows, slices, n_devices):
-        ledger = estimate_peak_device_bytes(make_plan(
+    def ledger_for(rows, slices, n_devices):
+        return estimate_peak_device_bytes(make_plan(
             n_devices=n_devices, view_charge=charge,
             torch_body_directions=('forward', 'back'),
             num_pixels_full=800, num_rows=rows, recon=(32, 32, slices)))
-        return dict(_named(ledger, 'initial forward projection')
+
+    def forward_batch(rows, slices, n_devices):
+        return dict(_named(ledger_for(rows, slices, n_devices),
+                           'initial forward projection')
                     .terms)['forward batch'][0]
 
-    # Tall volume, narrow detector: at one device the band is all 64 slices,
-    # and at four devices it is the 16-slice shard -- below the 32 rows, which
-    # then set the slab.
-    assert batch(32, 64, 1) == SLABS * 800 * 64 * 4
-    assert batch(32, 64, 4) == SLABS * 800 * 32 * 4
-    # Wide detector: the rows set the slab at every device count.
-    assert batch(128, 32, 1) == SLABS * 800 * 128 * 4
-    assert batch(128, 32, 4) == SLABS * 800 * 128 * 4
+    def back_batch(rows, slices, n_devices):
+        ledger = ledger_for(rows, slices, n_devices)
+        phase = _sub(ledger, 'direct recon (back loop)', n_devices,
+                     'back workers')
+        return dict(phase.terms)['back batch'][0]
+
+    # Tall volume, narrow detector.  The forward keeps all 64 slices at four
+    # devices, because the cylinders it transfers span them.
+    assert forward_batch(32, 64, 1) == SLABS * 800 * 64 * 4
+    assert forward_batch(32, 64, 4) == SLABS * 800 * 64 * 4
+    # The back is handed the 16-slice shard there, which is below the 32 rows,
+    # so the rows set its slab instead.
+    assert back_batch(32, 64, 1) == SLABS * 800 * 64 * 4
+    assert back_batch(32, 64, 4) == SLABS * 800 * 32 * 4
+    # Wide detector: the rows set the slab both ways at every device count.
+    assert forward_batch(128, 32, 1) == SLABS * 800 * 128 * 4
+    assert forward_batch(128, 32, 4) == SLABS * 800 * 128 * 4
+    assert back_batch(128, 32, 4) == SLABS * 800 * 128 * 4
 
 
 def test_a_torch_body_pays_for_both_forward_blocks():
@@ -1526,48 +1531,47 @@ def test_a_torch_body_pays_for_both_forward_blocks():
 
 
 # One row per measured arm: (sinogram shape, recon shape, masked pixel count,
-# per-device measured peak bytes).  Measured 2026-08-10 on four H100s (job
-# mg8) -- the two geometries with no hand-written kernels, at one, two and
-# four devices, weighted, from a supplied sinogram with no initial volume.
-# The ma512_n4 row was re-measured 2026-08-16 under mg8's protocol (slurm
-# 15304566, h016), because it is the one arm whose split changed when the
-# sharding pad was removed: 510 recon slices over four devices were padded to
-# four blocks of 128 and are now cut 128, 128, 127, 127.
+# per-device measured peak bytes).  Every row is the two geometries with no
+# hand-written kernels, weighted, from a supplied sinogram with no initial
+# volume.  One builder prices them all, _measured_arm_ledger below.
 #
-# Every arm here was measured with the multi-device forward walking SLICE
-# BANDS, which is what both geometries defaulted to when the runs were taken.
-# Their defaults moved to the column gather on 2026-08-17, and these rows do
-# not move with them: _measured_arm_ledger below builds its LedgerPlan
-# directly rather than from a live model, and leaves column_pixel_batch unset,
-# so the plan keeps the banded shape the peaks were measured on.  A future
-# edit that switches it to plan_from_model has to force the banded form back
-# on, or it will be judging measured peaks against a different driver.
+# The MULTI-DEVICE rows were measured 2026-08-17 on four H100s of node h014,
+# in the comparison job that ran beside slurm 15307729.  They are that job's
+# composed-reconstruction arms at the shipped pixel batch of 8192 (rows file
+# mg18_ab_h014_20260816_231137.jsonl in the plans repository).  They took the
+# place of multi-device rows measured 2026-08-10 (job mg8), which were taken
+# with the forward walking SLICE BANDS.  The banded forward was removed on
+# 2026-08-17, so those older peaks can no longer be priced: the ledger has no
+# banded forward left to charge.
+#
+# The SINGLE-DEVICE rows keep their mg8 measurements, unchanged.  They
+# survived the removal because one device runs neither multi-device driver --
+# the trivial path uses the plain projectors -- so the code they were measured
+# against is the code that runs today.
+#
+# MEASURED_ARM_PIXEL_BATCH is the batch the runs used, and
+# _measured_arm_ledger sets it on the plan.  Without it the plan would price
+# forward calls at the whole pass and judge these peaks against a call shape
+# the runs never made.
 MEASURED_ARMS = {
     'ma1024_n1': ((1024, 1008, 992), (992, 992, 1148), 771240,
                   [37310451712]),
     'ma1024_n2': ((1024, 1008, 992), (992, 992, 1148), 771240,
-                  [26138702848, 23767433216]),
+                  [21420991488, 19492240896]),
     'ma1024_n4': ((1024, 1008, 992), (992, 992, 1148), 771240,
-                  [17888278016, 17820163072, 17820163072, 16934779392]),
+                  [29052623872, 28982226944, 28982226944, 28977516544]),
     'ma512_n1': ((512, 448, 384), (384, 384, 510), 115164,
                  [12253271552]),
-    'ma512_n2': ((512, 448, 384), (384, 384, 510), 115164,
-                 [9492893184, 9452805632]),
-    'ma512_n4': ((512, 448, 384), (384, 384, 510), 115164,
-                 [3768088064, 3754872832, 3756371968, 3755782144]),
     'tct2k_n1': ((256, 1900, 3000), (118, 360, 240), 42480,
                  [29262431744]),
     'tct2k_n2': ((256, 1900, 3000), (118, 360, 240), 42480,
-                 [40081962496, 17882421760]),
+                 [14972986368, 14962369024]),
     'tct2k_n4': ((256, 1900, 3000), (118, 360, 240), 42480,
-                 [34051462656, 34081272320, 34081272320, 34081102336]),
+                 [20367477760, 20363603968, 20363603968, 20363433984]),
     'tct1k_n1': ((256, 950, 1500), (59, 180, 120), 10620,
                  [8227791872]),
-    'tct1k_n2': ((256, 950, 1500), (59, 180, 120), 10620,
-                 [11882288128, 5844949504]),
-    'tct1k_n4': ((256, 950, 1500), (59, 180, 120), 10620,
-                 [29162906112, 29161971200, 29161972224, 29161972224]),
 }
+MEASURED_ARM_PIXEL_BATCH = 8192
 # The granularity list those runs used, which is the library default.
 MEASURED_GRANULARITY = (1, 2, 4, 8, 16, 32, 64, 128, 128, 128, 128)
 MEASURED_VISITED = (4, 16, 64)
@@ -1621,6 +1625,7 @@ def _measured_arm_ledger(arm):
         # The translation arms carry no cylindrical mask, so their masked set
         # IS the whole grid and their hessian back-projects the grid directly.
         hessian_masked=num_pixels < recon_shape[0] * recon_shape[1],
+        pixel_batch=MEASURED_ARM_PIXEL_BATCH,
         view_charge=_measured_view_charge(sinogram_shape, recon_shape,
                                           n_devices),
         torch_body_directions=('forward', 'back'))
@@ -1644,11 +1649,13 @@ def test_the_torch_body_ledger_covers_every_measured_peak(arm):
 
 def test_the_torch_body_over_charge_stays_inside_its_band():
     """The other side of the floor: an over-charge spreads a reconstruction
-    over more devices than it needs, so the band is asserted too.  It is
-    wider than CALIBRATION_BAND because one slab count covers two geometries
-    that hold different numbers of slabs, and because two measured two-device
-    runs peaked twice as high on one device as on the other from identical
-    shards.
+    over more devices than it needs, so the band is asserted too.
+
+    The band is wider than CALIBRATION_BAND, and the module records the two
+    measurements that set its width.  The arms pinned above sit inside it:
+    the widest over-charge among them is about 4.2x, on tct1k_n1, against a
+    bound of 5.8x.  The bound is not narrowed to match, because it was set by
+    a measurement rather than by this set of arms.
     """
     low, high = _memory_ledger.TORCH_BODY_CALIBRATION_BAND
     assert low == _memory_ledger.CALIBRATION_BAND[0]
@@ -1667,89 +1674,78 @@ def test_format_calibration_judges_against_the_band_it_is_given():
         rows, band=_memory_ledger.TORCH_BODY_CALIBRATION_BAND)
 
 
-# ── the forward's column gather ──────────────────────────────────────────────
+# ── the forward's cylinder transfer ──────────────────────────────────────────
 @pytest.mark.parametrize('aligned', (False, True),
                          ids=('two-fan', 'row-aligned'))
-def test_the_column_gather_swaps_the_band_copy_for_a_gathered_cylinder(aligned):
-    """The two states of the same phase.  Walking slice bands leaves a
-    broadcast band resident on every view-owner; gathering columns leaves a
-    cylinder that is one pixel batch wide and the whole slice axis tall, and
-    no band at all.  Both forward phases carry the swap.
+def test_the_cylinder_transfer_charges_its_cylinders(aligned):
+    """The transfer leaves cylinders resident on every view-owner: one pixel
+    batch wide and the whole slice axis tall.  Both forward phases carry them.
 
     Both GEOMETRIES are priced by the same arithmetic, and the parametrization
-    is the claim: what a gather holds is set by the shape it assembles -- one
+    is the claim: what a transfer holds is set by the shape it
+    assembles -- one
     pixel batch by the whole device-form slice axis -- and not by whether the
     geometry's detector rows track its slices.  The two take the path for
     different reasons and pay the same term for it.
 
-    THREE such cylinders are charged, not one: the driver gathers one batch
+    THREE such batches are charged, not one: the driver transfers one
+    batch
     ahead of the projection that reads it, so the widest instant holds the
     cylinder about to be projected, the pieces arriving for the batch after
     it, and their concatenation.  The count is written out here rather than
     read from the module, so that changing the constant alone cannot move the
     charge without this test noticing."""
     slices, batch = 32, 100                  # make_plan's slice axis
-    banded = estimate_peak_device_bytes(
-        make_plan(n_devices=2, rows_track_slices=aligned))
-    gathered = estimate_peak_device_bytes(
+    transferred = estimate_peak_device_bytes(
         make_plan(n_devices=2, rows_track_slices=aligned,
-                  column_pixel_batch=batch))
+                  pixel_batch=batch))
     for fragment in ('initial forward projection',
                      'subset delta forward projection'):
-        walked = dict(_named(banded, fragment).terms)
-        columns = dict(_named(gathered, fragment).terms)
-        assert walked['broadcast band'][0] > 0, fragment
-        assert walked['column cylinder'] == [0, 0], fragment
-        assert columns['broadcast band'] == [0, 0], fragment
-        assert columns['column cylinder'] == [3 * batch * slices * 4] * 2, \
-            fragment
+        terms = dict(_named(transferred, fragment).terms)
+        assert (terms['transferred cylinders']
+                == [3 * batch * slices * 4] * 2), fragment
 
 
-def test_the_gathered_cylinder_is_capped_by_the_pass_it_covers():
-    """A batch wider than the pixel set gathers the pixel set: the charge
+def test_the_transferred_cylinders_are_capped_by_the_pass_they_cover():
+    """A batch wider than the pixel set transfers the pixel set: the charge
     follows what one call is actually handed, which is what keeps the term
     honest at the small end without a separate rule.
 
-    Such a pass runs as a single batch and so gathers nothing ahead, holding
+    Such a pass runs as a single batch and so transfers nothing ahead,
+    holding
     two cylinders where the charge is three.  That over-charge is deliberate:
     the ledger's one hard rule is that it may never charge less than a run
     needs, and one term that covers the widest instant is simpler than a
     second rule for the passes that fall short of it."""
     slices, pixels = 32, 800
     ledger = estimate_peak_device_bytes(
-        make_plan(n_devices=2, column_pixel_batch=10 ** 6))
+        make_plan(n_devices=2, pixel_batch=10 ** 6))
     terms = dict(_named(ledger, 'initial forward projection').terms)
-    assert terms['column cylinder'] == [3 * pixels * slices * 4] * 2
+    assert terms['transferred cylinders'] == [3 * pixels * slices * 4] * 2
 
 
-def test_the_gathered_cylinder_does_not_grow_with_the_device_count():
+def test_the_transferred_cylinders_do_not_grow_with_the_device_count():
     """The property that dissolves the objection to assembling whole
     cylinders: the term is the batch by the WHOLE slice axis on every
-    view-owner, so adding devices does not change it -- where the broadcast
-    band it replaces is a shard and halves with the count."""
-    charges, bands = [], []
+    view-owner, so adding devices does not change it."""
+    charges = []
     for n in (2, 4):
-        gathered = estimate_peak_device_bytes(
-            make_plan(n_devices=n, column_pixel_batch=100))
-        walked = estimate_peak_device_bytes(make_plan(n_devices=n))
-        charges.append(dict(_named(gathered, 'initial forward projection')
-                            .terms)['column cylinder'][0])
-        bands.append(dict(_named(walked, 'initial forward projection')
-                          .terms)['broadcast band'][0])
+        transferred = estimate_peak_device_bytes(
+            make_plan(n_devices=n, pixel_batch=100))
+        charges.append(dict(_named(transferred, 'initial forward projection')
+                            .terms)['transferred cylinders'][0])
     assert charges[0] == charges[1]
-    assert bands[1] == bands[0] // 2
-    # A single device never gathers: it holds the whole volume already.
+    # A single device never transfers: it holds the whole volume already.
     one = estimate_peak_device_bytes(
-        make_plan(n_devices=1, column_pixel_batch=100))
+        make_plan(n_devices=1, pixel_batch=100))
     assert dict(_named(one, 'initial forward projection')
-                .terms)['column cylinder'] == [0]
+                .terms)['transferred cylinders'] == [0]
 
 
-def test_the_column_gather_prices_the_call_it_actually_makes():
-    """The two terms that move with the new call shape.  One call is handed
-    the WHOLE device-form slice axis instead of a band, and one pixel batch
-    instead of every pixel of the pass, so the per-view cost model must be
-    asked those two numbers."""
+def test_the_cylinder_transfer_prices_the_call_it_actually_makes():
+    """The two numbers that set the forward's call shape.  One call is handed
+    the WHOLE device-form slice axis, and one pixel batch rather than every
+    pixel of the pass, so the per-view cost model must be asked those two."""
     asked = []
 
     def charge(direction, num_pixels, band_cols):
@@ -1757,28 +1753,24 @@ def test_the_column_gather_prices_the_call_it_actually_makes():
         return 4, 1024
 
     batch = 100
-    estimate_peak_device_bytes(make_plan(n_devices=2, view_charge=charge))
-    walked = [(p, c) for d, p, c in asked if d == 'forward']
-    asked.clear()
     estimate_peak_device_bytes(
-        make_plan(n_devices=2, view_charge=charge, column_pixel_batch=batch))
-    gathered = [(p, c) for d, p, c in asked if d == 'forward']
-    assert {c for _p, c in walked} == {16}          # one slice shard of 32
-    assert {c for _p, c in gathered} == {32}        # the whole slice axis
-    assert max(p for p, _c in walked) == 800        # the whole pass
-    assert max(p for p, _c in gathered) == batch
+        make_plan(n_devices=2, view_charge=charge, pixel_batch=batch,
+                  rows_track_slices=True))
+    transferred = [(p, c) for d, p, c in asked if d == 'forward']
+    assert {c for _p, c in transferred} == {32}     # the whole slice axis
+    assert max(p for p, _c in transferred) == batch
+    # The BACK call is handed a slice band instead, which is one shard here,
+    # and every pixel of its pass rather than a cylinder batch.
+    back = [(p, c) for d, p, c in asked if d == 'back']
+    assert {c for _p, c in back} == {16}            # one slice shard of 32
+    assert max(p for p, _c in back) > batch
 
 
-def test_plan_from_model_reads_the_resolved_pixel_batch(monkeypatch):
+def test_plan_from_model_reads_the_resolved_pixel_batch():
     """The ledger must not re-derive the driver's rule.  It asks the model
     for the batch it would actually walk, so a changed default or an override
-    reaches the charge without a second edit here.
-
-    The environment knob is cleared first, because the first assertion reads
-    the default and a suite run may be forcing the path on around it."""
-    from mbirtorch.tomography_model import (COLUMN_GATHER_ENV_VAR,
-                                            FORWARD_PIXEL_BATCH)
-    monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
+    reaches the charge without a second edit here."""
+    from mbirtorch.tomography_model import FORWARD_PIXEL_BATCH
     cell = (8, 8, 8)
     angles = np.linspace(0, 2 * np.pi, cell[0], endpoint=False)
     model = mbirtorch.ConeBeamModel(cell, angles, source_detector_dist=32,
@@ -1786,29 +1778,24 @@ def test_plan_from_model_reads_the_resolved_pixel_batch(monkeypatch):
     model.configure_devices(devices=['cpu'])
     model.set_params(no_warning=True, verbose=0)
     devices = ['cpu', 'cpu']
-    # Unset means the gather (the shipped default), so the charge is present
-    # at the shipped batch; refusing the gather removes it.
+    # Every projection plan carries the batch, because the cylinder
+    # transfer is the only multi-device forward.
     assert _memory_ledger.plan_from_model(
-        model, devices).column_pixel_batch == FORWARD_PIXEL_BATCH
-    model.forward_column_gather = False
-    assert _memory_ledger.plan_from_model(
-        model, devices).column_pixel_batch is None
-    model.forward_column_gather = True
+        model, devices).pixel_batch == FORWARD_PIXEL_BATCH
     model.forward_project_pixel_batch = 512
     assert _memory_ledger.plan_from_model(
-        model, devices).column_pixel_batch == 512
+        model, devices).pixel_batch == 512
     # The row-aligned geometry takes the same path, so the same resolution has
-    # to reach its charge -- present by default, absent when refused, exactly
-    # as on cone.
+    # to reach its charge.
     par = mbirtorch.ParallelBeamModel(cell, np.linspace(0, np.pi, cell[0],
                                                         endpoint=False))
     par.configure_devices(devices=['cpu'])
     par.set_params(no_warning=True, verbose=0)
     assert _memory_ledger.plan_from_model(
-        par, devices).column_pixel_batch == FORWARD_PIXEL_BATCH
-    par.forward_column_gather = False
+        par, devices).pixel_batch == FORWARD_PIXEL_BATCH
+    par.forward_project_pixel_batch = 256
     assert _memory_ledger.plan_from_model(
-        par, devices).column_pixel_batch is None
+        par, devices).pixel_batch == 256
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────

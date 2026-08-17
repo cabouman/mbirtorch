@@ -35,17 +35,11 @@ from .projectors import Projectors, maybe_compile
 
 _F32_EPS = float(np.finfo(np.float32).eps)
 
-# ── the multi-device forward's column gather ─────────────────────────────────
-# Pixel columns per gathered cylinder in the multi-device forward; bounds the
-# cross-device transient.  Set forward_project_pixel_batch on the model to
+# ── the multi-device forward's cylinder transfer ─────────────────────────────
+# Pixels per transferred cylinder batch in the multi-device forward; bounds
+# the cross-device transient.  Set forward_project_pixel_batch on the model to
 # override.
 FORWARD_PIXEL_BATCH = 8192
-
-# This environment variable forces the column gather on or off regardless
-# of the model attribute.  It is read per call.
-COLUMN_GATHER_ENV_VAR = 'MBIRTORCH_FORWARD_COLUMN_GATHER'
-_COLUMN_GATHER_ON_VALUES = ('1', 'true', 'yes', 'on')
-_COLUMN_GATHER_OFF_VALUES = ('0', 'false', 'no', 'off')
 
 
 # ── compiled updater glue (module level, one compile per process) ─────────────
@@ -574,7 +568,7 @@ class TomographyModel(ParameterHandler):
             sinogram, pixel_indices, coeff_power=coeff_power)
 
     def _band_pool(self, n):
-        """The thread pool for a banded projection's per-band fan-outs:
+        """The thread pool for a sharded projection's per-device fan-outs:
         reuse the recon-loop pool when one is active (vcd_recon creates it
         once for the whole loop), else a private pool for this call."""
         if self._per_device_pool is not None:
@@ -583,41 +577,23 @@ class TomographyModel(ParameterHandler):
 
     @staticmethod
     def _slice_band_length(slices_per_dev, n_dev, num_pixels, fixed_band=None):
-        """Band length B for streaming the slice axis in the banded drivers.
+        """Band length B for streaming the slice axis in the banded back
+        projection.
 
         The default is one band per slice-owner (the whole shard): sub-bands
         were measured to be slower, and a single device never runs the banded
-        drivers.  A smaller B reduces per-band memory; set
-        ``forward_project_slice_band`` / ``back_project_slice_band`` on the
-        model to opt in.  The result is capped at slices_per_dev so a band
-        never crosses a slice-owner boundary."""
+        driver.  A smaller B reduces per-band memory; set
+        ``back_project_slice_band`` on the model to opt in.  The result is
+        capped at slices_per_dev so a band never crosses a slice-owner
+        boundary."""
         b = fixed_band if fixed_band else slices_per_dev
         return min(int(b), slices_per_dev)
 
-    def _column_gather_forward(self):
-        """Whether the multi-device forward gathers pixel COLUMNS instead of
-        walking slice bands.
-
-        The gather runs when the geometry declares ``column_gather_geometry``
-        (all four projection geometries do, each on its own measurement) and
-        the ``forward_column_gather`` switch is not False.  The environment
-        variable overrides the switch either way."""
-        if not self.column_gather_geometry:
-            return False
-        override = os.environ.get(COLUMN_GATHER_ENV_VAR, '').strip().lower()
-        if override in _COLUMN_GATHER_ON_VALUES:
-            return True
-        if override in _COLUMN_GATHER_OFF_VALUES:
-            return False
-        switch = getattr(self, 'forward_column_gather', None)
-        return True if switch is None else bool(switch)
-
     def _forward_pixel_batch(self):
-        """How many pixel columns one gathered cylinder covers.
+        """How many pixels one transferred cylinder batch covers.
 
         :data:`FORWARD_PIXEL_BATCH` carries the value and its provenance.
-        ``forward_project_pixel_batch`` on the model overrides it, the same
-        way ``forward_project_slice_band`` overrides the band rule.  The
+        ``forward_project_pixel_batch`` on the model overrides it.  The
         memory ledger calls THIS method rather than re-deriving the number,
         so a changed default cannot leave the charge behind."""
         fixed = getattr(self, 'forward_project_pixel_batch', None)
@@ -644,14 +620,13 @@ class TomographyModel(ParameterHandler):
         return bounds
 
     def _banded_setup(self, pixel_indices):
-        """Shared setup for the banded sharded projectors: per-owner view
-        spans, recon band ranges, and the pixel indices placed once per
-        device."""
+        """Shared setup for the sharded projectors: per-owner view spans,
+        recon slice ranges, and the pixel indices placed once per device."""
         sp, rp = self.sino_placement, self.recon_placement
         if type(self)._view_batch_bodies is TomographyModel._view_batch_bodies:
             raise NotImplementedError(
                 f'{type(self).__name__} has no per-view-batch projection '
-                'bodies, so the banded multi-device drivers cannot run.')
+                'bodies, so the multi-device drivers cannot run.')
         # Half-open (start, end) view spans and slice-band ranges, in device
         # order.  A span can be empty: with more devices than views, or more
         # devices than slices, the trailing devices own nothing on that axis
@@ -664,114 +639,38 @@ class TomographyModel(ParameterHandler):
         return sp, rp, view_spans, band_ranges, idx_per_dev
 
     def _sparse_forward_project_sharded(self, voxel_shards, pixel_indices):
-        """The banded sharded forward: visit slice-owners in global slice
-        order, broadcast each band to every view-owner, forward-project each
-        owner's OWN views (one producer per detector row -- no reduce), and
-        concatenate the row-bands into per-view-owner sinogram shards.  A
-        trivial placement is the plain driver, wrapped."""
+        """The sharded forward.  A trivial placement is the plain driver,
+        wrapped; a multi-device placement is the cylinder transfer in
+        :meth:`_sparse_forward_project_cylinders`.  This method stays the one
+        entry point to the multi-device forward, so a caller and the speed
+        guard both have a single name to refer to."""
         if voxel_shards.placement.is_trivial:
             return _sharding.Shards(
                 [self.projector_functions._sparse_forward_project_single_device(
                     voxel_shards.tensors[0], pixel_indices)],
                 self.sino_placement)
-        if self._column_gather_forward():
-            return self._sparse_forward_project_columns(voxel_shards,
-                                                        pixel_indices)
-        sp, rp, view_spans, band_ranges, idx_per = self._banded_setup(pixel_indices)
-        pf = self.projector_functions
-        aligned = self.rows_track_slices
-        view_bands = [[] for _ in sp.devices]
-        partial_shards = None
-        num_rows = int(self.get_params('sinogram_shape')[1])
-        num_channels = int(self.get_params('sinogram_shape')[2])
-        num_pixels = int(idx_per[0].shape[0])
-        fixed_band = getattr(self, 'forward_project_slice_band', None)
-        # Bands go only to view-owners that project something: an owner with
-        # no views (the sparse-view extension) receives no copies and
-        # produces empty row-bands, so its block assembles as pure zeros.
-        proj_devs = [d for i, d in enumerate(sp.devices)
-                     if view_spans[i][1] > view_spans[i][0]]
-        with self._band_pool(sp.n_devices) as pool:
-            for oi, (odev, (s0, s1)) in enumerate(band_ranges):  # oi = owner index, odev = owner device
-                # Stream the owner's shard in sub-bands: each broadcast copy
-                # and per-band transient is band-sized, not shard-sized.  An
-                # owner with no slices yields no sub-bands at all.
-                band_len = self._slice_band_length(
-                    s1 - s0, sp.n_devices, num_pixels, fixed_band)
-                for (l0, l1) in self._balanced_slice_bounds(s1 - s0, band_len):
-                    band = voxel_shards.tensors[oi][:, l0:l1]
-                    copies = _sharding.broadcast_band_to_views(
-                        band, proj_devs, self.dev2dev_safe)
-                    if aligned:
-                        # Rows track slices 1:1 (parallel): each band yields
-                        # the matching ROW-band, a single producer per row --
-                        # concat (owners in slice order, sub-bands in order).
-                        # A no-view owner yields an empty row-band.
-                        row_bands = _sharding.run_per_device(
-                            sp.devices,
-                            lambda i, d: (
-                                pf.sparse_forward_project_view_range(
-                                    copies[d], idx_per[i], view_spans[i],
-                                    dev_index=i)
-                                if view_spans[i][1] > view_spans[i][0] else
-                                torch.zeros((0, l1 - l0, num_channels),
-                                            dtype=voxel_shards.dtype,
-                                            device=d)),
-                            executor=pool)
-                        for i in range(sp.n_devices):
-                            view_bands[i].append(row_bands[i])
-                    else:
-                        # A slice band spreads over MANY rows (cone): each
-                        # band yields a full-row PARTIAL shard -- accumulate.
-                        # A no-view owner yields an empty partial.
-                        partials = _sharding.run_per_device(
-                            sp.devices,
-                            lambda i, d: (
-                                pf.sparse_forward_project_view_range(
-                                    copies[d], idx_per[i], view_spans[i],
-                                    slice_start=s0 + l0, dev_index=i)
-                                if view_spans[i][1] > view_spans[i][0] else
-                                torch.zeros((0, num_rows, num_channels),
-                                            dtype=voxel_shards.dtype,
-                                            device=d)),
-                            executor=pool)
-                        if partial_shards is None:
-                            partial_shards = list(partials)
-                        else:
-                            for i in range(sp.n_devices):
-                                partial_shards[i].add_(partials[i])
-                        # This release must come before the next band's
-                        # run_per_device call.  Without it, this band's
-                        # partial stays live on every device through the next
-                        # projection.
-                        partials = None
-        if aligned:
-            tensors = [b[0] if len(b) == 1 else torch.cat(b, dim=1)
-                       for b in view_bands]
-        else:
-            tensors = partial_shards
-        return _sharding.Shards(tensors, sp)
+        return self._sparse_forward_project_cylinders(voxel_shards,
+                                                      pixel_indices)
 
-    def _sparse_forward_project_columns(self, voxel_shards, pixel_indices):
-        """The multi-device forward as a pixel-batched column gather: each
-        view-owner walks the pixel axis in batches, gathers each batch's
-        full-height cylinder from every slice-owner, and makes ONE projector
-        call per batch over its own views and the whole slice range.  The
-        alternative to the banded walk, for the geometries
-        :meth:`_column_gather_forward` admits: banding costs a two-fan
-        geometry a full call per band, and a row-aligned kernel runs about
-        twice as fast on full-width blocks.  The operator is unchanged, so
-        the forward stays the adjoint of the sharded back, and the back
-        driver is untouched.  ``forward_project_slice_band`` has no effect
-        here.  The pixel batch bounds the transfer instead, and the memory
-        ledger charges it (COLUMN_GATHER_RESIDENTS)."""
+    def _sparse_forward_project_cylinders(self, voxel_shards, pixel_indices):
+        """The multi-device forward as a pixel-batched cylinder transfer: each
+        view-owner walks the pixel axis in batches, collects each batch's
+        full-height cylinders from every slice-owner, and makes ONE projector
+        call per batch over its own views and the whole slice range.  This is
+        the multi-device forward on all four projection geometries; it was
+        measured faster than the slice-banded walk it replaced on each of them
+        in turn (H100, 2026-08-10 through 2026-08-17, records in the plans
+        repository).  The operator is unchanged, so the forward stays the
+        adjoint of the sharded back, and the back driver is untouched.  The
+        pixel batch bounds the cross-device transfer, and the memory ledger
+        charges it (CYLINDER_TRANSFER_RESIDENTS)."""
         sp, rp, view_spans, _band_ranges, idx_per = self._banded_setup(
             pixel_indices)
         pf = self.projector_functions
         num_channels = int(self.get_params('sinogram_shape')[2])
         # Block height per call.  A row-aligned body sizes its output by the
-        # gathered cylinder, which spans the whole slice axis; a two-fan body
-        # returns the detector rows.
+        # transferred cylinders, which span the whole slice axis; a two-fan
+        # body returns the detector rows.
         num_rows = (int(rp.axis_len) if self.rows_track_slices
                     else int(self.get_params('sinogram_shape')[1]))
         num_pixels = int(idx_per[0].shape[0])
@@ -790,25 +689,25 @@ class TomographyModel(ParameterHandler):
             local_idx = idx_per[i]
             owned = None
 
-            def gather(k):
+            def transfer(k):
                 p0, p1 = batch_bounds[k]
-                return _sharding.gather_column_band_async(
+                return _sharding.transfer_cylinder_batch_async(
                     shards, p0, p1, dev, self.dev2dev_safe)
 
-            # The batch after the one being projected, gathered ahead of it.
-            # A pass of one batch has nothing to gather ahead, and no pixels
-            # at all leaves this empty.
-            ahead = gather(0) if batch_bounds else None
+            # The batch after the one being projected, transferred ahead of
+            # it.  A pass of one batch has nothing to transfer ahead, and no
+            # pixels at all leaves this empty.
+            ahead = transfer(0) if batch_bounds else None
             for k, (p0, p1) in enumerate(batch_bounds):
                 full_cyl, ready = ahead
-                # The next batch's gather is issued before this batch is
+                # The next batch's transfer is issued before this batch is
                 # projected.  The copies run on separate per-device streams,
                 # so they move while this projection runs.  Each batch
                 # carries an event, and the wait below keeps a projection
                 # from starting before its batch's copies finish.  Off CUDA
-                # the gather is synchronous and the wait does nothing.
-                ahead = gather(k + 1) if k + 1 < len(batch_bounds) else None
-                _sharding.wait_for_column_band(dev, ready)
+                # the transfer is synchronous and the wait does nothing.
+                ahead = transfer(k + 1) if k + 1 < len(batch_bounds) else None
+                _sharding.wait_for_cylinder_batch(dev, ready)
                 # The first batch's projection allocates the owner's block.
                 # Later batches add into that block inside the projector's
                 # view loop, which saves a full-block allocation and pass per
@@ -822,23 +721,23 @@ class TomographyModel(ParameterHandler):
                     pf.sparse_forward_project_view_range(
                         full_cyl, local_idx[p0:p1], (v0, v1), slice_start=0,
                         dev_index=i, accumulate_into=owned)
-                # The cylinder is released once its projection is issued.
-                # The next batch is already resident, which is the third
-                # cylinder the memory ledger charges.
+                # The cylinder batch is released once its projection is
+                # issued.  The next batch is already resident, which is the
+                # third set of cylinders the memory ledger charges.
                 full_cyl = None
             if owned is None:
-                # No pixels at all: the owner still owes its views' block,
-                # and the banded form would have produced it as zeros too.
+                # No pixels at all: the owner still owes its views' block, and
+                # a block with no voxels behind it is zero everywhere.
                 owned = torch.zeros((v1 - v0, num_rows, num_channels),
                                     dtype=voxel_shards.dtype, device=dev)
             return owned
 
         # One fan-out covers the whole call: the pixel loop inside the worker
-        # issues each device's gathers from the thread that consumes them.
+        # issues each device's transfers from the thread that consumes them.
         # Both slice-owners and view-owners get their copy streams ordered.
-        gather_devices = (list(voxel_shards.placement.devices)
-                          + list(sp.devices))
-        _sharding.open_copy_streams(gather_devices)
+        transfer_devices = (list(voxel_shards.placement.devices)
+                            + list(sp.devices))
+        _sharding.open_copy_streams(transfer_devices)
         try:
             with self._band_pool(sp.n_devices) as pool:
                 tensors = _sharding.run_per_device(sp.devices, worker,
@@ -847,7 +746,7 @@ class TomographyModel(ParameterHandler):
             # Closed even if a worker raised: copies that were already issued
             # are still in flight, and the shards they read must not be
             # overwritten under them.
-            _sharding.close_copy_streams(gather_devices)
+            _sharding.close_copy_streams(transfer_devices)
         return _sharding.Shards(tensors, sp)
 
     def _sparse_back_project_sharded(self, sino_shards, pixel_indices,
@@ -1473,12 +1372,6 @@ class TomographyModel(ParameterHandler):
     # True).  False is the base so a geometry that forgets to declare
     # itself is never mis-assembled by the row-aligned fast path.
     rows_track_slices = False
-
-    # Whether the multi-device forward MAY gather pixel columns (see
-    # _column_gather_forward).  All four projection geometries have now been
-    # measured on it and all four declare it True.  False stays the base so a
-    # geometry added later walks slice bands until it has been measured too.
-    column_gather_geometry = False
 
     # The fewest pixels this geometry's COMPILED bodies may be called with;
     # narrower calls are padded up outside the compiled region (see

@@ -216,17 +216,22 @@ COST_INPUT_FILES = ('triton_parallel.py', 'triton_cone.py', 'projectors.py',
 
 #: Methods of TomographyModel that drive the multi-device projections.  The
 #: rest of that module moves for reasons unrelated to projection cost, so the
-#: hash is taken over these sources rather than the whole file.  The column
-#: gather is a third driver rather than a branch of the first, so it is named
-#: here in its own right; leaving it out would let the pixel batch it walks
-#: change without anything noticing.
+#: hash is taken over these sources rather than the whole file.  The cylinder
+#: transfer is named here in its own right, separately from the funnel that
+#: calls it; leaving it out would let the pixel batch it walks change without
+#: anything noticing.
 COST_INPUT_METHODS = ('_sparse_forward_project_sharded',
-                      '_sparse_forward_project_columns',
+                      '_sparse_forward_project_cylinders',
                       '_sparse_back_project_sharded')
 
 #: sha256 of each cost input as of the measurement above -- the recorded
 #: ("blessed") values the live check compares against.  Re-record them with
 #: ``python dev_scripts/refresh_widening_floors.py --bless``.
+#:
+#: The forward driver key still carries the method's former name,
+#: ``_sparse_forward_project_columns``, because these values are left exactly
+#: as they were measured and TABLE_CHECKSUM binds them.  The re-bless that
+#: clears the staleness note also rewrites the key.
 BLESSED_COST_HASHES = {
     'TomographyModel._sparse_back_project_sharded':
         'f73fa28f32d2393fac3f06139d8ddeccc55260fceb28bbca7f102334839fb5a4',

@@ -1,17 +1,17 @@
-"""Multi-device units: Placement, Shards, safe transfer, and the
-banded adjoint pair.  Runs everywhere: placement/banding logic uses two
-'virtual' CPU devices (['cpu', 'cpu'] -- transfers are no-ops but every
-range/pad/mask/assembly path executes), and real cross-device movement uses
-the cpu<->mps pair when MPS is available (the local analog of the 2-GPU
-platform)."""
+"""Multi-device units: Placement, Shards, safe transfer, the forward's
+cylinder transfer, and the back projection's band reduce.  Runs everywhere:
+placement/banding logic uses two 'virtual' CPU devices (['cpu', 'cpu'] --
+transfers are no-ops but every range/pad/mask/assembly path executes), and
+real cross-device movement uses the cpu<->mps pair when MPS is available (the
+local analog of the 2-GPU platform)."""
 
 import numpy as np
 import pytest
 import torch
 
-from mbirtorch._sharding import (Placement, Shards, broadcast_band_to_views,
-                                 device_pool, is_dev2dev_safe, move_shard,
-                                 run_per_device, sum_band_to_owner)
+from mbirtorch._sharding import (Placement, Shards, device_pool,
+                                 is_dev2dev_safe, move_shard, run_per_device,
+                                 sum_band_to_owner)
 
 
 def test_placement_ranges_split_evenly_within_one():
@@ -70,13 +70,10 @@ def test_the_split_is_balanced_and_the_gather_keeps_every_element():
         assert np.array_equal(sh.gather(), full), (size, count)
 
 
-def test_banded_adjoint_pair_values():
-    # broadcast then reduce reproduces a single-device sum exactly on the
+def test_band_reduce_values():
+    # The back projection's reduce reproduces a single-device sum on the
     # virtual 2-CPU placement (transfers are no-ops; the pattern is real).
     owners = [torch.device("cpu"), torch.device("cpu")]
-    band = torch.rand(5, 3)
-    copies = broadcast_band_to_views(band, owners)
-    assert all(torch.equal(c, band) for c in copies.values())
     partials = [torch.rand(5, 3) for _ in owners]
     total = sum_band_to_owner(partials, owners[0])
     ref_total = partials[0] + partials[1]
@@ -159,9 +156,9 @@ def test_real_cross_device_transfer_cpu_mps():
     devs = ["cpu", "mps"]
     assert is_dev2dev_safe(devs)
     band = torch.rand(64, 16)
-    copies = broadcast_band_to_views(band, [torch.device(d) for d in devs])
+    copies = {torch.device(d): move_shard(band, torch.device(d)) for d in devs}
     assert copies[torch.device("mps")].device.type == "mps"
-    # A broadcast copies bytes, so the round trip is exact, not merely close.
+    # A transfer copies bytes, so the round trip is exact, not merely close.
     assert torch.equal(copies[torch.device("mps")].cpu(), band)
     partials = [copies[torch.device("cpu")] * 2.0,
                 copies[torch.device("mps")] * 3.0]
@@ -747,11 +744,12 @@ def test_cone_sharded_vcd_recon_matches_single_device():
 
 
 def test_sub_band_streaming_matches_unstreamed():
-    # Force 2-slice sub-bands through both banded drivers (the default
+    # Force 2-slice sub-bands through the banded back driver (the default
     # bounds give one band at test sizes) on a non-dividing parallel cell AND
-    # a cone cell: values must match the single-device references exactly at
-    # the banded drivers' established tolerances -- streaming is a pure
-    # partition of the work.
+    # a cone cell: values must match the single-device references at the
+    # sharded drivers' established tolerances -- streaming is a pure partition
+    # of the work.  The forward, which transfers whole cylinders and walks no
+    # bands, is checked on the same models and must not move either.
     import mbirtorch
     sino_shape = (9, 7, 8)
     angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
@@ -769,7 +767,6 @@ def test_sub_band_streaming_matches_unstreamed():
     m2.configure_devices(devices=["cpu"])
     m2.set_params(no_warning=True, verbose=0)
     m2.configure_devices(devices=["cpu", "cpu"])
-    m2.forward_project_slice_band = 2
     m2.back_project_slice_band = 2
     fwd = m2._gather_sinogram(m2.forward_project(vol, output_sharded=True))
     bp = m2._gather_recon(m2.back_project(sino, output_sharded=True))
@@ -792,7 +789,6 @@ def test_sub_band_streaming_matches_unstreamed():
     c2.configure_devices(devices=["cpu"])
     c2.set_params(no_warning=True, verbose=0)
     c2.configure_devices(devices=["cpu", "cpu"])
-    c2.forward_project_slice_band = 2
     c2.back_project_slice_band = 2
     cfwd = c2._gather_sinogram(c2.forward_project(cvol, output_sharded=True))
     cbp = c2._gather_recon(c2.back_project(csino, output_sharded=True))
@@ -801,10 +797,10 @@ def test_sub_band_streaming_matches_unstreamed():
 
 
 def test_balanced_slice_bounds_tile_the_extent_and_stop_at_an_empty_shard():
-    # The band tiling both banded drivers walk.  A slice-owner with no slices
-    # arrives with an extent of 0 and a band length of 0, which the ceil
-    # division cannot take, so the answer there is no bands and the drivers'
-    # loops run zero times.
+    # The band tiling the banded back driver walks.  A slice-owner with no
+    # slices arrives with an extent of 0 and a band length of 0, which the
+    # ceil division cannot take, so the answer there is no bands and the
+    # driver's loop runs zero times.
     import mbirtorch
     bounds = mbirtorch.TomographyModel._balanced_slice_bounds
     assert bounds(0, 0) == [] and bounds(0, 4) == []
@@ -1032,92 +1028,83 @@ def test_sparse_view_more_devices_than_views():
     assert crel < 5e-3, crel   # same calibration as the parallel case above
 
 
-# ── the forward's column gather (default off) ────────────────────────────────
+# ── the forward's cylinder transfer ──────────────────────────────────────────
 # What may FAIL here, and what may only be recorded.  The value bar these
 # tests hold is the one the library already ships: the kernel-parity floor the
 # suites above enforce, at the 1e-5 relative these cone cases use on CPU.  The
-# multi-GPU measurement also registered an EXPECTATION beside that floor -- the
-# column gather sat about 1.5e-06 relative from the one-device anchor at the
-# 1024-class cell (measured 2026-08-10 on four H100s, job mg10), against a
-# banded walk that sat at its own repeat floor.  That expectation is recorded
-# so a later reading well outside it is visible to a human weighing the
-# tradeoff; it is deliberately NOT a threshold, and nothing here asserts it.
-# The distances below are printed for that comparison.  On CPU the runs are
-# deterministic and the gather's calls are the single-device call shape, so
+# multi-GPU measurement also registered an EXPECTATION beside that floor.  The
+# cylinder transfer sat about 1.5e-06 relative from the one-device anchor at
+# the 1024-class cell, measured 2026-08-10 on four H100s in job mg10.  That
+# expectation is recorded so a later reading well outside it is visible to a
+# human; it is deliberately NOT a threshold, and nothing here asserts it.  The
+# distances below are printed for that comparison.  On CPU the runs are
+# deterministic and the transfer's calls are the single-device call shape, so
 # what these tests do assert is exact-path mechanics rather than that bar.
-def _cone_column_case(devices, cell=(8, 8, 8), pixel_batch=None):
-    """A cone model on virtual CPU devices with the column gather switched
-    on, plus its single-device reference."""
+def _cone_cylinder_case(devices, cell=(8, 8, 8), pixel_batch=None):
+    """A cone model on virtual CPU devices, plus its single-device
+    reference.  The multi-device forward is the cylinder transfer."""
     m, idx, vals, sino, ref_fwd, ref_back = _cone_banded_case(devices, cell)
-    m.forward_column_gather = True
     if pixel_batch is not None:
         m.forward_project_pixel_batch = pixel_batch
-    assert m._column_gather_forward()
     return m, idx, vals, sino, ref_fwd, ref_back
 
 
-def test_gather_column_band_assembles_the_full_height_cylinder():
+def test_transfer_cylinder_batch_assembles_the_full_height_cylinder():
     # The primitive: every slice-owner's rows [p0:p1] moved to one target and
     # concatenated along the SLICE axis, in shard (global slice) order.  A
     # single shard short-circuits the concatenation.
-    from mbirtorch._sharding import gather_column_band
+    from mbirtorch._sharding import transfer_cylinder_batch
     rng = np.random.default_rng(11)
     full = torch.as_tensor(rng.standard_normal((9, 6)).astype(np.float32))
     shards = [full[:, 0:2].contiguous(), full[:, 2:4].contiguous(),
               full[:, 4:6].contiguous()]
-    cyl = gather_column_band(shards, 3, 7, torch.device("cpu"))
+    cyl = transfer_cylinder_batch(shards, 3, 7, torch.device("cpu"))
     assert cyl.shape == (4, 6)
     assert torch.equal(cyl, full[3:7])
     # A degenerate range is legal and empty; one shard is returned as itself.
-    empty = gather_column_band(shards, 5, 5, torch.device("cpu"))
+    empty = transfer_cylinder_batch(shards, 5, 5, torch.device("cpu"))
     assert empty.shape == (0, 6)
-    one = gather_column_band(shards[:1], 0, 9, torch.device("cpu"))
+    one = transfer_cylinder_batch(shards[:1], 0, 9, torch.device("cpu"))
     assert torch.equal(one, shards[0])
     # The host-bounce path is value-correct too (dev2dev_safe False).
-    bounced = gather_column_band(shards, 0, 9, torch.device("cpu"),
+    bounced = transfer_cylinder_batch(shards, 0, 9, torch.device("cpu"),
                                  dev2dev_safe=False)
     assert torch.equal(bounced, full)
 
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(),
                     reason="needs a second local device (mps)")
-def test_gather_column_band_moves_across_real_devices():
-    from mbirtorch._sharding import gather_column_band
+def test_transfer_cylinder_batch_moves_across_real_devices():
+    from mbirtorch._sharding import transfer_cylinder_batch
     full = torch.rand(32, 8)
     shards = [full[:, :4].contiguous().to("cpu"),
               full[:, 4:].contiguous().to("mps")]
-    cyl = gather_column_band(shards, 8, 16, torch.device("mps"))
+    cyl = transfer_cylinder_batch(shards, 8, 16, torch.device("mps"))
     assert cyl.device.type == "mps"
     assert torch.equal(cyl.cpu(), full[8:16])  # copies only, so exact
 
 
-def test_column_gather_matches_single_device_at_every_batch(monkeypatch):
+def test_cylinder_transfer_matches_single_device_at_every_batch():
     # The values gate on virtual CPU devices: a full-height call at
-    # slice_start=0 is the single-device call shape, so the gathered forward
+    # slice_start=0 is the single-device call shape, so the sharded forward
     # must reproduce the single-device values -- at one batch covering the
-    # pass, and at batches that force several.  The environment is cleared
-    # first so a suite run forcing the banded walk cannot unseat the gather
-    # this test is about -- the same pinning the banded tests do in reverse.
-    from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
-    monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
+    # pass, and at batches that force several.
     for n in (2, 3):
         for batch in (None, 1, 5, 10 ** 6):
-            m, idx, vals, _sino, ref_fwd, _ref_back = _cone_column_case(
+            m, idx, vals, _sino, ref_fwd, _ref_back = _cone_cylinder_case(
                 ["cpu"] * n, pixel_batch=batch)
             fwd = m._gather_sinogram(m.sparse_forward_project(vals, idx))
             rel = np.max(np.abs(fwd - ref_fwd)) / np.max(np.abs(ref_fwd))
-            print(f"cone column gather n={n} batch={batch}: rel {rel:.2e}")
+            print(f"cone cylinder transfer n={n} batch={batch}: rel {rel:.2e}")
             assert rel < 1e-5, (n, batch, rel)
 
 
-def test_column_gather_holds_the_adjoint_on_uneven_axes(monkeypatch):
-    # The back driver is untouched, so the pair must stay adjoint with the
-    # gather on -- on a cell whose axes do not divide (9 views and 7 slices
-    # over 2 devices), where the shards differ in length.
-    # The environment is cleared first, for the reason above.
-    from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
-    monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
-    m, idx, vals, sino, ref_fwd, ref_back = _cone_column_case(
+def test_cylinder_transfer_holds_the_adjoint_on_uneven_axes():
+    # The back driver walks slice bands where the forward moves whole
+    # cylinders, so
+    # the pair must stay adjoint -- on a cell whose axes do not divide (9
+    # views and 7 slices over 2 devices), where the shards differ in length.
+    m, idx, vals, sino, ref_fwd, ref_back = _cone_cylinder_case(
         ["cpu", "cpu"], cell=(9, 7, 8), pixel_batch=4)
     fwd = m.sparse_forward_project(vals, idx)
     back = m.sparse_back_project(sino, idx)
@@ -1132,31 +1119,24 @@ def test_column_gather_holds_the_adjoint_on_uneven_axes(monkeypatch):
     assert abs(lhs - rhs) / max(abs(rhs), 1e-30) < 1e-4, (lhs, rhs)
 
 
-def test_column_gather_replaces_the_band_broadcast(monkeypatch):
-    # The mechanics witness.  With the gather on, the cone forward must call
-    # gather_column_band and must NOT broadcast a band; each gather takes one
-    # piece per slice-owner and yields a cylinder that is the batch wide and
-    # the WHOLE slice axis tall; and each projector call runs at
-    # slice_start=0 over that whole axis for the owner's own views.  The
-    # environment is cleared first, for the reason above.
+def test_the_cylinder_transfer_assembles_one_batch_at_every_slice(monkeypatch):
+    # The mechanics witness.  The cone forward must call
+    # transfer_cylinder_batch; each transfer takes one piece per
+    # slice-owner and yields cylinders that are the batch wide and the
+    # WHOLE slice axis tall; and each projector call runs at
+    # slice_start=0 over that whole axis for the owner's own views.
     from mbirtorch import _sharding as sharding
-    from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
-    monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
     batch, n = 4, 2
-    m, idx, vals, _sino, _ref_fwd, _ref_back = _cone_column_case(
+    m, idx, vals, _sino, _ref_fwd, _ref_back = _cone_cylinder_case(
         ["cpu"] * n, pixel_batch=batch)
     slices = m.recon_placement.axis_len
-    gathers, broadcasts, calls = [], [], []
-    real_gather = sharding.gather_column_band
+    transfers, calls = [], []
+    real_gather = sharding.transfer_cylinder_batch
 
     def spy_gather(shard_tensors, p0, p1, target, dev2dev_safe=True):
         out = real_gather(shard_tensors, p0, p1, target, dev2dev_safe)
-        gathers.append((len(shard_tensors), p0, p1, tuple(out.shape)))
+        transfers.append((len(shard_tensors), p0, p1, tuple(out.shape)))
         return out
-
-    def spy_broadcast(*args, **kwargs):
-        broadcasts.append(args)
-        raise AssertionError("the column gather must not broadcast a band")
 
     real_call = m.projector_functions.sparse_forward_project_view_range
 
@@ -1168,16 +1148,14 @@ def test_column_gather_replaces_the_band_broadcast(monkeypatch):
                          slice_start=slice_start, dev_index=dev_index,
                          plan=plan, accumulate_into=accumulate_into)
 
-    monkeypatch.setattr(sharding, "gather_column_band", spy_gather)
-    monkeypatch.setattr(sharding, "broadcast_band_to_views", spy_broadcast)
+    monkeypatch.setattr(sharding, "transfer_cylinder_batch", spy_gather)
     monkeypatch.setattr(m.projector_functions,
                         "sparse_forward_project_view_range", spy_call)
     m.sparse_forward_project(vals, idx)
 
     expected_batches = -(-len(idx) // batch)
-    assert not broadcasts
-    assert len(gathers) == n * expected_batches
-    for pieces, p0, p1, shape in gathers:
+    assert len(transfers) == n * expected_batches
+    for pieces, p0, p1, shape in transfers:
         assert pieces == n                      # one piece per slice-owner
         assert shape == (p1 - p0, slices)       # the batch, at every slice
         assert p1 - p0 <= batch
@@ -1192,45 +1170,42 @@ def test_column_gather_replaces_the_band_broadcast(monkeypatch):
                           if span[1] > span[0]}
 
 
-def test_the_column_gather_runs_one_batch_ahead_of_the_projection(monkeypatch):
+def test_the_cylinder_transfer_runs_one_batch_ahead_of_the_projection(
+        monkeypatch):
     # The prefetch witness.  Each view-owner issues the NEXT pixel batch's
-    # gather before it projects the current batch, so that on real devices the
+    # transfer before it projects the current batch, so that on real
+    # devices the
     # copies feeding one projection can be moving while another projection
     # runs.  On virtual CPU devices nothing moves and nothing can be timed, so
     # what is asserted here is the ORDER the driver issues its work in, which
     # is the part of the change that has to hold on every device.
     #
     # The order one worker records is g0, g1, p0, g2, p1, ... , g(K-1), p(K-2),
-    # p(K-1): batch k+1's gather is issued before batch k is projected, the
-    # first gather runs before the loop, and the last batch has nothing to
-    # gather ahead of it.  The entry and exit of each projection are both
-    # recorded, so the witness is not merely that the gather precedes the
-    # accumulation -- it precedes the projector call entirely.
+    # p(K-1): batch k+1's transfer is issued before batch k is
+    # projected, the first transfer runs before the loop, and the last
+    # batch has nothing to transfer ahead of it.  The entry and exit of
+    # each projection are both recorded, so the witness is not merely
+    # that the transfer precedes the accumulation -- it precedes the
+    # projector call entirely.
     #
     # Each worker runs in its own thread, so events are kept per thread.  A
     # pool thread is allowed to run more than one worker when one finishes
     # before the next is submitted, and it would then record two workers'
     # sequences end to end; the check reads blocks rather than the whole list
     # so that it witnesses the order either way.
-    #
-    # The environment knob is cleared first, the way the tests around this one
-    # already do: it forces the gather off whatever the model says, so a suite
-    # run that sets it would otherwise decide what this test measures.
     import threading
     from mbirtorch import _sharding as sharding
-    from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
-    monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
     batch, n = 4, 2
-    m, idx, vals, _sino, ref_fwd, _rb = _cone_column_case(
+    m, idx, vals, _sino, ref_fwd, _rb = _cone_cylinder_case(
         ["cpu"] * n, pixel_batch=batch)
     n_batches = -(-len(idx) // batch)
     assert n_batches > 1                       # or there is no prefetch to see
     events = {}
-    real_gather = sharding.gather_column_band
+    real_gather = sharding.transfer_cylinder_batch
     real_call = m.projector_functions.sparse_forward_project_view_range
 
     def spy_gather(shard_tensors, p0, p1, target, dev2dev_safe=True):
-        # Recorded at ENTRY: what is being witnessed is when the gather is
+        # Recorded at ENTRY: what is being witnessed is when the transfer is
         # issued, not when it returns.
         events.setdefault(threading.get_ident(), []).append(f'g{p0 // batch}')
         return real_gather(shard_tensors, p0, p1, target, dev2dev_safe)
@@ -1239,7 +1214,7 @@ def test_the_column_gather_runs_one_batch_ahead_of_the_projection(monkeypatch):
                  dev_index=0, plan=None, accumulate_into=None):
         seq = events.setdefault(threading.get_ident(), [])
         # Number the projections within THIS worker, which begins at its own
-        # first gather, so that a thread running a second worker starts over
+        # first transfer, so that a thread running a second worker starts over
         # at zero rather than counting on from the first.
         first = len(seq) - 1 - seq[::-1].index('g0')
         k = sum(1 for e in seq[first:] if e.endswith('-in'))
@@ -1250,7 +1225,7 @@ def test_the_column_gather_runs_one_batch_ahead_of_the_projection(monkeypatch):
         seq.append(f'p{k}-out')
         return block
 
-    monkeypatch.setattr(sharding, "gather_column_band", spy_gather)
+    monkeypatch.setattr(sharding, "transfer_cylinder_batch", spy_gather)
     monkeypatch.setattr(m.projector_functions,
                         "sparse_forward_project_view_range", spy_call)
     fwd = m._gather_sinogram(m.sparse_forward_project(vals, idx))
@@ -1260,7 +1235,7 @@ def test_the_column_gather_runs_one_batch_ahead_of_the_projection(monkeypatch):
         if k + 1 < n_batches:
             expected.append(f'g{k + 1}')
         expected += [f'p{k}-in', f'p{k}-out']
-    assert events, "the column gather did not run"
+    assert events, "the cylinder transfer did not run"
     recorded = 0
     for seq in events.values():
         # Every worker of this cell owns real views, so each ran the whole
@@ -1270,7 +1245,7 @@ def test_the_column_gather_runs_one_batch_ahead_of_the_projection(monkeypatch):
             assert seq[start:start + len(expected)] == expected, seq
             recorded += 1
     assert recorded == n                       # one sequence per view-owner
-    # The prefetch moves WHEN a gather is issued and nothing else, so the
+    # The prefetch moves WHEN a transfer is issued and nothing else, so the
     # values are the ones the path already produced.
     rel = np.max(np.abs(fwd - ref_fwd)) / max(np.max(np.abs(ref_fwd)), 1e-30)
     assert rel < 1e-5, rel
@@ -1278,143 +1253,23 @@ def test_the_column_gather_runs_one_batch_ahead_of_the_projection(monkeypatch):
     # And the values hold across batch widths that force several batches,
     # including one that leaves a short final batch (30 pixels over 7).
     for width in (1, 3, 7):
-        mb, idxb, valsb, _s, ref_b, _rb2 = _cone_column_case(
+        mb, idxb, valsb, _s, ref_b, _rb2 = _cone_cylinder_case(
             ["cpu"] * n, pixel_batch=width)
         out = mb._gather_sinogram(mb.sparse_forward_project(valsb, idxb))
         rel = np.max(np.abs(out - ref_b)) / np.max(np.abs(ref_b))
-        print(f"cone gather one batch ahead, {width}-pixel batches: "
+        print(f"cone transfer one batch ahead, {width}-pixel batches: "
               f"rel {rel:.2e}")
         assert rel < 1e-5, (width, rel)
 
 
-def test_the_column_gather_is_on_by_default_and_scoped_to_its_geometry(
-        monkeypatch):
-    # The switch: on unless refused, on every shipped geometry; refused
-    # however it is asked on a geometry the shape has never been measured on;
-    # and overridable from the environment either way so one session can run
-    # both shapes over the same inputs.  The environment is cleared first,
-    # because this test reads the DEFAULT and a suite run may be forcing the
-    # path around it.
-    import mbirtorch
-    from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
-    monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
-    cone, _idx, _vals, _sino, _f, _b = _cone_banded_case(["cpu", "cpu"])
-    assert cone.column_gather_geometry
-    assert cone._column_gather_forward()              # default on
-    cone.forward_column_gather = False                # the rollback
-    assert not cone._column_gather_forward()
-    cone.forward_column_gather = True
-    assert cone._column_gather_forward()
-
-    # The row-aligned geometry declares the same capability, on its own
-    # measurement, and is on by default in the same way.
-    angles = np.linspace(0, np.pi, 8, endpoint=False)
-    par = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
-    assert par.column_gather_geometry
-    assert par._column_gather_forward()
-    par.forward_column_gather = False
-    assert not par._column_gather_forward()
-    par.forward_column_gather = True
-    assert par._column_gather_forward()
-
-    # The two geometries with no hand-written kernels declare it too, each on
-    # its own measurement (2026-08-17, four H100s), and are on by default in
-    # the same way.
-    trans = mbirtorch.TranslationModel(
-        (4, 6, 8), np.zeros((4, 3), dtype=np.float32),
-        source_detector_dist=32.0, source_iso_dist=16.0)
-    assert trans.column_gather_geometry
-    assert trans._column_gather_forward()
-    trans.forward_column_gather = False
-    assert not trans._column_gather_forward()
-
-    ma_angles = np.stack([np.linspace(0, np.pi, 6, endpoint=False),
-                          np.linspace(-0.3, 0.3, 6)], axis=1)
-    ma = mbirtorch.MultiAxisParallelModel((6, 6, 8), ma_angles)
-    assert ma.column_gather_geometry
-    assert ma._column_gather_forward()
-    ma.forward_column_gather = False
-    assert not ma._column_gather_forward()
-
-    # All four shipped geometries declare it now, so the scoping is carried by
-    # the BASE default: a geometry added later walks slice bands however it is
-    # asked, until it has been measured on the gather too.
-    import types
-    from mbirtorch.tomography_model import TomographyModel
-    assert TomographyModel.column_gather_geometry is False
-    unmeasured = types.SimpleNamespace(
-        column_gather_geometry=TomographyModel.column_gather_geometry,
-        forward_column_gather=True)
-    assert not TomographyModel._column_gather_forward(unmeasured)
-
-    # The environment wins over the attribute in BOTH directions: `cone` holds
-    # an explicit True and `refused` an explicit False, and each env value
-    # drives the two models to the same answer.
-    import os
-    refused = _cone_banded_case(["cpu", "cpu"])[0]
-    refused.forward_column_gather = False
-    for value, expected in (("1", True), ("on", True),
-                            ("0", False), ("off", False)):
-        os.environ[COLUMN_GATHER_ENV_VAR] = value
-        try:
-            assert refused._column_gather_forward() is expected
-            assert cone._column_gather_forward() is expected
-        finally:
-            del os.environ[COLUMN_GATHER_ENV_VAR]
-    assert not refused._column_gather_forward()
-    unset = _cone_banded_case(["cpu", "cpu"])[0]
-    assert unset._column_gather_forward()             # the shipped default
-
-
-@pytest.mark.parametrize('geometry', ('cone', 'parallel', 'multiaxis',
-                                      'translation'))
-def test_the_banded_walk_is_what_runs_with_the_switch_off(geometry,
-                                                          monkeypatch):
-    # The rollback, exercised on all four geometries that take the gather:
-    # switching the gather off selects the banded walk, which broadcasts
-    # bands and gathers no columns.  The switch has to be refused explicitly
-    # now that unset means on, and the environment knob is cleared first for
-    # the reason above.
-    from mbirtorch import _sharding as sharding
-    from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
-    monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
-    if geometry == 'parallel':
-        m, idx, vals, _sino, ref_fwd, _rb, _b2 = _banded_case(["cpu", "cpu"])
-    else:
-        case = {'cone': _cone_banded_case,
-                'multiaxis': _multiaxis_banded_case,
-                'translation': _translation_banded_case}[geometry]
-        m, idx, vals, _sino, ref_fwd, _rb = case(["cpu", "cpu"])
-    m.forward_column_gather = False
-    assert m.column_gather_geometry and not m._column_gather_forward()
-    broadcasts = []
-    real_broadcast = sharding.broadcast_band_to_views
-
-    def spy_broadcast(band, view_owners, dev2dev_safe=True):
-        broadcasts.append(tuple(band.shape))
-        return real_broadcast(band, view_owners, dev2dev_safe)
-
-    def refuse(*args, **kwargs):
-        raise AssertionError("the banded walk must not gather columns")
-
-    monkeypatch.setattr(sharding, "broadcast_band_to_views", spy_broadcast)
-    monkeypatch.setattr(sharding, "gather_column_band", refuse)
-    fwd = m._gather_sinogram(m.sparse_forward_project(vals, idx))
-    assert broadcasts
-    rel = np.max(np.abs(fwd - ref_fwd)) / max(np.max(np.abs(ref_fwd)), 1e-30)
-    assert rel < 1e-5, rel
-
-
-def test_column_gather_recon_matches_single_device(monkeypatch):
+def test_cylinder_transfer_recon_matches_single_device():
     # The end-to-end gate: a seeded cone reconstruction on two virtual CPU
-    # devices with the gather on must reproduce the single-device run, which
-    # is where the two changed summation orders (the vertical sum into the
-    # body, the pixel sum out of it) would show up if they were not inside
-    # the value class the forward already has.  The environment is cleared
-    # first so each of the three runs below is the shape it names.
+    # devices must reproduce the single-device run, which is where the two
+    # summation orders the transfer changed (the vertical sum into the
+    # body, the
+    # pixel sum out of it) would show up if they were not inside the value
+    # class the forward already has.
     import mbirtorch
-    from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
-    monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
     cell = (8, 8, 8)
     angles = np.linspace(0, 2 * np.pi, cell[0], endpoint=False)
 
@@ -1435,96 +1290,72 @@ def test_column_gather_recon_matches_single_device(monkeypatch):
     np.random.seed(31)
     ref, _ = m1.recon(sino, max_iterations=2, stop_threshold_change_pct=0.0)
 
-    banded = build(["cpu", "cpu"])
-    banded.forward_column_gather = False    # unset now means the gather
+    sharded = build(["cpu", "cpu"])
+    sharded.forward_project_pixel_batch = 8
     np.random.seed(31)
-    banded_out, _ = banded.recon(sino, max_iterations=2,
-                                 stop_threshold_change_pct=0.0)
-    gathered = build(["cpu", "cpu"])
-    gathered.forward_column_gather = True
-    gathered.forward_project_pixel_batch = 8
-    np.random.seed(31)
-    out, _ = gathered.recon(sino, max_iterations=2,
+    out, _ = sharded.recon(sino, max_iterations=2,
                             stop_threshold_change_pct=0.0)
     scale = max(np.max(np.abs(ref)), 1e-30)
     rel = np.max(np.abs(out - ref)) / scale
-    rel_banded = np.max(np.abs(banded_out - ref)) / scale
-    # Printed rather than asserted against each other: which of the two sits
-    # closer to the anchor is the reading the registered expectation is for.
-    print(f"cone recon vs n1: column gather {rel:.2e}, "
-          f"banded {rel_banded:.2e}")
+    # Printed as well as asserted: a later reading well above the registered
+    # expectation is worth a human's attention before it reaches the floor.
+    print(f"cone recon vs n1: cylinder transfer {rel:.2e}")
     assert rel < 5e-3, rel     # the shipped parity floor, as above
 
 
-# ── the same gather, on the row-aligned geometry ─────────────────────────────
-# Parallel takes the column gather for a different measured reason than cone.
-# It CAN produce its detector rows from a slice band -- the banded walk does
-# exactly that -- but its forward kernel runs about twice as efficiently per
-# slice on the full-width block of values the gather hands it as on the
-# shard-width blocks the band hands it (measured 2026-08-10 on one H100, at
-# 0.0411 ms per slice on a 1008-wide block against 0.0823 on a 504-wide one,
-# with the device count held at one).
+# ── the same transfer, on the row-aligned geometry ───────────────────────────
+# Parallel takes the cylinder transfer for a different measured reason
+# than cone.  It CAN produce its detector rows from a slice band, but
+# its forward kernel runs about twice as efficiently per slice on the
+# full-width block of values the transfer hands it as on a shard-width
+# block (measured 2026-08-10 on one
+# H100, at 0.0411 ms per slice on a 1008-wide block against 0.0823 on a
+# 504-wide one, with the device count held at one).
 #
 # The value bar was expected to be EQUALITY here, on the argument that each
 # detector row keeps a single producing call and CPU sums are deterministic.
 # The row half of that is true, and the mechanics test below asserts it
 # directly.  Equality is not, and the measurement that settled it is recorded
 # because it is worth knowing before anyone tries again (2026-08-10, this
-# suite, virtual CPU devices).  Run first in a fresh interpreter, BOTH the
-# banded walk and the column gather reproduce the single-device sinogram bit
-# for bit.  Run once other shapes have gone through the same per-device
-# bodies -- which is what a full suite run does -- both land in the float32
-# epsilon class instead, the banded walk at 1.6e-07 to 4.0e-07 and the gather
-# at 1.1e-07 to 4.0e-07 over the same cells.  The cause is the same for both:
-# the per-device bodies are separately torch.compiled, and what a compiled
-# body emits depends on the shapes its instance has already seen, so two
-# devices can differ in the last bit on identical inputs.  Bit-equality is
-# therefore a property of the process, not of the driver shape, and these
-# tests hold the gather against the shape it replaces instead.
-def _parallel_column_case(devices, sino_shape=(8, 6, 8), pixel_batch=None):
-    """A parallel model on virtual CPU devices with the column gather
-    switched on, plus its single-device reference."""
+# suite, virtual CPU devices).  Run first in a fresh interpreter, the cylinder
+# transfer reproduces the single-device sinogram bit for bit.  Run once other
+# shapes have gone through the same per-device bodies -- which is what a full
+# suite run does -- it lands in the float32 epsilon class instead, at 1.1e-07
+# to 4.0e-07 over these cells.  The cause: the per-device bodies are
+# separately torch.compiled, and what a compiled body emits depends on the
+# shapes its instance has already seen, so two devices can differ in the last
+# bit on identical inputs.  Bit-equality is therefore a property of the
+# process, not of the driver shape, and these tests hold the transfer to a
+# relative bar instead.
+def _parallel_cylinder_case(devices, sino_shape=(8, 6, 8), pixel_batch=None):
+    """A parallel model on virtual CPU devices, plus its single-device
+    reference.  The multi-device forward is the cylinder transfer."""
     m, idx, vals, sino, ref_fwd, ref_back, _b2 = _banded_case(devices,
                                                               sino_shape)
-    m.forward_column_gather = True
     if pixel_batch is not None:
         m.forward_project_pixel_batch = pixel_batch
-    assert m._column_gather_forward()
     return m, idx, vals, sino, ref_fwd, ref_back
 
 
-def test_parallel_column_gather_matches_the_shape_it_replaces(monkeypatch):
-    # The environment is cleared first so each leg below runs the shape it
-    # names, whatever a suite run is forcing around this test.
-    from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
-    monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
-    # The values gate.  Both shapes are run over the same inputs in the same
-    # process and both are held to the same bar, which is the reading that
-    # does not move with the compile state above; the two distances are
-    # printed side by side for the same reason.  One call per view-owner over
-    # every pixel is the single-device call in every respect that sets a
-    # value: the same voxel columns in one array, the whole slice range
-    # anchored at 0, and each detector row produced by that one call and no
-    # other.  A row taking contributions from more than one call would show up
-    # here as an order-one error, not as a last bit.
+def test_parallel_cylinder_transfer_matches_the_single_device_values():
+    # The values gate.  One call per view-owner over every pixel is the
+    # single-device call in every respect that sets a value: the same voxel
+    # columns in one array, the whole slice range anchored at 0, and each
+    # detector row produced by that one call and no other.  A row taking
+    # contributions from more than one call would show up here as an
+    # order-one error, not as a last bit.
     for n in (2, 3):
         # None takes the shipped batch, which covers a pass this size in one
         # call; the large value asks for that explicitly.
         for batch in (None, 10 ** 6):
-            m, idx, vals, _sino, ref_fwd, _rb = _banded_case(["cpu"] * n)[:6]
-            m.forward_column_gather = False   # unset now means the gather
-            banded = m._gather_sinogram(m.sparse_forward_project(vals, idx))
-            m.forward_column_gather = True
-            if batch is not None:
-                m.forward_project_pixel_batch = batch
+            m, idx, vals, _sino, ref_fwd, _rb = _parallel_cylinder_case(
+                ["cpu"] * n, pixel_batch=batch)
             fwd = m._gather_sinogram(m.sparse_forward_project(vals, idx))
             scale = np.max(np.abs(ref_fwd))
             rel = np.max(np.abs(fwd - ref_fwd)) / scale
-            rel_banded = np.max(np.abs(banded - ref_fwd)) / scale
-            print(f"parallel column gather n={n} batch={batch}: rel {rel:.2e},"
-                  f" banded {rel_banded:.2e}")
-            assert rel < 1e-5 and rel_banded < 1e-5, (n, batch, rel,
-                                                      rel_banded)
+            print(f"parallel cylinder transfer n={n} batch={batch}: "
+                  f"rel {rel:.2e}")
+            assert rel < 1e-5, (n, batch, rel)
 
     # The one summation order this shape does change for a row-aligned
     # geometry: several pixel batches turn a single accumulation over every
@@ -1533,42 +1364,36 @@ def test_parallel_column_gather_matches_the_shape_it_replaces(monkeypatch):
     # (measured 1.0e-07 to 1.6e-07 here).  This is the case that runs at
     # production sizes, where the pass is far wider than one batch.
     for batch in (1, 5, 7):
-        m, idx, vals, _sino, ref_fwd, _rb = _parallel_column_case(
+        m, idx, vals, _sino, ref_fwd, _rb = _parallel_cylinder_case(
             ["cpu", "cpu"], pixel_batch=batch)
         fwd = m._gather_sinogram(m.sparse_forward_project(vals, idx))
         rel = np.max(np.abs(fwd - ref_fwd)) / np.max(np.abs(ref_fwd))
-        print(f"parallel column gather, {batch}-pixel batches: rel {rel:.2e}")
+        print(f"parallel cylinder transfer, {batch}-pixel batches: "
+              f"rel {rel:.2e}")
         assert rel < 1e-5, (batch, rel)
 
 
-def test_parallel_column_gather_gathers_columns_and_sizes_its_rows_by_them(
+def test_parallel_cylinder_transfer_sizes_its_rows_by_the_cylinders(
         monkeypatch):
-    # The environment is cleared first, for the reason above.
-    from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
-    monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
-    # The mechanics witness, plus the row-aligned fact the banded walk used to
-    # supply by construction.  With the gather on, the parallel forward calls
-    # gather_column_band and broadcasts no band; each cylinder is one pixel
+    # The mechanics witness, plus the row-aligned fact.  The parallel
+    # forward calls transfer_cylinder_batch; each cylinder is one pixel
     # batch by the WHOLE slice axis; each projector call runs at
-    # slice_start=0 over that whole axis for the owner's own views; and the
-    # block that comes back is as TALL as the cylinder, because a row-aligned
-    # body sizes its output by the values it was handed.
+    # slice_start=0 over that whole axis for the owner's own views; and
+    # the block that comes back is as TALL as the cylinder, because a
+    # row-aligned body sizes its output by the values it was handed.
     from mbirtorch import _sharding as sharding
     batch, n = 4, 2
-    m, idx, vals, _sino, _ref_fwd, _rb = _parallel_column_case(
+    m, idx, vals, _sino, _ref_fwd, _rb = _parallel_cylinder_case(
         ["cpu"] * n, pixel_batch=batch)
     slices = m.recon_placement.axis_len
     channels = int(m.get_params('sinogram_shape')[2])
-    gathers, calls = [], []
-    real_gather = sharding.gather_column_band
+    transfers, calls = [], []
+    real_gather = sharding.transfer_cylinder_batch
 
     def spy_gather(shard_tensors, p0, p1, target, dev2dev_safe=True):
         out = real_gather(shard_tensors, p0, p1, target, dev2dev_safe)
-        gathers.append((len(shard_tensors), p0, p1, tuple(out.shape)))
+        transfers.append((len(shard_tensors), p0, p1, tuple(out.shape)))
         return out
-
-    def spy_broadcast(*args, **kwargs):
-        raise AssertionError("the column gather must not broadcast a band")
 
     real_call = m.projector_functions.sparse_forward_project_view_range
 
@@ -1581,15 +1406,14 @@ def test_parallel_column_gather_gathers_columns_and_sizes_its_rows_by_them(
                       tuple(block.shape)))
         return block
 
-    monkeypatch.setattr(sharding, "gather_column_band", spy_gather)
-    monkeypatch.setattr(sharding, "broadcast_band_to_views", spy_broadcast)
+    monkeypatch.setattr(sharding, "transfer_cylinder_batch", spy_gather)
     monkeypatch.setattr(m.projector_functions,
                         "sparse_forward_project_view_range", spy_call)
     fwd = m.sparse_forward_project(vals, idx)
 
     expected_batches = -(-len(idx) // batch)
-    assert len(gathers) == n * expected_batches
-    for pieces, p0, p1, shape in gathers:
+    assert len(transfers) == n * expected_batches
+    for pieces, p0, p1, shape in transfers:
         assert pieces == n                      # one piece per slice-owner
         assert shape == (p1 - p0, slices)       # the batch, at every slice
         assert p1 - p0 <= batch
@@ -1604,11 +1428,7 @@ def test_parallel_column_gather_gathers_columns_and_sizes_its_rows_by_them(
     assert all(tuple(t.shape[1:]) == (slices, channels) for t in fwd.tensors)
 
 
-def test_parallel_column_gather_holds_the_uneven_and_sparse_view_forms(
-        monkeypatch):
-    # The environment is cleared first, for the reason above.
-    from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
-    monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
+def test_parallel_cylinder_transfer_holds_the_uneven_and_sparse_view_forms():
     # Two layouts a row-aligned geometry has to assemble correctly: one whose
     # axes do not divide the device count, and one with more devices than
     # views.  Every block this driver assembles -- including the empty one it
@@ -1616,7 +1436,7 @@ def test_parallel_column_gather_holds_the_uneven_and_sparse_view_forms(
     # count, or the shards do not concatenate at all.
     for shape, devs in (((9, 7, 8), 2),        # neither axis divides
                         ((3, 7, 8), 4)):       # an owner with no views
-        m, idx, vals, sino, ref_fwd, ref_back = _parallel_column_case(
+        m, idx, vals, sino, ref_fwd, ref_back = _parallel_cylinder_case(
             ["cpu"] * devs, sino_shape=shape, pixel_batch=10 ** 6)
         real_rows = shape[1]
         fwd = m.sparse_forward_project(vals, idx)
@@ -1634,11 +1454,8 @@ def test_parallel_column_gather_holds_the_uneven_and_sparse_view_forms(
         assert abs(lhs - rhs) / max(abs(rhs), 1e-30) < 1e-4, (shape, lhs, rhs)
 
 
-def test_column_gather_batch_accumulation_matches_the_shape_it_replaces(
+def test_cylinder_batch_accumulation_matches_the_shape_it_replaces(
         monkeypatch):
-    # The environment is cleared first, for the reason above.
-    from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
-    monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
     # Each pixel batch after the first adds into the owner's block from inside
     # the projector's view loop, rather than assembling its own block for the
     # driver to add afterwards.  Those are the same summands added in the same
@@ -1693,8 +1510,8 @@ def test_column_gather_batch_accumulation_matches_the_shape_it_replaces(
     threads = torch.get_num_threads()
     torch.set_num_threads(1)
     try:
-        for name, case in (("parallel", _parallel_column_case),
-                           ("cone", _cone_column_case)):
+        for name, case in (("parallel", _parallel_cylinder_case),
+                           ("cone", _cone_cylinder_case)):
             for n in (2, 3):
                 for batch in (1, 3, 5):
                     m, idx, vals = case(["cpu"] * n, pixel_batch=batch)[:3]
@@ -1752,12 +1569,11 @@ def test_column_gather_batch_accumulation_matches_the_shape_it_replaces(
         torch.set_num_threads(threads)
 
 
-def test_parallel_column_gather_recon_matches_single_device():
+def test_parallel_cylinder_transfer_recon_matches_single_device():
     # The end-to-end gate, where the subset passes call the forward on small
     # pixel sets and the pixel batch above therefore bites: a seeded parallel
-    # reconstruction on two virtual CPU devices with the gather on must
-    # reproduce the single-device run within the loop's own multi-device
-    # floor, which the banded walk beside it is read against.
+    # reconstruction on two virtual CPU devices must reproduce the
+    # single-device run within the loop's own multi-device floor.
     import mbirtorch
     sino_shape = (8, 6, 8)
     angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
@@ -1778,48 +1594,37 @@ def test_parallel_column_gather_recon_matches_single_device():
     np.random.seed(31)
     ref, _ = m1.recon(sino, max_iterations=3, stop_threshold_change_pct=0.0)
 
-    banded = build(["cpu", "cpu"])
+    sharded = build(["cpu", "cpu"])
+    sharded.forward_project_pixel_batch = 8
     np.random.seed(31)
-    banded_out, _ = banded.recon(sino, max_iterations=3,
-                                 stop_threshold_change_pct=0.0)
-    gathered = build(["cpu", "cpu"])
-    gathered.forward_column_gather = True
-    gathered.forward_project_pixel_batch = 8
-    np.random.seed(31)
-    out, _ = gathered.recon(sino, max_iterations=3,
+    out, _ = sharded.recon(sino, max_iterations=3,
                             stop_threshold_change_pct=0.0)
     scale = max(np.max(np.abs(ref)), 1e-30)
     rel = np.max(np.abs(out - ref)) / scale
-    rel_banded = np.max(np.abs(banded_out - ref)) / scale
-    print(f"parallel recon vs n1: column gather {rel:.2e}, "
-          f"banded {rel_banded:.2e}")
+    print(f"parallel recon vs n1: cylinder transfer {rel:.2e}")
     assert rel < 5e-4, rel     # the sharded VCD loop's own floor at this cell
 
 
-# ── the same gather, on the two geometries with no hand-written kernels ──────
-# Translation and multiaxis share cone's banded branch and its
-# band-independent per-call cost, so the shape was expected to help them, and
-# on 2026-08-17 it was measured on four H100s at each geometry's production
-# cell rather than argued.  The gather was faster at every device count: the
-# multiaxis forward 1.27x at two devices and 1.86x at four, its composed
-# reconstruction 1.13x and 1.20x; the translation forward 1.86x and 25.4x,
-# its composed reconstruction 1.37x and 1.94x.  The translation four-device
-# figure is that large because the banded walk there ran slower than one
-# device does.  Per-device peak memory was lower at the shipped pixel batch on
-# every arm, and every value sat between 9e-7 and 2.5e-5 from the one-device
-# reference against a 1e-3 gate.  Both defaults moved with that reading.
+# ── the same transfer, on the two geometries with no hand-written kernels ────
+# Translation and multiaxis have the same band-independent per-call cost cone
+# has, so the shape was expected to help them, and on 2026-08-17 it was
+# measured on four H100s at each geometry's production cell rather than
+# argued.  The transfer was faster at every device count than the slice-banded
+# walk it replaced: the multiaxis forward 1.27x at two devices and 1.86x at
+# four, its composed reconstruction 1.13x and 1.20x; the translation forward
+# 1.86x and 25.4x, its composed reconstruction 1.37x and 1.94x.  The
+# translation four-device figure is that large because the banded walk there
+# ran slower than one device does.  Per-device peak memory was lower at the
+# shipped pixel batch on every arm, and every value sat between 9e-7 and
+# 2.5e-5 from the one-device reference against a 1e-3 gate.  Both defaults
+# moved with that reading, and the banded walk was removed on 2026-08-17.
 #
-# The bar here is the one the parallel and cone cases use: both drivers are
-# run over the same inputs in the same process and both are held to the 1e-5
-# relative these CPU cases already enforce.  The recorded caveat above the
-# parallel section applies unchanged -- bit-equality is a property of the
-# process's compile state, not of the driver shape -- so the gather is held
-# against the shape it replaces rather than against equality.
+# The bar here is the one the parallel and cone cases use: the 1e-5 relative
+# these CPU cases already enforce.  The recorded caveat above the parallel
+# section applies unchanged -- bit-equality is a property of the process's
+# compile state, not of the driver shape.
 @pytest.mark.parametrize('geometry', ('multiaxis', 'translation'))
-def test_torch_body_geometries_take_the_gather_by_default(geometry,
-                                                          monkeypatch):
-    from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
-    monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
+def test_torch_body_geometries_take_the_gather(geometry):
     case = {'multiaxis': _multiaxis_banded_case,
             'translation': _translation_banded_case}[geometry]
     # Two and three devices: at three, both sharded axes split unevenly (see
@@ -1827,31 +1632,22 @@ def test_torch_body_geometries_take_the_gather_by_default(geometry,
     # would show up.
     for n in (2, 3):
         m, idx, vals, _sino, ref_fwd, _rb = case(["cpu"] * n)
-        assert m.column_gather_geometry
-        assert m._column_gather_forward()          # the shipped default now
-        gathered = m._gather_sinogram(m.sparse_forward_project(vals, idx))
-        m.forward_column_gather = False            # the shape it replaced
-        assert not m._column_gather_forward()
-        banded = m._gather_sinogram(m.sparse_forward_project(vals, idx))
+        out = m._gather_sinogram(m.sparse_forward_project(vals, idx))
         scale = max(np.max(np.abs(ref_fwd)), 1e-30)
-        rel = np.max(np.abs(gathered - ref_fwd)) / scale
-        rel_banded = np.max(np.abs(banded - ref_fwd)) / scale
-        print(f"{geometry} column gather n={n}: rel {rel:.2e}, "
-              f"banded {rel_banded:.2e}")
-        assert rel < 1e-5 and rel_banded < 1e-5, (geometry, n, rel,
-                                                  rel_banded)
+        rel = np.max(np.abs(out - ref_fwd)) / scale
+        print(f"{geometry} cylinder transfer n={n}: rel {rel:.2e}")
+        assert rel < 1e-5, (geometry, n, rel)
 
     # Several pixel batches, which is what a production pass runs: the single
     # accumulation over every pixel becomes a sum of per-batch partials.  The
-    # back driver is untouched, so the pair still has to be adjoint.
+    # back driver walks slice bands, so the pair still has to be adjoint.
     for batch in (1, 5):
         m, idx, vals, sino, ref_fwd, ref_back = case(["cpu", "cpu"])
         m.forward_project_pixel_batch = batch
-        assert m._column_gather_forward()
         fwd = m.sparse_forward_project(vals, idx)
         rel = (np.max(np.abs(m._gather_sinogram(fwd) - ref_fwd))
                / max(np.max(np.abs(ref_fwd)), 1e-30))
-        print(f"{geometry} column gather, {batch}-pixel batches: "
+        print(f"{geometry} cylinder transfer, {batch}-pixel batches: "
               f"rel {rel:.2e}")
         assert rel < 1e-5, (geometry, batch, rel)
         back = m.sparse_back_project(sino, idx)
@@ -1865,7 +1661,7 @@ def test_torch_body_geometries_take_the_gather_by_default(geometry,
 
 
 # ── one pixel at a time ──────────────────────────────────────────────────────
-# The column gather's pixel batching hands the projectors a one-pixel call
+# The cylinder transfer's pixel batching hands the projectors a one-pixel call
 # whenever a batch, or the remainder of a batch, is a single pixel, and a user
 # can ask for one directly.  On linux with torch 2.13.0, CPU inductor
 # miscompiles exactly that case in both parallel bodies and lands the pixel's

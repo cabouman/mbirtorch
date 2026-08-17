@@ -100,8 +100,8 @@ def _multiaxis_forward_view_batch(values, pixel_indices, view_params_batch,
     """Multiaxis forward for one view batch: the slice-scatter vertical fan,
     then the per-pixel horizontal fan scatter.  Returns (Vb, R, C).
 
-    ``slice_start`` supports the banded sharded forward exactly as in cone:
-    ``values`` may be a slice BAND (P, L) with global indices [slice_start,
+    ``slice_start`` supports a slice-BANDED call exactly as in cone:
+    ``values`` may be a band (P, L) with global indices [slice_start,
     slice_start + L); the slice-to-row map is anchored on the full num_slices
     center, so summing per-band outputs over a tiling of the slice axis
     reproduces the unbanded projection.
@@ -251,12 +251,6 @@ class MultiAxisParallelModel(TomographyModel):
                          geometry_type=str(type(self)),
                          view_params_name='angles', angles=angles,
                          recon_slice_offset=0.0)
-
-    # Multiaxis takes the multi-device forward's column gather.  It shares
-    # cone's banded branch and the same band-independent per-call cost, and
-    # the gather was measured faster at every device count on this geometry's
-    # 2K^3 size measurement.
-    column_gather_geometry = True
 
     def _view_batch_bodies(self):
         # No hand-written kernels for multiaxis yet; the compiled torch bodies

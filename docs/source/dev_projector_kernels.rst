@@ -51,11 +51,11 @@ stack; steady-state execution takes no lock.
 **Geometry decides whether a slice can stream.**  For parallel beam a detector row
 looks straight across at exactly one recon slice, so the bodies can work on a band
 of rows and produce just those slices -- this is the ``rows_track_slices`` case, and
-it is what lets the multi-device code stream one slice band at a time.  For cone
-beam a single recon slice spreads across a *range* of detector rows, so a view-owner
-must read the full detector rows and hold whole voxel cylinders; the banded drivers
-still band the *output* slice axis through the ``slice_start`` and ``band_slices``
-arguments each body carries.
+it is what lets the multi-device back projection stream one slice band at a time.
+For cone beam a single recon slice spreads across a *range* of detector rows, so a
+view-owner must read the full detector rows and hold whole voxel cylinders; the
+back driver still bands the *output* slice axis through the ``slice_start`` and
+``band_slices`` arguments each body carries.
 
 
 The Triton kernels
@@ -68,7 +68,7 @@ step, and the code ships in the package like any other module (``triton_cone.py`
 
 **A kernel is an alternative body, never a new driver.**  Each kernel wrapper has
 the same signature as the torch body it replaces, so the driver's view loop, the
-banded multi-device seams, and everything downstream pass through unchanged.  The
+multi-device seams, and everything downstream pass through unchanged.  The
 torch bodies stay compiled in at every call site as the fallback and the value
 reference, so the kernel path can be turned off at any time with no loss of
 function.
