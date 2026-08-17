@@ -1533,6 +1533,15 @@ def test_a_torch_body_pays_for_both_forward_blocks():
 # 15304566, h016), because it is the one arm whose split changed when the
 # sharding pad was removed: 510 recon slices over four devices were padded to
 # four blocks of 128 and are now cut 128, 128, 127, 127.
+#
+# Every arm here was measured with the multi-device forward walking SLICE
+# BANDS, which is what both geometries defaulted to when the runs were taken.
+# Their defaults moved to the column gather on 2026-08-17, and these rows do
+# not move with them: _measured_arm_ledger below builds its LedgerPlan
+# directly rather than from a live model, and leaves column_pixel_batch unset,
+# so the plan keeps the banded shape the peaks were measured on.  A future
+# edit that switches it to plan_from_model has to force the banded form back
+# on, or it will be judging measured peaks against a different driver.
 MEASURED_ARMS = {
     'ma1024_n1': ((1024, 1008, 992), (992, 992, 1148), 771240,
                   [37310451712]),

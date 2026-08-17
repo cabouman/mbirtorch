@@ -303,6 +303,49 @@ def _cone_banded_case(devices, cell=(8, 8, 8)):
     return m, idx, vals, sino, ref_fwd, ref_back
 
 
+def _torch_body_case(m, devices, sino_shape, seed):
+    """The shared tail of the two cases below: take the single-device
+    references for a seeded sparse problem, then place the model on
+    ``devices``.  Same return shape as ``_cone_banded_case``."""
+    m.configure_devices(devices=["cpu"])
+    m.set_params(no_warning=True, verbose=0)
+    rs = tuple(m.get_params('recon_shape'))
+    rng = np.random.RandomState(seed)
+    num_pixels = min(20, rs[0] * rs[1])
+    idx = np.sort(rng.choice(rs[0] * rs[1], size=num_pixels, replace=False))
+    vals = rng.rand(len(idx), rs[2]).astype(np.float32)
+    sino = rng.rand(*sino_shape).astype(np.float32)
+    ref_fwd = m.sparse_forward_project(vals, idx).cpu().numpy()
+    ref_back = m.sparse_back_project(sino, idx).cpu().numpy()
+    m.configure_devices(devices=devices)
+    return m, idx, vals, sino, ref_fwd, ref_back
+
+
+def _multiaxis_banded_case(devices, sino_shape=(8, 7, 8)):
+    """A multiaxis model on virtual CPU devices, plus its single-device
+    reference.  This cell's recon is (8, 8, 7), so at three devices neither
+    the view axis nor the slice axis divides and both split unevenly."""
+    import mbirtorch
+    azimuth = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
+    elevation = np.linspace(-0.4, 0.4, sino_shape[0])
+    m = mbirtorch.MultiAxisParallelModel(
+        sino_shape, np.stack([azimuth, elevation], axis=1))
+    return _torch_body_case(m, devices, sino_shape, seed=7)
+
+
+def _translation_banded_case(devices, sino_shape=(4, 20, 16)):
+    """A translation model on virtual CPU devices, plus its single-device
+    reference.  Its recon is (1, 12, 8): four views over three devices and
+    eight slices over three both split unevenly."""
+    import mbirtorch
+    tvecs = mbirtorch.gen_translation_vectors(2, 2, x_spacing=3.0,
+                                              z_spacing=2.0)
+    m = mbirtorch.TranslationModel(sino_shape, tvecs,
+                                   source_detector_dist=128.0,
+                                   source_iso_dist=32.0)
+    return _torch_body_case(m, devices, sino_shape, seed=9)
+
+
 def test_cone_banded_projectors_match_single_device():
     # Cone bands spread over many rows: the banded forward ACCUMULATES
     # full-row partials and the banded back consumes the full local sinogram
@@ -1246,11 +1289,12 @@ def test_the_column_gather_runs_one_batch_ahead_of_the_projection(monkeypatch):
 
 def test_the_column_gather_is_on_by_default_and_scoped_to_its_geometry(
         monkeypatch):
-    # The switch: on unless refused, refused on a geometry the shape has never
-    # been measured on however it is asked, and overridable from the
-    # environment either way so one session can run both shapes over the same
-    # inputs.  The environment is cleared first, because this test reads the
-    # DEFAULT and a suite run may be forcing the path around it.
+    # The switch: on unless refused, on every shipped geometry; refused
+    # however it is asked on a geometry the shape has never been measured on;
+    # and overridable from the environment either way so one session can run
+    # both shapes over the same inputs.  The environment is cleared first,
+    # because this test reads the DEFAULT and a suite run may be forcing the
+    # path around it.
     import mbirtorch
     from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
     monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
@@ -1273,15 +1317,35 @@ def test_the_column_gather_is_on_by_default_and_scoped_to_its_geometry(
     par.forward_column_gather = True
     assert par._column_gather_forward()
 
-    # A geometry that has never been timed on the shape refuses it however it
-    # is asked: translation shares cone's banded branch, and an argument that
-    # it should gain too is not a measurement.
+    # The two geometries with no hand-written kernels declare it too, each on
+    # its own measurement (2026-08-17, four H100s), and are on by default in
+    # the same way.
     trans = mbirtorch.TranslationModel(
         (4, 6, 8), np.zeros((4, 3), dtype=np.float32),
         source_detector_dist=32.0, source_iso_dist=16.0)
-    trans.forward_column_gather = True
-    assert not trans.column_gather_geometry
+    assert trans.column_gather_geometry
+    assert trans._column_gather_forward()
+    trans.forward_column_gather = False
     assert not trans._column_gather_forward()
+
+    ma_angles = np.stack([np.linspace(0, np.pi, 6, endpoint=False),
+                          np.linspace(-0.3, 0.3, 6)], axis=1)
+    ma = mbirtorch.MultiAxisParallelModel((6, 6, 8), ma_angles)
+    assert ma.column_gather_geometry
+    assert ma._column_gather_forward()
+    ma.forward_column_gather = False
+    assert not ma._column_gather_forward()
+
+    # All four shipped geometries declare it now, so the scoping is carried by
+    # the BASE default: a geometry added later walks slice bands however it is
+    # asked, until it has been measured on the gather too.
+    import types
+    from mbirtorch.tomography_model import TomographyModel
+    assert TomographyModel.column_gather_geometry is False
+    unmeasured = types.SimpleNamespace(
+        column_gather_geometry=TomographyModel.column_gather_geometry,
+        forward_column_gather=True)
+    assert not TomographyModel._column_gather_forward(unmeasured)
 
     # The environment wins over the attribute in BOTH directions: `cone` holds
     # an explicit True and `refused` an explicit False, and each env value
@@ -1302,10 +1366,11 @@ def test_the_column_gather_is_on_by_default_and_scoped_to_its_geometry(
     assert unset._column_gather_forward()             # the shipped default
 
 
-@pytest.mark.parametrize('geometry', ('cone', 'parallel'))
+@pytest.mark.parametrize('geometry', ('cone', 'parallel', 'multiaxis',
+                                      'translation'))
 def test_the_banded_walk_is_what_runs_with_the_switch_off(geometry,
                                                           monkeypatch):
-    # The rollback, exercised on both geometries that can take the gather:
+    # The rollback, exercised on all four geometries that take the gather:
     # switching the gather off selects the banded walk, which broadcasts
     # bands and gathers no columns.  The switch has to be refused explicitly
     # now that unset means on, and the environment knob is cleared first for
@@ -1313,10 +1378,13 @@ def test_the_banded_walk_is_what_runs_with_the_switch_off(geometry,
     from mbirtorch import _sharding as sharding
     from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
     monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
-    if geometry == 'cone':
-        m, idx, vals, _sino, ref_fwd, _rb = _cone_banded_case(["cpu", "cpu"])
-    else:
+    if geometry == 'parallel':
         m, idx, vals, _sino, ref_fwd, _rb, _b2 = _banded_case(["cpu", "cpu"])
+    else:
+        case = {'cone': _cone_banded_case,
+                'multiaxis': _multiaxis_banded_case,
+                'translation': _translation_banded_case}[geometry]
+        m, idx, vals, _sino, ref_fwd, _rb = case(["cpu", "cpu"])
     m.forward_column_gather = False
     assert m.column_gather_geometry and not m._column_gather_forward()
     broadcasts = []
@@ -1726,6 +1794,74 @@ def test_parallel_column_gather_recon_matches_single_device():
     print(f"parallel recon vs n1: column gather {rel:.2e}, "
           f"banded {rel_banded:.2e}")
     assert rel < 5e-4, rel     # the sharded VCD loop's own floor at this cell
+
+
+# ── the same gather, on the two geometries with no hand-written kernels ──────
+# Translation and multiaxis share cone's banded branch and its
+# band-independent per-call cost, so the shape was expected to help them, and
+# on 2026-08-17 it was measured on four H100s at each geometry's production
+# cell rather than argued.  The gather was faster at every device count: the
+# multiaxis forward 1.27x at two devices and 1.86x at four, its composed
+# reconstruction 1.13x and 1.20x; the translation forward 1.86x and 25.4x,
+# its composed reconstruction 1.37x and 1.94x.  The translation four-device
+# figure is that large because the banded walk there ran slower than one
+# device does.  Per-device peak memory was lower at the shipped pixel batch on
+# every arm, and every value sat between 9e-7 and 2.5e-5 from the one-device
+# reference against a 1e-3 gate.  Both defaults moved with that reading.
+#
+# The bar here is the one the parallel and cone cases use: both drivers are
+# run over the same inputs in the same process and both are held to the 1e-5
+# relative these CPU cases already enforce.  The recorded caveat above the
+# parallel section applies unchanged -- bit-equality is a property of the
+# process's compile state, not of the driver shape -- so the gather is held
+# against the shape it replaces rather than against equality.
+@pytest.mark.parametrize('geometry', ('multiaxis', 'translation'))
+def test_torch_body_geometries_take_the_gather_by_default(geometry,
+                                                          monkeypatch):
+    from mbirtorch.tomography_model import COLUMN_GATHER_ENV_VAR
+    monkeypatch.delenv(COLUMN_GATHER_ENV_VAR, raising=False)
+    case = {'multiaxis': _multiaxis_banded_case,
+            'translation': _translation_banded_case}[geometry]
+    # Two and three devices: at three, both sharded axes split unevenly (see
+    # the case helpers), which is where a driver that assumes equal blocks
+    # would show up.
+    for n in (2, 3):
+        m, idx, vals, _sino, ref_fwd, _rb = case(["cpu"] * n)
+        assert m.column_gather_geometry
+        assert m._column_gather_forward()          # the shipped default now
+        gathered = m._gather_sinogram(m.sparse_forward_project(vals, idx))
+        m.forward_column_gather = False            # the shape it replaced
+        assert not m._column_gather_forward()
+        banded = m._gather_sinogram(m.sparse_forward_project(vals, idx))
+        scale = max(np.max(np.abs(ref_fwd)), 1e-30)
+        rel = np.max(np.abs(gathered - ref_fwd)) / scale
+        rel_banded = np.max(np.abs(banded - ref_fwd)) / scale
+        print(f"{geometry} column gather n={n}: rel {rel:.2e}, "
+              f"banded {rel_banded:.2e}")
+        assert rel < 1e-5 and rel_banded < 1e-5, (geometry, n, rel,
+                                                  rel_banded)
+
+    # Several pixel batches, which is what a production pass runs: the single
+    # accumulation over every pixel becomes a sum of per-batch partials.  The
+    # back driver is untouched, so the pair still has to be adjoint.
+    for batch in (1, 5):
+        m, idx, vals, sino, ref_fwd, ref_back = case(["cpu", "cpu"])
+        m.forward_project_pixel_batch = batch
+        assert m._column_gather_forward()
+        fwd = m.sparse_forward_project(vals, idx)
+        rel = (np.max(np.abs(m._gather_sinogram(fwd) - ref_fwd))
+               / max(np.max(np.abs(ref_fwd)), 1e-30))
+        print(f"{geometry} column gather, {batch}-pixel batches: "
+              f"rel {rel:.2e}")
+        assert rel < 1e-5, (geometry, batch, rel)
+        back = m.sparse_back_project(sino, idx)
+        rel_b = (np.max(np.abs(back.gather() - ref_back))
+                 / max(np.max(np.abs(ref_back)), 1e-30))
+        assert rel_b < 1e-5, (geometry, batch, rel_b)
+        lhs = float(np.sum(m._gather_sinogram(fwd) * sino))
+        rhs = float(np.sum(vals * back.gather()))
+        assert abs(lhs - rhs) / max(abs(rhs), 1e-30) < 1e-4, (geometry, batch,
+                                                              lhs, rhs)
 
 
 # ── one pixel at a time ──────────────────────────────────────────────────────

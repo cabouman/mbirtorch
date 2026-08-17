@@ -153,6 +153,36 @@ reduced this pass being held either way.  Set ``forward_project_slice_band`` or
 ``tomography_model.py``).
 
 
+The forward's column gather
+---------------------------
+
+The banded walk above is not what the forward runs by default any more.  All
+four geometries -- parallel-beam, cone-beam, translation and multi-axis
+parallel -- now take a second forward driver, the **column gather**: each
+view-owner walks the pixel axis in batches, collects each batch's full-height
+voxel cylinder from every slice-owner, and makes one projector call per batch
+over its own views and the whole slice range.  Each geometry was switched over
+on its own measurement, on four H100s: cone and parallel once their speed,
+value and memory gates passed on 2026-08-11, and translation and multi-axis on
+2026-08-17, where the gather was faster at both device counts measured --
+1.13x to 1.94x on a composed reconstruction -- and held a lower per-device
+peak.
+
+The operator does not change: every view-owner still produces its own views'
+whole sinogram block from the same voxels, so the forward stays the adjoint of
+the sharded back, and the **back projection is untouched** -- it walks slice
+bands exactly as described above.  What the pixel batch bounds for the forward
+is what the band bounded, so ``forward_project_slice_band`` has no effect while
+the gather runs; ``forward_project_pixel_batch`` is its counterpart lever.
+Setting ``forward_column_gather = False`` on the model restores the banded
+forward, and the ``MBIRTORCH_FORWARD_COLUMN_GATHER`` environment variable
+forces either shape so one session can run both over the same inputs.  A
+geometry added later runs the banded forward until it declares
+``column_gather_geometry`` on a measurement of its own
+(``_column_gather_forward`` and ``_sparse_forward_project_columns`` in
+``tomography_model.py``).
+
+
 Why cone beam projects whole cylinders
 --------------------------------------
 
@@ -271,7 +301,8 @@ Where this lives in the code
   execution helpers.  MBIRJAX splits these across a ``_sharding/`` package; here
   they are one module.
 * ``mbirtorch/tomography_model.py`` -- the placement chokepoints, the banded
-  sharded drivers, the band-length policy, and the sharded VCD engine.
+  sharded drivers, the forward's column gather, the band-length and pixel-batch
+  policies, and the sharded VCD engine.
 * ``mbirtorch/projectors.py`` -- the geometry-agnostic view-range drivers and the
   torch.compile plumbing.
 * ``mbirtorch/horizontal_fan.py`` -- the shared horizontal-fan kernels and the

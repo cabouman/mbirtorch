@@ -268,6 +268,12 @@ class TranslationModel(TomographyModel):
         # values.
         self.set_params(no_warning=True, max_alpha=1.3)
 
+    # Translation takes the multi-device forward's column gather.  It shares
+    # cone's banded branch and the same band-independent per-call cost, and
+    # the gather was measured faster at every device count on this geometry's
+    # 2K^3 size measurement.
+    column_gather_geometry = True
+
     def _view_batch_bodies(self):
         # No hand-written kernels for translation yet; the compiled torch
         # bodies are the only bodies.

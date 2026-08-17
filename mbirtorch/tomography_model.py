@@ -599,9 +599,9 @@ class TomographyModel(ParameterHandler):
         walking slice bands.
 
         The gather runs when the geometry declares ``column_gather_geometry``
-        (cone and parallel do, on measurement; translation and multiaxis are
-        untimed) and the ``forward_column_gather`` switch is not False.  The
-        environment variable overrides the switch either way."""
+        (all four projection geometries do, each on its own measurement) and
+        the ``forward_column_gather`` switch is not False.  The environment
+        variable overrides the switch either way."""
         if not self.column_gather_geometry:
             return False
         override = os.environ.get(COLUMN_GATHER_ENV_VAR, '').strip().lower()
@@ -1475,8 +1475,9 @@ class TomographyModel(ParameterHandler):
     rows_track_slices = False
 
     # Whether the multi-device forward MAY gather pixel columns (see
-    # _column_gather_forward).  Measured on cone and parallel only, so
-    # False is the base; a geometry switches on its own measurement.
+    # _column_gather_forward).  All four projection geometries have now been
+    # measured on it and all four declare it True.  False stays the base so a
+    # geometry added later walks slice bands until it has been measured too.
     column_gather_geometry = False
 
     # The fewest pixels this geometry's COMPILED bodies may be called with;
