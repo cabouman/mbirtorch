@@ -94,6 +94,44 @@ def as_automatic(model, num_devices):
     return num_devices
 
 
+def recon_peak(model, num_devices):
+    """The largest per-device peak of the model's full recon plan at
+    ``num_devices``.
+
+    ``layout_fits`` admits a layout only when EVERY device holds its share and
+    refuses it when any one is short, so the number that decides a budget
+    question is the largest per-device peak, not the lead device's.
+    """
+    devices = [torch.device('cpu', i) for i in range(num_devices)]
+    return max(model._build_memory_ledger(devices=devices).per_device_peaks())
+
+
+def budget_admitting_only(monkeypatch, model, fits, misses):
+    """A per-device budget the recon plan clears at ``fits`` and misses at
+    every entry of ``misses``, each given as a ``(device count, preflight
+    margin)`` pair.
+
+    Both ends of the window are modeled peaks scaled by the margin they are
+    priced against, so the budget is placed at the MIDPOINT and recomputed on
+    every run.  A charge that moves either peak is followed, rather than
+    breaking a factor someone chose once against numbers that have since
+    moved.  The window is as wide as widening's effect on the per-device peak,
+    which is the property these tests exist to exercise, so a window that
+    closes is reported as that and not as arithmetic that happened to invert.
+    """
+    count, margin = fits
+    floor = int((1.0 + margin) * recon_peak(model, count))
+    ceiling = min(int((1.0 + m) * recon_peak(model, n)) for n, m in misses)
+    assert floor < ceiling, (
+        f'no budget clears {fits} and misses {misses}: widening no longer '
+        f'lowers the modeled per-device peak enough to tell them apart '
+        f'({floor} is not below {ceiling})')
+    budget = (floor + ceiling) // 2
+    monkeypatch.setattr(_memory_ledger, 'device_budget_bytes',
+                        lambda d: budget)
+    return budget
+
+
 # ── the selection rule ───────────────────────────────────────────────────────
 def test_widening_picks_the_largest_count_that_fits(monkeypatch, unpinned,
                                                     no_speed_guard):
@@ -333,22 +371,26 @@ def test_the_margin_is_tunable_without_disabling_the_preflight(monkeypatch,
     # Big enough that the arrays dominate the ledger's fixed workspace term;
     # at a tiny shape both peaks are just that constant and cannot separate.
     model = make_model((128, 64, 128))
+    # This shape reconstructs 16,384 pixels a slice, which the shipped forward
+    # batch covers whole, so that transient does not shrink as devices are
+    # added and the one- and two-device peaks barely separate.  Pinning the
+    # batch to half a slice leaves the sharded arrays to dominate the
+    # difference, which is what the budget below is built from.
+    model.forward_project_pixel_batch = 8192
     as_automatic(model, 2)
     monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
     monkeypatch.setattr(torch.cuda, 'device_count', lambda: 2)
-    # A budget just over the two-device peak and under the one-device peak,
-    # so the verdict turns on the margin alone.
-    peak2 = model._build_memory_ledger(
-        devices=[torch.device('cpu', i) for i in range(2)]).peak_bytes(0)
-    peak1 = model._build_memory_ledger(devices=['cpu']).peak_bytes(0)
-    budget = int(1.05 * peak2)
-    assert budget < peak1                        # one device cannot rescue it
-    monkeypatch.setattr(_memory_ledger, 'device_budget_bytes',
-                        lambda d: budget)
-    model.memory_preflight_margin = 0.15
+    # A budget the two-device layout misses at the default margin and clears at
+    # the lowered one, so the verdict turns on the margin alone.  One device
+    # must miss it at the lowered margin too, or the search would answer with
+    # n=1 -- the floors are in force here and price that count first.
+    default_margin, accepted_margin = 0.15, 0.02
+    budget_admitting_only(monkeypatch, model, fits=(2, accepted_margin),
+                          misses=[(2, default_margin), (1, accepted_margin)])
+    model.memory_preflight_margin = default_margin
     with pytest.raises(MemoryPreflightError):
         model._apply_device_policy()
-    model.memory_preflight_margin = 0.02         # the user accepts less room
+    model.memory_preflight_margin = accepted_margin  # user accepts less room
     model._apply_device_policy()                 # now it fits
     assert model.sino_placement.n_devices == 2
 
@@ -611,15 +653,19 @@ def test_capacity_falls_back_past_a_speed_floor_and_says_so(monkeypatch,
     run that does not fit at all.  The log says which happened.
     """
     model = make_model((128, 64, 128))           # 1.0M elements: below every floor
+    # This shape reconstructs 16,384 pixels a slice, which the shipped forward
+    # batch covers whole, so that transient does not shrink as devices are
+    # added and the one- and four-device peaks barely separate.  Pinning the
+    # batch to half a slice leaves the sharded arrays to dominate the
+    # difference, which is what the budget below is built from.
+    model.forward_project_pixel_batch = 8192
     with_four_visible(monkeypatch, model)
-    peak1 = model._build_memory_ledger(devices=['cpu']).peak_bytes(0)
-    peak4 = model._build_memory_ledger(
-        devices=[torch.device('cpu', i) for i in range(4)]).peak_bytes(0)
-    budget = int(1.05 * peak4)
-    assert peak4 < budget < peak1                # only the wide layout fits
-    monkeypatch.setattr(_memory_ledger, 'device_budget_bytes',
-                        lambda d: budget)
-    model.memory_preflight_margin = 0.02
+    # Only the wide layout fits: n=1 is priced first, misses, and n=4 is then
+    # taken past its speed floor.
+    margin = 0.02
+    budget_admitting_only(monkeypatch, model, fits=(4, margin),
+                          misses=[(1, margin)])
+    model.memory_preflight_margin = margin
     model._apply_device_policy()
 
     assert model.sino_placement.n_devices == 4
@@ -735,8 +781,10 @@ def _synthetic_no_family(shape):
     return _UnlistedGeometry(shape, angles)
 
 
-def _multiaxis_no_family(shape):
-    """Multiaxis angles are (azimuth, elevation) pairs, one row per view."""
+def _multiaxis_model(shape):
+    """Multiaxis angles are (azimuth, elevation) pairs, one row per view.
+    Since 2026-08-17 this class declares its own floor family, so it no
+    longer belongs in the borrowed-floors lists below."""
     azimuth = np.linspace(0, np.pi, shape[0], endpoint=False)
     elevation = np.linspace(-0.4, 0.4, shape[0])
     return mbirtorch.MultiAxisParallelModel(shape, np.stack([azimuth, elevation], axis=1))
@@ -755,7 +803,6 @@ def _translation_no_family(shape):
 
 
 UNMEASURED_GEOMETRIES = [
-    (_multiaxis_no_family, 'MultiAxisParallelModel'),
     (_translation_no_family, 'TranslationModel'),
     (_synthetic_no_family, '_UnlistedGeometry'),
 ]
@@ -872,15 +919,17 @@ def test_the_device_line_does_not_call_the_count_it_is_using_rejected(
     """The fallback note names the count actually in use, and that count
     appears on a line whose other entries are refusals."""
     model = make_model((128, 64, 128))
+    # This shape reconstructs 16,384 pixels a slice, which the shipped forward
+    # batch covers whole, so that transient does not shrink as devices are
+    # added and the one- and four-device peaks barely separate.  Pinning the
+    # batch to half a slice leaves the sharded arrays to dominate the
+    # difference, which is what the budget below is built from.
+    model.forward_project_pixel_batch = 8192
     with_four_visible(monkeypatch, model)
-    peak1 = model._build_memory_ledger(devices=['cpu']).peak_bytes(0)
-    peak4 = model._build_memory_ledger(
-        devices=[torch.device('cpu', i) for i in range(4)]).peak_bytes(0)
-    budget = int(1.05 * peak4)
-    assert peak4 < budget < peak1
-    monkeypatch.setattr(_memory_ledger, 'device_budget_bytes',
-                        lambda d: budget)
-    model.memory_preflight_margin = 0.02
+    margin = 0.02
+    budget_admitting_only(monkeypatch, model, fits=(4, margin),
+                          misses=[(1, margin)])
+    model.memory_preflight_margin = margin
     model._apply_device_policy()
 
     line = model._device_report()
@@ -994,7 +1043,7 @@ DIRECT_RECONS = [
     (_automatic_parallel, 'fbp_recon'),
     (_automatic_cone, 'fdk_recon'),
     # The multiaxis constructor is the floors section's, at a toy shape.
-    (lambda: _multiaxis_no_family((8, 6, 8)), 'fbp_recon'),
+    (lambda: _multiaxis_model((8, 6, 8)), 'fbp_recon'),
     (_automatic_translation, 'fdk_recon'),
 ]
 DIRECT_RECON_IDS = ['parallel', 'cone', 'multiaxis', 'translation']
@@ -1036,12 +1085,13 @@ def test_a_bare_direct_recon_settles_the_layout_and_spreads(
     assert np.all(np.isfinite(recon))
 
 
-@pytest.mark.parametrize("make,method", DIRECT_RECONS[2:],
-                         ids=DIRECT_RECON_IDS[2:])
+@pytest.mark.parametrize("make,method", DIRECT_RECONS[3:],
+                         ids=DIRECT_RECON_IDS[3:])
 def test_an_unmeasured_geometry_takes_the_parallel_floors_into_its_direct_recon(
         monkeypatch, unpinned, caplog, make, method):
-    """Neither multiaxis nor translation names a ``_floor_family``, so the
-    parallel floors govern the count their direct reconstruction settles on.
+    """Translation names no ``_floor_family``, so the parallel floors govern
+    the count its direct reconstruction settles on.  (Multiaxis left this
+    test on 2026-08-17, when it gained its own family.)
 
     These shapes are far below every parallel floor, so with the floors in
     force the reconstruction holds at one device although four are free, and
@@ -1062,26 +1112,64 @@ def test_an_unmeasured_geometry_takes_the_parallel_floors_into_its_direct_recon(
 # layout serves the model's whole life.  The capacity check that can REFUSE is
 # made against the call in progress, so a direct reconstruction is not turned
 # away for a recon it is not going to run.
-def budget_between_the_two_plans(monkeypatch, model):
-    """A per-device budget no full recon fits at any count, and that a direct
-    reconstruction fits at four devices.
 
-    Both peaks come from the model's own ledger, so the test fixes the
-    RELATION between the two plans rather than a number that would have to be
-    rewritten whenever a charge moves.
+# Sinogram shapes to look for that budget at, tried in this order.  The first
+# is the one these tests have always run at and is expected to be the one they
+# get.  The others are taller volumes, where the phases only a full recon
+# builds -- the prior, the hessian diagonal, the error sinogram -- grow faster
+# than the filter and single back projection of a direct reconstruction do, so
+# the two peaks stand further apart.
+BETWEEN_THE_PLANS_SHAPES = [(128, 64, 128), (128, 128, 128), (128, 256, 128)]
+
+# How far above the preflight's own margin the budget's lower bound sits, so
+# the direct plan clears the check with room instead of landing on it.  At the
+# default 0.15 margin this is the 1.20 these tests have always used.
+BETWEEN_THE_PLANS_HEADROOM = 0.05
+
+
+def two_plan_peaks(model):
+    """The direct plan's peak at four devices and the smallest full-recon peak
+    over the counts the search tries, both the largest-per-device measure
+    ``recon_peak`` explains.
     """
-    def devices(count):
-        return [torch.device('cpu', i) for i in range(count)]
+    direct = max(model._build_memory_ledger(
+        devices=[torch.device('cpu', i) for i in range(4)],
+        workload='direct').per_device_peaks())
+    recon = min(recon_peak(model, n) for n in (1, 2, 3, 4))
+    return direct, recon
 
-    direct = model._build_memory_ledger(devices=devices(4),
-                                        workload='direct').peak_bytes(0)
-    recon = [model._build_memory_ledger(devices=devices(n)).peak_bytes(0)
-             for n in (1, 2, 3, 4)]
-    budget = int(1.20 * direct)               # clears the 0.15 margin
-    assert budget < min(recon)                # and no count fits a recon
-    monkeypatch.setattr(_memory_ledger, 'device_budget_bytes',
-                        lambda d: budget)
-    return budget
+
+def model_between_the_two_plans(monkeypatch):
+    """A four-device model, and a per-device budget that its direct
+    reconstruction fits at four devices while no full recon fits at any count.
+
+    Both bounds come from the model's own ledger, so these tests fix the
+    RELATION between the two plans rather than a number that would have to be
+    rewritten whenever a charge moves.  The budget is placed at the MIDPOINT of
+    the two, which is the point in the window furthest from both bounds, and it
+    is recomputed on every run: a charge that moves either peak is followed,
+    and only a charge set that closes the window outright can be a problem.
+    Should one do that, the shapes above are tried in turn and the test skips
+    saying which peaks it saw -- these tests are about the rule, and a window
+    too narrow to express it is not a failure of the rule.
+    """
+    tried = []
+    for shape in BETWEEN_THE_PLANS_SHAPES:
+        model = _automatic_on_cpu(lambda: _automatic_parallel(shape))
+        direct, recon = two_plan_peaks(model)
+        floor = int((1.0 + model.memory_preflight_margin
+                     + BETWEEN_THE_PLANS_HEADROOM) * direct)
+        if floor < recon:
+            with_four_visible(monkeypatch, model)
+            budget = (floor + recon) // 2
+            monkeypatch.setattr(_memory_ledger, 'device_budget_bytes',
+                                lambda d: budget)
+            return model
+        tried.append(f'{shape} needs {floor} for its direct plan but its '
+                     f'smallest recon plan is {recon}')
+    pytest.skip('no shape tried leaves a budget between the direct plan and '
+                'the recon plan, so no budget can admit one and refuse the '
+                'other: ' + '; '.join(tried))
 
 
 def test_a_geometry_too_large_for_a_recon_still_runs_a_direct_recon(
@@ -1089,9 +1177,7 @@ def test_a_geometry_too_large_for_a_recon_still_runs_a_direct_recon(
     """The cost §2.3 records, removed.  Every device count is short for a full
     recon here, and the direct reconstruction that was going to run is not
     refused for it -- it runs, on the widest count that holds it."""
-    model = _automatic_on_cpu(lambda: _automatic_parallel((128, 64, 128)))
-    with_four_visible(monkeypatch, model)
-    budget_between_the_two_plans(monkeypatch, model)
+    model = model_between_the_two_plans(monkeypatch)
     recon = model.fbp_recon(_impulse_sinogram(model))
     assert model.sino_placement.n_devices == 4
     assert np.all(np.isfinite(recon))
@@ -1108,9 +1194,7 @@ def test_a_recon_on_that_same_model_is_refused_by_the_preflight(
     """The other half of the rule.  The layout settled under the narrower
     check, so the recon that does not fit it must be refused HERE, with the
     message and the remedies, rather than reaching the allocator."""
-    model = _automatic_on_cpu(lambda: _automatic_parallel((128, 64, 128)))
-    with_four_visible(monkeypatch, model)
-    budget_between_the_two_plans(monkeypatch, model)
+    model = model_between_the_two_plans(monkeypatch)
     model._apply_device_policy(workload='direct')     # what fbp_recon does
     assert model.sino_placement.n_devices == 4
     assert model._settled_workload == 'direct'
@@ -1148,9 +1232,7 @@ def test_a_recon_after_a_direct_settle_rechecks_once_and_then_stops(
     a caller holds stay valid -- and passing records the recon as the workload
     the layout is known to hold, which the poisoned budget then proves.
     """
-    model = _automatic_on_cpu(lambda: _automatic_parallel((128, 64, 128)))
-    with_four_visible(monkeypatch, model)
-    budget_between_the_two_plans(monkeypatch, model)
+    model = model_between_the_two_plans(monkeypatch)
     model._apply_device_policy(workload='direct')
     placement = model.sino_placement
     assert model._settled_workload == 'direct'

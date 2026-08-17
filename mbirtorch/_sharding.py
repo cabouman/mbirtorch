@@ -203,19 +203,16 @@ def move_shard(x, target, dev2dev_safe=True):
     return torch.as_tensor(x.detach().cpu().numpy()).to(target)
 
 
-#: How many bytes of one arriving partial the reduce moves at a time.  A
-#: REASONED default, not a measured knee -- the cluster measurement of this
-#: change comes after it.  The slab has to be large enough that the fixed
-#: cost of one step (a python call, one device-to-device copy, one add) stays
-#: small beside the step's own work: at 64 MiB the copy and the add take
-#: hundreds of microseconds on any device-to-device link, against tens of
-#: microseconds of launch and dispatch, so the host stays well ahead of the
-#: devices and the streaming overhead is a few percent of the reduce.  And it
-#: has to be small enough to be negligible beside the band it streams: a
-#: production band is gigabytes, so the slab is well under one percent of it.
-#: A band smaller than one slab moves in a single piece, which is exactly
-#: what the reduce did before, so nothing changes at small sizes.
-REDUCE_SLAB_BYTES = 64 * 2 ** 20
+#: How many bytes of one arriving partial the reduce moves at a time.
+#: MEASURED (2026-08-17, 2048-class cone on four H100s): sweeping the slab
+#: from 16 to 256 MiB moved the back projection by 0.8 percent in all, with
+#: 256 MiB best by a small, repeatable margin, so the measured best ships.
+#: The bounds the original reasoning set still hold: the slab stays large
+#: enough that one step's launch and dispatch are negligible beside its copy
+#: and add, and small enough to be a fraction of a production band, which is
+#: gigabytes.  A band smaller than one slab moves in a single piece, which
+#: is exactly what the reduce always did, so nothing changes at small sizes.
+REDUCE_SLAB_BYTES = 256 * 2 ** 20
 
 
 def reduce_slab_rows(num_rows, row_bytes):

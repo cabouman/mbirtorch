@@ -170,6 +170,39 @@ FLOORS = {
              '768-class still just under admission at 0.96x.  A refresh '
              'can confirm this floor but cannot lower it without a '
              'larger cell'),
+    ('multiaxis', 2): Floor(
+        family='multiaxis', count=2, elements=88_080_384,
+        cell=(512, 448, 384), against=1,
+        bracket=Bracket(losing_cell=(384, 336, 288), losing_speedup=0.74,
+                        winning_cell=(512, 448, 384), winning_speedup=1.26),
+        spread=0.01794, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-16', commit='dba9652',
+        largest_tested=297_271_296,
+        note='CARRIED FROM PARALLEL, not measured on this geometry: the '
+             'cell, bracket, and spread are parallel\'s 2026-08-16 row, '
+             'kept so two devices behave exactly as they did when this '
+             'class borrowed the parallel floors.  The family exists for '
+             'the n=4 sentinel beside it; measuring multiaxis\'s own '
+             'thresholds replaces both rows'),
+    ('multiaxis', 4): Floor(
+        family='multiaxis', count=4, elements=None, cell=None,
+        against=2,
+        bracket=Bracket(losing_cell=(1024, 1008, 992), losing_speedup=0.41,
+                        winning_cell=None, winning_speedup=None),
+        spread=0.0, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-17', commit='78b4f78',
+        largest_tested=1_023_934_464,
+        note='a sentinel: the composed 1024-class reconstruction took 394 s '
+             'at two devices and 951 s at four on the cylinder-transfer '
+             'forward (job 15307729, h014), a 0.41x speedup, because the '
+             'banded back projection\'s per-device cost rises with the '
+             'count on this geometry.  One composed run per count, so the '
+             'spread is recorded as zero; the same job\'s forward drift '
+             'witness read 0.0 percent, and the 0.41x margin dwarfs any '
+             'plausible spread.  The parallel floors this class used to borrow '
+             'admit four devices at this size, which widened an automatic '
+             'reconstruction into that slowdown.  Measuring the family\'s '
+             'own thresholds replaces this row'),
     ('denoiser', 2): Floor(
         family='denoiser', count=2, elements=None, cell=None,
         against=1,
@@ -263,7 +296,7 @@ STALE_SINCE = None
 #: green the test leaves this behind, and the test says so.  Recomputed and
 #: printed by ``refresh_widening_floors.py --bless``.
 TABLE_CHECKSUM = \
-    '091bd6255de989c35ec429e81bb4a881e20d90c216103d9592ca4863c38bea0d'
+    '4129ae3260ab4cd8010ef4070af94b67c87d0fb7ecec02b2eb2c35a62b1cc017'
 
 
 # ── the env knob ─────────────────────────────────────────────────────────────

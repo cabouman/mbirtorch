@@ -39,7 +39,13 @@ _F32_EPS = float(np.finfo(np.float32).eps)
 # Pixels per transferred cylinder batch in the multi-device forward; bounds
 # the cross-device transient.  Set forward_project_pixel_batch on the model to
 # override.
-FORWARD_PIXEL_BATCH = 8192
+#
+# 32768 is the measured knee.  The production-scale sweep (2026-08-17, four
+# H100s, 2048-class cone and parallel) read forward busy time falling 11
+# percent from batch 8192 to 16384, 5 more to 32768, and 2 to 3 more to
+# 65536, with the transferred cylinders under 1.5 GiB at the largest batch.
+# The 1024-class sweep read the same direction, so one default serves both.
+FORWARD_PIXEL_BATCH = 32768
 
 
 # ── compiled updater glue (module level, one compile per process) ─────────────

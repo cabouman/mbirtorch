@@ -280,6 +280,28 @@ def test_the_measurement_envelope_is_stated():
 
 
 # ── the accessor ─────────────────────────────────────────────────────────────
+def test_multiaxis_is_held_to_two_devices():
+    """The multiaxis family exists to cap the count at two.
+
+    Its n=2 row carries parallel's floor, so two devices behave exactly as
+    they did when the class borrowed the parallel floors, and its n=4 row is
+    a sentinel from the 2026-08-17 measurement, where four devices ran the
+    composed 1024-class reconstruction 2.4 times slower than two.  Any count
+    above two is governed by that sentinel, so speed never admits it;
+    capacity can still widen a model that fits nowhere smaller.
+    """
+    import mbirtorch
+
+    assert mbirtorch.MultiAxisParallelModel._floor_family == 'multiaxis'
+    at_the_512_class = wf.sinogram_elements((512, 448, 384))
+    huge = 10 ** 12
+    assert wf.admitted('multiaxis', 2, at_the_512_class)[0]
+    for count in (3, 4, 8):
+        ok, why = wf.admitted('multiaxis', count, huge)
+        assert not ok, count
+        assert 'sentinel' in why or 'lost' in why or 'no admission' in why, why
+
+
 def test_one_device_is_always_admitted():
     for family in (None, 'parallel', 'cone', 'a-family-with-no-rows'):
         ok, why = wf.admitted(family, 1, 1)
@@ -377,7 +399,9 @@ def test_the_refresh_tool_reports_the_geometries_that_take_the_fallback(
         'substituted floors, and they are what this report is for')
     undeclared = missing[None]
     assert 'TranslationModel' in undeclared
-    assert 'MultiAxisParallelModel' in undeclared
+    # Multiaxis left this list on 2026-08-17: it declares its own family,
+    # whose rows hold it to two devices, so it no longer borrows floors.
+    assert 'MultiAxisParallelModel' not in undeclared
 
     # Every reported class really does inherit the base value rather than
     # naming a family of its own, so the report matches the code it describes.
@@ -432,7 +456,9 @@ def test_the_printed_report_names_the_class_and_the_floors_it_borrows(
     printed = capsys.readouterr().out
     assert 'NEEDS MEASUREMENT' in printed
     assert 'TranslationModel' in printed
-    assert 'MultiAxisParallelModel' in printed
+    # Multiaxis declares its own family since 2026-08-17, so it no longer
+    # borrows floors and no longer appears in the borrowed-floors report.
+    assert 'MultiAxisParallelModel' not in printed
     assert wf.DEFAULT_FAMILY in printed
 
 

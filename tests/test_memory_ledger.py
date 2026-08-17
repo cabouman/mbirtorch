@@ -175,12 +175,14 @@ def test_band_reduce_shrinks_with_the_device_count():
     two, four = reduce_bytes(2), reduce_bytes(4)
     # It now falls with the device count instead of standing still.  Not
     # exactly a half, because the slab term is a fixed number of bytes and
-    # there is one more of them at four devices.
-    assert 0.5 <= four / two <= 0.56
+    # there are three of them at four devices against one at two; at the
+    # 256 MiB slab (measured best, 2026-08-17) that term is a larger share
+    # than the old 64 MiB slab was, so the ratio sits near 0.69.
+    assert 0.5 <= four / two <= 0.75
     # And it is well under what the old materialize-then-sum form charged:
     # n + 1 bands at two devices, n + 2 at four.
     assert two < 0.8 * 3 * pixels * (slices // 2) * 4
-    assert four < 0.4 * 6 * pixels * (slices // 4) * 4
+    assert four < 0.6 * 6 * pixels * (slices // 4) * 4
     assert reduce_bytes(1) == 0       # a single device never runs the reduce
 
 
@@ -1537,7 +1539,8 @@ def test_a_torch_body_pays_for_both_forward_blocks():
 #
 # The MULTI-DEVICE rows were measured 2026-08-17 on four H100s of node h014,
 # in the comparison job that ran beside slurm 15307729.  They are that job's
-# composed-reconstruction arms at the shipped pixel batch of 8192 (rows file
+# composed-reconstruction arms at pixel batch 8192, the shipped default when
+# the runs were taken (the default moved to 32768 on 2026-08-17) (rows file
 # mg18_ab_h014_20260816_231137.jsonl in the plans repository).  They took the
 # place of multi-device rows measured 2026-08-10 (job mg8), which were taken
 # with the forward walking SLICE BANDS.  The banded forward was removed on
