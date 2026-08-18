@@ -51,8 +51,11 @@ from mbirtorch.triton_parallel import (PARALLEL_BACK_BLOCK_P,
                                        PARALLEL_BACK_BLOCK_R,
                                        PARALLEL_FWD_BLOCK_P,
                                        PARALLEL_FWD_BLOCK_R,
+                                       PARALLEL_SORTED_VIEW_CHUNK,
+                                       PARALLEL_SORTED_WINDOW,
                                        _parallel_back_view_batch_triton,
-                                       _parallel_forward_view_batch_triton)
+                                       _parallel_forward_view_batch_triton,
+                                       sorted_forward_enabled)
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -836,3 +839,85 @@ def test_parallel_kernel_selection_is_layout_independent():
         assert back is _parallel_back_view_batch_triton
     finally:
         monkeypatch.undo()
+
+
+# ── the sorted-contraction forward route ─────────────────────────────────────
+# The wrapper routes through the sorted kernel by default, so every forward
+# gate above already exercises it; these tests pin the pieces the default
+# path cannot reach on the small cells -- the two kernels against each
+# other, the sparse-set fallback, the view-chunk tail -- and the switch.
+
+
+def test_sorted_forward_switch_reads_environment(monkeypatch):
+    # No CUDA needed: the switch is plain environment reading, and a wrong
+    # default here would silently route every forward call the other way.
+    monkeypatch.delenv("MBIRTORCH_SORTED_FORWARD", raising=False)
+    assert sorted_forward_enabled()
+    for off in ("0", "false", "NO", " off "):
+        monkeypatch.setenv("MBIRTORCH_SORTED_FORWARD", off)
+        assert not sorted_forward_enabled()
+    monkeypatch.setenv("MBIRTORCH_SORTED_FORWARD", "1")
+    assert sorted_forward_enabled()
+
+
+@requires_cuda
+def test_parallel_forward_sorted_and_tap_kernels_agree(monkeypatch):
+    # The two routes compute the same sums in a different order, so they
+    # gate against each other at the same figure the kernels gate against
+    # their torch bodies.
+    model = _parallel_model()
+    _, pixel_indices, view_params, args = _body_inputs(model)
+    values = _voxel_values(model, pixel_indices)
+    monkeypatch.setenv("MBIRTORCH_SORTED_FORWARD", "0")
+    tap_out = _parallel_forward_view_batch_triton(values, pixel_indices,
+                                                  view_params, **args)
+    monkeypatch.setenv("MBIRTORCH_SORTED_FORWARD", "1")
+    sorted_out = _parallel_forward_view_batch_triton(values, pixel_indices,
+                                                     view_params, **args)
+    assert sorted_out.shape == tap_out.shape
+    assert bool(sorted_out.isfinite().all())
+    rel = _rel_max(sorted_out, tap_out)
+    print(f"sorted vs tap forward kernels: rel_max = {rel:.2e}")
+    assert rel <= 1e-5
+
+
+@requires_cuda
+def test_parallel_forward_sorted_fallback_for_sparse_pixels():
+    # A sparse pixel set is the ordinary way a SORTED tile's channel span
+    # exceeds the window: the small parity cells never reach it (their
+    # whole detector is narrower than the window), so this cell is wide
+    # (64 channels) and the set keeps every 103rd pixel.  The sorted
+    # 32-pixel tile then spans most of the detector, the kernel takes its
+    # per-tap fallback, and the values must still match the torch body.
+    model = _parallel_model(cell=(6, 12, 64))
+    _, pixel_indices, view_params, args = _body_inputs(model)
+    sparse = pixel_indices[::103].contiguous()
+    assert int(sparse.shape[0]) > PARALLEL_SORTED_WINDOW
+    values = _voxel_values(model, sparse)
+    reference = _parallel_forward_view_batch(values, sparse, view_params,
+                                             **args)
+    kernel_out = _parallel_forward_view_batch_triton(values, sparse,
+                                                     view_params, **args)
+    assert kernel_out.shape == reference.shape
+    rel = _rel_max(kernel_out, reference)
+    print(f"sorted forward sparse-set fallback: rel_max = {rel:.2e}")
+    assert rel <= 1e-5
+
+
+@requires_cuda
+def test_parallel_forward_sorted_view_chunk_tail():
+    # 21 views is one full 16-view chunk plus a 5-view tail, so the tail
+    # chunk's clamped iterations run and must write nothing: a defect there
+    # double-counts the last view and fails the parity by orders.
+    assert 21 % PARALLEL_SORTED_VIEW_CHUNK != 0
+    model = _parallel_model(cell=(21, 12, 12))
+    _, pixel_indices, view_params, args = _body_inputs(model)
+    values = _voxel_values(model, pixel_indices)
+    reference = _parallel_forward_view_batch(values, pixel_indices,
+                                             view_params, **args)
+    kernel_out = _parallel_forward_view_batch_triton(values, pixel_indices,
+                                                     view_params, **args)
+    assert kernel_out.shape == reference.shape
+    rel = _rel_max(kernel_out, reference)
+    print(f"sorted forward view-chunk tail (21 views): rel_max = {rel:.2e}")
+    assert rel <= 1e-5

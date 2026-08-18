@@ -239,15 +239,21 @@ def test_parallel_cost_functions_state_the_designed_residency():
         1000, 8, args)
     assert bytes_pv == 16 * 1000 + 4 * 12 * 16
     assert chunk == triton_parallel.PARALLEL_BACK_VIEW_CHUNK
+    # The forward's charge follows its route: the sorted-contraction route
+    # (the default) holds the argsort order, the permutation, and the
+    # gathered contract copies beside the 16-byte contract -- 20 more bytes
+    # per (view, pixel) -- and the per-tap route holds the contract alone.
+    forward_pv = (16 + 20) * 1000 if \
+        triton_parallel.sorted_forward_enabled() else 16 * 1000
     bytes_pv, chunk = triton_parallel._parallel_forward_view_batch_cost(
         1000, 8, args)
-    assert bytes_pv == 16 * 1000 + 4 * 12 * 16
+    assert bytes_pv == forward_pv + 4 * 12 * 16
     assert chunk == triton_parallel.PARALLEL_FWD_VIEW_CHUNK
     # A width that is already a multiple of 16 is charged unchanged.
     assert triton_parallel._parallel_back_view_batch_cost(
         1000, 16, args)[0] == 16 * 1000 + 4 * 12 * 16
     assert triton_parallel._parallel_forward_view_batch_cost(
-        1000, 16, args)[0] == 16 * 1000 + 4 * 12 * 16
+        1000, 16, args)[0] == forward_pv + 4 * 12 * 16
 
 
 def test_cone_cost_functions_state_the_designed_residency():

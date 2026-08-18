@@ -64,6 +64,7 @@ wrapper needs a working triton.
 """
 
 import contextlib
+import os
 
 import torch
 
@@ -129,6 +130,38 @@ PARALLEL_FWD_NUM_STAGES = 1
 PARALLEL_FWD_MIN_TILE = 8
 # The forward's nominal view chunk (see PARALLEL_BACK_VIEW_CHUNK).
 PARALLEL_FWD_VIEW_CHUNK = 128
+
+# The sorted-contraction forward's pins: the mg33 spike's winner (32 pixels,
+# a 16-channel window, 128 columns, 8 warps, 16-view chunks), where it read
+# 3.97x over the tap kernel at the full mask and 2.8x to 3.9x at the VCD
+# subset sizes, with the atomic adds down 31.6x (findings 1.30 in the plans
+# repository).  The window is a hard tl.dot minimum (16) and the sorted
+# spans measured 2 to 3 channels, so there is no headroom question in the
+# window choice itself.
+PARALLEL_SORTED_BLOCK_P = 32
+PARALLEL_SORTED_WINDOW = 16
+PARALLEL_SORTED_BLOCK_R = 128
+PARALLEL_SORTED_NUM_WARPS = 8
+PARALLEL_SORTED_NUM_STAGES = 1
+# tl.dot needs every dimension at 16 or more, so the column tile never
+# shrinks below 16 (the tap kernel's floor is 8).
+PARALLEL_SORTED_MIN_R = 16
+PARALLEL_SORTED_VIEW_CHUNK = 16
+
+
+def sorted_forward_enabled():
+    """Whether the parallel forward routes through the sorted-contraction
+    kernel (the default) or the original per-tap kernel.
+
+    Read per call, like the other environment switches, so a test or a
+    measurement can flip it around one block.  MBIRTORCH_SORTED_FORWARD=0
+    restores the per-tap kernel; the switch is the same escape-hatch
+    pattern the column-gather flip used while its gate ran.  Both kernels
+    compute the same sums in a different order, inside the standing 1e-5
+    value gates.
+    """
+    return os.environ.get('MBIRTORCH_SORTED_FORWARD', '1').strip().lower() \
+        not in ('0', 'false', 'no', 'off')
 
 
 @_jit
@@ -459,6 +492,109 @@ def _parallel_forward_kernel(n_p_ptr, centers_ptr, w_p_c_ptr,
                                         & (n_tap < num_channels))[:, None])
 
 
+@_jit
+def _parallel_forward_sorted_kernel(n_p_ptr, centers_ptr, w_p_c_ptr,
+                                    weight_scale_ptr, values_ptr, perm_ptr,
+                                    out_ptr, num_views, num_pixels,
+                                    num_channels, num_cols, out_view_stride,
+                                    VIEW_CHUNK: tl.constexpr,
+                                    WINDOW: tl.constexpr,
+                                    PSF_RADIUS: tl.constexpr,
+                                    BLOCK_P: tl.constexpr,
+                                    BLOCK_R: tl.constexpr):
+    """The sorted-contraction forward: one program per (pixel block, column
+    chunk, view chunk), with the pixels PRE-SORTED per view by channel
+    center and the values rows reached through that view's permutation.
+
+    Sorted, a tile's taps land in a narrow channel window, so the scatter
+    becomes a small dense contraction: the tile's trapezoid weights form a
+    (BLOCK_P, WINDOW) matrix, transpose(W) @ values accumulates the whole
+    tile (a segmented reduction where many pixels share a channel), and the
+    window lands with one atomic add per (channel, column) instead of one
+    per (pixel, tap, column).  The contraction runs in the full-precision
+    input mode; the tensor-core default rounds inputs to a 10-bit mantissa
+    and would fail the 1e-5 value gates.
+
+    A tile whose sorted span still exceeds the window -- a sparse pixel
+    set is the ordinary cause -- takes the original per-tap block below,
+    so correctness never rests on the span.  A view chunk past the batch's
+    end clamps its view index for every address and masks its stores, so a
+    batch of any length is safe (the driver's tail batches are shorter
+    than the chunk).
+    """
+    p_offs = tl.program_id(0) * BLOCK_P + tl.arange(0, BLOCK_P)
+    r_offs = tl.program_id(1) * BLOCK_R + tl.arange(0, BLOCK_R)
+    v0 = tl.program_id(2) * VIEW_CHUNK
+    p_mask = p_offs < num_pixels
+    r_mask = r_offs < num_cols
+    tile_mask = p_mask[:, None] & r_mask[None, :]
+
+    for dv in range(VIEW_CHUNK):
+        v = v0 + dv
+        v_ok = v < num_views
+        # The clamp keeps every address in bounds for a tail chunk; the
+        # store masks carry v_ok, so a clamped iteration writes nothing.
+        v_safe = tl.minimum(v, num_views - 1)
+        pix_base = v_safe.to(tl.int64) * num_pixels + p_offs
+        n_p = tl.load(n_p_ptr + pix_base, mask=p_mask, other=0.0)
+        centers = tl.load(centers_ptr + pix_base, mask=p_mask, other=0)
+        w_p_c = tl.load(w_p_c_ptr + v_safe)
+        weight_scale = tl.load(weight_scale_ptr + v_safe)
+        clip = tl.minimum(w_p_c, 1.0)
+        out_view_ptr = out_ptr + v_safe.to(tl.int64) * out_view_stride
+        row_idx = tl.load(perm_ptr + pix_base, mask=p_mask, other=0)
+        vals = tl.load(values_ptr + row_idx.to(tl.int64)[:, None] * num_cols
+                       + r_offs[None, :], mask=tile_mask, other=0.0)
+
+        big = 2147483647
+        c_lo = tl.min(tl.where(p_mask, centers, big)) - PSF_RADIUS
+        c_hi = tl.max(tl.where(p_mask, centers, -big)) + PSF_RADIUS
+        span = c_hi - c_lo + 1
+        if span <= WINDOW:
+            # The window weights are the tap path's trapezoid formula
+            # evaluated at every window channel: the psf radius is chosen
+            # so the trapezoid's support sits inside the taps, so the
+            # window holds the same nonzero weights plus true zeros.
+            j = tl.arange(0, WINDOW)
+            c = c_lo + j
+            w = tl.maximum(
+                (w_p_c + 1.0) / 2.0
+                - _tl_abs(n_p[:, None] - c.to(tl.float32)[None, :]), 0.0)
+            w = tl.minimum(w, clip) * weight_scale
+            w = tl.where(((c >= 0) & (c < num_channels))[None, :], w, 0.0)
+            w = tl.where(p_mask[:, None], w, 0.0)
+            out_window = tl.dot(tl.trans(w), vals,
+                                input_precision="ieee")
+            c_addr = tl.minimum(tl.maximum(c, 0), num_channels - 1)
+            win_ptrs = (out_view_ptr
+                        + c_addr.to(tl.int64)[:, None] * num_cols
+                        + r_offs[None, :])
+            # The span mask keeps the power-of-two window from inflating
+            # the adds: lanes past the tile's real span carry zero weight
+            # AND issue no atomic.
+            tl.atomic_add(win_ptrs, out_window,
+                          mask=(v_ok
+                                & ((j <= (c_hi - c_lo))
+                                   & (c >= 0)
+                                   & (c < num_channels))[:, None]
+                                & r_mask[None, :]))
+        else:
+            for tc in _tap_range(0, 2 * PSF_RADIUS + 1):
+                n_tap = centers + (tc - PSF_RADIUS)
+                w_chan = tl.maximum(
+                    (w_p_c + 1.0) / 2.0
+                    - _tl_abs(n_p - n_tap.to(tl.float32)), 0.0)
+                w_chan = tl.minimum(w_chan, clip) * weight_scale
+                n_chan = tl.minimum(tl.maximum(n_tap, 0), num_channels - 1)
+                out_ptrs = (out_view_ptr
+                            + n_chan.to(tl.int64)[:, None] * num_cols
+                            + r_offs[None, :])
+                tl.atomic_add(out_ptrs, w_chan[:, None] * vals,
+                              mask=(v_ok & tile_mask
+                                    & ((n_tap >= 0)
+                                       & (n_tap < num_channels))[:, None]))
+
+
 @torch.compiler.disable
 def _parallel_forward_view_batch_triton(values, pixel_indices,
                                         view_params_batch, num_rows, num_cols,
@@ -521,6 +657,53 @@ def _parallel_forward_view_batch_triton(values, pixel_indices,
         padded_values[:, :num_value_cols] = values
         padded_values[:, num_value_cols:] = 0.0
         values = padded_values
+    if sorted_forward_enabled():
+        # THE SORTED ROUTE (the default; findings 1.30 in the plans
+        # repository).  Per view, the pixels are sorted by channel center
+        # and the contract is gathered into that order, so the sorted
+        # kernel's tiles sit in narrow channel windows and its contraction
+        # replaces almost all of the atomic scatter.  The permutation maps
+        # each sorted position back to its values row; the kernel gathers
+        # the rows per view.  The sort computes per call; the orderings
+        # depend only on (pixel set, view batch), so a memoization through
+        # the ``plan`` slot is the recorded follow-up if the per-call
+        # milliseconds ever matter.
+        order = torch.argsort(n_p, dim=1)
+        contract = [torch.gather(n_p, 1, order).contiguous(),
+                    torch.gather(centers, 1, order).contiguous(),
+                    w_p_c.reshape(num_views).contiguous(),
+                    weight_scale.reshape(num_views).contiguous()]
+        perm = order.to(torch.int32).contiguous()
+        out = torch.zeros((num_views, num_channels, launch_cols), dtype=_F32,
+                          device=values.device)
+        block_p = PARALLEL_SORTED_BLOCK_P
+        block_r = max(PARALLEL_SORTED_MIN_R,
+                      _tile_size(PARALLEL_SORTED_BLOCK_R, launch_cols,
+                                 PARALLEL_SORTED_MIN_R))
+        grid = (-(-num_pixels // block_p), -(-launch_cols // block_r),
+                -(-num_views // PARALLEL_SORTED_VIEW_CHUNK))
+        launch_key = ('pfwd_sorted', values.device.index, int(psf_radius),
+                      block_p, block_r, int(num_views),
+                      int(num_pixels), int(num_channels), launch_cols)
+        first_launch = launch_key not in _COMPILED_LAUNCH_KEYS
+        guard = (compile_serialized() if first_launch
+                 else contextlib.nullcontext())
+        with torch.cuda.device(values.device), guard:
+            _parallel_forward_sorted_kernel[grid](
+                *contract, values, perm, out,
+                int(num_views), int(num_pixels), int(num_channels),
+                launch_cols, int(num_channels) * launch_cols,
+                VIEW_CHUNK=PARALLEL_SORTED_VIEW_CHUNK,
+                WINDOW=PARALLEL_SORTED_WINDOW,
+                PSF_RADIUS=int(psf_radius), BLOCK_P=block_p,
+                BLOCK_R=block_r,
+                num_warps=PARALLEL_SORTED_NUM_WARPS,
+                num_stages=PARALLEL_SORTED_NUM_STAGES)
+        _COMPILED_LAUNCH_KEYS.add(launch_key)
+        if launch_cols == num_value_cols:
+            return out.permute(0, 2, 1)
+        return out[:, :, :num_value_cols].permute(0, 2, 1)
+
     contract = [t.contiguous() for t in (n_p, centers)]
     # Per-view scalars, and the shape check that they really are per view.
     contract += [t.reshape(num_views).contiguous()
@@ -574,10 +757,19 @@ def _parallel_forward_view_batch_cost(num_pixels, num_value_cols, args):
     call-fixed and not charged.
 
     The plane is allocated at the PADDED column count, because that is what
-    the wrapper launches at, so the charge reads the padded value too."""
+    the wrapper launches at, so the charge reads the padded value too.
+
+    The sorted route adds per-(view, pixel) residents beside the 16-byte
+    contract: the argsort's int64 order (8), the int32 permutation (4), and
+    the gathered float32 and int32 contract copies (8).  Twenty bytes per
+    (view, pixel), charged only while the route is on, so the code and the
+    charge cannot disagree."""
     plane_bytes = (4 * int(args['num_channels'])
                    * padded_kernel_width(num_value_cols))
-    return 16 * int(num_pixels) + plane_bytes, PARALLEL_FWD_VIEW_CHUNK
+    per_view = 16 * int(num_pixels) + plane_bytes
+    if sorted_forward_enabled():
+        per_view += 20 * int(num_pixels)
+    return per_view, PARALLEL_FWD_VIEW_CHUNK
 
 
 _parallel_forward_view_batch_triton._view_batch_cost = \
