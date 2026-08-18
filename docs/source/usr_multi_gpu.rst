@@ -128,8 +128,8 @@ volume falls as the device count rises.  Reconstructing a volume that does not f
 GPU is the primary reason to use more of them.
 
 **Speed only on large problems.**  Reconstruction time does *not* scale linearly with the
-device count, and on small problems more devices is markedly worse.  Measured on H100, over
-a warm 3-iteration reconstruction:
+device count, and on small problems more devices is worse.  Measured on H100 for a
+parallel-beam model, over a warm 3-iteration reconstruction:
 
 .. list-table::
    :header-rows: 1
@@ -140,19 +140,20 @@ a warm 3-iteration reconstruction:
      - 2 devices
      - 4 devices
    * - 512 x 448 x 384
-     - 3.12 s
-     - 2.96 s
-     - 9.11 s
+     - 1.85 s
+     - 1.49 s
+     - 2.15 s
    * - 1024 x 1008 x 992
-     - 94.0 s
-     - 70.7 s
-     - 60.2 s
+     - 40.0 s
+     - 23.8 s
+     - 15.5 s
 
-The large volume improves by 1.33x at two devices and 1.56x at four.  The small volume gets
-*worse* at four devices, by roughly a factor of three.  Small reconstructions are
-orchestration-bound: the per-band, per-device coordination grows with the device count and
-outweighs the reduced compute per device.  These are hardware-dependent measurements, not
-guarantees.  Reach for more devices when you need the memory, or when the problem is large.
+The large volume improves by 1.7x at two devices and 2.6x at four.  The small volume gains
+a little at two devices and is *worse* at four devices than at one.  Small reconstructions
+are orchestration-bound: the per-band, per-device coordination grows with the device count
+and outweighs the reduced compute per device.  These are hardware-dependent measurements,
+not guarantees.  Reach for more devices when you need the memory, or when the problem is
+large.
 
 Behind the scenes
 -----------------
