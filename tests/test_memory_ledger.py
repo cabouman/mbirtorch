@@ -16,6 +16,7 @@ import mbirtorch
 from mbirtorch import _memory_ledger, _sharding
 from mbirtorch._memory_ledger import (Ledger, LedgerPlan, MemoryPreflightError,
                                       PhaseCharge, estimate_peak_device_bytes)
+from mbirtorch._utils import padded_kernel_width
 
 GB = 2 ** 30
 
@@ -194,14 +195,20 @@ def test_band_reduce_charges_the_bands_already_reduced_this_pass():
     the band narrowed while the owner really was holding most of a shard.
     The ``shard + band`` form covers both: the bands already done, at most
     ``shard - band``, and the two live ones.
+
+    The partial the owner produced itself came from a kernel wrapper, which
+    allocates the band rounded up to a multiple of 16, so that one term is
+    charged at the padded length.
     """
     plan = make_plan(n_devices=2, back_band=4)
     ledger = estimate_peak_device_bytes(plan)
     charged = dict(_sub(ledger, 'subset back projection', 2,
                         'band reduce').terms)['band reduce'][0]
     p_sub, shard, band = math.ceil(800 / 4), 16, 4
+    own_partial = padded_kernel_width(band)
+    assert own_partial == 16
     slab = _sharding.reduce_slab_rows(p_sub, band * 4) * band * 4
-    assert charged == p_sub * (shard + band) * 4 + slab
+    assert charged == p_sub * (shard + own_partial) * 4 + slab
 
     # The floor rule in the place it bites: however narrow the band, the owner
     # still ends the pass holding a whole shard, so the charge may not fall
@@ -521,6 +528,46 @@ def test_the_worker_block_count_follows_the_realized_view_batches():
     ledger = estimate_peak_device_bytes(make_plan(n_devices=2))
     assert dict(_sub(ledger, 'subset back projection', 2,
                      'back workers').terms)['back output'][0] == 2 * p_sub * 16 * 4
+
+
+def test_the_band_sized_back_partials_are_charged_at_the_padded_band():
+    """A kernel wrapper allocates the band rounded up to a multiple of 16.
+
+    Two terms hold such a partial, and both read the padded length: the
+    blocks the view loop holds, and the partial the reduce keeps alive on the
+    owner.  A band that is already a multiple of 16 is charged exactly what
+    it was charged before the padding existed.
+    """
+    p_sub = math.ceil(800 / 4)
+
+    def terms(slices):
+        ledger = estimate_peak_device_bytes(
+            make_plan(n_devices=2, recon=(32, 32, slices)))
+        workers = dict(_sub(ledger, 'subset back projection', 2,
+                            'back workers').terms)
+        reduce_phase = dict(_sub(ledger, 'subset back projection', 2,
+                                 'band reduce').terms)
+        return workers['back output'][0], reduce_phase['band reduce'][0]
+
+    # 40 slices over two devices is a shard and a band of 20, which rounds up
+    # to 32.  The two live blocks are charged at 32 slices each, and the
+    # reduce holds the owner's own partial at 32 beside its shard at 20.
+    band = 20
+    padded = padded_kernel_width(band)
+    assert padded == 32
+    blocks, reduce_bytes = terms(2 * band)
+    assert blocks == 2 * p_sub * padded * 4
+    slab = _sharding.reduce_slab_rows(p_sub, band * 4) * band * 4
+    assert reduce_bytes == p_sub * (band + padded) * 4 + slab
+
+    # 32 slices over two devices is a band of 16, which rounds up to itself,
+    # so both terms read exactly as they did before.
+    band = 16
+    assert padded_kernel_width(band) == band
+    blocks, reduce_bytes = terms(2 * band)
+    assert blocks == 2 * p_sub * band * 4
+    slab = _sharding.reduce_slab_rows(p_sub, band * 4) * band * 4
+    assert reduce_bytes == p_sub * (band + band) * 4 + slab
 
 
 def test_the_finished_own_band_is_one_cylinder_on_every_slice_owner():

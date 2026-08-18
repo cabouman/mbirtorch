@@ -80,6 +80,7 @@ import math
 
 import torch
 
+from ._utils import padded_kernel_width
 from .cone_beam import (_cone_back_view_batch, _cone_horizontal_data,
                         _cone_vertical_affine)
 from .projectors import compile_serialized
@@ -220,9 +221,19 @@ def _cone_back_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
     rows of the same view -- the L2 residency the pallas grid ordering bought
     for these transaction-bound gathers.
 
-    Pixels beyond ``num_pixels`` and slices beyond ``band_len`` ride as padded
-    lanes: their loaded contract values are zeroed, which zeroes both tap
-    weights, and their stores are masked (the poison-the-padding rule).
+    Pixels beyond ``num_pixels`` ride as padded lanes: their loaded contract
+    values are zeroed, which zeroes both tap weights, and their stores are
+    masked (the poison-the-padding rule).
+
+    The slice axis works differently.  ``band_len`` is the band the WRAPPER
+    launches, which is the real band rounded up to a multiple of 16 (see
+    :func:`mbirtorch._utils.padded_kernel_width`).  Slice lanes between the
+    real band and that rounded-up value are ordinary live lanes here: they
+    load, they compute, and they store.  Two things make that safe.  Every
+    sinogram address this kernel forms is clamped into the buffer, so a lane
+    whose global slice index points past the volume still reads inside the
+    sinogram.  And the wrapper returns only the first real-band columns of
+    ``out``, so nothing reads what those lanes stored.
     """
     p_offs = tl.program_id(0) * BLOCK_P + tl.arange(0, BLOCK_P)     # (BLOCK_P,)
     l_offs = tl.program_id(1) * BLOCK_L + tl.arange(0, BLOCK_L)     # (BLOCK_L,)
@@ -335,6 +346,13 @@ def _cone_back_view_batch_triton(sino_batch, pixel_indices, view_params_batch,
     (P, band) return, freshly written each call so the driver may accumulate
     into it in place).
 
+    The band argument is rounded up to a multiple of 16 before the launch,
+    because Triton compiles a faster kernel for an integer argument it can
+    prove divisible by 16.  The return is then the real-band slice of a
+    slightly wider output, so a band that is not a multiple of 16 returns a
+    strided view instead of a contiguous one.  A band that IS a multiple
+    takes exactly the path it took before, with the same allocations.
+
     Eager python by construction, declared twice over because the two
     mechanisms cover different callers: ``torch.compiler.disable`` keeps
     dynamo out when a compiled region CALLS this body, and the
@@ -380,23 +398,36 @@ def _cone_back_view_batch_triton(sino_batch, pixel_indices, view_params_batch,
 
     num_views, num_pixels = n_p.shape
     band_len = int(num_slices if band_slices is None else band_slices)
+    # The band the kernel is LAUNCHED at, rounded up to a multiple of 16 so
+    # that Triton compiles the faster specialization of it.  Every use of the
+    # band argument takes this value -- the grid, the tile mask, and the
+    # output row stride -- because splitting them would leave a
+    # non-divisible integer in the launch and lose the specialization again.
+    # A band that is already a multiple of 16 gets its own value back, so
+    # every allocation and every argument below is exactly what it was
+    # before this padding existed.
+    launch_band = padded_kernel_width(band_len)
     # Channel-major views, as in the torch body: the kernel's per-tile gather
     # walks the slice axis, whose row index is contiguous in this layout.
+    # The copy is NOT padded: the kernel clamps every sinogram address it
+    # forms, so a padded slice lane reads an existing detector row.
     sino_t = sino_batch.permute(0, 2, 1).contiguous()
     contract = [t.contiguous() for t in (n_p, centers, w_p_c, weight_scale,
                                          m0, w_p_r, pixel_mag, z_offset)]
-    out = torch.empty((num_pixels, band_len), dtype=_F32,
+    out = torch.empty((num_pixels, launch_band), dtype=_F32,
                       device=sino_batch.device)
 
     block_p = _tile_size(CONE_BACK_BLOCK_P, num_pixels, CONE_BACK_MIN_TILE)
-    block_l = _tile_size(CONE_BACK_BLOCK_L, band_len, CONE_BACK_MIN_TILE)
-    grid = (-(-num_pixels // block_p), -(-band_len // block_l))
+    block_l = _tile_size(CONE_BACK_BLOCK_L, launch_band, CONE_BACK_MIN_TILE)
+    grid = (-(-num_pixels // block_p), -(-launch_band // block_l))
     inv_sdd = (0.0 if math.isinf(float(source_detector_dist))
                else 1.0 / float(source_detector_dist))
+    # The padded band keys the launch, because it is the integer the
+    # compilation is keyed on.
     launch_key = ('back', sino_batch.device.index, int(psf_radius),
                   int(coeff_power), block_p, block_l,
                   int(num_views), int(num_pixels), int(num_channels),
-                  int(num_rows_r), band_len, int(slice_start))
+                  int(num_rows_r), launch_band, int(slice_start))
     first_launch = launch_key not in _COMPILED_LAUNCH_KEYS
     guard = compile_serialized() if first_launch else contextlib.nullcontext()
     # The device context is CORRECTNESS, not hygiene.  A Triton launch targets
@@ -415,7 +446,7 @@ def _cone_back_view_batch_triton(sino_batch, pixel_indices, view_params_batch,
         _cone_back_kernel[grid](
             *contract, sino_t, out,
             int(num_views), int(num_pixels), int(num_channels),
-            int(num_rows_r), band_len, int(slice_start),
+            int(num_rows_r), launch_band, int(slice_start),
             int(num_channels) * int(num_rows_r),
             float(delta_voxel_slice), (int(num_slices) - 1) / 2.0, inv_sdd,
             float(num_rows_r),
@@ -423,7 +454,12 @@ def _cone_back_view_batch_triton(sino_batch, pixel_indices, view_params_batch,
             BLOCK_P=block_p, BLOCK_L=block_l,
             num_warps=CONE_BACK_NUM_WARPS, num_stages=CONE_BACK_NUM_STAGES)
     _COMPILED_LAUNCH_KEYS.add(launch_key)
-    return out
+    if launch_band == band_len:
+        return out
+    # The padded columns hold values no caller reads, so they are sliced off.
+    # The result is a strided view, which the driver's accumulation and the
+    # cross-device reduce both handle: each row is still one contiguous run.
+    return out[:, :band_len]
 
 
 # See the wrapper's docstring: the driver reads this marker in maybe_compile.
@@ -444,7 +480,11 @@ def _cone_back_view_batch_cost(num_pixels, num_band_rows, args):
     charged at 20 more).  It also holds the channel-major copy of its
     sinogram plane (``sino_t`` above); the second argument is the sinogram's
     row count at this call site, so the plane term follows the input
-    directly.  Call-fixed tensors -- the (P, band) output partial -- exist at
+    directly.  That copy is not padded even when the band is: the kernel
+    clamps every sinogram address it forms, so a padded slice lane reads a
+    row this copy already holds.
+
+    Call-fixed tensors -- the (P, band) output partial -- exist at
     any batch size, so the batch choice cannot control them and they are not
     charged, exactly as the torch-body budget never charged its own fixed
     outputs.  The charge is a counted estimate that protects the budget
@@ -501,9 +541,18 @@ def _cone_forward_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
     instead of striding by C.  The wrapper transposes the view on return, as
     the torch body does.
 
-    Pixels beyond ``num_pixels`` and rows beyond ``num_rows`` ride as padded
-    lanes: their atomics are masked off entirely (the poison-the-padding rule),
-    which is why a padded lane's contract values may be anything finite.
+    Pixels beyond ``num_pixels`` ride as padded lanes: their atomics are
+    masked off entirely (the poison-the-padding rule), which is why a padded
+    lane's contract values may be anything finite.
+
+    The row axis works differently.  ``num_rows`` is the row count the WRAPPER
+    launches, which is the detector's real row count rounded up to a multiple
+    of 16 (see :func:`mbirtorch._utils.padded_kernel_width`).  Row lanes
+    between the two are ordinary live lanes: they gather from ``values`` and
+    their atomics land.  Two things make that safe.  The gather's index is
+    clamped into the slice band it was handed and masked by that band, so no
+    read leaves ``values``.  And those atomics land in the extra output rows,
+    which the wrapper slices off before it returns.
     """
     p_offs = tl.program_id(0) * BLOCK_P + tl.arange(0, BLOCK_P)     # (BLOCK_P,)
     r_offs = tl.program_id(1) * BLOCK_R + tl.arange(0, BLOCK_R)     # (BLOCK_R,)
@@ -604,6 +653,12 @@ def _cone_forward_view_batch_triton(values, pixel_indices, view_params_batch,
     (Vb, R, C) return, freshly zeroed each call because the kernel accumulates
     into it with atomics).
 
+    The detector row count is rounded up to a multiple of 16 before the
+    launch, for the reason :func:`_cone_back_view_batch_triton` gives for its
+    band.  The return is then the real-row slice of a slightly taller output.
+    A row count that IS a multiple of 16 takes exactly the path it took
+    before, with the same allocations.
+
     Eager python by construction and declared twice over, for the two reasons
     :func:`_cone_back_view_batch_triton` spells out, and with the same hoisted
     builders: the hfan contract and the vertical affine are built ONCE per
@@ -632,17 +687,26 @@ def _cone_forward_view_batch_triton(values, pixel_indices, view_params_batch,
 
     num_views, num_pixels = n_p.shape
     band_len = int(values.shape[1])
+    # The detector row count the kernel is LAUNCHED at, rounded up to a
+    # multiple of 16 for the same reason the back wrapper rounds its band: it
+    # is the kernel's vector axis and its output row stride, and Triton
+    # compiles a faster kernel when it can prove that integer divisible by 16.
+    # A row count that is already a multiple gets its own value back, so
+    # every allocation and every argument below is what it was before.  The
+    # geometry builders above keep the REAL row count; only the launch and
+    # the output the launch writes into move.
+    launch_rows = padded_kernel_width(int(num_rows_r))
     values = values.contiguous()
     contract = [t.contiguous() for t in (n_p, centers, w_p_c, weight_scale,
                                          m0, w_p_r, pixel_mag, z_offset)]
     # Channel-major, zeroed: the atomics accumulate, and the return transposes
     # the view exactly as the torch body transposes fan_forward_batch's.
-    out = torch.zeros((num_views, num_channels, num_rows_r), dtype=_F32,
+    out = torch.zeros((num_views, num_channels, launch_rows), dtype=_F32,
                       device=values.device)
 
     block_p = _tile_size(CONE_FWD_BLOCK_P, num_pixels, CONE_FWD_MIN_TILE)
-    block_r = _tile_size(CONE_FWD_BLOCK_R, num_rows_r, CONE_FWD_MIN_TILE)
-    grid = (-(-num_pixels // block_p), -(-num_rows_r // block_r), num_views)
+    block_r = _tile_size(CONE_FWD_BLOCK_R, launch_rows, CONE_FWD_MIN_TILE)
+    grid = (-(-num_pixels // block_p), -(-launch_rows // block_r), num_views)
     inv_sdd = (0.0 if math.isinf(float(source_detector_dist))
                else 1.0 / float(source_detector_dist))
     # The inert bounds on the slice center (see the kernel).  They are exactly
@@ -653,9 +717,11 @@ def _cone_forward_view_batch_triton(values, pixel_indices, view_params_batch,
     bp = int(bp_psf_radius)
     k_center_lo = float(int(slice_start) - bp - 1)
     k_center_hi = float(int(slice_start) + band_len + bp)
+    # The padded row count keys the launch, because it is the integer the
+    # compilation is keyed on.
     launch_key = ('fwd', values.device.index, int(psf_radius), bp, block_p,
                   block_r, int(num_views),
-                  int(num_pixels), int(num_channels), int(num_rows_r),
+                  int(num_pixels), int(num_channels), launch_rows,
                   band_len, int(slice_start))
     first_launch = launch_key not in _COMPILED_LAUNCH_KEYS
     guard = compile_serialized() if first_launch else contextlib.nullcontext()
@@ -665,15 +731,19 @@ def _cone_forward_view_batch_triton(values, pixel_indices, view_params_batch,
     with torch.cuda.device(values.device), guard:
         _cone_forward_kernel[grid](
             *contract, values, out,
-            int(num_pixels), int(num_channels), int(num_rows_r), band_len,
-            int(slice_start), int(num_channels) * int(num_rows_r),
+            int(num_pixels), int(num_channels), launch_rows, band_len,
+            int(slice_start), int(num_channels) * launch_rows,
             float(delta_voxel_slice), (int(num_slices) - 1) / 2.0, inv_sdd,
             k_center_lo, k_center_hi,
             PSF_RADIUS=int(psf_radius), BP_PSF_RADIUS=bp,
             BLOCK_P=block_p, BLOCK_R=block_r,
             num_warps=CONE_FWD_NUM_WARPS, num_stages=CONE_FWD_NUM_STAGES)
     _COMPILED_LAUNCH_KEYS.add(launch_key)
-    return out.permute(0, 2, 1)
+    if launch_rows == int(num_rows_r):
+        return out.permute(0, 2, 1)
+    # The extra detector rows hold values no caller reads, so they are sliced
+    # off before the transpose.
+    return out[:, :, :int(num_rows_r)].permute(0, 2, 1)
 
 
 # See the back wrapper's docstring: the driver reads this marker in
@@ -687,8 +757,12 @@ def _cone_forward_view_batch_cost(num_pixels, band_len, args):
     channel-major output plane (the atomics' target).  The output plane spans
     the FULL detector rows whatever slice band the values carry, so the plane
     term reads ``num_rows_r`` from the args rather than the band length.
-    ``values`` is call-fixed and not charged."""
-    plane_bytes = 4 * int(args['num_channels']) * int(args['num_rows_r'])
+    ``values`` is call-fixed and not charged.
+
+    The plane is allocated at the PADDED row count, because that is what the
+    wrapper launches at, so the charge reads the padded value too."""
+    plane_rows = padded_kernel_width(int(args['num_rows_r']))
+    plane_bytes = 4 * int(args['num_channels']) * plane_rows
     return 48 * int(num_pixels) + plane_bytes, CONE_FWD_VIEW_CHUNK
 
 

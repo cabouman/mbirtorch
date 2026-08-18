@@ -45,6 +45,7 @@ import numpy as np
 import torch
 
 from . import _sharding, tomography_utils
+from ._utils import padded_kernel_width
 
 _F32_BYTES = 4
 _INT64_BYTES = 8
@@ -404,6 +405,24 @@ def estimate_peak_device_bytes(plan):
     def cyl(i, num_pixels):
         return int(num_pixels) * plan.slice_blocks[i] * _F32_BYTES
 
+    def back_block(i, num_pixels):
+        """One live (pixels, band) back partial, at the size really allocated.
+
+        A hand-written kernel wrapper rounds the band up to a multiple of 16
+        before it allocates and returns the real-band slice of that wider
+        array, so the block occupies the padded band.  The padded length is
+        read from the same helper the wrappers use, so the code and the
+        charge cannot disagree.
+
+        A plan whose band is shorter than its shard keeps the shard-sized
+        charge, which is then the larger of the two.  That is what this term
+        charged before the padding existed, and the ledger may over-charge
+        but may not under-charge.
+        """
+        slices = max(int(plan.slice_blocks[i]),
+                     padded_kernel_width(plan.band_length(i)))
+        return int(num_pixels) * slices * _F32_BYTES
+
     def is_view_owner(i):
         return plan.view_blocks[i] > 0
 
@@ -505,9 +524,13 @@ def estimate_peak_device_bytes(plan):
             holding for the concatenation, at most ``shard - band`` slices,
           * the running total for the band it is on, one band,
           * the partial it produced itself, which the driver keeps alive
-            across the reduce, one band,
+            across the reduce, one band rounded up to a multiple of 16,
           * one slab per arriving partial, each bounded by
             ``_sharding.REDUCE_SLAB_BYTES``.
+
+        Only the partial this device produced takes the rounded-up length,
+        because only it comes straight from a kernel wrapper.  The running
+        total and every arriving slab are contiguous copies at the real band.
 
         That is ``shard + band`` slices of cylinder plus a bounded slab term,
         which at the default band -- the whole shard -- is TWO
@@ -527,9 +550,10 @@ def estimate_peak_device_bytes(plan):
             return 0
         band = plan.band_length(i)
         shard = plan.slice_blocks[i]
+        own_partial = padded_kernel_width(band)
         row_bytes = int(band) * _F32_BYTES
         slab_rows = _sharding.reduce_slab_rows(int(num_pixels), row_bytes)
-        return (int(num_pixels) * (int(shard) + int(band)) * _F32_BYTES
+        return (int(num_pixels) * (int(shard) + own_partial) * _F32_BYTES
                 + (n - 1) * slab_rows * row_bytes)
 
     def back_view_batches(i, num_pixels):
@@ -570,14 +594,18 @@ def estimate_peak_device_bytes(plan):
 
         This is charged on every VIEW owner: the workers run wherever there
         are views to project, not only where the bands land.
+
+        Each block is sized by ``back_block`` rather than by the shard,
+        because a kernel wrapper allocates the band rounded up to a multiple
+        of 16.
         """
         if n == 1:
-            return 3 * cyl(i, num_pixels) if is_slice_owner(i) else 0
+            return (3 * back_block(i, num_pixels) if is_slice_owner(i) else 0)
         if not is_view_owner(i):
             return 0
         batches = back_view_batches(i, num_pixels)
         live = 2 if batches is None else min(2, batches)
-        return live * cyl(i, num_pixels)
+        return live * back_block(i, num_pixels)
 
     def back_own_band(i, num_pixels):
         """The band this device already finished, live from its own pass on.
@@ -663,8 +691,16 @@ def estimate_peak_device_bytes(plan):
         carry: ``_cone_forward_view_batch_triton`` allocates ``(views,
         channels, num_rows_r)`` and reads ``num_rows_r`` from the params,
         because one slice lights up every row it projects onto.
+
+        Both kernel bodies round that extent up to a multiple of 16 before
+        they allocate, and return the real-width slice of the wider array, so
+        a kernel body's block is charged at the padded extent.  A torch body
+        rounds nothing up and keeps the real one.
         """
-        return forward_cols(i) if plan.rows_track_slices else plan.sino_rows
+        rows = forward_cols(i) if plan.rows_track_slices else plan.sino_rows
+        if 'forward' in plan.torch_body_directions:
+            return int(rows)
+        return padded_kernel_width(rows)
 
     def forward_block(i, num_pixels):
         """The view block the loop holds BESIDES the one the batch prices.
