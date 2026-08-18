@@ -283,19 +283,22 @@ def test_the_measurement_envelope_is_stated():
 def test_multiaxis_is_held_to_two_devices():
     """The multiaxis family exists to cap the count at two.
 
-    Its n=2 row carries parallel's floor, so two devices behave exactly as
-    they did when the class borrowed the parallel floors, and its n=4 row is
-    a sentinel from the 2026-08-17 measurement, where four devices ran the
-    composed 1024-class reconstruction 2.4 times slower than two.  Any count
-    above two is governed by that sentinel, so speed never admits it;
-    capacity can still widen a model that fits nowhere smaller.
+    Its rows were measured on the geometry itself on 2026-08-17 (mg22).
+    Two devices are admitted at and above the 768-class floor and held
+    below it -- the measurement was not monotone, and the row's note
+    records why the floor sits above the smallest winning cell.  The n=4
+    row is a sentinel (four devices lost at every probe), so any count
+    above two is never admitted on speed; capacity can still widen a
+    model that fits nowhere smaller.
     """
     import mbirtorch
 
     assert mbirtorch.MultiAxisParallelModel._floor_family == 'multiaxis'
     at_the_512_class = wf.sinogram_elements((512, 448, 384))
+    at_the_768_class = wf.sinogram_elements((768, 672, 576))
     huge = 10 ** 12
-    assert wf.admitted('multiaxis', 2, at_the_512_class)[0]
+    assert not wf.admitted('multiaxis', 2, at_the_512_class)[0]
+    assert wf.admitted('multiaxis', 2, at_the_768_class)[0]
     for count in (3, 4, 8):
         ok, why = wf.admitted('multiaxis', count, huge)
         assert not ok, count
@@ -333,8 +336,9 @@ def test_a_model_with_no_family_gets_the_parallel_floors_and_is_told_so():
 def test_an_unmeasured_family_admits_everything_rather_than_refusing_it():
     """A family the table has never heard of is not evidence against
     widening.  Only a model class routes here, and only by declaring a
-    family with no rows -- which the refresh script reports as work to do."""
-    ok, why = wf.admitted('translation', 4, 1)
+    family with no rows -- which the refresh script reports as work to do.
+    The name below is invented: every shipped family has rows now."""
+    ok, why = wf.admitted('a-family-with-no-rows', 4, 1)
     assert ok and 'no speed floors are measured' in why
 
 
@@ -382,7 +386,7 @@ def test_sinogram_elements_is_the_product_of_the_shape():
 
 # ── the refresh tool's "needs measurement" report ────────────────────────────
 def test_the_refresh_tool_reports_the_geometries_that_take_the_fallback(
-        refresh_tool):
+        refresh_tool, monkeypatch):
     """The one tool whose job is to say "this geometry needs measurement"
     must not be silent about the geometries that actually need it.
 
@@ -390,23 +394,22 @@ def test_the_refresh_tool_reports_the_geometries_that_take_the_fallback(
     floors, which were measured on a different geometry.  That is the state
     every newly ported geometry arrives in, so it is reported under the None
     key rather than skipped for having nothing declared.
+
+    Since 2026-08-17 (mg22) every shipped geometry declares a measured
+    family, so the live report is empty; the None-key path is exercised by
+    returning one class to the newly ported state.
     """
     import mbirtorch
 
-    missing = refresh_tool.unmeasured_families()
-    assert None in missing, (
-        'the classes that declare no floor family are the ones taking the '
-        'substituted floors, and they are what this report is for')
-    undeclared = missing[None]
-    assert 'TranslationModel' in undeclared
-    # Multiaxis left this list on 2026-08-17: it declares its own family,
-    # whose rows hold it to two devices, so it no longer borrows floors.
-    assert 'MultiAxisParallelModel' not in undeclared
+    assert refresh_tool.unmeasured_families() == {}, (
+        'every shipped geometry declares a family the table has rows for; '
+        'a class appearing here has lost its declaration or its rows')
 
-    # Every reported class really does inherit the base value rather than
-    # naming a family of its own, so the report matches the code it describes.
-    for name in undeclared:
-        assert getattr(mbirtorch, name)._floor_family is None
+    monkeypatch.setattr(mbirtorch.TranslationModel, '_floor_family', None)
+    missing = refresh_tool.unmeasured_families()
+    assert missing == {None: ['TranslationModel']}, (
+        'a class that declares no floor family must be reported under the '
+        'None key, not skipped for having nothing declared')
 
 
 def test_the_report_covers_every_geometry_that_reaches_the_device_decision(
@@ -443,22 +446,31 @@ def test_a_declared_family_with_no_rows_is_still_reported_under_its_name(
 
     missing = refresh_tool.unmeasured_families()
     assert missing.get('parallel') == ['ParallelBeamModel']
-    assert 'TranslationModel' in missing[None]
+    # No shipped class is in the newly ported (no-family) state anymore, so
+    # dropping one family's rows must surface only that family.
+    assert None not in missing
 
 
 def test_the_printed_report_names_the_class_and_the_floors_it_borrows(
-        refresh_tool, capsys):
+        refresh_tool, capsys, monkeypatch):
     """Reading the report has to be enough: it names which class is
     unmeasured and which family's floors are standing in for it, so nobody
-    has to go read the fallback rule to find out what is governing."""
-    refresh_tool.print_plan(refresh_tool.build_plan(smoke=True), smoke=True)
+    has to go read the fallback rule to find out what is governing.  Every
+    shipped geometry is measured since 2026-08-17 (mg22), so the live plan
+    prints the all-measured line; the borrowed-floors lines are exercised
+    by returning one class to the newly ported state."""
+    import mbirtorch
 
+    refresh_tool.print_plan(refresh_tool.build_plan(smoke=True), smoke=True)
+    printed = capsys.readouterr().out
+    assert 'every model class is governed by floors measured for it' in printed
+    assert 'NEEDS MEASUREMENT' not in printed
+
+    monkeypatch.setattr(mbirtorch.TranslationModel, '_floor_family', None)
+    refresh_tool.print_plan(refresh_tool.build_plan(smoke=True), smoke=True)
     printed = capsys.readouterr().out
     assert 'NEEDS MEASUREMENT' in printed
     assert 'TranslationModel' in printed
-    # Multiaxis declares its own family since 2026-08-17, so it no longer
-    # borrows floors and no longer appears in the borrowed-floors report.
-    assert 'MultiAxisParallelModel' not in printed
     assert wf.DEFAULT_FAMILY in printed
 
 
@@ -467,8 +479,22 @@ def test_the_refresh_tool_refuses_to_measure_a_family_it_cannot_build(
     """The report above invites someone to declare a new floor family.  The
     builder must then refuse the family it has no geometry for: falling
     through to parallel beam would time parallel beam and record the numbers
-    under the new family's name."""
+    under the new family's name.
+
+    The family named here is invented, so no future port can make it
+    buildable.  This test used to name 'translation', which stopped being a
+    refusal on 2026-08-17 when the builder gained that geometry.
+    """
     with pytest.raises(ValueError, match='cannot build a model for floor family'):
+        refresh_tool._build_model('no_such_geometry', (8, 12, 16), 'cpu')
+
+
+def test_the_refresh_tool_refuses_a_translation_cell_it_has_no_grid_for(
+        refresh_tool):
+    """A translation cell needs a grid and a spacing, which the sinogram
+    shape does not supply.  Building an unlisted cell with some default grid
+    would measure a scan nobody chose, so the builder refuses instead."""
+    with pytest.raises(ValueError, match='no translation grid recorded'):
         refresh_tool._build_model('translation', (8, 12, 16), 'cpu')
 
 

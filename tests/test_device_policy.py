@@ -790,20 +790,10 @@ def _multiaxis_model(shape):
     return mbirtorch.MultiAxisParallelModel(shape, np.stack([azimuth, elevation], axis=1))
 
 
-def _translation_no_family(shape):
-    """Translation views are object translations, laid out on a grid whose
-    two side lengths multiply to the view count."""
-    num_views = shape[0]
-    num_x = 16 if num_views == CELL_128[0] else 32
-    vectors = mbirtorch.gen_translation_vectors(num_x, num_views // num_x,
-                                                x_spacing=3.0, z_spacing=2.0)
-    return mbirtorch.TranslationModel(shape, vectors,
-                                      source_detector_dist=4.0 * shape[2],
-                                      source_iso_dist=1.0 * shape[2])
-
-
+# Translation left this list on 2026-08-17, when the mg22 refresh gave it a
+# measured family of its own; the synthetic class is now the one resident of
+# the newly ported, no-family state.
 UNMEASURED_GEOMETRIES = [
-    (_translation_no_family, 'TranslationModel'),
     (_synthetic_no_family, '_UnlistedGeometry'),
 ]
 
@@ -820,8 +810,8 @@ def _built(make, shape, verbose=0):
 def test_a_model_with_no_floor_family_gets_the_parallel_floors(
         monkeypatch, unpinned, make, class_name):
     """Every class that declares no floor family is governed by the parallel
-    floors -- checked on the two real geometries that arrive that way, not
-    only on a stand-in."""
+    floors.  Since 2026-08-17 every shipped geometry declares a measured
+    family, so the synthetic stand-in is what arrives in that state."""
     model = make(CELL_128)
     assert type(model).__name__ == class_name
     assert model._floor_family is None
@@ -1030,8 +1020,8 @@ def _automatic_translation():
     """Translation geometry needs a source far enough from the object for the
     automatic recon shape to exist, so it carries its own size -- the one
     test_translation.py reconstructs at -- rather than the shared toy shape.
-    The floors section's ``_translation_no_family`` lays its views out on a
-    grid sized for the measured cells, which no toy shape divides."""
+    A translation grid must multiply out to the view count, which no toy
+    shape divides, so this factory carries its own."""
     vectors = mbirtorch.gen_translation_vectors(4, 4, x_spacing=3.0,
                                                 z_spacing=2.0)
     return mbirtorch.TranslationModel((vectors.shape[0], 40, 32), vectors,
@@ -1087,24 +1077,23 @@ def test_a_bare_direct_recon_settles_the_layout_and_spreads(
 
 @pytest.mark.parametrize("make,method", DIRECT_RECONS[3:],
                          ids=DIRECT_RECON_IDS[3:])
-def test_an_unmeasured_geometry_takes_the_parallel_floors_into_its_direct_recon(
+def test_translation_takes_its_own_floors_into_its_direct_recon(
         monkeypatch, unpinned, caplog, make, method):
-    """Translation names no ``_floor_family``, so the parallel floors govern
-    the count its direct reconstruction settles on.  (Multiaxis left this
-    test on 2026-08-17, when it gained its own family.)
-
-    These shapes are far below every parallel floor, so with the floors in
-    force the reconstruction holds at one device although four are free, and
-    the log says whose floors it borrowed.
+    """Translation declares its own measured family (2026-08-17, mg22), so
+    its rows govern the count its direct reconstruction settles on.  Both
+    family rows are sentinels -- splitting lost at every size probed -- so
+    the reconstruction holds at one device although four are free, and the
+    log names the family's own floor rather than a borrowed one.
     """
     model = _automatic_on_cpu(make, verbose=2)
     with_four_visible(monkeypatch, model)
-    assert model._floor_family is None
+    assert model._floor_family == 'translation'
     with caplog.at_level('DEBUG', logger=model.logger.name):
         getattr(model, method)(_impulse_sinogram(model))
     assert model.sino_placement.n_devices == 1
-    assert 'names no _floor_family' in caplog.text
-    assert 'parallel widening speed floors' in caplog.text
+    assert 'translation' in caplog.text
+    assert 'sentinel' in caplog.text
+    assert 'names no _floor_family' not in caplog.text
 
 
 # ── the check against the work in progress ───────────────────────────────────

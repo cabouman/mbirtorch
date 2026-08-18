@@ -247,6 +247,16 @@ class TranslationModel(TomographyModel):
         view_batch_size, compile_mode: as in ParallelBeamModel.
     """
 
+    # Translation has its own floor family so that splitting is never
+    # admitted by speed.  Measured 2026-08-17 (mg22) on production-anchored
+    # translation cells up to the (256, 1900, 3000) production scan: two
+    # devices lost at every size probed (0.66x to 0.88x against one device)
+    # and four lost worse (0.15x to 0.64x), while the parallel floors this
+    # class used to borrow admit both counts at those sizes.  Both family
+    # rows are sentinels, so the automatic path holds a translation model to
+    # one device; capacity can still widen a model that cannot fit one.
+    _floor_family = 'translation'
+
     def __init__(self, sinogram_shape, translation_vectors, source_detector_dist,
                  source_iso_dist, view_batch_size=None, compile_mode='auto'):
         translation_vectors = np.asarray(translation_vectors, dtype=np.float32)

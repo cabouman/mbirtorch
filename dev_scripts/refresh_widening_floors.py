@@ -23,8 +23,10 @@ fails HARD: tamper protection was never the optional part.
 THE WORDS THIS SCRIPT USES.  A CELL is one problem to measure: a geometry
 family and a sinogram shape.  An ARM is one timed reconstruction of a cell at
 one device count.  The LADDER is the fixed list of sinogram shapes a refresh
-measures at.  A SENTINEL row is one whose ``elements`` is None -- a device
-count for which no admission size has been found yet.
+measures at.  Most families share one ladder; a family whose problems that
+ladder does not describe has a ladder of its own, named in FAMILY_LADDERS.  A
+SENTINEL row is one whose ``elements`` is None -- a device count for which no
+admission size has been found yet.
 
 THE METHOD, per cell and per device count: one cold recon, DISCARDED, then the
 warm median of 3 seeded 3-iteration reconstructions.  Every arm runs in a
@@ -43,6 +45,31 @@ environment pin -- ``denoise`` makes no automatic device-count decision, and
 the pin acts only through that decision.  Its cell is an IMAGE shape, because
 QGGMRFDenoiser sets its sinogram shape equal to its image shape.
 
+THE MULTIAXIS FAMILY takes the shared ladder, and its models are built the
+way mg18 built them: two angles per view, azimuths evenly spaced over half a
+turn and elevations swept across +/- 0.5 radians.  The elevation range is
+part of what a multiaxis cell measures rather than a free choice, because the
+automatic geometry sizes the reconstruction from it.
+
+THE TRANSLATION FAMILY has a ladder of its own.  The shared ladder does not
+describe a translation scan: production runs a 16x16 grid of translations,
+which is 256 views, against a large detector.  Translation's three cells keep
+that grid and halve the detector and the spacing together, so all three scan
+the same object at three resolutions, and the largest is the production cell
+mg18 measured.  A sinogram shape alone does not determine a translation model
+the way an angle list does, so TRANSLATION_SPECS records the grid and the
+spacing for every translation cell and ``_build_model`` reads them.  The
+generator differs too.  The shepp-logan phantom comes back all zeros on a
+volume only a few voxels deep, which is what the --smoke translation cell
+reconstructs, so the generator falls back to a seeded uniform phantom and
+records that it did.
+
+The first translation refresh measures BOTH counts against one device.  The
+crossover rule below reads the admitted set off the CURRENT table, and
+translation has no measured smaller count there yet.  Once its rows are
+pasted in, the next refresh compares n=4 against n=2, provided n=2 gained a
+finite floor.  Cone n=4 reached its comparison count the same way.
+
 THE CROSSOVER RULE.  A count's floor is its crossover against the best smaller
 ADMITTED count, not against n=1 unconditionally: parallel n=4 must beat n=2.
 The admitted set is read off the CURRENT table, so the comparison count can
@@ -54,8 +81,9 @@ move a floor.  Where the crossover falls between two ladder cells, the floor
 takes the CONSERVATIVE end -- the larger cell.
 
 WHICH CELLS RUN.  For a finite floor: the ladder cells bracketing it -- one
-below, the floor's own, one above.  For a sentinel: the 512-, 768- and
-1024-class cells, looking for the admission size that has never been found.
+below, the floor's own, one above.  For a sentinel: the top three cells of
+that family's ladder, looking for the admission size that has never been
+found.  On the shared ladder those are the 512-, 768- and 1024-class cells.
 A family the table has no rows for at all takes those same probe cells,
 looking for its first admission size; see UNTABLED_FAMILIES.  A sentinel
 becomes a finite floor when its count clears 1.0x by more than the measured
@@ -68,10 +96,12 @@ Run:
     python dev_scripts/refresh_widening_floors.py --smoke    # tiny, CPU, fast
     python dev_scripts/refresh_widening_floors.py --bless    # hashes only
 
-``--plan``, ``--smoke`` and ``--bless`` need no GPU.  The real run needs CUDA
-and takes roughly 30-60 minutes.  ``--accept-stale`` is accepted and does
-nothing: acknowledging by hand that a re-measurement is owed is what the
-automatic detection replaced.
+``--plan``, ``--smoke`` and ``--bless`` need no GPU.  The real run needs CUDA.
+How long it takes follows the plan: probing the largest cells at three device
+counts costs hours by itself, so run ``--plan`` first and budget from the arm
+list it prints.  ``--accept-stale`` is accepted and does nothing:
+acknowledging by hand that a re-measurement is owed is what the automatic
+detection replaced.
 
 Environment:
     REFRESH_PYTHON      interpreter for the arm subprocesses (default: this one)
@@ -109,10 +139,38 @@ SEED = 13
 #: a cell.
 LADDER = [(128, 112, 96), (192, 168, 144), (256, 224, 192), (384, 336, 288),
           (512, 448, 384), (768, 672, 576), (1024, 1008, 992)]
-#: The cells a sentinel row is measured at.
+#: The cells a sentinel row on the shared ladder is measured at -- its top
+#: three.  A family with a ladder of its own takes that ladder's top three
+#: instead; see ``probe_cells``.
 SENTINEL_PROBES = [(512, 448, 384), (768, 672, 576), (1024, 1008, 992)]
 #: Tiny stand-ins so --smoke exercises every path in seconds on a CPU.
 SMOKE_LADDER = [(8, 12, 16), (12, 12, 16), (16, 12, 16)]
+
+#: The translation grid and spacing behind each translation cell:
+#: ``cell -> (num_x, num_z, x_spacing, z_spacing)``.  A translation scan
+#: moves the object across a fixed source and detector on a grid, so its
+#: views are grid positions rather than angles, and the same sinogram shape
+#: could come from many different grids.  The grid is therefore written down
+#: here rather than derived, and ``_build_model`` reads it.  The three
+#: measured cells keep production's 16x16 grid and halve the detector and the
+#: spacing together; the largest is the production cell mg18 measured, and
+#: its grid, spacing and source distances are mg18's.
+TRANSLATION_SPECS = {
+    (256, 475, 750): (16, 16, 6.0, 4.0),
+    (256, 950, 1500): (16, 16, 12.0, 8.0),
+    (256, 1900, 3000): (16, 16, 24.0, 16.0),
+    (16, 40, 32): (4, 4, 3.0, 2.0),        # the --smoke cell, also mg18's
+}
+#: Translation's ladder, and the tiny stand-in --smoke uses for it.
+TRANSLATION_LADDER = [(256, 475, 750), (256, 950, 1500), (256, 1900, 3000)]
+TRANSLATION_SMOKE_LADDER = [(16, 40, 32)]
+
+#: Families measured at a ladder of their own, and the tiny stand-ins --smoke
+#: uses for them.  A family belongs here when the shared ladder does not
+#: describe its problems: a translation scan has few views and a large
+#: detector, so no cell on the shared ladder resembles one.
+FAMILY_LADDERS = {'translation': TRANSLATION_LADDER}
+FAMILY_SMOKE_LADDERS = {'translation': TRANSLATION_SMOKE_LADDER}
 
 #: Floor families the table has no rows for yet, and the device counts to
 #: measure for each.  The FLOORS table gains a family only through a paste of
@@ -121,7 +179,9 @@ SMOKE_LADDER = [(8, 12, 16), (12, 12, 16), (16, 12, 16)]
 #: that clears one prints its first rows.  Remove a family from here in the
 #: same change that pastes its rows in, so it is planned from the table
 #: afterwards like every other.  The denoiser left this set on 2026-08-16,
-#: when the mg16 refresh gave it its first (sentinel) rows.
+#: when the mg16 refresh gave it its first (sentinel) rows; translation
+#: entered on 2026-08-17 and left the same day, when the mg22 refresh gave
+#: it its first (sentinel) rows and TranslationModel its family declaration.
 UNTABLED_FAMILIES = {}
 
 #: What a family's floor counts, for a family whose metric is not the plain
@@ -133,6 +193,13 @@ FAMILY_METRIC_NOTES = {
                  'shape, so a denoiser floor is read in IMAGE VOXELS where '
                  'every other family reads sinogram elements.  Say so in the '
                  "row's note."),
+    'translation': ('a translation floor is read in sinogram elements like '
+                    'the other projection families, but its probe cells are '
+                    'not the shared ladder.  They are production-anchored '
+                    'translation scans: a fixed 16x16 translation grid, with '
+                    'the detector and the spacing scaled together.  Say so '
+                    "in the row's note and name the cell, so nobody reads a "
+                    'translation floor as a size on the shared ladder.'),
 }
 
 
@@ -154,6 +221,20 @@ def cell_named(target_elements, ladder):
         if elements(cell) == target_elements:
             return cell
     return None
+
+
+def family_ladder(family, smoke=False):
+    """The cells ``family`` is measured at.  Most families share LADDER; one
+    named in FAMILY_LADDERS is measured at its own cells instead."""
+    if smoke:
+        return FAMILY_SMOKE_LADDERS.get(family, SMOKE_LADDER)
+    return FAMILY_LADDERS.get(family, LADDER)
+
+
+def probe_cells(ladder):
+    """The cells a row with no known admission size is measured at: the top of
+    that family's ladder.  On LADDER these are exactly SENTINEL_PROBES."""
+    return list(ladder[-len(SENTINEL_PROBES):])
 
 
 # ── the plan ─────────────────────────────────────────────────────────────────
@@ -178,9 +259,9 @@ def comparison_count(family, count):
 def build_plan(smoke=False):
     """``[{family, count, cell, counts, role}, ...]`` in run order, plus the
     families that have no measured rows at all."""
-    ladder = SMOKE_LADDER if smoke else LADDER
     rows = []
     for (family, count) in planned_rows():
+        ladder = family_ladder(family, smoke)
         floor = wf.FLOORS.get((family, count))
         against = comparison_count(family, count)
         arms = sorted({1, against, count})
@@ -188,8 +269,7 @@ def build_plan(smoke=False):
             # No admission size is known: a row that has never been measured
             # and a sentinel row are searched the same way, at the probe
             # cells, because neither says where its crossover is.
-            cells = (ladder[-len(SENTINEL_PROBES):] if smoke
-                     else list(SENTINEL_PROBES))
+            cells = probe_cells(ladder)
             role = 'first measurement' if floor is None else 'sentinel probe'
         else:
             at = cell_named(floor.elements, ladder)
@@ -249,33 +329,46 @@ def print_plan(plan, smoke):
         'SMOKE, CPU' if smoke else 'CUDA', TORCH_PYTHON))
     print('  ladder: ' + ', '.join(
         '{} ({:,})'.format(c, elements(c)) for c in ladder))
+    # A family measured at its own cells prints them too, so the plan never
+    # shows a cell that is absent from the ladder printed above it.
+    for family in sorted({row['family'] for row in plan} & set(FAMILY_LADDERS)):
+        print('  {} ladder: '.format(family) + ', '.join(
+            '{} ({:,})'.format(c, elements(c))
+            for c in family_ladder(family, smoke)))
     print()
-    header = '{:>9}{:>4}{:>9}{:>20}{:>16}{:>18}'.format(
+    # The family column is wide enough for the longest family name, so a long
+    # one does not push the rest of the row out of alignment.
+    header = '{:>11}{:>4}{:>9}{:>20}{:>16}{:>18}'.format(
         'family', 'n', 'against', 'cell', 'sino elements', 'role')
     print(header)
     for row in plan:
-        print('{:>9}{:>4}{:>9}{:>20}{:>16,}{:>18}'.format(
+        print('{:>11}{:>4}{:>9}{:>20}{:>16,}{:>18}'.format(
             row['family'], row['count'], row['against'], str(tuple(row['cell'])),
             row['cell_elements'], row['role']))
     arms = sum(len(row['counts']) for row in plan)
     cells = {(row['family'], tuple(row['cell'])) for row in plan}
     print('\n{} rows, {} distinct cells, {} timed arms + {} generators'.format(
         len(plan), len(cells), arms, len(cells)))
-    top = elements(ladder[-1])
     for (family, count) in sorted({(r['family'], r['count']) for r in plan}):
         floor = wf.FLOORS.get((family, count))
+        # Read against the family's OWN ladder: a family measured elsewhere
+        # would otherwise be judged against a top cell it never runs.
+        top = elements(family_ladder(family, smoke)[-1])
+        # Count the cells this row actually got, rather than assuming the
+        # shared probe count: a short ladder yields fewer.
+        probes = sum(1 for r in plan
+                     if r['family'] == family and r['count'] == count)
         if floor is None:
             print('  NOTE {} n={}: the FLOORS table has no row for this '
                   'family yet, so this run is looking for its first '
                   'admission size at the {} cells above.  Until a row is '
                   'pasted in, the {} floors govern it.'.format(
-                      family, count, len(SENTINEL_PROBES), wf.DEFAULT_FAMILY))
+                      family, count, probes, wf.DEFAULT_FAMILY))
         elif floor.elements is None:
             print('  NOTE {} n={}: SENTINEL.  Measured at the {} cells '
                   'above; sizes above largest_tested ({:,} sinogram '
                   'elements) are NOT measured by this plan.'.format(
-                      family, count, len(SENTINEL_PROBES),
-                      floor.largest_tested))
+                      family, count, probes, floor.largest_tested))
         elif floor.elements >= top:
             print('  NOTE {} n={}: its floor sits at the TOP of the ladder, '
                   'so the bracket has no cell above it -- a refresh can '
@@ -331,6 +424,45 @@ def _build_model(family, cell, device, n_dev=None):
     elif family == 'parallel':
         angles = np.linspace(0, np.pi, num_views, endpoint=False)
         model = mbirtorch.ParallelBeamModel(tuple(cell), angles)
+    elif family == 'multiaxis':
+        # Two angles per view: azimuth around the object, elevation (tilt)
+        # out of the plane.  These are the geometry's own test defaults, and
+        # mg18 measured this family with them -- azimuths evenly spaced over
+        # half a turn, elevations swept across +/- 0.5 radians.  The
+        # elevation range sets the recon shape: the automatic geometry
+        # divides the detector height by the smallest |cos(elevation)| and
+        # clamps that divisor at 0.1, so a range wide enough to reach the
+        # clamp would inflate the slice count roughly tenfold.  0.5 radians
+        # is far from the clamp.
+        azimuth = np.linspace(0, np.pi, num_views, endpoint=False)
+        elevation = np.linspace(-0.5, 0.5, num_views)
+        model = mbirtorch.MultiAxisParallelModel(
+            tuple(cell), np.stack([azimuth, elevation], axis=1))
+    elif family == 'translation':
+        # A translation scan moves the object across a fixed source and
+        # detector on a grid, so its views are grid positions rather than
+        # angles.  The cell does not say what that grid is, so the grid and
+        # the spacing come from TRANSLATION_SPECS.  The construction below is
+        # mg18's, including the source distances.
+        spec = TRANSLATION_SPECS.get(tuple(cell))
+        if spec is None:
+            raise ValueError(
+                'refresh_widening_floors has no translation grid recorded '
+                'for cell {}.  Add it to TRANSLATION_SPECS before measuring '
+                'that cell.'.format(tuple(cell)))
+        num_x, num_z, x_spacing, z_spacing = spec
+        vectors = mbirtorch.gen_translation_vectors(
+            num_x, num_z, x_spacing=x_spacing, z_spacing=z_spacing)
+        if vectors.shape[0] != num_views:
+            raise ValueError(
+                'translation cell {} has {} views, but its {}x{} grid gives '
+                '{} translations.'.format(tuple(cell), num_views, num_x,
+                                          num_z, vectors.shape[0]))
+        # Both distances are half the smaller detector extent, as in mg18.
+        source_dist = min(cell[1], cell[2]) / 2
+        model = mbirtorch.TranslationModel(
+            tuple(cell), vectors, source_detector_dist=source_dist,
+            source_iso_dist=source_dist)
     elif family == 'denoiser':
         # The denoiser's input is an image, not a sinogram, and its
         # sinogram_shape is set equal to that image shape, so the cell IS the
@@ -393,6 +525,19 @@ def generate(cfg):
                          n_dev=1)
     recon_shape = tuple(model.get_params('recon_shape'))
     phantom = mbirtorch.generate_3d_shepp_logan_low_dynamic_range(recon_shape)
+    # The shepp-logan builder places its ellipsoids as fractions of the
+    # volume, and on a volume only a few voxels deep every one of them can
+    # miss, leaving the phantom all zeros.  The --smoke translation cell
+    # reconstructs a volume that shallow.  An all-zero phantom forward
+    # projects to an all-zero sinogram, so every arm of that cell would time
+    # a reconstruction of nothing.  A seeded uniform volume has the same
+    # shape and a comparable dynamic range, and the generator row records
+    # that it was used.
+    phantom_fallback = None
+    if float(np.max(phantom)) == 0.0:
+        phantom = np.asarray(np.random.RandomState(SEED).rand(*recon_shape),
+                             dtype=np.float32)
+        phantom_fallback = 'seeded uniform (shepp-logan returned all zeros)'
     if cfg['family'] == 'denoiser':
         noise = np.random.RandomState(SEED).randn(*recon_shape)
         staged = np.asarray(phantom + DENOISE_SIGMA * noise, dtype=np.float32)
@@ -403,7 +548,8 @@ def generate(cfg):
     np.save(_input_path(cfg['family'], cfg['cell']),
             np.ascontiguousarray(staged))
     return dict(cfg, role='generator', recon_shape=list(recon_shape),
-                sino_shape=list(staged.shape))
+                sino_shape=list(staged.shape),
+                phantom_fallback=phantom_fallback)
 
 
 def _to_numpy(x):
@@ -520,6 +666,8 @@ def run_plan(plan, device):
         row = run_one(cfg, tag)
         if row.get('error'):
             print('    ERROR: {}'.format(str(row['error'])[:400]))
+        elif row.get('phantom_fallback'):
+            print('    phantom: {}'.format(row['phantom_fallback']))
 
     measured = {}
     arms = sorted({(row['family'], tuple(row['cell']), n)
