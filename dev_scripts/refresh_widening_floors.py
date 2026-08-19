@@ -75,10 +75,27 @@ ADMITTED count, not against n=1 unconditionally: parallel n=4 must beat n=2.
 The admitted set is read off the CURRENT table, so the comparison count can
 change between refreshes -- cone n=4 was measured against n=1 while cone n=2
 had no admission size, and the 2026-08-10 refresh that gave cone n=2 a floor
-makes the next cone n=4 refresh compare against n=2.  A win counts only when
-it clears 1.0x by more than that cell's warm spread, so one noisy cell cannot
-move a floor.  Where the crossover falls between two ladder cells, the floor
-takes the CONSERVATIVE end -- the larger cell.
+makes the next cone n=4 refresh compare against n=2.  A cell WINS only under
+the coarse admission rule (ruled 2026-08-19): the speedup must reach
+``ADMISSION_MARGIN`` (1.15x) AND clear 1.0x by more than that cell's warm
+spread.  The floor is the smallest measured cell that wins; a thinner win
+rounds the floor up one class, and a thin win at the largest measured cell
+means this run cannot place the floor and says so.  Where the crossover
+falls between two ladder cells, the floor takes the CONSERVATIVE end -- the
+larger cell.
+
+THE SCOPED REFRESH (``--families``).  A full refresh re-measures every
+family, which costs about 12 GPU-hours, and most of that re-measures rows
+whose costs did not change.  ``--families cone,parallel`` measures the named
+families only; bare ``--families`` measures exactly the families whose
+recorded cost inputs moved (``_widening_floors.stale_families()``).  Every
+other family's rows are CARRIED: printed verbatim in the paste, provenance
+untouched, so the tool stays the sole writer of the whole table and the
+checksum binding survives.  Carrying a family asserts its costs did not
+change, and with per-family cost inputs that assertion is checkable: a
+scoped run REFUSES to start if a family it would carry has drifted inputs.
+A change to a shared input therefore forces the full refresh, and a change
+confined to one family's files allows the scoped one.
 
 WHICH CELLS RUN.  For a finite floor: the ladder cells bracketing it -- one
 below, the floor's own, one above.  For a sentinel: the top three cells of
@@ -92,6 +109,8 @@ spread, and the script prints the proposed floor.  Sizes above a row's
 
 Run:
     python dev_scripts/refresh_widening_floors.py            # a 4-GPU node
+    python dev_scripts/refresh_widening_floors.py --families # stale families only
+    python dev_scripts/refresh_widening_floors.py --families cone,parallel
     python dev_scripts/refresh_widening_floors.py --plan     # arms, then exit
     python dev_scripts/refresh_widening_floors.py --smoke    # tiny, CPU, fast
     python dev_scripts/refresh_widening_floors.py --bless    # hashes only
@@ -212,6 +231,48 @@ def planned_rows():
     return sorted(rows)
 
 
+def resolve_scope(families_arg):
+    """The families this run measures: None for every family, else a sorted
+    list.  Raises SystemExit on an unknown name, and on a scope that would
+    CARRY a family whose cost inputs moved -- carrying a family asserts its
+    costs did not change, and a drifted family fails that assertion, so the
+    refusal happens here, before any GPU work.
+    """
+    all_families = sorted({family for family, _count in planned_rows()})
+    stale = wf.stale_families()
+    if families_arg is None:
+        return None
+    if families_arg == 'stale':
+        chosen = list(stale)
+        if not chosen:
+            raise SystemExit(
+                'no cost input has moved since the hashes were recorded, so '
+                'a stale-scoped refresh has nothing to measure.  Name '
+                'families explicitly (--families cone,parallel) for a '
+                'deliberate re-measure, or run without --families for the '
+                'full refresh.')
+    else:
+        chosen = sorted({token.strip() for token in families_arg.split(',')
+                         if token.strip()})
+        unknown = [name for name in chosen if name not in all_families]
+        if unknown:
+            raise SystemExit(
+                'unknown floor famil{}: {}.  The families a refresh can '
+                'measure are: {}.'.format(
+                    'y' if len(unknown) == 1 else 'ies', ', '.join(unknown),
+                    ', '.join(all_families)))
+    carried_stale = [name for name in stale if name not in chosen]
+    if carried_stale:
+        raise SystemExit(
+            'refusing the scoped refresh: the cost inputs of {} moved, and '
+            'this scope would carry {} rows forward as if their costs were '
+            'unchanged.  Widen the scope to include {}, or run the full '
+            'refresh.'.format(', '.join(carried_stale),
+                              'their' if len(carried_stale) > 1 else 'its',
+                              ', '.join(carried_stale)))
+    return chosen
+
+
 def elements(cell):
     return int(cell[0]) * int(cell[1]) * int(cell[2])
 
@@ -256,11 +317,14 @@ def comparison_count(family, count):
     return 1
 
 
-def build_plan(smoke=False):
+def build_plan(smoke=False, scope=None):
     """``[{family, count, cell, counts, role}, ...]`` in run order, plus the
-    families that have no measured rows at all."""
+    families that have no measured rows at all.  ``scope`` limits the plan to
+    the named families; None plans every family."""
     rows = []
     for (family, count) in planned_rows():
+        if scope is not None and family not in scope:
+            continue
         ladder = family_ladder(family, smoke)
         floor = wf.FLOORS.get((family, count))
         against = comparison_count(family, count)
@@ -323,10 +387,15 @@ def unmeasured_families():
     return {family: sorted(names) for family, names in seen.items()}
 
 
-def print_plan(plan, smoke):
+def print_plan(plan, smoke, scope=None):
     ladder = SMOKE_LADDER if smoke else LADDER
     print('widening-floor refresh plan ({}), interpreter {}'.format(
         'SMOKE, CPU' if smoke else 'CUDA', TORCH_PYTHON))
+    if scope is not None:
+        carried = sorted({family for family, _count in planned_rows()}
+                         - set(scope))
+        print('  SCOPED: measuring {}; carrying verbatim: {}'.format(
+            ', '.join(scope), ', '.join(carried) or 'nothing'))
     print('  ladder: ' + ', '.join(
         '{} ({:,})'.format(c, elements(c)) for c in ladder))
     # A family measured at its own cells prints them too, so the plan never
@@ -705,8 +774,12 @@ def verdict(plan, measured):
     """Per table row: the per-cell speedups, and the floor the crossover
     rule above reads off them.
 
-    A win counts only when it clears 1.0x by MORE than that cell's warm
-    spread, which is what keeps one noisy cell from moving a floor.
+    A cell wins only under the coarse admission rule: the speedup reaches
+    ``wf.ADMISSION_MARGIN`` AND clears 1.0x by MORE than that cell's warm
+    spread.  The margin is what makes a floor survive hardware and shape
+    variation; the spread condition keeps one noisy cell from moving a
+    floor.  A win that clears the spread but not the margin is recorded as
+    ``thin`` so the printout can say what the margin rounded away.
     """
     out = {}
     # Read off the PLAN rather than the table, so a family the table has no
@@ -718,11 +791,16 @@ def verdict(plan, measured):
         rows, winner = [], None
         for cell in cells:
             ratio, spread = speedup(measured, family, cell, count, against)
-            wins = ratio is not None and ratio - 1.0 > spread
+            clears_spread = ratio is not None and ratio - 1.0 > spread
+            wins = clears_spread and ratio >= wf.ADMISSION_MARGIN
             rows.append((cell, ratio, spread, wins))
             if wins and winner is None:
                 winner = cell
-        out[(family, count)] = dict(against=against, rows=rows, winner=winner)
+        thin = [cell for cell, ratio, spread, wins in rows
+                if not wins and ratio is not None and ratio - 1.0 > spread
+                and (winner is None or elements(cell) < elements(winner))]
+        out[(family, count)] = dict(against=against, rows=rows, winner=winner,
+                                    thin=thin)
     return out
 
 
@@ -736,16 +814,30 @@ def print_verdict(verdicts):
                 print('  {:>20} {:>16,}   (no measurement)'.format(
                     str(cell), elements(cell)))
                 continue
+            if wins:
+                label = 'WINS'
+            elif ratio - 1.0 > spread and ratio < wf.ADMISSION_MARGIN:
+                label = ('thin: clears the spread, under the {:.2f}x '
+                         'margin'.format(wf.ADMISSION_MARGIN))
+            else:
+                label = 'loses'
             print('  {:>20} {:>16,}   {:.3f}x  spread {:.1%}   {}'.format(
-                str(cell), elements(cell), ratio, spread,
-                'WINS' if wins else 'loses'))
+                str(cell), elements(cell), ratio, spread, label))
         largest = max(elements(c) for c, _r, _s, _w in record['rows'])
         winner = record['winner']
         proposed = elements(winner) if winner else None
         # A family with no table row is in the same state as a sentinel: no
         # admission size is known for it.  The two are reported separately so
         # the reader can tell a first measurement from a re-measurement.
-        if winner is None and floor is None:
+        if winner is None and record['thin']:
+            print('  NO CELL CLEARS THE {:.2f}x MARGIN, but {} clear the '
+                  'spread: the coarse rule rounds a thin win up one class, '
+                  'and the class above the largest measured cell is '
+                  'unmeasured.  This run cannot place the floor; re-run '
+                  'with a larger ladder, or a person decides what the row '
+                  'becomes.'.format(wf.ADMISSION_MARGIN,
+                                    ', '.join(str(c) for c in record['thin'])))
+        elif winner is None and floor is None:
             print('  no admission size in these cells -> {} n={} still has '
                   'no row; sizes above {:,} elements are unmeasured.'.format(
                       family, count, largest))
@@ -772,6 +864,10 @@ def print_verdict(verdicts):
         else:
             print('  floor unchanged at {:,} sinogram elements.'.format(
                 proposed))
+        if winner is not None and record['thin']:
+            print('  the {:.2f}x margin rounded away thin wins at: '
+                  '{}.'.format(wf.ADMISSION_MARGIN,
+                               ', '.join(str(c) for c in record['thin'])))
 
 
 _ROW_TEMPLATE = """    ('{family}', {count}): Floor(
@@ -785,13 +881,80 @@ _ROW_TEMPLATE = """    ('{family}', {count}): Floor(
         note='...'),"""
 
 
-def print_table(verdicts, commit):
-    """The paste-ready replacement for FLOORS, provenance included."""
+def _source_chunks(text, width=60):
+    """``text`` split at spaces into pieces at most ``width`` characters,
+    each keeping its trailing space, so joining the pieces reproduces the
+    text exactly.  Used to print a carried row's note as wrapped source."""
+    chunks, current = [], ''
+    for word in text.split(' '):
+        candidate = word if not current else current + ' ' + word
+        if current and len(candidate) > width:
+            chunks.append(current + ' ')
+            current = word
+        else:
+            current = candidate
+    chunks.append(current)
+    assert ''.join(chunks) == text
+    return chunks
+
+
+def _render_carried_row(family, count, floor):
+    """One CURRENT table row, printed back in source form.  Every field
+    passes through verbatim -- elements, bracket, spread, dates, commit, and
+    the note -- so a scoped run's paste never claims a measurement that did
+    not happen."""
+    gpu = ('MEASURED_GPU' if floor.gpu == wf.MEASURED_GPU
+           else repr(floor.gpu))
+    config = ('MEASURED_CONFIG' if floor.config == wf.MEASURED_CONFIG
+              else repr(floor.config))
+    elements_text = ('{:_}'.format(floor.elements)
+                     if floor.elements is not None else 'None')
+    largest_text = ('{:_}'.format(floor.largest_tested)
+                    if floor.largest_tested is not None else 'None')
+    lines = [
+        "    ('{}', {}): Floor(".format(family, count),
+        "        family='{}', count={}, elements={}, cell={},".format(
+            family, count, elements_text, floor.cell),
+        "        against={},".format(floor.against),
+        "        bracket=Bracket(losing_cell={}, losing_speedup={},".format(
+            floor.bracket.losing_cell, floor.bracket.losing_speedup),
+        "                        winning_cell={}, winning_speedup={}),".format(
+            floor.bracket.winning_cell, floor.bracket.winning_speedup),
+        "        spread={}, gpu={}, config={},".format(
+            floor.spread, gpu, config),
+        "        measured={!r}, commit={!r},".format(
+            floor.measured, floor.commit),
+        "        largest_tested={},".format(largest_text),
+    ]
+    chunks = _source_chunks(floor.note)
+    lines.append("        note={!r}".format(chunks[0])
+                 + ('' if len(chunks) == 1 else ''))
+    for chunk in chunks[1:]:
+        lines.append("             {!r}".format(chunk))
+    lines[-1] += '),'
+    return '\n'.join(lines)
+
+
+def print_table(verdicts, commit, carried_families=()):
+    """The paste-ready replacement for FLOORS, provenance included.  Measured
+    families print from this run's verdicts with their notes left to write;
+    carried families print their CURRENT rows verbatim, so the paste is
+    always the whole table."""
     today = datetime.date.today().isoformat()
     print('\n' + '=' * 78)
     print('PASTE INTO mbirtorch/_widening_floors.py (FLOORS, then the three')
     print('bound constants printed by --bless).  All of it, or none of it.')
+    if carried_families:
+        print('measured this run: {}.  carried verbatim (their cost inputs '
+              'are unmoved): {}.'.format(
+                  ', '.join(sorted({f for f, _c in verdicts})),
+                  ', '.join(sorted(carried_families))))
     print('=' * 78 + '\nFLOORS = {')
+    # Carried rows keep the CURRENT table's own ordering, printed first so
+    # the paste groups this run's measured rows together at the end.
+    for (family, count), floor in wf.FLOORS.items():
+        if family in carried_families:
+            print(_render_carried_row(family, count, floor))
     for (family, count), record in sorted(verdicts.items()):
         winner, rows = record['winner'], record['rows']
         found = elements(winner) if winner else None
@@ -847,6 +1010,9 @@ def do_bless():
     print('projection-cost inputs that moved since the hashes were last '
           'recorded: {}'.format(
               ', '.join(name for name, _w, _g in stale) or 'none'))
+    if stale:
+        print('floor families those inputs price: {}'.format(
+            ', '.join(wf.stale_families())))
     print('\nRecording the current hashes after a measurement run.  If you')
     print('have NOT just re-measured, doing this hides a real change from')
     print('the automatic staleness note; leave the old hashes in place')
@@ -884,6 +1050,14 @@ def main(argv=None):
                         help='accepted and ignored: staleness is detected and '
                              'logged automatically, so there is nothing to '
                              'acknowledge by hand')
+    parser.add_argument('--families', nargs='?', const='stale', default=None,
+                        metavar='NAMES',
+                        help='measure only these floor families (comma-'
+                             'separated); with no value, exactly the families '
+                             'whose recorded cost inputs moved.  Every other '
+                             "family's rows are carried into the paste "
+                             'verbatim, and the run refuses a scope that '
+                             'would carry a family whose inputs moved')
     args = parser.parse_args(argv)
 
     # Checked before --bless: the pair used to mean "record the hashes
@@ -894,9 +1068,13 @@ def main(argv=None):
     if args.bless:
         return do_bless()
 
-    plan = build_plan(smoke=args.smoke)
+    scope = resolve_scope(args.families)
+    carried = (() if scope is None else
+               sorted({family for family, _count in planned_rows()}
+                      - set(scope)))
+    plan = build_plan(smoke=args.smoke, scope=scope)
     if args.plan:
-        print_plan(plan, args.smoke)
+        print_plan(plan, args.smoke, scope)
         return 0
 
     device = 'cpu' if args.smoke else 'cuda'
@@ -913,13 +1091,13 @@ def main(argv=None):
               'speedups are all 1.0x -- this proves the plumbing (batching, '
               'subprocess env, analysis, table printing), not the floors.')
 
-    print_plan(plan, args.smoke)
+    print_plan(plan, args.smoke, scope)
     print('\nrunning ...')
     started = time.time()
     measured = run_plan(plan, device)
     verdicts = verdict(plan, measured)
     print_verdict(verdicts)
-    print_table(verdicts, head_commit())
+    print_table(verdicts, head_commit(), carried)
     print('\nthen: python dev_scripts/refresh_widening_floors.py --bless')
     print('elapsed {:.1f} min; rows under {}'.format(
         (time.time() - started) / 60, RESULTS_DIR))

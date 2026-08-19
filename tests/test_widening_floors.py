@@ -57,11 +57,9 @@ def install_a_table_with_a_sentinel(monkeypatch):
     row whose ``elements`` is None because no admission size was ever
     measured for that count.
 
-    The rule outlives the data.  No shipped row has been a sentinel since the
-    2026-08-10 refresh gave cone n=2 a finite floor, so the tests below read
-    the rule off a table built here rather than off whichever numbers happen
-    to ship.  A refresh that finds a count with no admission size puts a
-    sentinel row back, and these tests have to keep holding when it does.
+    The rule outlives the data.  The shipped table's sentinel rows come and
+    go with refreshes (six ship today), so the tests below read the rule off
+    a table built here rather than off whichever numbers happen to ship.
     """
     def row(count, elements, cell, bracket, note):
         return wf.Floor(family='synthetic', count=count, elements=elements,
@@ -172,6 +170,36 @@ def test_a_staleness_check_that_cannot_run_is_logged_rather_than_raised(
     assert 'FileNotFoundError' in note, note
 
 
+# ── the per-family cost inputs ───────────────────────────────────────────────
+def test_every_family_names_cost_inputs_and_every_name_is_hashed():
+    """The scoped refresh carries a family only because its inputs provably
+    did not move, and that proof needs two things: every family in the table
+    names a non-empty input set, and every named input is actually hashed."""
+    assert set(wf.FAMILY_COST_INPUTS) == set(wf.families())
+    hashed = set(wf.cost_input_hashes())
+    for family, names in wf.FAMILY_COST_INPUTS.items():
+        assert names, family
+        missing = set(names) - hashed
+        assert not missing, (family, missing)
+
+
+def test_a_moved_input_names_the_families_it_prices(monkeypatch):
+    """triton_cone.py hosts kernel helpers both kernel families import, so
+    forging its recorded hash must mark BOTH cone and parallel stale -- the
+    partition, exercised rather than asserted."""
+    forged = dict(wf.BLESSED_COST_HASHES)
+    forged['triton_cone.py'] = '0' * 64
+    monkeypatch.setattr(wf, 'BLESSED_COST_HASHES', forged)
+    monkeypatch.setattr(wf, 'STALE_SINCE', None)
+    monkeypatch.setattr(wf, '_DRIFT_CHECK', None)
+
+    families = wf.stale_families()
+    assert 'cone' in families and 'parallel' in families, families
+    note = wf.stale_note()
+    assert 'triton_cone.py' in note, note
+    assert 'cone' in note and 'parallel' in note, note
+
+
 # ── the tamper guard (this still fails hard) ─────────────────────────────────
 def test_the_floors_hashes_and_staleness_stamp_move_as_one_unit():
     """Now that a changed cost input only warns, hand-editing a hash is the
@@ -233,29 +261,34 @@ def test_every_floor_records_the_bracket_it_was_read_off():
         bracket = floor.bracket
         assert bracket is not None, where
         if floor.elements is None:
-            # A sentinel has lost somewhere and won nowhere.
+            # A sentinel has no admission size, so it records no winning
+            # cell.  A cell that read above 1.0 without earning admission --
+            # the multiaxis window, a thin win under the margin -- belongs in
+            # the note, not in the bracket's winning side.
             assert bracket.winning_cell is None, where
             assert bracket.losing_cell is not None, where
         else:
             assert bracket.winning_cell is not None, where
             assert wf.sinogram_elements(bracket.winning_cell) == floor.elements, \
                 where
-            assert bracket.winning_speedup > 1.0, where
+            # "Won" is the coarse admission rule: the winning cell must clear
+            # the margin, not merely 1.0.
+            assert bracket.winning_speedup >= wf.ADMISSION_MARGIN, where
             if bracket.losing_cell is not None:
                 assert (wf.sinogram_elements(bracket.losing_cell)
                         < floor.elements), where
-                # "Lost" is the admission rule, not a bare comparison with
-                # 1.0: a win has to clear 1.0x by MORE than the spread, so a
-                # nominal 1.02x inside a 2.5% spread is a loss.
-                assert bracket.losing_speedup <= 1.0 + floor.spread, where
+                # "Lost" is the same rule from the other side: a cell loses
+                # by failing the margin, so a real-but-thin 1.14x win rounds
+                # the floor up and lands here as the losing side.
+                assert bracket.losing_speedup < wf.ADMISSION_MARGIN, where
 
 
 def test_a_sentinel_says_how_far_it_was_tested(monkeypatch):
     """A sentinel is not a permanent never; it is a place a refresh has to
     start from, so it must say where that is.
 
-    Read off a synthetic table: the shipped one has no sentinel row today, so
-    asserting against it would test the current data rather than the rule.
+    Read off a synthetic table, so the assertion tests the rule rather than
+    whichever rows happen to be sentinels in the shipped table.
     """
     install_a_table_with_a_sentinel(monkeypatch)
     sentinels = [(key, floor) for key, floor in wf.FLOORS.items()
@@ -280,29 +313,29 @@ def test_the_measurement_envelope_is_stated():
 
 
 # ── the accessor ─────────────────────────────────────────────────────────────
-def test_multiaxis_is_held_to_two_devices():
-    """The multiaxis family exists to cap the count at two.
+def test_multiaxis_is_held_to_one_device():
+    """The multiaxis family is held to one device at every size.
 
-    Its rows were measured on the geometry itself on 2026-08-17 (mg22).
-    Two devices are admitted at and above the 768-class floor and held
-    below it -- the measurement was not monotone, and the row's note
-    records why the floor sits above the smallest winning cell.  The n=4
-    row is a sentinel (four devices lost at every probe), so any count
-    above two is never admitted on speed; capacity can still widen a
-    model that fits nowhere smaller.
+    The n=2 row is a sentinel BY RULING (2026-08-19): the mg26 refresh
+    measured a two-device WIN at the 768-class with LOSSES on both sides
+    of it, so the win is a window in problem size, and a floor placed at
+    the window's start would widen larger problems into a measured
+    slowdown.  The n=4 row is an ordinary sentinel (four devices lost at
+    every probe).  So no multiaxis count above one is ever admitted on
+    speed; capacity can still widen a model that fits nowhere smaller.
     """
     import mbirtorch
 
     assert mbirtorch.MultiAxisParallelModel._floor_family == 'multiaxis'
-    at_the_512_class = wf.sinogram_elements((512, 448, 384))
     at_the_768_class = wf.sinogram_elements((768, 672, 576))
     huge = 10 ** 12
-    assert not wf.admitted('multiaxis', 2, at_the_512_class)[0]
-    assert wf.admitted('multiaxis', 2, at_the_768_class)[0]
-    for count in (3, 4, 8):
+    # The 768-class window win is deliberately NOT an admission.
+    assert not wf.admitted('multiaxis', 2, at_the_768_class)[0]
+    for count in (2, 3, 4, 8):
         ok, why = wf.admitted('multiaxis', count, huge)
         assert not ok, count
-        assert 'sentinel' in why or 'lost' in why or 'no admission' in why, why
+        assert 'sentinel' in why, why
+        assert 'configure_devices' in why, why
 
 
 def test_one_device_is_always_admitted():
@@ -356,7 +389,7 @@ def test_the_sentinel_holds_its_count_at_every_size(monkeypatch):
 def test_a_refusal_names_the_override_the_user_can_reach_for():
     _ok, why = wf.admitted('parallel', 2, 11_010_048)
     assert why.startswith('held by the speed floor: ')
-    assert '11.0M sinogram elements < 88.1M' in why
+    assert '11.0M sinogram elements < 297.3M' in why
     assert 'configure_devices(num_devices=2) overrides' in why
 
 
@@ -370,10 +403,10 @@ def test_the_fallback_note_says_capacity_overrode_speed(monkeypatch):
     why = wf.fallback_reason('parallel', 2, 11_010_048)
     assert 'chosen past its speed floor' in why
     assert 'no admitted count fits' in why
-    assert '11.0M sinogram elements < 88.1M' in why
+    assert '11.0M sinogram elements < 297.3M' in why
     # A sentinel row has no number to compare against, and says so instead of
-    # printing a nonsense inequality.  Synthetic, since the shipped table has
-    # carried no sentinel row since the 2026-08-10 refresh.
+    # printing a nonsense inequality.  Synthetic, so the assertion does not
+    # depend on which shipped rows happen to be sentinels.
     install_a_table_with_a_sentinel(monkeypatch)
     assert 'no admission point is measured' in wf.fallback_reason(
         'synthetic', 4, 88_080_384)

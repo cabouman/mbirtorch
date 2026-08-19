@@ -31,9 +31,11 @@ per-device work no longer covers the cost of splitting it, and a small reconstru
 spread over four GPUs can run several times slower than the same reconstruction on one.
 So each device count carries a measured **speed floor** -- a problem size, in sinogram
 elements, below which the automatic path does not prefer that count.  The floors are
-per-geometry, because parallel-beam and cone-beam reach the crossover at different
-sizes.  A geometry without measured floors of its own, such as translation or
-multi-axis parallel, uses the parallel-beam floors and says so in the log.  The
+per-geometry and deliberately coarse: a count is admitted only where it was measured
+clearly faster, and a thin measured win is rounded up to the next larger problem size,
+so the floors survive hardware and shape variation.  Translation and multi-axis
+parallel were measured too, and splitting them never paid clearly, so the automatic
+path holds them to one device.  The
 denoiser's per-pixel work is very small, so an automatic denoise stays on one
 device until it no longer fits there; ``configure_devices`` can be used to shard it explicitly.
 
@@ -140,16 +142,16 @@ parallel-beam model, over a warm 3-iteration reconstruction:
      - 2 devices
      - 4 devices
    * - 512 x 448 x 384
-     - 1.85 s
-     - 1.49 s
-     - 2.15 s
+     - 1.31 s
+     - 1.29 s
+     - 2.10 s
    * - 1024 x 1008 x 992
-     - 40.0 s
-     - 23.8 s
-     - 15.5 s
+     - 21.3 s
+     - 14.2 s
+     - 10.8 s
 
-The large volume improves by 1.7x at two devices and 2.6x at four.  The small volume gains
-a little at two devices and is *worse* at four devices than at one.  Small reconstructions
+The large volume improves by 1.5x at two devices and 2.0x at four.  The small volume shows
+no real gain at two devices and is *worse* at four devices than at one.  Small reconstructions
 are orchestration-bound: the per-band, per-device coordination grows with the device count
 and outweighs the reduced compute per device.  These are hardware-dependent measurements,
 not guarantees.  Reach for more devices when you need the memory, or when the problem is

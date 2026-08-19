@@ -23,6 +23,7 @@ GB = 2 ** 30
 # Sinogram shapes the speed floors are measured at, each named for its view
 # count; the comment beside each is its sinogram element count.
 CELL_512 = (512, 448, 384)          #    88,080,384
+CELL_768 = (768, 672, 576)          #   297,271,296
 CELL_1024 = (1024, 1008, 992)       # 1,023,934,464
 CELL_128 = (128, 112, 96)           #     1,376,256
 SPARSE_VIEW_CELL = (64, 448, 384)   #    11,010,048
@@ -602,10 +603,14 @@ def test_a_cone_problem_at_its_n2_floor_chooses_two_devices(monkeypatch,
     cone._apply_device_policy()
     assert cone.sino_placement.n_devices == 2
 
-    # Parallel reads the same at this shape, as it did before the refresh.
+    # Parallel now holds at ONE device here: the channel-sorted forward
+    # kernel (mg40, 2026-08-19) made the one-device forward fast enough
+    # that two devices stopped paying at this size, so the parallel n=2
+    # floor sits a class above cone's and the two geometries part ways at
+    # this shape.
     parallel = with_four_visible(monkeypatch, make_model(CELL_512))
     parallel._apply_device_policy()
-    assert parallel.sino_placement.n_devices == 2
+    assert parallel.sino_placement.n_devices == 1
 
 
 # ── what turns the guard off ─────────────────────────────────────────────────
@@ -820,8 +825,9 @@ def test_a_model_with_no_floor_family_gets_the_parallel_floors(
     small._apply_device_policy()
     assert small.sino_placement.n_devices == 1
 
-    # The permissive set, not a refusal: at the parallel n=2 floor it widens.
-    at_the_floor = with_four_visible(monkeypatch, _built(make, CELL_512))
+    # The parallel floors, not a refusal: at the parallel n=2 floor (the
+    # 768-class since the sorted forward kernel, mg40) it widens.
+    at_the_floor = with_four_visible(monkeypatch, _built(make, CELL_768))
     at_the_floor._apply_device_policy()
     assert at_the_floor.sino_placement.n_devices == 2
 

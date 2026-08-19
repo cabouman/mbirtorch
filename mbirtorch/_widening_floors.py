@@ -24,19 +24,35 @@ between two tested sizes, the floor takes the larger, because the risk is
 lopsided -- widening too early has cost multiples, while holding a
 just-large-enough problem at a smaller count costs a few percent.
 
+The table is COARSE by rule (ruled 2026-08-19).  A count is admitted at the
+smallest measured class where it wins by at least :data:`ADMISSION_MARGIN`,
+and a thinner win rounds the floor up one class.  The margin is what
+survives a different GPU, a different shape in the same class, and
+run-to-run drift; the earlier rule admitted any win wider than the cell's
+warm spread, which shipped admissions as thin as 1.02x.  Where parallel and
+cone measure the same floor at a count, the table carries one shared row
+for the pair rather than two values that agree by coincidence, and the
+rows' notes name the sharing (the n=4 rows share today; the n=2 rows split
+when the sorted forward kernel moved parallel's crossover).
+
 ``elements=None`` -- a "sentinel" row, as the refusal message and the tests
-call it -- records a count with no admission size at or below the largest
+call it -- records a count with no admission SIZE at or below the largest
 size tested.  It is not a permanent refusal: it excludes that count
 everywhere until a refresh finds an admission size, and it carries
-``largest_tested`` so the refresh knows where to start.  Five rows are in
-that state today: both denoiser rows, both translation rows, and multiaxis
-n=4 -- in each case splitting lost at every size probed, so the automatic
-path holds those models to fewer devices and only capacity widens them.
+``largest_tested`` so the refresh knows where to start.  Six rows are in
+that state today.  In five of them -- both denoiser rows, both translation
+rows, and multiaxis n=4 -- splitting lost at every size probed.  The sixth,
+multiaxis n=2, WON at one probed size and lost above it: two devices win
+only in a window of problem sizes, a floor cannot express a window, and a
+floor placed at the window's start would widen the larger sizes into a
+measured slowdown.  That row therefore holds the family to one device until
+the mechanism is understood (multigpu_findings.md sections 1.22 and 1.25);
+its note carries the readings.  In every sentinel case the automatic path
+holds those models to fewer devices and only capacity widens them.
 A count with no row inherits the row of the next MEASURED count
 above it (n=3 is governed by the n=4 floor, as is any count above 4), and a
-model declaring no ``_floor_family`` gets the parallel floors, the more
-permissive measured set, with the reason string and the verbose-2 log both
-saying so.
+model declaring no ``_floor_family`` gets the parallel floors, with the
+reason string and the verbose-2 log both saying so.
 
 The nightly runs validate none of this: every one of them, n=1 included, pins
 the count through ``MBIRTORCH_NUM_DEVICES``, and a pin bypasses the guard by
@@ -56,11 +72,14 @@ hashes and :data:`STALE_SINCE` into one unit, so hand-editing a hash to
 silence the note is caught, and the provenance checks (dates, brackets,
 floors rising with the count) are assertions.
 ``dev_scripts/refresh_widening_floors.py`` is the SOLE writer of those three
-constants, and pasting its output is the one thing that clears the note.  If
-code that determines projection cost MOVES (a new driver function in
-``tomography_model``, batching logic moving to a new file), add it to
-:data:`COST_INPUT_FILES` or :data:`COST_INPUT_METHODS` in the same change and
-re-record the hashes: the check covers only what it names.
+constants, and pasting its output is the one thing that clears the note.  The
+cost inputs are named PER FAMILY (:data:`FAMILY_COST_INPUTS`), so the note
+says which families' floors a change touched, and the refresh tool's
+``--families`` mode re-measures exactly those.  If code that determines
+projection cost MOVES (a new driver function in ``tomography_model``,
+batching logic moving to a new file), add it to :data:`FAMILY_COST_INPUTS`
+under every family it prices in the same change and re-record the hashes:
+the check covers only what it names.
 
 Set the environment variable named in :data:`GUARD_ENV_VAR` to ``0`` to turn
 the guard off and restore the pure capacity order.  An explicit
@@ -96,6 +115,14 @@ MEASUREMENT_CAVEAT = ('validated at MEASURED_CONFIG only; a different '
                       'iteration count or subset schedule is outside the '
                       'measured envelope')
 
+#: The coarse admission rule's margin (ruled 2026-08-19).  A device count's
+#: floor is the smallest measured class where it beats the best smaller
+#: admitted count by at least this factor; a thinner win rounds the floor up
+#: one class.  A win must also clear 1.0 by more than the cell's warm spread,
+#: which keeps one noisy cell from moving a floor.  The refresh tool applies
+#: both conditions when it reads a floor off a run's speedups.
+ADMISSION_MARGIN = 1.15
+
 #: Where a crossover was pinned down: the largest problem size at which the
 #: count under test LOST, the smallest at which it WON, and the speedups
 #: measured there against the comparison count.  A side is None when no such
@@ -125,33 +152,36 @@ Floor = namedtuple('Floor', ('family', 'count', 'elements', 'cell', 'against',
 #    1024-class  (1024, 1008, 992)   = 1,023,934,464 elements
 FLOORS = {
     ('parallel', 2): Floor(
-        family='parallel', count=2, elements=88_080_384, cell=(512, 448, 384),
-        against=1,
-        bracket=Bracket(losing_cell=(384, 336, 288), losing_speedup=0.75,
-                        winning_cell=(512, 448, 384), winning_speedup=1.20),
-        spread=0.05592, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
-        measured='2026-08-18', commit='64dedb8',
+        family='parallel', count=2, elements=297_271_296,
+        cell=(768, 672, 576), against=1,
+        bracket=Bracket(losing_cell=(512, 448, 384), losing_speedup=0.97,
+                        winning_cell=(768, 672, 576), winning_speedup=1.38),
+        spread=0.01483, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-19', commit='c761b24',
         largest_tested=297_271_296,
-        note='re-measured on the padded 64dedb8 tree (mg26, job '
-             '15342578): the same floor, 0.75x losing at the 384-class '
-             'and 1.20x winning at the 512-class against a 5.6 percent '
-             'spread.  The kernel width padding left these cells nearly '
-             'alone, as its band arithmetic predicts: the parallel back '
-             'share is small at these sizes'),
+        note='the first scoped refresh (mg40, job 15369689), on the '
+             'channel-sorted forward kernel: THE FLOOR MOVED UP one '
+             'class.  The sorted kernel made the one-device forward fast '
+             'enough that the 512-class win disappeared (1.20x on the '
+             'per-tap kernel, 0.97x sorted), and the 768-class wins at '
+             '1.38x.  Cone n=2 keeps its 512-class floor, so the n=2 '
+             'rows no longer share; the pair still shares the n=4 row'),
     ('parallel', 4): Floor(
-        family='parallel', count=4, elements=297_271_296,
-        cell=(768, 672, 576), against=2,
-        bracket=Bracket(losing_cell=(512, 448, 384), losing_speedup=0.72,
-                        winning_cell=(768, 672, 576), winning_speedup=1.06),
-        spread=0.05592, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
-        measured='2026-08-18', commit='64dedb8',
+        family='parallel', count=4, elements=1_023_934_464,
+        cell=(1024, 1008, 992), against=2,
+        bracket=Bracket(losing_cell=(768, 672, 576), losing_speedup=0.80,
+                        winning_cell=(1024, 1008, 992), winning_speedup=1.32),
+        spread=0.01307, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-19', commit='c761b24',
         largest_tested=1_023_934_464,
-        note='the tightest admission in the table again: 1.06x at the '
-             '768-class against a 0.9 percent spread, with the 512-class '
-             'losing at 0.72x and the 1024-class winning at 1.54x.  The '
-             'padding widened the margin only slightly (1.02x on the '
-             'unpadded tree).  The coarsening proposal rounds exactly '
-             'this kind of thin win up one class'),
+        note='the first scoped refresh (mg40, job 15369689), on the '
+             'channel-sorted forward kernel: the coarse floor holds at '
+             'the 1024-class, now by measurement rather than by '
+             'rounding.  mg26 read a thin 1.06x win at the 768-class and '
+             'the margin rule rounded it up; on the sorted kernel that '
+             'cell LOSES outright at 0.80x, so the rounding anticipated '
+             'exactly this kernel change.  The 1024-class wins at 1.32x.  '
+             'Shared row with cone n=4'),
     ('cone', 2): Floor(
         family='cone', count=2, elements=88_080_384, cell=(512, 448, 384),
         against=1,
@@ -160,44 +190,44 @@ FLOORS = {
         spread=0.03913, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
         measured='2026-08-18', commit='64dedb8',
         largest_tested=297_271_296,
-        note='re-measured on the padded tree (mg26): the same floor.  The '
-             '384-class losing side rose from 0.76x to 0.87x, which is '
-             'the padded n=2 back at that class\'s non-divisible band '
-             '168, and it did not flip the cell; the 512-class wins at '
-             '1.34x'),
+        note='mg26 (job 15342578), read under the coarse rule: 0.87x at '
+             'the 384-class, 1.34x at the 512-class, so the 512-class win '
+             'clears the 1.15x margin and the floor sits there.  The '
+             'parallel n=2 floor moved above this one on the sorted '
+             'forward kernel (mg40), so this row is cone\'s own; the '
+             'pair still shares the n=4 row'),
     ('cone', 4): Floor(
-        family='cone', count=4, elements=297_271_296,
-        cell=(768, 672, 576), against=2,
-        bracket=Bracket(losing_cell=None, losing_speedup=None,
-                        winning_cell=(768, 672, 576), winning_speedup=1.14),
+        family='cone', count=4, elements=1_023_934_464,
+        cell=(1024, 1008, 992), against=2,
+        bracket=Bracket(losing_cell=(768, 672, 576), losing_speedup=1.14,
+                        winning_cell=(1024, 1008, 992), winning_speedup=1.60),
         spread=0.007508, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
         measured='2026-08-18', commit='64dedb8',
         largest_tested=1_023_934_464,
-        note='THE FLOOR MOVED DOWN one class with the band padding '
-             '(mg26): before it, the 768-class n=4 back ran its '
-             'non-divisible band 168 at half rate and the cell read '
-             '0.87x; padded it reads 1.14x, so four devices are admitted '
-             'from the 768-class, with 1.60x at the 1024-class above it.  '
-             'No losing cell is recorded because n=4 was not measured at '
-             'the 512-class this run; the floor takes the winning cell, '
-             'which is the conservative end'),
+        note='mg26 (job 15342578), read under the coarse rule: 1.145x at '
+             'the 768-class, 1.60x at the 1024-class.  The 768-class win '
+             'misses the 1.15x margin by 0.005, and the ruling rounds it '
+             'up rather than bending the margin to fit -- a margin chosen '
+             'after seeing the numbers is not a rule.  Shared row with '
+             'parallel n=4'),
     ('multiaxis', 2): Floor(
-        family='multiaxis', count=2, elements=297_271_296,
-        cell=(768, 672, 576), against=1,
-        bracket=Bracket(losing_cell=(512, 448, 384), losing_speedup=0.35,
-                        winning_cell=(768, 672, 576), winning_speedup=1.46),
+        family='multiaxis', count=2, elements=None, cell=None,
+        against=1,
+        bracket=Bracket(losing_cell=(1024, 1008, 992), losing_speedup=0.80,
+                        winning_cell=None, winning_speedup=None),
         spread=0.001937, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
         measured='2026-08-18', commit='64dedb8',
         largest_tested=1_023_934_464,
-        note='the floor holds at the 768-class (0.35x at the 512-class, '
-             '1.46x at the 768-class), and this refresh adds a first n=2 '
-             'reading ABOVE it: the 1024-class LOSES at 0.80x.  The '
-             'two-device win is therefore a WINDOW, not a threshold, and '
-             'a floor cannot express that -- an automatic 1024-class '
-             'multiaxis reconstruction widens into a measured 20 percent '
-             'slowdown.  The anomaly is B6\'s (multigpu_findings 1.22); '
-             'the coarsening proposal asks whether this row should hold '
-             'the family to one device until B6 finds the mechanism'),
+        note='a sentinel BY RULING (2026-08-19), not by losing everywhere: '
+             'mg26 (job 15342578) read 0.35x at the 512-class, a 1.46x WIN '
+             'at the 768-class, and a 0.80x LOSS at the 1024-class.  Two '
+             'devices win only in a window of sizes, a floor cannot '
+             'express a window, and the old 768-class floor widened '
+             'automatic 1024-class reconstructions into the measured 20 '
+             'percent slowdown.  Held to one device until the mechanism '
+             'is understood (multigpu_findings.md sections 1.22 and '
+             '1.25); the cost of holding is the forgone 1.46x at the '
+             '768-class'),
     ('multiaxis', 4): Floor(
         family='multiaxis', count=4, elements=None, cell=None,
         against=2,
@@ -270,33 +300,57 @@ FLOORS = {
              'the row'),
 }
 
-# ── the projection-cost inputs the floors were measured against ──────────────
-#: Files whose contents price a projection.  Hashed WHOLE, deliberately: the
-#: module-level chunk constants and the budget class attributes these files
-#: carry are exactly the kind of tuning that moves a crossover without
-#: touching any function this table names, so a function-level hash would
-#: miss them.  ``_sharding.py`` is here because it holds the cross-device
-#: transfer primitives the multi-device drivers are built from, and how much
-#: those move is most of what a wider device count costs.
-COST_INPUT_FILES = ('triton_parallel.py', 'triton_cone.py', 'projectors.py',
-                    '_sharding.py')
+# ── the cost inputs the floors were measured against, named per family ───────
+#: The inputs every projection family's cost runs through: the projector
+#: assembly, the cross-device transfer primitives the multi-device drivers
+#: are built from, the utility module that holds ``padded_kernel_width``, and
+#: the three TomographyModel methods that drive the multi-device projections.
+#: A method entry is hashed over its source; a file entry is hashed WHOLE,
+#: deliberately -- the module-level chunk constants and budget class
+#: attributes these files carry are exactly the kind of tuning that moves a
+#: crossover without touching any named function.
+_SHARED_COST_INPUTS = (
+    'projectors.py', '_sharding.py', '_utils.py',
+    'TomographyModel._sparse_forward_project_sharded',
+    'TomographyModel._sparse_forward_project_cylinders',
+    'TomographyModel._sparse_back_project_sharded',
+)
 
-#: Methods of TomographyModel that drive the multi-device projections.  The
-#: rest of that module moves for reasons unrelated to projection cost, so the
-#: hash is taken over these sources rather than the whole file.  The cylinder
-#: transfer is named here in its own right, separately from the funnel that
-#: calls it; leaving it out would let the pixel batch it walks change without
-#: anything noticing.
-COST_INPUT_METHODS = ('_sparse_forward_project_sharded',
-                      '_sparse_forward_project_cylinders',
-                      '_sparse_back_project_sharded')
+#: What prices each family's floors, so staleness is detected PER FAMILY and
+#: a refresh can be scoped to the families whose costs actually moved.  On
+#: top of the shared set, each projection family adds its geometry body file,
+#: and the two kernel families add their kernel files -- ``triton_cone.py``
+#: appears in both because it hosts the shared kernel helpers that
+#: ``triton_parallel.py`` imports.  The denoiser runs no projector at all, so
+#: its set is its own two modules and none of the shared set.
+FAMILY_COST_INPUTS = {
+    'parallel': _SHARED_COST_INPUTS + ('triton_parallel.py', 'triton_cone.py',
+                                       'parallel_beam.py'),
+    'cone': _SHARED_COST_INPUTS + ('triton_cone.py', 'cone_beam.py'),
+    'multiaxis': _SHARED_COST_INPUTS + ('multiaxis_parallel.py',),
+    'translation': _SHARED_COST_INPUTS + ('translation_model.py',),
+    'denoiser': ('denoising.py', 'qggmrf.py'),
+}
 
-#: sha256 of each cost input as of the measurement above -- the recorded
+#: Every distinct cost input across the families, split by how it is hashed.
+#: Derived from the partition above so the two views cannot drift apart.
+_ALL_COST_INPUTS = sorted({name for names in FAMILY_COST_INPUTS.values()
+                           for name in names})
+COST_INPUT_FILES = tuple(name for name in _ALL_COST_INPUTS
+                         if not name.startswith('TomographyModel.'))
+COST_INPUT_METHODS = tuple(name.split('.', 1)[1] for name in _ALL_COST_INPUTS
+                           if name.startswith('TomographyModel.'))
+
+#: sha256 of each cost input as of the measurements above -- the recorded
 #: ("blessed") values the live check compares against.  Re-record them with
 #: ``python dev_scripts/refresh_widening_floors.py --bless``.  Recorded
-#: 2026-08-18 with the mg26 refresh on the padded 64dedb8 tree; the two
-#: hashes that moved since mg22 are the kernel files the width padding
-#: touched (triton_cone.py and triton_parallel.py).
+#: 2026-08-19 with the mg40 scoped refresh: ``triton_parallel.py`` is the
+#: channel-sorted kernel the fresh parallel rows price, and every other
+#: input is unchanged since the mg26 refresh, which is what let mg40 carry
+#: the other families' rows.  The names added when the inputs became
+#: per-family on 2026-08-19 (the geometry body files, ``_utils.py``, and
+#: the denoiser modules) are recorded at their 64dedb8 content, which none
+#: of them has moved from.
 BLESSED_COST_HASHES = {
     'TomographyModel._sparse_back_project_sharded':
         'f73fa28f32d2393fac3f06139d8ddeccc55260fceb28bbca7f102334839fb5a4',
@@ -306,12 +360,26 @@ BLESSED_COST_HASHES = {
         'f4389b004622d77eb74be81a9c6a61628007e1558f657d0a09b7bf790e69266d',
     '_sharding.py':
         '6e05b082984506f1f765491fd33498772758fdad4e3e10c72a8832e02ac6e610',
+    '_utils.py':
+        '7a4e6a2857be395423b04968f0a9cae2837224f6f6869c0a8f95223e13e9a5b9',
+    'cone_beam.py':
+        '5b52ff9cf972fec61e8a7ac5dd4ba568bc276e65f80c9caa0df30dc71710ccba',
+    'denoising.py':
+        '09f902af84895b88bceed9ca4a3f833c279cdd93c3a442cf95c0ce431beb443a',
+    'multiaxis_parallel.py':
+        '3208b93998462dedf8341351f7dfe30a42d683417b7c1a6da60d9d2b3395d852',
+    'parallel_beam.py':
+        '065572c91201ce0b354aa9fd15d7aaef5f25bbea24d65b1b46ba8305c5943da1',
     'projectors.py':
         '1cd3b1e39fd0d7f2c5d835545154c044c5e90d399604dd44c944f995551c85ce',
+    'qggmrf.py':
+        '64e35c114ed049764a3f2f3005fb6341235747270aa2ebe181fff60947bc8602',
+    'translation_model.py':
+        '0e39120c721edf0ed7d082f74593ce3e0d45a8142919c87224414af9c3cad5b8',
     'triton_cone.py':
         'a4d8350b350cd34a358bb54c33ae3d408f5b1d0131044d0d88b462c5cbaf2dbc',
     'triton_parallel.py':
-        '874f80d8a4a0b482b4fbdca74a2b9434b522bc63d6cd4bb19ae79ce54a931e81',
+        '79c4aaaa071c03567f505978a65ed9a183908d6c11342b59ac5668fb10ad0d55',
 }
 
 #: A hand-written staleness date, or None -- currently None, from the
@@ -328,7 +396,7 @@ STALE_SINCE = None
 #: green the test leaves this behind, and the test says so.  Recomputed and
 #: printed by ``refresh_widening_floors.py --bless``.
 TABLE_CHECKSUM = \
-    'f66e022c7c2572a4432f5e66b0d6d7dd769ea4a60d0adebb6a705bb7953f9311'
+    'a9abaf9cc2935b7ca7e6d7de0c722a5be36994f41efeacab096d31f2254434c6'
 
 
 # ── the env knob ─────────────────────────────────────────────────────────────
@@ -399,10 +467,12 @@ def stale_note():
                      'the projection-cost code ({}), so whether they are '
                      'stale is unknown'.format(failure))
     elif drifted:
+        families_hit = _families_priced_by(drifted)
         parts.append('the widening speed floors were measured against '
-                     'projection-cost code that has since changed ({}), so '
-                     'they may no longer describe it'.format(
-                         ', '.join(drifted)))
+                     'projection-cost code that has since changed ({}, '
+                     'pricing the {} floors), so they may no longer '
+                     'describe it'.format(', '.join(drifted),
+                                          ', '.join(families_hit)))
     if STALE_SINCE is not None:
         parts.append('the widening speed floors are marked stale since {}: '
                      'the floors were not re-measured when they were '
@@ -459,7 +529,7 @@ def admitted(family, count, sino_elements):
     Args:
         family (str or None): ``'parallel'``, ``'cone'``, or None for a model
             that declares no ``_floor_family``; None takes the parallel
-            floors, which are the more permissive measured set.
+            floors.
         count (int): the device count under test.
         sino_elements (int): ``prod(sinogram_shape)``.
 
@@ -583,6 +653,23 @@ def stale_cost_inputs():
         if want != got:
             stale.append((name, want, got))
     return stale
+
+
+def _families_priced_by(input_names):
+    """The floor families whose cost-input sets contain any of these names."""
+    moved = set(input_names)
+    return sorted(family for family, names in FAMILY_COST_INPUTS.items()
+                  if moved & set(names))
+
+
+def stale_families():
+    """The floor families whose recorded cost inputs no longer hash to their
+    recorded values.  Empty means every family's rows still describe the code
+    they were measured against.  The refresh tool's family-scoped mode
+    measures exactly this set by default, and refuses to carry a family that
+    appears here."""
+    return _families_priced_by(name for name, _want, _got
+                               in stale_cost_inputs())
 
 
 def table_checksum():
