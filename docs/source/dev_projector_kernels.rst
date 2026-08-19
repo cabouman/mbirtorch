@@ -96,8 +96,8 @@ pixel per tap.  A tile whose sorted span exceeds the window (a sparse or scatter
 pixel set is the ordinary cause) falls back tap by tap for that tile alone, so
 correctness never rests on the sort; only speed does.  The per-tap parallel forward
 remains in the module behind an environment switch (see below), and cone beam keeps
-its per-tap forward: a sorted cone variant is a design sketch in the plans repo,
-not yet built.
+its per-tap forward: sorted cone variants were built and measured in the plans repo
+and lost, so the per-tap form stands.
 
 **Parallel beam is the degenerate case.**  Apart from the sorted forward just
 described, the parallel kernels are the cone kernels with the vertical fan deleted:
