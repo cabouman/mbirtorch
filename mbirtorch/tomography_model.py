@@ -1385,8 +1385,7 @@ class TomographyModel(ParameterHandler):
     min_compiled_pixel_width = 1
 
     # Which measured widening-floor set governs the automatic device count
-    # (see _widening_floors).  None means the parallel floors, the more
-    # permissive measured set.
+    # (see _widening_floors).  None means the parallel floors.
     _floor_family = None
 
     def prepare_sino_for_devices(self, sinogram, weights=None):
