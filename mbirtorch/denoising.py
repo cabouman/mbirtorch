@@ -82,6 +82,74 @@ def vcd_subset_denoiser(flat_image, flat_error_image, pixel_indices,
     return flat_image, flat_error_image, ell1_for_subset, alpha
 
 
+def _volume_shape(image):
+    """The shape of a 3D volume in any form the denoiser accepts: a numpy
+    array, a torch tensor on any device, or a slice-sharded Shards.
+
+    A denoiser image is sharded on the LAST axis, so its slice count is the
+    sum of the per-shard widths; rows and columns are not sharded, and every
+    shard holds all of them."""
+    if isinstance(image, _sharding.Shards):
+        first = image.tensors[0]
+        num_slices = sum(int(t.shape[-1]) for t in image.tensors)
+        return int(first.shape[0]), int(first.shape[1]), num_slices
+    if torch.is_tensor(image):
+        return tuple(int(n) for n in image.shape)
+    return tuple(int(n) for n in np.asarray(image).shape)
+
+
+def _subsample_to_host(image, row_step=1, col_step=1, slice_step=1):
+    """Return ``numpy.asarray(image)[::row_step, ::col_step, ::slice_step]``
+    for a 3D volume in any form the denoiser accepts, without ever holding
+    the whole volume on the host.
+
+    The denoiser's two statistics -- the noise estimate and the
+    auto-regularization parameters -- each look at a small strided subsample
+    of the image and at nothing else, so only that subsample needs to cross
+    to the host.  For a tensor or for shards, the strided block is taken on
+    the device that holds the data and only its elements are copied over.
+
+    For sharded input the result is EXACT: the same elements in the same
+    order as striding the assembled volume, because this is data movement
+    rather than an approximation.  Rows and columns are not sharded, so every
+    shard is strided identically on those two axes.  On the sharded last
+    axis, shard k owns global slices ``[start_k, end_k)``, so the sampled
+    global positions ``0, slice_step, 2 * slice_step, ...`` that land in that
+    block are the local positions ``j`` with
+    ``(start_k + j) % slice_step == 0`` -- they begin at local offset
+    ``(-start_k) % slice_step`` and continue by ``slice_step``.  Taking each
+    shard's block from that offset and concatenating on the last axis
+    reproduces the strided volume slice for slice.  A shard that owns no
+    slices, or one in which no sampled position lands, contributes a
+    zero-width block, which changes nothing.
+
+    Incidentally this also removes a latent failure on a single-device CUDA
+    model: ``numpy.asarray`` raises on a CUDA tensor, so a caller's tensor
+    handed straight to numpy would fail there.  Every tensor path here goes
+    through ``.cpu()`` first.
+    """
+    def block_to_host(tensor, slice_start):
+        """One tensor's strided block, made dense on its own device so that
+        the copy crossing to the host carries only the sampled elements."""
+        block = tensor[::row_step, ::col_step, slice_start::slice_step]
+        return block.detach().contiguous().cpu().numpy()
+
+    if isinstance(image, _sharding.Shards):
+        placement = image.placement
+        if placement.axis % 3 != 2:
+            raise ValueError(
+                'A denoiser image must be sharded on its last (slice) axis; '
+                'got a placement on axis {}.'.format(placement.axis))
+        num_slices = _volume_shape(image)[2]
+        blocks = [block_to_host(tensor, (-start) % slice_step)
+                  for tensor, (_dev, (start, _end))
+                  in zip(image.tensors, placement.shard_ranges(num_slices))]
+        return np.concatenate(blocks, axis=-1)
+    if torch.is_tensor(image):
+        return block_to_host(image, 0)
+    return np.asarray(image)[::row_step, ::col_step, ::slice_step]
+
+
 class QGGMRFDenoiser(TomographyModel):
     """
     The QGGMRFDenoiser uses the recon framework to implement a qggmrf proximal
@@ -166,11 +234,20 @@ class QGGMRFDenoiser(TomographyModel):
         """
         Estimate the noise standard deviation from the image (two passes of
         support-indicator + neighbor-difference std).
+
+        Only a strided subsample of at most about five million points is ever
+        used, so the element count and the stride come from the image's
+        SHAPE rather than from a host copy, and the subsample itself is taken
+        through :func:`_subsample_to_host`.  A sharded image is therefore
+        strided on its own devices and never brought over whole.  The stride
+        arithmetic is unchanged, so any given image still yields the estimate
+        it always did.
         """
-        image = np.asarray(image)
-        num_pts_to_use = np.minimum(5_000_000, image.size)
-        stride = round((image.size / num_pts_to_use) ** (1 / 3))
-        small_image = image[::stride, ::stride, ::stride]
+        num_rows, num_cols, num_slices = _volume_shape(image)
+        num_elements = num_rows * num_cols * num_slices
+        num_pts_to_use = np.minimum(5_000_000, num_elements)
+        stride = round((num_elements / num_pts_to_use) ** (1 / 3))
+        small_image = _subsample_to_host(image, stride, stride, stride)
 
         support_indicator = self._get_sino_indicator(small_image, sigma_noise=0.0)
         sigma_noise = self._get_estimate_of_recon_std(small_image, support_indicator)
@@ -255,24 +332,37 @@ class QGGMRFDenoiser(TomographyModel):
         self._apply_device_policy(workload='denoise', init_recon=init_image)
         self._log_device_report()
 
-        # The noise and regularization estimates below index the image on the
-        # host; a sharded input supplies a host copy for them (statistics
-        # only -- the sweep itself consumes the sharded form).
-        host_image = image
-        if isinstance(image, _sharding.Shards):
-            from .utilities import _to_host
-            host_image = _to_host(image)
-
+        # The noise and regularization estimates below each run on a small
+        # strided subsample of the image and never on the whole volume, so
+        # each one brings over only the elements it reads.  A sharded input is
+        # subsampled on its own devices, so no full copy crosses to the host
+        # and a caller that keeps its volume on the devices (a plug-and-play
+        # loop, say) pays no whole-volume transfer per denoise.
         self.set_params(no_warning=True, use_ror_mask=use_ror_mask)
         if sigma_noise is None:
-            sigma_noise = self.estimate_image_noise_std(host_image)
+            # This one strides all three axes itself, so it takes the image in
+            # whatever form the caller supplied.  Handing it the row subsample
+            # built below would change the estimate.
+            sigma_noise = self.estimate_image_noise_std(image)
         self.set_params(no_warning=True, sigma_noise=sigma_noise)
         self.logger.info('Initializing QGGMRFDenoiser')
 
         # Auto-regularization with the background-estimation warning suppressed.
+        # auto_set_regularization_params begins by calling subsample_views,
+        # which keeps every step_size-th row and reads nothing else, so giving
+        # it those rows instead of the volume gives it exactly the same data:
+        # one such subsample leaves at most 39 rows, and at 39 rows or fewer
+        # subsample_views uses a step size of 1, so its own call passes them
+        # through unchanged.  (Checked for every row count from 1 to 4999.)
+        # The step comes from subsample_views itself, applied to the row
+        # indices, rather than from a second copy of its rule here.
+        num_rows = _volume_shape(image)[0]
+        sampled_rows = self.subsample_views(np.arange(num_rows))
+        row_step = int(sampled_rows[1] - sampled_rows[0]) if sampled_rows.size > 1 else 1
+        small_image = _subsample_to_host(image, row_step=row_step)
         verbose = self.get_params('verbose')
         self.set_params(no_warning=True, verbose=0)
-        regularization_params = self.auto_set_regularization_params(np.asarray(host_image))
+        regularization_params = self.auto_set_regularization_params(small_image)
         self.set_params(no_warning=True, verbose=verbose)
 
         # One fixed partition (sequential subsets; no per-iteration shuffle).

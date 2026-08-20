@@ -67,7 +67,8 @@ Choosing the devices
 
 To take the layout out of the library's hands, call
 :meth:`~mbirtorch.TomographyModel.configure_devices`.  A layout set this way is final: the
-automatic choice never runs again on that model.  It takes either a count or an explicit device list.  Use
+automatic choice never runs again on that model.  It takes a count, an explicit device list, or
+another model to match.  Use
 ``torch.cuda.device_count()`` to see how many CUDA devices are visible::
 
     import torch
@@ -76,6 +77,7 @@ automatic choice never runs again on that model.  It takes either a count or an 
     model.configure_devices(2)                            # the first 2 CUDA devices
     model.configure_devices(devices=["cuda:0", "cuda:2"]) # exactly these devices
     model.configure_devices(1)                            # back to a single device
+    other_model.configure_devices(like=model)             # match this model's devices
 
 Passing a count requires that many CUDA devices to be visible, and raises otherwise.  Pass
 an explicit ``devices`` list to select particular GPUs, for example to leave one free for
@@ -92,6 +94,37 @@ fewer views than devices, they still hold slice shards and run the prior.
 
 To run on `num_cpus CPUs` when a GPU is present, call
 ``model.configure_devices(devices=['cpu']*num_cpus)``.
+
+Matching one model to another
+-----------------------------
+
+``configure_devices(like=other_model)`` copies another model's devices.  This matters when
+two models work on the same volume, as a Plug-and-Play or ADMM loop does when it alternates
+:meth:`~mbirtorch.TomographyModel.prox_map` on a reconstruction model with
+:meth:`~mbirtorch.QGGMRFDenoiser.denoise` on a denoiser.  Placed on the same devices, the
+two models pass the volume between them in its device form, so it stays where it was
+computed instead of being gathered to the host and scattered again on every half-iteration::
+
+    denoiser = mbirtorch.QGGMRFDenoiser(ct_model.get_params('recon_shape'))
+    denoiser.configure_devices(like=ct_model)
+
+    volume, _ = ct_model.prox_map(volume, sinogram, output_sharded=True)
+    volume, _ = denoiser.denoise(volume, output_sharded=True)
+
+Build the denoiser at the other model's **recon** shape, as above, not its sinogram shape.
+The two models must agree on that shape, and ``configure_devices`` raises naming both shapes
+if they do not.  Configure the model being copied first: one still on the automatic layout
+has not chosen its devices yet, and the pair would diverge when it settles.
+
+This makes reconstruction volumes interchangeable, not sinograms.  A denoiser's "sinogram"
+is its image, so its sinogram placement divides an image by slice, while a projection
+model's divides a sinogram by view; those are different things.  To place two models on the
+same devices without exchanging arrays, pass ``devices=`` instead.
+
+A denoiser configured this way runs on the devices you gave it.  The automatic choice would
+hold a denoise to one device at any size, because splitting one has never been measured
+faster; that measurement is of a call that returns its result to the host, and a loop
+keeping the volume on the devices does not pay what made splitting lose.
 
 Tips for efficiency
 -------------------
