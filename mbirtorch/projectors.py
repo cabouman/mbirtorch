@@ -17,6 +17,7 @@ body declares its own, much smaller, per-view cost through its
 bodies are torch.compiled (see maybe_compile below).
 """
 
+import os
 import threading
 
 import torch
@@ -31,7 +32,10 @@ _F32 = torch.float32
 # compiled callables are cached per FUNCTION at
 # module level: torch.compile handles multiple input shapes itself (one
 # specialization per shape guard), and the VCD loop's shape set is small (one
-# subset size per partition granularity, plus the full-index size).  A compile
+# subset size per partition granularity, plus the full-index size).  That set
+# must fit torch's per-function recompile budget once PER DEVICE, because the
+# per-device instances share one budget; _raise_recompile_budget below makes
+# the budget large enough.  A compile
 # failure falls back to eager silently-but-recorded, so exotic
 # backends/toolchains keep working.
 _COMPILE_CACHE = {}
@@ -42,6 +46,64 @@ _COMPILE_ERRORS = {}
 # instances).  Each wrapper takes this lock only for input-shape keys it has
 # not completed before, so steady-state threaded execution stays lock-free.
 _GLOBAL_COMPILE_LOCK = threading.Lock()
+
+#: The per-function recompile budget this module guarantees before it
+#: compiles anything.  torch caps how many specialized variants one function
+#: may hold (``torch._dynamo.config.recompile_limit``, default 8), and the
+#: cap attaches to the function's code object, so every per-device compiled
+#: instance of one body draws on one shared budget.  The variants guard on
+#: the input tensors' device index, so a run on n devices needs roughly n
+#: times the one-device variant count.  When a function's budget fills,
+#: torch stops compiling it, and calls that match no existing variant run
+#: eagerly from then on.  Measured 2026-08-19 on two H100s (job 15391547):
+#: the multiaxis and translation back bodies filled the default budget at
+#: several two-device cells, their remaining calls ran eagerly at 5x to 11x
+#: the compiled device time, and that was the whole measured two-device
+#: slowdown of both geometries (0.35x at the multiaxis 512-class cell).
+#: The one-device variant set fits inside torch's default of 8 at every
+#: measured cell, and a node holds at most 8 GPUs, so 8 x 8 covers the
+#: widest placement.  The accumulated limit across all functions
+#: (``accumulated_recompile_limit``, torch default 256) is left alone as
+#: the backstop against unbounded variant growth; the largest measured
+#: whole-process graph count is 36 (two devices, 3-iteration
+#: reconstruction).
+_RECOMPILE_LIMIT_FLOOR = 64
+
+
+def _raise_recompile_budget():
+    """Make torch's per-function recompile budget at least
+    ``_RECOMPILE_LIMIT_FLOOR``, on THIS thread, before compiling.
+
+    The budget must be raised on every thread that can trigger a
+    compilation, because dynamo consults a per-thread view of this config:
+    an assignment made on one thread does not reach another (measured,
+    torch 2.13 -- a limit assigned on the main thread capped nothing on a
+    worker thread, and the same assignment made on the worker thread
+    capped it).  The per-device fan-outs run the compiled bodies on pool
+    threads, so a raise made only where the wrapper is created would leave
+    every pool thread at torch's default; that is exactly how the first
+    form of this remedy failed its gate.  ``maybe_compile``'s wrapper
+    therefore calls this on each first sight of an input shape, which is
+    on the calling thread and before any call that can compile.
+
+    ``MBIRTORCH_RECOMPILE_LIMIT`` overrides the floor verbatim, including
+    downward, which is the debugging escape: a tiny limit makes torch's
+    recompile warnings fire early and name their guards.  Without the
+    override, a value someone already raised above the floor is kept.  Both
+    config names are set together: ``recompile_limit`` is the operative name
+    on current torch, ``cache_size_limit`` is its older spelling, and
+    leaving them different invites whichever one a future torch reads.
+    """
+    import torch._dynamo.config as dynamo_config
+
+    override = os.environ.get('MBIRTORCH_RECOMPILE_LIMIT')
+    if override:
+        limit = int(override)
+    else:
+        limit = max(int(dynamo_config.recompile_limit),
+                    _RECOMPILE_LIMIT_FLOOR)
+    dynamo_config.recompile_limit = limit
+    dynamo_config.cache_size_limit = limit
 
 
 def _shape_key(args, kwargs):
@@ -96,6 +158,7 @@ def maybe_compile(fn, enabled, instance_key=None):
     cache_key = fn if instance_key is None else (fn, instance_key)
     if cache_key in _COMPILE_CACHE:
         return _COMPILE_CACHE[cache_key]
+    _raise_recompile_budget()
     compiled = torch.compile(fn)
     state = {"impl": compiled}
     seen_keys = set()
@@ -106,8 +169,12 @@ def maybe_compile(fn, enabled, instance_key=None):
             return state["impl"](*args, **kwargs)
         # First sight of this shape: the call may trigger dynamo/inductor
         # compilation, which must not run concurrently with any other
-        # compile in the process (see _GLOBAL_COMPILE_LOCK).
+        # compile in the process (see _GLOBAL_COMPILE_LOCK).  The budget is
+        # raised HERE, on the calling thread, because dynamo's view of it is
+        # per thread and this is the thread about to compile (see
+        # _raise_recompile_budget).
         with _GLOBAL_COMPILE_LOCK:
+            _raise_recompile_budget()
             try:
                 out = state["impl"](*args, **kwargs)
             except Exception as e:                            # noqa: BLE001
