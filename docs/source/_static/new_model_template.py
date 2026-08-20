@@ -25,7 +25,7 @@ def _template_forward_view_batch(values, pixel_indices, view_params_batch,
             (num_rows x num_cols) recon plane.
         view_params_batch (tensor): the view-dependent parameters for this
             batch of views (for parallel beam, the angles).
-        slice_start (int): first slice of a slice band, for a slice-banded
+        slice_start (int): first slice of a slice band, for the slice-banded
             multi-device drivers.  A geometry whose detector rows track the
             recon slices can assert it is 0 (see parallel_beam.py).
         plan: memoization slot reserved by the driver; leave unused.

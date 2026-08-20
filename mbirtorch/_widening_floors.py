@@ -345,6 +345,12 @@ COST_INPUT_METHODS = tuple(name.split('.', 1)[1] for name in _ALL_COST_INPUTS
 #: sits in the SHARED input set, and that is why the refresh was the full
 #: one -- every family re-measured rather than carried.  Every other
 #: input is unchanged since mg40 recorded it.
+#:
+#: Re-recorded later the same day for a documentation pass that edited
+#: comments and one docstring in ``denoising.py``,
+#: ``multiaxis_parallel.py`` and ``translation_model.py``.  No executable
+#: line moved in any of the three, so the mg48 measurements above still
+#: describe the code these hashes cover.
 BLESSED_COST_HASHES = {
     'TomographyModel._sparse_back_project_sharded':
         'f73fa28f32d2393fac3f06139d8ddeccc55260fceb28bbca7f102334839fb5a4',
@@ -359,9 +365,9 @@ BLESSED_COST_HASHES = {
     'cone_beam.py':
         '5b52ff9cf972fec61e8a7ac5dd4ba568bc276e65f80c9caa0df30dc71710ccba',
     'denoising.py':
-        '09f902af84895b88bceed9ca4a3f833c279cdd93c3a442cf95c0ce431beb443a',
+        'b4462ca388e80e444f8484c4cf32840b462e6778b66599076e48c4425c293b85',
     'multiaxis_parallel.py':
-        '3208b93998462dedf8341351f7dfe30a42d683417b7c1a6da60d9d2b3395d852',
+        '5f365b4e07426e78aab09d8b0f67eab017f1efd23a25b70e31b1e81873cb6a2e',
     'parallel_beam.py':
         '065572c91201ce0b354aa9fd15d7aaef5f25bbea24d65b1b46ba8305c5943da1',
     'projectors.py':
@@ -369,7 +375,7 @@ BLESSED_COST_HASHES = {
     'qggmrf.py':
         '64e35c114ed049764a3f2f3005fb6341235747270aa2ebe181fff60947bc8602',
     'translation_model.py':
-        '0e39120c721edf0ed7d082f74593ce3e0d45a8142919c87224414af9c3cad5b8',
+        '5ad3f7d021cda57fdb00729c5c4c54906102c4c6dc1a3aa917156ab92256f00f',
     'triton_cone.py':
         'a4d8350b350cd34a358bb54c33ae3d408f5b1d0131044d0d88b462c5cbaf2dbc',
     'triton_parallel.py':
@@ -390,7 +396,7 @@ STALE_SINCE = None
 #: green the test leaves this behind, and the test says so.  Recomputed and
 #: printed by ``refresh_widening_floors.py --bless``.
 TABLE_CHECKSUM = \
-    'ce529224f5554e05fe7ba154acad889f91bcb6ecf58cc58dff1953d76806d3fd'
+    '17401aa10e1ec60580b0a489b3588767753c49fcad77b4b13ea9d0ceee978d57'
 
 
 # ── the env knob ─────────────────────────────────────────────────────────────

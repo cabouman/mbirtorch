@@ -247,14 +247,15 @@ class TranslationModel(TomographyModel):
         view_batch_size, compile_mode: as in ParallelBeamModel.
     """
 
-    # Translation has its own floor family so that splitting is never
-    # admitted by speed.  Measured 2026-08-17 (mg22) on production-anchored
-    # translation cells up to the (256, 1900, 3000) production scan: two
-    # devices lost at every size probed (0.66x to 0.88x against one device)
-    # and four lost worse (0.15x to 0.64x), while the parallel floors this
-    # class used to borrow admit both counts at those sizes.  Both family
-    # rows are sentinels, so the automatic path holds a translation model to
-    # one device; capacity can still widen a model that cannot fit one.
+    # Translation has its own floor family rather than borrowing parallel's,
+    # because it is measured on production-anchored translation cells rather
+    # than on the shared ladder.  The thresholds themselves, the runs behind
+    # them, and their dates are the translation rows of
+    # _widening_floors.FLOORS; they are not restated here, because a refresh
+    # moves them and a copy would go stale.  Historical note: the 2026-08-17
+    # readings that first justified a separate family (both counts losing at
+    # every size probed) were torch's per-function recompile budget filling,
+    # which projectors._raise_recompile_budget has since fixed.
     _floor_family = 'translation'
 
     def __init__(self, sinogram_shape, translation_vectors, source_detector_dist,

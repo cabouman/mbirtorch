@@ -13,15 +13,18 @@ control it), see :doc:`usr_multi_gpu`.
 **Scope.**  Sharding runs within a single process across the chosen devices
 (multiple GPUs, or CPU devices).  It works for all of the library's
 geometries: parallel-beam, cone-beam, translation, and multi-axis parallel.  A
-device count need not divide the axis it splits: the blocks then differ in
+device count need not divide the axis it splits: the shards then differ in
 length by at most one, and no data is padded.  Results can still differ slightly
 with the device count, and the difference decays as iterations proceed.
 Multi-node execution is out of scope.
-As in MBIRJAX, the device layout is chosen automatically -- on CUDA with two or
-more visible devices, a reconstruction spreads across the devices that can hold
-their share.  :meth:`~mbirtorch.TomographyModel.configure_devices` is the
-explicit door out of that choice, and ``configure_devices(num_devices=1)`` is
-the reproducibility pin.
+
+The device layout is chosen automatically on CUDA with two or more visible
+devices.  Each device count carries a measured speed floor
+(``_widening_floors.py``), and a count below its floor is tried only after
+every admitted count, so capacity still widens a reconstruction that needs the
+memory.  :meth:`~mbirtorch.TomographyModel.configure_devices` is the explicit
+door out of that choice, and ``configure_devices(num_devices=1)`` is the
+reproducibility pin.  :doc:`usr_multi_gpu` states both rules in full.
 
 
 The two shardings
@@ -46,9 +49,12 @@ MBIRTorch shards the two large arrays along complementary axes:
 
 Because the two arrays are sharded on different axes, projecting between them is
 an all-to-all: every slice-shard contributes to every view-shard, and vice
-versa.  To bound both the inter-device communication and the peak per-device
-memory, the projectors **work one slice-shard at a time** rather than moving the
-whole volume at once.
+versa.  Neither projector moves the whole volume at once, but the two bound
+different things.  The forward bounds the **transfer**: a view-owner brings over
+one batch of voxel cylinders at a time, and each cylinder spans the whole slice
+axis, so the projector call itself covers every slice-shard together.  The back
+projection bounds **both**, because it processes one slice-shard at a time and
+one band of slices within that shard.
 
 
 Placement and Shards: the device layout and the device form
@@ -70,11 +76,8 @@ state.  A single device is the trivial one-shard case, and the placement
 functions return plain tensors there, so the ``n = 1`` path is unchanged.
 
 The *device form* of a sharded array is a ``Shards`` container: the per-device
-tensors plus their placement.  This is where MBIRTorch diverges most sharply from
-MBIRJAX.  JAX offers a single logically-global sharded array, assembled with
-``jax.make_array_from_single_device_arrays``, and MBIRJAX's code operates on that
-global array.  Torch's counterpart, DTensor, was deliberately rejected as immature
-for these index-heavy kernels, so there is no global array here.  ``Shards`` is a
+tensors plus their placement.  Torch's logically-global sharded array, DTensor, was deliberately rejected as immature
+for the index-heavy kernels in MBIRTorch, so there is no global array here.  ``Shards`` is a
 plain container instead: it holds the tensors, checks on construction that each
 shard really lives on its placement's device, and exposes ``gather()`` as the host
 exit.  The drivers and the VCD loop operate on the per-device tensors directly.
@@ -82,7 +85,7 @@ exit.  The drivers and the VCD loop operate on the per-device tensors directly.
 One layout is refused: a device holding no data on **either** axis, since it
 would do no work.  That happens exactly when the device count exceeds both the
 view count and the slice count.  A device idle on only one axis is legal and
-useful, and this is a deliberate extension beyond MBIRJAX.  With fewer slices
+useful.  With fewer slices
 than devices the extra devices still project their views, which dominates there;
 with fewer views than devices they still hold slice shards and run the prior and
 updates, which dominate there (``_check_no_empty_shard`` in
@@ -94,7 +97,7 @@ The forward's cylinder transfer
 
 **Forward projection** (recon → sinogram) is the **cylinder transfer**, on all four
 geometries: parallel-beam, cone-beam, translation and multi-axis parallel.
-Each view-owner walks the pixel axis in batches, collects each batch's
+Each view-owner partitions the pixel axis into batches, collects each batch's
 full-height voxel cylinder from every slice-owner, and makes one projector call
 per batch over its own views and the whole slice range.  When the loop
 finishes, the sinogram is already in the view-sharded layout.
@@ -104,13 +107,6 @@ device count, so the transient does not grow with the problem at a fixed batch.
 ``forward_project_pixel_batch`` on the model sets that batch
 (``transfer_cylinder_batch`` in ``_sharding.py`` and
 ``_sparse_forward_project_cylinders`` in ``tomography_model.py``).
-
-Each geometry took this driver on its own measurement, on four H100s: cone and
-parallel on 2026-08-11, and translation and multi-axis on 2026-08-17, where the
-gather was faster at both device counts measured -- 1.13x to 1.94x on a
-composed reconstruction -- and held a lower per-device peak.  A slice-banded
-forward ran beside it until 2026-08-17 and was removed once all four geometries
-had been measured on the gather.
 
 
 Back projection by bands
@@ -135,28 +131,27 @@ reduced (summed) and scattered into the slice-owner that holds those slices --
 a reduce-scatter, ``sum_band_to_owner``.  The result is already in the
 slice-sharded recon layout.
 
-The reduce **streams**.  It forms the running total for a band once on the
-slice-owner and then adds each arriving partial one bounded row slab at a time,
-so the owner holds one slab per source above that total instead of every
-partial at once.  The summation order is untouched, so the streamed result is
-bit for bit the one-shot sum.  This is what makes the reduce shrink as devices
-are added: it used to hold n whole bands, and n bands of 1/n of the volume each
-is the same number of bytes at every device count.
+**The owner adds the partials a slab of rows at a time.**  It allocates the
+running total for the band once, then adds each arriving partial into that total
+in slabs of at most 256 MiB.  So beyond the running total the owner holds one
+slab per source, and a slab is the same number of bytes however many devices
+there are.  The simpler alternative is to move all n partials across first and
+add them together; that holds n whole bands at once, and since each band is 1/n
+of the volume, it costs the same at every device count and never gets smaller.
+Adding in slabs changes neither which numbers are added nor the order they are
+added in, so the result matches the one-shot sum bit for bit.
 
-**The default band is the whole shard**, which differs from MBIRJAX deliberately
-and on measurement.  MBIRJAX's sweeps found time flat across band length, so it
-streams by default for the memory win.  The torch banded pass pays a fixed
-orchestration cost per band: with the compiled kernels in place, sub-band walks
-measured 2 to 23 percent more busy time at parallel 1024 with two devices,
-depending on the walk (an earlier pre-kernel reading of 47 to 66 percent
-overstated the cost).
-MBIRJAX's stream-even-at-one-device rationale is also void here, because a single
-torch device never runs the banded driver at all -- the trivial path uses the
-plain projectors.  A smaller band remains a real **memory** lever, since the
-per-band partial scales with it; what it sets in the reduce is the running
-total the slabs are added into, the bands already reduced this pass being held
-either way.  Set ``back_project_slice_band`` on the model to opt in
-(``_slice_band_length`` in ``tomography_model.py``).
+**The default band is the whole shard.**  Each band costs a fixed amount of
+orchestration, so dividing a shard into several bands costs time.  With the
+compiled kernels in place, narrower bands measured 2 to 23 percent more busy
+time at parallel 1024 on two devices, depending on the band length.  An earlier
+reading of 47 to 66 percent predates those kernels and overstated the cost.  A
+single device never reaches this driver at all, because the trivial placement
+uses the plain projectors.  A smaller band is still a real **memory** lever,
+since each per-band partial scales with the band, and the band also sets the
+size of the running total the slabs are added into.  Bands already reduced in
+this pass are held either way.  Set ``back_project_slice_band`` on the model to
+opt in (``_slice_band_length`` in ``tomography_model.py``).
 
 
 Why cone beam projects whole cylinders
@@ -223,9 +218,13 @@ device count:
 Both paths converge to the same result; only the boundary handling and the loop
 structure differ.
 
-The QGGMRF denoiser is single-device only.  Sharding it is possible future work,
-and was not efficient in MBIRJAX, so the trade needs measuring in torch before it
-is worth doing.
+The QGGMRF denoiser takes the same two paths.  ``QGGMRFDenoiser.denoise``
+selects a device layout through the same policy a reconstruction uses, and on
+several devices it slice-shards the image and runs the sweep shard by shard,
+staging the qGGMRF halos once per pass (``_denoise_sharded`` in
+``denoising.py``).  Sharding the denoiser was measured slower than one device
+at every size probed, so the automatic path widens a denoise only when it does
+not fit on one device.
 
 
 Multi-device execution: thread pools
@@ -241,8 +240,7 @@ data through host memory**.
 
 MBIRTorch uses a **thread pool with one worker per device**: each thread operates
 on its device's tensors in place, runs the per-device kernel, and keeps its result
-on-device (``device_pool`` / ``run_per_device`` in ``_sharding.py``).  Two details
-differ from the MBIRJAX port of the same idea.  Torch needs no thread-local
+on-device (``device_pool`` / ``run_per_device`` in ``_sharding.py``).  Torch needs no thread-local
 default device, because tensors carry their own device, so a worker simply operates
 on the tensors it is given.  And a single device short-circuits to a direct call on
 the calling thread, with no pool and no thread hop, so code written uniformly over
@@ -283,7 +281,8 @@ Where this lives in the code
   torch.compile plumbing.
 * ``mbirtorch/horizontal_fan.py`` -- the shared horizontal-fan kernels and the
   fan data contract.
-* the per-geometry view-batch bodies in ``parallel_beam.py`` and ``cone_beam.py``.
+* the per-geometry view-batch bodies in ``parallel_beam.py``, ``cone_beam.py``,
+  ``multiaxis_parallel.py``, and ``translation_model.py``.
 
 The correctness gates for the sharding invariants are in ``tests/test_sharding.py``.
 The strongest of them compare against a single-device reference: the sharded

@@ -30,12 +30,11 @@ dependencies = [
     "numpy",
     # The slice viewer (mbirtorch/viewer.py) needs matplotlib always and h5py
     # for HDF5 load/save (imported lazily, but required for full function).
-    # Both unversioned, matching mbirjax's pyproject.
     "matplotlib",
     "h5py",
     # The preprocess package needs scipy (filters, fitting), tifffile (scan
     # readers), tqdm (batch progress), and pywavelets (wavelet-FFT stripe
-    # removal).  All unversioned, matching mbirjax's pyproject.
+    # removal).
     "scipy",
     "tifffile",
     "tqdm",

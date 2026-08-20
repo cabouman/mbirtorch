@@ -252,13 +252,15 @@ class MultiAxisParallelModel(TomographyModel):
                          view_params_name='angles', angles=angles,
                          recon_slice_offset=0.0)
 
-    # Multiaxis has its own floor family so that four devices are never
-    # admitted by speed.  Measured 2026-08-17 at the 1024-class production
-    # cell: the composed reconstruction took 394 s at two devices and 951 s
-    # at four, while the parallel floors this class used to borrow admit
-    # four at that size.  The family's rows hold it to two devices until its
-    # own thresholds are measured; capacity can still widen a model that
-    # cannot fit two devices.
+    # Multiaxis has its own floor family rather than borrowing parallel's,
+    # because its crossover was measured separately.  The thresholds
+    # themselves, the runs behind them, and their dates are the multiaxis
+    # rows of _widening_floors.FLOORS; they are not restated here, because a
+    # refresh moves them and a copy would go stale.  Historical note: the
+    # 2026-08-17 reading that first justified a separate family (394 s at two
+    # devices against 951 s at four, 1024-class) was torch's per-function
+    # recompile budget filling, which projectors._raise_recompile_budget has
+    # since fixed.
     _floor_family = 'multiaxis'
 
     def _view_batch_bodies(self):

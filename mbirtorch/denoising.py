@@ -214,7 +214,7 @@ class QGGMRFDenoiser(TomographyModel):
         can also be adjusted with the ``sharpness`` parameter (default 0.0).
 
         The first call settles the model's device layout, so it may raise the
-        memory preflight's :class:`MemoryPreflightError` when no device count
+        memory preflight's ``MemoryPreflightError`` when no device count
         holds the sweep.  ``MBIRTORCH_NUM_DEVICES`` caps the automatic count,
         and ``configure_devices`` fixes it outright.
 

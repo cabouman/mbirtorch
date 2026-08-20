@@ -9,18 +9,19 @@ larger volumes than fit on one GPU, and on large problems it **reduces reconstru
 time**.  It works for all of the library's geometries: parallel-beam,
 cone-beam, translation, and multi-axis parallel.  :class:`~mbirtorch.QGGMRFDenoiser`
 follows the same rules through :meth:`~mbirtorch.QGGMRFDenoiser.denoise`, with one
-practical difference recorded below: its measured speed floors admit no multi-device
-count, so an automatic denoise spreads only when it cannot fit on one device.
+practical difference.  No measured problem size makes a multi-device denoise faster,
+so an automatic denoise spreads only when it cannot fit on one device.
 
 The default: spread across the visible GPUs
 -------------------------------------------
 
 Multi-device reconstruction is **automatic**.  On a machine with two or more
-CUDA devices, a reconstruction spreads across them with no change to your script::
+GPUs, a reconstruction can use them with no change to your script::
 
     recon, recon_dict = model.recon(sinogram)   # uses the GPUs that fit
 
-The automatic choice is made once per model, at its first reconstruction.  Later
+However, depending on the problem, the code may not use all available GPUs.  The
+automatic choice is made once per model, at its first reconstruction.  Later
 reconstructions on the same model reuse the layout, and the choice runs again only when
 the model's sinogram or reconstruction shape changes.
 
@@ -30,36 +31,25 @@ The automatic choice applies two rules, in this order.
 per-device work no longer covers the cost of splitting it, and a small reconstruction
 spread over four GPUs can run several times slower than the same reconstruction on one.
 So each device count carries a measured **speed floor** -- a problem size, in sinogram
-elements, below which the automatic path does not prefer that count.  The floors are
-per-geometry and deliberately coarse: a count is admitted only where it was measured
-clearly faster, and a thin measured win is rounded up to the next larger problem size,
-so the floors survive hardware and shape variation.  Translation and multi-axis
-parallel were measured too, and splitting them never paid clearly, so the automatic
-path holds them to one device.  The
-denoiser's per-pixel work is very small, so an automatic denoise stays on one
-device until it no longer fits there; ``configure_devices`` can be used to shard it explicitly.
+elements, below which the automatic path does not prefer that count.
+``configure_devices`` can be used to set the number of GPUs explicitly.
 
-**Capacity always wins.**  A count below its floor is only set aside, never discarded.
+**Capacity always wins.**  A count below its floor is set aside, not discarded.
 Before the first large allocation, MBIRTorch estimates the memory each candidate layout
 would need and takes the largest *preferred* count whose per-device share fits, with a
 safety margin; if none of them fits, it falls back through the set-aside counts rather
 than refusing to run.  So a reconstruction that genuinely needs four GPUs still gets
 them.  If no layout fits at all, the reconstruction fails immediately with the shortfall
-named, rather than failing mid-run with an out-of-memory error.  A direct reconstruction
-(``fbp_recon``, ``fdk_recon``) is checked against what it alone allocates, which is far
-less than an iterative ``recon``, so it still runs on a problem too large for one; the
-``recon`` itself is then the call that is refused.  Two model attributes tune the memory
-check: ``model.skip_memory_preflight = True`` runs without it, and
-``model.memory_preflight_margin`` (default 0.15) is the fraction by which the estimate is
-padded before it is compared with the free memory.  Note that skipping the preflight
-skips the *memory* rule only; the speed floors still order the choice.
+named, rather than failing mid-run with an out-of-memory error.
 
-The run log's device line names any count the automatic choice left on the table and
+**Feedback.** The run log's device line names any count the automatic choice left on the table and
 why, so idle GPUs are never silent -- either because a count is below its speed floor or
 because it did not fit.  Both ways of naming the devices yourself --
 :meth:`~mbirtorch.TomographyModel.configure_devices` and ``MBIRTORCH_NUM_DEVICES`` --
-bypass the floors entirely, since a count you asked for is not the library's to
-second-guess.  To keep the automatic search but disable the speed floors alone, set
+use what you specify.  They differ on the memory check: ``configure_devices`` skips it,
+while a count pinned by the environment variable is still checked and can still be
+refused.  To
+keep the automatic search but disable the speed floors alone, set
 ``MBIRTORCH_WIDENING_GUARD=0``, which restores the pure largest-count-that-fits
 behavior.
 
@@ -77,8 +67,7 @@ Choosing the devices
 
 To take the layout out of the library's hands, call
 :meth:`~mbirtorch.TomographyModel.configure_devices`.  A layout set this way is final: the
-automatic choice never runs again on that model, and the memory check no longer
-second-guesses the count you gave.  It takes either a count or an explicit device list.  Use
+automatic choice never runs again on that model.  It takes either a count or an explicit device list.  Use
 ``torch.cuda.device_count()`` to see how many CUDA devices are visible::
 
     import torch
@@ -101,8 +90,8 @@ would do no work at all.  Layouts where a device is idle on only one axis are al
 useful.  With fewer slices than devices, the extra devices still project their views; with
 fewer views than devices, they still hold slice shards and run the prior.
 
-There is no ``use_gpu`` parameter.  To run on the CPU when a GPU is present, call
-``model.configure_devices(devices=['cpu'])``.
+To run on `num_cpus CPUs` when a GPU is present, call
+``model.configure_devices(devices=['cpu']*num_cpus)``.
 
 Tips for efficiency
 -------------------
@@ -120,7 +109,7 @@ Tips for efficiency
   for more time.  Leave it unset unless a run is memory-constrained.  The forward projection
   has its own lever, ``forward_project_pixel_batch``, which sets how many voxel cylinders it
   moves between devices at once.
-* **More devices is often slower.**  See the next section.
+* **More devices is sometimes slower.** This mostly concerns small problems. See the next section.
 
 What to expect from more GPUs
 -----------------------------
@@ -160,9 +149,10 @@ large.
 Behind the scenes
 -----------------
 
-Internally MBIRTorch uses *sharding*: the sinogram is split across the devices by view and the
-reconstruction volume by slice, and the two are combined with a small amount of banded
-communication between devices.  A device count need not divide the sinogram or the
-volume evenly; the shares then differ in size by at most one view or one slice.
+Internally MBIRTorch uses *sharding*: the sinogram is split across the devices by view
+and the reconstruction volume by slice.  Projecting between the two layouts requires
+communication between devices, and the projectors move the data in bounded pieces, so no
+single transfer holds the whole volume.  A device count need not divide the sinogram or
+the volume evenly; the shares then differ in size by at most one view or one slice.
 A reconstruction runs within a single process; multi-node execution is
 out of scope.  For the developer-facing architecture, see :doc:`dev_sharding_overview`.

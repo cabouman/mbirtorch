@@ -1004,6 +1004,53 @@ def head_commit():
         return 'unknown'
 
 
+def print_bless_paste_help(stale):
+    """How to hand-paste the block --bless just printed, and how to check it.
+
+    Nothing here writes _widening_floors.py.  Every value in that file sits
+    beside a hand-written comment recording what measured it and when, and a
+    writer that rewrote the file would have to preserve those comments or
+    silently drop them.  So the paste is by hand, and these are the steps.
+    """
+    print('\n' + '-' * 78)
+    print('HOW TO PASTE')
+    print('-' * 78)
+    print('In mbirtorch/_widening_floors.py, replace three things with the')
+    print('block above:')
+    print()
+    print('  1. the whole BLESSED_COST_HASHES = {...} dict.  Usually only a')
+    print('     few entries differ, but replacing the dict whole is always')
+    print('     right and takes the same time;')
+    print('  2. the STALE_SINCE = ... line;')
+    print('  3. the TABLE_CHECKSUM = ... value.  The file wraps it after the')
+    print("     '=' with a backslash; either form is fine.")
+    print()
+    print('Leave FLOORS alone.  --bless measures nothing, so no row and no')
+    print('row note moves.  A full refresh prints its own FLOORS block to')
+    print('paste beside these three.')
+    print()
+    print('Then extend the comment above BLESSED_COST_HASHES to say WHEN you')
+    print('re-recorded and WHY.  That comment is the only place a reader can')
+    print('learn whether a hash moved because the floors were re-measured or')
+    print('because someone edited a comment in a priced file.  No hash')
+    print('distinguishes the two, and the difference decides whether the')
+    print('measurements above still describe the code.')
+    if stale:
+        print('  Here it needs to cover: {}.'.format(
+            ', '.join(name for name, _w, _g in stale)))
+    print()
+    print('Finally, check that the paste took:')
+    print()
+    print('    python -c "import mbirtorch._widening_floors as wf; '
+          'print(wf.stale_note())"')
+    print('    python -m pytest tests/test_widening_floors.py')
+    print()
+    print('The first should print None.  A string instead means the hashes')
+    print('did not all land.  A test failure naming TABLE_CHECKSUM means the')
+    print('checksum and the values it binds disagree, which is exactly what')
+    print('that check exists to catch: paste all three, or none of them.')
+
+
 def do_bless():
     """``--bless``: print fresh values for the three bound constants."""
     stale = wf.stale_cost_inputs()
@@ -1018,7 +1065,12 @@ def do_bless():
     print('the automatic staleness note; leave the old hashes in place')
     print('instead and let the note stand until the floors are')
     print('re-measured.\n')
+    print('=' * 78)
+    print('PASTE INTO mbirtorch/_widening_floors.py.  All of it, or none of')
+    print('it: the checksum binds these three constants together.')
+    print('=' * 78)
     print(wf.bless_lines(stale_since=None))
+    print_bless_paste_help(stale)
     return 0
 
 
