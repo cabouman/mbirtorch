@@ -31,6 +31,49 @@ def test_placement_ranges_split_evenly_within_one():
         Placement(["cpu"], axis=0).shard_ranges()
 
 
+def test_placements_compare_by_value_and_hash_with_it():
+    """Two placements built separately from the same devices, axis and axis
+    length are equal, and equal placements split the axis into the same blocks
+    on the same devices.
+
+    This is what lets one model hand a sharded volume to another model
+    configured the same way -- the alternation a Plug-and-Play loop makes
+    between a reconstruction and a denoiser -- instead of the handoff being
+    refused because the two placement OBJECTS are distinct.
+    """
+    p = Placement(["cpu", "cpu"], axis=-1, axis_len=8)
+    q = Placement(["cpu", "cpu"], axis=-1, axis_len=8)
+    assert p == q and p is not q
+    assert [r for _, r in p.shard_ranges()] == [r for _, r in q.shard_ranges()]
+
+    # Equal objects hash equally, so a placement stays usable as a dict key or
+    # a set member.
+    assert hash(p) == hash(q)
+    assert len({p, q}) == 1
+
+    # Any one of the three fields differing makes them unequal.
+    assert p != Placement(["cpu"], axis=-1, axis_len=8)           # devices
+    assert p != Placement(["cpu", "cpu"], axis=0, axis_len=8)     # axis
+    assert p != Placement(["cpu", "cpu"], axis=-1, axis_len=7)    # axis length
+
+    # A foreign operand is deferred to rather than answered, so the other type
+    # gets its say and the comparison still comes out False.
+    assert p.__eq__("not a placement") is NotImplemented
+    assert not (p == "not a placement")
+    assert p != "not a placement"
+
+    # An unindexed device and an indexed one do not compare equal, so a model
+    # on 'cuda' and a model on 'cuda:0' are refused rather than wrongly
+    # accepted.  No device is touched here: the placements only name one.
+    assert (Placement(["cuda"], axis=-1, axis_len=4)
+            != Placement(["cuda:0"], axis=-1, axis_len=4))
+
+    # The repr names all three fields, so an error message built from it says
+    # which configuration an array actually came from.
+    assert (repr(Placement(["cuda:0", "cuda:1"], axis=-1, axis_len=992))
+            == "Placement(cuda:0,cuda:1, axis=-1, axis_len=992)")
+
+
 def test_shards_gather_roundtrip():
     p = Placement(["cpu", "cpu"], axis=0, axis_len=6)
     full = np.arange(24, dtype=np.float32).reshape(6, 4)

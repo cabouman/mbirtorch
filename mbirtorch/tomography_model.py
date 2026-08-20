@@ -912,15 +912,33 @@ class TomographyModel(ParameterHandler):
         self._dc_damping_cache = None
 
     # ── device configuration ──────────────────────────────────────────────────
-    def configure_devices(self, num_devices=1, devices=None):
+    def configure_devices(self, num_devices=1, devices=None, like=None):
         """
         Set the compute devices the model uses.
 
-        Specify either a CUDA device count (``num_devices=n``) or an explicit
+        Specify either a CUDA device count (``num_devices=n``), an explicit
         device list (``devices=['cpu']``, ``['mps']``, or
-        ``['cuda:0', 'cuda:1']``).  With more than one device, the sinogram
+        ``['cuda:0', 'cuda:1']``), or another model to match
+        (``like=other_model``).  With more than one device, the sinogram
         is divided across the devices by view and the reconstruction by
         slice.
+
+        ``like=`` exists for a Plug-and-Play or ADMM loop, which alternates
+        :meth:`prox_map` on a reconstruction model with
+        :meth:`~mbirtorch.QGGMRFDenoiser.denoise` on a denoiser over the same
+        volume.  Placing the two models on the same devices lets that volume
+        pass between them in its device form (``output_sharded=True``),
+        instead of being gathered to the host and scattered again on every
+        half-iteration::
+
+            denoiser = QGGMRFDenoiser(ct_model.get_params('recon_shape'))
+            denoiser.configure_devices(like=ct_model)
+
+        The one limit is worth stating plainly: this makes RECON-like arrays
+        interchangeable, not sinogram-like ones.  A denoiser's sinogram IS its
+        image, so its sinogram placement divides an image by slice, while a
+        projection model's divides a sinogram by view; they are different
+        things, and nothing exchanges sinograms with a denoiser anyway.
 
         Without a call to this method, the model chooses its devices
         automatically: it prefers cuda, then mps, then cpu, and on CUDA it
@@ -943,7 +961,26 @@ class TomographyModel(ParameterHandler):
                 cpu); values above 1 require that many CUDA devices.
             devices (list, optional): explicit device list.  Overrides
                 num_devices.
+            like (TomographyModel, optional): another model (a geometry model
+                or a ``QGGMRFDenoiser``) whose device list this model copies,
+                so that recon-like arrays can pass between the two in their
+                device form.  The two models must agree on their recon shape,
+                which is what makes a volume from one usable by the other;
+                they need not agree on their sinogram shapes, and a denoiser
+                paired with a geometry model never does.  What is copied is the
+                layout the other model has at this moment, so configure that
+                model first: one whose layout is still automatic has not
+                chosen yet -- it settles on its first reconstruction -- and
+                the pair would then end up on different layouts.  ``like``
+                and ``devices`` cannot both be given, and ``num_devices`` is
+                ignored when ``like`` is: it has a default value, so an
+                explicit ``num_devices=1`` cannot be told from the default.
         """
+        if like is not None and devices is not None:
+            raise ValueError(
+                'configure_devices takes like= or devices=, not both: like= '
+                "copies another model's device list, and devices= names one "
+                'directly.  Pass whichever one expresses the intent.')
         self.device_layout_is_automatic = False
         # An earlier automatic settle may have left rejected counts behind.
         # They explain a search this layout did not come from, so the run log
@@ -954,6 +991,8 @@ class TomographyModel(ParameterHandler):
         # keeps the two states consistent rather than changing behavior.
         self._settled_shapes = None
         self._settled_workload = None
+        if like is not None:
+            devices = self._devices_like(like)
         if devices is None:
             if num_devices == 1:
                 devices = [self.torch_device]
@@ -966,6 +1005,48 @@ class TomographyModel(ParameterHandler):
                         f"{torch.cuda.device_count() if torch.cuda.is_available() else 0}.")
                 devices = [torch.device(f"cuda:{i}") for i in range(num_devices)]
         self._install_device_layout(devices)
+
+    def _devices_like(self, other):
+        """The device list of ``other``, checked as a model this model's
+        recon-like arrays can be exchanged with: the body of
+        ``configure_devices(like=...)``.
+
+        The check is the point of the method.  Copying a device list is easy;
+        what is easy to get wrong is building the second model at the wrong
+        shape -- typically a denoiser built at a CT model's SINOGRAM shape
+        instead of its recon shape -- and then discovering it only once an
+        array fails to place, or worse, places into blocks that do not line
+        up.  The slice count is what the recon-like arrays are divided by, so
+        that is what has to agree.
+        """
+        placement = getattr(other, 'recon_placement', None)
+        other_get_params = getattr(other, 'get_params', None)
+        if not isinstance(placement, _sharding.Placement) \
+                or not getattr(placement, 'devices', None) \
+                or other_get_params is None:
+            raise ValueError(
+                'configure_devices(like=...) copies the device list from '
+                'another tomography model (a geometry model or a '
+                f'QGGMRFDenoiser).  Got {type(other).__name__}, which has no '
+                'device placement to copy.')
+        own_shape = tuple(int(s) for s in self.get_params('recon_shape'))
+        other_shape = tuple(int(s) for s in other_get_params('recon_shape'))
+        if own_shape != other_shape:
+            raise ValueError(
+                'configure_devices(like=...) needs the two models to agree on '
+                'the whole recon shape, because that is what makes a volume '
+                'from one usable by the other.  The slice count alone decides '
+                'how the shards are cut, but a mismatch in the rows or the '
+                'columns would pass this check and then fail deep inside a '
+                'reconstruction as an unreadable tensor error.  This '
+                f'{type(self).__name__} has recon_shape {own_shape}, and the '
+                f'{type(other).__name__} given as like= has recon_shape '
+                f'{other_shape}, so recon-like arrays could not pass between '
+                "them.  A QGGMRFDenoiser is built at the other model's RECON "
+                "shape (ct_model.get_params('recon_shape')), not its sinogram "
+                'shape.  To place two models on the same devices without '
+                'exchanging arrays between them, pass devices=... instead.')
+        return list(placement.devices)
 
     def _install_device_layout(self, devices):
         """Rebuild the placements over ``devices``: the shared body of
@@ -1359,9 +1440,12 @@ class TomographyModel(ParameterHandler):
         view-sharded on a multi-device placement."""
         num_views = self.get_params('sinogram_shape')[0]
         if isinstance(sinogram, _sharding.Shards):
-            if sinogram.placement is not self.sino_placement:
-                raise ValueError('Sinogram shards belong to a different '
-                                 'device configuration; re-place the array.')
+            if sinogram.placement != self.sino_placement:
+                raise ValueError(
+                    'Sinogram shards belong to a different device '
+                    'configuration: the shards are placed as '
+                    f'{sinogram.placement}, and this model uses '
+                    f'{self.sino_placement}; re-place the array.')
             return sinogram
         if self.sino_placement.is_trivial:
             sinogram = torch.as_tensor(sinogram, dtype=torch.float32,
@@ -1431,9 +1515,25 @@ class TomographyModel(ParameterHandler):
         LAST axis) checked, slice-sharded on a multi-device placement."""
         num_slices = self.get_params('recon_shape')[2]
         if isinstance(recon, _sharding.Shards):
-            if recon.placement is not self.recon_placement:
-                raise ValueError('Recon shards belong to a different device '
-                                 'configuration; re-place the array.')
+            # Placements compare by value, so shards produced by ANOTHER model
+            # on the same devices with the same slice count are accepted here.
+            # That is the handoff a Plug-and-Play loop makes between a
+            # reconstruction model and a denoiser (see
+            # :meth:`configure_devices` and its ``like=`` argument).
+            #
+            # No whole-volume shape check belongs here: sparse_forward_project
+            # sends pixel SUBSETS through this method, whose shards are
+            # (subset_pixels, local_slices), so a check demanding the full
+            # rows * cols would refuse a legitimate call.  The whole-volume
+            # contract is checked where it actually holds -- on the prox input
+            # in :meth:`vcd_recon`, and on the two recon shapes in
+            # :meth:`configure_devices`.
+            if recon.placement != self.recon_placement:
+                raise ValueError(
+                    'Recon shards belong to a different device '
+                    'configuration: the shards are placed as '
+                    f'{recon.placement}, and this model uses '
+                    f'{self.recon_placement}; re-place the array.')
             return recon
         if self.recon_placement.is_trivial:
             recon = torch.as_tensor(recon, dtype=torch.float32,
@@ -1562,6 +1662,56 @@ class TomographyModel(ParameterHandler):
             flat = self._shard_recon(
                 recon.reshape((-1, recon.shape[-1]))).contiguous()
         return flat
+
+    def _flatten_prox_shards(self, prox_input, recon_shape):
+        """A prox input that is ALREADY in the device form, brought into the
+        VCD loop's flat (num_pixels, local_slices) layout.
+
+        This is the return leg of a Plug-and-Play loop: ``denoise(...,
+        output_sharded=True)`` hands back one 3-D tensor per device, and this
+        turns them into the loop's flat shards with no trip through host
+        memory.  Each SHARD is reshaped rather than the container, which has
+        no shape of its own, and the pixel count is named rather than inferred
+        because a shard that owns no slices has no elements to infer it from.
+
+        The whole-volume contract is checked here, where it holds: the shards
+        together have to cover the full pixel grid and the full slice axis.
+        (``_shard_recon`` cannot check that, because pixel SUBSETS route
+        through it as well.)  Both per-shard forms are accepted: the 3-D
+        ``(rows, cols, local_slices)`` one a denoise returns, and the
+        already-flat ``(num_pixels, local_slices)`` one.  A shard that owns no
+        slices is legal and contributes zero to the slice total.
+        """
+        rows, cols, num_slices = (int(recon_shape[0]), int(recon_shape[1]),
+                                  int(recon_shape[2]))
+        num_pixels = rows * cols
+        tensors = prox_input.tensors
+        covers_grid = True
+        total_slices = 0
+        for t in tensors:
+            if t.ndim == 3:
+                pixels = int(t.shape[0]) * int(t.shape[1])
+            elif t.ndim == 2:
+                pixels = int(t.shape[0])
+            else:
+                covers_grid = False
+                break
+            total_slices += int(t.shape[-1])
+            covers_grid = covers_grid and pixels == num_pixels
+        if not covers_grid or total_slices != num_slices:
+            raise ValueError(
+                'prox_input does not have the correct size. \n'
+                f'Expected shards covering {tuple(recon_shape)}: each shard '
+                f'({rows}, {cols}, local_slices) or ({num_pixels}, '
+                'local_slices), with the local slice counts summing to '
+                f'{num_slices}.  Got shapes '
+                f'{[tuple(t.shape) for t in tensors]} for prox_input.')
+        # Re-placed through _shard_recon so the placement check runs: shards
+        # from a model on a different device layout are refused here rather
+        # than surfacing later as a cross-device error.
+        return self._shard_recon(_sharding.Shards(
+            [t.reshape(num_pixels, t.shape[-1]) for t in tensors],
+            prox_input.placement))
 
     def _flatten_hessian(self, fm_hessian):
         """The Hessian diagonal in the VCD loop's flat layout, for either
@@ -2381,7 +2531,9 @@ class TomographyModel(ParameterHandler):
                 same shape as the sinogram.  Defaults to all 1s.
             init_recon (array or int or None): initial reconstruction.  None
                 uses direct_recon; an int gives a constant volume.
-            prox_input (array, optional): input to a proximal map.
+            prox_input (array or Shards, optional): input to a proximal map,
+                as a full volume or in the device form (one shard per device,
+                on this model's recon placement).
             compute_prior_loss (bool, optional): If True, also compute the
                 prior loss (a debug path for small recons).
             first_iteration (int, optional): iteration offset for restarts.
@@ -2483,17 +2635,24 @@ class TomographyModel(ParameterHandler):
         error_sinogram = self._shard_sinogram(error_sinogram)
 
         if prox_input is not None:
-            # Validate the prox input's shape before flattening: a
-            # size-compatible but mis-shaped input (e.g. a transposed volume)
-            # must fail loudly rather than silently reshape.
-            if tuple(prox_input.shape) != tuple(recon_shape):
-                raise ValueError('prox_input does not have the correct size. \n'
-                                 f'Expected {tuple(recon_shape)}, got shape '
-                                 f'{tuple(prox_input.shape)} for prox_input shape.')
-            # Flatten first, then place: the flat form is the slice-sharded
-            # device form.
-            prox_input = self._shard_recon(
-                prox_input.reshape((-1, prox_input.shape[-1])))
+            if isinstance(prox_input, _sharding.Shards):
+                # Already in the device form -- what a Plug-and-Play loop gets
+                # back from denoise(output_sharded=True).  The container has
+                # no shape of its own, so the per-shard tensors are flattened
+                # and checked instead.
+                prox_input = self._flatten_prox_shards(prox_input, recon_shape)
+            else:
+                # Validate the prox input's shape before flattening: a
+                # size-compatible but mis-shaped input (e.g. a transposed volume)
+                # must fail loudly rather than silently reshape.
+                if tuple(prox_input.shape) != tuple(recon_shape):
+                    raise ValueError('prox_input does not have the correct size. \n'
+                                     f'Expected {tuple(recon_shape)}, got shape '
+                                     f'{tuple(prox_input.shape)} for prox_input shape.')
+                # Flatten first, then place: the flat form is the slice-sharded
+                # device form.
+                prox_input = self._shard_recon(
+                    prox_input.reshape((-1, prox_input.shape[-1])))
 
         verbose, sigma_y = self.get_params(['verbose', 'sigma_y'])
 
@@ -2857,8 +3016,11 @@ class TomographyModel(ParameterHandler):
         reproducible result.
 
         Args:
-            prox_input (numpy or tensor): proximal map input with the same shape
-                as the reconstruction.
+            prox_input (numpy or tensor or Shards): proximal map input with the
+                same shape as the reconstruction.  The device form is accepted
+                too, so a Plug-and-Play loop can feed back what a denoiser
+                returned with ``output_sharded=True``, provided the two models
+                share a device layout (see :meth:`configure_devices`).
             sinogram (numpy or tensor): 3D sinogram data with shape
                 (num_views, num_det_rows, num_det_channels).
             sigma_prox (None or float, optional): standard deviation of the

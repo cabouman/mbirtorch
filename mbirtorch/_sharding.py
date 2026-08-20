@@ -52,6 +52,10 @@ class Placement:
     blocks.  The axis is never padded: the device form is a list of
     per-device tensors, so blocks of unequal length are allowed.
 
+    Placements compare by VALUE, not by identity: see :meth:`__eq__` for what
+    that does and does not certify about two arrays held under equal
+    placements.
+
     Args:
         devices (sequence of torch.device or str): the devices this array
             type lives on.  A single device is the trivial (1-shard)
@@ -71,6 +75,55 @@ class Placement:
             raise ValueError("Placement requires at least one device.")
         self.axis = axis
         self.axis_len = int(axis_len) if axis_len is not None else None
+
+    def __eq__(self, other):
+        """Two placements are equal when they name the same devices and split
+        the same axis of the same length.
+
+        Those three fields are all a placement has, and the block boundaries
+        follow from them alone, so equal placements cut the axis into the same
+        blocks on the same devices.  Shard tensors held under equal placements
+        are therefore interchangeable between the two owners: this is what lets
+        one model hand its sharded array to another model configured the same
+        way.
+
+        What equality does NOT certify is the array's UNSHARDED extents.  A
+        placement carries no record of them -- a recon placement says how the
+        slice axis is divided and nothing about the rows and columns -- so two
+        arrays under equal placements can still disagree on their other axes.
+        The whole-volume shape check is the one
+        :meth:`~mbirtorch.TomographyModel.configure_devices` performs when it
+        is given ``like=``, and that is where a model built at the wrong shape
+        is caught.
+
+        One property worth knowing: ``torch.device('cuda')`` and
+        ``torch.device('cuda:0')`` do not compare equal, so a model left on an
+        unindexed device and a model on an indexed one have unequal placements
+        even when they run on the same hardware.  That is the conservative
+        direction -- refuse rather than wrongly accept -- and a caller who
+        builds one layout from another with ``like=`` copies the device list
+        verbatim, so the two always match exactly.
+        """
+        if not isinstance(other, Placement):
+            return NotImplemented
+        return (self.devices == other.devices
+                and self.axis == other.axis
+                and self.axis_len == other.axis_len)
+
+    def __hash__(self):
+        """Hash over the same three fields :meth:`__eq__` compares.
+
+        Placements are treated as immutable once constructed: nothing rebuilds
+        one in place, and a layout change builds a new one.  Nothing in the
+        library uses a placement as a dict key or a set member today, but
+        defining ``__eq__`` alone would silently make every instance
+        unhashable, so both are defined together.
+        """
+        return hash((tuple(self.devices), self.axis, self.axis_len))
+
+    def __repr__(self):
+        return 'Placement({}, axis={}, axis_len={})'.format(
+            ','.join(str(d) for d in self.devices), self.axis, self.axis_len)
 
     @property
     def n_devices(self):

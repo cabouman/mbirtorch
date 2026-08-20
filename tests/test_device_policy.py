@@ -15,7 +15,7 @@ import pytest
 import torch
 
 import mbirtorch
-from mbirtorch import _memory_ledger, _widening_floors
+from mbirtorch import _memory_ledger, _sharding, _widening_floors
 from mbirtorch._memory_ledger import MemoryPreflightError
 
 GB = 2 ** 30
@@ -1751,3 +1751,273 @@ def test_the_denoiser_sentinel_floors_hold_an_automatic_denoiser_at_one_device(
     assert denoiser.recon_placement.n_devices == 1
     reasons = dict(denoiser.device_choice_rejections)
     assert 'sentinel' in reasons[4] and 'sentinel' in reasons[2]
+
+
+# ── two models sharing one device layout ─────────────────────────────────────
+# A Plug-and-Play or ADMM loop alternates prox_map on a reconstruction model
+# with denoise on a QGGMRFDenoiser over the same volume.  Both accept and
+# return the device form, so the volume can stay on the devices for the whole
+# loop -- but only if the two models place recon-like arrays the same way.
+# configure_devices(like=...) is how they are made to agree, and the tests
+# below drive the handoff on two virtual CPU devices, in both directions.
+PAIR_CELL = (12, 8, 20)      # recon shape (20, 20, 8): 8 slices, split 4 + 4
+
+
+def paired_ct_and_denoiser(sino_shape=PAIR_CELL, devices=('cpu', 'cpu')):
+    """A parallel-beam model and a denoiser built at its recon shape, placed
+    on the same (virtual) devices -- the two-line idiom the configure_devices
+    docstring gives."""
+    angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
+    ct_model = mbirtorch.ParallelBeamModel(sino_shape, angles)
+    ct_model.configure_devices(devices=list(devices))
+    ct_model.set_params(no_warning=True, verbose=0)
+
+    denoiser = mbirtorch.QGGMRFDenoiser(ct_model.get_params('recon_shape'))
+    denoiser.configure_devices(like=ct_model)
+    denoiser.set_params(no_warning=True, verbose=0)
+    return ct_model, denoiser
+
+
+def pair_phantom(ct_model):
+    """A small block phantom in the model's recon shape."""
+    recon_shape = tuple(ct_model.get_params('recon_shape'))
+    phantom = np.zeros(recon_shape, dtype=np.float32)
+    r0, c0, s0 = [max(1, n // 4) for n in recon_shape]
+    phantom[r0:-r0, c0:-c0, s0:-s0] = 1.0
+    return phantom
+
+
+def test_a_denoiser_placed_like_a_ct_model_takes_its_sharded_volume():
+    """The handoff the whole seam exists for, on two virtual CPU devices.
+
+    The two models are configured separately, so their recon placements are
+    distinct OBJECTS naming the same devices, axis and slice count.  Equality
+    rather than identity is what lets the denoiser accept a volume the
+    reconstruction model placed, with no gather to the host in between.
+    """
+    ct_model, denoiser = paired_ct_and_denoiser()
+    assert denoiser.recon_placement == ct_model.recon_placement
+    assert denoiser.recon_placement is not ct_model.recon_placement
+
+    recon_shape = tuple(ct_model.get_params('recon_shape'))
+    volume = np.random.RandomState(2).rand(*recon_shape).astype(np.float32)
+    placed = ct_model._shard_recon(volume)
+    assert isinstance(placed, _sharding.Shards)
+
+    denoised, _ = denoiser.denoise(placed, sigma_noise=0.1, max_iterations=1,
+                                   stop_threshold_change_pct=0.0,
+                                   logfile_path=None, print_logs=False,
+                                   output_sharded=True)
+    assert isinstance(denoised, _sharding.Shards)
+    assert denoised.placement == ct_model.recon_placement
+    assert ([tuple(t.shape) for t in denoised.tensors]
+            == [tuple(t.shape) for t in placed.tensors])
+    assert np.isfinite(denoised.gather()).all()
+
+
+def test_a_sharded_denoiser_output_goes_back_into_prox_map():
+    """The return leg: what denoise hands back in the device form is a valid
+    prox_input for the reconstruction model, so a loop closes without either
+    half of it touching host memory."""
+    ct_model, denoiser = paired_ct_and_denoiser()
+    phantom = pair_phantom(ct_model)
+    sinogram = ct_model.forward_project(phantom)
+
+    denoised, _ = denoiser.denoise(ct_model._shard_recon(phantom),
+                                   sigma_noise=0.1, max_iterations=1,
+                                   stop_threshold_change_pct=0.0,
+                                   logfile_path=None, print_logs=False,
+                                   output_sharded=True)
+    np.random.seed(0)
+    recon, _ = ct_model.prox_map(denoised, sinogram, sigma_prox=0.5,
+                                 init_recon=phantom, max_iterations=1,
+                                 stop_threshold_change_pct=0.0,
+                                 logfile_path=None, print_logs=False,
+                                 output_sharded=True)
+    assert isinstance(recon, _sharding.Shards)
+    assert recon.placement == ct_model.recon_placement
+    # The reconstruction comes back as a volume, one 3-D block per device,
+    # split on the slice axis exactly as the input was.
+    assert ([tuple(t.shape) for t in recon.tensors]
+            == [tuple(t.shape) for t in denoised.tensors])
+    assert np.isfinite(recon.gather()).all()
+
+
+def test_a_flat_sharded_prox_input_is_accepted_too():
+    """A prox input already in the loop's flat (num_pixels, local_slices)
+    form is accepted alongside the 3-D form denoise returns, so a caller who
+    kept the flat shards does not have to reshape them back first."""
+    ct_model, _ = paired_ct_and_denoiser()
+    phantom = pair_phantom(ct_model)
+    sinogram = ct_model.forward_project(phantom)
+    recon_shape = tuple(ct_model.get_params('recon_shape'))
+
+    volume = ct_model._shard_recon(0.5 * phantom)
+    flat = _sharding.Shards(
+        [t.reshape(recon_shape[0] * recon_shape[1], t.shape[-1])
+         for t in volume.tensors], volume.placement)
+    np.random.seed(0)
+    recon, _ = ct_model.prox_map(flat, sinogram, sigma_prox=0.5,
+                                 init_recon=phantom, max_iterations=1,
+                                 stop_threshold_change_pct=0.0,
+                                 logfile_path=None, print_logs=False,
+                                 output_sharded=True)
+    assert isinstance(recon, _sharding.Shards)
+    assert np.isfinite(recon.gather()).all()
+
+
+def test_like_copies_the_device_list_and_pins_the_layout():
+    """like= takes the other model's devices verbatim, and it is an explicit
+    configuration like any other: the automatic choice is off afterwards."""
+    ct_model, denoiser = paired_ct_and_denoiser(devices=('cpu', 'cpu'))
+    assert ([str(d) for d in denoiser.recon_placement.devices]
+            == [str(d) for d in ct_model.recon_placement.devices])
+    assert denoiser.device_layout_is_automatic is False
+    # The denoiser's own arrays are divided the same way, 8 slices as 4 + 4.
+    assert [e - s for _d, (s, e) in denoiser.recon_placement.shard_ranges()] \
+        == [e - s for _d, (s, e) in ct_model.recon_placement.shard_ranges()]
+
+
+def test_like_refuses_a_denoiser_built_at_the_wrong_shape():
+    """The realistic mistake: a denoiser built at the CT model's SINOGRAM
+    shape instead of its recon shape.
+
+    A volume from one model would then not fit the other, so the pairing is
+    refused when it is configured -- with both shapes named -- rather than at
+    some later array that fails to line up.  The check is on the whole recon
+    shape, not the slice count alone: a mismatch in the rows or the columns
+    divides into the same blocks and would pass a slice-count check, then
+    fail deep inside a reconstruction as an unreadable tensor error.
+    """
+    sino_shape = PAIR_CELL          # recon shape (20, 20, 8): 8 slices, not 20
+    angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
+    ct_model = mbirtorch.ParallelBeamModel(sino_shape, angles)
+    ct_model.configure_devices(devices=['cpu', 'cpu'])
+    wrong = mbirtorch.QGGMRFDenoiser(sino_shape)
+
+    with pytest.raises(ValueError, match='recon shape') as excinfo:
+        wrong.configure_devices(like=ct_model)
+    message = str(excinfo.value)
+    assert 'QGGMRFDenoiser' in message and 'ParallelBeamModel' in message
+    assert str(tuple(sino_shape)) in message
+    assert str(tuple(ct_model.get_params('recon_shape'))) in message
+    # And it names the way to share devices WITHOUT sharing arrays.
+    assert 'devices=' in message
+
+
+def test_like_and_devices_together_are_refused():
+    """The two arguments express different intents, so giving both is a
+    question about which one was meant rather than a precedence rule."""
+    ct_model, denoiser = paired_ct_and_denoiser()
+    with pytest.raises(ValueError, match='not both'):
+        denoiser.configure_devices(like=ct_model, devices=['cpu'])
+    # The layout the refused call would have changed is left alone.
+    assert denoiser.recon_placement == ct_model.recon_placement
+
+
+def test_like_needs_a_model_to_copy_from():
+    """An object that is not a placed model is reported as that, rather than
+    as an attribute error from inside the configuration."""
+    _ct_model, denoiser = paired_ct_and_denoiser()
+    with pytest.raises(ValueError, match='no device placement to copy'):
+        denoiser.configure_devices(like=object())
+
+
+def test_a_sharded_prox_input_that_misses_the_volume_is_refused_clearly():
+    """A sharded prox input has to cover the whole volume: the shards' leading
+    dimensions have to span the pixel grid and their slice counts have to add
+    up to the volume's.
+
+    The container carries no shape of its own, so without this check a
+    mis-shaped set of shards would surface as a torch reshape failure deep in
+    the loop.  The message names what was expected and what arrived, in the
+    same voice as the one a mis-shaped host array gets.
+    """
+    ct_model, _ = paired_ct_and_denoiser()
+    phantom = pair_phantom(ct_model)
+    sinogram = ct_model.forward_project(phantom)
+    placement = ct_model.recon_placement
+    blocks = [e - s for _d, (s, e) in placement.shard_ranges()]
+
+    def run(shard_shapes):
+        shards = _sharding.Shards(
+            [torch.zeros(shape, dtype=torch.float32) for shape in shard_shapes],
+            placement)
+        np.random.seed(0)
+        return ct_model.prox_map(shards, sinogram, sigma_prox=0.5,
+                                 init_recon=phantom, max_iterations=1,
+                                 stop_threshold_change_pct=0.0,
+                                 logfile_path=None, print_logs=False,
+                                 output_sharded=True)
+
+    # Right slice split, wrong pixel grid.
+    with pytest.raises(ValueError,
+                       match='prox_input does not have the correct size'):
+        run([(3, n) for n in blocks])
+    # Right pixel grid, slice counts that do not add up to the volume's.
+    recon_shape = tuple(ct_model.get_params('recon_shape'))
+    with pytest.raises(ValueError,
+                       match='prox_input does not have the correct size'):
+        run([(recon_shape[0], recon_shape[1], n - 1) for n in blocks])
+
+
+def test_a_shard_that_owns_no_slices_is_a_legal_prox_input():
+    """More devices than slices leaves a trailing device with an empty block,
+    which is a layout the library allows as long as that device still owns
+    views.  Such a shard has no elements, so it must pass the prox input's
+    whole-volume check rather than be read as a shard that covers nothing."""
+    sino_shape = (12, 2, 20)        # recon shape (20, 20, 2): 2 slices
+    angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
+    ct_model = mbirtorch.ParallelBeamModel(sino_shape, angles)
+    ct_model.configure_devices(devices=['cpu', 'cpu', 'cpu'])
+    ct_model.set_params(no_warning=True, verbose=0)
+
+    recon_shape = tuple(ct_model.get_params('recon_shape'))
+    blocks = [e - s for _d, (s, e)
+              in ct_model.recon_placement.shard_ranges()]
+    assert blocks == [1, 1, 0]
+
+    shards = _sharding.Shards(
+        [torch.zeros((recon_shape[0], recon_shape[1], n), dtype=torch.float32)
+         for n in blocks], ct_model.recon_placement)
+    flat = ct_model._flatten_prox_shards(shards, recon_shape)
+    assert isinstance(flat, _sharding.Shards)
+    assert ([tuple(t.shape) for t in flat.tensors]
+            == [(recon_shape[0] * recon_shape[1], n) for n in blocks])
+
+
+def test_shards_from_a_differently_placed_model_are_still_refused():
+    """Value equality widens what is accepted; it does not remove the check.
+    A volume from a model on a different device layout is refused, and the
+    message shows both placements so the mismatch is readable."""
+    ct_model, _ = paired_ct_and_denoiser()
+    placed = ct_model._shard_recon(pair_phantom(ct_model))
+
+    other = mbirtorch.QGGMRFDenoiser(ct_model.get_params('recon_shape'))
+    other.configure_devices(devices=['cpu'])
+    with pytest.raises(ValueError, match='different device configuration') as e:
+        other._shard_recon(placed)
+    message = str(e.value)
+    assert repr(ct_model.recon_placement) in message
+    assert repr(other.recon_placement) in message
+
+
+def test_like_refuses_a_transverse_shape_mismatch():
+    """Two models whose recon shapes agree on the slice count but differ in
+    the rows and columns are refused as well.
+
+    Their placements would be equal -- the slice axis divides identically --
+    so nothing downstream would notice until a volume from one was reshaped
+    for the other.  The check is on the whole recon shape for that reason.
+    """
+    angles = np.linspace(0, np.pi, PAIR_CELL[0], endpoint=False)
+    ct_model = mbirtorch.ParallelBeamModel(PAIR_CELL, angles)
+    ct_model.configure_devices(devices=['cpu', 'cpu'])
+    recon_shape = tuple(ct_model.get_params('recon_shape'))
+    wider = (recon_shape[0] + 4, recon_shape[1] + 4, recon_shape[2])
+    denoiser = mbirtorch.QGGMRFDenoiser(wider)
+
+    with pytest.raises(ValueError, match='recon shape') as excinfo:
+        denoiser.configure_devices(like=ct_model)
+    message = str(excinfo.value)
+    assert str(wider) in message and str(recon_shape) in message
