@@ -39,16 +39,14 @@ when the sorted forward kernel moved parallel's crossover).
 call it -- records a count with no admission SIZE at or below the largest
 size tested.  It is not a permanent refusal: it excludes that count
 everywhere until a refresh finds an admission size, and it carries
-``largest_tested`` so the refresh knows where to start.  Six rows are in
-that state today.  In five of them -- both denoiser rows, both translation
-rows, and multiaxis n=4 -- splitting lost at every size probed.  The sixth,
-multiaxis n=2, WON at one probed size and lost above it: two devices win
-only in a window of problem sizes, a floor cannot express a window, and a
-floor placed at the window's start would widen the larger sizes into a
-measured slowdown.  That row therefore holds the family to one device until
-the mechanism is understood (multigpu_findings.md sections 1.22 and 1.25);
-its note carries the readings.  In every sentinel case the automatic path
-holds those models to fewer devices and only capacity widens them.
+``largest_tested`` so the refresh knows where to start.  Two rows are in
+that state today, both the denoiser's: splitting lost at every size
+probed.  Four more rows were sentinels until 2026-08-20 -- both multiaxis
+and both translation rows -- held down by a torch recompile mechanism the
+projection remedy removed; their notes and multigpu_findings.md sections
+1.36 through 1.38 carry that history.  In every sentinel case the
+automatic path holds those models to fewer devices and only capacity
+widens them.
 A count with no row inherits the row of the next MEASURED count
 above it (n=3 is governed by the n=4 floor, as is any count above 4), and a
 model declaring no ``_floor_family`` gets the parallel floors, with the
@@ -154,150 +152,147 @@ FLOORS = {
     ('parallel', 2): Floor(
         family='parallel', count=2, elements=297_271_296,
         cell=(768, 672, 576), against=1,
-        bracket=Bracket(losing_cell=(512, 448, 384), losing_speedup=0.97,
-                        winning_cell=(768, 672, 576), winning_speedup=1.38),
-        spread=0.01483, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
-        measured='2026-08-19', commit='c761b24',
-        largest_tested=297_271_296,
-        note='the first scoped refresh (mg40, job 15369689), on the '
-             'channel-sorted forward kernel: THE FLOOR MOVED UP one '
-             'class.  The sorted kernel made the one-device forward fast '
-             'enough that the 512-class win disappeared (1.20x on the '
-             'per-tap kernel, 0.97x sorted), and the 768-class wins at '
-             '1.38x.  Cone n=2 keeps its 512-class floor, so the n=2 '
-             'rows no longer share; the pair still shares the n=4 row'),
+        bracket=Bracket(losing_cell=(512, 448, 384), losing_speedup=1.02,
+                        winning_cell=(768, 672, 576), winning_speedup=1.36),
+        spread=0.01263, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-20', commit='c012379',
+        largest_tested=1_023_934_464,
+        note='the full refresh on the recompile-remedied tree (mg48, job '
+             '15399595): 1.02x at the 512-class, 1.36x at the 768-class, '
+             '1.48x at the 1024-class; the floor holds at the 768-class, '
+             'where mg40 moved it on the channel-sorted kernel.  Cone n=2 '
+             'keeps its 512-class floor, so the n=2 rows still split; the '
+             'pair still shares the n=4 row'),
     ('parallel', 4): Floor(
         family='parallel', count=4, elements=1_023_934_464,
         cell=(1024, 1008, 992), against=2,
-        bracket=Bracket(losing_cell=(768, 672, 576), losing_speedup=0.80,
-                        winning_cell=(1024, 1008, 992), winning_speedup=1.32),
-        spread=0.01307, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
-        measured='2026-08-19', commit='c761b24',
+        bracket=Bracket(losing_cell=(768, 672, 576), losing_speedup=0.83,
+                        winning_cell=(1024, 1008, 992), winning_speedup=1.34),
+        spread=0.01263, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-20', commit='c012379',
         largest_tested=1_023_934_464,
-        note='the first scoped refresh (mg40, job 15369689), on the '
-             'channel-sorted forward kernel: the coarse floor holds at '
-             'the 1024-class, now by measurement rather than by '
-             'rounding.  mg26 read a thin 1.06x win at the 768-class and '
-             'the margin rule rounded it up; on the sorted kernel that '
-             'cell LOSES outright at 0.80x, so the rounding anticipated '
-             'exactly this kernel change.  The 1024-class wins at 1.32x.  '
-             'Shared row with cone n=4'),
+        note='mg48 (job 15399595): 0.83x at the 768-class and 1.34x at the '
+             '1024-class against two devices; the floor holds at the '
+             '1024-class.  Shared row with cone n=4'),
     ('cone', 2): Floor(
         family='cone', count=2, elements=88_080_384, cell=(512, 448, 384),
         against=1,
         bracket=Bracket(losing_cell=(384, 336, 288), losing_speedup=0.87,
-                        winning_cell=(512, 448, 384), winning_speedup=1.34),
-        spread=0.03913, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
-        measured='2026-08-18', commit='64dedb8',
+                        winning_cell=(512, 448, 384), winning_speedup=1.30),
+        spread=0.007311, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-20', commit='c012379',
         largest_tested=297_271_296,
-        note='mg26 (job 15342578), read under the coarse rule: 0.87x at '
-             'the 384-class, 1.34x at the 512-class, so the 512-class win '
-             'clears the 1.15x margin and the floor sits there.  The '
-             'parallel n=2 floor moved above this one on the sorted '
-             'forward kernel (mg40), so this row is cone\'s own; the '
-             'pair still shares the n=4 row'),
+        note='mg48 (job 15399595), the full refresh on the '
+             'recompile-remedied tree: 0.87x at the 384-class, 1.30x at '
+             'the 512-class, 1.61x at the 768-class; the floor holds at '
+             'the 512-class.  The remedy raised the compiled closures\' '
+             'recompile budget and moved nothing here, which is what this '
+             'reproduction verifies'),
     ('cone', 4): Floor(
         family='cone', count=4, elements=1_023_934_464,
         cell=(1024, 1008, 992), against=2,
-        bracket=Bracket(losing_cell=(768, 672, 576), losing_speedup=1.14,
+        bracket=Bracket(losing_cell=(768, 672, 576), losing_speedup=1.12,
                         winning_cell=(1024, 1008, 992), winning_speedup=1.60),
-        spread=0.007508, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
-        measured='2026-08-18', commit='64dedb8',
+        spread=0.01469, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-20', commit='c012379',
         largest_tested=1_023_934_464,
-        note='mg26 (job 15342578), read under the coarse rule: 1.145x at '
-             'the 768-class, 1.60x at the 1024-class.  The 768-class win '
-             'misses the 1.15x margin by 0.005, and the ruling rounds it '
-             'up rather than bending the margin to fit -- a margin chosen '
-             'after seeing the numbers is not a rule.  Shared row with '
-             'parallel n=4'),
+        note='mg48 (job 15399595): 1.12x at the 768-class, 1.60x at the '
+             '1024-class.  The 768-class win clears the spread but misses '
+             'the 1.15x margin, as it has at every measurement since the '
+             'width padding landed, and the coarse rule rounds the floor '
+             'up to the 1024-class.  Shared row with parallel n=4'),
     ('multiaxis', 2): Floor(
-        family='multiaxis', count=2, elements=None, cell=None,
-        against=1,
-        bracket=Bracket(losing_cell=(1024, 1008, 992), losing_speedup=0.80,
-                        winning_cell=None, winning_speedup=None),
-        spread=0.001937, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
-        measured='2026-08-18', commit='64dedb8',
+        family='multiaxis', count=2, elements=88_080_384,
+        cell=(512, 448, 384), against=1,
+        bracket=Bracket(losing_cell=None, losing_speedup=None,
+                        winning_cell=(512, 448, 384), winning_speedup=1.52),
+        spread=0.006272, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-20', commit='c012379',
         largest_tested=1_023_934_464,
-        note='a sentinel BY RULING (2026-08-19), not by losing everywhere: '
-             'mg26 (job 15342578) read 0.35x at the 512-class, a 1.46x WIN '
-             'at the 768-class, and a 0.80x LOSS at the 1024-class.  Two '
-             'devices win only in a window of sizes, a floor cannot '
-             'express a window, and the old 768-class floor widened '
-             'automatic 1024-class reconstructions into the measured 20 '
-             'percent slowdown.  Held to one device until the mechanism '
-             'is understood (multigpu_findings.md sections 1.22 and '
-             '1.25); the cost of holding is the forgone 1.46x at the '
-             '768-class'),
+        note='the sentinel CLEARED on the recompile-remedied tree (mg48, '
+             'job 15399595): two devices win at every probed cell, 1.53x '
+             'at the 512-class, 1.46x at the 768-class, 1.52x at the '
+             '1024-class.  The old window (0.35x / 1.46x / 0.80x) was the '
+             'back projection running uncompiled once torch\'s shared '
+             'per-function recompile budget filled; the remedy raises the '
+             'budget on the compiling thread (projectors.py; '
+             'multigpu_findings.md sections 1.36 to 1.38).  The 384-class '
+             'was not probed -- sentinel probes are the ladder\'s top '
+             'three cells -- and the pre-anomaly record read a 1.25x win '
+             'there (mg22), so a ladder extension could lower this floor'),
     ('multiaxis', 4): Floor(
-        family='multiaxis', count=4, elements=None, cell=None,
-        against=2,
-        bracket=Bracket(losing_cell=(1024, 1008, 992), losing_speedup=0.40,
-                        winning_cell=None, winning_speedup=None),
-        spread=0.02673, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
-        measured='2026-08-18', commit='64dedb8',
+        family='multiaxis', count=4, elements=88_080_384,
+        cell=(512, 448, 384), against=1,
+        bracket=Bracket(losing_cell=None, losing_speedup=None,
+                        winning_cell=(512, 448, 384), winning_speedup=2.03),
+        spread=0.006272, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-20', commit='c012379',
         largest_tested=1_023_934_464,
-        note='a sentinel again at the full protocol (mg26): four devices '
-             'lose at every probe against two, 0.87x at the 512-class, '
-             '0.23x at the 768-class, and 0.40x at the 1024-class.  The '
-             '0.23x reading shares the shape of the n=2 anomaly recorded '
-             'in the n=2 row'),
+        note='cleared with the n=2 row (mg48, job 15399595): 2.03x, 2.19x, '
+             '2.17x against ONE device across the 512- through 1024-class, '
+             'measured against n=1 because the n=2 row was a sentinel when '
+             'the plan was drawn.  Relative to the new n=2 row, four '
+             'devices still win everywhere (1.33x to 1.50x).  The old '
+             '0.23x to 0.87x readings were the recompile mechanism at four '
+             'pool threads'),
     ('denoiser', 2): Floor(
         family='denoiser', count=2, elements=None, cell=None,
         against=1,
         bracket=Bracket(losing_cell=(1024, 1008, 992), losing_speedup=0.67,
                         winning_cell=None, winning_speedup=None),
-        spread=0.01694, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
-        measured='2026-08-18', commit='64dedb8',
+        spread=0.02768, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-20', commit='c012379',
         largest_tested=1_023_934_464,
-        note='still a sentinel on the padded tree (mg26): sharded '
-             'denoising lost at every probe cell, 0.56x at the 512-class '
-             'to 0.67x at the 1024-class.  Read in IMAGE VOXELS: the '
-             'denoiser sinogram shape is its image shape.  The timed '
-             'call is denoise with sigma_noise supplied, at the shared '
-             'warm-median protocol.  The ratio rises with size, so a '
-             'larger ladder may yet find admission; capacity still '
-             'widens a denoise that cannot fit one device'),
+        note='still a sentinel on the remedied tree (mg48): 0.59x at the '
+             '512-class to 0.67x at the 1024-class.  Read in IMAGE '
+             'VOXELS: the denoiser sinogram shape is its image shape.  '
+             'The timed call is denoise with sigma_noise supplied, at the '
+             'shared warm-median protocol.  The one family with no '
+             'projectors, so the remedy changed nothing here; capacity '
+             'still widens a denoise that cannot fit one device'),
     ('denoiser', 4): Floor(
         family='denoiser', count=4, elements=None, cell=None,
         against=1,
         bracket=Bracket(losing_cell=(1024, 1008, 992), losing_speedup=0.61,
                         winning_cell=None, winning_speedup=None),
-        spread=0.06266, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
-        measured='2026-08-18', commit='64dedb8',
+        spread=0.05412, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-20', commit='c012379',
         largest_tested=1_023_934_464,
-        note='a sentinel like n=2, losing 0.45x to 0.61x across the '
+        note='a sentinel like n=2, losing 0.46x to 0.61x across the '
              'probes, measured against n=1 because no smaller denoiser '
              'count is admitted.  Read in image voxels; the n=2 note '
-             'records the protocol'),
+             'records the protocol.  The ratio rises with size, so a '
+             'larger ladder may yet find admission'),
     ('translation', 2): Floor(
-        family='translation', count=2, elements=None, cell=None,
-        against=1,
-        bracket=Bracket(losing_cell=(256, 1900, 3000), losing_speedup=0.89,
-                        winning_cell=None, winning_speedup=None),
-        spread=0.06554, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
-        measured='2026-08-18', commit='64dedb8',
+        family='translation', count=2, elements=364_800_000,
+        cell=(256, 950, 1500), against=1,
+        bracket=Bracket(losing_cell=(256, 475, 750), losing_speedup=0.66,
+                        winning_cell=(256, 950, 1500), winning_speedup=1.19),
+        spread=0.01036, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-20', commit='c012379',
         largest_tested=1_459_200_000,
-        note='a sentinel again (mg26): two devices lose at every probe, '
-             '0.64x to 0.89x, rising with size.  The probe cells are '
-             'production-anchored translation scans, a fixed 16x16 '
-             'translation grid with the detector and the spacing scaled '
-             'together, ending at the production cell (256, 1900, 3000); '
-             'they are NOT the shared ladder, and the floor reads in '
-             'sinogram elements as usual.  The rising trend says '
-             'admission may sit just above the largest size tested'),
+        note='the sentinel CLEARED on the recompile-remedied tree (mg48, '
+             'job 15399595): 0.66x, 1.19x, 1.26x across the '
+             'production-anchored cells, so the floor is the middle cell '
+             '(256, 950, 1500).  The probe cells are NOT the shared '
+             'ladder: production-anchored translation scans on a fixed '
+             '16x16 grid with the detector and the spacing scaled '
+             'together; the floor reads in sinogram elements as usual.  '
+             'The old losses were the same recompile mechanism as '
+             'multiaxis (multigpu_findings.md section 1.36)'),
     ('translation', 4): Floor(
-        family='translation', count=4, elements=None, cell=None,
-        against=1,
-        bracket=Bracket(losing_cell=(256, 1900, 3000), losing_speedup=0.65,
-                        winning_cell=None, winning_speedup=None),
-        spread=0.01699, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
-        measured='2026-08-18', commit='64dedb8',
+        family='translation', count=4, elements=1_459_200_000,
+        cell=(256, 1900, 3000), against=1,
+        bracket=Bracket(losing_cell=(256, 950, 1500), losing_speedup=0.94,
+                        winning_cell=(256, 1900, 3000), winning_speedup=1.43),
+        spread=0.009759, gpu=MEASURED_GPU, config=MEASURED_CONFIG,
+        measured='2026-08-20', commit='c012379',
         largest_tested=1_459_200_000,
-        note='a sentinel like n=2, losing 0.16x to 0.65x across the same '
-             'production-anchored cells, measured against n=1 because no '
-             'smaller translation count is admitted.  The production-cell '
-             'reading (0.65x against a 0.2 percent spread) is what holds '
-             'the row'),
+        note='cleared at the production cell (mg48, job 15399595): 0.38x, '
+             '0.94x, 1.43x against one device across the same '
+             'production-anchored cells, so the floor is (256, 1900, '
+             '3000).  Below it four devices still lose; the n=2 note '
+             'records the grid'),
 }
 
 # ── the cost inputs the floors were measured against, named per family ───────
@@ -344,13 +339,12 @@ COST_INPUT_METHODS = tuple(name.split('.', 1)[1] for name in _ALL_COST_INPUTS
 #: sha256 of each cost input as of the measurements above -- the recorded
 #: ("blessed") values the live check compares against.  Re-record them with
 #: ``python dev_scripts/refresh_widening_floors.py --bless``.  Recorded
-#: 2026-08-19 with the mg40 scoped refresh: ``triton_parallel.py`` is the
-#: channel-sorted kernel the fresh parallel rows price, and every other
-#: input is unchanged since the mg26 refresh, which is what let mg40 carry
-#: the other families' rows.  The names added when the inputs became
-#: per-family on 2026-08-19 (the geometry body files, ``_utils.py``, and
-#: the denoiser modules) are recorded at their 64dedb8 content, which none
-#: of them has moved from.
+#: 2026-08-20 with the mg48 full refresh on the recompile-remedied tree:
+#: ``projectors.py`` is the one input that moved (the remedy raises
+#: torch's per-function recompile budget on the compiling thread), it
+#: sits in the SHARED input set, and that is why the refresh was the full
+#: one -- every family re-measured rather than carried.  Every other
+#: input is unchanged since mg40 recorded it.
 BLESSED_COST_HASHES = {
     'TomographyModel._sparse_back_project_sharded':
         'f73fa28f32d2393fac3f06139d8ddeccc55260fceb28bbca7f102334839fb5a4',
@@ -371,7 +365,7 @@ BLESSED_COST_HASHES = {
     'parallel_beam.py':
         '065572c91201ce0b354aa9fd15d7aaef5f25bbea24d65b1b46ba8305c5943da1',
     'projectors.py':
-        '1cd3b1e39fd0d7f2c5d835545154c044c5e90d399604dd44c944f995551c85ce',
+        '05293d4ba18dc9fa56e50c3773909304fe8e635edd6256f19594d95066daec5f',
     'qggmrf.py':
         '64e35c114ed049764a3f2f3005fb6341235747270aa2ebe181fff60947bc8602',
     'translation_model.py':
@@ -396,7 +390,7 @@ STALE_SINCE = None
 #: green the test leaves this behind, and the test says so.  Recomputed and
 #: printed by ``refresh_widening_floors.py --bless``.
 TABLE_CHECKSUM = \
-    'a9abaf9cc2935b7ca7e6d7de0c722a5be36994f41efeacab096d31f2254434c6'
+    'ce529224f5554e05fe7ba154acad889f91bcb6ecf58cc58dff1953d76806d3fd'
 
 
 # ── the env knob ─────────────────────────────────────────────────────────────

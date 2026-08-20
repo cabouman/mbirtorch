@@ -1086,9 +1086,11 @@ def test_a_bare_direct_recon_settles_the_layout_and_spreads(
 def test_translation_takes_its_own_floors_into_its_direct_recon(
         monkeypatch, unpinned, caplog, make, method):
     """Translation declares its own measured family (2026-08-17, mg22), so
-    its rows govern the count its direct reconstruction settles on.  Both
-    family rows are sentinels -- splitting lost at every size probed -- so
-    the reconstruction holds at one device although four are free, and the
+    its rows govern the count its direct reconstruction settles on.  Since
+    the mg48 refresh (2026-08-20) both rows are finite floors -- n=2
+    admits at 364.8 million sinogram elements and n=4 at the production
+    cell -- and this test's sinogram sits far below both, so the
+    reconstruction holds at one device although four are free, and the
     log names the family's own floor rather than a borrowed one.
     """
     model = _automatic_on_cpu(make, verbose=2)
@@ -1098,7 +1100,7 @@ def test_translation_takes_its_own_floors_into_its_direct_recon(
         getattr(model, method)(_impulse_sinogram(model))
     assert model.sino_placement.n_devices == 1
     assert 'translation' in caplog.text
-    assert 'sentinel' in caplog.text
+    assert 'held by the speed floor' in caplog.text
     assert 'names no _floor_family' not in caplog.text
 
 
