@@ -7,6 +7,9 @@ projected width W_p_c, and the weight scale (in-plane voxel area over the
 footprint length).
 """
 
+import os
+import warnings
+
 import numpy as np
 import torch
 
@@ -375,6 +378,296 @@ class ParallelBeamModel(TomographyModel):
         return self.fbp_filter(sinogram, filter_name=filter_name,
                                output_sharded=output_sharded)
 
+    def recon_split_sino(self, sino, weights=None, half_overlap=5, init_recon=None, max_iterations=15,
+                         stop_threshold_change_pct=0.2, first_iteration=0, compute_prior_loss=False,
+                         logfile_path='~/.mbirtorch/logs/recon.log', print_logs=True,
+                         align_split_grid=False, slices_per_part=None):
+        """
+        This function reduces the memory needed for parallel beam MBIR reconstruction by splitting the
+        detector rows into overlapping parts, reconstructing one part at a time, and stitching the
+        reconstructions together.  Memory use drops by roughly the number of parts, since only one
+        part is resident at a time.
+
+        In parallel beam geometry detector row r is recon slice r, so a band of detector rows
+        reconstructs exactly the matching band of slices and the parts decouple exactly in the
+        forward model.  The overlap is there for the prior: it gives the voxels near a seam their
+        neighbors on the other side, so the seam is not treated as a volume boundary.
+
+        The arguments mirror TomographyModel.recon(), and the result is approximately equal to the
+        reconstruction recon() returns.  Two differences: ``output_sharded`` is not accepted, and
+        ``compute_prior_loss`` is accepted but unused.
+
+        Args:
+            sino (numpy or tensor): Full sinogram of shape (num_views, num_rows, num_cols).  A
+                sharded array is not accepted.
+            weights (numpy or tensor, optional): Optional sinogram weights with the same shape as
+                `sino`.  Not accepted in sharded form, like `sino`.
+            half_overlap (int): Number of detector rows, and therefore recon slices, kept past each
+                side of a seam by the part on that side.  Every interior seam is then computed twice
+                over ``2 * half_overlap`` slices, which is the span the stitch blends across.
+            init_recon (optional): Same as in the recon method.  Not accepted
+                in sharded form, like `sino`.
+            max_iterations (int, optional): Same as in the recon method.
+            stop_threshold_change_pct (float, optional): Same as in the recon method.
+            first_iteration (int, optional): Same as in the TomographyModel.recon() method.
+            compute_prior_loss (bool, optional): Accepted for interface compatibility; not
+                currently used by the mbirtorch recon.
+            logfile_path (str, optional): Same as in the TomographyModel.recon() method.  The parts'
+                logs are merged into this single file, each under a section header.
+            print_logs (bool, optional): Same as in the TomographyModel.recon() method.
+            align_split_grid (bool, optional): Accepted for interface compatibility and does
+                nothing here.  Rows and slices share one grid in parallel beam, so the sub-slice
+                misalignment between the sinogram cut and the recon split that this flag corrects
+                for cone beam cannot exist.
+            slices_per_part (int, optional): Number of slices each part keeps, which sets the number
+                of parts.  Must be at least ``2 * half_overlap``.  The default, None, chooses the
+                fewest parts whose reconstruction is modeled to fit the available device memory,
+                using the same memory model the reconstruction itself uses; a value of at least the
+                number of slices asks for a single part, which is a plain recon().
+
+        Returns:
+            Tuple[np.ndarray, dict]: the reconstructed volume (numpy array), and a
+                metadata dictionary containing recon and model parameters for each
+                part, plus 'split_params' (the overlap, the number of parts, and the
+                slice range each part contributes).  If the volume has too few slices
+                to split at this half_overlap, the method warns, performs a standard
+                recon() instead, and returns that result's dictionary (no per-part
+                entries).  A single part chosen by the estimate, or asked for through
+                `slices_per_part`, does the same without a warning.
+
+        Raises:
+            ValueError: If inputs are missing or shapes are inconsistent, if half_overlap < 2, if
+                `slices_per_part` would leave a part with fewer than ``2 * half_overlap`` slices, or
+                if `sino`, `weights`, or `init_recon` is in the sharded form.
+            AssertionError: If array dimensions are invalid.
+
+        Example:
+            >>> import numpy as np
+            >>> import mbirtorch
+            >>> sino = np.ones((180, 64, 64), dtype=np.float32)  # (views, rows, cols)
+            >>> model = mbirtorch.ParallelBeamModel(sinogram_shape=sino.shape,
+            ...                                     angles=np.linspace(0, np.pi, 180))
+            >>> recon, recon_info = model.recon_split_sino(sino, half_overlap=4)
+        """
+        from . import _sharding
+        from .utilities import copy_ct_model, stitch_arrays, merge_log_files
+
+        # -------- Basic validation --------
+        if half_overlap < 2:
+            raise ValueError('half_overlap must be >= 2.')
+        if sino is None:
+            raise ValueError("sino must be provided.")
+        # An input already placed on the devices is refused.  Each part settles
+        # a device layout of its own, so this method works from the host array.
+        # Gathering here would leave the caller's placed copy on the devices
+        # for the whole call, which is the memory the split is meant to save.
+        # The initial reconstruction is included in the check: it is sliced on
+        # the host below, which the device form does not support.
+        if (isinstance(sino, _sharding.Shards)
+                or isinstance(weights, _sharding.Shards)
+                or isinstance(init_recon, _sharding.Shards)):
+            raise ValueError(
+                'recon_split_sino does not accept a sinogram, weights, or an '
+                'initial reconstruction in sharded form.  Pass the host (numpy '
+                'or tensor) arrays.')
+        if not (hasattr(sino, "ndim") and sino.ndim == 3):
+            raise AssertionError("sino must be a 3D array shaped (num_views, num_rows, num_cols).")
+        if weights is not None and getattr(weights, "shape", None) != sino.shape:
+            raise AssertionError("weights, if provided, must have the same shape as sino.")
+
+        # Operate on the host: split here and let each part's recon re-shard its own part, so the
+        # full sinogram is never on the devices at once (the memory saving).  The per-part slices
+        # below are then cheap host views.
+        if isinstance(sino, torch.Tensor):
+            sino = sino.detach().cpu().numpy()
+        sino = np.asarray(sino)
+        if weights is not None:
+            if isinstance(weights, torch.Tensor):
+                weights = weights.detach().cpu().numpy()
+            weights = np.asarray(weights)
+        if init_recon is not None and isinstance(init_recon, torch.Tensor):
+            # Same host-side treatment as sino/weights: host slicing keeps only one part's arrays
+            # device-resident at a time.
+            init_recon = self._gather_recon(init_recon)
+
+        num_rows = sino.shape[1]
+        recon_rows, recon_cols = self.get_params('recon_shape')[:2]
+
+        # -------- Model builders shared by the estimate and the reconstruction --------
+        def _part_model(num_part_rows):
+            """A copy of this model covering ``num_part_rows`` detector rows, and therefore that
+            many recon slices.  The recon rows and columns are set explicitly so a parent with a
+            custom in-plane recon shape keeps it; the copy's own automatic pass would recompute it
+            from the detector."""
+            model = copy_ct_model(self, new_num_det_rows=num_part_rows)
+            # The regularization values come from the parent, which derives them from the FULL
+            # sinogram below, so a part must not re-derive them from its own partial data.
+            model.set_params(no_warning=True, auto_regularize_flag=False)
+            model.set_params(recon_shape=(recon_rows, recon_cols, num_part_rows))
+            return model
+
+        def _worst_part_model_rows(num_parts):
+            """Rows in the largest part model at this part count: the largest kept part, plus
+            half_overlap for each interior side it has.  A middle part has two, an end part of a
+            two-part split has one, and a single part has none."""
+            biggest_kept = -(-num_rows // num_parts)
+            if num_parts == 1:
+                return biggest_kept
+            if num_parts == 2:
+                return biggest_kept + half_overlap
+            return biggest_kept + 2 * half_overlap
+
+        # -------- Choose the number of parts --------
+        # Each part must keep at least 2 * half_overlap slices, so that the overlaps at its two
+        # seams do not run into each other, which bounds the number of parts.
+        max_parts = num_rows // (2 * half_overlap)
+        estimated = False
+        if slices_per_part is not None:
+            if slices_per_part < 2 * half_overlap:
+                raise ValueError(
+                    f'slices_per_part must be at least 2 * half_overlap = {2 * half_overlap}; '
+                    f'got {slices_per_part}.')
+            num_parts = -(-num_rows // int(slices_per_part))
+            if num_parts > 1 and num_parts > max_parts:
+                raise ValueError(
+                    f'slices_per_part={slices_per_part} gives {num_parts} parts of about '
+                    f'{num_rows // num_parts} slices each, which is below 2 * half_overlap = '
+                    f'{2 * half_overlap}; use at most {max_parts} parts, or a smaller '
+                    f'half_overlap.')
+        elif max_parts < 2:
+            # Fewer than 4 * half_overlap slices: no split leaves both parts with the slices their
+            # overlaps need, so warn and do a normal MBIR recon.
+            warnings.warn(
+                "the volume has too few slices to split at this half_overlap; "
+                "falling back to standard MBIR reconstruction.",
+                UserWarning,
+            )
+            num_parts = 1
+        else:
+            # The fewest parts whose largest part model is priced to fit the devices.  The
+            # candidates are built and discarded here, so nothing about the estimate is left
+            # behind on this model or on them.
+            num_parts = max_parts
+            for candidate in range(1, max_parts + 1):
+                if _part_model(_worst_part_model_rows(candidate))._fits_available_devices():
+                    num_parts = candidate
+                    break
+            estimated = True
+
+        if num_parts == 1:
+            return self.recon(
+                sino,
+                weights=weights,
+                init_recon=init_recon,
+                max_iterations=max_iterations,
+                stop_threshold_change_pct=stop_threshold_change_pct,
+                first_iteration=first_iteration,
+                logfile_path=logfile_path,
+                print_logs=print_logs,
+            )
+
+        # -------- The kept slice ranges, which tile [0, num_rows) in nearly equal parts --------
+        base, extra = divmod(num_rows, num_parts)
+        part_ranges, start = [], 0
+        for index in range(num_parts):
+            stop = start + base + (1 if index < extra else 0)
+            part_ranges.append((start, stop))
+            start = stop
+
+        # Regularization params come from the FULL sinogram; the parts copy them and set
+        # auto_regularize_flag=False so they do not re-derive from their partial sinograms.
+        self.auto_set_regularization_params(sino)
+
+        def _recon_one_part(model_lo, model_hi, part_logfile_path):
+            """Reconstruct one band of detector rows on the host; return (host_recon, recon_dict).
+
+            Builds the part's model, sinogram slice, and weights, runs recon, and gathers the result
+            to the host.  All the heavy state (the part model, the device recon) is local, so it is
+            released when this returns -- only ONE part's inputs are resident at a time, which is
+            the point of doing one part at a time.  The returned reconstruction is a host array.
+            """
+            model = _part_model(model_hi - model_lo)
+
+            # Sinogram and weight slices are host VIEWS (nothing mutates them; weights=None passes
+            # through so the part recon uses its constant-weight path with no ones array built).
+            sino_part = sino[:, model_lo:model_hi, :]
+            weights_part = None if weights is None else weights[:, model_lo:model_hi, :]
+            # Rows are slices, so the part's initial reconstruction is the matching slice band.
+            part_init = None if init_recon is None else init_recon[:, :, model_lo:model_hi]
+
+            # recon() already returns a host NumPy array (its output_sharded=False gather), so the
+            # part is on the host here.
+            return model.recon(sino_part, weights=weights_part, init_recon=part_init,
+                               max_iterations=max_iterations,
+                               stop_threshold_change_pct=stop_threshold_change_pct,
+                               first_iteration=first_iteration,
+                               logfile_path=part_logfile_path,
+                               print_logs=print_logs)
+
+        # -------- Reconstruct the parts ONE AT A TIME (each part is built, recon'd, gathered to the
+        # host, and freed before the next is built), so only one part's sino/weights/model and one
+        # part's device recon are resident at any moment. --------
+        # Each part logs to its own temp file; they are merged into logfile_path afterward
+        # (in finally, so any part logs written before a failure are preserved).
+        if logfile_path:
+            log_path = os.path.expanduser(logfile_path)
+            part_log_paths = [log_path + '.part{}'.format(index) for index in range(num_parts)]
+        else:
+            log_path, part_log_paths = None, [None] * num_parts
+        part_recons, part_dicts = [], []
+        try:
+            for index, (lo, hi) in enumerate(part_ranges):
+                # The part's model spans its kept rows plus half_overlap on each interior side.
+                model_lo, model_hi = max(lo - half_overlap, 0), min(hi + half_overlap, num_rows)
+                part_recon, part_dict = _recon_one_part(model_lo, model_hi, part_log_paths[index])
+                part_recons.append(part_recon)
+                part_dicts.append(part_dict)
+        finally:
+            if log_path:
+                labels = ['recon_split_sino: part {} of {} (slices {}-{})'.format(
+                    index + 1, num_parts, lo, hi - 1)
+                    for index, (lo, hi) in enumerate(part_ranges)]
+                merge_log_files(log_path, zip(labels, part_log_paths))
+
+        # -------- Stitch the parts together --------
+        # The parts are host arrays, so stitch_arrays (host-preserving) assembles the full volume ON
+        # THE HOST -- the full recon is never rebuilt on a single device, which would defeat the
+        # part-at-a-time memory saving (and OOM for a recon too large to fit whole on the GPUs).
+        # half_overlap is used on both sides of each seam, so the total overlap between consecutive
+        # parts is 2 * half_overlap, the same for every seam.  ramp_overlap determines which slices
+        # are blended, which is usually less than 2 * half_overlap to avoid possible boundary
+        # effects.  ramp_overlap should be even so that it applies equally to slices on either side
+        # of the seam.
+        ramp_overlap = 4
+        ramp_overlap = min(ramp_overlap, half_overlap)
+        ramp_overlap -= ramp_overlap % 2  # ensure even
+        recon_full = stitch_arrays(part_recons, axis=2, overlap=2 * half_overlap,
+                                   ramp_overlap=ramp_overlap)
+
+        # -------- Construct full reconstruction dictionary --------
+        # One entry per part, in part order.  The last three split_params entries have no parallel
+        # beam meaning -- rows and slices share one grid, so there is no grid shift and no cut/split
+        # mismatch -- and are carried so a reader of either geometry's dictionary finds the same
+        # fields.
+        recon_full_dict = {'recon_params_parts': [d.get('recon_params') for d in part_dicts],
+                           'recon_log_parts': [d.get('recon_log', '# Log info not saved.')
+                                               for d in part_dicts],
+                           'notes_parts': [d.get('notes', '# No notes saved') for d in part_dicts],
+                           'model_params_parts': [d.get('model_params') for d in part_dicts],
+                           'split_params': {'half_overlap_sino': int(half_overlap),
+                                            'half_overlap_recon': int(half_overlap),
+                                            'num_parts': int(num_parts),
+                                            'part_slice_ranges': [(int(lo), int(hi))
+                                                                  for lo, hi in part_ranges],
+                                            'slices_per_part': int(max(hi - lo for lo, hi
+                                                                       in part_ranges)),
+                                            'estimated': bool(estimated),
+                                            'align_split_grid': bool(align_split_grid),
+                                            'grid_shift_alu': 0.0,
+                                            'split_cut_mismatch_slices': 0.0}, }
+
+        return recon_full, recon_full_dict
+
 
 def recon_simple_parallel(sinogram, angles, weights=None, sharpness=1.0,
                           max_iterations=15):
@@ -414,6 +707,12 @@ def recon_simple_parallel(sinogram, angles, weights=None, sharpness=1.0,
         >>> angles = np.linspace(0, np.pi, 180, endpoint=False)
         >>> recon, recon_dict = mbirtorch.recon_simple_parallel(sinogram, angles)
     """
+    # The model's geometry is read off the sinogram's shape, which a divided
+    # array does not have, so that form is refused here rather than failing on
+    # a missing attribute in the line that builds the model.
+    from . import _sharding
+    _sharding.reject_shards('recon_simple_parallel', sinogram=sinogram,
+                            weights=weights)
     # A torch sinogram or torch angles are converted here, so that the model
     # gets the same plain shape tuple and host angles either way.
     if torch.is_tensor(angles):

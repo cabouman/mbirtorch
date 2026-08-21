@@ -53,35 +53,11 @@ def permitted_devices(devices=None):
     return [f'cuda:{i}' for i in range(num_visible)]
 
 
-def reject_shards(function_name, **arrays):
-    """Refuse an array in the divided device form at a preprocessing function's entry.
-
-    The preprocessing functions take whole host arrays: NumPy in, NumPy out, with torch tensors
-    also accepted as input.  Any use of a GPU is internal -- they move one batch of views to a
-    device themselves and bring the result back.  So they never take an array that is already
-    divided across devices.
-
-    A ``Shards`` (see :mod:`mbirtorch._sharding`) holds one tensor per device rather than one
-    array, so it has no shape of its own.  Passed in and left alone, it would fail partway through
-    the batching loop on a missing attribute, with nothing in the message to say what the caller
-    did wrong.  Checking here turns that into a refusal that names the function, the argument, and
-    the fix.
-
-    Args:
-        function_name (str): name of the calling function, used in the message.
-        **arrays: the calling function's array arguments, given by parameter name.  Anything that
-            is not a ``Shards`` is ignored, so an argument can be passed in without being checked
-            first.
-
-    Raises:
-        TypeError: if any of the given arguments is a ``Shards`` container.
-    """
-    divided = [name for name, value in arrays.items() if isinstance(value, _sharding.Shards)]
-    if divided:
-        raise TypeError(
-            '{} does not accept an array in the divided device form.  Passed in that form: {}.  '
-            'Gather the shards to the host first with shards.gather(), then pass the host '
-            'array.'.format(function_name, ', '.join(divided)))
+# The preprocessing functions take whole host arrays: NumPy in, NumPy out, with torch tensors
+# also accepted as input.  Any use of a GPU is internal -- they move one batch of views to a
+# device themselves and bring the result back.  So they never take an array that is already
+# divided across devices, and each entry refuses one by name with the shared check.
+reject_shards = _sharding.reject_shards
 
 
 def _stage_batch(batch, device):

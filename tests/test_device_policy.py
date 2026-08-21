@@ -463,17 +463,19 @@ def test_configure_devices_is_the_only_door_to_a_backend():
 
 
 # ── the geometry-specific remedy ─────────────────────────────────────────────
-def test_a_cone_model_names_recon_split_sino_as_a_remedy():
-    """It nearly doubles the feasible size at a fixed device count, so the
-    message names it where it exists."""
+def test_the_split_geometries_name_recon_split_sino_as_a_remedy():
+    """It raises the feasible size at a fixed device count, so the message
+    names it for every geometry that has it, and for no other."""
     angles = np.linspace(0, 2 * np.pi, 8, endpoint=False)
     cone = mbirtorch.ConeBeamModel((8, 6, 8), angles,
                                    source_detector_dist=40,
                                    source_iso_dist=40)
     parallel = make_model()
-    assert any('recon_split_sino' in line
-               for line in cone._memory_remedies())
-    assert not parallel._memory_remedies()
+    for model in (cone, parallel):
+        assert any('recon_split_sino' in line
+                   for line in model._memory_remedies())
+    # A geometry that does not implement the method has nothing to point at.
+    assert not _multiaxis_model((8, 6, 8))._memory_remedies()
 
 
 # ── device inheritance through copy_ct_model ─────────────────────────────────
@@ -1457,6 +1459,16 @@ def test_recon_split_sino_refuses_a_placed_sinogram():
     # placed weights is refused too.
     with pytest.raises(ValueError, match='sharded form'):
         model.recon_split_sino(sinogram, weights=placed_weights, half_overlap=3)
+    # And so is an initial reconstruction in the device form: the method
+    # slices its init on the host, which the device form does not support.
+    recon_shape = tuple(model.get_params('recon_shape'))
+    placement = _sharding.Placement(['cpu', 'cpu'], axis=-1,
+                                    axis_len=recon_shape[-1])
+    placed_init = _sharding.Shards(
+        [torch.zeros(recon_shape[:2] + (end - start,))
+         for _, (start, end) in placement.shard_ranges()], placement)
+    with pytest.raises(ValueError, match='sharded form'):
+        model.recon_split_sino(sinogram, init_recon=placed_init, half_overlap=3)
 
 
 def test_recon_plastic_metal_refuses_a_placed_sinogram(monkeypatch):

@@ -37,3 +37,5 @@ Alternative Reconstruction
 --------------------------
 
 .. automethod:: mbirtorch.ConeBeamModel.recon_fdk
+
+.. automethod:: mbirtorch.ConeBeamModel.recon_split_sino

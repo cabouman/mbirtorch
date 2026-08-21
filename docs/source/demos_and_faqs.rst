@@ -116,11 +116,13 @@ available for the problem grows roughly in proportion to the number of GPUs.  La
 faster as well, but small ones do not; see :doc:`usr_multi_gpu` for the measured behavior and the details.
 If you have no GPU, all processing is done on the CPU.
 
-If your reconstruction is still too large, then for a parallel beam system you can select a subset of rows of your
-sinogram, reconstruct them separately, and then concatenate them at the end.  If you have a cone beam system, you can
-reconstruct a subset of the central slices or use :meth:`~mbirtorch.TomographyModel.recon_split_sino`.  For cone beam you can
-also make sure axial padding is disabled (``axial_pad_fraction=0``, the default -- see
-:ref:`ConeBeamModelDocs`) if that padding is what pushes you over the memory limit.
+If your reconstruction is still too large, use :meth:`~mbirtorch.TomographyModel.recon_split_sino`, which splits the
+detector rows into overlapping bands, reconstructs one band at a time, and stitches the results together.  A cone beam
+reconstruction splits into two halves; a parallel beam reconstruction splits into as many parts as the memory requires,
+either the number estimated from the memory available on your devices or the number you ask for with
+``slices_per_part``.  With a cone beam system you can also reconstruct a subset of the central slices, and you can make
+sure axial padding is disabled (``axial_pad_fraction=0``, the default -- see :ref:`ConeBeamModelDocs`) if that padding
+is what pushes you over the memory limit.
 
 We continue to improve the time and memory efficiency of MBIRTorch.
 

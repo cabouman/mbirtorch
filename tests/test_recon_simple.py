@@ -189,3 +189,39 @@ def test_accepts_tensor_inputs(case):
     recorded_shape = tensor_dict["model_params"]["sinogram_shape"]
     assert type(recorded_shape) is tuple
     assert recorded_shape == tuple(case.sinogram.shape)
+
+
+def test_refuses_a_sinogram_in_the_divided_form():
+    """The one-call functions read the geometry off the sinogram's shape, which
+    an array divided across devices does not have.  Both refuse it by name
+    rather than failing on a missing attribute in the line that builds the
+    model.  Two 'virtual' CPU devices build the divided form, so no real
+    second device is needed."""
+    from mbirtorch._sharding import Placement, Shards
+
+    sinogram = np.random.RandomState(0).rand(4, 6, 8).astype(np.float32)
+    angles = np.linspace(0, np.pi, sinogram.shape[0], endpoint=False)
+    placement = Placement(['cpu', 'cpu'], axis=0, axis_len=sinogram.shape[0])
+    divided = Shards([torch.as_tensor(sinogram[start:end])
+                      for _, (start, end) in placement.shard_ranges()], placement)
+
+    calls = [
+        ('recon_simple_parallel', 'sinogram',
+         lambda: mbirtorch.recon_simple_parallel(divided, angles)),
+        ('recon_simple_parallel', 'weights',
+         lambda: mbirtorch.recon_simple_parallel(sinogram, angles,
+                                                 weights=divided)),
+        ('recon_simple_cone', 'sinogram',
+         lambda: mbirtorch.recon_simple_cone(divided, angles, 600.0, 400.0)),
+        ('recon_simple_cone', 'weights',
+         lambda: mbirtorch.recon_simple_cone(sinogram, angles, 600.0, 400.0,
+                                             weights=divided)),
+    ]
+    for function_name, argument_name, call in calls:
+        with pytest.raises(TypeError) as refusal:
+            call()
+        message = str(refusal.value)
+        assert function_name in message, message
+        assert argument_name in message, message
+        assert 'divided device form' in message, message
+        assert 'shards.gather()' in message, message

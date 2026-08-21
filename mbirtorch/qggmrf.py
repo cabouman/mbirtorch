@@ -14,6 +14,8 @@ The golden-value tests (tests/test_vs_goldens.py) hold it to ~1e-7 rel-max.
 import numpy as np
 import torch
 
+from . import _sharding
+
 _F32_EPS = torch.finfo(torch.float32).eps
 
 
@@ -107,7 +109,17 @@ def qggmrf_gradient_and_hessian_at_indices(flat_recon, recon_shape, pixel_indice
         tuple of two tensors (first_derivative, second_derivative), each of shape
         (N_indices, num_local_slices) representing the gradient and Hessian
         values at the specified indices.
+
+    Raises:
+        TypeError: If ``flat_recon`` or either halo is in the divided device form.
     """
+    # This works on ONE shard's tensors, with the halos supplying the values
+    # just outside it, so a whole divided array is refused.  Left alone it
+    # would fail on the indexing below with a message that says only that a
+    # Shards cannot be subscripted.
+    _sharding.reject_shards('qggmrf_gradient_and_hessian_at_indices',
+                            flat_recon=flat_recon, left_halo=left_halo,
+                            right_halo=right_halo)
     # Neighborhood weight order is [row+1, row-1, col+1, col-1, slice+1, slice-1]
     # (see the definition in _utils.py).
     b, sigma_x, p, q, T = qggmrf_params
@@ -207,7 +219,14 @@ def qggmrf_loss(full_recon, qggmrf_params):
 
     Returns:
         float
+
+    Raises:
+        TypeError: If ``full_recon`` is in the divided device form.
     """
+    # np.asarray turns a divided array into a 0-d object array without
+    # complaint, and the failure then surfaces much further down as a numpy
+    # message about dimensionality, so it is refused here instead.
+    _sharding.reject_shards('qggmrf_loss', full_recon=full_recon)
     b, sigma_x, p, q, T = qggmrf_params
     full_recon = np.asarray(full_recon)
 

@@ -35,3 +35,5 @@ Alternative Reconstruction
 --------------------------
 
 .. automethod:: mbirtorch.ParallelBeamModel.recon_fbp
+
+.. automethod:: mbirtorch.ParallelBeamModel.recon_split_sino

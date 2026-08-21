@@ -613,6 +613,9 @@ def median_filter3d(x, max_block_gb=4.0, return_min_max=False):
         dtype as ``x`` containing the median-filtered result, numpy for
         numpy input and tensor for tensor input.
 
+    Raises:
+        TypeError: If ``x`` is in the divided device form.
+
     Note:
         The array is processed in blocks along axis 0 so that roughly
         ``max_block_gb`` of temporary data exists at once.  If axis 0 is
@@ -628,6 +631,12 @@ def median_filter3d(x, max_block_gb=4.0, return_min_max=False):
     import torch.nn.functional as F
     from .tomography_model import _resolve_device
 
+    # The filter works on one array on one device, and each output voxel needs
+    # the 26 around it, so a slice-divided volume would need its neighboring
+    # slices exchanged between devices.  It is refused rather than being taken
+    # for numpy by the check just below, which fails on a torch dtype message
+    # that says nothing about where the array actually is.
+    _sharding.reject_shards('median_filter3d', x=x)
     was_numpy = not isinstance(x, torch.Tensor)
     if was_numpy:
         xt = torch.as_tensor(np.asarray(x), device=_resolve_device('auto'))

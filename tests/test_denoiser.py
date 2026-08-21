@@ -335,3 +335,29 @@ def test_sharded_denoise_makes_no_whole_volume_host_transfer(monkeypatch):
                      logfile_path=None, output_sharded=True)
     assert gathered == []
     assert moved == [noise_elements, row_elements]
+
+
+def test_median_filter3d_refuses_the_divided_form():
+    """Each output voxel needs the 26 voxels around it, so a volume divided
+    across devices on its slice axis would need its neighboring slices
+    exchanged between them.  The filter refuses it by name instead of taking it
+    for numpy, which fails on a torch dtype message that says nothing about
+    where the array actually is.  Two 'virtual' CPU devices build the divided
+    form, so this runs everywhere."""
+    volume = np.random.RandomState(0).rand(6, 6, 8).astype(np.float32)
+    placement = _sharding.Placement(['cpu', 'cpu'], axis=-1,
+                                    axis_len=volume.shape[-1])
+    divided = _sharding.Shards(
+        [torch.as_tensor(volume[..., start:end].copy())
+         for _, (start, end) in placement.shard_ranges()], placement)
+
+    with pytest.raises(TypeError) as refusal:
+        mbirtorch.median_filter3d(divided)
+    message = str(refusal.value)
+    assert 'median_filter3d' in message
+    assert 'form: x.' in message          # the argument that was wrong
+    assert 'divided device form' in message
+    assert 'shards.gather()' in message
+
+    # The whole-array forms still go through.
+    assert mbirtorch.median_filter3d(volume).shape == volume.shape

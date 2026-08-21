@@ -346,10 +346,11 @@ class TomographyModel(ParameterHandler):
                          logfile_path='~/.mbirtorch/logs/recon.log', print_logs=True,
                          align_split_grid=False):
         """
-        Perform MBIR reconstruction with about half the memory of :meth:`recon`
-        by splitting the detector rows into two overlapping halves,
-        reconstructing each half separately, and stitching the results.  The
-        output is approximately equal to the output of :meth:`recon`.
+        Perform MBIR reconstruction with less memory than :meth:`recon` by
+        splitting the detector rows into overlapping row bands -- two halves
+        for cone beam, one or more parts for parallel beam -- reconstructing
+        one band at a time, and stitching the results.  The output is
+        approximately equal to the output of :meth:`recon`.
 
         The split arithmetic is geometry specific, and recon_split_sino may
         not be available for all geometries; geometries without an
@@ -362,7 +363,8 @@ class TomographyModel(ParameterHandler):
                 `sino`.  Not accepted in sharded form, like `sino`.
             half_overlap (int, optional): Number of overlapping detector rows
                 kept past the split in each half.  Defaults to 5.
-            init_recon (optional): Same as in :meth:`recon`.
+            init_recon (optional): Same as in :meth:`recon`.  Not accepted in
+                sharded form, like `sino`.
             max_iterations (int, optional): Same as in :meth:`recon`.
             stop_threshold_change_pct (float, optional): Same as in :meth:`recon`.
             first_iteration (int, optional): Same as in :meth:`recon`.
@@ -1310,9 +1312,9 @@ class TomographyModel(ParameterHandler):
         """Extra remedy lines for this geometry's preflight message."""
         if type(self).recon_split_sino is not TomographyModel.recon_split_sino:
             return ['  model.recon_split_sino(...)                '
-                    '# reconstructs in halves; nearly doubles the',
+                    '# reconstructs one row band at a time; raises',
                     '                                             '
-                    '# feasible size at a fixed device count']
+                    '# the feasible size at a fixed device count']
         return []
 
     def _layout_is_valid(self, devices):
@@ -1333,6 +1335,56 @@ class TomographyModel(ParameterHandler):
             devices, list(call_arrays.values()))
         return _memory_ledger.layout_fits(
             ledger, budgets, credits, margin=self.memory_preflight_margin)
+
+    def _fits_available_devices(self, workload='recon', **call_arrays):
+        """Whether the modeled peak for ``workload`` fits any device layout
+        this model could run on, answered without changing anything.
+
+        This asks the capacity question :meth:`_apply_device_policy` asks,
+        priced from the same plan and compared the same way, but it settles no
+        layout, records nothing on the model, and allocates no reconstruction.
+        A caller can therefore price a model it is about to throw away -- a
+        candidate whose shape it is still choosing -- and discard it.
+
+        The candidate device lists are the ones the policy would try: the
+        configured devices when the caller fixed them, otherwise the pinned
+        count, otherwise every count up to the number of visible devices.
+        Order does not matter to a yes-or-no answer, so the widening speed
+        floors, which only reorder, are not consulted.  A device with no
+        readable budget (anything other than CUDA) holds whatever it is asked
+        to hold, which is how the policy treats it too.
+
+        Returns:
+            bool: True when some candidate layout holds the modeled peak.
+        """
+        if self.skip_memory_preflight:
+            return True
+        if not self.device_layout_is_automatic:
+            candidates = [list(self.sino_placement.devices)]
+        else:
+            pinned = _memory_ledger.pinned_device_count()
+            visible = (torch.cuda.device_count() if torch.cuda.is_available()
+                       else 0)
+            if visible < 2:
+                counts = [1]
+            elif pinned is not None:
+                counts = [min(pinned, visible)]
+            else:
+                counts = list(range(visible, 0, -1))
+            candidates = [self._candidate_devices(count) if count > 1
+                          else [self.torch_device] for count in counts]
+        for devices in candidates:
+            if not self._layout_is_valid(devices):
+                continue
+            ledger = self._build_memory_ledger(devices=devices,
+                                               workload=workload,
+                                               **call_arrays)
+            if ledger is None:
+                return True
+            fits, _rows = self._layout_capacity(devices, ledger, call_arrays)
+            if fits:
+                return True
+        return False
 
     def _check_settled_capacity(self, workload, call_arrays):
         """Run the capacity check for ``workload`` on the layout already
@@ -1980,6 +2032,25 @@ class TomographyModel(ParameterHandler):
         return hessian if output_sharded else self._gather_recon(hessian)
 
     def get_voxels_at_indices(self, recon, indices):
+        """The voxel cylinders at ``indices``, as (num_indices, num_slices).
+
+        A recon divided across devices keeps its division: each shard is
+        flattened and indexed on the device that holds it, and the result is a
+        container over the same placement.  Only the row and column axes are
+        flattened and only rows are selected, so the slice axis -- the one the
+        shards are cut on -- is untouched, and gathering the result gives
+        exactly what the whole-array call gives.
+        """
+        if isinstance(recon, _sharding.Shards):
+            recon_shape = self.get_params('recon_shape')
+            # The row count is named rather than inferred: a shard that owns no
+            # slices has no elements, and reshape cannot infer a row count from
+            # an empty tensor whose column count is also zero.
+            num_pixels = int(recon_shape[0]) * int(recon_shape[1])
+            indices = torch.as_tensor(indices, dtype=torch.int64)
+            return _sharding.Shards(
+                [t.reshape(num_pixels, t.shape[-1])[indices.to(t.device)]
+                 for t in recon.tensors], recon.placement)
         return recon.reshape((-1, recon.shape[-1]))[indices]
 
     # ── auto-regularization (verbatim-math numpy ports) ───────────────────────
@@ -2033,7 +2104,15 @@ class TomographyModel(ParameterHandler):
 
     def auto_set_sigma_y(self, sinogram, sino_indicator, weights=1):
         """Set sigma_y from the (typically view-subsampled) sinogram, its
-        support indicator, and optional weights."""
+        support indicator, and optional weights.
+
+        The statistics run on the host, against a host support indicator of the
+        same shape, so a divided sinogram is refused.  To reduce a divided
+        sinogram to something this accepts, take a view subsample of it with
+        :meth:`subsample_views`, which returns a host array.
+        """
+        _sharding.reject_shards('auto_set_sigma_y', sinogram=sinogram,
+                                sino_indicator=sino_indicator, weights=weights)
         snr_db = self.get_params('snr_db')
         magnification = self.get_magnification()
         delta_voxel, delta_det_channel = self.get_params(['delta_voxel', 'delta_det_channel'])
@@ -2259,6 +2338,11 @@ class TomographyModel(ParameterHandler):
         Returns:
             The loss as a device scalar tensor.
         """
+        # The sums below run on one array on one device.  Summing a divided
+        # array would take a cross-device reduction and a choice of where the
+        # scalar lands, so the divided form is refused here instead.
+        _sharding.reject_shards('get_forward_model_loss',
+                                error_sinogram=error_sinogram, weights=weights)
         if weights is None:
             weights = 1
             avg_weight = 1
@@ -2315,7 +2399,15 @@ class TomographyModel(ParameterHandler):
         ``fm_constant * sum(weighted_error_sinogram * delta_sinogram)`` and
         ``fm_constant * sum(delta_sinogram^2 * weights)``, returned as device
         scalars.
+
+        The reconstruction loop calls this once per shard, on that shard's own
+        tensors, and combines the partials itself.  A whole divided array is
+        refused: summing one would take a cross-device reduction and a choice
+        of where the scalars land.
         """
+        _sharding.reject_shards('get_forward_lin_quad',
+                                weighted_error_sinogram=weighted_error_sinogram,
+                                delta_sinogram=delta_sinogram, weights=weights)
         forward_linear = fm_constant * torch.sum(weighted_error_sinogram * delta_sinogram)
         if const_weights:
             forward_quadratic = fm_constant * torch.sum(delta_sinogram * delta_sinogram)
@@ -3066,6 +3158,10 @@ class TomographyModel(ParameterHandler):
             'recon_log' (the run's log text), 'notes', and
             'model_params' (a snapshot of the model parameters).
         """
+        # The sinogram and the weights may arrive already divided across the
+        # devices, but the initial reconstruction is checked against the whole
+        # volume's shape, which a divided array does not have.
+        _sharding.reject_shards('recon', init_recon=init_recon)
         (sinogram, weights, init_recon, partitions, partition_sequence, granularity,
          regularization_params) = self.initialize_recon(
             sinogram, weights, init_recon, max_iterations, first_iteration,
@@ -3213,6 +3309,11 @@ class TomographyModel(ParameterHandler):
             'recon_log' (the run's log text), 'notes', and
             'model_params' (a snapshot of the model parameters).
         """
+        # The proximal input, the sinogram, and the weights may all arrive
+        # already divided across the devices, but the initial reconstruction is
+        # checked against the whole volume's shape, which a divided array does
+        # not have.
+        _sharding.reject_shards('prox_map', init_recon=init_recon)
         prior_loss = [0]
         if do_initialization or self.prox_data is None:
             (sinogram, weights, init_recon, partitions, partition_sequence,
@@ -3302,6 +3403,13 @@ class TomographyModel(ParameterHandler):
         return new_rows - old_rows, new_cols - old_cols, new_slices - old_slices
 
     def reshape_recon(self, recon):
+        """Reshape a recon-like array to the model's ``recon_shape``.
+
+        The target shape names the WHOLE volume's slice count, which no single
+        shard has, so a divided array is refused rather than reshaped shard by
+        shard against a slice count that is not its own.
+        """
+        _sharding.reject_shards('reshape_recon', recon=recon)
         recon_shape = self.get_params('recon_shape')
         return recon.reshape(recon_shape)
 

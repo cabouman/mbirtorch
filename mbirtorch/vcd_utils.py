@@ -333,6 +333,9 @@ def gen_weights_mar(ct_model, sinogram, init_recon=None, metal_threshold=None, b
     Returns:
         (ndarray): Weights used in reconstruction, with the same array shape as ``sinogram``
 
+    Raises:
+        TypeError: If ``sinogram`` or ``init_recon`` is in the divided device form.
+
     Note:
         Only the ``init_recon`` branch uses the devices.  On that branch, and
         on a model whose device layout is still automatic, this call also
@@ -343,6 +346,13 @@ def gen_weights_mar(ct_model, sinogram, init_recon=None, metal_threshold=None, b
         too large for the available devices.  The Otsu branch works on the
         host throughout and leaves the layout alone.
     """
+    # The thresholding and the exponential below run on whole host arrays.  A
+    # divided array survives np.asarray as a 0-d object array, so the first
+    # comparison against it fails on an unsupported operand instead of saying
+    # what went wrong; it is refused here instead, before the import below.
+    _sharding.reject_shards('gen_weights_mar', sinogram=sinogram,
+                            init_recon=init_recon)
+
     import mbirtorch.preprocess as mtp
 
     # If init_recon is not provided, then identify the distorted sino entries with Otsu's thresholding method.

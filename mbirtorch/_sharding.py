@@ -276,6 +276,35 @@ class Shards:
         return out.numpy()
 
 
+def reject_shards(function_name, **arrays):
+    """Refuse an array in the divided device form at a function's entry.
+
+    A :class:`Shards` holds one tensor per device rather than one array, so it
+    has no shape of its own and does not support indexing, reshaping, or
+    arithmetic.  A function that works on whole arrays and is handed one anyway
+    fails somewhere further down on a missing attribute, an unsupported
+    operand, or -- worse -- a 0-d object array that numpy builds without
+    complaint.  None of those messages say what the caller did wrong.  Checking
+    at the entry turns them into a refusal that names the function, the
+    argument, and the fix.
+
+    Args:
+        function_name (str): name of the calling function, used in the message.
+        **arrays: the calling function's array arguments, given by parameter
+            name.  Anything that is not a ``Shards`` is ignored, so an argument
+            can be passed in without being checked first.
+
+    Raises:
+        TypeError: if any of the given arguments is a ``Shards`` container.
+    """
+    divided = [name for name, value in arrays.items() if isinstance(value, Shards)]
+    if divided:
+        raise TypeError(
+            '{} does not accept an array in the divided device form.  Passed in that '
+            'form: {}.  Gather the shards to the host first with shards.gather(), then '
+            'pass the host array.'.format(function_name, ', '.join(divided)))
+
+
 # ── safe transfer ─────────────────────────────────────────────────────────────
 # jax's device_put silently corrupted device-resident transfers on some GPUs
 # (L40S); torch's tensor.to() has no known analog, but the empirical probe is

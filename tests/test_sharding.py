@@ -1872,3 +1872,108 @@ def test_the_minimum_pixel_width_padding_keeps_the_values():
                        (pf._back_body_per_dev[0], raw_back)):
         assert bound.__name__.startswith('padded_') == (bound is not raw)
 
+
+
+# ── the divided form at the public entries ───────────────────────────────────
+# Some entries take a divided array and keep it divided; others work on one
+# whole array and refuse it. What matters for the refusals is that they fire at
+# the entry with a message that names the function, the argument, and the fix,
+# rather than failing somewhere below on a missing attribute, an unsupported
+# operand, or a 0-d object array that numpy builds without complaint.
+
+def _two_device_case(sino_shape=(10, 7, 8)):
+    """A small parallel-beam model on two 'virtual' CPU devices, with a
+    sinogram and a reconstruction in both the whole and the divided form.  The
+    7 detector rows give 7 recon slices, which split 4 + 3, so the two shards
+    have different local slice counts."""
+    import mbirtorch
+    angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
+    model = mbirtorch.ParallelBeamModel(sino_shape, angles)
+    model.configure_devices(devices=["cpu"])
+    model.set_params(no_warning=True, verbose=0)
+    model.configure_devices(devices=["cpu", "cpu"])
+    rng = np.random.RandomState(11)
+    sino = rng.rand(*sino_shape).astype(np.float32)
+    recon = rng.rand(*tuple(model.get_params('recon_shape'))).astype(np.float32)
+    return model, sino, recon, model._shard_sinogram(sino), model._shard_recon(recon)
+
+
+def test_get_voxels_at_indices_keeps_a_divided_recon_divided():
+    """Selecting cylinders flattens the row and column axes and picks rows, so
+    it never touches the slice axis the shards are cut on.  Each shard is
+    indexed where it lives, and the assembled result equals the whole-array
+    one exactly -- values move, nothing is computed."""
+    from mbirtorch._sharding import Shards
+    model, _sino, recon, _sino_sh, recon_sh = _two_device_case()
+    recon_shape = tuple(model.get_params('recon_shape'))
+    assert [int(t.shape[-1]) for t in recon_sh.tensors] == [4, 3]
+    indices = torch.as_tensor(
+        np.sort(np.random.RandomState(12).choice(
+            recon_shape[0] * recon_shape[1], size=11, replace=False)),
+        dtype=torch.int64)
+
+    whole = model.get_voxels_at_indices(torch.as_tensor(recon), indices)
+    assert np.array_equal(
+        whole.numpy(), recon.reshape(-1, recon.shape[-1])[indices.numpy()])
+
+    divided = model.get_voxels_at_indices(recon_sh, indices)
+    assert isinstance(divided, Shards)
+    assert divided.placement == recon_sh.placement
+    assert [int(t.shape[-1]) for t in divided.tensors] == [4, 3]
+    assert np.array_equal(divided.gather(), whole.numpy())
+
+    # An index set covering the whole grid is the plain flattening, and it
+    # still comes back divided the same way.
+    all_indices = torch.arange(recon_shape[0] * recon_shape[1], dtype=torch.int64)
+    flat = model.get_voxels_at_indices(recon_sh, all_indices)
+    assert np.array_equal(flat.gather(), recon.reshape(-1, recon.shape[-1]))
+
+
+def _divided_form_refusals():
+    """One call per guarded entry, each with one argument in the divided form.
+    Returned as (function name, argument name, no-argument callable) triples so
+    the test can check that the message names what the caller actually did."""
+    from mbirtorch import qggmrf, vcd_utils
+    model, sino, recon, sino_sh, recon_sh = _two_device_case()
+    recon_shape = tuple(model.get_params('recon_shape'))
+    num_pixels = recon_shape[0] * recon_shape[1]
+    all_indices = torch.arange(num_pixels, dtype=torch.int64)
+    flat_sh = model.get_voxels_at_indices(recon_sh, all_indices)
+    indicator = np.ones(sino.shape, dtype=np.int8)
+    qggmrf_params = (qggmrf.get_b_from_nbr_wts([1.0, 1.0, 1.0]), 0.1, 1.1, 1.0, 1.0)
+    return [
+        ('reshape_recon', 'recon',
+         lambda: model.reshape_recon(flat_sh)),
+        ('get_forward_model_loss', 'error_sinogram',
+         lambda: model.get_forward_model_loss(sino_sh, 1.0)),
+        # The whole-array argument comes first here, so this also holds that
+        # the guard looks past the first argument.
+        ('get_forward_lin_quad', 'delta_sinogram',
+         lambda: model.get_forward_lin_quad(sino, sino_sh, 1, 1.0, True)),
+        ('auto_set_sigma_y', 'sinogram',
+         lambda: model.auto_set_sigma_y(sino_sh, indicator)),
+        ('recon', 'init_recon',
+         lambda: model.recon(sino, init_recon=recon_sh, max_iterations=1)),
+        ('prox_map', 'init_recon',
+         lambda: model.prox_map(recon, sino, init_recon=recon_sh, max_iterations=1)),
+        ('gen_weights_mar', 'sinogram',
+         lambda: vcd_utils.gen_weights_mar(model, sino_sh)),
+        ('gen_weights_mar', 'init_recon',
+         lambda: vcd_utils.gen_weights_mar(model, sino, init_recon=recon_sh)),
+        ('qggmrf_loss', 'full_recon',
+         lambda: qggmrf.qggmrf_loss(recon_sh, qggmrf_params)),
+        ('qggmrf_gradient_and_hessian_at_indices', 'flat_recon',
+         lambda: qggmrf.qggmrf_gradient_and_hessian_at_indices(
+             flat_sh, recon_shape, all_indices, qggmrf_params)),
+    ]
+
+
+def test_entries_that_work_on_one_whole_array_refuse_the_divided_form():
+    for function_name, argument_name, call in _divided_form_refusals():
+        with pytest.raises(TypeError) as refusal:
+            call()
+        message = str(refusal.value)
+        assert function_name in message, (function_name, message)
+        assert argument_name in message, (function_name, message)
+        assert 'divided device form' in message, (function_name, message)
+        assert 'shards.gather()' in message, (function_name, message)

@@ -828,7 +828,8 @@ class ConeBeamModel(TomographyModel):
                 it still spans ``half_overlap`` slices).  The reconstruction overlap is derived
                 from it, widened by the cone divergence so every slice the kept rows can see is
                 representable.
-            init_recon (optional): Same as in the recon method.
+            init_recon (optional): Same as in the recon method.  Not accepted
+                in sharded form, like `sino`.
             max_iterations (int, optional): Same as in the recon method.
             stop_threshold_change_pct (float, optional): Same as in the recon method.
             first_iteration (int, optional): Same as in the TomographyModel.recon() method.
@@ -851,8 +852,8 @@ class ConeBeamModel(TomographyModel):
 
         Raises:
             ValueError: If inputs are missing or shapes are inconsistent, if half_overlap < 2,
-                if the geometry has nonzero helical z-shifts, or if `sino` or `weights` is in
-                the sharded form.
+                if the geometry has nonzero helical z-shifts, or if `sino`, `weights`, or
+                `init_recon` is in the sharded form.
             AssertionError: If array dimensions are invalid.
 
         Example:
@@ -880,12 +881,15 @@ class ConeBeamModel(TomographyModel):
         # a device layout of its own, so this method works from the host array.
         # Gathering here would leave the caller's placed copy on the devices
         # for the whole call, which is the memory the split is meant to save.
+        # The initial reconstruction is included in the check: it is sliced on
+        # the host below, which the device form does not support.
         if (isinstance(sino, _sharding.Shards)
-                or isinstance(weights, _sharding.Shards)):
+                or isinstance(weights, _sharding.Shards)
+                or isinstance(init_recon, _sharding.Shards)):
             raise ValueError(
-                'recon_split_sino does not accept a sinogram or weights '
-                'in sharded form.  Pass the host (numpy or tensor) sinogram and the '
-                'host weights.')
+                'recon_split_sino does not accept a sinogram, weights, or an '
+                'initial reconstruction in sharded form.  Pass the host (numpy '
+                'or tensor) arrays.')
         if not (hasattr(sino, "ndim") and sino.ndim == 3):
             raise AssertionError("sino must be a 3D array shaped (num_views, num_rows, num_cols).")
         if weights is not None and getattr(weights, "shape", None) != sino.shape:
@@ -1169,6 +1173,12 @@ def recon_simple_cone(sinogram, angles, source_detector_dist, source_iso_dist,
         >>> recon, recon_dict = mbirtorch.recon_simple_cone(
         ...     sinogram, angles, source_detector_dist=600, source_iso_dist=400)
     """
+    # The model's geometry is read off the sinogram's shape, which a divided
+    # array does not have, so that form is refused here rather than failing on
+    # a missing attribute in the line that builds the model.
+    from . import _sharding
+    _sharding.reject_shards('recon_simple_cone', sinogram=sinogram,
+                            weights=weights)
     # A torch sinogram or torch angles are converted here, so that the model
     # gets the same plain shape tuple and host angles either way.
     if torch.is_tensor(angles):
