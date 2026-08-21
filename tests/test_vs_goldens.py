@@ -85,7 +85,7 @@ def test_hessian_diagonal(golden, model):
 
 
 def test_fbp(golden, model):
-    out = model.fbp_recon(golden["sinogram"])
+    out = model.recon_fbp(golden["sinogram"])
     err = _rel_max(out, golden["fbp"])
     print(f"fbp rel_max = {err:.2e}")
     assert err < 1e-3

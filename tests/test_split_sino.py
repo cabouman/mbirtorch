@@ -1,4 +1,4 @@
-"""Gates for ConeBeamModel.split_sino_recon.
+"""Gates for ConeBeamModel.recon_split_sino.
 
 Contract tests: the split reconstruction approximately equals recon() on the
 same inputs; a 2-device layout on the parent carries to the halves and
@@ -40,7 +40,7 @@ def test_split_approximates_full_recon():
     np.random.seed(0)
     full, _ = model.recon(sino, weights=weights, max_iterations=8)
     np.random.seed(0)
-    split, split_dict = model.split_sino_recon(sino, weights=weights, half_overlap=4,
+    split, split_dict = model.recon_split_sino(sino, weights=weights, half_overlap=4,
                                                max_iterations=8)
     assert split.shape == full.shape
     nrmse = float(np.linalg.norm(split - full) / np.linalg.norm(full))
@@ -55,12 +55,12 @@ def test_split_preserves_device_layout():
     # A 2-device parent layout must carry to the halves and reproduce the single-device split.
     model, sino, weights = _small_cone_case()
     np.random.seed(0)
-    split1, _ = model.split_sino_recon(sino, weights=weights, half_overlap=4, max_iterations=5)
+    split1, _ = model.recon_split_sino(sino, weights=weights, half_overlap=4, max_iterations=5)
 
     model2, _, _ = _small_cone_case()
     model2.configure_devices(devices=['cpu', 'cpu'])
     np.random.seed(0)
-    split2, _ = model2.split_sino_recon(sino, weights=weights, half_overlap=4, max_iterations=5)
+    split2, _ = model2.recon_split_sino(sino, weights=weights, half_overlap=4, max_iterations=5)
     err = float(np.max(np.abs(split1 - split2)) / max(np.max(np.abs(split1)), 1e-30))
     print(f"sharded vs single split rel_max = {err:.2e}")
     # Multi-device runs carry the documented compiled-variant float envelope (see the multi-GPU
@@ -78,7 +78,7 @@ def test_split_fallback_warns_and_recons():
     tsino = np.ones((8, 6, 12), dtype=np.float32)
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter('always')
-        recon, _ = tiny.split_sino_recon(tsino, max_iterations=2)
+        recon, _ = tiny.recon_split_sino(tsino, max_iterations=2)
     assert any('falling back' in str(x.message) for x in w)
     assert recon.shape == tuple(tiny.get_params('recon_shape'))
 
@@ -86,11 +86,11 @@ def test_split_fallback_warns_and_recons():
 def test_split_rejects_bad_inputs():
     model, sino, weights = _small_cone_case()
     with pytest.raises(ValueError):
-        model.split_sino_recon(sino, half_overlap=1)
+        model.recon_split_sino(sino, half_overlap=1)
     with pytest.raises(AssertionError):
-        model.split_sino_recon(sino[0])
+        model.recon_split_sino(sino[0])
     with pytest.raises(AssertionError):
-        model.split_sino_recon(sino, weights=weights[:, :4, :])
+        model.recon_split_sino(sino, weights=weights[:, :4, :])
 
 
 @pytest.mark.goldens
@@ -104,7 +104,7 @@ def test_split_golden_parity():
     model.configure_devices(devices=['cpu'])
     model.set_params(no_warning=True, verbose=0)
     np.random.seed(19)
-    recon, split_dict = model.split_sino_recon(golden["mar_sino"].copy(),
+    recon, split_dict = model.recon_split_sino(golden["mar_sino"].copy(),
                                                weights=golden["mar_weights"].copy(),
                                                half_overlap=4, max_iterations=5)
     sp = split_dict['split_params']

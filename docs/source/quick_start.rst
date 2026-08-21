@@ -2,16 +2,23 @@
 Quick Start
 ===========
 
-MBIRTorch is designed to give reconstructions using just a few lines of code.  Most functions can be accessed
-by importing mbirtorch and creating a model or through mbirtorch directly.  Assuming your sinogram is a numpy array
+MBIRTorch is designed to give reconstructions using just a few lines of code.  Assuming your sinogram is a numpy array
 in the shape (views, rows, channels) from a parallel beam projection, you can create and visualize a reconstruction using:
 
 .. code-block::
 
     import mbirtorch
+    recon, recon_dict = mbirtorch.recon_simple_parallel(sinogram, angles)
+    mbirtorch.slice_viewer(recon, title='MBIRTorch Recon')
+
+(:func:`~mbirtorch.recon_simple_cone` is the cone-beam counterpart.)  For more control -- sharpness and
+other regularization parameters, weights, geometry offsets, device choices, and the other reconstruction
+methods -- create a model object and call its methods:
+
+.. code-block::
+
     ct_model = mbirtorch.ParallelBeamModel(sinogram.shape, angles)
     recon, recon_dict = ct_model.recon(sinogram)
-    mbirtorch.slice_viewer(recon, title='MBIRTorch Recon')
 
 Demos
 ~~~~~
@@ -27,7 +34,8 @@ You can then adapt these demos to suit your needs.
 Application
 ~~~~~~~~~~~
 
-Below are simple instructions on how to do your first reconstruction:
+Below are simple instructions on how to do your first reconstruction.  For a first pass,
+``recon_simple_parallel(sinogram, angles)`` performs the initialize and reconstruct steps below in one call.
 
 - **Get your data:**
 

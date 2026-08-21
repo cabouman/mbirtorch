@@ -16,6 +16,15 @@ The spacing between slices of the reconstruction are fixed to be the same as the
 See the API docs for the :class:`~mbirtorch.TomographyModel` class for details on a wide range
 of functions that can be implemented using the ``ParallelBeamModel``.
 
+Simple Reconstruction
+---------------------
+
+For a basic reconstruction, one function call takes the sinogram and the view angles and returns
+the reconstruction.  The class below gives full control over the geometry, the parameters, and the
+reconstruction itself.
+
+.. autofunction:: mbirtorch.recon_simple_parallel
+
 Constructor
 -----------
 
@@ -25,4 +34,4 @@ Constructor
 Alternative Reconstruction
 --------------------------
 
-.. automethod:: mbirtorch.ParallelBeamModel.fbp_recon
+.. automethod:: mbirtorch.ParallelBeamModel.recon_fbp

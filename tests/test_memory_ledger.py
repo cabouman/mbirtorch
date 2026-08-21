@@ -280,7 +280,7 @@ def test_back_projection_holds_three_cylinders_on_one_device():
 
 
 def test_weights_are_live_in_every_pre_loop_phase_when_supplied():
-    """Supplied weights are placed at the top of vcd_recon, so they are
+    """Supplied weights are placed at the top of _vcd_recon, so they are
     resident through the direct recon and the initial error state."""
     sino_bytes = 64 * 32 * 32 * 4
     ledger = estimate_peak_device_bytes(make_plan(weights_supplied=True))
@@ -337,7 +337,7 @@ def test_error_formation_holds_the_scaled_projection_and_its_result():
     assert terms['forward projection'][0] == sino_bytes
 
 
-def test_direct_recon_loop_and_scatter_are_not_co_live():
+def test_recon_direct_loop_and_scatter_are_not_co_live():
     """The back accumulator feeds the scatter, so the two are consecutive
     sub-peaks rather than one sum.
 
@@ -735,7 +735,7 @@ def test_recon_is_bitwise_identical_with_the_masked_hessian():
 
     The two runs differ in ONE variable: where the hessian came from.  The
     control supplies one computed the dense way, which bypasses the internal
-    masked call; the comparison run lets vcd_recon compute it at the masked
+    masked call; the comparison run lets _vcd_recon compute it at the masked
     indices.
 
     Compilation is OFF deliberately, and not to hide a difference.  The two
@@ -763,12 +763,12 @@ def test_recon_is_bitwise_identical_with_the_masked_hessian():
                                                    output_sharded=True)
 
     np.random.seed(7)
-    control, _losses = model.vcd_recon(sinogram.copy(), partitions, sequence,
-                                       0.0, weights=weights,
-                                       fm_hessian=dense_hessian.clone())
+    control, _losses = model._vcd_recon(sinogram.copy(), partitions, sequence,
+                                        0.0, weights=weights,
+                                        fm_hessian=dense_hessian.clone())
     np.random.seed(7)
-    masked, _losses = model.vcd_recon(sinogram.copy(), partitions, sequence,
-                                      0.0, weights=weights)
+    masked, _losses = model._vcd_recon(sinogram.copy(), partitions, sequence,
+                                       0.0, weights=weights)
     np.testing.assert_array_equal(control.cpu().numpy(), masked.cpu().numpy())
 
 

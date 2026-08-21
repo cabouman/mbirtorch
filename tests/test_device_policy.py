@@ -463,7 +463,7 @@ def test_configure_devices_is_the_only_door_to_a_backend():
 
 
 # ── the geometry-specific remedy ─────────────────────────────────────────────
-def test_a_cone_model_names_split_sino_recon_as_a_remedy():
+def test_a_cone_model_names_recon_split_sino_as_a_remedy():
     """It nearly doubles the feasible size at a fixed device count, so the
     message names it where it exists."""
     angles = np.linspace(0, 2 * np.pi, 8, endpoint=False)
@@ -471,7 +471,7 @@ def test_a_cone_model_names_split_sino_recon_as_a_remedy():
                                    source_detector_dist=40,
                                    source_iso_dist=40)
     parallel = make_model()
-    assert any('split_sino_recon' in line
+    assert any('recon_split_sino' in line
                for line in cone._memory_remedies())
     assert not parallel._memory_remedies()
 
@@ -848,10 +848,10 @@ def test_the_substituted_family_is_named_in_the_log(monkeypatch, unpinned,
     assert class_name in caplog.text
 
 
-# ── the split_sino_recon halves ──────────────────────────────────────────────
+# ── the recon_split_sino halves ──────────────────────────────────────────────
 def test_a_split_sino_half_model_is_governed_by_its_own_half_size(monkeypatch,
                                                                   unpinned):
-    """split_sino_recon builds each half with copy_ct_model, and since the
+    """recon_split_sino builds each half with copy_ct_model, and since the
     2026-08 prerelease change a half inherits no explicit layout: it lands on
     the automatic branch and chooses for itself.
 
@@ -1006,7 +1006,7 @@ def test_configure_devices_overrides_a_settled_layout(monkeypatch, unpinned,
 
 
 # ── the direct reconstructions ───────────────────────────────────────────────
-# fbp_recon and fdk_recon settle the layout themselves, so a direct
+# recon_fbp and recon_fdk settle the layout themselves, so a direct
 # reconstruction spreads across the devices instead of landing whole on the
 # lead one.  All four geometries are covered here: cone has made the call
 # since commit 72208bb and the other three gained it with this increment.
@@ -1036,11 +1036,11 @@ def _automatic_translation():
 
 
 DIRECT_RECONS = [
-    (_automatic_parallel, 'fbp_recon'),
-    (_automatic_cone, 'fdk_recon'),
+    (_automatic_parallel, 'recon_fbp'),
+    (_automatic_cone, 'recon_fdk'),
     # The multiaxis constructor is the floors section's, at a toy shape.
-    (lambda: _multiaxis_model((8, 6, 8)), 'fbp_recon'),
-    (_automatic_translation, 'fdk_recon'),
+    (lambda: _multiaxis_model((8, 6, 8)), 'recon_fbp'),
+    (_automatic_translation, 'recon_fdk'),
 ]
 DIRECT_RECON_IDS = ['parallel', 'cone', 'multiaxis', 'translation']
 
@@ -1068,7 +1068,7 @@ def _impulse_sinogram(model):
 
 
 @pytest.mark.parametrize("make,method", DIRECT_RECONS, ids=DIRECT_RECON_IDS)
-def test_a_bare_direct_recon_settles_the_layout_and_spreads(
+def test_a_bare_recon_direct_settles_the_layout_and_spreads(
         monkeypatch, unpinned, no_speed_guard, make, method):
     """The A2 gap, closed for every geometry: a direct reconstruction on a
     model with no explicit layout uses the devices that fit, exactly as recon
@@ -1083,7 +1083,7 @@ def test_a_bare_direct_recon_settles_the_layout_and_spreads(
 
 @pytest.mark.parametrize("make,method", DIRECT_RECONS[3:],
                          ids=DIRECT_RECON_IDS[3:])
-def test_translation_takes_its_own_floors_into_its_direct_recon(
+def test_translation_takes_its_own_floors_into_its_recon_direct(
         monkeypatch, unpinned, caplog, make, method):
     """Translation declares its own measured family (2026-08-17, mg22), so
     its rows govern the count its direct reconstruction settles on.  Since
@@ -1169,13 +1169,13 @@ def model_between_the_two_plans(monkeypatch):
                 'other: ' + '; '.join(tried))
 
 
-def test_a_geometry_too_large_for_a_recon_still_runs_a_direct_recon(
+def test_a_geometry_too_large_for_a_recon_still_runs_a_recon_direct(
         monkeypatch, unpinned, no_speed_guard):
     """The cost §2.3 records, removed.  Every device count is short for a full
     recon here, and the direct reconstruction that was going to run is not
     refused for it -- it runs, on the widest count that holds it."""
     model = model_between_the_two_plans(monkeypatch)
-    recon = model.fbp_recon(_impulse_sinogram(model))
+    recon = model.recon_fbp(_impulse_sinogram(model))
     assert model.sino_placement.n_devices == 4
     assert np.all(np.isfinite(recon))
     # The count in use is not reported as a rejection, and the line says why
@@ -1192,7 +1192,7 @@ def test_a_recon_on_that_same_model_is_refused_by_the_preflight(
     check, so the recon that does not fit it must be refused HERE, with the
     message and the remedies, rather than reaching the allocator."""
     model = model_between_the_two_plans(monkeypatch)
-    model._apply_device_policy(workload='direct')     # what fbp_recon does
+    model._apply_device_policy(workload='direct')     # what recon_fbp does
     assert model.sino_placement.n_devices == 4
     assert model._settled_workload == 'direct'
 
@@ -1204,9 +1204,42 @@ def test_a_recon_on_that_same_model_is_refused_by_the_preflight(
     assert 'skip_memory_preflight' in message
 
 
-def test_a_direct_recon_on_a_recon_settled_model_repeats_no_check(
+def test_preparing_a_sinogram_is_checked_against_its_own_footprint(
         monkeypatch, unpinned, no_speed_guard):
-    """The nested direct reconstruction inside vcd_recon arrives here on every
+    """Placing a sinogram allocates far less than a full reconstruction, so
+    the same rule applies to it: the count is chosen for a full recon, and
+    when none fits, the check that can refuse is made against this call
+    instead.  The layout is then recorded as serving the narrower check, so
+    the recon that follows is refused rather than run on a layout no recon
+    check ever passed."""
+    model = model_between_the_two_plans(monkeypatch)
+    prepared = model.prepare_sino_for_devices(_impulse_sinogram(model))
+    assert model.sino_placement.n_devices == 4
+    assert model._settled_workload == 'direct'
+    assert prepared.placement == model.sino_placement
+
+    with pytest.raises(MemoryPreflightError):
+        model.recon(prepared, max_iterations=1)
+
+
+def test_the_hessian_diagonal_is_checked_against_its_own_footprint(
+        monkeypatch, unpinned, no_speed_guard):
+    """The hessian diagonal is one masked back projection beside a weights
+    array, which the direct plan's charges cover, so it runs where a full
+    reconstruction is refused.  Its layout serves the narrower check too."""
+    model = model_between_the_two_plans(monkeypatch)
+    hessian = model.compute_hessian_diagonal()
+    assert model.sino_placement.n_devices == 4
+    assert model._settled_workload == 'direct'
+    assert np.all(np.isfinite(hessian))
+
+    with pytest.raises(MemoryPreflightError):
+        model.recon(_impulse_sinogram(model), max_iterations=1)
+
+
+def test_a_recon_direct_on_a_recon_settled_model_repeats_no_check(
+        monkeypatch, unpinned, no_speed_guard):
+    """The nested direct reconstruction inside _vcd_recon arrives here on every
     run.  The recon plan charges everything the direct plan charges, so the
     settled layout has already been checked for it and the poisoned budget
     must not be consulted."""
@@ -1355,7 +1388,7 @@ def test_the_generation_settles_with_the_capacity_check_skipped(
 #
 # Settling is what first hands a placed array to the entries below it, so those
 # entries had to learn about the device form before the settle was added.
-# gen_weights, split_sino_recon, and recon_plastic_metal all refuse one: each
+# gen_weights, recon_split_sino, and recon_plastic_metal all refuse one: each
 # of the three would have to gather it before doing any work.
 def _placed_cone_case(cell=(12, 24, 16), num_devices=2):
     """A cone model small enough to reconstruct in a test, placed on virtual
@@ -1405,7 +1438,7 @@ def test_the_supported_order_places_the_weights_with_the_sinogram():
     assert np.array_equal(model._gather_sinogram(placed_sino), sinogram)
 
 
-def test_split_sino_recon_refuses_a_placed_sinogram():
+def test_recon_split_sino_refuses_a_placed_sinogram():
     """Each half builds its own model and settles its own device layout, so
     this method has no use for the parent's device form.  Gathering the input
     would leave the caller's placed copy resident for the whole call, which is
@@ -1416,14 +1449,14 @@ def test_split_sino_recon_refuses_a_placed_sinogram():
     prepared, placed_weights = model.prepare_sino_for_devices(sinogram,
                                                               weights=weights)
     with pytest.raises(ValueError) as excinfo:
-        model.split_sino_recon(prepared, weights=weights, half_overlap=3)
+        model.recon_split_sino(prepared, weights=weights, half_overlap=3)
     message = str(excinfo.value)
     assert 'does not accept' in message
     assert 'sharded form' in message
     # The weights are checked with the sinogram, so a host sinogram carrying
     # placed weights is refused too.
     with pytest.raises(ValueError, match='sharded form'):
-        model.split_sino_recon(sinogram, weights=placed_weights, half_overlap=3)
+        model.recon_split_sino(sinogram, weights=placed_weights, half_overlap=3)
 
 
 def test_recon_plastic_metal_refuses_a_placed_sinogram(monkeypatch):
@@ -1455,7 +1488,7 @@ def test_recon_plastic_metal_refuses_a_placed_sinogram(monkeypatch):
         return np.zeros(tuple(model.get_params('recon_shape')),
                         dtype=np.float32), {}
 
-    monkeypatch.setattr(model, 'split_sino_recon', record_and_return_zeros)
+    monkeypatch.setattr(model, 'recon_split_sino', record_and_return_zeros)
     recon, _recon_dict = model.recon_plastic_metal(torch.as_tensor(sinogram),
                                                    torch.as_tensor(weights),
                                                    num_metal=0)
@@ -1571,7 +1604,7 @@ def test_the_otsu_branch_of_gen_weights_mar_does_not_settle(
 # ── the calibration scope ────────────────────────────────────────────────────
 def test_calibration_resets_once_per_reconstruction(monkeypatch):
     """The counters reset where the report that reads them lives, so the
-    nested direct_recon inside a cone reconstruction cannot clear the peak
+    nested recon_direct inside a cone reconstruction cannot clear the peak
     mid-run."""
     resets = []
     monkeypatch.setenv('MBIRTORCH_MEMORY_CALIBRATION', '1')
@@ -1585,7 +1618,7 @@ def test_calibration_resets_once_per_reconstruction(monkeypatch):
     assert len(resets) == 1
 
 
-def test_a_standalone_direct_recon_does_not_open_a_calibration_scope(
+def test_a_standalone_recon_direct_does_not_open_a_calibration_scope(
         monkeypatch):
     """A direct reconstruction before the recon must neither reset the
     counters itself nor suppress the recon's own reset."""
@@ -1596,7 +1629,7 @@ def test_a_standalone_direct_recon_does_not_open_a_calibration_scope(
     model = make_cone_model((8, 6, 8))
     sinogram = np.zeros((8, 6, 8), dtype=np.float32)
     sinogram[:, 3, 4] = 1.0
-    model.direct_recon(sinogram)
+    model.recon_direct(sinogram)
     assert resets == []
     np.random.seed(0)
     model.recon(sinogram, max_iterations=2)

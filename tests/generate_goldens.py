@@ -70,7 +70,7 @@ def main():
         flat_phantom, recon_shape, subset, qggmrf_params)
 
     hessian_diag = np.asarray(model.compute_hessian_diagonal(weights=weights))
-    fbp = np.asarray(model.fbp_recon(sinogram))
+    fbp = np.asarray(model.recon_fbp(sinogram))
 
     # Auto-set regularization values on this sinogram+weights.
     reg = model.auto_set_regularization_params(sinogram, weights=weights)
@@ -121,7 +121,7 @@ def main():
     cone_sp_fwd = np.asarray(cone.sparse_forward_project(cone_vals, cone_subset))
     cone_sp_back = np.asarray(cone.sparse_back_project(cone_sino, cone_subset))
     cone_hess = np.asarray(cone.compute_hessian_diagonal(weights=cone_weights))
-    cone_fdk = np.asarray(cone.fdk_recon(cone_sino))
+    cone_fdk = np.asarray(cone.recon_fdk(cone_sino))
     np.random.seed(RECON_SEED)
     cone_recon, cone_dict = cone.recon(cone_sino, weights=cone_weights,
                                        max_iterations=MAX_ITERATIONS,
@@ -153,7 +153,7 @@ def main():
         len(chel_subset), chel_recon_shape[2]).astype(np.float32)
     chel_sp_fwd = np.asarray(chel.sparse_forward_project(chel_vals, chel_subset))
     chel_sp_back = np.asarray(chel.sparse_back_project(chel_sino, chel_subset))
-    chel_fdk = np.asarray(chel.fdk_recon(chel_sino))
+    chel_fdk = np.asarray(chel.recon_fdk(chel_sino))
     np.random.seed(RECON_SEED)
     chel_recon, chel_dict = chel.recon(chel_sino, weights=chel_weights,
                                        max_iterations=3,
@@ -180,7 +180,7 @@ def main():
         len(ccurv_subset), ccurv_recon_shape[2]).astype(np.float32)
     ccurv_sp_fwd = np.asarray(ccurv.sparse_forward_project(ccurv_vals, ccurv_subset))
     ccurv_sp_back = np.asarray(ccurv.sparse_back_project(ccurv_sino, ccurv_subset))
-    ccurv_fdk = np.asarray(ccurv.fdk_recon(ccurv_sino))
+    ccurv_fdk = np.asarray(ccurv.recon_fdk(ccurv_sino))
 
     # Translation (TCT) golden: a 4x4 grid of translations, dot phantom,
     # single ops, FDK, and a seeded 3-iteration recon with traces.
@@ -204,7 +204,7 @@ def main():
         len(tct_subset), tct_recon_shape[2]).astype(np.float32)
     tct_sp_fwd = np.asarray(tct.sparse_forward_project(tct_vals, tct_subset))
     tct_sp_back = np.asarray(tct.sparse_back_project(tct_sino, tct_subset))
-    tct_fdk = np.asarray(tct.fdk_recon(tct_sino))
+    tct_fdk = np.asarray(tct.recon_fdk(tct_sino))
     np.random.seed(RECON_SEED)
     tct_recon, tct_dict = tct.recon(tct_sino, max_iterations=3,
                                     stop_threshold_change_pct=0.0)
@@ -230,7 +230,7 @@ def main():
         len(ma_subset), ma_recon_shape[2]).astype(np.float32)
     ma_sp_fwd = np.asarray(ma.sparse_forward_project(ma_vals, ma_subset))
     ma_sp_back = np.asarray(ma.sparse_back_project(ma_sino, ma_subset))
-    ma_fbp = np.asarray(ma.fbp_recon(ma_sino))
+    ma_fbp = np.asarray(ma.recon_fbp(ma_sino))
     np.random.seed(RECON_SEED)
     ma_recon, ma_dict = ma.recon(ma_sino, max_iterations=3,
                                  stop_threshold_change_pct=0.0)

@@ -4,7 +4,7 @@ The denoiser uses the recon framework: the forward model is the IDENTITY (the
 residual image plays the role of the error sinogram), so no projectors exist
 and the VCD subset update reduces to the closed-form below.  A plain python
 loop runs over the subsets of ONE fixed partition, in order.  Unlike
-vcd_recon, which reshuffles each iteration, the denoiser never reshuffles, so
+_vcd_recon, which reshuffles each iteration, the denoiser never reshuffles, so
 a seeded partition makes the whole sweep deterministic.
 
 There are two paths.  On one device the whole sweep runs through the compiled
@@ -296,13 +296,20 @@ class QGGMRFDenoiser(TomographyModel):
         and ``configure_devices`` fixes it outright.
 
         Args:
-            image (numpy or tensor): the 3D volume to be denoised.
+            image (numpy or tensor or Shards): the 3D volume to be denoised.
+                The slice-sharded device form is accepted too, so a
+                Plug-and-Play loop can feed back what a reconstruction
+                returned with ``output_sharded=True``, provided the two models
+                share a device layout (see
+                :meth:`~mbirtorch.TomographyModel.configure_devices` and its
+                ``like=`` argument).
             sigma_noise (float, optional): estimated noise std in the image.
                 If None, estimated from the image.
             use_ror_mask: restrict denoising to a masked region (False default;
                 True for the inscribed ellipse, or a custom 2D mask).
-            init_image (numpy or tensor, optional): initial image for the
-                minimization.  Defaults to ``image``.
+            init_image (numpy or tensor or Shards, optional): initial image
+                for the minimization, in a plain array or in the device form.
+                Defaults to ``image``.
             max_iterations (int, optional): maximum VCD iterations.
             stop_threshold_change_pct (float, optional): stop when
                 100 * ||delta||_1 / ||image||_1 drops below this.  0 guarantees
@@ -447,12 +454,12 @@ class QGGMRFDenoiser(TomographyModel):
                          first_iteration, verbose):
         """Run the denoising sweep across devices on slice-sharded state.
 
-        Mirrors vcd_recon's sharded path: the qGGMRF halos are staged once
+        Mirrors _vcd_recon's sharded path: the qGGMRF halos are staged once
         per pass, each device computes its shard's prior and identity-forward
         terms, and the four line-search sums combine ON THE LEAD DEVICE into
         one step size (the same formula as vcd_subset_denoiser).
 
-        The line search stays on device for the reason vcd_recon states at
+        The line search stays on device for the reason _vcd_recon states at
         its own combine: alpha is a scalar tensor, so no host synchronization
         is forced per subset.  Reading the four sums back as Python floats
         would cost 5 x n_devices device-to-host syncs per subset per pass,
@@ -500,7 +507,7 @@ class QGGMRFDenoiser(TomographyModel):
         nmae_update = np.zeros(max_iters)
         alpha_values = np.zeros(max_iters)
         num_iters = 0
-        # ONE per-device thread pool for the whole sweep, as vcd_recon keeps
+        # ONE per-device thread pool for the whole sweep, as _vcd_recon keeps
         # for its loop: the two fan-outs per subset reuse it instead of
         # building and tearing down a private pool each time.  A caller that
         # already installed one (a reconstruction driving the denoiser) keeps

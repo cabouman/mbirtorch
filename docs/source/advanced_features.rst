@@ -53,7 +53,7 @@ Below are tips on important and useful features:
     devices used.
 
   - For tall volumes that do not fit in memory even after tuning the padding, see
-    :meth:`~mbirtorch.TomographyModel.split_sino_recon`, which reconstructs the volume in two
+    :meth:`~mbirtorch.TomographyModel.recon_split_sino`, which reconstructs the volume in two
     overlapping halves.
 
 - **Set Sinogram Weights:**

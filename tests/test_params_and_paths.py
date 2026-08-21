@@ -251,19 +251,19 @@ def test_vcd_checkpoint_resume_matches_continuous():
         sinogram, weights=weights, max_iterations=9)
 
     np.random.seed(7)
-    ref, ref_stats = model.vcd_recon(sinogram, partitions, seq, 0.0,
-                                     weights=weights, init_recon=0)
+    ref, ref_stats = model._vcd_recon(sinogram, partitions, seq, 0.0,
+                                      weights=weights, init_recon=0)
 
     np.random.seed(7)
-    r3, s3, ck = model.vcd_recon(sinogram, partitions, seq[:3], 0.0,
-                                 weights=weights, init_recon=0,
-                                 return_checkpoint=True)
+    r3, s3, ck = model._vcd_recon(sinogram, partitions, seq[:3], 0.0,
+                                  weights=weights, init_recon=0,
+                                  return_checkpoint=True)
     ck_err_before = ck['error_sinogram'].clone()
-    r6, s6, ck6 = model.vcd_recon(sinogram, partitions, seq[3:6], 0.0,
-                                  weights=weights, init_recon=r3,
-                                  init_error_sinogram=ck['error_sinogram'],
-                                  fm_hessian=ck['fm_hessian'],
-                                  first_iteration=3, return_checkpoint=True)
+    r6, s6, ck6 = model._vcd_recon(sinogram, partitions, seq[3:6], 0.0,
+                                   weights=weights, init_recon=r3,
+                                   init_error_sinogram=ck['error_sinogram'],
+                                   fm_hessian=ck['fm_hessian'],
+                                   first_iteration=3, return_checkpoint=True)
     # In-place contract (CPU, memory-compatible inputs): the returned recon
     # shares init_recon's storage, and the checkpoint now holds the resumed
     # error state.
@@ -271,10 +271,10 @@ def test_vcd_checkpoint_resume_matches_continuous():
     assert not torch.equal(ck['error_sinogram'], ck_err_before)
     assert torch.equal(ck['error_sinogram'], ck6['error_sinogram'])
 
-    r9, s9 = model.vcd_recon(sinogram, partitions, seq[6:], 0.0,
-                             weights=weights, init_recon=r6,
-                             init_error_sinogram=ck6['error_sinogram'],
-                             fm_hessian=ck6['fm_hessian'], first_iteration=6)
+    r9, s9 = model._vcd_recon(sinogram, partitions, seq[6:], 0.0,
+                              weights=weights, init_recon=r6,
+                              init_error_sinogram=ck6['error_sinogram'],
+                              fm_hessian=ck6['fm_hessian'], first_iteration=6)
 
     assert float(torch.max(torch.abs(r9 - ref))) < 1e-4
     fm_chunked = np.concatenate([s3[0], s6[0], s9[0]])
@@ -288,8 +288,8 @@ def test_vcd_resume_requires_init_recon():
     (_, _, _, partitions, seq, _, _) = model.initialize_recon(
         sinogram, max_iterations=2)
     with pytest.raises(ValueError, match='init_error_sinogram requires init_recon'):
-        model.vcd_recon(sinogram, partitions, seq, 0.0,
-                        init_error_sinogram=np.zeros_like(sinogram))
+        model._vcd_recon(sinogram, partitions, seq, 0.0,
+                         init_error_sinogram=np.zeros_like(sinogram))
 
 
 def test_sino_ones_device_form_seam():
@@ -313,7 +313,7 @@ def test_sino_ones_device_form_seam():
 
 
 def test_compute_prior_loss_records_pm_loss():
-    # The compute_prior_loss path (ported with the vcd_recon sweep): pm_loss
+    # The compute_prior_loss path (ported with the _vcd_recon sweep): pm_loss
     # recorded per iteration, positive and finite; qggmrf_loss cross-checked
     # against mbirjax at 2.3e-7 rel (2026-08-05, seeded 12x11x10 volume).
     # mbirjax parity quirk kept: recorded only at verbose >= 1.
@@ -325,15 +325,15 @@ def test_compute_prior_loss_records_pm_loss():
 
     model.set_params(no_warning=True, verbose=1)
     np.random.seed(1)
-    _, losses = model.vcd_recon(sinogram, partitions, seq, 0.0,
-                                compute_prior_loss=True)
+    _, losses = model._vcd_recon(sinogram, partitions, seq, 0.0,
+                                 compute_prior_loss=True)
     pm = losses[1]
     assert pm.shape == (2,) and np.all(np.isfinite(pm)) and np.all(pm > 0)
 
     model.set_params(no_warning=True, verbose=0)
     np.random.seed(1)
-    _, losses0 = model.vcd_recon(sinogram, partitions, seq, 0.0,
-                                 compute_prior_loss=True)
+    _, losses0 = model._vcd_recon(sinogram, partitions, seq, 0.0,
+                                  compute_prior_loss=True)
     assert np.all(losses0[1] == 0.0)
 
     # The loss itself penalizes roughness.
@@ -345,7 +345,7 @@ def test_compute_prior_loss_records_pm_loss():
 
 def test_get_memory_stats_structure():
     # One dict per processor, devices first then 'CPU', each with byte counts;
-    # printing to a file-like works (the vcd_recon verbose>=2 route).
+    # printing to a file-like works (the _vcd_recon verbose>=2 route).
     import io
     stats = mbirtorch.get_memory_stats(print_results=False)
     assert stats[-1]['id'] == 'CPU'
@@ -367,7 +367,7 @@ def test_vcd_verbose2_memory_dump_runs():
     (_, _, _, partitions, seq, _, _) = model.initialize_recon(
         sinogram, max_iterations=1)
     np.random.seed(1)
-    recon, _ = model.vcd_recon(sinogram, partitions, seq, 0.0, init_recon=0)
+    recon, _ = model._vcd_recon(sinogram, partitions, seq, 0.0, init_recon=0)
     assert np.all(np.isfinite(recon.cpu().numpy()))
 
 

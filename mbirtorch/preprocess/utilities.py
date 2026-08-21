@@ -37,6 +37,17 @@ def _transmission_kernel(obj_batch, blank_minus_dark, dark_scan_mean, flat_indic
     return _fill_nan_pixels(sino_batch)
 
 
+def _reference_scan_to_host(scan):
+    """Bring a blank or dark scan to host numpy if it is a torch tensor.
+
+    The reference scans are small and are reduced on the host with numpy
+    functions, and numpy's functions cannot be trusted on a torch tensor:
+    np.mean, for one, forwards keyword names torch's mean does not take.
+    Converting once at entry keeps every downstream host computation on a
+    plain numpy array.  A numpy input passes through untouched."""
+    return scan.detach().cpu().numpy() if torch.is_tensor(scan) else scan
+
+
 def compute_sino_transmission(obj_scan, blank_scan, dark_scan, defective_pixel_array=(), batch_size=90,
                               devices=None):
     """
@@ -49,13 +60,20 @@ def compute_sino_transmission(obj_scan, blank_scan, dark_scan, defective_pixel_a
     - Any values resulting in `inf` or `NaN`
     - Any indices listed in the `defective_pixel_array` (if provided)
 
+    Accepted forms: the scans may be NumPy arrays or torch tensors (a tensor blank or dark scan is
+    brought to the host and reduced with NumPy).  The result is always a NumPy array on the host.
+    Any GPU use is internal -- the views are moved to a device one batch at a time and each batch's
+    result is brought back.  An array in the divided device form (a ``Shards`` container, as
+    produced by the multi-GPU projectors) is not accepted; gather it to the host first with
+    ``shards.gather()``.
+
     Args:
-        obj_scan (ndarray):
+        obj_scan (numpy array or tensor):
             A 3D object scan of shape (num_views, num_det_rows, num_det_channels).
-        blank_scan (ndarray):
+        blank_scan (ndarray or tensor):
             A 3D blank scan of shape (num_blank_scans, num_det_rows, num_det_channels).
             If `num_blank_scans > 1`, a pixel-wise mean will be computed.
-        dark_scan (ndarray):
+        dark_scan (ndarray or tensor):
             A 3D dark scan of shape (num_dark_scans, num_det_rows, num_det_channels).
             If `num_dark_scans > 1`, a pixel-wise mean will be computed.
         defective_pixel_array (ndarray or tuple, optional):
@@ -71,9 +89,17 @@ def compute_sino_transmission(obj_scan, blank_scan, dark_scan, defective_pixel_a
             there are none.
 
     Returns:
-        ndarray:
+        numpy.ndarray:
             The computed sinogram, with shape (num_views, num_det_rows, num_det_channels).
+
+    Raises:
+        TypeError: If any of the scans is in the divided device form.
     """
+    pipeline.reject_shards('compute_sino_transmission', obj_scan=obj_scan, blank_scan=blank_scan,
+                           dark_scan=dark_scan, defective_pixel_array=defective_pixel_array)
+    blank_scan = _reference_scan_to_host(blank_scan)
+    dark_scan = _reference_scan_to_host(dark_scan)
+
     # Blank/dark means (host); blank_minus_dark does not vary across batches, so precompute it once.
     blank_scan_mean = np.mean(blank_scan, axis=0, keepdims=True)
     dark_scan_mean = np.mean(dark_scan, axis=0, keepdims=True)
@@ -240,8 +266,14 @@ def correct_det_rotation(sino, det_rotation=0.0, batch_size=30, devices=None):
     """
     Correct sinogram data to account for detector rotation, using batch processing and GPU acceleration.
 
+    Accepted forms: `sino` may be a NumPy array or a torch tensor, and the result is always a NumPy
+    array on the host.  Any GPU use is internal -- the views are moved to a device one batch at a
+    time and each batch's result is brought back.  A sinogram in the divided device form (a
+    ``Shards`` container, as produced by the multi-GPU projectors) is not accepted; gather it to the
+    host first with ``shards.gather()``.
+
     Args:
-        sino (numpy.ndarray): Sinogram data with 3D shape (num_views, num_det_rows, num_det_channels).
+        sino (numpy array or tensor): Sinogram data with 3D shape (num_views, num_det_rows, num_det_channels).
         det_rotation (float, optional): tilt angle between the rotation axis and the detector columns in radians.
         batch_size (int): Number of views to process in each batch to avoid memory overload.
         devices (sequence or None): devices to spread the views over.  None (default) uses all
@@ -250,7 +282,11 @@ def correct_det_rotation(sino, det_rotation=0.0, batch_size=30, devices=None):
 
     Returns:
         numpy.ndarray: The corrected sinogram, with the same shape as `sino`.
+
+    Raises:
+        TypeError: If `sino` is in the divided device form.
     """
+    pipeline.reject_shards('correct_det_rotation', sino=sino)
 
     return pipeline.map_view_batches(sino, lambda b: _rotation_kernel(b, det_rotation), batch_size,
                                      devices=pipeline.permitted_devices(devices))
@@ -383,6 +419,12 @@ def downsample_view_data(obj_scan, blank_scan, dark_scan, downsample_factor, def
     This is done for the object, blank_scan, and dark_scan data,
     and the defective_pixel_array is updated to reflect the new pixel grid.
 
+    Accepted forms: the scans may be NumPy arrays or torch tensors, and the returned scans are
+    always NumPy arrays on the host.  Any GPU use is internal -- the object scan's views are moved
+    to a device one batch at a time and each batch's result is brought back.  An array in the
+    divided device form (a ``Shards`` container, as produced by the multi-GPU projectors) is not
+    accepted; gather it to the host first with ``shards.gather()``.
+
     Args:
         obj_scan (ndarray): A stack of sinograms. 3D NumPy array of shape (num_views, num_det_rows, num_det_channels).
         blank_scan (ndarray): Blank scan(s). 3D NumPy array of shape (num_blank_views, num_det_rows, num_det_channels).
@@ -400,11 +442,19 @@ def downsample_view_data(obj_scan, blank_scan, dark_scan, downsample_factor, def
 
     Returns:
         tuple:
-        - **obj_scan** (ndarray): Downsampled object scan. Shape (num_views, new_rows, new_cols).
-        - **blank_scan** (ndarray): Downsampled blank scan(s). Shape (num_blank_views, new_rows, new_cols).
-        - **dark_scan** (ndarray): Downsampled dark scan(s). Shape (num_dark_views, new_rows, new_cols).
-        - **defective_pixel_array** (ndarray): Updated defective pixel coordinates. Shape (N_def, 2).
+        - **obj_scan** (numpy.ndarray): Downsampled object scan. Shape (num_views, new_rows, new_cols).
+        - **blank_scan** (numpy.ndarray): Downsampled blank scan(s). Shape (num_blank_views, new_rows, new_cols).
+        - **dark_scan** (numpy.ndarray): Downsampled dark scan(s). Shape (num_dark_views, new_rows, new_cols).
+        - **defective_pixel_array** (numpy.ndarray): Updated defective pixel coordinates. Shape (N_def, 2).
+
+    Raises:
+        TypeError: If any of the scans is in the divided device form.
     """
+    pipeline.reject_shards('downsample_view_data', obj_scan=obj_scan, blank_scan=blank_scan,
+                           dark_scan=dark_scan, defective_pixel_array=defective_pixel_array)
+    blank_scan = _reference_scan_to_host(blank_scan)
+    dark_scan = _reference_scan_to_host(dark_scan)
+
     assert len(downsample_factor) == 2, 'factor({}) needs to be of len 2'.format(downsample_factor)
     assert (downsample_factor[0] >= 1 and downsample_factor[1] >= 1), 'factor({}) along each dimension should be greater or equal to 1'.format(downsample_factor)
 
@@ -429,8 +479,16 @@ def scan_to_sino(obj_scan, blank_scan, dark_scan, defective_pixel_array=(),
 
     The steps run as one fused kernel per view batch, view-sharded across devices.
 
+    Accepted forms: the scans may be NumPy arrays or torch tensors (a tensor blank or dark scan is
+    brought to the host and reduced with NumPy).  The result is always a NumPy array on the host.
+    Any GPU use is internal -- the views are moved to a device one batch at a time and each batch's
+    result is brought back.  An array in the divided device form (a ``Shards``
+    container, as produced by the multi-GPU projectors) is not accepted; gather it to the host first
+    with ``shards.gather()``.
+
     Args:
-        obj_scan, blank_scan, dark_scan (ndarray): cropped scans (object batched along axis 0).
+        obj_scan (numpy array or tensor): cropped object scan, batched along axis 0 (views).
+        blank_scan, dark_scan (ndarray): cropped blank and dark scans.
         defective_pixel_array (ndarray or tuple): shared defective-pixel (row, col) coords, or ().
         downsample_factor (tuple[int, int]): detector row/channel downsample; (1, 1) skips downsampling.
         det_rotation (float): detector rotation in radians; 0 skips the rotation.
@@ -441,7 +499,15 @@ def scan_to_sino(obj_scan, blank_scan, dark_scan, defective_pixel_array=(),
 
     Returns:
         numpy.ndarray: the sinogram, shape (num_views, num_det_rows, num_det_channels).
+
+    Raises:
+        TypeError: If any of the scans is in the divided device form.
     """
+    pipeline.reject_shards('scan_to_sino', obj_scan=obj_scan, blank_scan=blank_scan,
+                           dark_scan=dark_scan, defective_pixel_array=defective_pixel_array)
+    blank_scan = _reference_scan_to_host(blank_scan)
+    dark_scan = _reference_scan_to_host(dark_scan)
+
     devices = pipeline.permitted_devices(devices)
     obj_flat_indices = new_size1 = new_size2 = block_shape = None
     do_downsample = downsample_factor[0] * downsample_factor[1] > 1
@@ -1003,7 +1069,7 @@ def finalize_model(sino, required_params, optional_params, *, auto_crop=False, s
     return sino, model
 
 
-def estimate_sino_view_offset(ct_model, sino, direct_recon):
+def estimate_sino_view_offset(ct_model, sino, recon_direct):
     """
     Estimate per-view 2D shifts for a sinogram.
 
@@ -1017,7 +1083,7 @@ def estimate_sino_view_offset(ct_model, sino, direct_recon):
     Args:
         ct_model (mt.TomographyModel): A CT model object that defined the CT geometry.
         sino (numpy array or tensor): 3D sinogram data with shape (num_views, num_det_rows, num_det_channels).
-        direct_recon (numpy array or tensor): A preliminary 3D reconstruction of the sinogram.
+        recon_direct (numpy array or tensor): A preliminary 3D reconstruction of the sinogram.
 
     Returns:
         estimated_shifts (numpy.array): A (num_views, 2) array of per-view shift (y, x) in pixels.
@@ -1028,11 +1094,11 @@ def estimate_sino_view_offset(ct_model, sino, direct_recon):
 
     # Verify the input recon shape
     recon_shape = ct_model.get_params('recon_shape')
-    if tuple(direct_recon.shape) != tuple(recon_shape):
+    if tuple(recon_direct.shape) != tuple(recon_shape):
         raise ValueError("Input recon shape does not match ct_model's recon shape.")
 
     # Forward project the reconstruction
-    sino_from_recon = ct_model.forward_project(direct_recon)
+    sino_from_recon = ct_model.forward_project(recon_direct)
 
     # Apply a high-pass filter to sinogram and forward projection of the reconstruction
     filtered_sino = sino_high_pass_filtering(sino)
@@ -1136,7 +1202,7 @@ def _translate_views_bilinear(sino, shifts):
     return out
 
 
-def align_sino_views(ct_model, sino, direct_recon):
+def align_sino_views(ct_model, sino, recon_direct):
     """
     Align each sinogram view using estimated per-view shifts.
 
@@ -1150,13 +1216,13 @@ def align_sino_views(ct_model, sino, direct_recon):
     Args:
         ct_model (mt.TomographyModel): A CT model object that defined the CT geometry.
         sino (numpy array or tensor): 3D sinogram data with shape (num_views, num_det_rows, num_det_channels).
-        direct_recon (numpy array or tensor): A preliminary 3D reconstruction of the sinogram.
+        recon_direct (numpy array or tensor): A preliminary 3D reconstruction of the sinogram.
 
     Returns:
         numpy array: Aligned sinogram with the same shape as the input sinogram (num_views, num_det_rows, num_det_channels).
     """
     # Estimate per-view shift of the sinogram
-    estimated_shifts = estimate_sino_view_offset(ct_model, sino, direct_recon)
+    estimated_shifts = estimate_sino_view_offset(ct_model, sino, recon_direct)
 
     # Align each view of the sinogram using estimated shifts
     return _translate_views_bilinear(sino, estimated_shifts).cpu().numpy()
@@ -1524,6 +1590,12 @@ def correct_zinger_pixels(sino, zinger_pixel_ratio=0.1, num_passes=3, batch_size
     their finite 3x3 in-view neighbors in ``num_passes`` fill passes.  Runs per view-batch, so device
     memory stays bounded.
 
+    Accepted forms: `sino` may be a NumPy array or a torch tensor, and the result is always a NumPy
+    array on the host.  Any GPU use is internal -- the views are moved to a device one batch at a
+    time and each batch's result is brought back.  A sinogram in the divided device form (a
+    ``Shards`` container, as produced by the multi-GPU projectors) is not accepted; gather it to the
+    host first with ``shards.gather()``.
+
     Args:
         sino (numpy array or tensor): Background-corrected 3D sinogram of shape
             (num_views, num_det_rows, num_det_channels).
@@ -1538,7 +1610,12 @@ def correct_zinger_pixels(sino, zinger_pixel_ratio=0.1, num_passes=3, batch_size
     Returns:
         numpy.ndarray: Sinogram with zinger pixels corrected; any pixel still NaN after ``num_passes``
         is set to 0 (with a warning).
+
+    Raises:
+        TypeError: If `sino` is in the divided device form.
     """
+    pipeline.reject_shards('correct_zinger_pixels', sino=sino)
+
     # The threshold is computed once, on the whole sinogram, BEFORE the views are split across
     # devices.  A per-shard threshold would be estimated from a different subsample on each device,
     # so the result would depend on the device count.

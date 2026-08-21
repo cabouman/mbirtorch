@@ -118,7 +118,7 @@ If you have no GPU, all processing is done on the CPU.
 
 If your reconstruction is still too large, then for a parallel beam system you can select a subset of rows of your
 sinogram, reconstruct them separately, and then concatenate them at the end.  If you have a cone beam system, you can
-reconstruct a subset of the central slices or use :meth:`~mbirtorch.TomographyModel.split_sino_recon`.  For cone beam you can
+reconstruct a subset of the central slices or use :meth:`~mbirtorch.TomographyModel.recon_split_sino`.  For cone beam you can
 also make sure axial padding is disabled (``axial_pad_fraction=0``, the default -- see
 :ref:`ConeBeamModelDocs`) if that padding is what pushes you over the memory limit.
 
@@ -200,7 +200,7 @@ Positive values of ``offset`` will shift the region down relative to the detecto
 This is useful if you would like to reconstruct the top or bottom half of a conebeam reconstruction in order to save memory.
 
 
-Q: What are the differences between (iterative) recon and fbp_recon/fdk_recon?
+Q: What are the differences between (iterative) recon and recon_fbp/recon_fdk?
 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 A: The primary reconstruction method in MBIRTorch is iterative reconstruction (``mbirtorch.TomographyModel.recon``)
@@ -208,7 +208,7 @@ using a Bayesian formulation that balances a data-fitting loss function with a p
 reduces noise while maintaining sharp edges. This approach updates the reconstruction multiple times in order to
 minimize the sum of these two loss functions.
 
-In contrast, FBP (``mbirtorch.ParallelBeamModel.fbp_recon``) and FDK (``mbirtorch.ConeBeamModel.fdk_recon``) are direct
+In contrast, FBP (``mbirtorch.ParallelBeamModel.recon_fbp``) and FDK (``mbirtorch.ConeBeamModel.recon_fdk``) are direct
 methods, in which the sinograms are filtered and then backprojected once to form the reconstruction. In this case,
 there is no prior information and no attempt to denoise the sinogram or the reconstruction.
 

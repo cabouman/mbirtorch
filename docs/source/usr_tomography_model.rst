@@ -19,7 +19,7 @@ Reconstruction and Projection
 
 .. automethod:: mbirtorch.TomographyModel.recon
 
-.. automethod:: mbirtorch.TomographyModel.direct_recon
+.. automethod:: mbirtorch.TomographyModel.recon_direct
 
 .. automethod:: mbirtorch.TomographyModel.prox_map
 
@@ -27,7 +27,7 @@ Reconstruction and Projection
 
 .. automethod:: mbirtorch.TomographyModel.back_project
 
-.. automethod:: mbirtorch.TomographyModel.split_sino_recon
+.. automethod:: mbirtorch.TomographyModel.recon_split_sino
 
 .. automethod:: mbirtorch.TomographyModel.recon_plastic_metal
 

@@ -30,7 +30,7 @@ def nrmse(recon, phantom):
 # Case 1: plenty of views (128).  FBP is serviceable; MBIR is cleaner.
 phantom, sinogram, angles = make_data(num_views=128)
 model = mbirtorch.ParallelBeamModel(sinogram.shape, angles)
-fbp_many = model.direct_recon(sinogram)
+fbp_many = model.recon_direct(sinogram)
 mbir_many, _ = model.recon(sinogram)
 print(f'128 views:  FBP error {nrmse(fbp_many, phantom):.3f},  '
       f'MBIR error {nrmse(mbir_many, phantom):.3f}')
@@ -38,7 +38,7 @@ print(f'128 views:  FBP error {nrmse(fbp_many, phantom):.3f},  '
 # Case 2: very few views (16).  FBP produces streaks; MBIR holds up.
 phantom, sinogram, angles = make_data(num_views=16)
 model = mbirtorch.ParallelBeamModel(sinogram.shape, angles)
-fbp_sparse = model.direct_recon(sinogram)
+fbp_sparse = model.recon_direct(sinogram)
 mbir_sparse, mbir_sparse_dict = model.recon(sinogram)
 print(f'16 views:   FBP error {nrmse(fbp_sparse, phantom):.3f},  '
       f'MBIR error {nrmse(mbir_sparse, phantom):.3f}')

@@ -429,7 +429,7 @@ class TranslationModel(TomographyModel):
                                                output_sharded=output_sharded,
                                                row_weight=weight_t)
 
-    def fdk_recon(self, sinogram, filter_name="ramp", output_sharded=False):
+    def recon_fdk(self, sinogram, filter_name="ramp", output_sharded=False):
         """
         Perform FDK reconstruction: standard filtering, then the exact adjoint
         of the forward projector as the backprojection.
@@ -451,11 +451,11 @@ class TranslationModel(TomographyModel):
         recon = self.back_project(filtered_sinogram, output_sharded=True)
         return recon if output_sharded else self._gather_recon(recon)
 
-    def direct_recon(self, sinogram, filter_name="ramp", output_sharded=False):
+    def recon_direct(self, sinogram, filter_name="ramp", output_sharded=False):
         """Direct reconstruction by the FDK algorithm; equivalent to
-        :meth:`fdk_recon`.  See :meth:`TomographyModel.direct_recon` for the
+        :meth:`recon_fdk`.  See :meth:`TomographyModel.recon_direct` for the
         argument and return conventions."""
-        return self.fdk_recon(sinogram, filter_name=filter_name,
+        return self.recon_fdk(sinogram, filter_name=filter_name,
                               output_sharded=output_sharded)
 
     def direct_filter(self, sinogram, filter_name="ramp", output_sharded=False):

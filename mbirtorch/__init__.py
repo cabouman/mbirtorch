@@ -26,8 +26,8 @@ _os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR",
                        _os.path.expanduser("~/.mbirtorch/torch_cache"))
 _os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
 
-from .parallel_beam import ParallelBeamModel
-from .cone_beam import ConeBeamModel
+from .parallel_beam import ParallelBeamModel, recon_simple_parallel
+from .cone_beam import ConeBeamModel, recon_simple_cone
 from .translation_model import TranslationModel
 from .multiaxis_parallel import MultiAxisParallelModel, MultiAxisParallelBeamModel
 from .denoising import QGGMRFDenoiser
@@ -62,6 +62,7 @@ from .memory_stats import get_memory_stats
 __all__ = [
     "ParallelBeamModel", "ConeBeamModel", "TranslationModel",
     "MultiAxisParallelModel", "TomographyModel", "QGGMRFDenoiser",
+    "recon_simple_parallel", "recon_simple_cone",
     "TorchProjector", "forward_project_differentiable",
     "back_project_differentiable", "gen_weights", "gen_weights_mar",
     "median_filter3d", "download_and_extract", "build_model",

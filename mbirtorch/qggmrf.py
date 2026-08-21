@@ -198,7 +198,7 @@ def qggmrf_loss(full_recon, qggmrf_params):
     """
     Computes the loss for the qGGMRF prior for a given recon.  This is meant
     only for relatively small recons for debugging and demo purposes (the
-    verbose compute_prior_loss path of vcd_recon); it runs host-side in numpy
+    verbose compute_prior_loss path of _vcd_recon); it runs host-side in numpy
     on the gathered volume.
 
     Args:

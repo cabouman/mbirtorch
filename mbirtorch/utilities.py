@@ -954,7 +954,7 @@ def stitch_arrays(array_list, overlap, axis=2, ramp_overlap=None):
 
     # Build the blend weights and assemble on the inputs' OWN array module so the result stays where
     # the inputs live: host (NumPy) arrays stitch on the HOST (no gather to a single device), device
-    # tensors stitch on-device.  split_sino_recon relies on this -- it passes host halves, so the full
+    # tensors stitch on-device.  recon_split_sino relies on this -- it passes host halves, so the full
     # volume is never reassembled on one GPU (which would defeat the half-at-a-time memory saving and
     # OOM for a recon too large to fit whole).  float32 weights avoid upcasting a float32 recon to f64.
     is_torch = any(isinstance(a, torch.Tensor) for a in array_list)

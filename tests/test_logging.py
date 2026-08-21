@@ -1,6 +1,6 @@
 """Tests for the run logging: the log file, the in-memory copy in
 recon_dict, console silencing, and the merged logs of the composite runs
-(split_sino_recon and recon_plastic_metal).  The behavior matches mbirjax.
+(recon_split_sino and recon_plastic_metal).  The behavior matches mbirjax.
 """
 
 import logging
@@ -371,13 +371,13 @@ def test_merge_log_files_no_parts_writes_nothing(tmp_path):
     assert not os.path.exists(merged)
 
 
-def test_split_sino_recon_merges_half_logs(tmp_path, small_cone_case):
+def test_recon_split_sino_merges_half_logs(tmp_path, small_cone_case):
     model, sino = small_cone_case
     logpath = os.path.join(str(tmp_path), 'split.log')
-    model.split_sino_recon(sino, half_overlap=3, max_iterations=1, logfile_path=logpath)
+    model.recon_split_sino(sino, half_overlap=3, max_iterations=1, logfile_path=logpath)
     content = open(logpath).read()
-    assert '======== split_sino_recon: top half ========' in content
-    assert '======== split_sino_recon: bottom half ========' in content
+    assert '======== recon_split_sino: top half ========' in content
+    assert '======== recon_split_sino: bottom half ========' in content
     assert content.count('After iteration') >= 2
     # The merged file holds each half's whole log, not just its header.
     assert content.count('MBIRTorch Version') == 2

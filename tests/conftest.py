@@ -38,7 +38,7 @@ def redirect_default_log_location(tmp_path_factory):
     '~/.mbirtorch' and hands every other path to the real expanduser, so
     HOME itself is untouched and torch's caches -- expensive to rebuild --
     stay where they are.  And it patches the expansion rather than the
-    logging setup, because the composite runs (split_sino_recon,
+    logging setup, because the composite runs (recon_split_sino,
     recon_plastic_metal) expand the path themselves to name their per-part
     temp files; one patch covers every site that turns a '~' into a real
     directory.

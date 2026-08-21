@@ -156,8 +156,14 @@ def BH_correction(sino, alpha, batch_size=64, devices=None):
 
     It processes the sinogram in batches of views for memory efficiency.
 
+    Accepted forms: `sino` may be a NumPy array or a torch tensor, and the result is always a NumPy
+    array on the host.  Any GPU use is internal -- the views are moved to a device one batch at a
+    time and each batch's result is brought back.  A sinogram in the divided device form (a
+    ``Shards`` container, as produced by the multi-GPU projectors) is not accepted; gather it to the
+    host first with ``shards.gather()``.
+
     Args:
-        sino (ndarray of shape (views, rows, cols)):
+        sino (numpy array or tensor, of shape (views, rows, cols)):
             Input sinogram to correct.
         alpha (list or array of floats):
             Coefficients for the polynomial correction. The k-th term corresponds to sino^(k+1).
@@ -170,14 +176,19 @@ def BH_correction(sino, alpha, batch_size=64, devices=None):
             default device when there are none.
 
     Returns:
-        corrected_sino: ndarray of shape (views, rows, cols)
+        corrected_sino: numpy.ndarray of shape (views, rows, cols)
             Beam hardening corrected sinogram.
+
+    Raises:
+        TypeError: If `sino` is in the divided device form.
 
     Example:
         >>> import mbirtorch.preprocess as mtp
         >>> alpha = [1.0, 0.2, 0.1]  # Correction: sino + 0.2 * sino^2 + 0.1 * sino^3
         >>> corrected_sino = mtp.BH_correction(sino, alpha)
     """
+    pipeline.reject_shards('BH_correction', sino=sino)
+
     alpha = np.asarray(alpha)
 
     # Per-view-batch polynomial evaluation, driven through the shared pipeline driver.  The

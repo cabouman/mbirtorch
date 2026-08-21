@@ -127,7 +127,7 @@ def test_cone_hessian(golden, cone_model):
 @pytest.mark.goldens
 @cone_golden
 def test_cone_fdk(golden, cone_model):
-    out = cone_model.fdk_recon(golden["cone_sino"])
+    out = cone_model.recon_fdk(golden["cone_sino"])
     err = _rel_max(out, golden["cone_fdk"])
     print(f"cone fdk rel_max = {err:.2e}")
     assert err < 1e-3
@@ -219,7 +219,7 @@ def test_helical_full_forward(golden, helical_model):
 @hel_golden
 def test_helical_fdk(golden, helical_model):
     # Exercises the helical z-weight (nonuniform per-slice coverage).
-    out = helical_model.fdk_recon(golden["chel_sino"])
+    out = helical_model.recon_fdk(golden["chel_sino"])
     err = _rel_max(out, golden["chel_fdk"])
     print(f"helical fdk rel_max = {err:.2e}")
     assert err < 1e-3
@@ -273,7 +273,7 @@ def test_curved_full_forward(golden, curved_model):
 
 @hel_golden
 def test_curved_fdk(golden, curved_model):
-    out = curved_model.fdk_recon(golden["ccurv_sino"])
+    out = curved_model.recon_fdk(golden["ccurv_sino"])
     err = _rel_max(out, golden["ccurv_fdk"])
     print(f"curved fdk rel_max = {err:.2e}")
     assert err < 1e-3

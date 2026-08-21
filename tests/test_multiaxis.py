@@ -185,7 +185,7 @@ def test_multiaxis_full_forward(golden, ma_model):
 @pytest.mark.goldens
 @ma_golden
 def test_multiaxis_fbp(golden, ma_model):
-    out = ma_model.fbp_recon(golden["ma_sino"])
+    out = ma_model.recon_fbp(golden["ma_sino"])
     err = _rel_max(out, golden["ma_fbp"])
     print(f"multiaxis fbp rel_max = {err:.2e}")
     assert err < 1e-3

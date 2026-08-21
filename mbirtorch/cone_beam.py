@@ -750,7 +750,7 @@ class ConeBeamModel(TomographyModel):
         coverage = np.sum(visible, axis=1)
         return np.where(coverage > 0, num_views / np.maximum(coverage, 1), 0.0)
 
-    def fdk_recon(self, sinogram, filter_name="ramp", output_sharded=False):
+    def recon_fdk(self, sinogram, filter_name="ramp", output_sharded=False):
         """
         Perform FDK reconstruction: standard filtering, then the exact adjoint
         of the forward projector as the backprojection.
@@ -785,7 +785,7 @@ class ConeBeamModel(TomographyModel):
         # when already placed; a single device is the trivial 1-shard case).
         # The pipeline then stays on-device throughout -- fdk_filter then
         # back_project, both output_sharded=True (zero host transfer) --
-        # exactly like ParallelBeamModel.fbp_recon.
+        # exactly like ParallelBeamModel.recon_fbp.
         sinogram = self._shard_sinogram(sinogram)
         filtered_sinogram = self.fdk_filter(sinogram, filter_name=filter_name,
                                             output_sharded=True)
@@ -795,18 +795,18 @@ class ConeBeamModel(TomographyModel):
             recon = self.helical_fdk_z_weight(recon, sinogram)
         return recon if output_sharded else self._gather_recon(recon)
 
-    def direct_recon(self, sinogram, filter_name="ramp", output_sharded=False):
+    def recon_direct(self, sinogram, filter_name="ramp", output_sharded=False):
         """Direct reconstruction by the FDK algorithm; equivalent to
-        :meth:`fdk_recon`.  See :meth:`TomographyModel.direct_recon` for the
+        :meth:`recon_fdk`.  See :meth:`TomographyModel.recon_direct` for the
         argument and return conventions."""
-        return self.fdk_recon(sinogram, filter_name=filter_name,
+        return self.recon_fdk(sinogram, filter_name=filter_name,
                               output_sharded=output_sharded)
 
     def direct_filter(self, sinogram, filter_name="ramp", output_sharded=False):
         return self.fdk_filter(sinogram, filter_name=filter_name,
                                output_sharded=output_sharded)
 
-    def split_sino_recon(self, sino, weights=None, half_overlap=5, init_recon=None, max_iterations=15, stop_threshold_change_pct=0.2,
+    def recon_split_sino(self, sino, weights=None, half_overlap=5, init_recon=None, max_iterations=15, stop_threshold_change_pct=0.2,
                          first_iteration=0, compute_prior_loss=False, logfile_path='~/.mbirtorch/logs/recon.log', print_logs=True,
                          align_split_grid=False):
         """
@@ -863,7 +863,7 @@ class ConeBeamModel(TomographyModel):
             ...                                 angles=np.linspace(0, np.pi, 180),
             ...                                 source_detector_dist=1000.0,
             ...                                 source_iso_dist=500.0)
-            >>> recon, recon_info = model.split_sino_recon(sino, half_overlap=4)
+            >>> recon, recon_info = model.recon_split_sino(sino, half_overlap=4)
         """
         from . import _sharding
         from .utilities import copy_ct_model, stitch_arrays, merge_log_files
@@ -883,7 +883,7 @@ class ConeBeamModel(TomographyModel):
         if (isinstance(sino, _sharding.Shards)
                 or isinstance(weights, _sharding.Shards)):
             raise ValueError(
-                'split_sino_recon does not accept a sinogram or weights '
+                'recon_split_sino does not accept a sinogram or weights '
                 'in sharded form.  Pass the host (numpy or tensor) sinogram and the '
                 'host weights.')
         if not (hasattr(sino, "ndim") and sino.ndim == 3):
@@ -1088,7 +1088,7 @@ class ConeBeamModel(TomographyModel):
                                                              half_logfile_path=half_log_paths[1])
         finally:
             if log_path:
-                merge_log_files(log_path, zip(('split_sino_recon: top half', 'split_sino_recon: bottom half'),
+                merge_log_files(log_path, zip(('recon_split_sino: top half', 'recon_split_sino: bottom half'),
                                               half_log_paths))
 
         # -------- Stitch together top and bottom reconstructions --------
@@ -1125,3 +1125,56 @@ class ConeBeamModel(TomographyModel):
                                             'split_cut_mismatch_slices': split_cut_mismatch}, }
 
         return recon_full, recon_full_dict
+
+
+def recon_simple_cone(sinogram, angles, source_detector_dist, source_iso_dist,
+                      weights=None, sharpness=1.0, max_iterations=15):
+    """
+    Functional interface for a basic cone-beam reconstruction.
+
+    This builds a :class:`ConeBeamModel` with default geometry parameters and
+    reconstructs in one call.  For anything beyond the arguments here -- a
+    helical scan, a curved detector, changing the voxel size or the recon
+    shape, choosing devices, controlling the stopping rule or the logs,
+    restarting from a previous reconstruction -- create the model yourself and
+    call :meth:`TomographyModel.recon`; see :class:`ConeBeamModel` for the
+    geometry arguments.
+
+    Args:
+        sinogram (numpy or tensor): 3D sinogram data with shape
+            (num_views, num_det_rows, num_det_channels).
+        angles (numpy or tensor): 1D array of projection angles in radians, one
+            per view.
+        source_detector_dist (float): distance from source to detector in ALU.
+        source_iso_dist (float): distance from source to iso (the center of
+            rotation) in ALU.
+        weights (numpy or tensor, optional): 3D positive weights with the same
+            shape as the sinogram.  Defaults to None (all 1s).
+        sharpness (float, optional): higher values give crisper edges and more
+            noise; lower values give softer edges and less noise.  Defaults
+            to 1.0.
+        max_iterations (int, optional): maximum number of iterations.  Defaults
+            to 15.  Use max_iterations=0 for a filtered back projection scaled
+            to fit the data.
+
+    Returns:
+        (recon, recon_dict): the reconstruction volume, and a dict
+        with entries 'recon_params' (per-iteration traces and settings),
+        'recon_log' (the run's log text), 'notes', and
+        'model_params' (a snapshot of the model parameters).
+
+    Example:
+        >>> import numpy as np, mbirtorch
+        >>> angles = np.linspace(0, 2 * np.pi, 180, endpoint=False)
+        >>> recon, recon_dict = mbirtorch.recon_simple_cone(
+        ...     sinogram, angles, source_detector_dist=600, source_iso_dist=400)
+    """
+    # A torch sinogram or torch angles are converted here, so that the model
+    # gets the same plain shape tuple and host angles either way.
+    if torch.is_tensor(angles):
+        angles = angles.detach().cpu().numpy()
+    model = ConeBeamModel(tuple(sinogram.shape), angles,
+                          source_detector_dist=source_detector_dist,
+                          source_iso_dist=source_iso_dist)
+    model.set_params(sharpness=sharpness)
+    return model.recon(sinogram, weights=weights, max_iterations=max_iterations)

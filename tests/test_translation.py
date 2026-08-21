@@ -139,7 +139,7 @@ def test_translation_full_forward(golden, tct_model):
 @pytest.mark.goldens
 @tct_golden
 def test_translation_fdk(golden, tct_model):
-    out = tct_model.fdk_recon(golden["tct_sino"])
+    out = tct_model.recon_fdk(golden["tct_sino"])
     err = _rel_max(out, golden["tct_fdk"])
     print(f"translation fdk rel_max = {err:.2e}")
     assert err < 1e-3

@@ -17,4 +17,11 @@ Available on PyPI via
 ```bash
 pip install mbirtorch
 ```
+
+Reconstruct in one line:
+```python
+import mbirtorch
+recon, recon_dict = mbirtorch.recon_simple_parallel(sinogram, angles)
+```
+
 Full documentation at [https://mbirtorch.readthedocs.io/](https://mbirtorch.readthedocs.io/)

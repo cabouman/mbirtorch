@@ -141,7 +141,7 @@ class ParameterHandler:
         keeps writing to whatever file it opened, even after that file has
         been renamed or deleted, and on Windows it would block the delete
         outright.  So the composite runs that merge and then delete the log of
-        each part (split_sino_recon, recon_plastic_metal) need each part's
+        each part (recon_split_sino, recon_plastic_metal) need each part's
         file closed first.
 
         The in-memory buffer handler is left alone, so the run's log text is
@@ -279,7 +279,7 @@ class ParameterHandler:
           ADDED as a new recompile-flagged parameter (how the geometry's own
           parameters, e.g. ``angles``, enter).
         - No validity check runs here.  Validation is deferred to
-          reconstruction entry (``verify_valid_params`` in ``vcd_recon``), so
+          reconstruction entry (``verify_valid_params`` in ``_vcd_recon``), so
           multi-step geometry changes (set a new sinogram shape, then call
           ``auto_set_recon_geometry``) work without a transiently-inconsistent
           state raising.

@@ -331,7 +331,7 @@ class LedgerPlan:
     positivity: bool = False
     helical: bool = False
     # Whether the hessian back-projects at the ROR-masked index set rather
-    # than the full grid.  vcd_recon does; a direct call to the public method
+    # than the full grid.  _vcd_recon does; a direct call to the public method
     # does not, and neither does an unmasked model.
     hessian_masked: bool = False
     # ── knobs and model choices ──────────────────────────────────────────────
@@ -790,7 +790,7 @@ def estimate_peak_device_bytes(plan):
     # does not, the internally built all-ones sinogram is the only one.  It is
     # charged whenever either exists.
     # WHEN the weights array exists differs from WHETHER it exists.  A
-    # supplied weights array is placed at the top of vcd_recon, so it is
+    # supplied weights array is placed at the top of _vcd_recon, so it is
     # resident from the direct recon onward.  The internally built all-ones
     # array is created inside the hessian block, so on an unweighted run
     # nothing weights-shaped exists before that.  Measurement confirms both:

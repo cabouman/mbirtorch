@@ -102,7 +102,7 @@ class TomographyModel(ParameterHandler):
     """
     Base class for all tomography geometries.  It provides projection
     (:meth:`forward_project`, :meth:`back_project`), reconstruction
-    (:meth:`recon`, :meth:`prox_map`, :meth:`direct_recon`), device
+    (:meth:`recon`, :meth:`prox_map`, :meth:`recon_direct`), device
     configuration (:meth:`configure_devices`), and parameter handling.
     Users construct a geometry subclass (for example ``ConeBeamModel`` or
     ``ParallelBeamModel``) rather than this class.
@@ -176,7 +176,7 @@ class TomographyModel(ParameterHandler):
         # reads them back.
         self.last_memory_ledger = None
         self.last_memory_calibration = None
-        # The per-device thread pool is owned by vcd_recon and is None
+        # The per-device thread pool is owned by _vcd_recon and is None
         # outside a recon.
         self._per_device_pool = None
 
@@ -310,11 +310,11 @@ class TomographyModel(ParameterHandler):
         summation order, and measured peaks."""
         return band_cols
 
-    def direct_recon(self, sinogram, filter_name=None, output_sharded=False):
+    def recon_direct(self, sinogram, filter_name=None, output_sharded=False):
         """
         Do a direct (non-iterative) reconstruction, typically using a form of
         filtered backprojection.  The implementation details are geometry
-        specific, and direct_recon may not be available for all geometries.
+        specific, and recon_direct may not be available for all geometries.
 
         Args:
             sinogram (numpy or tensor): 3D sinogram data with shape
@@ -340,7 +340,7 @@ class TomographyModel(ParameterHandler):
         """
         raise NotImplementedError
 
-    def split_sino_recon(self, sino, weights=None, half_overlap=5, init_recon=None,
+    def recon_split_sino(self, sino, weights=None, half_overlap=5, init_recon=None,
                          max_iterations=15, stop_threshold_change_pct=0.2,
                          first_iteration=0, compute_prior_loss=False,
                          logfile_path='~/.mbirtorch/logs/recon.log', print_logs=True,
@@ -351,7 +351,7 @@ class TomographyModel(ParameterHandler):
         reconstructing each half separately, and stitching the results.  The
         output is approximately equal to the output of :meth:`recon`.
 
-        The split arithmetic is geometry specific, and split_sino_recon may
+        The split arithmetic is geometry specific, and recon_split_sino may
         not be available for all geometries; geometries without an
         implementation raise ``NotImplementedError``.
 
@@ -384,7 +384,7 @@ class TomographyModel(ParameterHandler):
             result's dictionary (no per-half entries).
         """
         raise NotImplementedError(
-            f'split_sino_recon is not implemented for {type(self).__name__}.')
+            f'recon_split_sino is not implemented for {type(self).__name__}.')
 
     def recon_plastic_metal(self, sino, weights, num_BH_iterations=3, num_constraint_update_iter=10,
                             stop_threshold_change_pct=0.2, num_metal=1, order=3, alpha=1, beta=0.002,
@@ -398,8 +398,8 @@ class TomographyModel(ParameterHandler):
         The method alternates between adaptive beam hardening correction (via `correct_sino_plastic_metal`)
         and reconstruction, refining the image over several iterations to suppress metal-induced artifacts.
 
-        The method works on any geometry that provides `direct_recon` and `recon`.  For a cone
-        beam model the reconstruction passes use `split_sino_recon`; for every other geometry they
+        The method works on any geometry that provides `recon_direct` and `recon`.  For a cone
+        beam model the reconstruction passes use `recon_split_sino`; for every other geometry they
         use `recon`.  It has been used mainly with cone beam models.
 
         Args:
@@ -479,8 +479,8 @@ class TomographyModel(ParameterHandler):
         # full sinogram is never device-resident); otherwise use the standard recon with a device-form
         # output so the next correction consumes it with no gather/re-upload.
         if ('cone' in self.get_params('geometry_type')
-                and type(self).split_sino_recon is not TomographyModel.split_sino_recon):
-            recon_function = self.split_sino_recon
+                and type(self).recon_split_sino is not TomographyModel.recon_split_sino):
+            recon_function = self.recon_split_sino
         else:
             recon_function = functools.partial(self.recon, output_sharded=True)
 
@@ -498,7 +498,7 @@ class TomographyModel(ParameterHandler):
         # Continue with beam hardening and segmentation
         if verbose >= 1:
             print("\n************ Perform initial FDK reconstruction  **************")
-        recon = self.direct_recon(sino, output_sharded=True)
+        recon = self.recon_direct(sino, output_sharded=True)
 
         # Each BH pass logs to its own temp file; merged into logfile_path afterward
         # (in finally, so any pass logs written before a failure are preserved).
@@ -576,7 +576,7 @@ class TomographyModel(ParameterHandler):
 
     def _band_pool(self, n):
         """The thread pool for a sharded projection's per-device fan-outs:
-        reuse the recon-loop pool when one is active (vcd_recon creates it
+        reuse the recon-loop pool when one is active (_vcd_recon creates it
         once for the whole loop), else a private pool for this call."""
         if self._per_device_pool is not None:
             return contextlib.nullcontext(self._per_device_pool)
@@ -1073,7 +1073,7 @@ class TomographyModel(ParameterHandler):
                              **call_arrays):
         """The modeled per-device peak for one candidate device list; None
         means the current placement.  Device-agnostic, so the rule can be
-        tested on CPU.  ``workload`` can be used to specify the function: `direct_recon` vs `recon`.
+        tested on CPU.  ``workload`` can be used to specify the function: `recon_direct` vs `recon`.
         """
 
         devices = list(self.sino_placement.devices if devices is None
@@ -1113,7 +1113,7 @@ class TomographyModel(ParameterHandler):
         the candidate ORDER comes from the widening speed floors
         (:meth:`_speed_ordered_candidates`), and capacity still wins when
         nothing admitted fits.  Explicit layouts and process-wide pins skip
-        the floors.  split_sino_recon's halves arrive here and choose for
+        the floors.  recon_split_sino's halves arrive here and choose for
         themselves at their own sinogram size.
         """
         calibrating = _memory_ledger.calibration_enabled()
@@ -1308,8 +1308,8 @@ class TomographyModel(ParameterHandler):
 
     def _memory_remedies(self):
         """Extra remedy lines for this geometry's preflight message."""
-        if type(self).split_sino_recon is not TomographyModel.split_sino_recon:
-            return ['  model.split_sino_recon(...)                '
+        if type(self).recon_split_sino is not TomographyModel.recon_split_sino:
+            return ['  model.recon_split_sino(...)                '
                     '# reconstructs in halves; nearly doubles the',
                     '                                             '
                     '# feasible size at a fixed device count']
@@ -1418,9 +1418,9 @@ class TomographyModel(ParameterHandler):
         rather than price anything.
 
         The peak-counter reset the calibration mode compares against lives in
-        :meth:`vcd_recon`, beside the report that reads the counters.  A
+        :meth:`_vcd_recon`, beside the report that reads the counters.  A
         reset here would run on every policy return, and the nested return
-        inside a reconstruction (vcd_recon -> direct_recon -> policy) would
+        inside a reconstruction (_vcd_recon -> recon_direct -> policy) would
         clear the peak after the sinogram and weights were already placed,
         under-measuring the run."""
         if ledger is not None:
@@ -1485,17 +1485,22 @@ class TomographyModel(ParameterHandler):
         same placement automatically to a plain input.  Use this function to
         transfer just once when running several reconstructions on
         the same large sinogram.  What it returns goes straight into
-        :meth:`recon`, :meth:`prox_map` and :meth:`vcd_recon` in place of the
-        sinogram (and the weights), so those calls do no transfer of their own.
+        :meth:`recon` and :meth:`prox_map` in place of the sinogram (and the
+        weights), so those calls do no transfer of their own.
         If the device configuration changes afterwards, the prepared array no
         longer matches, and the reconstruction methods raise an error; re-run
         this method to fix it.
 
         On a model whose device layout is still automatic, this call also
         decides the layout, and every later reconstruction on the model
-        reuses it.  The decision runs the memory check, so the call can raise
-        ``MemoryPreflightError`` for a problem
-        too large for the available devices.
+        reuses it.  The layout is sized for a full reconstruction whenever one
+        fits.  On a problem too large for any full reconstruction, the memory
+        check falls back to what this call itself allocates, which is much
+        smaller, the way the direct reconstructions do; preparing a sinogram
+        then succeeds where a full reconstruction could not run.  A later
+        :meth:`recon` on such a layout runs the memory check again and raises
+        ``MemoryPreflightError``, rather than reusing a layout that was never
+        checked for it.
 
         Args:
             sinogram (numpy or tensor): sinogram in the model's sinogram_shape.
@@ -1507,7 +1512,10 @@ class TomographyModel(ParameterHandler):
         """
         # Settle before the sinogram is placed.  Placing first would put the
         # whole sinogram on the lead device and then need it moved again.
-        self._apply_device_policy()
+        # The layout is still sized for a full reconstruction; naming the
+        # workload here only changes what the check that can refuse is made
+        # against when no device count fits a full reconstruction.
+        self._apply_device_policy(workload='direct')
         sino = self._shard_sinogram(sinogram)
         if weights is None:
             return sino
@@ -1530,7 +1538,7 @@ class TomographyModel(ParameterHandler):
             # (subset_pixels, local_slices), so a check demanding the full
             # rows * cols would refuse a legitimate call.  The whole-volume
             # contract is checked where it actually holds -- on the prox input
-            # in :meth:`vcd_recon`, and on the two recon shapes in
+            # in :meth:`_vcd_recon`, and on the two recon shapes in
             # :meth:`configure_devices`.
             if recon.placement != self.recon_placement:
                 raise ValueError(
@@ -1909,14 +1917,22 @@ class TomographyModel(ParameterHandler):
         Note:
             On a model whose device layout is still automatic, this call also
             decides the layout, and every later reconstruction on the model
-            reuses it.  The decision runs the memory check, so the call can
-            raise ``MemoryPreflightError`` for
-            a problem too large for the available devices.
+            reuses it.  The layout is sized for a full reconstruction whenever
+            one fits.  On a problem too large for any full reconstruction, the
+            memory check falls back to what this call itself allocates, which
+            is much smaller, the way the direct reconstructions do; the
+            Hessian diagonal can then be computed where a full reconstruction
+            could not run.  A later :meth:`recon` on such a layout runs the
+            memory check again and raises ``MemoryPreflightError``, rather
+            than reusing a layout that was never checked for it.
         """
         # Settle before the full sinogram of weights and the full volume are
         # built.  Both are sized by the model, so on an unsettled model they
-        # would land whole on the lead device.
-        self._apply_device_policy()
+        # would land whole on the lead device.  The layout is still sized for
+        # a full reconstruction; naming the workload here only changes what
+        # the check that can refuse is made against when no device count fits
+        # a full reconstruction.
+        self._apply_device_policy(workload='direct')
         sinogram_shape, recon_shape = self.get_params(['sinogram_shape', 'recon_shape'])
         if weights is None:
             # Unit weights built through the device-form seam, for either
@@ -2588,15 +2604,23 @@ class TomographyModel(ParameterHandler):
         return (flat_recon, error_sinogram, ell1_for_partition,
                 alpha_sum / partition.shape[0], delta_sumsq_partition)
 
-    def vcd_recon(self, sinogram, partitions, partition_sequence,
-                  stop_threshold_change_pct, weights=None, init_recon=None,
-                  prox_input=None, compute_prior_loss=False, first_iteration=0,
-                  init_error_sinogram=None, fm_hessian=None,
-                  return_checkpoint=False):
+    def _vcd_recon(self, sinogram, partitions, partition_sequence,
+                   stop_threshold_change_pct, weights=None, init_recon=None,
+                   prox_input=None, compute_prior_loss=False, first_iteration=0,
+                   init_error_sinogram=None, fm_hessian=None,
+                   return_checkpoint=False):
         """
         Perform MBIR reconstruction using the Multi-Granular Vector Coordinate
         Descent algorithm for a given set of partitions and a prescribed
         partition sequence.
+
+        This is the reconstruction engine that :meth:`recon` and
+        :meth:`prox_map` run, and it is not part of the public interface.  An
+        ordinary reconstruction calls one of those two, which build the
+        partitions, the partition sequence and the regularization first.  This
+        method is described here for advanced users who need the
+        ``init_error_sinogram`` / ``return_checkpoint`` resume workflow
+        below, which the public methods do not offer.
 
         Args:
             sinogram (numpy or tensor or Shards): 3D sinogram data with shape
@@ -2614,7 +2638,7 @@ class TomographyModel(ParameterHandler):
                 with the same shape as the sinogram, in a plain array or in the
                 device form.  Defaults to all 1s.
             init_recon (array or int or None): initial reconstruction.  None
-                uses direct_recon; an int gives a constant volume.
+                uses recon_direct; an int gives a constant volume.
             prox_input (array or Shards, optional): input to a proximal map,
                 as a full volume or in the device form (one shard per device,
                 on this model's recon placement).
@@ -2668,7 +2692,7 @@ class TomographyModel(ParameterHandler):
             # The measured run begins here, so this is where the peak
             # counters reset -- one reset per reconstruction, owned by the
             # same function that reads the counters at the end.  A reset
-            # inside the policy would also run on the nested direct_recon
+            # inside the policy would also run on the nested recon_direct
             # call below and clear the peak mid-run.
             _memory_ledger.calibration_start(self.sino_placement.devices)
         # The layout is final here, so this is where the log can name the
@@ -2696,7 +2720,7 @@ class TomographyModel(ParameterHandler):
         scale_recon_to_sinogram = init_recon is None
         if init_recon is None:
             self.logger.info('Starting direct recon for initial reconstruction')
-            init_recon = self.direct_recon(sinogram, output_sharded=True)
+            init_recon = self.recon_direct(sinogram, output_sharded=True)
         elif isinstance(init_recon, int):
             init_recon = self._constant_recon(init_recon)
         else:
@@ -3019,7 +3043,7 @@ class TomographyModel(ParameterHandler):
                 with the same shape as the sinogram, in a plain array or in the
                 device form.  Defaults to None (all 1s).
             init_recon (array, int, or None, optional): initial reconstruction.
-                If None, direct_recon is called with default arguments.
+                If None, recon_direct is called with default arguments.
             max_iterations (int, optional): maximum number of VCD iterations.
             stop_threshold_change_pct (float, optional): stop when
                 100 * ||delta_recon||_1 / ||recon||_1 between iterations drops
@@ -3050,7 +3074,7 @@ class TomographyModel(ParameterHandler):
         # no_grad, not inference_mode: torch.compile's guards crash on
         # compiled calls inside inference_mode with in-place updates.
         with torch.no_grad():
-            recon, loss_vectors = self.vcd_recon(
+            recon, loss_vectors = self._vcd_recon(
                 sinogram, partitions, partition_sequence,
                 stop_threshold_change_pct, weights=weights, init_recon=init_recon,
                 first_iteration=first_iteration)
@@ -3162,7 +3186,7 @@ class TomographyModel(ParameterHandler):
                 with the same shape as the sinogram, in a plain array or in the
                 device form.  Defaults to None (all 1s).
             init_recon (numpy or tensor, optional): reconstruction used for
-                initialization.  Defaults to None (determined by vcd_recon).
+                initialization.  Defaults to None (determined by _vcd_recon).
             do_initialization (bool, optional): If True, initialize parameters
                 (partitions and regularization).  Set False if a previous
                 prox_map call on this model already initialized this sinogram.
@@ -3215,7 +3239,7 @@ class TomographyModel(ParameterHandler):
                             auto_regularize_flag=self.get_params('auto_regularize_flag'))
 
         with torch.no_grad():
-            recon, loss_vectors = self.vcd_recon(
+            recon, loss_vectors = self._vcd_recon(
                 sinogram, partitions, partition_sequence,
                 stop_threshold_change_pct, weights=weights,
                 init_recon=init_recon, prox_input=prox_input,

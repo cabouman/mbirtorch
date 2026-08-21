@@ -169,7 +169,7 @@ def main():
     mar_sino = np.asarray(mar_model.forward_project(mar_phantom))
     mar_weights = np.asarray(mbirjax.gen_weights(mar_sino / mar_sino.max(),
                                                  weight_type='transmission_root'))
-    mar_recon_input = np.asarray(mar_model.direct_recon(mar_sino))
+    mar_recon_input = np.asarray(mar_model.recon_direct(mar_sino))
 
     # Huber weights and BH_correction.
     hub_w = (0.5 + rng.rand(6, 8, 10)).astype(np.float32)
@@ -208,9 +208,9 @@ def main():
         mar_model, mar_sino, mar_weights, num_BH_iterations=1, max_iterations=5,
         num_metal=1, verbose=0, logfile_path=None))
 
-    # split_sino_recon on the shared cone case (seeded; recon in the loop, so parity is loose).
+    # recon_split_sino on the shared cone case (seeded; recon in the loop, so parity is loose).
     np.random.seed(19)
-    split_recon, split_dict = mar_model.split_sino_recon(mar_sino.copy(), weights=mar_weights.copy(),
+    split_recon, split_dict = mar_model.recon_split_sino(mar_sino.copy(), weights=mar_weights.copy(),
                                                          half_overlap=4, max_iterations=5,
                                                          logfile_path=None)
     split_params = split_dict['split_params']

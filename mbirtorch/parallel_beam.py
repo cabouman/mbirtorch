@@ -315,7 +315,7 @@ class ParallelBeamModel(TomographyModel):
                                                filter_scale=scaling_factor,
                                                output_sharded=output_sharded)
 
-    def fbp_recon(self, sinogram, filter_name="ramp", output_sharded=False):
+    def recon_fbp(self, sinogram, filter_name="ramp", output_sharded=False):
         """
         Perform filtered back-projection (FBP) reconstruction on the given
         sinogram.
@@ -364,13 +364,60 @@ class ParallelBeamModel(TomographyModel):
         recon = self.back_project(filtered_sinogram, output_sharded=True)
         return recon if output_sharded else self._gather_recon(recon)
 
-    def direct_recon(self, sinogram, filter_name="ramp", output_sharded=False):
+    def recon_direct(self, sinogram, filter_name="ramp", output_sharded=False):
         """Direct reconstruction by filtered backprojection (FBP); equivalent
-        to :meth:`fbp_recon`.  See :meth:`TomographyModel.direct_recon` for
+        to :meth:`recon_fbp`.  See :meth:`TomographyModel.recon_direct` for
         the argument and return conventions."""
-        return self.fbp_recon(sinogram, filter_name=filter_name,
+        return self.recon_fbp(sinogram, filter_name=filter_name,
                               output_sharded=output_sharded)
 
     def direct_filter(self, sinogram, filter_name="ramp", output_sharded=False):
         return self.fbp_filter(sinogram, filter_name=filter_name,
                                output_sharded=output_sharded)
+
+
+def recon_simple_parallel(sinogram, angles, weights=None, sharpness=1.0,
+                          max_iterations=15):
+    """
+    Functional interface for a basic parallel-beam reconstruction.
+
+    This builds a :class:`ParallelBeamModel` with default geometry parameters
+    and reconstructs in one call.  For anything beyond the arguments here --
+    changing the voxel size or the recon shape, choosing devices, controlling
+    the stopping rule or the logs, restarting from a previous reconstruction --
+    create the model yourself and call
+    :meth:`TomographyModel.recon`; see :class:`ParallelBeamModel` for the
+    geometry arguments.
+
+    Args:
+        sinogram (numpy or tensor): 3D sinogram data with shape
+            (num_views, num_det_rows, num_det_channels).
+        angles (numpy or tensor): 1D array of projection angles in radians, one
+            per view.
+        weights (numpy or tensor, optional): 3D positive weights with the same
+            shape as the sinogram.  Defaults to None (all 1s).
+        sharpness (float, optional): higher values give crisper edges and more
+            noise; lower values give softer edges and less noise.  Defaults
+            to 1.0.
+        max_iterations (int, optional): maximum number of iterations.  Defaults
+            to 15.  Use max_iterations=0 for a filtered back projection scaled
+            to fit the data.
+
+    Returns:
+        (recon, recon_dict): the reconstruction volume, and a dict
+        with entries 'recon_params' (per-iteration traces and settings),
+        'recon_log' (the run's log text), 'notes', and
+        'model_params' (a snapshot of the model parameters).
+
+    Example:
+        >>> import numpy as np, mbirtorch
+        >>> angles = np.linspace(0, np.pi, 180, endpoint=False)
+        >>> recon, recon_dict = mbirtorch.recon_simple_parallel(sinogram, angles)
+    """
+    # A torch sinogram or torch angles are converted here, so that the model
+    # gets the same plain shape tuple and host angles either way.
+    if torch.is_tensor(angles):
+        angles = angles.detach().cpu().numpy()
+    model = ParallelBeamModel(tuple(sinogram.shape), angles)
+    model.set_params(sharpness=sharpness)
+    return model.recon(sinogram, weights=weights, max_iterations=max_iterations)

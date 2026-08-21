@@ -18,6 +18,15 @@ However, these parameters can be changed by the user using the ``TomographyModel
 See the API docs for the :class:`~mbirtorch.TomographyModel` class for details on a wide range
 of functions that can be implemented using the ``ConeBeamModel``.
 
+Simple Reconstruction
+---------------------
+
+For a basic reconstruction, one function call takes the sinogram, the view angles, and the two
+source distances and returns the reconstruction.  The class below gives full control over the
+geometry, the parameters, and the reconstruction itself.
+
+.. autofunction:: mbirtorch.recon_simple_cone
+
 Constructor
 -----------
 
@@ -27,4 +36,4 @@ Constructor
 Alternative Reconstruction
 --------------------------
 
-.. automethod:: mbirtorch.ConeBeamModel.fdk_recon
+.. automethod:: mbirtorch.ConeBeamModel.recon_fdk

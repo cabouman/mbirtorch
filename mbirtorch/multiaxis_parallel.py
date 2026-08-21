@@ -394,7 +394,7 @@ class MultiAxisParallelModel(TomographyModel):
             sinogram, filter_name, filter_scale=scaling_factor,
             output_sharded=output_sharded, row_weight=None)
 
-    def fbp_recon(self, sinogram, filter_name="ramp", output_sharded=False):
+    def recon_fbp(self, sinogram, filter_name="ramp", output_sharded=False):
         """
         Perform FBP reconstruction: filter the sinogram, then apply the exact
         adjoint of the forward projector as the backprojection.
@@ -431,11 +431,11 @@ class MultiAxisParallelModel(TomographyModel):
         recon = self.back_project(filtered_sinogram, output_sharded=True)
         return recon if output_sharded else self._gather_recon(recon)
 
-    def direct_recon(self, sinogram, filter_name="ramp", output_sharded=False):
+    def recon_direct(self, sinogram, filter_name="ramp", output_sharded=False):
         """Direct reconstruction by stacked 2-D FBP; equivalent to
-        :meth:`fbp_recon`.  See :meth:`TomographyModel.direct_recon` for the
+        :meth:`recon_fbp`.  See :meth:`TomographyModel.recon_direct` for the
         argument and return conventions."""
-        return self.fbp_recon(sinogram, filter_name=filter_name,
+        return self.recon_fbp(sinogram, filter_name=filter_name,
                               output_sharded=output_sharded)
 
     def direct_filter(self, sinogram, filter_name="ramp", output_sharded=False):

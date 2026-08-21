@@ -132,8 +132,8 @@ Tips for efficiency
 * **Reuse a prepared sinogram.**  If you reconstruct the same large sinogram several times,
   :meth:`~mbirtorch.TomographyModel.prepare_sino_for_devices` distributes it across the devices once, so
   the host-to-device transfer is not repeated on every reconstruction.
-* **Keep results on-device.**  Passing ``output_sharded=True`` to ``recon``, ``fbp_recon``, or
-  ``fdk_recon`` returns the reconstruction in its device form (the slice shards), with no
+* **Keep results on-device.**  Passing ``output_sharded=True`` to ``recon``, ``recon_fbp``, or
+  ``recon_fdk`` returns the reconstruction in its device form (the slice shards), with no
   gather back to the host, so it can feed another on-device step directly.
 * **Trade memory for time with a smaller band.**  Setting ``back_project_slice_band`` on the
   model streams the back projection's slice axis in smaller pieces.  This is a memory lever:
