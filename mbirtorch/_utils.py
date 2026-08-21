@@ -1,9 +1,8 @@
 """Parameter defaults and small shared helpers.
 
-Ported from mbirjax._utils: the Param dataclass and the default parameter
-dictionaries are copied verbatim (same names, values, and recompile flags) so
-the two packages stay parameter-compatible.  The jax-specific OOM-marker and
-ParamNames-literal tooling is not ported.
+Defines the Param dataclass and the default parameter dictionaries.  The
+names, values, and recompile flags of those defaults are fixed by an external
+reference and must not be changed here.
 """
 
 import copy
@@ -11,6 +10,38 @@ from dataclasses import dataclass
 from typing import Any
 
 FILE_FORMAT_NUMBER = 1.0
+
+#: The multiple a hand-written kernel's width argument is rounded up to.
+#: Triton compiles a separate, faster kernel for each integer argument it can
+#: prove is a multiple of 16; the unspecialized compilation uses more
+#: registers and runs at roughly half the rate on the cone back kernel.
+KERNEL_WIDTH_MULTIPLE = 16
+
+
+def padded_kernel_width(width):
+    """``width`` rounded up to the next multiple of 16.
+
+    A width that is already a multiple of 16 is returned unchanged, so a
+    caller can compare the result against its input and take its original
+    path when the two agree.
+
+    This is the ONE definition of the rule.  The Triton kernel wrappers call
+    it to size the launch and the arrays they allocate, and the memory ledger
+    calls it to charge those same arrays, so the code and the charge cannot
+    disagree.
+
+    Args:
+        width (int): a non-negative length -- a slice band, a detector row
+            count, or a value-column count.
+
+    Returns:
+        int: the padded length.
+    """
+    width = int(width)
+    remainder = width % KERNEL_WIDTH_MULTIPLE
+    if remainder == 0:
+        return width
+    return width + KERNEL_WIDTH_MULTIPLE - remainder
 
 
 @dataclass
@@ -22,7 +53,7 @@ class Param:
         return f"Param(val={self.val}, recompile_flag={self.recompile_flag})"
 
 
-# The values below are copied from mbirjax._utils (2026-08-04) and must track it.
+# The names, values, and recompile flags below are fixed; do not change them here.
 _forward_model_defaults_dict = {
     'geometry_type': Param(None, False),
     'file_format': Param(FILE_FORMAT_NUMBER, False),

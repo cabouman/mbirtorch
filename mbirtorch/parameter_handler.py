@@ -1,13 +1,14 @@
-"""Parameter storage and access, ported (lean) from mbirjax.parameter_handler.
+"""Parameter storage and access.
 
-The public surface the reconstruction methods and users rely on is kept: ``get_params`` (one
-name or a list), ``set_params(**kwargs)`` with mbirjax's recompile and
-auto-regularization semantics, ``verify_valid_params``, ``print_params``, and
-the shared geometry-params namedtuple cache.  Not yet ported: YAML save/load
-and the ParamNames Literal typing machinery.
+The public surface is ``get_params`` (one name or a list),
+``set_params(**kwargs)`` with its recompile and auto-regularization semantics,
+``verify_valid_params``, ``print_params``, and the shared geometry-params
+namedtuple cache.  Not implemented: YAML save/load and the ParamNames Literal
+typing machinery.
 """
 
 import io
+import itertools
 import logging
 import os
 import warnings
@@ -18,17 +19,43 @@ import numpy as np
 from . import _utils
 from ._utils import Param
 
+# Counts the model instances created in this process, to give each one a
+# logger name of its own (see ParameterHandler.__init__).
+_instance_counter = itertools.count(1)
+
 
 class ParameterHandler:
+    """Store and access model parameters.  ``TomographyModel`` inherits its
+    parameter interface -- ``get_params``, ``set_params``, and
+    ``print_params`` -- from this class."""
 
     def __init__(self):
         self.params = _utils.get_default_params()
-        self.logger = None
+        # Every instance gets a logger of its own, named for the class plus a
+        # count that is never reused.  Python's logging module hands out one
+        # shared logger per name, so a name shared by all instances of a class
+        # would mean that setting up the log for a second model tears down the
+        # handlers of a first model that is still running: its later lines
+        # would land in the second model's file and log buffer.  The count is
+        # used instead of id(self) because ids are recycled once an object is
+        # freed, so a new model could inherit a dead one's logger.
+        self.logger_name = 'mbirtorch.{}.{}'.format(type(self).__name__,
+                                                    next(_instance_counter))
+        # Messages logged before a run starts go to the console only; a run
+        # replaces these handlers in setup_logger.
+        self.logger = logging.getLogger(self.logger_name)
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(logging.Formatter('%(message)s'))
+        self.logger.addHandler(console_handler)
+        self.logger.setLevel(logging.INFO)
         self.log_buffer = None
+        # The log file of the run in progress, remembered so that a call
+        # continuing that run can reopen the file the previous call closed.
+        self._logfile_path = None
 
     def setup_logger(self, *, logfile_path: str = "~/.mbirtorch/logs/recon.log", print_logs: bool = True):
         """
-        Initialize self.logger and self.log_buffer.
+        Set up this instance's logger (self.logger) and self.log_buffer for a run.
         The logging level comes from the model's 'verbose' parameter (0 -> WARNING, 1 -> INFO, 2+ -> DEBUG).
 
         Args:
@@ -51,8 +78,10 @@ class ParameterHandler:
         else:
             level = logging.DEBUG
 
-        # Configure logger
-        logger = logging.getLogger(self.__class__.__name__)
+        # Configure logger.  This is the instance's own logger (see
+        # __init__), so setting it up here cannot disturb the log of another
+        # model that is still running.
+        logger = self.logger
         logger.setLevel(level)
         # The handlers attached below are the complete set of intended outputs:
         # the in-memory buffer, the console when print_logs is on, and the file
@@ -84,17 +113,66 @@ class ParameterHandler:
             console_handler.setFormatter(console_formatter)
             logger.addHandler(console_handler)
 
-        # File handler (optional)
+        # File handler (optional).  mode='w' starts a new log for a new run.
+        self._logfile_path = logfile_path if logfile_path else None
         if logfile_path:
-            from .utilities import makedirs
-            makedirs(logfile_path)
-            file_handler = logging.FileHandler(logfile_path, mode='w')
-            file_handler.setLevel(level)
-            file_formatter = logging.Formatter('%(message)s')
-            file_handler.setFormatter(file_formatter)
-            logger.addHandler(file_handler)
+            self._add_log_file_handler(logfile_path, mode='w', level=level)
 
-        self.logger = logger
+    def _add_log_file_handler(self, logfile_path, mode, level):
+        """Attach a handler that copies the log to ``logfile_path``.
+
+        ``delay=True`` leaves the file unopened until the first line is
+        actually written to it.  Without it, opening in mode 'w' would create
+        the file (and truncate an existing one) right here, so a run that logs
+        nothing -- at verbose=0 only warnings are logged at all -- would leave
+        an empty file behind.
+        """
+        from .utilities import makedirs
+        makedirs(logfile_path)
+        file_handler = logging.FileHandler(logfile_path, mode=mode, delay=True)
+        file_handler.setLevel(level)
+        file_handler.setFormatter(logging.Formatter('%(message)s'))
+        self.logger.addHandler(file_handler)
+
+    def close_log_file(self):
+        """Finish the log file: flush it, close it, and detach its handler.
+
+        Called when a run has written its last line.  An open file handler
+        keeps writing to whatever file it opened, even after that file has
+        been renamed or deleted, and on Windows it would block the delete
+        outright.  So the composite runs that merge and then delete the log of
+        each part (recon_split_sino, recon_plastic_metal) need each part's
+        file closed first.
+
+        The in-memory buffer handler is left alone, so the run's log text is
+        still available for recon_dict['recon_log'].  A later call continuing
+        the same run reopens the file in append mode; see ``_reopen_log_file``.
+        """
+        if self.logger is None:
+            return
+        for h in list(self.logger.handlers):
+            if isinstance(h, logging.FileHandler):
+                try:
+                    h.flush()
+                finally:
+                    h.close()
+                    self.logger.removeHandler(h)
+
+    def _reopen_log_file(self):
+        """Reattach the log file of a run that is being continued.
+
+        A run's last call closed the file (see ``close_log_file``), so a call
+        that continues that run -- a resumed recon, or a later pass of a
+        Plug-and-Play loop -- has to open it again.  Mode 'a' keeps what the
+        earlier calls wrote.  Nothing happens if the run never had a log file,
+        or if one is already attached.
+        """
+        if self.logger is None or not self._logfile_path:
+            return
+        if any(isinstance(h, logging.FileHandler) for h in self.logger.handlers):
+            return
+        self._add_log_file_handler(self._logfile_path, mode='a',
+                                   level=self.logger.level)
 
     def _log_run_header(self, first_iteration, logfile_path, print_logs):
         """Set up the run logger (on the first iteration, or whenever none has been set up) and log
@@ -105,46 +183,37 @@ class ParameterHandler:
         only once the reconstruction is about to start; see that method.
         """
         # log_buffer, not logger, is what says "setup_logger has never run".
-        # mbirjax tests self.logger here, which works there because its logger
-        # stays None until setup.  TomographyModel fills that slot at
-        # construction with a console-only logger for messages that happen
-        # before a recon starts, so testing it would skip setup on every
-        # resumed run (first_iteration > 0) and drop the log entirely.  Only
-        # setup_logger ever creates the buffer.
+        # TomographyModel fills the logger slot at construction with a
+        # console-only logger for messages that happen before a recon starts,
+        # so testing self.logger here would skip setup on every resumed run
+        # (first_iteration > 0) and drop the log entirely.  Only setup_logger
+        # ever creates the buffer.
         if first_iteration == 0 or self.log_buffer is None:
             self.setup_logger(logfile_path=logfile_path, print_logs=print_logs)
+        else:
+            # Continuing a run that is already set up: reopen the log file the
+            # previous call closed, so this call's lines join it.
+            self._reopen_log_file()
         from . import __version__
         self.logger.info('MBIRTorch Version = {}'.format(__version__))
 
     def _log_device_report(self):
         """Log the devices the reconstruction will actually use.
 
-        Called once the device layout is final.  mbirjax logs this in the run
-        header, which it can do because its layout is fixed when the model is
-        built.  Here the automatic layout is chosen when a reconstruction
-        starts, so a header-time report would name the placement the run was
-        about to leave, and a widened run would log '1 x CUDA'.
+        Called once the device layout is final.  The report cannot go in the
+        run header, because the automatic layout is chosen when a
+        reconstruction starts: a header-time report would name the placement
+        the run was about to leave, and a widened run would log '1 x CUDA'.
         """
         self.logger.info('Reconstruction devices: {}'.format(
             self._device_report()))
 
     def _device_report(self):
         """An 'N x PLATFORM (sharded)' summary of the recon devices, for the
-        recon log, noting any padding of the sharded axes.
-
-        Padding is invisible in the results (it is kept exactly inert), so the
-        log says so rather than leaving the device-form shapes a surprise.
-        """
+        recon log."""
         devices = self.recon_placement.devices
         platform = devices[0].type.upper()
         report = '{} x {} (sharded)'.format(len(devices), platform)
-        if self.sino_placement is not None and self.sino_placement.is_padded:
-            report += ' (views padded {}->{})'.format(
-                self.sino_placement.real_size, self.sino_placement.padded_size)
-        if self.recon_placement.is_padded:
-            report += ' (slices padded {}->{})'.format(
-                self.recon_placement.real_size,
-                self.recon_placement.padded_size)
         # Automatic selection that used fewer than the visible devices: say
         # which counts were turned down and why, so idle hardware is never
         # silent.  Only a layout the library chose can have a search to
@@ -182,8 +251,8 @@ class ParameterHandler:
 
     @staticmethod
     def normalize_scalar(val):
-        """Convert numpy scalar types to plain python scalars (mbirjax's
-        normalize_scalar); arrays and other values pass through."""
+        """Convert numpy scalar types to plain python scalars; arrays and
+        other values pass through."""
         if isinstance(val, np.generic):
             return val.item()
         return val
@@ -196,19 +265,21 @@ class ParameterHandler:
         geometry-related parameters are modified, it triggers a rebuild of the
         projector system unless suppressed via the `no_compile` flag.
 
-        The mbirjax special-case semantics are reproduced exactly:
+        Four special cases apply:
 
         - Directly setting a regularization parameter (``sigma_y``, ``sigma_x``,
-          or ``sigma_prox``) DISABLES auto-regularization (with a warning unless
-          ``no_warning``), so the user's value is actually used by ``recon``.
-        - Setting ``sharpness`` or ``snr_db`` RE-ENABLES a disabled
-          auto-regularization (with a warning), so those parameters take effect.
+          or ``sigma_prox``) disables auto-regularization and warns, so the
+          user's value is actually used by ``recon``.  With ``no_warning=True``
+          neither happens: the value is stored and auto-regularization stays
+          on.  (The automatic setters use that path internally.)
+        - Setting ``sharpness`` or ``snr_db`` re-enables a disabled
+          auto-regularization, with a warning unless ``no_warning``.
         - An unknown parameter name raises ValueError listing the valid names,
           except under ``no_warning`` (the construction path), where it is
           ADDED as a new recompile-flagged parameter (how the geometry's own
           parameters, e.g. ``angles``, enter).
-        - No validity check runs here: like mbirjax, validation is deferred to
-          reconstruction entry (``verify_valid_params`` in ``vcd_recon``), so
+        - No validity check runs here.  Validation is deferred to
+          reconstruction entry (``verify_valid_params`` in ``_vcd_recon``), so
           multi-step geometry changes (set a new sinogram shape, then call
           ``auto_set_recon_geometry``) work without a transiently-inconsistent
           state raising.
@@ -232,7 +303,7 @@ class ParameterHandler:
             recompile_flag = True
             if key in self.params:
                 recompile_flag = self.params[key].recompile_flag
-            elif not no_warning:   # disabled for initialization, as in mbirjax
+            elif not no_warning:   # disabled for initialization
                 error_message = '{} is not a recognized parameter'.format(key)
                 error_message += '\nValid parameters are: \n'
                 for valid_key in self.params.keys():
@@ -285,7 +356,7 @@ class ParameterHandler:
 
     def verify_valid_params(self):
         """Check parameter consistency; geometry classes extend this.  Called at
-        reconstruction entry (not from set_params), matching mbirjax."""
+        reconstruction entry, not from set_params."""
         sinogram_shape = self.get_params('sinogram_shape')
         if len(sinogram_shape) != 3:
             raise ValueError(f'sinogram_shape must be (views, rows, channels); '
@@ -318,9 +389,8 @@ class ParameterHandler:
         print('----')
 
     # ── shared geometry-params namedtuple cache ───────────────────────────────
-    # The namedtuple CLASS is cached per field-name tuple (module-level), matching
-    # mbirjax's make_geometry_params.  In torch there is no jit-cache reason, but a
-    # shared class keeps equality and repr behavior consistent across instances.
+    # The namedtuple CLASS is cached per field-name tuple (module-level).  A shared
+    # class keeps equality and repr behavior consistent across instances.
     _geometry_param_classes = {}
 
     @classmethod

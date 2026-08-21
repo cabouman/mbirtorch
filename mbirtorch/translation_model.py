@@ -1,4 +1,4 @@
-"""TranslationModel, ported from mbirjax.translation_model: each view is a
+"""TranslationModel: each view is a
 cone beam projection of a translated object (translation computed tomography,
 TCT).  Useful for 3D imaging of thin objects.
 
@@ -11,17 +11,16 @@ to detector channels with per-pixel magnification; the VERTICAL fan maps
 each slice of a voxel cylinder to a range of detector rows through the
 affine pair (m0, W_p_r) of :func:`_translation_vertical_affine`.  Both
 directions use the single psf_radius of :meth:`TranslationModel.get_psf_radius`
-(translation has no separate forward vertical radius -- inherited from
-mbirjax).
+(translation has no separate forward vertical radius).
 
-Known scale limit, recorded at port time: at production TCT detector shapes
+Known scale limit: at production TCT detector shapes
 (~1900x3000 panels) the back projection holds (view_batch, P, rows) and
 (view_batch, P, slices) transients, so large pixel batches are memory-bound
 and the view batch shrinks accordingly.  What would relieve it is a change
 to the projector drivers, not to this file: they currently tile over views
 only, and tiling over the pixel axis as well -- the two-axis tiling
-described in projectors.py, which mbirjax's sparse projection drivers do --
-would let the pixel batch shrink instead of the view batch.  Nothing here
+described in projectors.py -- would let the pixel batch shrink instead of the
+view batch.  Nothing here
 works around its absence.
 """
 
@@ -44,8 +43,7 @@ def _translation_pixel_xy_mag(pixel_indices, t_x, t_y, num_rows, num_cols,
     """Translated in-plane coordinates and the per-pixel magnification.
 
     Returns x (Vb, P), y (Vb, P), pixel_mag (Vb, P).  No rotation: the object
-    shifts by (t_x, t_y) per view (mbirjax's recon_ijk_to_xyz +
-    compute_y_mag_for_pixel).
+    shifts by (t_x, t_y) per view.
     """
     row_index = (pixel_indices // num_cols).to(_F32)
     col_index = (pixel_indices % num_cols).to(_F32)
@@ -111,8 +109,8 @@ def _translation_forward_view_batch(values, pixel_indices, view_params_batch,
     """Translation forward for one view batch: the detector-side vertical fan,
     then the per-pixel horizontal fan scatter.  Returns (Vb, R, C).
 
-    ``slice_start`` supports the banded sharded forward exactly as in cone:
-    ``values`` may be a slice BAND (P, L) with global indices [slice_start,
+    ``slice_start`` supports a slice-BANDED call exactly as in cone:
+    ``values`` may be a band (P, L) with global indices [slice_start,
     slice_start + L); the z geometry stays anchored on the full num_slices
     center and taps outside the band contribute zero.
 
@@ -249,13 +247,24 @@ class TranslationModel(TomographyModel):
         view_batch_size, compile_mode: as in ParallelBeamModel.
     """
 
+    # Translation has its own floor family rather than borrowing parallel's,
+    # because it is measured on production-anchored translation cells rather
+    # than on the shared ladder.  The thresholds themselves, the runs behind
+    # them, and their dates are the translation rows of
+    # _widening_floors.FLOORS; they are not restated here, because a refresh
+    # moves them and a copy would go stale.  Historical note: the 2026-08-17
+    # readings that first justified a separate family (both counts losing at
+    # every size probed) were torch's per-function recompile budget filling,
+    # which projectors._raise_recompile_budget has since fixed.
+    _floor_family = 'translation'
+
     def __init__(self, sinogram_shape, translation_vectors, source_detector_dist,
                  source_iso_dist, view_batch_size=None, compile_mode='auto'):
         translation_vectors = np.asarray(translation_vectors, dtype=np.float32)
         if translation_vectors.ndim != 2 or translation_vectors.shape[1] != 3:
             raise ValueError('translation_vectors must have shape '
                              f'(num_views, 3); got {translation_vectors.shape}.')
-        # Translation defaults from mbirjax: weaker row-neighbor regularization
+        # Translation defaults: weaker row-neighbor regularization
         # (thin objects), and no cylindrical mask (the object typically spans
         # the whole field of view).
         super().__init__(sinogram_shape,
@@ -267,7 +276,7 @@ class TranslationModel(TomographyModel):
                          source_iso_dist=source_iso_dist,
                          qggmrf_nbr_wts=[0.1, 1.0, 1.0], use_ror_mask=False)
         # Smaller line-search cap due to observed instabilities with larger
-        # values (mbirjax).
+        # values.
         self.set_params(no_warning=True, max_alpha=1.3)
 
     def _view_batch_bodies(self):
@@ -420,7 +429,7 @@ class TranslationModel(TomographyModel):
                                                output_sharded=output_sharded,
                                                row_weight=weight_t)
 
-    def fdk_recon(self, sinogram, filter_name="ramp", output_sharded=False):
+    def recon_fdk(self, sinogram, filter_name="ramp", output_sharded=False):
         """
         Perform FDK reconstruction: standard filtering, then the exact adjoint
         of the forward projector as the backprojection.
@@ -430,16 +439,23 @@ class TranslationModel(TomographyModel):
             this direct reconstruction is only approximate; it is intended as
             an initializer for the iterative ``recon()``.
         """
+        # Settle the device layout before the first large allocation, as
+        # recon() does: a no-op when the user already chose devices;
+        # otherwise the automatic selection runs here, so a bare FDK call
+        # spreads across the GPUs instead of landing whole on one.  The
+        # workload tells the memory check to price this reconstruction rather
+        # than the full recon the device count is chosen for.
+        self._apply_device_policy(workload='direct')
         filtered_sinogram = self.fdk_filter(sinogram, filter_name=filter_name,
                                             output_sharded=True)
         recon = self.back_project(filtered_sinogram, output_sharded=True)
         return recon if output_sharded else self._gather_recon(recon)
 
-    def direct_recon(self, sinogram, filter_name="ramp", output_sharded=False):
+    def recon_direct(self, sinogram, filter_name="ramp", output_sharded=False):
         """Direct reconstruction by the FDK algorithm; equivalent to
-        :meth:`fdk_recon`.  See :meth:`TomographyModel.direct_recon` for the
+        :meth:`recon_fdk`.  See :meth:`TomographyModel.recon_direct` for the
         argument and return conventions."""
-        return self.fdk_recon(sinogram, filter_name=filter_name,
+        return self.recon_fdk(sinogram, filter_name=filter_name,
                               output_sharded=output_sharded)
 
     def direct_filter(self, sinogram, filter_name="ramp", output_sharded=False):

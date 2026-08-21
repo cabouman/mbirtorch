@@ -44,7 +44,8 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
-from . import _sharding
+from . import _sharding, tomography_utils
+from ._utils import padded_kernel_width
 
 _F32_BYTES = 4
 _INT64_BYTES = 8
@@ -71,19 +72,109 @@ PROX_CYLINDERS = 4
 DIRECTION_CYLINDERS = 7
 # apply_worker holds the direction and the scaled direction.
 APPLY_CYLINDERS = 2
-# How many gathered column cylinders a forward on the column-gather path
-# holds at once (TomographyModel._sparse_forward_project_columns).  The driver
-# issues each batch's gather one batch ahead of the projection that reads it,
-# so at the widest instant -- inside the gather that runs ahead -- a device
-# holds three: the cylinder the projection is about to read, the pieces
-# arriving from the slice-owners for the batch after it, and the concatenation
-# those pieces are assembled into.
+# How many transferred cylinder batches a multi-device forward holds at once
+# (TomographyModel._sparse_forward_project_cylinders).  The driver issues each
+# batch's transfer one batch ahead of the projection that reads it, so at the
+# widest instant -- inside the transfer that runs ahead -- a device holds
+# three: the cylinders the projection is about to read, the pieces arriving
+# from the slice-owners for the batch after it, and the concatenation those
+# pieces are assembled into.
 #
-# The last batch of a pass has nothing to gather ahead of it, and a pass that
-# fits in one batch never gathers ahead at all, so both hold two rather than
-# three.  The charge covers the widest instant, which is the rule the ledger
-# keeps: it may charge more than a run needs but never less.
-COLUMN_GATHER_RESIDENTS = 3
+# The last batch of a pass has nothing to transfer ahead of it, and a pass
+# that fits in one batch never transfers ahead at all, so both hold two rather
+# than three.  The charge covers the widest instant, which is the rule the
+# ledger keeps: it may charge more than a run needs but never less.
+CYLINDER_TRANSFER_RESIDENTS = 3
+
+# ── the denoiser's own counts ────────────────────────────────────────────────
+# QGGMRFDenoiser runs its own sweep, so its per-subset counts are read from
+# denoising.py rather than shared with the reconstruction counts above.  Only
+# the prior's count is shared, because the denoiser calls the same qGGMRF
+# kernel the reconstruction calls.
+#
+# How many subset cylinders the denoiser holds once that kernel has returned.
+# The single-device updater, vcd_subset_denoiser, holds eight at its widest
+# instant, which is the residual update at the end.  Those eight are the
+# prior gradient, the prior hessian, the gathered residual, the forward
+# gradient, the unscaled update direction, the direction scaled by the step
+# size, the second scaled copy the residual update forms, and the updated
+# residual itself.
+#
+# The sharded worker, terms_worker, holds seven.  Its widest instant is the
+# division that forms the direction, where it holds the prior gradient, the
+# prior hessian, the gathered residual, the forward gradient, the two
+# operands of that division, and its result.  Eight is charged on both paths,
+# because the ledger may charge more than a run needs but never less.
+DENOISE_DIRECTION_CYLINDERS = 8
+# How many the state application holds: the direction the subset produced,
+# the direction scaled by the step size, and one temporary -- the negated
+# step the residual subtracts, or the absolute value the ell-1 sum reduces.
+DENOISE_APPLY_CYLINDERS = 3
+# How many qGGMRF boundary columns one device holds while the sharded sweep
+# exchanges halos.  The exchange rebinds the pass's halos only after it
+# returns, so a device holds the two columns the previous pass left, the one
+# this exchange has already received, and the outgoing column the move copies
+# from.  The two end devices hold one halo rather than two, and this charges
+# them four as well.
+DENOISE_HALO_COLUMNS = 4
+# The ell-1 statistics -- the denoiser's per pass, the reconstruction's per
+# iteration -- reduce a recon-shaped array a chunk at a time so that no whole
+# array of absolute values is allocated.  These two set the chunk.  They live
+# here, beside the charge that models them, because a second definition
+# elsewhere could drift from this one and quietly mis-price the phase; the
+# reduction itself is image_ell1 just below, for the same reason.
+# The size is the measured knee on both backends; image_ell1 documents the
+# measurement and why the fused torch.linalg.vector_norm is not used instead.
+# The cap bounds the kernel launches for a very large array; past it the chunk
+# grows again, which the charge follows.
+ELL1_CHUNK_BYTES = 16 * 2 ** 20
+ELL1_MAX_CHUNKS = 1024
+
+
+def image_ell1(flat_image):
+    """The ell-1 norm of a recon-shaped array, without a recon-shaped
+    temporary.
+
+    ``torch.sum(torch.abs(x))`` allocates a whole array of absolute values
+    before it reduces.  Reducing a chunk at a time bounds the temporary to one
+    chunk, so it stops scaling with the array.
+
+    Considered but rejected: ``torch.linalg.vector_norm(x, ord=1)``, which
+    allocates nothing at all.  On CPU it accumulates float32 sequentially
+    where ``torch.sum`` sums pairwise, so its error grows with the element
+    count.  On MPS it is accurate but runs the reduction about 34 times
+    slower than ``sum(abs)``.
+
+    Chunking keeps torch's pairwise summation inside each chunk and adds only
+    the chunk totals, so it tracks the unchunked value to about 1e-7 at every
+    size measured.
+
+    An array below one chunk is reduced whole, which is the arithmetic this
+    replaced, so small problems -- the goldens among them -- are unchanged bit
+    for bit.
+    """
+    n_bytes = flat_image.numel() * flat_image.element_size()
+    n_chunks = min(ELL1_MAX_CHUNKS, max(1, round(n_bytes / ELL1_CHUNK_BYTES)))
+    if n_chunks == 1:
+        return torch.sum(torch.abs(flat_image))
+    return torch.stack([torch.sum(torch.abs(chunk)) for chunk
+                        in torch.chunk(flat_image, n_chunks, dim=0)]).sum()
+
+
+def ell1_chunk_bytes(image_bytes):
+    """What one chunk of image_ell1 holds, for an array of ``image_bytes``.
+
+    An array small enough to want a single chunk is reduced whole, so the
+    temporary is the array itself; that is the unchunked case and it is only
+    reached below this module's chunk size, where one extra copy is small in
+    absolute terms.
+    """
+    image_bytes = int(image_bytes)
+    n_chunks = min(ELL1_MAX_CHUNKS,
+                   max(1, round(image_bytes / ELL1_CHUNK_BYTES)))
+    if n_chunks == 1:
+        return image_bytes, 1
+    return math.ceil(image_bytes / n_chunks), n_chunks
 
 # Library workspace that torch allocates through its own caching allocator,
 # and that the ledger's array enumeration therefore cannot see.  Measured as
@@ -214,16 +305,24 @@ class LedgerPlan:
     sinogram_shape: tuple                 # (V, R, C), the problem's shape
     recon_shape: tuple                    # (Rr, Rc, S), the problem's shape
     devices: list                         # one entry per device, in order
-    view_blocks: list                     # (padded_views, real_views) per device
-    slice_blocks: list                    # (padded_slices, real_slices) per device
-    sino_rows: int                        # the DEVICE-form detector row count
+    view_blocks: list                     # views held, per device
+    slice_blocks: list                    # slices held, per device
+    sino_rows: int                        # the detector row count
     rows_track_slices: bool
     # ── pixel counts ─────────────────────────────────────────────────────────
     num_pixels_full: int                  # the ROR-masked set
     num_pixels_grid: int                  # the unmasked grid (the hessian's)
     granularities: tuple                  # subset counts the sequence visits
     partition_granularities: tuple        # every subset count built up front
-    # ── what this call supplies ──────────────────────────────────────────────
+    # ── what this call runs and supplies ─────────────────────────────────────
+    # Which call the plan prices: 'recon' for a full reconstruction, 'direct'
+    # for a direct reconstruction alone, 'denoise' for one QGGMRFDenoiser
+    # sweep.  Each holds a different set of arrays.  A direct reconstruction
+    # builds no prior, no hessian, no partitions and no loop state, and a
+    # denoise builds no projector, no view batch and no hessian at all.  They
+    # are therefore separate plans rather than one plan with the extra terms
+    # zeroed.
+    workload: str = 'recon'
     weights_supplied: bool = False
     fm_hessian_supplied: bool = False
     init_recon_supplied: bool = False
@@ -232,17 +331,17 @@ class LedgerPlan:
     positivity: bool = False
     helical: bool = False
     # Whether the hessian back-projects at the ROR-masked index set rather
-    # than the full grid.  vcd_recon does; a direct call to the public method
+    # than the full grid.  _vcd_recon does; a direct call to the public method
     # does not, and neither does an unmasked model.
     hessian_masked: bool = False
     # ── knobs and model choices ──────────────────────────────────────────────
-    forward_band: int = None
     back_band: int = None
-    # The pixel-column batch the forward's column gather assembles at once,
-    # or None when the forward walks slice bands instead.  One field rather
-    # than a flag and a width, so the two can never disagree, and resolved by
-    # the model in plan_from_model rather than re-derived here.
-    column_pixel_batch: int = None
+    # How many pixels one transferred cylinder batch covers in the forward.
+    # Every projection plan carries one, because the cylinder transfer is the
+    # only multi-device forward; a denoise plan has no forward projection and
+    # leaves it None.  Resolved by the model in plan_from_model rather than
+    # re-derived here.
+    pixel_batch: int = None
     qggmrf_cylinders: int = QGGMRF_CYLINDERS_COMPILED
     # (direction, num_pixels, band_cols) -> (view_batch, bytes_per_view), with
     # direction in {'forward', 'back'}.  Defaults to a no-charge model so a
@@ -267,12 +366,13 @@ class LedgerPlan:
             direction, int(num_pixels), int(band_cols))
         return int(view_batch) * int(bytes_per_view)
 
-    def band_length(self, dev_index, direction):
-        """The slice-band length one owner streams, matching
-        ``TomographyModel._slice_band_length``: the whole shard by default."""
-        padded_slices = self.slice_blocks[dev_index][0]
-        fixed = self.forward_band if direction == 'forward' else self.back_band
-        return min(int(fixed), padded_slices) if fixed else padded_slices
+    def band_length(self, dev_index):
+        """The slice-band length one owner streams in the BACK projection,
+        matching ``TomographyModel._slice_band_length``: the whole shard by
+        default.  The forward transfers whole cylinders and walks no bands."""
+        local_slices = self.slice_blocks[dev_index]
+        fixed = self.back_band
+        return min(int(fixed), local_slices) if fixed else local_slices
 
 
 def estimate_peak_device_bytes(plan):
@@ -283,6 +383,12 @@ def estimate_peak_device_bytes(plan):
     count the model is not configured for, and what lets the tests run the
     whole model on CPU.
 
+    Which phases are emitted follows ``plan.workload``: a full reconstruction
+    by default, the filter and single back projection of a direct
+    reconstruction under ``'direct'``, and one denoiser sweep under
+    ``'denoise'``.  All three share the charges below, so the plans cannot
+    drift apart.
+
     Returns:
         Ledger: the phases and their per-device bytes.
     """
@@ -291,19 +397,37 @@ def estimate_peak_device_bytes(plan):
     rows_recon, cols_recon = int(plan.recon_shape[0]), int(plan.recon_shape[1])
 
     def sino_dev(i):
-        return plan.view_blocks[i][0] * num_rows_dev * num_channels * _F32_BYTES
+        return plan.view_blocks[i] * num_rows_dev * num_channels * _F32_BYTES
 
     def recon_dev(i):
-        return rows_recon * cols_recon * plan.slice_blocks[i][0] * _F32_BYTES
+        return rows_recon * cols_recon * plan.slice_blocks[i] * _F32_BYTES
 
     def cyl(i, num_pixels):
-        return int(num_pixels) * plan.slice_blocks[i][0] * _F32_BYTES
+        return int(num_pixels) * plan.slice_blocks[i] * _F32_BYTES
+
+    def back_block(i, num_pixels):
+        """One live (pixels, band) back partial, at the size really allocated.
+
+        A hand-written kernel wrapper rounds the band up to a multiple of 16
+        before it allocates and returns the real-band slice of that wider
+        array, so the block occupies the padded band.  The padded length is
+        read from the same helper the wrappers use, so the code and the
+        charge cannot disagree.
+
+        A plan whose band is shorter than its shard keeps the shard-sized
+        charge, which is then the larger of the two.  That is what this term
+        charged before the padding existed, and the ledger may over-charge
+        but may not under-charge.
+        """
+        slices = max(int(plan.slice_blocks[i]),
+                     padded_kernel_width(plan.band_length(i)))
+        return int(num_pixels) * slices * _F32_BYTES
 
     def is_view_owner(i):
-        return plan.view_blocks[i][1] > 0
+        return plan.view_blocks[i] > 0
 
     def is_slice_owner(i):
-        return plan.slice_blocks[i][1] > 0
+        return plan.slice_blocks[i] > 0
 
     def per_dev(fn):
         return [int(fn(i)) for i in range(n)]
@@ -313,40 +437,42 @@ def estimate_peak_device_bytes(plan):
         """The back call's band_cols: its local sinogram's row count."""
         if n == 1:
             return int(plan.sinogram_shape[1])
-        return (plan.band_length(i, 'back') if plan.rows_track_slices
+        return (plan.band_length(i) if plan.rows_track_slices
                 else num_rows_dev)
 
-    def column_gather_slices():
-        """The slice extent one column-gather call is handed: the WHOLE
-        device-form slice axis, padded tail included, because the gathered
-        cylinder spans every slice-owner at once."""
-        return sum(int(block[0]) for block in plan.slice_blocks)
+    def whole_slice_extent():
+        """The slice extent one forward call is handed: the WHOLE slice axis,
+        because a transferred cylinder spans every slice-owner at once."""
+        return sum(int(block) for block in plan.slice_blocks)
 
     def forward_call_pixels(num_pixels):
-        """How many pixel columns ONE forward call is handed: every pixel of
-        the pass by default, and one column batch on the column-gather path,
-        which is what makes that path's per-call terms fall."""
-        if plan.column_pixel_batch:
-            return min(int(num_pixels), int(plan.column_pixel_batch))
+        """How many pixels ONE forward call is handed: one cylinder batch,
+        capped by the pass, which is what makes the forward's per-call terms
+        fall.  A plan with no batch prices the whole pass; only a hand-built
+        plan is in that state, since every plan built from a model carries the
+        batch."""
+        if plan.pixel_batch:
+            return min(int(num_pixels), int(plan.pixel_batch))
         return int(num_pixels)
 
     def forward_cols(i):
-        """The forward call's band_cols: its voxel columns."""
+        """The forward call's band_cols, which is its slice extent.  One
+        device is handed the whole slice axis, and so is every view-owner
+        under sharding, because a transferred cylinder spans every slice-owner
+        at once."""
         if n == 1:
             return int(plan.recon_shape[2])
-        if plan.column_pixel_batch:
-            return column_gather_slices()
-        return plan.band_length(i, 'forward')
+        return whole_slice_extent()
 
     def band_slices(i, direction):
         """The slice extent one projection call is handed: the whole slice
-        axis at one device, this owner's slice band under sharding, and the
-        whole device-form axis again on the column-gather path."""
+        axis at one device, the whole device-form axis for a sharded forward
+        call, and this owner's slice band for a sharded back call."""
         if n == 1:
             return int(plan.recon_shape[2])
-        if direction == 'forward' and plan.column_pixel_batch:
-            return column_gather_slices()
-        return plan.band_length(i, direction)
+        if direction == 'forward':
+            return whole_slice_extent()
+        return plan.band_length(i)
 
     def torch_body_batch(i, direction, num_pixels):
         """What one view batch of a TORCH BODY holds.
@@ -379,8 +505,8 @@ def estimate_peak_device_bytes(plan):
     def forward_batch(i, num_pixels):
         if not is_view_owner(i):
             return 0
-        # A call's own pixel count, which is the pass's on the banded path
-        # and one column batch on the column-gather path.
+        # A call's own pixel count, which is one cylinder batch under
+        # sharding.
         call_pixels = forward_call_pixels(num_pixels)
         if 'forward' in plan.torch_body_directions:
             return torch_body_batch(i, 'forward', call_pixels)
@@ -398,9 +524,13 @@ def estimate_peak_device_bytes(plan):
             holding for the concatenation, at most ``shard - band`` slices,
           * the running total for the band it is on, one band,
           * the partial it produced itself, which the driver keeps alive
-            across the reduce, one band,
+            across the reduce, one band rounded up to a multiple of 16,
           * one slab per arriving partial, each bounded by
             ``_sharding.REDUCE_SLAB_BYTES``.
+
+        Only the partial this device produced takes the rounded-up length,
+        because only it comes straight from a kernel wrapper.  The running
+        total and every arriving slab are contiguous copies at the real band.
 
         That is ``shard + band`` slices of cylinder plus a bounded slab term,
         which at the default band -- the whole shard -- is TWO
@@ -418,22 +548,23 @@ def estimate_peak_device_bytes(plan):
         """
         if n == 1 or not is_slice_owner(i):
             return 0
-        band = plan.band_length(i, 'back')
-        shard = plan.slice_blocks[i][0]
+        band = plan.band_length(i)
+        shard = plan.slice_blocks[i]
+        own_partial = padded_kernel_width(band)
         row_bytes = int(band) * _F32_BYTES
         slab_rows = _sharding.reduce_slab_rows(int(num_pixels), row_bytes)
-        return (int(num_pixels) * (int(shard) + int(band)) * _F32_BYTES
+        return (int(num_pixels) * (int(shard) + own_partial) * _F32_BYTES
                 + (n - 1) * slab_rows * row_bytes)
 
     def back_view_batches(i, num_pixels):
         """How many batches one worker's view loop runs, or None when this
         plan prices no batch (a hand-built plan with no cost model)."""
-        real_views = plan.view_blocks[i][1]
-        if real_views <= 0 or plan.view_charge is None:
+        local_views = plan.view_blocks[i]
+        if local_views <= 0 or plan.view_charge is None:
             return None
         view_batch = int(plan.view_charge(
             'back', int(num_pixels), back_cols(i))[0])
-        return max(1, -(-int(real_views) // max(1, view_batch)))
+        return max(1, -(-int(local_views) // max(1, view_batch)))
 
     def back_fixed(i, num_pixels):
         """The back view loop's live cylinder-shards.
@@ -463,14 +594,18 @@ def estimate_peak_device_bytes(plan):
 
         This is charged on every VIEW owner: the workers run wherever there
         are views to project, not only where the bands land.
+
+        Each block is sized by ``back_block`` rather than by the shard,
+        because a kernel wrapper allocates the band rounded up to a multiple
+        of 16.
         """
         if n == 1:
-            return 3 * cyl(i, num_pixels) if is_slice_owner(i) else 0
+            return (3 * back_block(i, num_pixels) if is_slice_owner(i) else 0)
         if not is_view_owner(i):
             return 0
         batches = back_view_batches(i, num_pixels)
         live = 2 if batches is None else min(2, batches)
-        return live * cyl(i, num_pixels)
+        return live * back_block(i, num_pixels)
 
     def back_own_band(i, num_pixels):
         """The band this device already finished, live from its own pass on.
@@ -501,89 +636,71 @@ def estimate_peak_device_bytes(plan):
     # Over-charging is bounded too -- CALIBRATION_BAND asks the model to stay
     # within 1.30x of the measurement -- so an unneeded term is also a defect.
     def forward_fixed(i):
-        """The forward's assembled output.  A multi-device owner holds the
-        per-band pieces AND their concatenation (a row-aligned geometry, one
-        whose detector row r comes from recon slice r), or the running partial
-        AND the incoming one (a two-fan geometry such as cone, where one slice
-        projects onto many detector rows), so it pays twice.
+        """The forward's assembled output.
 
-        The COLUMN-GATHER forward holds one rather than two: its batches add
-        into the owner's block from inside the projector's view loop, so there
-        is no separate incoming block to hold beside it.  The charge stays at
-        two anyway.  It is shared with the banded path, which really does hold
-        both, and the ledger's rule is that it may charge more than a run needs
-        but never less -- so the column-gather path is deliberately over-charged
-        by one block here rather than given a term of its own."""
+        A multi-device owner holds ONE such block: its batches add into that
+        block from inside the projector's view loop, so there is no separate
+        incoming block beside it.  TWO are charged anyway, which is a
+        deliberate over-charge of one block.  The ledger's rule is that it may
+        charge more than a run needs but never less, and this term was
+        calibrated against measured peaks at two blocks."""
         if not is_view_owner(i):
             return 0
         return sino_dev(i) if n == 1 else 2 * sino_dev(i)
 
-    def forward_band_copy(i, num_pixels):
-        """The broadcast band the forward leaves resident on every projector.
+    def forward_transferred_cylinders(i, num_pixels):
+        """The cylinder batches the multi-device forward holds.
 
-        ``_sharding.broadcast_band_to_views`` copies the current slice-owner's
-        band onto every view-owner, and the copy stays live for the whole of
-        that band's projection.  One band is the whole shard by default, so
-        the copy is a full cylinder-shard on each device, on top of the
-        device's own shard.  Without this term the model falls below the
-        measured peak on a large cone reconstruction at four devices.
+        ``_sharding.transfer_cylinder_batch`` moves one batch of pixels from
+        every slice-owner and concatenates them, so what a view-owner holds is
+        that batch by the WHOLE device-form slice axis.  That does not grow
+        with the shard, so at a fixed batch it does not grow with the problem.
+        Three are live at the widest instant, because the driver transfers one
+        batch ahead of the projection that reads it; see
+        CYLINDER_TRANSFER_RESIDENTS for which three.
 
-        The column-gather path broadcasts no band at all, so this term is
-        zero there and ``forward_column_cylinder`` charges what it holds
-        instead.
-        """
-        if n == 1 or not is_view_owner(i) or plan.column_pixel_batch:
-            return 0
-        return cyl(i, num_pixels)
-
-    def forward_column_cylinder(i, num_pixels):
-        """The gathered cylinder the column-gather forward assembles.
-
-        ``_sharding.gather_column_band`` moves one batch of pixel columns
-        from every slice-owner and concatenates them, so what a view-owner
-        holds is that batch by the WHOLE device-form slice axis -- and,
-        unlike the band copy it replaces, that does not grow with the shard,
-        so it does not grow with the problem at a fixed batch.  Three are live
-        at the widest instant, because the driver gathers one batch ahead of
-        the projection that reads it; see COLUMN_GATHER_RESIDENTS for which
-        three.
-
-        Measured 2026-08-10 on four H100s, job mg10: ONE such cylinder read
-        7.9, 15.8 and 31.5 MiB at batches 2048, 4096 and 8192 at 1008 slices,
+        Measured 2026-08-10 on four H100s, job mg10: ONE such batch read 7.9,
+        15.8 and 31.5 MiB at pixel batches 2048, 4096 and 8192 at 1008 slices,
         which is the closed form exactly.
         """
-        if n == 1 or not is_view_owner(i) or not plan.column_pixel_batch:
+        if n == 1 or not is_view_owner(i) or not plan.pixel_batch:
             return 0
-        return (COLUMN_GATHER_RESIDENTS * forward_call_pixels(num_pixels)
-                * column_gather_slices() * _F32_BYTES)
+        return (CYLINDER_TRANSFER_RESIDENTS * forward_call_pixels(num_pixels)
+                * whole_slice_extent() * _F32_BYTES)
 
     def forward_view_batches(i, num_pixels):
         """How many batches one owner's forward view loop runs, or None when
         this plan prices no batch (a hand-built plan with no cost model).
         The counterpart of ``back_view_batches`` above, using the forward's
         own cost model."""
-        real_views = plan.view_blocks[i][1]
-        if real_views <= 0 or plan.view_charge is None:
+        local_views = plan.view_blocks[i]
+        if local_views <= 0 or plan.view_charge is None:
             return None
         view_batch = int(plan.view_charge(
             'forward', forward_call_pixels(num_pixels), forward_cols(i))[0])
-        return max(1, -(-int(real_views) // max(1, view_batch)))
+        return max(1, -(-int(local_views) // max(1, view_batch)))
 
     def forward_block_rows(i):
         """The DETECTOR-ROW extent of one forward view block.
 
         A row-aligned geometry's body sizes its output by the value columns it
         was handed -- ``_parallel_forward_view_batch_triton`` allocates
-        ``(views, channels, num_value_cols)`` -- so a slice band yields the
-        matching row band and the block shrinks with the band.  A TWO-FAN
-        body's output spans the whole detector whatever band the values carry:
-        ``_cone_forward_view_batch_triton`` allocates ``(views, channels,
-        num_rows_r)`` and reads ``num_rows_r`` from the params, because one
-        slice band lights up every row it projects onto.  So the block does
-        NOT shrink with the band there, and charging it at the band instead
-        would under-charge the cone forward by ``(rows - band)`` per view.
+        ``(views, channels, num_value_cols)`` -- and a transferred cylinder
+        carries the whole slice axis, so the block spans every row.  A TWO-FAN
+        body's output spans the whole detector as well, whatever the values
+        carry: ``_cone_forward_view_batch_triton`` allocates ``(views,
+        channels, num_rows_r)`` and reads ``num_rows_r`` from the params,
+        because one slice lights up every row it projects onto.
+
+        Both kernel bodies round that extent up to a multiple of 16 before
+        they allocate, and return the real-width slice of the wider array, so
+        a kernel body's block is charged at the padded extent.  A torch body
+        rounds nothing up and keeps the real one.
         """
-        return forward_cols(i) if plan.rows_track_slices else plan.sino_rows
+        rows = forward_cols(i) if plan.rows_track_slices else plan.sino_rows
+        if 'forward' in plan.torch_body_directions:
+            return int(rows)
+        return padded_kernel_width(rows)
 
     def forward_block(i, num_pixels):
         """The view block the loop holds BESIDES the one the batch prices.
@@ -611,9 +728,9 @@ def estimate_peak_device_bytes(plan):
         charged.
 
         The batch follows the pixel count of THIS call, so the subset phases
-        must pass their own subset size rather than the full index count --
-        and on the column-gather path a call's pixel count is one column
-        batch, which raises the view batch and with it this block.
+        must pass their own subset size rather than the full index count.
+        Under sharding a call's pixel count is one cylinder batch, which raises
+        the view batch and with it this block.
         """
         if not is_view_owner(i):
             return 0
@@ -628,13 +745,52 @@ def estimate_peak_device_bytes(plan):
         return ((live - already_paid) * int(view_batch)
                 * forward_block_rows(i) * num_channels * _F32_BYTES)
 
+    # ── the direct recon's filter ────────────────────────────────────────────
+    # Charged only by the 'direct' plan: inside a full reconstruction the
+    # filter runs between phases that hold more than it does.
+    def filter_row_weights(i):
+        """The FDK cosine pre-weight, one detector plane per device.
+
+        ``fdk_filter`` builds it and ``_apply_direct_recon_filter`` copies it
+        onto every device (``row_weight.to(d)``).  The FBP filters pass none,
+        so this over-charges them by one detector plane, which is one view of
+        the sinogram.
+        """
+        return int(plan.sino_rows) * num_channels * _F32_BYTES
+
+    def filter_row_batch(i):
+        """What one batch of the filter's row loop holds.
+
+        ``tomography_utils.apply_row_filter`` walks the shard
+        ROW_FILTER_BATCH detector rows at a time, convolving in frequency
+        space.  At the widest instant -- inside the inverse transform -- one
+        batch holds the pre-weighted window, the window's real FFT, its
+        product with the filter's transform, and the inverse transform's
+        output.  The two frequency arrays are complex over the zero-padded
+        length, and the inverse is real over that same length; the filtered
+        sinogram the batches write into is charged separately, as the array
+        it is.
+
+        The batch is a fixed row count, so this term does not fall with the
+        device count.
+        """
+        rows_in_shard = plan.view_blocks[i] * int(plan.sino_rows)
+        batch = min(tomography_utils.ROW_FILTER_BATCH, rows_in_shard)
+        # channels + (2 * channels - 1) taps - 1, the linear convolution
+        # length apply_row_filter transforms at.
+        padded = 3 * num_channels - 2
+        per_row = (num_channels * _F32_BYTES
+                   + 2 * (padded // 2 + 1) * (2 * _F32_BYTES)
+                   + padded * _F32_BYTES)
+        return batch * per_row
+
     # ── the persistent set ───────────────────────────────────────────────────
     # One sinogram-shaped weights term, never two: when the caller supplies
     # weights the hessian's weight array is a bare ALIAS of them, and when it
     # does not, the internally built all-ones sinogram is the only one.  It is
     # charged whenever either exists.
     # WHEN the weights array exists differs from WHETHER it exists.  A
-    # supplied weights array is placed at the top of vcd_recon, so it is
+    # supplied weights array is placed at the top of _vcd_recon, so it is
     # resident from the direct recon onward.  The internally built all-ones
     # array is created inside the hessian block, so on an unweighted run
     # nothing weights-shaped exists before that.  Measurement confirms both:
@@ -668,12 +824,14 @@ def estimate_peak_device_bytes(plan):
 
     # The partitions and the index cache are built before the reconstruction
     # starts and live on the lead device for its whole duration, so they are a
-    # base under EVERY phase, not only the loop.
+    # base under EVERY phase, not only the loop.  The workspace term is named
+    # separately because it is the only one of the two a direct reconstruction
+    # also carries.
+    workspace_term = ('library workspace', [FIXED_DEVICE_OVERHEAD_BYTES] * n)
     constant_terms = [
         ('partitions (lead device)',
          persistent.pop('partitions (lead device)')),
-        ('library workspace',
-         [FIXED_DEVICE_OVERHEAD_BYTES] * n),
+        workspace_term,
     ]
     constant_base = [sum(vals[i] for _name, vals in constant_terms)
                      for i in range(n)]
@@ -717,6 +875,153 @@ def estimate_peak_device_bytes(plan):
                 _phase(f'{name} [band reduce]', reduce_terms, n,
                        base=base, base_terms=base_terms)]
 
+    # ── the direct plan ──────────────────────────────────────────────────────
+    # A direct reconstruction is the filter and one back projection, and this
+    # is all of it.  It builds no prior, no hessian diagonal, no partition
+    # sequence and no reconstruction loop, so the only thing under its phases
+    # is the library's own workspace, and the phases themselves are the ones
+    # the full plan gives the same code.
+    #
+    # The device count is still chosen for a full recon; this plan is what the
+    # capacity check that can REFUSE is made against.  See
+    # TomographyModel._apply_device_policy.
+    if plan.workload == 'direct':
+        p_full = plan.num_pixels_full
+        base_terms = [workspace_term]
+        base = list(workspace_term[1])
+        # The sinogram is placed at entry (_shard_sinogram) and the filter
+        # writes a second array of the same shape (apply_row_filter's `out`),
+        # which is the input the back projection then reads.
+        residents = [
+            ('sinogram', per_dev(sino_dev)),
+            ('filtered sinogram', per_dev(sino_dev)),
+        ]
+        filter_terms = residents + [
+            ('filter row weights', per_dev(filter_row_weights)),
+            ('filter row batch', per_dev(filter_row_batch)),
+        ]
+        scatter_terms = residents + [
+            ('back cylinders', per_dev(lambda i: cyl(i, p_full))),
+            ('scatter buffer', per_dev(recon_dev)),
+        ]
+        if plan.helical:
+            scatter_terms.append(('helical z-weight', per_dev(recon_dev)))
+        phases.append(_phase('direct recon (filter)', filter_terms, n,
+                             base=base, base_terms=base_terms))
+        phases.extend(back_phases('direct recon (back loop)', residents,
+                                  p_full, base, base_terms))
+        phases.append(_phase('direct recon (scatter)', scatter_terms, n,
+                             base=base, base_terms=base_terms))
+        return Ledger(devices=list(plan.devices), phases=phases,
+                      num_pixels_full=int(plan.num_pixels_full))
+
+    # ── the denoise plan ─────────────────────────────────────────────────────
+    # One QGGMRFDenoiser sweep, and this is all of it.  The denoiser's forward
+    # model is the identity, so it has no projectors at all; its
+    # create_projectors is a no-op.  Nothing here therefore charges a view
+    # batch, a projection body, a hessian diagonal or a weights array.  Its
+    # sinogram shape IS its image shape, so every term below is image-shaped
+    # and none is sinogram-shaped.  It fixes one partition rather than a
+    # sequence, so it builds exactly the granularities this plan names.
+    #
+    # The arrays are split by SLICE, which is how _shard_recon places a
+    # recon-shaped array.  Every term therefore follows slice_blocks and none
+    # follows view_blocks.
+    if plan.workload == 'denoise':
+        base_terms = [workspace_term]
+        base = list(workspace_term[1])
+
+        def halo_columns(i):
+            """The qGGMRF boundary columns one device holds across a pass.
+
+            ``_sharding.exchange_qggmrf_halos`` gives each shard the image
+            slice just beyond each of its boundaries, as a ``(num_pixels,)``
+            column on the shard's own device.  A single device runs the
+            compiled sweep instead and exchanges nothing, so the term is zero
+            there.  See DENOISE_HALO_COLUMNS for which columns are counted.
+            """
+            if n == 1:
+                return 0
+            return (DENOISE_HALO_COLUMNS * int(plan.num_pixels_grid)
+                    * _F32_BYTES)
+
+        def partition_indices(i):
+            """The subset partition, which EVERY device holds whole.
+
+            The sharded sweep copies the whole partition onto each device
+            once rather than splitting it, because a subset's indices address
+            the in-slice pixel grid and every shard updates those same pixels
+            in its own slices.  One partition of g subsets is
+            ``g x ceil(P / g)`` int64 values.  Charged from the partitions
+            this plan BUILDS, which for a denoiser is the one partition the
+            sweep visits and no other.
+            """
+            return sum(
+                int(g) * math.ceil(plan.num_pixels_full / max(1, int(g)))
+                * _INT64_BYTES for g in plan.partition_granularities)
+
+        # What the sweep holds from the moment its state exists until it
+        # returns.  The denoiser places the input image, clones it into the
+        # working image, and forms the residual between the two, so three
+        # image-shaped arrays are live throughout.  A caller-supplied initial
+        # image is a fourth.  By default that argument aliases the input image
+        # and costs nothing.
+        #
+        # The reshape into flat (pixels, slices) form allocates nothing more.
+        # A shard arrives from its cross-device copy contiguous, and a
+        # single-device image is contiguous as placed, so the reshape is a
+        # view on either path.
+        residents = [
+            ('input image', per_dev(recon_dev)),
+            ('init image', per_dev(
+                lambda i: recon_dev(i) if plan.init_recon_supplied else 0)),
+            ('working image', per_dev(recon_dev)),
+            ('residual', per_dev(recon_dev)),
+            ('subset indices', per_dev(partition_indices)),
+            ('qggmrf halos', per_dev(halo_columns)),
+        ]
+        phases.append(_phase('denoise state placement', residents, n,
+                             base=base, base_terms=base_terms))
+        for granularity in plan.granularities:
+            p_sub = math.ceil(plan.num_pixels_full / max(1, int(granularity)))
+            # The prior and the update direction are consecutive rather than
+            # co-live.  The kernel's own working set is dead before the
+            # direction is formed, and the two arrays that survive the call
+            # are the prior gradient and hessian, which both counts include.
+            # The per-device maximum over phases picks between them.
+            sub_phases = (
+                ('prior', [('prior cylinders', per_dev(
+                    lambda i: plan.qggmrf_cylinders * cyl(i, p_sub)))]),
+                ('update direction', [('direction cylinders', per_dev(
+                    lambda i: DENOISE_DIRECTION_CYLINDERS * cyl(i, p_sub)))]),
+                ('state application', [
+                    ('direction and scaled direction', per_dev(
+                        lambda i: DENOISE_APPLY_CYLINDERS * cyl(i, p_sub)))]),
+            )
+            for name, terms in sub_phases:
+                phases.append(_phase(
+                    f'denoise subset {name} (granularity {granularity})',
+                    residents + terms, n, base=base, base_terms=base_terms))
+        # The convergence test reads the working image's ell-1 norm once per
+        # pass.  image_ell1 reduces the image a chunk at a time, so the
+        # absolute values it forms are one chunk rather than a whole
+        # image.  Written as sum(abs) over the whole image this was a fourth
+        # image-shaped resident and the denoiser's widest phase; at any size
+        # that chunks, the peak now falls on the qGGMRF prior instead.
+        # The chunk totals the reduction stacks, and the per-shard partials
+        # combine_on_lead moves onto the lead device, are 0-d scalars and are
+        # not charged -- the same treatment the line-search sums above get,
+        # and far below the resolution of the workspace term.
+        def ell1_chunk(i):
+            return ell1_chunk_bytes(recon_dev(i))[0]
+
+        phases.append(_phase(
+            'denoise per-pass statistics',
+            residents + [('ell-1 chunk', per_dev(ell1_chunk))], n,
+            base=base, base_terms=base_terms))
+        return Ledger(devices=list(plan.devices), phases=phases,
+                      num_pixels_full=int(plan.num_pixels_full))
+
     # ── phase B: the direct reconstruction ───────────────────────────────────
     # Runs only when no initial reconstruction was supplied.  Its full-index
     # back projection is the largest single projection of the run.
@@ -758,9 +1063,8 @@ def estimate_peak_device_bytes(plan):
             ('weights', per_dev(supplied_weights_term)),
             ('init recon', per_dev(recon_dev)),
             ('voxel gather', per_dev(lambda i: cyl(i, p_full))),
-            ('broadcast band', per_dev(lambda i: forward_band_copy(i, p_full))),
-            ('column cylinder', per_dev(
-                lambda i: forward_column_cylinder(i, p_full))),
+            ('transferred cylinders', per_dev(
+                lambda i: forward_transferred_cylinders(i, p_full))),
             ('forward output', per_dev(forward_fixed)),
             ('forward block', per_dev(lambda i: forward_block(i, p_full))),
             ('forward batch', per_dev(lambda i: forward_batch(i, p_full))),
@@ -851,13 +1155,29 @@ def estimate_peak_device_bytes(plan):
     # This phase has to be charged rather than assumed small: on an unweighted
     # run it is the peak.  Its transient measures EXACTLY two sinogram-shaped
     # arrays at the largest sizes tested, which is the two squared-error
-    # products; the recon L1 fuses into its own reduction and materializes
-    # nothing.
-    phases.append(_phase(
-        'per-iteration statistics',
-        [('squared-error products', per_dev(lambda i: 2 * sino_dev(i)))],
-        n, base=persistent_total,
-        base_terms=constant_terms + list(persistent.items())))
+    # products.
+    #
+    # The recon L1 is charged BESIDE those rather than folded into them,
+    # because the two are consecutive and not co-live: the squared-error
+    # products are dead before the L1 runs, and the L1's own temporary is dead
+    # before the RMSE product.  So the phase holds whichever is larger, which
+    # the per-device maximum below picks.  Sizes tested had two sinograms
+    # larger, which is why this used to charge them alone; a geometry whose
+    # recon exceeds two sinograms is the case that missed.  image_ell1 now
+    # bounds the L1's temporary to one chunk, so what could have been a whole
+    # second recon is the chunk instead.
+    stats_sub_phases = (
+        ('squared error',
+         ('squared-error products', per_dev(lambda i: 2 * sino_dev(i)))),
+        ('recon ell-1',
+         ('recon ell-1 chunk',
+          per_dev(lambda i: ell1_chunk_bytes(recon_dev(i))[0]))),
+    )
+    stats_base_terms = constant_terms + list(persistent.items())
+    for name, term in stats_sub_phases:
+        phases.append(_phase(f'per-iteration statistics ({name})', [term], n,
+                             base=persistent_total,
+                             base_terms=stats_base_terms))
 
     # ── phase E: the subset step, per granularity in the sequence ────────────
     prior_cylinders = PROX_CYLINDERS if plan.prox else plan.qggmrf_cylinders
@@ -887,10 +1207,8 @@ def estimate_peak_device_bytes(plan):
                 ('delta sinogram', per_dev(sino_dev)),
                 ('forward assembly', per_dev(
                     lambda i: sino_dev(i) if n > 1 and is_view_owner(i) else 0)),
-                ('broadcast band', per_dev(
-                    lambda i: forward_band_copy(i, p_sub))),
-                ('column cylinder', per_dev(
-                    lambda i: forward_column_cylinder(i, p_sub))),
+                ('transferred cylinders', per_dev(
+                    lambda i: forward_transferred_cylinders(i, p_sub))),
                 ('forward block', per_dev(lambda i: forward_block(i, p_sub))),
                 ('forward batch', per_dev(lambda i: forward_batch(i, p_sub))),
             ],
@@ -946,52 +1264,79 @@ def qggmrf_cylinder_count(model):
     return QGGMRF_CYLINDERS_COMPILED
 
 
-def plan_from_model(model, devices, partition_sequence=None, weights=None,
-                    init_recon=None, fm_hessian=None, prox_input=None,
-                    init_error_sinogram=None):
+def plan_from_model(model, devices, workload='recon', partition_sequence=None,
+                    weights=None, init_recon=None, fm_hessian=None,
+                    prox_input=None, init_error_sinogram=None):
     """Build a :class:`LedgerPlan` for ``model`` over a CANDIDATE device list.
 
     The device list is an argument rather than a reading of the model's own
     placement, because the widening rule prices counts the model is not
     configured for.  The placements are rebuilt here from the current params,
-    so a geometry change cannot leave a stale real size behind.
+    so a geometry change cannot leave a stale axis length behind.
+
+    ``workload`` names the call the plan is for: ``'recon'`` (the default)
+    prices a full reconstruction, ``'direct'`` prices a direct reconstruction
+    -- the filter and one back projection, with none of the prior, hessian,
+    partition and loop state a full reconstruction holds -- and ``'denoise'``
+    prices one QGGMRFDenoiser sweep.
+
+    A denoiser is read differently in three places, because it is built
+    differently.  It has no projectors, so no per-view cost model is built and
+    no projection body is asked what it costs.  Asking would raise, because a
+    denoiser defines no bodies.  It also builds one partition rather than a
+    sequence, so the plan names the single granularity the sweep visits.  And
+    its sinogram shape is its image shape, which is checked here rather than
+    assumed.  A plan built from a model where the two differ would price the
+    wrong arrays.
     """
     sinogram_shape = tuple(int(s) for s in model.get_params('sinogram_shape'))
     recon_shape = tuple(int(s) for s in model.get_params('recon_shape'))
     devices = [torch.device(d) for d in devices]
+    denoising = workload == 'denoise'
+    if denoising and sinogram_shape != recon_shape:
+        raise ValueError(
+            "the 'denoise' workload prices a QGGMRFDenoiser, whose "
+            'sinogram_shape is its image shape.  This model has '
+            f'sinogram_shape {sinogram_shape} and recon_shape {recon_shape}.')
 
     sino_placement = _sharding.Placement(devices, axis=0,
-                                         real_size=sinogram_shape[0])
+                                         axis_len=sinogram_shape[0])
     recon_placement = _sharding.Placement(devices, axis=-1,
-                                          real_size=recon_shape[2])
-    view_blocks = [(end - start, n_valid)
-                   for _d, (start, end), n_valid
-                   in sino_placement.padded_shard_ranges()]
-    slice_blocks = [(end - start, n_valid)
-                    for _d, (start, end), n_valid
-                    in recon_placement.padded_shard_ranges()]
-    # A row-aligned geometry presents the same padded length on the detector
-    # row axis as on the sharded slice axis.
+                                          axis_len=recon_shape[2])
+    view_blocks = [end - start for _d, (start, end)
+                   in sino_placement.shard_ranges()]
+    slice_blocks = [end - start for _d, (start, end)
+                    in recon_placement.shard_ranges()]
     rows_track_slices = bool(getattr(model, 'rows_track_slices', False))
-    sino_rows = (recon_placement.padded_size
-                 if rows_track_slices and recon_placement.is_padded
-                 else sinogram_shape[1])
+    sino_rows = sinogram_shape[1]
 
     granularity = list(model.get_params('granularity'))
     if partition_sequence is None:
         partition_sequence = list(model.get_params('partition_sequence'))
-    visited = sorted({granularity[int(k)] for k in partition_sequence
-                      if int(k) < len(granularity)})
+    if denoising:
+        # A denoise sweep builds and visits ONE partition: the one the FIRST
+        # entry of the sequence names.  A reconstruction walks the whole
+        # sequence and builds every granularity in the list, so reading the
+        # sequence the reconstruction's way would charge partitions the
+        # denoiser never builds and subset phases it never runs.
+        index = int(partition_sequence[0]) if len(partition_sequence) else 0
+        visited = [granularity[index]] if index < len(granularity) else []
+        built = list(visited)
+    else:
+        visited = sorted({granularity[int(k)] for k in partition_sequence
+                          if int(k) < len(granularity)})
+        built = list(granularity)
 
     num_pixels_full = int(model.full_index_count())
     num_pixels_grid = recon_shape[0] * recon_shape[1]
 
-    charge = _model_view_charge(model, len(devices))
+    charge = None if denoising else _model_view_charge(model, len(devices))
 
     return LedgerPlan(
         sinogram_shape=sinogram_shape,
         recon_shape=recon_shape,
         devices=devices,
+        workload=workload,
         view_blocks=view_blocks,
         slice_blocks=slice_blocks,
         sino_rows=int(sino_rows),
@@ -999,7 +1344,7 @@ def plan_from_model(model, devices, partition_sequence=None, weights=None,
         num_pixels_full=num_pixels_full,
         num_pixels_grid=num_pixels_grid,
         granularities=tuple(visited) or (granularity[0],),
-        partition_granularities=tuple(granularity),
+        partition_granularities=tuple(built) or (granularity[0],),
         weights_supplied=weights is not None,
         fm_hessian_supplied=fm_hessian is not None,
         init_recon_supplied=init_recon is not None,
@@ -1008,17 +1353,36 @@ def plan_from_model(model, devices, partition_sequence=None, weights=None,
         positivity=bool(model.get_params('positivity_flag')),
         helical=_is_helical(model),
         hessian_masked=model.get_params('use_ror_mask') is not False,
-        forward_band=getattr(model, 'forward_project_slice_band', None),
         back_band=getattr(model, 'back_project_slice_band', None),
-        # Both read from the model's own resolvers rather than re-derived
-        # here: a charge that re-implements a driver rule is a charge that
-        # can be left behind when the rule moves.
-        column_pixel_batch=(model._forward_pixel_batch()
-                            if model._column_gather_forward() else None),
+        # Read from the model's own resolver rather than re-derived here: a
+        # charge that re-implements a driver rule is a charge that can be
+        # left behind when the rule moves.  A denoiser has no forward
+        # projection, so it is not asked.
+        pixel_batch=(None if denoising
+                            else model._forward_pixel_batch()),
         qggmrf_cylinders=qggmrf_cylinder_count(model),
         view_charge=charge,
-        torch_body_directions=torch_body_directions(model),
+        torch_body_directions=(() if denoising
+                               else torch_body_directions(model)),
     )
+
+
+def workload_covers(checked, incoming):
+    """Whether a layout already checked for ``checked`` needs no fresh check
+    before ``incoming`` runs on it.
+
+    The recon plan charges every array the direct plan charges and a great
+    deal besides, so a layout that passed a recon check passes a direct one.
+    Nothing beyond that pair is claimed: a plan added later is unrelated to
+    these until it has been priced against them.
+
+    ``'denoise'`` is one such plan.  It covers nothing and is covered by
+    nothing, because it holds arrays neither of the other two holds.  A
+    denoise holds three image-shaped arrays at once, where a reconstruction
+    holds one recon beside its sinogram-shaped set.  Equality below is what
+    lets one denoise follow another with no fresh check.
+    """
+    return checked == incoming or (checked, incoming) == ('recon', 'direct')
 
 
 def torch_body_directions(model):

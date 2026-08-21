@@ -1,17 +1,17 @@
-"""Direct-recon filter machinery, ported from mbirjax.tomography_utils.
+"""Direct-recon filter machinery.
 
-``generate_direct_recon_filter`` is a verbatim numpy port.  ``apply_row_filter``
-keeps the same contract (per-row 'valid' convolution with the (2C-1)-tap
-filter, output length == channels) but implements it with torch.fft in
-row batches, replacing jax's fftconvolve + scan machinery.
+``generate_direct_recon_filter`` builds the space-domain filter in numpy.
+``apply_row_filter`` applies it as a per-row 'valid' convolution with the
+(2C-1)-tap filter (output length == channels), computed with torch.fft in
+row batches.
 """
 
 import numpy as np
 import torch
 
-# Detector rows convolved per batch; bounds the FFT work area (the mbirjax
-# constant, kept -- its H100 sweep rationale is backend-independent enough to
-# start from; re-sweep as part of the torch tuning).
+# Detector rows convolved per batch; bounds the FFT work area.  The value comes
+# from an H100 sweep in an earlier implementation and is kept as a starting
+# point; re-sweep as part of the torch tuning.
 ROW_FILTER_BATCH = 1024
 
 
@@ -34,8 +34,7 @@ def apply_row_filter(block, filter_arr, row_weight=None):
     BEFORE convolution.  It is applied inside the batched loop (a bounded
     gather per window), so the peak stays at the input+output floor -- no
     full-sinogram out-of-place copy.  ``None`` (the default) is pure FBP,
-    leaving the parallel-beam path unchanged.  (Same contract as the mbirjax
-    function.)
+    leaving the parallel-beam path unchanged.
 
     Args:
         block: (views, rows, channels) float32 tensor.
@@ -61,7 +60,9 @@ def apply_row_filter(block, filter_arr, row_weight=None):
     # the valid slice is filtered[C-1 : C-1+C].
     start = n_channels - 1
     out = torch.empty_like(rows)
-    batch = min(ROW_FILTER_BATCH, total_rows)
+    # Never zero: a view-shard that owns no views has no rows to filter, and
+    # a loop step of zero is an error even where the range it walks is empty.
+    batch = max(1, min(ROW_FILTER_BATCH, total_rows))
     for r0 in range(0, total_rows, batch):
         window = rows[r0:r0 + batch]
         if row_weight is not None:

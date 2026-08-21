@@ -64,13 +64,14 @@ recon, recon_dict = ct_model.recon(sinogram, weights=weights)
 nrmse = np.linalg.norm(recon - phantom) / np.linalg.norm(phantom)
 print(f'Normalized RMS error between reconstruction and phantom: {nrmse:.3f}')
 
-# View the phantom and the reconstruction side by side.
-mbirtorch.slice_viewer(phantom, recon, data_dicts=[None, recon_dict], vmin=0.0,
-                       title='Phantom (left) and cone-beam MBIR reconstruction (right)')
-
 # Save the reconstruction and its settings to one file.  The file can be
 # reloaded later for viewing, or to continue from this result:
 #     recon, recon_dict = mbirtorch.TomographyModel.load_recon_hdf5(filepath)
 filepath = './output/demo2_recon.h5'
 ct_model.save_recon_hdf5(filepath, recon, recon_dict)
 print(f'Reconstruction saved to {filepath}')
+
+# View the phantom and the reconstruction side by side.
+mbirtorch.slice_viewer(phantom, recon, data_dicts=[None, recon_dict], vmin=0.0,
+                       title='Phantom (left) and cone-beam MBIR reconstruction (right)', block=False)
+mbirtorch.slice_viewer(sinogram, title='Sinogram', slice_axis=0)

@@ -37,4 +37,5 @@ nrmse = np.linalg.norm(recon - phantom) / np.linalg.norm(phantom)
 print(f'Normalized RMS error between reconstruction and phantom: {nrmse:.3f}')
 
 mbirtorch.slice_viewer(phantom, recon, data_dicts=[None, recon_dict], vmin=0.0,
-                       title='Phantom (left) and laminography reconstruction (right)')
+                       title='Phantom (left) and laminography reconstruction (right)', block=False)
+mbirtorch.slice_viewer(sinogram, title='Sinogram', slice_axis=0)

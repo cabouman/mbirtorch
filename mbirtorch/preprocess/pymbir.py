@@ -23,7 +23,7 @@ def get_sino_and_model(filename, *, bh_correction=True, auto_crop=False, subsamp
     Returns:
         tuple: ``(sino, model)`` where
 
-            - ``sino`` (jax array): the computed sinogram, shape (num_views, num_det_rows, num_det_channels).
+            - ``sino`` (numpy.ndarray): the computed sinogram, shape (num_views, num_det_rows, num_det_channels).
             - ``model`` (ConeBeamModel): a model with its reconstruction geometry already set.
 
     Example:

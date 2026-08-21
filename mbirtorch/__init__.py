@@ -1,33 +1,33 @@
-"""mbirtorch: a PyTorch port of mbirjax (parallel-beam geometry).
+"""mbirtorch: model-based iterative reconstruction for computed tomography, in PyTorch.
 
-The public API mirrors mbirjax where implemented: numpy in, numpy out by
-default, with device tensors available via ``output_sharded=True`` (the name
-kept for API compatibility; here it means "return the device tensor").
+The package reconstructs volumes from tomographic measurements for several
+scanner geometries.  The public API takes numpy arrays and returns numpy
+arrays by default; pass ``output_sharded=True`` to get the device tensor
+instead.  All available GPUs are used automatically.
 """
 
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 
 # ── persistent torch.compile cache ────────────────────────────────────────────
 # The inductor cache directory defaults to /tmp/torchinductor_<user>, which the
 # OS may clean; pin it to a stable per-user location so compiled artifacts
-# survive across processes and reboots (the mbirjax ~/.mbirjax/jax_cache
-# analog).  The FX-graph cache is what makes a FRESH PROCESS reuse prior
-# compilations; enable it explicitly for torch versions where it is not the
-# default.  setdefault keeps both overridable per-run via the environment, and
-# -- like mbirjax's TF_CPP_MIN_LOG_LEVEL -- this is effective only if mbirtorch
-# is imported before torch triggers its first compile, which any
-# import-mbirtorch-first program satisfies.  Dynamo TRACING still runs per
-# process (the cache skips inductor codegen, not tracing), so a cold process
-# keeps a small residual warmup.  ``mbirtorch.clear_cache()`` removes the
-# whole ~/.mbirtorch directory (see utilities.py).
+# survive across processes and reboots.  The FX-graph cache is what makes a NEW
+# PROCESS reuse prior compilations; enable it explicitly for torch versions
+# where it is not the default.  setdefault keeps both overridable per-run via
+# the environment.  Both settings take effect only if mbirtorch is imported
+# before torch triggers its first compile, which any import-mbirtorch-first
+# program satisfies.  Dynamo TRACING still runs per process (the cache skips
+# inductor codegen, not tracing), so a cold process keeps a small residual
+# warmup.  ``mbirtorch.clear_cache()`` removes the whole ~/.mbirtorch directory
+# (see utilities.py).
 import os as _os
 
 _os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR",
                        _os.path.expanduser("~/.mbirtorch/torch_cache"))
 _os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
 
-from .parallel_beam import ParallelBeamModel
-from .cone_beam import ConeBeamModel
+from .parallel_beam import ParallelBeamModel, recon_simple_parallel
+from .cone_beam import ConeBeamModel, recon_simple_cone
 from .translation_model import TranslationModel
 from .multiaxis_parallel import MultiAxisParallelModel, MultiAxisParallelBeamModel
 from .denoising import QGGMRFDenoiser
@@ -56,12 +56,13 @@ from .memory_stats import get_memory_stats
 # documented by ``automodule:: mbirtorch :members:``.  It is deliberately narrower than
 # the import list above -- the VCD and qGGMRF helpers stay importable as attributes
 # (mbirtorch.gen_full_indices still works, and the tests use that spelling) but are not
-# promised as public API, matching the surface mbirjax documents.  The same goes for
-# gen_cube_phantom and get_helical_half_rotation_slice_range: mbirjax's star imports put
-# them on the package, and its tests call them there, but its docs do not carry them.
+# promised as public API.  The same goes for gen_cube_phantom and
+# get_helical_half_rotation_slice_range: they are importable from the package, and the
+# tests call them there, but the docs do not carry them.
 __all__ = [
     "ParallelBeamModel", "ConeBeamModel", "TranslationModel",
     "MultiAxisParallelModel", "TomographyModel", "QGGMRFDenoiser",
+    "recon_simple_parallel", "recon_simple_cone",
     "TorchProjector", "forward_project_differentiable",
     "back_project_differentiable", "gen_weights", "gen_weights_mar",
     "median_filter3d", "download_and_extract", "build_model",
@@ -87,13 +88,13 @@ __all__ = [
 # tqdm).  Both spellings keep working -- `mbirtorch.hsnt` resolves here, and
 # `import mbirtorch.hsnt` is an ordinary submodule import -- and the
 # star-exported FUNCTION names (mbirtorch.dehydrate, mbirtorch.get_opt_views,
-# ...) resolve through _LAZY_NAMES, so the public surface matches mbirjax's
-# eager star imports exactly; only WHEN each module loads changes.
+# ...) resolve through _LAZY_NAMES, so the public surface is exactly what eager
+# star imports would give; only WHEN each module loads changes.
 _VIEWER_EXPORTS = ("SliceViewer", "VolumeStack", "slice_viewer")
 
 _LAZY_MODULES = ("preprocess", "hsnt", "vcls")
 
-# The names mbirjax exposes at package level via `from .hsnt import *` and
+# The names exposed at package level via `from .hsnt import *` and
 # `from .vcls import *`, mapped to their owning module (neither module
 # declares __all__, so this is their full public def list; a new public
 # function in either module gets a line here).

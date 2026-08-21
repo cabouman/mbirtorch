@@ -1,4 +1,3 @@
-import functools
 import os
 import warnings
 
@@ -35,9 +34,12 @@ def _ps_sum(fn, *xs):
 
 
 def _ps_max(fn, x):
-    """float: fn (a scalar reduction) maximized across the pieces."""
+    """float: fn (a scalar reduction) maximized across the pieces.
+
+    A piece with no elements is skipped: a device may own no views, and a
+    reduction has no value to return there."""
     if isinstance(x, _sharding.Shards):
-        return max(float(fn(t)) for t in x.tensors)
+        return max(float(fn(t)) for t in x.tensors if t.numel() > 0)
     return float(fn(x))
 
 
@@ -52,7 +54,7 @@ def _ps_item(x, idx):
     """float: the value at a global (view, row, col) index."""
     if isinstance(x, _sharding.Shards):
         pl = x.placement
-        for t, (_d, (v0, v1)) in zip(x.tensors, pl.shard_ranges(pl.padded_size)):
+        for t, (_d, (v0, v1)) in zip(x.tensors, pl.shard_ranges()):
             if v0 <= idx[0] < v1:
                 return float(t[idx[0] - v0, idx[1], idx[2]])
         raise IndexError(f'view {idx[0]} outside the sharded axis')
@@ -67,36 +69,26 @@ def _ps_argmin3d(x):
         return _argmin_3d(x)
     pl = x.placement
     best_idx, best_val = None, None
-    for t, (_d, (v0, _v1)) in zip(x.tensors, pl.shard_ranges(pl.padded_size)):
+    for t, (_d, (v0, _v1)) in zip(x.tensors, pl.shard_ranges()):
+        if t.numel() == 0:
+            # A device may own no views, and an argmin has no answer there.
+            continue
         (v, r, c), val = _argmin_3d(t)
         if best_val is None or float(val) < best_val:
             best_idx, best_val = (v + v0, r, c), float(val)
     return best_idx, best_val
 
 
-def _ps_view_mask(mask, x):
-    """The (num_views, 1, 1) host view mask in x's form: sliced per piece onto
-    its device, or one tensor.  None passes through."""
-    if mask is None:
-        return None
-    mask = np.asarray(mask)
-    if isinstance(x, _sharding.Shards):
-        pl = x.placement
-        parts = [torch.as_tensor(mask[v0:v1], device=t.device)
-                 for t, (_d, (v0, v1)) in zip(x.tensors,
-                                              pl.shard_ranges(pl.padded_size))]
-        return _sharding.Shards(parts, pl)
-    return torch.as_tensor(mask, device=x.device)
-
 def gen_huber_weights(weights, sino_error, T=1.0, delta=1.0, epsilon=1e-6):
     """
-    This function generates generalized Huber weights based on the method described in the referenced notes.
-    It adds robustness by treating any element where ``|sino_error / weights| > T`` as an outlier,
-    down-weighting it according to the generalized Huber function.
+    Generate generalized Huber weights that down-weight outliers in ``sino_error``.
 
-    The function returns new `ghuber_weights`.
+    The per-element standard deviation is ``std = 1 / sqrt(weights)``.  A single global factor
+    ``alpha = ||sino_error|| / ||std||`` rescales it, and an element counts as an outlier when
+    ``|sino_error / (alpha * std)| > T``.  Each outlier is down-weighted by the generalized Huber
+    function; all other elements get weight 1.
 
-    Typically, to obtain the final robust weights, the `ghuber_weights` should be multiplied by the original `weights`:
+    Typically, to obtain the final robust weights, the returned weights should be multiplied by the original `weights`:
 
         final_weights = weights * ghuber_weights
 
@@ -106,7 +98,7 @@ def gen_huber_weights(weights, sino_error, T=1.0, delta=1.0, epsilon=1e-6):
         sino_error: ndarray or tensor of shape (views, rows, cols):
             Sinogram error array representing deviations from the model.
         T: float, optional (default=1.0):
-            Threshold parameter; values greater than T are treated as outliers.
+            Outlier threshold on the normalized error ``|sino_error / (alpha * std)|``.
         delta: float, optional (default=1.0):
             Controls the strength of the generalized Huber function (delta=1 corresponds to the conventional Huber).
         epsilon: float, optional (default=1e-6):
@@ -164,25 +156,39 @@ def BH_correction(sino, alpha, batch_size=64, devices=None):
 
     It processes the sinogram in batches of views for memory efficiency.
 
+    Accepted forms: `sino` may be a NumPy array or a torch tensor, and the result is always a NumPy
+    array on the host.  Any GPU use is internal -- the views are moved to a device one batch at a
+    time and each batch's result is brought back.  A sinogram in the divided device form (a
+    ``Shards`` container, as produced by the multi-GPU projectors) is not accepted; gather it to the
+    host first with ``shards.gather()``.
+
     Args:
-        sino (ndarray of shape (views, rows, cols)):
+        sino (numpy array or tensor, of shape (views, rows, cols)):
             Input sinogram to correct.
         alpha (list or array of floats):
             Coefficients for the polynomial correction. The k-th term corresponds to sino^(k+1).
         batch_size (int, optional, default=64):
             Number of views to process in a single batch.
-        devices (sequence, optional):
-            Accepted for interface compatibility; the batches run on a single device.
+        devices (sequence or None, optional):
+            Devices to spread the view batches over.  The views are split into contiguous blocks,
+            one per device, and the blocks are processed at the same time.  None (the default) uses
+            all visible CUDA devices, capped by ``MBIRTORCH_NUM_DEVICES`` when that is set, or the
+            default device when there are none.
 
     Returns:
-        corrected_sino: ndarray of shape (views, rows, cols)
+        corrected_sino: numpy.ndarray of shape (views, rows, cols)
             Beam hardening corrected sinogram.
+
+    Raises:
+        TypeError: If `sino` is in the divided device form.
 
     Example:
         >>> import mbirtorch.preprocess as mtp
         >>> alpha = [1.0, 0.2, 0.1]  # Correction: sino + 0.2 * sino^2 + 0.1 * sino^3
         >>> corrected_sino = mtp.BH_correction(sino, alpha)
     """
+    pipeline.reject_shards('BH_correction', sino=sino)
+
     alpha = np.asarray(alpha)
 
     # Per-view-batch polynomial evaluation, driven through the shared pipeline driver.  The
@@ -193,7 +199,8 @@ def BH_correction(sino, alpha, batch_size=64, devices=None):
             corrected = corrected + float(alpha[k]) * torch.pow(sino_batch, k + 1)
         return corrected
 
-    return pipeline.map_view_batches(sino, kernel, batch_size, devices=devices)
+    return pipeline.map_view_batches(sino, kernel, batch_size,
+                                     devices=pipeline.permitted_devices(devices))
 
 
 def _generate_metal_exponent_list(num_metal, max_order):
@@ -249,12 +256,6 @@ def _est_plastic_metal_sinos_from_recon(recon, num_metal, ct_model,
     # 1+num_metal forward projections below consume the SAME device recon.
     recon = ct_model._shard_recon(recon)
 
-    # Slice-padding info: valid_mask (True on real slices; None when unpadded) and num_real_slices
-    # let the segmentation exclude any padded slices from its statistics and masks.
-    pl = ct_model.recon_placement
-    ndim = recon.tensors[0].ndim if isinstance(recon, _sharding.Shards) else recon.ndim
-    valid_mask = pl.real_mask(ndim)
-
     # --- Segment plastic and metal regions in the reconstruction ---
     # plastic_mask: Mask for plastic regions.
     # metal_masks: List of masks for each metal.
@@ -262,7 +263,7 @@ def _est_plastic_metal_sinos_from_recon(recon, num_metal, ct_model,
     # metal_scales: List of scaling factors for each metal region.
     plastic_mask, metal_masks, plastic_scale, metal_scales = mtp.segment_plastic_metal(
         recon, num_metal=num_metal, radial_margin=radial_margin, top_margin=top_margin,
-        bottom_margin=bottom_margin, valid_mask=valid_mask, num_real_slices=pl.real_size)
+        bottom_margin=bottom_margin)
 
     # --- Forward project and scale plastic ---
     # Keep the OUTPUT on-device (output_sharded=True): the whole correction below runs on these
@@ -368,7 +369,7 @@ def _argmin_3d(x):
 _METAL_SUPPORT_FLOOR = 1e-3
 
 
-def _find_most_violated_constraints(measured_sino, plastic_sino_est, metal_sino_est, theta, H_exponent_list, num_cross_terms, view_mask=None):
+def _find_most_violated_constraints(measured_sino, plastic_sino_est, metal_sino_est, theta, H_exponent_list, num_cross_terms):
     """
     Compute the most violated constraints for the beam hardening model.
 
@@ -377,9 +378,7 @@ def _find_most_violated_constraints(measured_sino, plastic_sino_est, metal_sino_
         2. Residual positivity:       y[i] − H_m[i,:] θ_m ≥ 0
 
     This function evaluates the indices and values of the entries that most violate
-    the constraints.  When the sinogram is zero-padded on the view axis, ``view_mask`` (1 on real
-    views, 0 on padded, broadcasting over the sinogram) excludes the padded views from the argmin so
-    a padded entry is never selected as a constraint.
+    the constraints.
 
     The residual argmin is further restricted to pixels where some metal estimate exceeds
     ``_METAL_SUPPORT_FLOOR``: where every metal estimate is (near) zero the row H_m[i,:] is (near)
@@ -417,19 +416,8 @@ def _find_most_violated_constraints(measured_sino, plastic_sino_est, metal_sino_
     Sp = _ps_map(build_sp, plastic_sino_est, *metal_sino_est)
     y_minus_Sm = _ps_map(build_y_minus_sm, measured_sino, plastic_sino_est, *metal_sino_est)
 
-    # Lower-bound violator: minimize Sp and y-Sm over the REAL views (padded views set to +inf so they
-    # can't win the argmin).
-    def mask_sp(sp, vm=None):
-        if vm is None:
-            return sp
-        inf = torch.tensor(float('inf'), dtype=sp.dtype, device=sp.device)
-        return torch.where(vm, sp, inf)
-
-    Sp_masked = Sp if view_mask is None else _ps_map(mask_sp, Sp, view_mask)
-
     # Residual argmin restricted to the metal support (see the docstring): pixels where every metal
     # estimate is <= the floor cannot be moved by theta, so they must never become constraints.
-    # Padded views have all-zero metal estimates, so this mask also excludes them.
     def mask_residual(ym, *ms):
         support = torch.zeros_like(ym, dtype=torch.bool)
         for metal in ms:
@@ -438,7 +426,7 @@ def _find_most_violated_constraints(measured_sino, plastic_sino_est, metal_sino_
         return torch.where(support, ym, inf)
 
     ymSm_masked = _ps_map(mask_residual, y_minus_Sm, *metal_sino_est)
-    idx_min_Sp, v_min_Sp = _ps_argmin3d(Sp_masked)
+    idx_min_Sp, v_min_Sp = _ps_argmin3d(Sp)
     idx_min_residual, v_min_residual = _ps_argmin3d(ymSm_masked)
 
     return idx_min_Sp, v_min_Sp, idx_min_residual, v_min_residual
@@ -543,7 +531,7 @@ def _compute_entry_for_OSQP(plastic_sino_est, metal_sino_est, measured_sino, H_e
 
     return P, q
 
-def _estimate_BH_model_params(plastic_sino_est, metal_sino_est, measured_sino, H_exponent_list, num_cross_terms, alpha, beta, num_constraint_update_iter=10, tolerance=-1e-5, view_mask=None):
+def _estimate_BH_model_params(plastic_sino_est, metal_sino_est, measured_sino, H_exponent_list, num_cross_terms, alpha, beta, num_constraint_update_iter=10, tolerance=-1e-5):
     """
     Estimate polynomial beam hardening model parameters with iterative constraints search.
 
@@ -596,7 +584,7 @@ def _estimate_BH_model_params(plastic_sino_est, metal_sino_est, measured_sino, H
 
     for iter in range(num_constraint_update_iter):
         # Find the (view, row, col) indices and values of the points that most violate each constraint
-        idx_min_Sp, v_min_Sp, idx_min_residual, v_min_residual = _find_most_violated_constraints(measured_sino, plastic_sino_est, metal_sino_est, theta, H_exponent_list, num_cross_terms, view_mask=view_mask)
+        idx_min_Sp, v_min_Sp, idx_min_residual, v_min_residual = _find_most_violated_constraints(measured_sino, plastic_sino_est, metal_sino_est, theta, H_exponent_list, num_cross_terms)
 
         # (1) Hp θp ≥ 0  ->  (-Hp) θ ≤ 0
         if v_min_Sp < tolerance and (idx_min_Sp not in C_p):
@@ -641,7 +629,7 @@ def _estimate_BH_model_params(plastic_sino_est, metal_sino_est, measured_sino, H
     return theta
 
 
-def _correct_plastic_sinogram(measured_sino, plastic_sino_est, metal_sino_est, theta, H_exponent_list, num_cross_terms, num_metal_terms, p_normalization, gamma, view_mask=None, num_real_pixels=None):
+def _correct_plastic_sinogram(measured_sino, plastic_sino_est, metal_sino_est, theta, H_exponent_list, num_cross_terms, num_metal_terms, p_normalization, gamma):
     """
     Perform beam hardening correction on the plastic sinogram.
 
@@ -658,8 +646,7 @@ def _correct_plastic_sinogram(measured_sino, plastic_sino_est, metal_sino_est, t
     The correction is applied as:
         corrected_plastic = p_normalization * max(y - H_metal·θ_m, 0) / (max(H_plastic·θ_p, γ * mean(H_plastic·θ_p))
     The stabilization term involving γ prevents division by near-zero or negative values, reducing streaks
-    and numerical instability.  (``view_mask`` / ``num_real_pixels`` restrict the mean to the real views
-    when the sinogram is zero-padded on the view axis.)
+    and numerical instability.
 
     Args:
         measured_sino (tensor): Measured sinogram.
@@ -699,27 +686,20 @@ def _correct_plastic_sinogram(measured_sino, plastic_sino_est, metal_sino_est, t
 
     # Central plastic coefficient, used to define a stabilization floor.  The MEAN (rather than the
     # median) is a cheap reduction; over the sinogram support the two are close, and this only sets a
-    # floor.  When the sinogram is zero-padded on the view axis, exclude the padded views via
-    # view_mask so they don't drag the mean toward 0.
+    # floor.
     #
     # The two forms below are NOT interchangeable, so the branch is on the form
     # of Sp rather than on convenience.  One tensor keeps the pre-sharding
-    # reduction exactly: torch.mean (or the masked float32 sum), a 0-d float32
-    # Sp_floor, and torch.maximum against it.  The float32-sum / float64-divide
-    # form exists only to combine per-piece partials that cannot be reduced in
-    # one kernel, so it is reserved for the sharded branch; using it on one
-    # device would move the divide to float64 and silently change a
-    # single-device result that this port promises to leave alone.
+    # reduction exactly: torch.mean, a 0-d float32 Sp_floor, and torch.maximum
+    # against it.  The float32-sum / float64-divide form exists only to combine
+    # per-piece partials that cannot be reduced in one kernel, so it is
+    # reserved for the sharded branch; using it on one device would move the
+    # divide to float64 and silently change a single-device result that this
+    # port promises to leave alone.
     if not isinstance(Sp, _sharding.Shards):
-        if view_mask is None:
-            mean_plastic_coef = torch.mean(Sp)
-        else:
-            mean_plastic_coef = torch.sum(Sp * view_mask) / float(num_real_pixels)
-    elif view_mask is None:
-        mean_plastic_coef = _ps_sum(torch.sum, Sp) / _ps_numel(Sp)
+        mean_plastic_coef = torch.mean(Sp)
     else:
-        mean_plastic_coef = (_ps_sum(lambda sp, vm: torch.sum(sp * vm), Sp, view_mask)
-                             / float(num_real_pixels))
+        mean_plastic_coef = _ps_sum(torch.sum, Sp) / _ps_numel(Sp)
     Sp_floor = gamma * mean_plastic_coef
 
     # A negative mean would be non-physical and may indicate instability in the algorithm
@@ -801,21 +781,11 @@ def correct_sino_plastic_metal(ct_model, measured_sino, recon, num_metal=1, orde
     # Put the measured sinogram in the model's device form.
     measured_sino = ct_model.prepare_sino_for_devices(measured_sino)
 
-    # Real-view mask (True on real views, False on padded; None when unpadded), plus the real pixel
-    # count -- used to exclude padded views from the statistical reductions (the Sp mean floor and the
-    # constraint argmins).  The mask takes the sinogram's form (per piece when sharded).
-    pl = ct_model.sino_placement
-    view_mask = _ps_view_mask(pl.real_mask(3), measured_sino)
-    if view_mask is None:
-        num_real_pixels = None
-    else:
-        num_real_pixels = pl.real_size * (_ps_numel(measured_sino) // pl.padded_size)
-
     # Get normalized sinogram p and [m_0, m_1, ...].
     plastic_sino_est, metal_sino_est = _est_plastic_metal_sinos_from_recon(
         recon, num_metal, ct_model, radial_margin=radial_margin, top_margin=top_margin,
         bottom_margin=bottom_margin)
-    plastic_sino_scale = _ps_max(lambda t: torch.max(torch.abs(t)), plastic_sino_est)   # max over padded 0s is unaffected
+    plastic_sino_scale = _ps_max(lambda t: torch.max(torch.abs(t)), plastic_sino_est)
     metal_sino_scale = [_ps_max(lambda t: torch.max(torch.abs(t)), arr) for arr in metal_sino_est]
     # An empty (all-zero) plastic or metal estimate would silently fill the normalized sinogram with
     # NaNs and fail far downstream.  Check the scales explicitly and fail fast with an actionable
@@ -834,12 +804,11 @@ def correct_sino_plastic_metal(ct_model, measured_sino, recon, num_metal=1, orde
                       for arr, norm in zip(metal_sino_est, metal_sino_scale)]
 
     # Estimate beam hardening model parameters theta
-    theta = _estimate_BH_model_params(plastic_sino_est, metal_sino_est, measured_sino, H_exponent_list, num_cross_terms, alpha, beta, num_constraint_update_iter, view_mask=view_mask)
+    theta = _estimate_BH_model_params(plastic_sino_est, metal_sino_est, measured_sino, H_exponent_list, num_cross_terms, alpha, beta, num_constraint_update_iter)
 
     # Compute the corrected plastic sinogram
     plastic_sino_corrected = _correct_plastic_sinogram(measured_sino, plastic_sino_est, metal_sino_est, theta, H_exponent_list,
-                                                       num_cross_terms, num_metal_terms, float(plastic_sino_scale), gamma,
-                                                       view_mask=view_mask, num_real_pixels=num_real_pixels)
+                                                       num_cross_terms, num_metal_terms, float(plastic_sino_scale), gamma)
 
     # Compute and apply the scaling of the corrected plastic sino
     plastic_sino_corrected_scale = _estimate_plastic_scaling(plastic_sino_est, metal_sino_est, measured_sino, plastic_sino_corrected)
@@ -854,133 +823,3 @@ def correct_sino_plastic_metal(ct_model, measured_sino, recon, num_metal=1, orde
 
     corrected_sino = _ps_map(combine, plastic_sino_corrected, *metal_sino_est)
     return ct_model._gather_sinogram(corrected_sino)
-
-
-def recon_plastic_metal(ct_model, sino, weights, num_BH_iterations=3, num_constraint_update_iter=10, stop_threshold_change_pct=0.2,
-                        num_metal=1, order=3, alpha=1, beta=0.002, gamma=0.1, verbose=0, output_sharded=False,
-                        max_iterations=15, logfile_path='~/.mbirtorch/logs/recon.log',
-                        radial_margin=None, top_margin=None, bottom_margin=None):
-    """
-    Perform iterative metal artifact reduction using plastic-metal beam hardening correction.  If num_metal is 0,
-    then this performs a standard MBIR recon.
-
-    This function alternates between adaptive beam hardening correction (via `correct_sino_plastic_metal`)
-    and reconstruction, refining the image over several iterations to suppress metal-induced artifacts.
-
-    Args:
-        ct_model: MBIRTORCH cone beam model instance with `direct_recon` and `recon` methods.
-        sino (ndarray):  Input sinogram data to be corrected.
-        weights (ndarray): Transmission weights used in the reconstruction algorithm.
-        num_BH_iterations (int, optional): Number of correction-reconstruction iterations. Defaults to 3.
-        num_constraint_update_iter (int, optional): Number of iterations for updating constraints.
-            At each iteration, the most violated constraints are activated and the quadratic program is re-solved via OSQP.
-        stop_threshold_change_pct (float, optional): Relative change threshold (%) for early stopping in MBIR. Defaults to 0.2.
-        num_metal (int, optional): Number of metal materials to segment and correct for. Defaults to 1.
-        order (int, optional): Maximum total degree of the beam hardening correction polynomial. Defaults to 3.
-        alpha (float, optional): Degree-dependent scaling factor for regularization weights. Higher values penalize
-            higher-order terms more strongly. Defaults to 1.
-        beta (float, optional): Regularization strength for ridge regression. Defaults to 0.002.
-        gamma (float, optional): Stabilization factor used in plastic correction. Multiplies the mean of `s_p`
-            to set a positive floor in the denominator, preventing division by near-zero or negative values. Defaults to 0.1.
-        verbose (int, optional): Verbosity level for printing intermediate information. Defaults to 0.
-        output_sharded (bool, optional): Choose the form of the returned reconstruction.  If False
-            (default), return an ordinary host NumPy array.  If True, return the device tensor for a
-            following on-device step.
-        max_iterations (int, optional): Maximum MBIR iterations per reconstruction pass. Defaults to 15.
-        logfile_path (str, optional): Same as in the TomographyModel.recon() method.  The BH passes'
-            logs are merged into this single file, each under a section header.
-        radial_margin, top_margin, bottom_margin (int or None, optional): Segmentation mask margins
-            used when classifying plastic/metal; None (default) = size-relative
-            (see segment_plastic_metal).
-
-    Returns:
-         numpy array or tensor: The final corrected reconstruction after iterative beam hardening
-         correction -- a host NumPy array by default, or a device tensor if ``output_sharded=True``.
-
-    Example:
-        >>> recon = recon_plastic_metal(
-        ...     ct_model, sino, weights,
-        ...     num_BH_iterations=3,
-        ...     stop_threshold_change_pct=0.2,
-        ...     num_metal=1,
-        ...     order=3,
-        ...     alpha=1,
-        ...     beta=0.005,
-        ...     verbose=1
-        ... )
-        >>> mt.slice_viewer(recon)
-    """
-    # Check for nonnegative num_metals
-    if num_metal < 0:
-        raise ValueError("num_metal must be >= 0")
-
-    # Use split sino recon for cone beam when the model provides it (it splits on the host so the
-    # full sinogram is never device-resident); otherwise use the standard recon with a device-form
-    # output so the next correction consumes it with no gather/re-upload.
-    if 'cone' in ct_model.get_params('geometry_type') and hasattr(ct_model, 'split_sino_recon'):
-        recon_function = ct_model.split_sino_recon
-    else:
-        recon_function = functools.partial(ct_model.recon, output_sharded=True)
-
-    # Deliver the user-requested output form (a host recon, e.g. from split_sino_recon, is already
-    # in the gathered form).
-    def to_output_form(r):
-        if output_sharded:
-            return ct_model._shard_recon(r)
-        return r if isinstance(r, np.ndarray) else ct_model._gather_recon(r)
-
-    # Do a regular recon if num_metal == 0
-    if num_metal == 0:
-        recon, _ = recon_function(sino, weights=weights, max_iterations=max_iterations,
-                                  stop_threshold_change_pct=stop_threshold_change_pct,
-                                  logfile_path=logfile_path)
-        return to_output_form(recon)
-
-    # Continue with beam hardening and segmentation
-    if verbose >= 1:
-        print("\n************ Perform initial FDK reconstruction  **************")
-    recon = ct_model.direct_recon(sino, output_sharded=True)
-
-    # Each BH pass logs to its own temp file; merged into logfile_path afterward
-    # (in finally, so any pass logs written before a failure are preserved).
-    if logfile_path:
-        log_path = os.path.expanduser(logfile_path)
-        pass_log_paths = [log_path + '.pass{}'.format(i + 1) for i in range(num_BH_iterations)]
-    else:
-        log_path, pass_log_paths = None, [None] * num_BH_iterations
-    try:
-        for i in range(num_BH_iterations):
-            # Estimate Corrected Sinogram
-            if verbose >= 1:
-                print(f"\n************ Correct sino plastic metal {i + 1}  **************")
-            corrected_sinogram = correct_sino_plastic_metal(ct_model, sino, recon, num_metal=num_metal, order=order, alpha=alpha, beta=beta, gamma=gamma, num_constraint_update_iter=num_constraint_update_iter,
-                                                            radial_margin=radial_margin, top_margin=top_margin, bottom_margin=bottom_margin)
-
-            # Reconstruct Corrected Sinogram
-            if verbose >= 1:
-                print(f"\n************ Perform MBIR reconstruction {i + 1} **************")
-            # The recon entry points validate a user-supplied init_recon as a
-            # host/tensor array, so a sharded recon is gathered first (one
-            # gather per BH pass; the engine builds its own device-form init).
-            init = (ct_model._gather_recon(recon)
-                    if isinstance(recon, _sharding.Shards) else recon)
-            recon, _ = recon_function(corrected_sinogram, weights=weights, init_recon=init,
-                                      max_iterations=max_iterations,
-                                      stop_threshold_change_pct=stop_threshold_change_pct,
-                                      logfile_path=pass_log_paths[i])
-
-            if verbose >= 2:
-                print(f"\n************ BH Iteration {i + 1}: Display plastic and metal mask **************")
-                plastic_mask, metal_masks, plastic_scale, metal_scales = mtp.segment_plastic_metal(
-                    recon, num_metal, radial_margin=radial_margin, top_margin=top_margin,
-                    bottom_margin=bottom_margin)
-                labels = ['Plastic Mask'] + [f'Metal {j + 1} Mask' for j in range(len(metal_masks))]
-                mt.slice_viewer(plastic_mask, *metal_masks, vmin=0, vmax=1.0,
-                                slice_label=labels,
-                                title=f'Iteration {i + 1}: Comparison of Plastic and Metal Masks')
-    finally:
-        if log_path:
-            labels = ['recon_plastic_metal: BH pass {}'.format(i + 1) for i in range(num_BH_iterations)]
-            mt.merge_log_files(log_path, zip(labels, pass_log_paths))
-
-    return to_output_form(recon)

@@ -32,7 +32,7 @@ def hyper_denoise(data, dataset_type='attenuation', num_materials=None, safety_f
         max_iter: Maximum iterations for the NMF solver. Defaults to 300.
         tolerance: Convergence tolerance for the NMF solver. Defaults to 1e-10.
         batch_size: Size of data processed per batch. Useful for large datasets to limit memory usage. Defaults to 2^27.
-        subspace_basis: Pre-computed subspace basis spectra of shape. If None, the basis spectra are
+        subspace_basis: Pre-computed subspace basis spectra of shape :math:`(N_s, N_k)`. If None, the basis spectra are
             estimated directly from the data. Defaults to None.
         random_state: Random seed for reproducibility of the NMF initialization and batch row sampling. If None,
             the factors vary from run to run. Defaults to None.
@@ -581,9 +581,9 @@ def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector
         verbose: Verbosity level. If 0, prints nothing; if 1, prints details; if >1, also generates plots. Defaults to 1.
 
     Returns:
-        A list in the form [hsnt_data, gt_hyper_projection].
-            - hsnt_data: Simulated noisy hyperspectral data of shape :math:`(N_v, N_r, N_c, N_k)`.
-            - angles: ndarray of view angles in radian
+        A list in the form [noisy_hyper_projection, angles, gt_hyper_projection].
+            - noisy_hyper_projection: Simulated noisy hyperspectral data of shape :math:`(N_v, N_r, N_c, N_k)`.
+            - angles: ndarray of view angles in radians.
             - gt_hyper_projection: Ground truth noiseless hyperspectral data of same shape.
 
     """

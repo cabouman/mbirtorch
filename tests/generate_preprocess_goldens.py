@@ -17,8 +17,10 @@ curve family, and the small helpers.  It also carries the demo-data utilities:
 the reference Shepp-Logan phantom on a non-cubic shape, the phantom, sinogram
 and view geometry that generate_demo_data produces for the parallel, cone, and
 helical-cone cases, and the recon shapes get_ct_model builds.  The HDF5 file is
-an mbirjax-written save_cone_preprocessing output, pinning the on-disk format as
-shared between the two packages.
+an mbirjax-written save_cone_preprocessing output, pinning the on-disk layout as
+shared between the two packages.  It carries the format tag
+'mbirjax_preprocessing_v1'; mbirtorch now writes 'mbirtorch_preprocessing_v1'
+and accepts both when loading, so this file does not need regenerating.
 """
 
 import os
@@ -167,7 +169,7 @@ def main():
     mar_sino = np.asarray(mar_model.forward_project(mar_phantom))
     mar_weights = np.asarray(mbirjax.gen_weights(mar_sino / mar_sino.max(),
                                                  weight_type='transmission_root'))
-    mar_recon_input = np.asarray(mar_model.direct_recon(mar_sino))
+    mar_recon_input = np.asarray(mar_model.recon_direct(mar_sino))
 
     # Huber weights and BH_correction.
     hub_w = (0.5 + rng.rand(6, 8, 10)).astype(np.float32)
@@ -206,9 +208,9 @@ def main():
         mar_model, mar_sino, mar_weights, num_BH_iterations=1, max_iterations=5,
         num_metal=1, verbose=0, logfile_path=None))
 
-    # split_sino_recon on the shared cone case (seeded; recon in the loop, so parity is loose).
+    # recon_split_sino on the shared cone case (seeded; recon in the loop, so parity is loose).
     np.random.seed(19)
-    split_recon, split_dict = mar_model.split_sino_recon(mar_sino.copy(), weights=mar_weights.copy(),
+    split_recon, split_dict = mar_model.recon_split_sino(mar_sino.copy(), weights=mar_weights.copy(),
                                                          half_overlap=4, max_iterations=5,
                                                          logfile_path=None)
     split_params = split_dict['split_params']
@@ -280,9 +282,10 @@ def main():
     vcls_inds, vcls_value = mbirjax.get_opt_views(vcls_model, vcls_ref, num_selected_views=5,
                                                   r_1=0.05, seed=3)
 
-    # Demo-data utilities: the reference phantom on a non-cubic shape, demo data for the
-    # parallel, cone, and helical-cone paths, and the recon shapes get_ct_model produces.
-    ref_phantom = mbirjax.generate_3d_shepp_logan_reference((32, 30, 28))
+    # Demo-data utilities: demo data for the parallel, cone, and helical-cone
+    # paths, and the recon shapes get_ct_model produces.  (The reference-phantom
+    # parity entry was dropped 2026-08-14: mbirjax's phantom transposes rows and
+    # columns, and mbirtorch corrected that.)
 
     demo_cases = {}
     for tag, kwargs in [('par', dict(model_type='parallel')),
@@ -317,7 +320,8 @@ def main():
                               h5_vol, recon_dict={'scan_id': 'sample1'}, remove_flash=True,
                               radial_margin=2, top_margin=2, bottom_margin=3)
 
-    # mbirjax-written cone-preprocessing save: pins the on-disk format.
+    # mbirjax-written cone-preprocessing save: pins the on-disk layout, and carries the older
+    # format tag that the mbirtorch loader still accepts.
     h5_path = os.path.join(OUT_DIR, 'preprocess_goldens_cone_save.h5')
     mjp.save_cone_preprocessing(
         h5_path, sino_trans,
@@ -388,7 +392,6 @@ def main():
         split_recon=np.asarray(split_recon, dtype=np.float32),
         split_overlap_sino=np.int64(split_params['half_overlap_sino']),
         split_overlap_recon=np.int64(split_params['half_overlap_recon']),
-        ref_phantom=ref_phantom.astype(np.float64),
         gcm_shapes=gcm_shapes,
         **demo_cases,
     )

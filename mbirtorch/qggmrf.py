@@ -1,19 +1,20 @@
 """qGGMRF prior: gradient and Hessian-diagonal at pixel indices.
 
-Ported from mbirjax.qggmrf (single-device path; the sharded halo/mask
-machinery is not ported).  The formulas are FCI Figure 8.5 /
-Table 8.1, and ``b_tilde`` deliberately has ONE implementation
-(``b_tilde_by_definition``), matching the mbirjax structure after its
-qggmrf-flake fix: the clip floor lives only there.
+This is the single-device path; the sharded halo exchange lives in
+_sharding.py.  The formulas are FCI Figure 8.5 / Table 8.1.  ``b_tilde`` has ONE
+implementation (``b_tilde_by_definition``), so the clip floor lives in exactly
+one place.
 
-Shapes: the jax version vmaps per cylinder and per slice; here the same math
-is written directly batched -- per-cylinder over (N, S) arrays and per-slice
-via flat gathers -- which is value-identical (the ops are elementwise on the
-same operands; validated against the mbirjax goldens at ~1e-7 rel-max).
+Shapes: the math is written directly batched -- per-cylinder over (N, S)
+arrays and per-slice via flat gathers.  The operations are elementwise on the
+same operands, so the batched form is value-identical to a per-cylinder loop.
+The golden-value tests (tests/test_vs_goldens.py) hold it to ~1e-7 rel-max.
 """
 
 import numpy as np
 import torch
+
+from . import _sharding
 
 _F32_EPS = torch.finfo(torch.float32).eps
 
@@ -36,10 +37,10 @@ def b_tilde_by_definition(delta, sigma_x, p, q, T):
 
     This is the ONE b_tilde implementation (the reference form): the
     production gradient/Hessian path delegates here via :func:`get_2_b_tilde`,
-    so the two can never diverge (mbirjax previously carried two
-    separately-coded forms that disagreed by up to ~3e-3 near ``delta -> 0``
-    because they floored the removable 0/0 singularity differently).  The
-    floor is a clip of ``|delta|`` at ``T * sigma_x * eps_f32``: exact above
+    so the two can never diverge.  Two separately-coded forms would disagree by
+    up to ~3e-3 near ``delta -> 0``, because the removable 0/0 singularity can
+    be floored in more than one way.  The floor is a clip of ``|delta|`` at
+    ``T * sigma_x * eps_f32``: exact above
     the floor, and for ``p = 2`` equal to the analytic ``rho''(0)/2`` to
     ~1e-6; below the floor the surrogate weight ``b_tilde * delta^2`` is
     ~1e-14, numerically inert in a reconstruction.
@@ -75,7 +76,7 @@ def get_2_b_tilde(delta, b_for_delta, qggmrf_params):
 
 def qggmrf_gradient_and_hessian_at_indices(flat_recon, recon_shape, pixel_indices,
                                            qggmrf_params, left_halo=None,
-                                           right_halo=None, interface_mask=None):
+                                           right_halo=None):
     """
     Calculate the gradient and hessian at each index location in a reconstructed
     image using the surrogate function for the qGGMRF prior.
@@ -103,22 +104,22 @@ def qggmrf_gradient_and_hessian_at_indices(flat_recon, recon_shape, pixel_indice
             boundary condition, reproducing the single-device result exactly.
         right_halo (tensor or None): as left_halo for the slice immediately
             AFTER this shard.
-        interface_mask (tensor or None): optional (num_local_slices + 1,)
-            float mask multiplying the slice-to-slice differences; entry j is
-            the interface between local slices j-1 and j (0 and n are the
-            boundary interfaces).  A 0 entry decouples the two slices it
-            joins exactly as the reflected boundary does at a true edge (the
-            Hessian keeps its b_tilde(0) term).  Used when the slice axis is
-            padded for sharding: zeroing every interface whose higher-index
-            GLOBAL slice is padded reproduces the reflected boundary at the
-            last REAL slice and keeps the padded slices' gradient exactly
-            zero.  None (the default) applies no masking.
 
     Returns:
         tuple of two tensors (first_derivative, second_derivative), each of shape
         (N_indices, num_local_slices) representing the gradient and Hessian
         values at the specified indices.
+
+    Raises:
+        TypeError: If ``flat_recon`` or either halo is in the divided device form.
     """
+    # This works on ONE shard's tensors, with the halos supplying the values
+    # just outside it, so a whole divided array is refused.  Left alone it
+    # would fail on the indexing below with a message that says only that a
+    # Shards cannot be subscripted.
+    _sharding.reject_shards('qggmrf_gradient_and_hessian_at_indices',
+                            flat_recon=flat_recon, left_halo=left_halo,
+                            right_halo=right_halo)
     # Neighborhood weight order is [row+1, row-1, col+1, col-1, slice+1, slice-1]
     # (see the definition in _utils.py).
     b, sigma_x, p, q, T = qggmrf_params
@@ -139,11 +140,6 @@ def qggmrf_gradient_and_hessian_at_indices(flat_recon, recon_shape, pixel_indice
     delta = torch.cat((cylinders[:, :1] - left_val,
                        cylinders[:, 1:] - cylinders[:, :-1],
                        right_val - cylinders[:, -1:]), dim=1)  # (N, S+1)
-    if interface_mask is not None:
-        # Reflected BC at a true edge IS a zero boundary delta, so this is
-        # the same condition applied at an arbitrary interface; the Hessian
-        # still receives the b_tilde(0) term from a masked interface.
-        delta = delta * interface_mask
 
     # Compute the primary quantity used for the gradient and Hessian.
     # Use b_for_delta = 1 here and scale by the slice-direction b below.
@@ -214,8 +210,8 @@ def qggmrf_loss(full_recon, qggmrf_params):
     """
     Computes the loss for the qGGMRF prior for a given recon.  This is meant
     only for relatively small recons for debugging and demo purposes (the
-    verbose compute_prior_loss path of vcd_recon); it runs host-side in numpy
-    on the gathered volume, verbatim mbirjax math.
+    verbose compute_prior_loss path of _vcd_recon); it runs host-side in numpy
+    on the gathered volume.
 
     Args:
         full_recon (ndarray): 3D volume, (rows, cols, slices).
@@ -223,7 +219,14 @@ def qggmrf_loss(full_recon, qggmrf_params):
 
     Returns:
         float
+
+    Raises:
+        TypeError: If ``full_recon`` is in the divided device form.
     """
+    # np.asarray turns a divided array into a 0-d object array without
+    # complaint, and the failure then surfaces much further down as a numpy
+    # message about dimensionality, so it is refused here instead.
+    _sharding.reject_shards('qggmrf_loss', full_recon=full_recon)
     b, sigma_x, p, q, T = qggmrf_params
     full_recon = np.asarray(full_recon)
 

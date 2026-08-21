@@ -1,16 +1,18 @@
-"""Partitions, masks, and weights, ported from mbirjax.vcd_utils.
+"""Partitions, masks, and weights.
 
-The partition generators are numpy-for-numpy ports with the SAME global
-np.random call sequence as mbirjax, so a seeded mbirtorch recon draws the
-identical subsets (and subset order) as a seeded mbirjax recon -- the property
-the cross-framework convergence-parity gate rests on.  Not ported: the grid
-and blue-noise partition variants and the MAR weights.
+The partition generators run in numpy and draw from the global np.random
+state.  That call sequence is deliberate: the golden-value tests
+(tests/test_vs_goldens.py) and restart reproducibility depend on a seeded run
+drawing the identical subsets in the identical order.  Do not reorder the
+calls.  Not implemented: the grid and blue-noise partition variants.
 """
 
 import warnings
 
 import numpy as np
 import torch
+
+from . import _sharding
 
 
 def get_2d_ror_mask(recon_shape, *, use_ror_mask=True, crop_radius_pixels=0,
@@ -83,7 +85,7 @@ def get_support_radius(recon_shape, delta_voxel_row, delta_voxel_col, use_ror_ma
     farthest updatable pixels sit at the ends of the longer grid axis (half the
     larger physical width); with the mask disabled (or custom) the conservative
     half-diagonal is used.  Overestimating only pads slightly; underestimating
-    reintroduces truncation artifacts.  (Verbatim mbirjax.vcd_utils math.)"""
+    reintroduces truncation artifacts."""
     num_rows, num_cols = recon_shape[:2]
     half_width_row = 0.5 * num_rows * delta_voxel_row
     half_width_col = 0.5 * num_cols * delta_voxel_col
@@ -98,9 +100,9 @@ def gen_pixel_partition(recon_shape, num_subsets, use_ror_mask=True):
     use in tomographic reconstruction algorithms.  The function ensures that each
     subset contains an equal number of pixels, suitable for VCD reconstruction.
 
-    Verbatim numpy port of mbirjax.vcd_utils.gen_pixel_partition, including its
-    np.random call sequence (permutation, then choice) and its single-subset
-    RNG skip -- the cross-framework trace-parity mechanism.
+    The np.random call sequence here (permutation, then choice) and the
+    single-subset RNG skip are deliberate; seeded runs must reproduce exactly.
+    Do not reorder the calls.
 
     Args:
         recon_shape (tuple): Shape of recon in (rows, columns, slices).
@@ -200,35 +202,35 @@ def gen_full_indices(recon_shape, use_ror_mask=True):
     return partition[0]
 
 
-def gen_weights(sinogram, weight_type, ct_model=None):
+def gen_weights(sinogram, weight_type):
     """
     Compute optional weights used in MBIR reconstruction based on the noise model.
 
     The weights should be proportional to the inverse variance of the noise for
     each sinogram entry.  They can be used to improve reconstruction quality.
 
-    The result is computed with the input's OWN array module, so it stays where
-    the input is: a host (numpy) sinogram yields host weights; a torch tensor
-    yields a tensor on the same device.
+    The weights are computed where the input is: a numpy sinogram yields numpy
+    weights, and a torch tensor yields a tensor on the same device.  A sinogram
+    already placed on the devices is rejected, because the arithmetic here
+    reads host arrays and single tensors only.  Compute the weights from the
+    host sinogram first, then place both at once with
+    :meth:`~mbirtorch.TomographyModel.prepare_sino_for_devices`.
 
     Args:
         sinogram (ndarray or tensor): 3D array of shape
-            (num_views, num_det_rows, num_det_channels).
+            (num_views, num_det_rows, num_det_channels).  A sinogram in sharded form is not accepted.
         weight_type (str): The type of noise model to use for weighting.  One of:
             - 'unweighted': Use uniform weights (all ones).
             - 'transmission': Use exponential decay, `exp(-sinogram)`.
             - 'transmission_root': Use square-root decay, `exp(-sinogram / 2)`.
             - 'emission': Use reciprocal decay, `1 / (abs(sinogram) + 0.1)`.
-        ct_model (TomographyModel, optional): if given, the sinogram is first
-            placed in the model's device form (``_shard_sinogram``), so the
-            weights are built on the model device -- and,
-            under a future sharding port, per shard.  Default None leaves the
-            input where it is.
 
     Returns:
-        ndarray or tensor: weights with the same shape and residence as the input.
+        ndarray or tensor: weights with the same shape as the input, in the
+        input's form and place.
 
     Raises:
+        ValueError: If `sinogram` is in sharded form.
         Exception: If `weight_type` is not one of the supported options.
 
     Note:
@@ -236,10 +238,14 @@ def gen_weights(sinogram, weight_type, ct_model=None):
         large (e.g., > 5), as this corresponds to near-zero transmission, which
         is not physically meaningful in typical X-ray imaging.
     """
-    # Optionally place the sinogram in the model's device form first, so the
-    # weights are built where the reconstruction will run.
-    if ct_model is not None:
-        sinogram = ct_model._shard_sinogram(sinogram)
+    # A placed sinogram would fall through to the numpy branch below and give a
+    # silently wrong answer, so it is refused here instead.
+    if isinstance(sinogram, _sharding.Shards):
+        raise ValueError(
+            'gen_weights does not accept a sinogram that has been placed on '
+            'the devices.  Compute the weights from the host sinogram first, '
+            'then place the sinogram and the weights together with '
+            'ct_model.prepare_sino_for_devices(sinogram, weights).')
     xp = torch if isinstance(sinogram, torch.Tensor) else np
     if weight_type == 'unweighted':
         weights = xp.ones_like(sinogram)
@@ -258,7 +264,7 @@ def estimate_background_cluster_boundaries(sinogram):
     """
     Estimate background cluster left and right boundaries from the sinogram
     histogram.  This function assumes that the background takes on values near
-    zero.  (Verbatim numpy port of the mbirjax.utilities function.)
+    zero.
 
     Args:
         sinogram (ndarray): 3D array with shape
@@ -314,6 +320,8 @@ def gen_weights_mar(ct_model, sinogram, init_recon=None, metal_threshold=None, b
     If not provided, the metal segmentation is generated directly from the sinogram.
 
     Args:
+        ct_model (TomographyModel): The model used to forward project the metal mask.  It is used
+            only when ``init_recon`` is given.
         sinogram (ndarray): 3D array containing sinogram with shape (num_views, num_det_rows, num_det_channels).
         init_recon (ndarray, optional): An initial reconstruction used to identify metal voxels. If not provided, Otsu's method is used to directly segment sinogram into metal regions.
         metal_threshold (float, optional): Values in ``init_recon`` above ``metal_threshold`` are classified as metal. If not provided, Otsu's method is used to segment ``init_recon``.
@@ -324,7 +332,27 @@ def gen_weights_mar(ct_model, sinogram, init_recon=None, metal_threshold=None, b
 
     Returns:
         (ndarray): Weights used in reconstruction, with the same array shape as ``sinogram``
+
+    Raises:
+        TypeError: If ``sinogram`` or ``init_recon`` is in the divided device form.
+
+    Note:
+        Only the ``init_recon`` branch uses the devices.  On that branch, and
+        on a model whose device layout is still automatic, this call also
+        decides the layout before it forward projects, and every later
+        reconstruction on the model reuses it.  The decision runs the memory
+        check, so the call can raise
+        ``MemoryPreflightError`` for a problem
+        too large for the available devices.  The Otsu branch works on the
+        host throughout and leaves the layout alone.
     """
+    # The thresholding and the exponential below run on whole host arrays.  A
+    # divided array survives np.asarray as a 0-d object array, so the first
+    # comparison against it fails on an unsupported operand instead of saying
+    # what went wrong; it is refused here instead, before the import below.
+    _sharding.reject_shards('gen_weights_mar', sinogram=sinogram,
+                            init_recon=init_recon)
+
     import mbirtorch.preprocess as mtp
 
     # If init_recon is not provided, then identify the distorted sino entries with Otsu's thresholding method.
@@ -345,6 +373,10 @@ def gen_weights_mar(ct_model, sinogram, init_recon=None, metal_threshold=None, b
         print("metal_threshold = ", metal_threshold)
         # Identify metal voxels
         metal_mask = (np.asarray(init_recon) > metal_threshold).astype(np.float32)
+        # Settle the model's layout before the projection below places the mask
+        # and the sinogram it produces.  Only this branch reaches a device; the
+        # Otsu branch above works on the host throughout.
+        ct_model._apply_device_policy()
         # Forward project metal mask to generate a sinogram mask
         metal_mask_projected = ct_model.forward_project(metal_mask)
 

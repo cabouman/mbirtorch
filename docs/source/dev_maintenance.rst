@@ -11,10 +11,18 @@ From the repository root, in the ``mbirtorch`` conda environment::
     python -m pytest -n 4 tests ci
 
 To include the cross-framework parity tests against mbirjax, first generate
-the golden archives (``tests/generate_goldens.py``, run in the mbirjax
-environment), then::
+the golden archives.  Two scripts write them, both run in the mbirjax
+environment::
+
+    python tests/generate_goldens.py
+    python tests/generate_preprocess_goldens.py
+
+Then run the full suite::
 
     python -m pytest -m "goldens or not goldens" tests
+
+A parity test whose archive is missing skips rather than fails, so run both
+scripts to get the whole set.
 
 The same tests run automatically on every push and pull request.
 
@@ -78,12 +86,17 @@ Releasing to PyPI
 
        dev_scripts/check_published_wheel.sh --version 0.X.Y
 
-Each ``release.sh`` stage sets ``__version__`` in ``mbirtorch/__init__.py``,
-commits, and creates the matching ``v``-prefixed tag; the upload fails if the
-tag and ``__version__`` ever disagree.  The manual procedure behind the
-script: edit ``__version__``, commit to ``prerelease``, and draft a GitHub
-release with tag ``v`` + ``__version__`` — target ``prerelease`` with "Set as
-a pre-release" checked for an rc, target ``main`` for a final version.
+The three ``release.sh`` commands divide the work.  Steps 1 and 3 set
+``__version__`` in ``mbirtorch/__init__.py``, commit it, and push to
+``prerelease``.  Steps 1 and 4 create the matching ``v``-prefixed tag, on
+``prerelease`` and on ``main`` respectively.  Step 4 changes no file: it checks
+that ``main`` already carries the version and stops if it does not.  The upload
+fails if the tag and ``__version__`` ever disagree.
+
+The script automates a short manual procedure: edit ``__version__``, commit to
+``prerelease``, and draft a GitHub release with tag ``v`` + ``__version__``.
+For an rc, target ``prerelease`` with "Set as a pre-release" checked.  For a
+final version, target ``main``.
 
 The documentation rebuilds automatically: ``latest`` follows ``main``, and
 ``stable`` follows the highest release tag.

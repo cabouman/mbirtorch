@@ -65,4 +65,6 @@ mbirtorch.slice_viewer(
     phantom_roi, recon_default, padded_roi,
     data_dicts=[None, dict_default, dict_padded], vmin=0.0, vmax=1.0,
     title='Phantom region (left), default recon with artifacts (center),\n'
-          'enlarged-region recon (right)')
+          'enlarged-region recon (right)', block=False)
+mbirtorch.slice_viewer(sinogram, title='Sinogram', slice_axis=0)
+

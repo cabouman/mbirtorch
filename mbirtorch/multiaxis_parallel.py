@@ -1,5 +1,5 @@
-"""MultiAxisParallelModel, ported from mbirjax.multiaxis_parallel: parallel
-beam with a per-view elevation (tilt) angle.  Each view has two angles --
+"""MultiAxisParallelModel: parallel beam with a per-view elevation (tilt)
+angle.  Each view has two angles --
 azimuth (the standard tomography rotation about z) and elevation (the tilt of
 the ray out of the xy plane).  Parallel beam laminography is a special case;
 at zero elevation the geometry is mathematically equivalent to parallel beam.
@@ -100,8 +100,8 @@ def _multiaxis_forward_view_batch(values, pixel_indices, view_params_batch,
     """Multiaxis forward for one view batch: the slice-scatter vertical fan,
     then the per-pixel horizontal fan scatter.  Returns (Vb, R, C).
 
-    ``slice_start`` supports the banded sharded forward exactly as in cone:
-    ``values`` may be a slice BAND (P, L) with global indices [slice_start,
+    ``slice_start`` supports a slice-BANDED call exactly as in cone:
+    ``values`` may be a band (P, L) with global indices [slice_start,
     slice_start + L); the slice-to-row map is anchored on the full num_slices
     center, so summing per-band outputs over a tiling of the slice axis
     reproduces the unbanded projection.
@@ -244,13 +244,24 @@ class MultiAxisParallelModel(TomographyModel):
         if np.any(np.abs(angles[:, 1]) > np.pi / 4):
             warnings.warn("One or more elevation angles exceed 45 degrees. "
                           "This may degrade approximation quality.")
-        # geometry_type is the class-identity string, as in mbirjax, so
-        # save/load resolves the class by name.
+        # geometry_type is the class-identity string, so save/load resolves
+        # the class by name.
         super().__init__(sinogram_shape,
                          view_batch_size=view_batch_size, compile_mode=compile_mode,
                          geometry_type=str(type(self)),
                          view_params_name='angles', angles=angles,
                          recon_slice_offset=0.0)
+
+    # Multiaxis has its own floor family rather than borrowing parallel's,
+    # because its crossover was measured separately.  The thresholds
+    # themselves, the runs behind them, and their dates are the multiaxis
+    # rows of _widening_floors.FLOORS; they are not restated here, because a
+    # refresh moves them and a copy would go stale.  Historical note: the
+    # 2026-08-17 reading that first justified a separate family (394 s at two
+    # devices against 951 s at four, 1024-class) was torch's per-function
+    # recompile budget filling, which projectors._raise_recompile_budget has
+    # since fixed.
+    _floor_family = 'multiaxis'
 
     def _view_batch_bodies(self):
         # No hand-written kernels for multiaxis yet; the compiled torch bodies
@@ -383,28 +394,48 @@ class MultiAxisParallelModel(TomographyModel):
             sinogram, filter_name, filter_scale=scaling_factor,
             output_sharded=output_sharded, row_weight=None)
 
-    def fbp_recon(self, sinogram, filter_name="ramp", output_sharded=False):
+    def recon_fbp(self, sinogram, filter_name="ramp", output_sharded=False):
         """
-        Perform FBP reconstruction: ramp-filter the sinogram, then the exact
+        Perform FBP reconstruction: filter the sinogram, then apply the exact
         adjoint of the forward projector as the backprojection.
+
+        Args:
+            sinogram (numpy or tensor): 3D sinogram data with shape
+                (num_views, num_det_rows, num_det_channels).
+            filter_name (string, optional): The name of the filter to use.
+                Defaults to 'ramp'.
+            output_sharded (bool, optional): If False (default), return a
+                numpy array.  If True, return the device form: a torch
+                tensor on a single device, or a Shards container (one
+                tensor per device) on a multi-device model.
+
+        Returns:
+            recon (numpy or tensor): The reconstructed volume.
 
         Note:
             The pi/num_views weight assumes equally spaced azimuths, and the
-            geometry is treated as stacked 2-D FBP (elevation approximated in
-            the filter).  Multiaxis parallel beam is typically a limited-angle
+            geometry is treated as stacked 2-D FBP: the filter ignores
+            elevation.  Multiaxis parallel beam is typically a limited-angle
             geometry, so this direct reconstruction is only approximate; it is
             intended as an initializer for the iterative ``recon()``.
         """
+        # Settle the device layout before the first large allocation, as
+        # recon() does: a no-op when the user already chose devices;
+        # otherwise the automatic selection runs here, so a bare FBP call
+        # spreads across the GPUs instead of landing whole on one.  The
+        # workload tells the memory check to price this reconstruction rather
+        # than the full recon the device count is chosen for.
+        self._apply_device_policy(workload='direct')
         filtered_sinogram = self.fbp_filter(sinogram, filter_name=filter_name,
                                             output_sharded=True)
         recon = self.back_project(filtered_sinogram, output_sharded=True)
         return recon if output_sharded else self._gather_recon(recon)
 
-    def direct_recon(self, sinogram, filter_name="ramp", output_sharded=False):
+    def recon_direct(self, sinogram, filter_name="ramp", output_sharded=False):
         """Direct reconstruction by stacked 2-D FBP; equivalent to
-        :meth:`fbp_recon`.  See :meth:`TomographyModel.direct_recon` for the
+        :meth:`recon_fbp`.  See :meth:`TomographyModel.recon_direct` for the
         argument and return conventions."""
-        return self.fbp_recon(sinogram, filter_name=filter_name,
+        return self.recon_fbp(sinogram, filter_name=filter_name,
                               output_sharded=output_sharded)
 
     def direct_filter(self, sinogram, filter_name="ramp", output_sharded=False):

@@ -14,6 +14,19 @@ commonly used functions are described below.  See :ref:`DemosFAQs` for examples.
 .. automodule:: mbirtorch
    :no-index:
 
+One-Call Reconstruction
+-----------------------
+
+For a basic reconstruction, one function call takes the sinogram and the geometry and returns the
+reconstruction, with no model to create first:
+
+.. autosummary::
+
+   recon_simple_parallel
+   recon_simple_cone
+
+The model classes below give full control over the same reconstruction.
+
 Geometry Models
 ---------------
 
@@ -32,7 +45,7 @@ Reconstruction and Projection
 Each geometry class is derived from :ref:`TomographyModelDocs`, which includes a number of powerful methods listed below for manipulating sinograms and reconstructions.
 Detailed documentation for each geometry class is provided in :ref:`ParallelBeamModelDocs` and :ref:`ConeBeamModelDocs`.
 
-Note that :ref:`ParallelBeamModelDocs` also includes ``fbp_recon`` and :ref:`ConeBeamModelDocs` includes ``fdk_recon``
+Note that :ref:`ParallelBeamModelDocs` also includes ``recon_fbp`` and :ref:`ConeBeamModelDocs` includes ``recon_fdk``
 for direct (non-iterative) reconstruction in the case of many views and low-noise data.
 
 .. autosummary::
@@ -63,7 +76,7 @@ Differentiable Projectors
 -------------------------
 
 See :ref:`AutogradDocs` for the projectors exposed as differentiable PyTorch operations, for
-use inside a deep-learning pipeline.  This section has no MBIRJAX counterpart.
+use inside a deep-learning pipeline.
 
 .. autosummary::
 
@@ -126,6 +139,6 @@ It also includes functions for processing cone beam and parallel beam data to re
 
 The ``preprocess`` subpackage loads lazily: ``import mbirtorch`` does not pull in its
 dependency stack, and ``import mbirtorch.preprocess`` or the first attribute access loads
-it.  This is a deliberate improvement over MBIRJAX, which imports its preprocess eagerly.
+it.
 
 It also includes functions for optimal view selection.

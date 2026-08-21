@@ -8,7 +8,7 @@ The ``MultiAxisParallelModel`` class implements a geometry and reconstruction mo
 Therefore, parallel beam laminography is a special case of this geometry when there is a constant tilt for all views.
 
 This class inherits all behaviors and attributes of the :ref:`TomographyModelDocs`.
-It also implements multi-axis parallel-beam direct reconstruction methods such as ``direct_recon`` and ``fbp_recon``.
+It also implements multi-axis parallel-beam direct reconstruction methods such as ``recon_direct`` and ``recon_fbp``.
 
 For multi-axis parallel beam geometry, the default detector channel spacing is ``delta_det_channel`` is 1 ALU,
 and the voxels are 3D cubes with spacing ``delta_voxel = delta_det_channel``.
@@ -26,4 +26,4 @@ Constructor
 Alternative Reconstruction
 --------------------------
 
-.. automethod:: mbirtorch.MultiAxisParallelModel.fbp_recon
+.. automethod:: mbirtorch.MultiAxisParallelModel.recon_fbp

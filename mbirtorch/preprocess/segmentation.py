@@ -17,7 +17,7 @@ def _shard_valid_masks(valid_mask, placement, ndim):
     mask = np.asarray(valid_mask)
     axis = placement.axis % ndim
     pieces = []
-    for _dev, (s0, s1) in placement.shard_ranges(placement.padded_size):
+    for _dev, (s0, s1) in placement.shard_ranges():
         if mask.shape[axis] == 1:
             pieces.append(mask)
         else:
@@ -71,9 +71,7 @@ def _sharded_masked_histogram(shards, valid_mask, num_bins):
     maximizes between-class variance over bins whose counts are in the
     millions at production scale, so a handful of displaced counts is not
     expected to move a boundary -- but "expected not to" is the claim, not
-    "cannot".  mbirjax records the same divergence in its own port and deems
-    it irrelevant at Otsu's granularity; this is at parity with that, not
-    stricter than it.
+    "cannot".
 
     Returns:
         (hist, bin_edges): host numpy arrays in the single-array path's dtypes
@@ -92,7 +90,7 @@ def _sharded_masked_histogram(shards, valid_mask, num_bins):
         for chunk, mc in _shard_chunks(t, mp):
             vals = chunk.reshape(-1) if mc is None else chunk[mc]
             if vals.numel() == 0:
-                continue          # a shard that is entirely padding
+                continue          # an empty shard, or one the mask excludes
             lo = min(lo, float(vals.min()))
             hi = max(hi, float(vals.max()))
 
@@ -166,24 +164,16 @@ def multi_threshold_otsu(image, classes=2, num_bins=1024, valid_mask=None):
     number of classes by minimizing the intra-class variance. It returns `classes - 1` thresholds
     that can be used to partition the image intensity range into `classes` distinct segments.
 
-    The histogram is computed on the host; a torch tensor input is gathered to the host first.
-    A sharded volume (a ``Shards`` container) is instead histogrammed where it sits, shard by
-    shard, and only the count tables travel.  That path bins in float32 on the device rather
-    than in numpy's float64-plus-edge-correction, so its thresholds are expected to agree with
-    the unsharded ones but are not guaranteed to (see ``_sharded_masked_histogram``); it also
-    raises rather than binning a volume whose valid entries are all one value.
-
     Args:
-        image (np.ndarray or torch.Tensor):
+        image (np.ndarray, torch.Tensor, or Shards):
             Input image of floating-point values.
         classes (int, optional):
             Number of classes to divide the image into. Must be ≥ 2. Defaults to 2.
         num_bins (int, optional):
             Number of bins to use when constructing the image histogram. Defaults to 1024.
         valid_mask (array or None, optional):
-            Broadcastable boolean mask, True on the entries to include.  Used e.g. to exclude the
-            zero-padded entries of a padded volume so the histogram range and counts match the
-            unpadded volume exactly.  None includes everything.
+            Broadcastable boolean mask, True on the entries to include.  Used e.g. to restrict the
+            histogram range and counts to a region of interest.  None includes everything.
 
     Returns:
         list of float:
@@ -311,19 +301,14 @@ def _otsu_thresholds_dp(hist, num_thresholds):
     return boundaries[::-1]
 
 
-def segment_plastic_metal(recon, num_metal, radial_margin=None, top_margin=None, bottom_margin=None,
-                          valid_mask=None, num_real_slices=None):
+def segment_plastic_metal(recon, num_metal, radial_margin=None, top_margin=None, bottom_margin=None):
     """
     Segment a reconstruction into plastic and multiple metal masks using multi-threshold Otsu.
 
     ``recon`` may be a host numpy array, a torch tensor, or a sharded volume (a ``Shards``
     container); the class masks are returned in the same form as the input, on the same
     devices.  A sharded volume is processed shard by shard where it sits: only the small
-    histogram tables travel, never the volume.  For a volume whose slice axis is
-    zero-padded, pass ``valid_mask`` / ``num_real_slices`` so the padded slices are
-    excluded from the histogram, the bottom margin lands on the real bottom slices, and
-    the class masks are zero on padding (otherwise a threshold interval spanning 0 would
-    include the padded voxels and bias the scaling factors).
+    histogram tables travel, never the volume.
 
     Args:
         recon (np.ndarray, torch.Tensor, or Shards): Reconstructed volume.
@@ -336,15 +321,16 @@ def segment_plastic_metal(recon, num_metal, radial_margin=None, top_margin=None,
             None (default) uses max(2, min(10, num_slices // 25)) with the same rationale.
         bottom_margin (int or None, optional): Number of slices to mask out from the bottom.
             None (default) as for top_margin.
-        valid_mask (array or None, optional): Broadcastable boolean mask, True on real voxels.
-        num_real_slices (int or None, optional): Real slice count (see ``apply_cylindrical_mask``).
 
     Returns:
-        Tuple[ndarray, List[ndarray], float, List[float]]:
-            - plastic_mask (ndarray): Binary mask for plastic regions.
-            - metal_masks (List[ndarray]): List of binary masks for each metal region.
-            - plastic_scale (float): Scaling factor for plastic region.
-            - metal_scales (List[float]): List of scaling factors for each metal region.
+        tuple: ``(plastic_mask, metal_masks, plastic_scale, metal_scales)``.  Each mask has the same
+        type as ``recon``: numpy in gives numpy out, tensor in gives tensor out, ``Shards`` in gives
+        ``Shards`` out.
+
+            - plastic_mask (np.ndarray, torch.Tensor, or Shards): Binary mask for plastic regions.
+            - metal_masks (list): One binary mask per metal region, each in the same form as ``recon``.
+            - plastic_scale (float): Scaling factor for the plastic region.
+            - metal_scales (list of float): One scaling factor per metal region.
     """
     if num_metal <= 0:
         raise ValueError("num_metal must be positive")
@@ -355,8 +341,7 @@ def segment_plastic_metal(recon, num_metal, radial_margin=None, top_margin=None,
         pl = recon.placement
         plastic_mask, metal_masks, plastic_scale, metal_scales = segment_plastic_metal(
             recon.tensors[0], num_metal, radial_margin=radial_margin,
-            top_margin=top_margin, bottom_margin=bottom_margin,
-            valid_mask=valid_mask, num_real_slices=num_real_slices)
+            top_margin=top_margin, bottom_margin=bottom_margin)
         return (_sharding.Shards([plastic_mask], pl),
                 [_sharding.Shards([m], pl) for m in metal_masks],
                 plastic_scale, metal_scales)
@@ -364,10 +349,7 @@ def segment_plastic_metal(recon, num_metal, radial_margin=None, top_margin=None,
     # Size-relative default margins: the former fixed 10 at production sizes, smaller for small
     # volumes so the mask never carves off a large fraction of the field of view.
     shape = recon.tensors[0].shape if is_shards else recon.shape
-    if num_real_slices is not None:
-        num_slices = num_real_slices
-    else:
-        num_slices = recon.placement.real_size if is_shards else recon.shape[2]
+    num_slices = recon.placement.axis_len if is_shards else recon.shape[2]
     if radial_margin is None:
         radial_margin = max(2, min(10, min(shape[0], shape[1]) // 25))
     if top_margin is None:
@@ -377,43 +359,30 @@ def segment_plastic_metal(recon, num_metal, radial_margin=None, top_margin=None,
 
     # Remove any flash from the boundary of the recon
     recon = mtp.apply_cylindrical_mask(recon, radial_margin=radial_margin, top_margin=top_margin,
-                                       bottom_margin=bottom_margin, num_real_slices=num_real_slices)
+                                       bottom_margin=bottom_margin)
 
-    # Compute thresholds using multi-threshold Otsu (padded voxels excluded via valid_mask)
-    thresholds = multi_threshold_otsu(recon, classes=num_metal + 2, valid_mask=valid_mask)
+    # Compute thresholds using multi-threshold Otsu
+    thresholds = multi_threshold_otsu(recon, classes=num_metal + 2)
 
     is_torch = isinstance(recon, torch.Tensor)
-    if is_shards:
-        shard_masks = _shard_valid_masks(valid_mask, recon.placement,
-                                         recon.tensors[0].ndim)
 
     # Plastic: lowest class
     plastic_low_threshold = thresholds[0]
     plastic_metal_threshold = thresholds[1]
 
-    # Masks are 1 inside the class interval AND on a real voxel: padded voxels are exactly 0, so a class
-    # interval spanning 0 would otherwise mark them, biasing compute_scaling_factor's denominator.
-    def _tensor_class_mask(vol, lower, upper, mask):
-        in_class = (vol > lower) & (vol <= upper)
-        if mask is not None:
-            if not isinstance(mask, torch.Tensor):
-                mask = torch.as_tensor(np.asarray(mask), device=vol.device)
-            in_class = in_class & mask.bool()
-        return in_class.to(vol.dtype)
+    def _tensor_class_mask(vol, lower, upper):
+        return ((vol > lower) & (vol <= upper)).to(vol.dtype)
 
     def class_mask(lower, upper):
         if is_shards:
             # Shard by shard, each on its own device; the mask comes back
             # sharded the same way as the volume.
             return _sharding.Shards(
-                [_tensor_class_mask(t, lower, upper, mp)
-                 for t, mp in zip(recon.tensors, shard_masks)],
+                [_tensor_class_mask(t, lower, upper) for t in recon.tensors],
                 recon.placement)
         if is_torch:
-            return _tensor_class_mask(recon, lower, upper, valid_mask)
+            return _tensor_class_mask(recon, lower, upper)
         in_class = (recon > lower) & (recon <= upper)
-        if valid_mask is not None:
-            in_class = in_class & np.asarray(valid_mask).astype(bool)
         return np.where(in_class, np.float32(1.0), np.float32(0.0)).astype(recon.dtype)
 
     plastic_mask = class_mask(plastic_low_threshold, plastic_metal_threshold)

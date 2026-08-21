@@ -17,6 +17,7 @@ body declares its own, much smaller, per-view cost through its
 bodies are torch.compiled (see maybe_compile below).
 """
 
+import os
 import threading
 
 import torch
@@ -31,10 +32,12 @@ _F32 = torch.float32
 # compiled callables are cached per FUNCTION at
 # module level: torch.compile handles multiple input shapes itself (one
 # specialization per shape guard), and the VCD loop's shape set is small (one
-# subset size per partition granularity, plus the full-index size).  A compile
+# subset size per partition granularity, plus the full-index size).  That set
+# must fit torch's per-function recompile budget once PER DEVICE, because the
+# per-device instances share one budget; _raise_recompile_budget below makes
+# the budget large enough.  A compile
 # failure falls back to eager silently-but-recorded, so exotic
-# backends/toolchains keep working (the same availability philosophy as
-# mbirjax's pallas gate).
+# backends/toolchains keep working.
 _COMPILE_CACHE = {}
 _COMPILE_ERRORS = {}
 # Serializes COMPILE EVENTS process-wide: triton/inductor compilation is not
@@ -43,6 +46,64 @@ _COMPILE_ERRORS = {}
 # instances).  Each wrapper takes this lock only for input-shape keys it has
 # not completed before, so steady-state threaded execution stays lock-free.
 _GLOBAL_COMPILE_LOCK = threading.Lock()
+
+#: The per-function recompile budget this module guarantees before it
+#: compiles anything.  torch caps how many specialized variants one function
+#: may hold (``torch._dynamo.config.recompile_limit``, default 8), and the
+#: cap attaches to the function's code object, so every per-device compiled
+#: instance of one body draws on one shared budget.  The variants guard on
+#: the input tensors' device index, so a run on n devices needs roughly n
+#: times the one-device variant count.  When a function's budget fills,
+#: torch stops compiling it, and calls that match no existing variant run
+#: eagerly from then on.  Measured 2026-08-19 on two H100s (job 15391547):
+#: the multiaxis and translation back bodies filled the default budget at
+#: several two-device cells, their remaining calls ran eagerly at 5x to 11x
+#: the compiled device time, and that was the whole measured two-device
+#: slowdown of both geometries (0.35x at the multiaxis 512-class cell).
+#: The one-device variant set fits inside torch's default of 8 at every
+#: measured cell, and a node holds at most 8 GPUs, so 8 x 8 covers the
+#: widest placement.  The accumulated limit across all functions
+#: (``accumulated_recompile_limit``, torch default 256) is left alone as
+#: the backstop against unbounded variant growth; the largest measured
+#: whole-process graph count is 36 (two devices, 3-iteration
+#: reconstruction).
+_RECOMPILE_LIMIT_FLOOR = 64
+
+
+def _raise_recompile_budget():
+    """Make torch's per-function recompile budget at least
+    ``_RECOMPILE_LIMIT_FLOOR``, on THIS thread, before compiling.
+
+    The budget must be raised on every thread that can trigger a
+    compilation, because dynamo consults a per-thread view of this config:
+    an assignment made on one thread does not reach another (measured,
+    torch 2.13 -- a limit assigned on the main thread capped nothing on a
+    worker thread, and the same assignment made on the worker thread
+    capped it).  The per-device fan-outs run the compiled bodies on pool
+    threads, so a raise made only where the wrapper is created would leave
+    every pool thread at torch's default; that is exactly how the first
+    form of this remedy failed its gate.  ``maybe_compile``'s wrapper
+    therefore calls this on each first sight of an input shape, which is
+    on the calling thread and before any call that can compile.
+
+    ``MBIRTORCH_RECOMPILE_LIMIT`` overrides the floor verbatim, including
+    downward, which is the debugging escape: a tiny limit makes torch's
+    recompile warnings fire early and name their guards.  Without the
+    override, a value someone already raised above the floor is kept.  Both
+    config names are set together: ``recompile_limit`` is the operative name
+    on current torch, ``cache_size_limit`` is its older spelling, and
+    leaving them different invites whichever one a future torch reads.
+    """
+    import torch._dynamo.config as dynamo_config
+
+    override = os.environ.get('MBIRTORCH_RECOMPILE_LIMIT')
+    if override:
+        limit = int(override)
+    else:
+        limit = max(int(dynamo_config.recompile_limit),
+                    _RECOMPILE_LIMIT_FLOOR)
+    dynamo_config.recompile_limit = limit
+    dynamo_config.cache_size_limit = limit
 
 
 def _shape_key(args, kwargs):
@@ -97,6 +158,7 @@ def maybe_compile(fn, enabled, instance_key=None):
     cache_key = fn if instance_key is None else (fn, instance_key)
     if cache_key in _COMPILE_CACHE:
         return _COMPILE_CACHE[cache_key]
+    _raise_recompile_budget()
     compiled = torch.compile(fn)
     state = {"impl": compiled}
     seen_keys = set()
@@ -107,8 +169,12 @@ def maybe_compile(fn, enabled, instance_key=None):
             return state["impl"](*args, **kwargs)
         # First sight of this shape: the call may trigger dynamo/inductor
         # compilation, which must not run concurrently with any other
-        # compile in the process (see _GLOBAL_COMPILE_LOCK).
+        # compile in the process (see _GLOBAL_COMPILE_LOCK).  The budget is
+        # raised HERE, on the calling thread, because dynamo's view of it is
+        # per thread and this is the thread about to compile (see
+        # _raise_recompile_budget).
         with _GLOBAL_COMPILE_LOCK:
+            _raise_recompile_budget()
             try:
                 out = state["impl"](*args, **kwargs)
             except Exception as e:                            # noqa: BLE001
@@ -148,12 +214,12 @@ def maybe_compile(fn, enabled, instance_key=None):
 # one-pixel compile itself.  The cone bodies do not have the defect, and macOS
 # inductor compiles the same one-pixel body correctly.  One-pixel calls are
 # ordinary: sparse_forward_project with a single index makes one, and the
-# column gather's pixel batching makes one whenever a batch, or the remainder
-# of a batch, is a single pixel.
+# cylinder transfer's pixel batching makes one whenever a batch, or the
+# remainder of a batch, is a single pixel.
 #
 # The driver's view-batch charge is computed from the REAL pixel count, before
 # the padding: it prices the transient of a call this small at a batch far
-# below any cap, so the one padded column cannot move it.
+# below any cap, so the one padded pixel cannot move it.
 
 
 def _callable_name(fn, fallback):
@@ -164,10 +230,10 @@ def _callable_name(fn, fallback):
 def forward_at_min_pixel_width(compiled, min_width):
     """The forward body with narrow pixel batches padded to ``min_width``.
 
-    The padded columns carry zero values at a repeated -- hence in-range --
+    The padded pixels carry zero values at a repeated -- hence in-range --
     pixel index.  The forward output has no pixel axis: the fan bins each
     pixel's weighted row into the detector channels with index_add_, so a
-    zero-valued column adds exactly 0.0 wherever it lands and the padded call
+    zero-valued pixel adds exactly 0.0 wherever it lands and the padded call
     returns bit-identical values with nothing to slice off (verified against
     the eager body).
     """
@@ -245,12 +311,10 @@ class Projectors:
     assembles outputs sized lazily from the first block.  One geometry class
     therefore never subclasses this driver.
 
-    Center-consistency contract (adapted from mbirjax's rounding-fix design):
-    forward and back consume the SAME deterministic center computation for each
-    (view, pixel), so the pair stays exactly adjoint even at rounding ties.  In
-    mbirjax the centers are computed once outside the jitted programs (an XLA
-    miscompile workaround); here there is no compiler hazard, and recomputing
-    the same deterministic chain per call preserves the consistency property.
+    Center-consistency contract: forward and back consume the SAME
+    deterministic center computation for each (view, pixel), so the pair stays
+    exactly adjoint even at rounding ties.  The centers are recomputed by that
+    same chain on every call rather than cached, which preserves the property.
     """
 
     # Rough per-batch transient budget for the fan kernels' (Vb, P, cols)
@@ -295,15 +359,13 @@ class Projectors:
     #     it.  The driver loop is shaped as a two-axis tile walk with an
     #     accumulating forward precisely so the pixel loop drops in without
     #     touching the geometry contract.
-    #     Pixel chunking here means mbirjax's TWO-axis tiling (its
-    #     _sparse_forward/_back_project drivers): forward sums partial
-    #     sinograms over PIXEL batches around the view loop
-    #     (sum_function_in_batches), back concatenates per-PIXEL-batch outputs
-    #     inside the view-sum loop (concatenate_function_in_batches), with a
-    #     jointly chosen (view_batch, pixel_batch) tile.  These drivers tile
-    #     views only; the joint tile choice needs a 2-D budget rule and gate
-    #     measurement (tile shape moved mbirjax kernels several-fold in its
-    #     campaign), so it belongs with the kernel work.
+    #     Pixel chunking here means TWO-axis tiling: forward sums partial
+    #     sinograms over PIXEL batches around the view loop, back concatenates
+    #     per-PIXEL-batch outputs inside the view-sum loop, with a jointly
+    #     chosen (view_batch, pixel_batch) tile.  These drivers tile views
+    #     only; the joint tile choice needs a 2-D budget rule and its own
+    #     measurements (tile shape has changed kernel run time several-fold in
+    #     earlier work), so it belongs with the kernel work.
     VIEW_BATCH_TRANSIENT_BUDGET_BYTES = 2 * 2**30
     VIEW_BATCH_TRANSIENT_FLOOR_BYTES = 256 * 2**20
     VIEW_BATCH_SINO_MULTIPLE = 8
@@ -430,8 +492,8 @@ class Projectors:
         Args:
             body: the projection body actually bound (kernel or torch).
             num_pixels (int): P, the pixel subset this call projects.
-            band_cols (int): the call's column count -- the forward's voxel
-                columns, or the back's local sinogram row count.
+            band_cols (int): the call's column count -- the forward's slice
+                extent, or the back's local sinogram row count.
             args (dict): the geometry's per-call argument dict.
             n_devices (int, optional): price the budget for a HYPOTHETICAL
                 device count instead of the model's current placement.  Used
@@ -464,16 +526,16 @@ class Projectors:
         transient budget, and assembly (output sized lazily from the first
         block, so the driver never derives geometry-specific shapes).
 
-        ``accumulate_into`` lets a caller that runs this loop repeatedly -- the
-        column-gather forward, once per pixel batch -- add straight into the
-        block it is building instead of receiving a fresh one to add itself.
-        That merges two full-block passes into one and drops one full-block
-        allocation per call; see the accumulation comment in
-        ``TomographyModel._sparse_forward_project_columns`` for why it is worth
-        doing and why the values do not move.  The parameter is added HERE, on
-        a plain python method, and not to the geometry body: the bodies are
-        torch.compile'd per device with shape-keyed caches, so a new argument
-        there would recompile every one of them.
+        ``accumulate_into`` lets a caller that runs this loop repeatedly --
+        the cylinder-transfer forward, once per pixel batch -- add straight
+        into the block it is building instead of receiving a fresh one to add
+        itself.  That merges two full-block passes into one and drops one
+        full-block allocation per call; see the accumulation comment in
+        ``TomographyModel._sparse_forward_project_cylinders`` for why it is
+        worth doing and why the values do not move.  The parameter is added
+        HERE, on a plain python method, and not to the geometry body: the
+        bodies are torch.compile'd per device with shape-keyed caches, so a
+        new argument there would recompile every one of them.
 
         Args:
             band_values: (P, cols) voxel cylinders (or a slice band), on this

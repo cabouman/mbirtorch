@@ -17,7 +17,10 @@ tests pin both paths and their interaction with ``view_batch_size``:
   - an explicit ``view_batch_size`` is the nominal for EVERY body;
   - the four kernel cost functions state the residency the design charges
     (contract bytes per (view, pixel) plus one sinogram-shaped plane per
-    view) and ride on the wrapper functions the selection hook returns.
+    view) and ride on the wrapper functions the selection hook returns;
+  - the shared rule that rounds a kernel's width argument up to a multiple
+    of 16, which those charges read because it is what the wrappers
+    allocate.
 
 Everything here is arithmetic on function objects and tiny CPU models: no
 kernel is ever launched, so the file runs anywhere.  The driver-level CUDA
@@ -31,6 +34,7 @@ import pytest
 import torch
 
 import mbirtorch
+from mbirtorch._utils import KERNEL_WIDTH_MULTIPLE, padded_kernel_width
 from mbirtorch.projectors import Projectors
 from mbirtorch import triton_cone, triton_parallel
 
@@ -195,32 +199,85 @@ def test_mixed_selection_batches_each_direction_by_its_own_model():
     assert torch_vb == 5
 
 
+# ── the shared kernel-width padding rule ──────────────────────────────────────
+
+def test_the_kernel_width_padding_rule_rounds_up_to_a_multiple_of_16():
+    """One definition of the rule, read by the wrappers and by the ledger.
+
+    Triton compiles a faster kernel for an integer argument it can prove is a
+    multiple of 16, so a wrapper rounds its width argument up to one before
+    the launch.  A width that is ALREADY a multiple must come back unchanged:
+    that is what makes the padding cost nothing at the production widths, and
+    what lets a wrapper compare the result against its input to take its
+    original path.
+    """
+    assert KERNEL_WIDTH_MULTIPLE == 16
+    for width in (16, 32, 48, 256, 512, 1008, 2016):
+        assert padded_kernel_width(width) == width, width
+    for width, padded in ((1, 16), (8, 16), (15, 16), (17, 32), (31, 32),
+                          (252, 256), (504, 512)):
+        assert padded_kernel_width(width) == padded, width
+    # A width below one multiple rounds up to the first one rather than
+    # staying where it is; zero has nothing to round.
+    assert padded_kernel_width(1) == KERNEL_WIDTH_MULTIPLE
+    assert padded_kernel_width(0) == 0
+    # It never shrinks a width, and never adds a whole multiple.
+    for width in range(1, 200):
+        padded = padded_kernel_width(width)
+        assert width <= padded < width + KERNEL_WIDTH_MULTIPLE, width
+        assert padded % KERNEL_WIDTH_MULTIPLE == 0, width
+
+
 # ── the four kernel cost functions ────────────────────────────────────────────
 
 def test_parallel_cost_functions_state_the_designed_residency():
+    # Both parallel wrappers allocate their plane at the width rounded up to
+    # a multiple of 16, so both charges read the padded width: 8 columns are
+    # charged as 16.
     args = {'num_channels': 12}
     bytes_pv, chunk = triton_parallel._parallel_back_view_batch_cost(
         1000, 8, args)
-    assert bytes_pv == 16 * 1000 + 4 * 12 * 8
+    assert bytes_pv == 16 * 1000 + 4 * 12 * 16
     assert chunk == triton_parallel.PARALLEL_BACK_VIEW_CHUNK
+    # The forward's charge follows its route: the sorted-contraction route
+    # (the default) holds the argsort order, the permutation, and the
+    # gathered contract copies beside the 16-byte contract -- 20 more bytes
+    # per (view, pixel) -- and the per-tap route holds the contract alone.
+    forward_pv = (16 + 20) * 1000 if \
+        triton_parallel.sorted_forward_enabled() else 16 * 1000
     bytes_pv, chunk = triton_parallel._parallel_forward_view_batch_cost(
         1000, 8, args)
-    assert bytes_pv == 16 * 1000 + 4 * 12 * 8
+    assert bytes_pv == forward_pv + 4 * 12 * 16
     assert chunk == triton_parallel.PARALLEL_FWD_VIEW_CHUNK
+    # A width that is already a multiple of 16 is charged unchanged.
+    assert triton_parallel._parallel_back_view_batch_cost(
+        1000, 16, args)[0] == 16 * 1000 + 4 * 12 * 16
+    assert triton_parallel._parallel_forward_view_batch_cost(
+        1000, 16, args)[0] == forward_pv + 4 * 12 * 16
 
 
 def test_cone_cost_functions_state_the_designed_residency():
     args = {'num_channels': 12, 'num_rows_r': 10}
+    # The cone back kernel reads a sinogram copy the wrapper does NOT pad --
+    # every address it forms is clamped into that copy -- so the back plane
+    # term reads the real row count.
     bytes_pv, chunk = triton_cone._cone_back_view_batch_cost(1000, 10, args)
     assert bytes_pv == 48 * 1000 + 4 * 12 * 10
     assert chunk == triton_cone.CONE_BACK_VIEW_CHUNK
     # The forward's output plane spans the full detector rows whatever slice
-    # band the values carry: the band length must not enter the charge.
+    # band the values carry: the band length must not enter the charge.  The
+    # wrapper allocates that plane at the row count rounded up to a multiple
+    # of 16, so a 10-row detector is charged 16 rows.
     banded = triton_cone._cone_forward_view_batch_cost(1000, 3, args)
     unbanded = triton_cone._cone_forward_view_batch_cost(1000, 10, args)
     assert banded == unbanded
-    assert banded[0] == 48 * 1000 + 4 * 12 * 10
+    assert banded[0] == 48 * 1000 + 4 * 12 * 16
     assert banded[1] == triton_cone.CONE_FWD_VIEW_CHUNK
+    # A detector whose row count is already a multiple of 16 is charged
+    # unchanged.
+    divisible = triton_cone._cone_forward_view_batch_cost(
+        1000, 10, {'num_channels': 12, 'num_rows_r': 16})
+    assert divisible[0] == 48 * 1000 + 4 * 12 * 16
 
 
 def test_cost_attributes_ride_on_the_wrappers():

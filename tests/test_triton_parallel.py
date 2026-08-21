@@ -11,6 +11,13 @@ direction's torch body, and the two kernels against each other -- and the
 poison-the-padding class (a pixel count that is not a multiple of the kernel's
 pixel tile, where the padded lanes must contribute exactly nothing).
 
+One more class sits beside those.  Each wrapper rounds its width argument up
+to a multiple of 16 before the launch -- the back's sinogram row count, the
+forward's value column count -- and pads the input it reads with zeros to
+match, so a width that is not a multiple has extra columns that the wrapper
+then slices off.  Those tests read the values and the returned view's stride,
+which is the width the wrapper really allocated.
+
 Two things differ from the cone battery, both because the vertical fan is
 gone.  The banded seam is a ROW band rather than a slice band with a z anchor:
 rows track slices, so the back body bands by being handed fewer sinogram rows
@@ -37,14 +44,18 @@ import torch
 
 import mbirtorch
 from mbirtorch import kernel_availability
+from mbirtorch._utils import padded_kernel_width
 from mbirtorch.parallel_beam import (_parallel_back_view_batch,
                                      _parallel_forward_view_batch)
 from mbirtorch.triton_parallel import (PARALLEL_BACK_BLOCK_P,
                                        PARALLEL_BACK_BLOCK_R,
                                        PARALLEL_FWD_BLOCK_P,
                                        PARALLEL_FWD_BLOCK_R,
+                                       PARALLEL_SORTED_VIEW_CHUNK,
+                                       PARALLEL_SORTED_WINDOW,
                                        _parallel_back_view_batch_triton,
-                                       _parallel_forward_view_batch_triton)
+                                       _parallel_forward_view_batch_triton,
+                                       sorted_forward_enabled)
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -158,6 +169,47 @@ def test_parallel_back_kernel_row_band_parity():
 
 
 @requires_cuda
+@pytest.mark.parametrize("band_rows", [5, 12, 16, 32])
+def test_parallel_back_kernel_pads_the_row_count_to_a_multiple_of_16(
+        band_rows):
+    """The wrapper launches the row count rounded up to a multiple of 16.
+
+    This kernel's sinogram is band-sized and its gather is bounded by the row
+    argument alone, so a rounded-up launch would read past the last real row.
+    The wrapper therefore makes its channel-major copy at the rounded-up row
+    count with the extra rows zeroed, and a zero row contributes exactly
+    zero.  Three statements follow, at every band this sweeps: the values are
+    the torch body's at the design's 1e-5 gate, they are the values the
+    unbanded call produces over the same rows, and the returned view's row
+    stride is the width the wrapper allocated.
+
+    A 32-row sinogram makes both cases reachable: bands of 16 and 32 need no
+    padding, and bands of 5 and 12 do.
+    """
+    model = _parallel_model(cell=(6, 32, 20))
+    sinogram, pixel_indices, view_params, args = _body_inputs(model)
+    num_rows = int(sinogram.shape[1])
+    assert num_rows == 32
+    unbanded = _parallel_back_view_batch_triton(sinogram, pixel_indices,
+                                                view_params, **args)
+    for row_start in range(0, num_rows, band_rows):
+        band = sinogram[:, row_start:row_start + band_rows]
+        rows = int(band.shape[1])
+        kernel_out = _parallel_back_view_batch_triton(band, pixel_indices,
+                                                      view_params, **args)
+        reference = _parallel_back_view_batch(band, pixel_indices,
+                                              view_params, **args)
+        assert kernel_out.shape == reference.shape
+        assert bool(kernel_out.isfinite().all())
+        assert _rel_max(kernel_out, reference) <= 1e-5
+        window = unbanded[:, row_start:row_start + rows]
+        assert _rel_max(kernel_out, window) <= 1e-6
+        padded = padded_kernel_width(rows)
+        assert kernel_out.stride(0) == padded, (rows, padded)
+        assert kernel_out.is_contiguous() == (padded == rows)
+
+
+@requires_cuda
 def test_parallel_back_kernel_adjointness():
     # <F x, a> == <x, B a> with F the TORCH forward body and B the kernel: the
     # pairing the whole projector contract rests on, and the check that would
@@ -266,6 +318,39 @@ def test_parallel_forward_kernel_row_band_parity():
     rel = _rel_max(tiled, reference)
     print(f"parallel forward triton row-band parity: rel_max = {rel:.2e}")
     assert rel <= 1e-5
+
+
+@requires_cuda
+@pytest.mark.parametrize("band_cols", [5, 12, 16, 32])
+def test_parallel_forward_kernel_pads_the_column_count_to_a_multiple_of_16(
+        band_cols):
+    """The forward's width-class argument is its VALUE COLUMN count, which is
+    its vector axis and its output row stride, so that is what the wrapper
+    rounds up.
+
+    A rounded-up launch would read past the last real column of ``values``,
+    so the wrapper copies ``values`` into a zero-padded array of the launched
+    width; a zero column adds exactly 0.0 through the atomics.  The values
+    must be the torch body's at the design's 1e-5 gate, and the returned
+    view's last stride is the width the wrapper allocated (the transpose puts
+    the channel-major row stride there).
+    """
+    model = _parallel_model(cell=(6, 32, 20))
+    _, pixel_indices, view_params, args = _body_inputs(model)
+    values = _voxel_values(model, pixel_indices)
+    num_cols = int(values.shape[1])
+    assert num_cols == 32
+    for col_start in range(0, num_cols, band_cols):
+        band = values[:, col_start:col_start + band_cols]
+        cols = int(band.shape[1])
+        kernel_out = _parallel_forward_view_batch_triton(band, pixel_indices,
+                                                         view_params, **args)
+        reference = _parallel_forward_view_batch(band, pixel_indices,
+                                                 view_params, **args)
+        assert kernel_out.shape == reference.shape
+        assert bool(kernel_out.isfinite().all())
+        assert _rel_max(kernel_out, reference) <= 1e-5
+        assert kernel_out.stride(2) == padded_kernel_width(cols), cols
 
 
 @requires_cuda
@@ -754,3 +839,85 @@ def test_parallel_kernel_selection_is_layout_independent():
         assert back is _parallel_back_view_batch_triton
     finally:
         monkeypatch.undo()
+
+
+# ── the sorted-contraction forward route ─────────────────────────────────────
+# The wrapper routes through the sorted kernel by default, so every forward
+# gate above already exercises it; these tests pin the pieces the default
+# path cannot reach on the small cells -- the two kernels against each
+# other, the sparse-set fallback, the view-chunk tail -- and the switch.
+
+
+def test_sorted_forward_switch_reads_environment(monkeypatch):
+    # No CUDA needed: the switch is plain environment reading, and a wrong
+    # default here would silently route every forward call the other way.
+    monkeypatch.delenv("MBIRTORCH_SORTED_FORWARD", raising=False)
+    assert sorted_forward_enabled()
+    for off in ("0", "false", "NO", " off "):
+        monkeypatch.setenv("MBIRTORCH_SORTED_FORWARD", off)
+        assert not sorted_forward_enabled()
+    monkeypatch.setenv("MBIRTORCH_SORTED_FORWARD", "1")
+    assert sorted_forward_enabled()
+
+
+@requires_cuda
+def test_parallel_forward_sorted_and_tap_kernels_agree(monkeypatch):
+    # The two routes compute the same sums in a different order, so they
+    # gate against each other at the same figure the kernels gate against
+    # their torch bodies.
+    model = _parallel_model()
+    _, pixel_indices, view_params, args = _body_inputs(model)
+    values = _voxel_values(model, pixel_indices)
+    monkeypatch.setenv("MBIRTORCH_SORTED_FORWARD", "0")
+    tap_out = _parallel_forward_view_batch_triton(values, pixel_indices,
+                                                  view_params, **args)
+    monkeypatch.setenv("MBIRTORCH_SORTED_FORWARD", "1")
+    sorted_out = _parallel_forward_view_batch_triton(values, pixel_indices,
+                                                     view_params, **args)
+    assert sorted_out.shape == tap_out.shape
+    assert bool(sorted_out.isfinite().all())
+    rel = _rel_max(sorted_out, tap_out)
+    print(f"sorted vs tap forward kernels: rel_max = {rel:.2e}")
+    assert rel <= 1e-5
+
+
+@requires_cuda
+def test_parallel_forward_sorted_fallback_for_sparse_pixels():
+    # A sparse pixel set is the ordinary way a SORTED tile's channel span
+    # exceeds the window: the small parity cells never reach it (their
+    # whole detector is narrower than the window), so this cell is wide
+    # (64 channels) and the set keeps every 103rd pixel.  The sorted
+    # 32-pixel tile then spans most of the detector, the kernel takes its
+    # per-tap fallback, and the values must still match the torch body.
+    model = _parallel_model(cell=(6, 12, 64))
+    _, pixel_indices, view_params, args = _body_inputs(model)
+    sparse = pixel_indices[::103].contiguous()
+    assert int(sparse.shape[0]) > PARALLEL_SORTED_WINDOW
+    values = _voxel_values(model, sparse)
+    reference = _parallel_forward_view_batch(values, sparse, view_params,
+                                             **args)
+    kernel_out = _parallel_forward_view_batch_triton(values, sparse,
+                                                     view_params, **args)
+    assert kernel_out.shape == reference.shape
+    rel = _rel_max(kernel_out, reference)
+    print(f"sorted forward sparse-set fallback: rel_max = {rel:.2e}")
+    assert rel <= 1e-5
+
+
+@requires_cuda
+def test_parallel_forward_sorted_view_chunk_tail():
+    # 21 views is one full 16-view chunk plus a 5-view tail, so the tail
+    # chunk's clamped iterations run and must write nothing: a defect there
+    # double-counts the last view and fails the parity by orders.
+    assert 21 % PARALLEL_SORTED_VIEW_CHUNK != 0
+    model = _parallel_model(cell=(21, 12, 12))
+    _, pixel_indices, view_params, args = _body_inputs(model)
+    values = _voxel_values(model, pixel_indices)
+    reference = _parallel_forward_view_batch(values, pixel_indices,
+                                             view_params, **args)
+    kernel_out = _parallel_forward_view_batch_triton(values, pixel_indices,
+                                                     view_params, **args)
+    assert kernel_out.shape == reference.shape
+    rel = _rel_max(kernel_out, reference)
+    print(f"sorted forward view-chunk tail (21 views): rel_max = {rel:.2e}")
+    assert rel <= 1e-5

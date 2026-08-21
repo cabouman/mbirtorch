@@ -1,11 +1,10 @@
 """Tests for the run logging: the log file, the in-memory copy in
 recon_dict, console silencing, and the merged logs of the composite runs
-(split_sino_recon and recon_plastic_metal).  The behavior matches mbirjax.
+(recon_split_sino and recon_plastic_metal).  The behavior matches mbirjax.
 """
 
 import logging
 import os
-import re
 
 import numpy as np
 import pytest
@@ -32,6 +31,16 @@ def small_parallel_case():
         tuple(model.get_params('recon_shape')))
     sino = model.forward_project(phantom)
     return model, sino
+
+
+def _small_parallel_model():
+    """A model matching the small_parallel_case fixture, for the tests that
+    need two models of one class alive at the same time."""
+    angles = np.linspace(0, np.pi, 8, endpoint=False)
+    model = mbirtorch.ParallelBeamModel((8, 12, 16), angles)
+    model.configure_devices(devices=['cpu'])
+    model.set_params(no_warning=True, verbose=1)
+    return model
 
 
 @pytest.fixture()
@@ -88,6 +97,85 @@ def test_continuing_run_keeps_one_log(tmp_path, small_parallel_case):
                                 first_iteration=1, logfile_path=logpath)
     # Both passes are in the one log; the second call did not truncate it.
     assert recon_dict['recon_log'].count('MBIRTorch Version') == 2
+    # The file has both passes too, not just the first.
+    assert open(logpath).read().count('MBIRTorch Version') == 2
+
+
+def test_two_live_models_keep_their_logs_apart(tmp_path, small_parallel_case):
+    """Two models of the same class, both alive, keep separate logs.
+
+    Setting up the log of the second model must not take over the file or the
+    in-memory copy of the first: the first model goes on logging afterwards,
+    and those lines belong to its own log.
+    """
+    first, sino = small_parallel_case
+    second = _small_parallel_model()
+    first_path = os.path.join(str(tmp_path), 'first.log')
+    second_path = os.path.join(str(tmp_path), 'second.log')
+
+    # The iteration lines name the iteration limit of the run that wrote them,
+    # which is what tells the three passes below apart in the log text.
+    recon, _ = first.recon(sino, max_iterations=1, logfile_path=first_path)
+    _, second_dict = second.recon(sino, max_iterations=3,
+                                  logfile_path=second_path)
+    # The first model logs again, with the second model still alive.
+    _, first_dict = first.recon(sino, init_recon=recon, max_iterations=2,
+                                first_iteration=1, logfile_path=first_path)
+
+    first_file = open(first_path).read()
+    second_file = open(second_path).read()
+    # Each log has its own model's lines ...
+    assert 'of a max of 1' in first_file and 'of a max of 2' in first_file
+    assert 'of a max of 3' in second_file
+    assert 'of a max of 2' in first_dict['recon_log']
+    assert 'of a max of 3' in second_dict['recon_log']
+    # ... and none of the other model's.
+    assert 'of a max of 3' not in first_file
+    assert 'of a max of 3' not in first_dict['recon_log']
+    assert 'of a max of 1' not in second_file and 'of a max of 2' not in second_file
+    assert 'of a max of 1' not in second_dict['recon_log']
+    # Both of the first model's passes are in its log and its in-memory copy,
+    # and the second model's log holds its one pass only.
+    assert first_dict['recon_log'].count('MBIRTorch Version') == 2
+    assert first_file.count('MBIRTorch Version') == 2
+    assert second_dict['recon_log'].count('MBIRTorch Version') == 1
+    assert second_file.count('MBIRTorch Version') == 1
+
+
+def test_verbose_zero_writes_no_log_file(tmp_path, small_parallel_case):
+    """At verbose=0 a run with nothing to report writes no file at all,
+    rather than leaving an empty one behind."""
+    model, sino = small_parallel_case
+    model.set_params(no_warning=True, verbose=0)
+    logpath = os.path.join(str(tmp_path), 'quiet.log')
+    # stop_threshold_change_pct=0 runs every iteration, so the run cannot log
+    # the warning it gives when it stops early: at verbose=0 a warning is the
+    # one thing that would (rightly) create the file.
+    _, recon_dict = model.recon(sino, max_iterations=1, logfile_path=logpath,
+                                stop_threshold_change_pct=0)
+    assert not os.path.exists(logpath)
+    assert os.listdir(str(tmp_path)) == []
+    assert 'After iteration' not in recon_dict['recon_log']
+
+
+def test_the_log_file_is_closed_when_the_run_returns(tmp_path,
+                                                     small_parallel_case):
+    """A finished run does not hold its log file open.
+
+    An open file handler keeps writing to the file it opened even after that
+    file is deleted, and on Windows it blocks the delete outright, so the runs
+    that merge and delete the logs of their parts depend on this.
+    """
+    model, sino = small_parallel_case
+    logpath = os.path.join(str(tmp_path), 'closed.log')
+    model.recon(sino, max_iterations=1, logfile_path=logpath)
+
+    assert not any(isinstance(h, logging.FileHandler)
+                   for h in model.logger.handlers)
+    # Nothing holds the file, so it can be removed and written again.
+    os.remove(logpath)
+    model.recon(sino, max_iterations=1, logfile_path=logpath)
+    assert 'After iteration' in open(logpath).read()
 
 
 def test_prox_map_loop_keeps_one_growing_log(tmp_path, small_parallel_case):
@@ -113,7 +201,7 @@ def test_prox_map_loop_keeps_one_growing_log(tmp_path, small_parallel_case):
 
 def test_device_report_names_the_settled_layout():
     """The device line reports the layout the run actually uses, in the
-    'N x PLATFORM (sharded)' form, and says when an axis is padded."""
+    'N x PLATFORM (sharded)' form."""
     angles = np.linspace(0, np.pi, 8, endpoint=False)
     model = mbirtorch.ParallelBeamModel((8, 11, 16), angles)
     model.configure_devices(devices=['cpu', 'cpu'])
@@ -123,12 +211,10 @@ def test_device_report_names_the_settled_layout():
     sino = model.forward_project(phantom)
     _, recon_dict = model.recon(sino, max_iterations=1, logfile_path=None)
 
-    # 11 slices over 2 devices pads the slice axis to 12.  The pieces are
-    # asserted rather than the whole sentence, so rewording the line does not
-    # fail a test that is about what the line reports.
+    # The pieces are asserted rather than the whole sentence, so rewording the
+    # line does not fail a test that is about what the line reports.
     line = _device_line(recon_dict['recon_log'])
     assert '2 x CPU' in line
-    assert re.search(r'\b11\b.*\b12\b', line)
 
 
 def test_device_line_reflects_a_layout_chosen_during_the_run(monkeypatch):
@@ -144,8 +230,17 @@ def test_device_line_reflects_a_layout_chosen_during_the_run(monkeypatch):
         tuple(model.get_params('recon_shape')))
     sino = model.forward_project(phantom)
 
+    # The stand-in widens ONCE, as the real policy does: it settles at the
+    # top of the run and every later call on the same shapes -- including the
+    # one the nested direct reconstruction makes -- returns the settled
+    # layout.  Re-installing on each call would re-place arrays the run is
+    # already holding.
+    settled = []
+
     def widen(**call_arrays):
-        model._install_device_layout(['cpu', 'cpu'])
+        if not settled:
+            model._install_device_layout(['cpu', 'cpu'])
+            settled.append(True)
         return None
 
     monkeypatch.setattr(model, '_apply_device_policy', widen)
@@ -224,9 +319,10 @@ def test_the_run_log_does_not_reach_the_root_logger(small_parallel_case):
             collected.append(record)
 
     # A fresh logger propagates, which is the state the model's setup has to
-    # change; assert against that rather than against whatever an earlier
-    # test left on this process-wide logger.
-    logging.getLogger(type(model).__name__).propagate = True
+    # change; assert against that rather than against whatever an earlier call
+    # on this model left behind.
+    model.logger.propagate = True
+    logger_name = model.logger.name
     root = logging.getLogger()
     handler = _Collector()
     root.addHandler(handler)
@@ -238,8 +334,7 @@ def test_the_run_log_does_not_reach_the_root_logger(small_parallel_case):
         root.removeHandler(handler)
         root.setLevel(previous_level)
 
-    from_model = [r.getMessage() for r in collected
-                  if r.name == type(model).__name__]
+    from_model = [r.getMessage() for r in collected if r.name == logger_name]
     assert from_model == []
 
 
@@ -276,14 +371,18 @@ def test_merge_log_files_no_parts_writes_nothing(tmp_path):
     assert not os.path.exists(merged)
 
 
-def test_split_sino_recon_merges_half_logs(tmp_path, small_cone_case):
+def test_recon_split_sino_merges_half_logs(tmp_path, small_cone_case):
     model, sino = small_cone_case
     logpath = os.path.join(str(tmp_path), 'split.log')
-    model.split_sino_recon(sino, half_overlap=3, max_iterations=1, logfile_path=logpath)
+    model.recon_split_sino(sino, half_overlap=3, max_iterations=1, logfile_path=logpath)
     content = open(logpath).read()
-    assert '======== split_sino_recon: top half ========' in content
-    assert '======== split_sino_recon: bottom half ========' in content
+    assert '======== recon_split_sino: top half ========' in content
+    assert '======== recon_split_sino: bottom half ========' in content
     assert content.count('After iteration') >= 2
+    # The merged file holds each half's whole log, not just its header.
+    assert content.count('MBIRTorch Version') == 2
+    assert content.count('Reconstruction devices:') == 2
+    assert content.rstrip().endswith('Merged logs written to ' + logpath)
     # The per-half temp files are gone.
     assert not os.path.exists(logpath + '.top') and not os.path.exists(logpath + '.bot')
 
@@ -297,7 +396,7 @@ def test_recon_plastic_metal_merges_pass_logs(tmp_path, small_cone_case):
     weights = mbirtorch.gen_weights(sino / max(1e-6, sino.max()),
                                     weight_type='transmission_root')
     logpath = os.path.join(str(tmp_path), 'mar.log')
-    mtp.recon_plastic_metal(model, sino, weights, num_BH_iterations=2, max_iterations=1,
+    model.recon_plastic_metal(sino, weights, num_BH_iterations=2, max_iterations=1,
                             num_metal=1, verbose=0, logfile_path=logpath)
     content = open(logpath).read()
     assert '======== recon_plastic_metal: BH pass 1 ========' in content

@@ -6,7 +6,15 @@ geometry variants (flat, curved, helical) at every coefficient power the body
 takes, parity across the banded seams, the explicit adjointness pairing
 against the OTHER direction's torch body, and the poison-the-padding class (a
 pixel count that is not a multiple of the kernel's pixel tile, where the
-padded lanes must contribute exactly nothing).  Tolerances follow the design's
+padded lanes must contribute exactly nothing).
+
+One more class sits beside those.  Each wrapper rounds its width argument up
+to a multiple of 16 before the launch -- the back's slice band, the forward's
+detector row count -- so a width that is not one is computed with extra
+columns that the wrapper then slices off.  Those tests read the values and
+the returned view's stride, which is the width the wrapper really allocated.
+
+Tolerances follow the design's
 value gate -- rel 1e-5 on the gradient path, 1e-4 at coeff_power 2 -- which is
 the mbirjax rounding carve-out for the kernels' sqrt-vs-atan2 cone divisor.
 
@@ -25,6 +33,7 @@ import torch
 
 import mbirtorch
 from mbirtorch import kernel_availability
+from mbirtorch._utils import padded_kernel_width
 from mbirtorch.cone_beam import _cone_back_view_batch, _cone_forward_view_batch
 from mbirtorch.triton_cone import (CONE_BACK_BLOCK_P, CONE_FWD_BLOCK_P,
                                    _cone_back_view_batch_triton,
@@ -130,6 +139,48 @@ def test_cone_back_kernel_banded_parity():
     rel = _rel_max(tiled, reference)
     print(f"cone back triton banded parity: rel_max = {rel:.2e}")
     assert rel <= 1e-5
+
+
+@requires_cuda
+@pytest.mark.parametrize("band_slices", [5, 12, 16, 32])
+def test_cone_back_kernel_pads_the_band_to_a_multiple_of_16(band_slices):
+    """The wrapper launches the band rounded up to a multiple of 16.
+
+    Three statements, at every band this sweeps.  The returned values are the
+    torch body's at the design's 1e-5 gate, whether or not the band was
+    rounded up.  They are also the values the unbanded call produces over the
+    same slices, so the columns the rounding added changed nothing.  And the
+    returned view's row stride is the width the wrapper allocated, which is
+    the real band when the band is already a multiple of 16 -- the path that
+    has to stay exactly what it was.
+
+    A 32-slice volume makes both cases reachable: bands of 16 and 32 need no
+    padding, and bands of 5 and 12 do.  The last band of the 5-slice tiling
+    is 2 slices long, so its padded columns address slices past the end of
+    the volume, which is the case the kernel's address clamps exist for.
+    """
+    model = _cone_model(cell=(6, 32, 20))
+    sinogram, pixel_indices, view_params, args = _body_inputs(model)
+    num_slices = int(args['num_slices'])
+    assert num_slices == 32
+    unbanded = _cone_back_view_batch_triton(sinogram, pixel_indices,
+                                            view_params, **args)
+    for slice_start in range(0, num_slices, band_slices):
+        length = min(band_slices, num_slices - slice_start)
+        banded = _cone_back_view_batch_triton(
+            sinogram, pixel_indices, view_params, slice_start=slice_start,
+            band_slices=length, **args)
+        reference = _cone_back_view_batch(
+            sinogram, pixel_indices, view_params, slice_start=slice_start,
+            band_slices=length, **args)
+        assert banded.shape == reference.shape
+        assert bool(banded.isfinite().all())
+        assert _rel_max(banded, reference) <= 1e-5
+        window = unbanded[:, slice_start:slice_start + length]
+        assert _rel_max(banded, window) <= 1e-6
+        padded = padded_kernel_width(length)
+        assert banded.stride(0) == padded, (length, padded)
+        assert banded.is_contiguous() == (padded == length)
 
 
 @requires_cuda
@@ -283,6 +334,34 @@ def test_cone_forward_kernel_banded_parity():
     rel = _rel_max(tiled, reference)
     print(f"cone forward triton banded parity: rel_max = {rel:.2e}")
     assert rel <= 1e-5
+
+
+@requires_cuda
+@pytest.mark.parametrize("cell,detector_rows", [((6, 12, 12), 12),
+                                                ((6, 32, 20), 32)])
+def test_cone_forward_kernel_pads_the_detector_rows_to_a_multiple_of_16(
+        cell, detector_rows):
+    """The forward's width-class argument is its DETECTOR ROW count, which is
+    its vector axis and its output row stride, so that is what the wrapper
+    rounds up.
+
+    The 12-row detector is rounded up to 16 and the 32-row one is not, so
+    both paths are exercised.  The values must be the torch body's either
+    way, and the returned view's last stride is the width the wrapper
+    allocated (the transpose puts the channel-major row stride there).
+    """
+    model = _cone_model(cell=cell)
+    _, pixel_indices, view_params, args = _body_inputs(model)
+    assert int(args['num_rows_r']) == detector_rows
+    values = _voxel_values(model, pixel_indices)
+    kernel_out = _cone_forward_view_batch_triton(values, pixel_indices,
+                                                 view_params, **args)
+    reference = _cone_forward_view_batch(values, pixel_indices, view_params,
+                                         **args)
+    assert kernel_out.shape == reference.shape
+    assert bool(kernel_out.isfinite().all())
+    assert _rel_max(kernel_out, reference) <= 1e-5
+    assert kernel_out.stride(2) == padded_kernel_width(detector_rows)
 
 
 @requires_cuda

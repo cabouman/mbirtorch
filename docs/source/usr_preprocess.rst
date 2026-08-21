@@ -53,7 +53,6 @@ Zeiss translation tomography functions
 .. currentmodule:: mbirtorch.preprocess.zeiss_tct
 
 .. autofunction:: get_sino_and_model
-.. autofunction:: compute_weight
 .. autofunction:: load_scans_and_params
 
 
@@ -92,7 +91,6 @@ MAR utilities
 .. currentmodule:: mbirtorch.preprocess
 
 .. autofunction:: gen_huber_weights
-.. autofunction:: recon_plastic_metal
 .. autofunction:: BH_correction
 .. autofunction:: fit_beam_hardening_curve
 .. autofunction:: fit_inverse_beam_hardening_curve

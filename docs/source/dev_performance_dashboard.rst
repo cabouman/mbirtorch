@@ -29,7 +29,7 @@ How to read it
 --------------
 
 The dashboard explains itself: open the live page and expand the **"How to read this dashboard"**
-panel at the top.  It walks through the tiles, the red correctness banner, the History and Scaling
+panel at the top.  It describes the tiles, the red correctness banner, the History and Scaling
 views, and the colors & marks.
 
 That reading guide is authored *inside* the dashboard and ships in the page itself, so it can never

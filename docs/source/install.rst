@@ -4,11 +4,17 @@
 Installation
 ============
 
-``MBIRTorch`` is currently installed from source on GitHub.  Installation
-from PyPI with ``pip install mbirtorch`` will be available once the first
-release is published.
+Install ``MBIRTorch`` from PyPI into a Python 3.11 or later environment::
+
+    pip install mbirtorch
+
+The standard ``torch`` dependency installs automatically.  On a Linux
+machine with an NVIDIA GPU, the default torch wheel includes CUDA support;
+no separate CUDA variant of ``MBIRTorch`` is needed.
 
 **Installing from source**
+
+Install from source to modify the package or to run its test suite.
 
 1. Download the source code
 
@@ -29,19 +35,14 @@ This creates a conda environment named ``mbirtorch``, installs the package
 in editable mode with its test and documentation dependencies, and builds
 the documentation.
 
-**Installing with pip**
-
-Alternatively, install into an existing Python (>= 3.11) environment from
-the repository root::
+To install into an existing environment instead, run this from the
+repository root::
 
     pip install .
 
-The standard ``torch`` dependency installs automatically.  On a Linux
-machine with an NVIDIA GPU, the default torch wheel includes CUDA support;
-no separate CUDA variant of ``MBIRTorch`` is needed.
-
 **Verifying the installation**
 
-From the repository root, run the self-contained test suite::
+The tests are not part of the installed package, so run them from a source
+checkout.  From the repository root::
 
     pytest tests

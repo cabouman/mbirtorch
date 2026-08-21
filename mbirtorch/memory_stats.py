@@ -1,12 +1,11 @@
-"""Per-processor memory statistics, ported from mbirjax.memory_stats.
+"""Per-processor memory statistics.
 
-``get_memory_stats`` mirrors the mbirjax function: one dict per processor
-with the bytes in use, the peak, and the limit, printed in GB.  The device
-numbers come from each torch backend's own allocator introspection
-(torch.cuda / torch.mps) and the host numbers from psutil -- the same
-authoritative rulers mbirjax reads via XLA and psutil.  Backends differ in
-what they can report, so the per-device dicts carry the keys their backend
-actually tracks (the printer iterates whatever is present):
+``get_memory_stats`` returns one dict per processor with the bytes in use,
+the peak, and the limit, printed in GB.  The device numbers come from each
+torch backend's own allocator introspection (torch.cuda / torch.mps) and the
+host numbers from psutil.  Backends differ in what they can report, so the
+per-device dicts carry the keys their backend actually tracks (the printer
+iterates whatever is present):
 
 - CUDA: ``bytes_in_use`` (allocated), ``peak_bytes_in_use`` (resettable via
   torch.cuda.reset_peak_memory_stats), ``reserved_bytes`` (the caching
@@ -15,13 +14,12 @@ actually tracks (the printer iterates whatever is present):
 - MPS: ``bytes_in_use`` (current allocated), ``driver_bytes_in_use`` (the
   Metal driver's total footprint), and ``bytes_limit`` (the recommended
   working-set maximum).  MPS does not track a peak.
-- CPU: mbirjax's psutil convention kept verbatim -- ``bytes_in_use`` is the
+- CPU: the psutil convention is deliberate -- ``bytes_in_use`` is the
   unique set size (USS), ``peak_bytes_in_use`` the resident set size (RSS),
   and ``bytes_limit`` the currently available physical memory.
 
-Not ported: mbirjax's ``memory_report`` live-array inventory -- jax keeps a
-registry of live arrays; torch has no equivalent (torch.cuda.memory_summary
-is the closer native deep-dive tool there).
+There is no inventory of live arrays here, because torch keeps no registry of
+them (torch.cuda.memory_summary is the closest native deep-dive tool).
 """
 
 import os
@@ -70,7 +68,7 @@ def get_memory_stats(print_results=True, file=None):
     memory_stats['id'] = 'CPU'
     # memory_info.rss is the Resident Set Size (the non-swapped physical
     # memory the process has used); uss is the Unique Set Size.  The
-    # peak<-rss / in_use<-uss assignment is mbirjax's convention, kept.
+    # peak<-rss / in_use<-uss assignment is intentional.
     memory_stats['bytes_in_use'] = memory_info.uss
     memory_stats['peak_bytes_in_use'] = memory_info.rss
     # Available physical memory (excluding swap)

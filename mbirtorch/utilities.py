@@ -1,15 +1,13 @@
-"""Phantom generation, ported from mbirjax.utilities (the low-dynamic-range
-Shepp-Logan used by the demos).
+"""Phantom generation: the low-dynamic-range Shepp-Logan used by the demos.
 
-The build is plain numpy: the phantom is a host-side reference object in
-mbirjax too (its jax machinery there exists only to bound peak memory at very
-large sizes, not needed here yet).  The ellipsoid definitions and the
-attenuation-scale formula are copied verbatim.
+The build is plain numpy, because the phantom is a host-side reference object.
+The ellipsoid definitions and the attenuation-scale formula are fixed values
+that the golden tests depend on.
 
-Boundary note for cross-framework comparisons: each ellipsoid is a <= 1
-threshold on a float quadratic, so voxels exactly at an ellipsoid boundary can
-flip between frameworks (f32 vs f64 grid arithmetic).  The golden test
-therefore allows a small fraction of differing boundary voxels.
+Boundary note: each ellipsoid is a <= 1 threshold on a float quadratic, so
+voxels exactly at an ellipsoid boundary can flip with the grid precision (f32
+vs f64).  The golden test therefore allows a small fraction of differing
+boundary voxels.
 """
 
 import os
@@ -18,6 +16,8 @@ import warnings
 from enum import Enum
 
 import numpy as np
+import torch
+
 from . import _sharding
 
 
@@ -50,15 +50,30 @@ def clear_cache(_root=None):
     return root
 
 
+def _as_float32(mask):
+    """A boolean mask as float32, for a numpy array or for a torch tensor.
+
+    :func:`add_ellipsoid` runs on both kinds of array, and this cast is the one
+    step the two libraries spell differently.
+    """
+    if torch.is_tensor(mask):
+        return mask.to(torch.float32)
+    return mask.astype(np.float32)
+
+
 def add_ellipsoid(current_volume, grids, z_locations, x0, y0, z0, a, b, c,
                   angle=0, intensity=1.0):
     """
     Add an ellipsoid to an existing volume.
 
+    The volume, the grids and ``z_locations`` are either all numpy arrays or all
+    torch tensors on one device.  Every step is elementwise, so the two forms
+    produce the same values from the same coordinates.
+
     Args:
-        current_volume (ndarray): 3D volume, (rows, cols, slices).
+        current_volume (ndarray or Tensor): 3D volume, (rows, cols, slices).
         grids (tuple): (x_grid, y_grid) in-plane coordinate grids, (rows, cols).
-        z_locations (ndarray): 1D array of z coordinates of the slices.
+        z_locations (ndarray or Tensor): 1D array of z coordinates of the slices.
         x0, y0, z0 (float): ellipsoid center.
         a, b, c (float): x, y, z radii.
         angle (float): rotation of the ellipsoid in the xy plane around
@@ -66,11 +81,13 @@ def add_ellipsoid(current_volume, grids, z_locations, x0, y0, z0, a, b, c,
         intensity (float): the constant value of the ellipsoid to be added.
 
     Returns:
-        ndarray: current_volume + ellipsoid.
+        ndarray or Tensor: current_volume + ellipsoid, matching the input type.
     """
     x_grid, y_grid = grids
-    cos_angle = np.cos(np.deg2rad(angle))
-    sin_angle = np.sin(np.deg2rad(angle))
+    # Python floats rather than numpy scalars, so that the multiplications below
+    # stay in the array library the grids came from.
+    cos_angle = float(np.cos(np.deg2rad(angle)))
+    sin_angle = float(np.sin(np.deg2rad(angle)))
     Xr = cos_angle * (x_grid - x0) + sin_angle * (y_grid - y0)
     Yr = -sin_angle * (x_grid - x0) + cos_angle * (y_grid - y0)
 
@@ -78,12 +95,12 @@ def add_ellipsoid(current_volume, grids, z_locations, x0, y0, z0, a, b, c,
     xy_norm = Xr ** 2 / a ** 2 + Yr ** 2 / b ** 2
     z_norm = (z_locations - z0) ** 2 / c ** 2
     inside = (xy_norm[:, :, None] + z_norm[None, None, :]) <= 1
-    return current_volume + intensity * inside.astype(np.float32)
+    return current_volume + intensity * _as_float32(inside)
 
 
 def _add_shepp_logan_ellipsoids(phantom, grids, z_locations):
     """Add the nine standard low-dynamic-range Shepp-Logan ellipsoids to
-    ``phantom`` (definitions copied verbatim from mbirjax)."""
+    ``phantom``.  The definitions are fixed; the golden tests depend on them."""
     phantom = add_ellipsoid(phantom, grids, z_locations, 0, 0, 0, 0.69, 0.92, 0.9, intensity=1)
     # Smaller ellipsoids and other structures
     phantom = add_ellipsoid(phantom, grids, z_locations, 0, 0.0184, 0, 0.6624, 0.874, 0.88, intensity=-0.8)
@@ -105,22 +122,170 @@ _MAIN_ELLIPSOID_SEMI_AXES = (0.69, 0.92, 0.9)
 
 def _shepp_logan_attenuation_scale(phantom_shape, target_max_attenuation):
     """Intensity scale so the peak forward projection of the phantom is
-    ~``target_max_attenuation`` (verbatim mbirjax formula; assumes
-    ``delta_voxel ~= 1``, since the phantom cannot see the projector's voxel
-    spacing)."""
+    ~``target_max_attenuation`` (assumes ``delta_voxel ~= 1``, since the
+    phantom cannot see the projector's voxel spacing)."""
     longest_path_voxels = max(s * n for s, n in
                               zip(_MAIN_ELLIPSOID_SEMI_AXES, phantom_shape))
     interior_intensity = 0.28  # approximate average intensity along the center
     return (target_max_attenuation / longest_path_voxels) / interior_intensity
 
 
-def generate_3d_shepp_logan_low_dynamic_range(phantom_shape,
+def _phantom_devices(devices):
+    """The devices the phantom build runs on.
+
+    The phantom follows the preprocessing rule, so ``devices=None`` means every
+    permitted device.  Permitted means every visible CUDA device, capped by
+    MBIRTORCH_NUM_DEVICES when that variable is set, and an explicit list
+    overrides the default.  ``permitted_devices`` implements that rule, so this
+    function calls it rather than repeating it.  What puts the phantom in the
+    preprocessing category is that one band is bounded work at any phantom size.
+    No memory estimate and no device policy enter the choice.
+
+    Every device the rule names then builds a band.  The build is float32, which
+    every backend supports, so no device type is substituted for another here.
+    """
+    from .preprocess import pipeline
+    return pipeline.permitted_devices(devices)
+
+
+def _phantom_block_rows(band_shape, max_block_gb):
+    """The number of rows in one block of a band build, from ``max_block_gb``.
+
+    Only one block is live at a time, and while it is live the build holds a few
+    arrays of the block's own size.  Those arrays are the float32 sum of the
+    coordinate terms, the boolean result of comparing that sum against 1, the
+    same result as float32, and the running float32 block.  No step holds all of
+    them at once, and the heaviest step comes to about thirteen bytes per voxel.
+    Four float32 copies, sixteen bytes per voxel, bound that, and four copies is
+    the budget mbirjax uses for the same purpose.
+    """
+    n_rows, n_cols, n_band = band_shape
+    band_bytes = n_rows * n_cols * n_band * 4
+    num_blocks = max(1, int(np.ceil(4 * band_bytes / (max_block_gb * 1024 ** 3))))
+    return max(1, -(-n_rows // num_blocks))          # ceil(n_rows / num_blocks)
+
+
+def _shepp_logan_band(phantom_shape, slice_range, device, max_block_gb, scale=1.0):
+    """Build the slices ``[start, stop)`` of the phantom on one device.
+
+    Every voxel of the phantom depends only on its own coordinates, so a band of
+    slices can be built by itself and needs nothing from the other bands.  The
+    rows of the band are split into blocks and built one block at a time, which
+    is what bounds the temporaries the build holds.  ``scale`` multiplies each
+    block, so the scaled phantom never exists as a separate array.
+
+    Returns:
+        Tensor: a float32 tensor of shape (rows, cols, stop - start) on
+        ``device``.
+    """
+    n_rows, n_cols, n_slices = phantom_shape
+    start, stop = slice_range
+    if stop <= start:
+        # A device count above the slice axis leaves the trailing devices with
+        # no slices at all.  Their band is empty, and the gather concatenates an
+        # empty band like any other.
+        return torch.zeros((n_rows, n_cols, 0), dtype=torch.float32, device=device)
+
+    # One float32 coordinate vector per axis, built with torch on this device.
+    # Each vector covers its whole axis, and the band and the row blocks below
+    # take slices of it.  Slicing a full-axis vector is what makes a band's
+    # values equal the same slices of a build that took the whole axis at once,
+    # and a block's values equal the same rows of an unblocked build.
+    x_axis = torch.linspace(-1, 1, n_rows, dtype=torch.float32, device=device)
+    y_axis = torch.linspace(-1, 1, n_cols, dtype=torch.float32, device=device)
+    z_band = torch.linspace(-1, 1, n_slices, dtype=torch.float32,
+                            device=device)[start:stop]
+
+    # A float32 scale, so that scaling a block matches scaling the whole phantom.
+    scale32 = float(np.float32(scale))
+    band = torch.empty((n_rows, n_cols, stop - start), dtype=torch.float32,
+                       device=device)
+    block_rows = _phantom_block_rows((n_rows, n_cols, stop - start), max_block_gb)
+    for row_start in range(0, n_rows, block_rows):
+        row_stop = min(row_start + block_rows, n_rows)
+        # The last block is short whenever the block size does not divide the
+        # rows.  mbirjax pads the rows up to a whole number of equal blocks
+        # because lax.map requires them; here the loop simply runs one short
+        # block, so there are no padded rows to crop off afterwards.
+        grids = torch.meshgrid(x_axis[row_start:row_stop], y_axis, indexing='ij')
+        block = _add_shepp_logan_ellipsoids(
+            torch.zeros((row_stop - row_start, n_cols, stop - start),
+                        dtype=torch.float32, device=device), grids, z_band)
+        if scale32 != 1.0:
+            block = block * scale32
+        band[row_start:row_stop] = block
+    return band
+
+
+def _generate_3d_shepp_logan_blocked(phantom_shape, device, max_block_gb, scale=1.0):
+    """Build the phantom on one device, with the rows in blocks.
+
+    The whole slice axis is one band here, so this is the single-device form of
+    :func:`_shepp_logan_band`.  Only the loop structure separates it from a
+    build that takes all the rows at once, so the two give identical values.
+    """
+    band = _shepp_logan_band(phantom_shape, (0, phantom_shape[2]), device,
+                             max_block_gb, scale)
+    phantom = _to_host(band)
+    del band                    # the phantom is a host array; free the device one
+    return phantom
+
+
+def _generate_3d_shepp_logan_sharded(phantom_shape, devices, max_block_gb, scale=1.0):
+    """Build the phantom with the slices split into one band per device.
+
+    The slice axis is the axis a reconstruction shards on, and the bands here
+    are the blocks :meth:`Placement.shard_ranges` gives that axis.  Those blocks
+    are contiguous, they differ in length by at most one, and the longer ones
+    come first.  mbirjax pads the axis up to a multiple of the device count
+    instead, because a jax global array requires equal blocks.  The bands here
+    are separate per-device tensors, so they take their own lengths and sum to
+    the slice axis exactly.  Nothing is padded and nothing is cropped.
+
+    The bands run in one thread per device.  mbirjax loops over its devices
+    without a thread pool, since dispatching a jax computation returns
+    immediately and the devices then run concurrently on their own.  A torch
+    call runs where it is issued, so the threads are what make the bands
+    concurrent here.
+    """
+    placement = _sharding.Placement(devices, axis=-1, axis_len=phantom_shape[2])
+    band_ranges = [slice_range for _, slice_range in placement.shard_ranges()]
+    bands = _sharding.run_per_device(
+        devices,
+        lambda i, device: _shepp_logan_band(phantom_shape, band_ranges[i], device,
+                                            max_block_gb, scale))
+    shards = _sharding.Shards(bands, placement)
+    phantom = _to_host(shards)
+    del bands, shards           # the phantom is a host array; free the device ones
+    return phantom
+
+
+def generate_3d_shepp_logan_low_dynamic_range(phantom_shape, devices=None,
+                                              max_block_gb=4.0,
                                               target_max_attenuation=None):
     """
     Generates a 3D Shepp-Logan phantom with specified dimensions.
 
+    The phantom is a reference object, so it is always returned as a host numpy
+    array.  The build itself runs on devices.  Each device builds one contiguous
+    band of slices, the bands are then gathered to the host, and the device
+    arrays are freed.  Every voxel depends only on its own coordinates, so the
+    bands exchange nothing and the phantom does not depend on the device count.
+
     Args:
         phantom_shape (tuple): Phantom shape in (rows, columns, slices).
+        devices (sequence of devices, optional): Devices to build the phantom
+            across.  Defaults to None, which uses every permitted device: every
+            visible CUDA device, capped by MBIRTORCH_NUM_DEVICES when that
+            variable is set.  This is the rule the preprocessing functions
+            follow, and the phantom follows it because one band is bounded work
+            at any phantom size.  More than one device gives a band per device;
+            one device gives a single band covering every slice.  Every device
+            type can build the phantom, because the build is float32.
+        max_block_gb (float, optional): Rough upper bound in GB on the temporary
+            memory one row block of a band uses.  Defaults to 4.0.  It bounds a
+            band of any length, so it applies to a multi-device build as well as
+            to a single-device one.
         target_max_attenuation (float, optional): If given, scale the phantom so
             that the peak line integral through it (its forward projection) is
             roughly this value, independent of the array shape.  Without it, the
@@ -134,20 +299,16 @@ def generate_3d_shepp_logan_low_dynamic_range(phantom_shape,
 
     Note:
         The build holds a few phantom-sized transients, so very large shapes use
-        proportionally more peak memory (mbirjax's blocked/sharded builds exist
-        for that regime and are not ported).
+        proportionally more peak memory.
     """
-    n_rows, n_cols, n_slices = phantom_shape
-    x_grid, y_grid = np.meshgrid(np.linspace(-1, 1, n_rows),
-                                 np.linspace(-1, 1, n_cols), indexing='ij')
-    z_locations = np.linspace(-1, 1, n_slices)
-
-    phantom = _add_shepp_logan_ellipsoids(
-        np.zeros(phantom_shape, dtype=np.float32), (x_grid, y_grid), z_locations)
-    if target_max_attenuation is not None:
-        phantom = phantom * np.float32(
-            _shepp_logan_attenuation_scale(phantom_shape, target_max_attenuation))
-    return phantom.astype(np.float32)
+    scale = 1.0 if target_max_attenuation is None \
+        else _shepp_logan_attenuation_scale(phantom_shape, target_max_attenuation)
+    devices = _phantom_devices(devices)
+    if len(devices) > 1:
+        return _generate_3d_shepp_logan_sharded(phantom_shape, devices,
+                                                max_block_gb, scale)
+    return _generate_3d_shepp_logan_blocked(phantom_shape, devices[0],
+                                            max_block_gb, scale)
 
 
 def makedirs(file_path):
@@ -158,18 +319,11 @@ def makedirs(file_path):
 
 def _to_host(array):
     """Move a numpy array, torch tensor (any device), or sharded volume to a
-    host numpy array.  A sharded volume is concatenated on the host and any
-    zero-padding of its sharded axis is cropped, so the result equals the
-    single-device volume."""
+    host numpy array.  A sharded volume is concatenated on the host, so the
+    result equals the single-device volume."""
     if isinstance(array, _sharding.Shards):
         # gather() already returns numpy; do not convert it again.
-        out = array.gather()
-        pl = array.placement
-        if pl.real_size is not None and pl.padded_size > pl.real_size:
-            sel = [slice(None)] * out.ndim
-            sel[pl.axis % out.ndim] = slice(0, pl.real_size)
-            out = out[tuple(sel)]
-        return out
+        return array.gather()
     if hasattr(array, 'detach'):
         return array.detach().cpu().numpy()
     return np.asarray(array)
@@ -183,7 +337,7 @@ def load_data_hdf5(file_path):
     It also loads any associated attributes and returns them as a dict.
 
     Args:
-        file_path (str): Path to the HDF5 file containing the reconstructed volume.
+        file_path (str): Path to the HDF5 file containing the array.
 
     Returns:
         tuple: (array, data_dict)
@@ -192,7 +346,8 @@ def load_data_hdf5(file_path):
 
     Raises:
         FileNotFoundError: If the file does not exist.
-        ValueError: If more than one dataset is not found in the file.
+        ValueError: If the file contains more than one dataset.
+        IndexError: If the file contains no dataset.
 
     Example:
         >>> import mbirtorch
@@ -216,25 +371,23 @@ def load_data_hdf5(file_path):
 
 def _shard_axis_block(shards, i0, i1):
     """Host copy of the global range [i0, i1) of a sharded volume's SHARDED
-    axis (real coordinates; padding never included), all other axes full.
-    Only this block leaves the devices, so a caller that walks the axis in
-    slabs never holds the whole volume on the host.
+    axis, all other axes full.  Only this block leaves the devices, so a
+    caller that walks the axis in slabs never holds the whole volume on the
+    host.
 
     Shard extents are read off the TENSORS rather than the placement, and the
     dtype off an empty slice -- the rule :func:`_sharded_slab_source` uses --
-    so this holds whether or not ``real_size`` was supplied (a placement built
-    without it has ``padded_size is None``, which the placement-derived form
-    turns into a None-length axis).
+    so this holds whether or not ``axis_len`` was supplied.
     """
     pl = shards.placement
     ndim = shards.tensors[0].ndim
     axis = pl.axis % ndim
     sizes = [int(t.shape[axis]) for t in shards.tensors]
     starts = np.cumsum([0] + sizes)
-    real_end = int(pl.real_size) if pl.real_size is not None else int(starts[-1])
+    axis_end = int(pl.axis_len) if pl.axis_len is not None else int(starts[-1])
     pieces = []
     for t, s0, s1 in zip(shards.tensors, starts[:-1], starts[1:]):
-        lo, hi = max(i0, int(s0)), min(i1, min(int(s1), real_end))
+        lo, hi = max(i0, int(s0)), min(i1, min(int(s1), axis_end))
         if lo < hi:
             sel = [slice(None)] * ndim
             sel[axis] = slice(lo - int(s0), hi - int(s0))
@@ -244,14 +397,14 @@ def _shard_axis_block(shards, i0, i1):
 
 def _sharded_host_shape_dtype(shards):
     """The shape and numpy dtype of a sharded volume's host form (sharded
-    axis at its real size), computed without gathering anything.  Same extent
+    axis at its full length), computed without gathering anything.  Same extent
     and dtype rules as :func:`_shard_axis_block`."""
     pl = shards.placement
     ndim = shards.tensors[0].ndim
     axis = pl.axis % ndim
     shape = [int(v) for v in shards.tensors[0].shape]
     total = sum(int(t.shape[axis]) for t in shards.tensors)
-    shape[axis] = int(pl.real_size) if pl.real_size is not None else total
+    shape[axis] = int(pl.axis_len) if pl.axis_len is not None else total
     np_dtype = shards.tensors[0][:0].detach().cpu().numpy().dtype
     return tuple(shape), np_dtype
 
@@ -291,11 +444,8 @@ def save_data_hdf5(file_path, array, array_name='array', attributes_dict=None):
     The resulting structure has a single dataset with one array and associated text attributes.
     These can be retrieved using :func:`load_data_hdf5`.
 
-    A sharded volume (a ``Shards`` container) is gathered SLAB BY SLAB rather than up front,
-    so the peak host footprint is one slab and not the whole volume -- which is the point of
-    the streaming design and would otherwise be lost exactly where it matters most.  The file
-    is byte-identical to the gather-first version: same slab order, same concatenation axis,
-    same padding crop, same dtype (see ``_to_host``).
+    Large arrays and sharded volumes (a ``Shards`` container) are written one slab at a time,
+    so no full copy of the array is built on the host.
 
     Args:
         file_path (str): Full path to the output HDF5 file. Directories will be created if they do not exist.
@@ -343,22 +493,18 @@ def _sharded_slab_source(shards):
 
     - sharded on axis 0: the slab spans one or more shards' own ranges, so each
       contributing shard hands over just its overlap and they concatenate in
-      shard order -- the same order ``gather`` uses.  Padding rows sit past
-      ``real_size``, and the writer stops at ``out_shape[0]``, so they are never
-      requested.
-    - sharded on any other axis: every shard contributes rows ``[i0:i1]``, they
-      concatenate on the sharded axis, and the padding tail of that axis is
-      cropped per slab exactly as ``_to_host`` crops it once.
+      shard order -- the same order ``gather`` uses.
+    - sharded on any other axis: every shard contributes rows ``[i0:i1]``, and
+      they concatenate on the sharded axis.
     """
     pl = shards.placement
     ndim = shards.tensors[0].ndim
     axis = pl.axis % ndim
     # Shard extents along the sharded axis, read off the tensors rather than the
-    # placement, so this holds whether or not real_size was supplied.
+    # placement, so this holds whether or not axis_len was supplied.
     sizes = [int(t.shape[axis]) for t in shards.tensors]
     starts = np.cumsum([0] + sizes)
-    cropped = pl.real_size is not None and pl.padded_size > pl.real_size
-    axis_len = int(pl.real_size) if cropped else int(starts[-1])
+    axis_len = int(starts[-1])
 
     out_shape = list(shards.tensors[0].shape)
     out_shape[axis] = axis_len
@@ -377,14 +523,9 @@ def _sharded_slab_source(shards):
                     parts.append(t[lo - int(s0):hi - int(s0)].detach().cpu().numpy())
             return np.ascontiguousarray(np.concatenate(parts, axis=0))
     else:
-        sel = [slice(None)] * ndim
-        sel[axis] = slice(0, axis_len)
-        crop = tuple(sel)
-
         def produce_slab(i0, i1):
             parts = [t[i0:i1].detach().cpu().numpy() for t in shards.tensors]
-            out = np.concatenate(parts, axis=axis)
-            return np.ascontiguousarray(out[crop] if cropped else out)
+            return np.ascontiguousarray(np.concatenate(parts, axis=axis))
 
     return out_shape, dtype, produce_slab
 
@@ -394,8 +535,8 @@ def export_recon_hdf5(file_path, recon, recon_dict=None, remove_flash=False, rad
     Export a 3D reconstruction volume to an HDF5 file with optional post-processing.
 
     This function works with numpy arrays, torch tensors, and sharded volumes (a ``Shards``
-    container): a sharded volume is gathered to the host at this file boundary and any
-    zero-padding of its slice axis is cropped, so the file equals the single-device export.
+    container).  A sharded volume is copied to the host and written one slab at a time, so the
+    file equals the single-device export.
     The function also transposes the reconstruction to right-hand coordinates (slice, col, row),
     and writes the reconstruction and optional metadata to an HDF5 file.
 
@@ -469,14 +610,12 @@ def _resolve_geometry_class(geometry_type):
 
 def build_model(required_params, optional_params=None, regularization=None):
     """
-    Construct a model from parameter dicts and compute its reconstruction geometry.
+    Construct a model from the parameter dicts returned by
+    :meth:`~mbirtorch.TomographyModel.get_all_params`.
 
-    The single place the ``construct -> set_params -> auto_set_recon_geometry`` sequence lives, so a
-    caller never forgets the final ``auto_set_recon_geometry`` (which would leave the reconstruction
-    grid sized with default detector pitches).  Because ``required_params`` carries ``geometry_type``
-    (see :meth:`~mbirtorch.TomographyModel.get_all_params`), the correct model class is resolved here
-    and ``(required_params, optional_params)`` is a self-contained model description -- calling this
-    reads like calling the constructor through the new interface.
+    The model class is taken from the ``geometry_type`` entry of ``required_params``.  The model is
+    constructed, the optional parameters and regularization are applied, and the reconstruction
+    geometry is set with ``auto_set_recon_geometry``.
 
     Args:
         required_params (dict): The model constructor's arguments, including ``geometry_type`` (as
@@ -720,17 +859,26 @@ def stitch_arrays(array_list, overlap, axis=2, ramp_overlap=None):
     between adjacent arrays.
 
     This behaves like a concatenate except that for each adjacent pair, the
-    first `overlap_length` elements of the second array and the last
-    `overlap_length` elements of the current result are combined by a piece-wise linear cross‑fade.
+    first `overlap` elements of the second array and the last
+    `overlap` elements of the current result are combined by a piece-wise linear cross‑fade.
 
     All non‑`axis` dimensions must match across inputs.
+
+    Accepted forms: a list of NumPy arrays, or a list of torch tensors that are all on one device,
+    possibly mixed with NumPy arrays (the NumPy arrays are moved to that device).  Two forms are
+    refused rather than handled: tensors spread over more than one device, and an array in the
+    divided device form (a ``Shards`` container, as produced by the multi-GPU projectors).  In both
+    cases the caller decides where the data should go -- by moving the tensors to a common device,
+    or by gathering the shards to the host -- because the right choice depends on how much memory
+    the stitched result needs and where it is used next.
 
     Args:
         array_list (list of ndarray or tensor): Sequence of 2+ arrays to stitch.  The result is
             built on the inputs' own array module, so host (NumPy) inputs stitch on the host (no
-            gather to a single device) and device tensors stitch on-device.
+            gather to a single device) and device tensors stitch on-device.  All tensors must be
+            on the same device, and none of the elements may be a ``Shards`` container.
         overlap (int): Number of elements overlapped between arrays.
-            Must be `>= 1` and not exceed the length of any input along `axis`.
+            Must not exceed the length of any input along `axis`.
         axis (int, optional): Axis along which to stitch. Defaults to 2.
         ramp_overlap (int, optional): Target number of blended (0 < w < 1) elements. Defaults to None.
 
@@ -739,14 +887,15 @@ def stitch_arrays(array_list, overlap, axis=2, ramp_overlap=None):
         out, tensor in -> on-device out). Its shape equals the input shape with the
         length along `axis` equal to:
 
-            sum(len_k) - (len(array_list) - 1) * overlap_length
+            sum(len_k) - (len(array_list) - 1) * overlap
 
         where `len_k` are the lengths of each input along `axis`.
 
     Raises:
         ValueError: If fewer than two arrays are provided, if non‑`axis`
-            dimensions differ, or if any array is shorter than
-            `overlap_length` along `axis`.
+            dimensions differ, if any array is shorter than
+            `overlap` along `axis`, or if the tensors are not all on one device.
+        TypeError: If any element is a ``Shards`` container.
 
     Example:
         >>> import numpy as np
@@ -763,6 +912,27 @@ def stitch_arrays(array_list, overlap, axis=2, ramp_overlap=None):
     # Check for valid input
     if not isinstance(array_list, list) or len(array_list) < 2:
         raise ValueError('array_list must be a list of 2 or more arrays.')
+
+    # A Shards holds one tensor per device rather than one array, so it has no shape of its own.
+    # Left alone it would fail further down on a missing attribute, with nothing in the message to
+    # say what the caller did wrong, so it is refused here.
+    for array in array_list:
+        if isinstance(array, _sharding.Shards):
+            raise TypeError(
+                'stitch_arrays does not accept an array in the divided device form.  Gather the '
+                'shards to the host first with shards.gather(), then stitch the host arrays.')
+
+    # Tensors on different devices cannot be combined by torch, and picking one of the devices for
+    # the caller would move data across the bus behind their back -- possibly a whole volume onto a
+    # GPU that cannot hold it.  Refuse instead and let the caller choose.
+    tensor_devices = {array.device for array in array_list if isinstance(array, torch.Tensor)}
+    if len(tensor_devices) > 1:
+        found = ', '.join(sorted(str(device) for device in tensor_devices))
+        raise ValueError(
+            'stitch_arrays requires all tensors in array_list to be on one device, but found '
+            'tensors on {}.  Move them to a common device before calling, for example with '
+            'array.to(device).'.format(found))
+
     for dim in range(array_list[0].ndim):
         lengths = [array.shape[dim] for array in array_list]
         if dim != axis:
@@ -784,12 +954,12 @@ def stitch_arrays(array_list, overlap, axis=2, ramp_overlap=None):
 
     # Build the blend weights and assemble on the inputs' OWN array module so the result stays where
     # the inputs live: host (NumPy) arrays stitch on the HOST (no gather to a single device), device
-    # tensors stitch on-device.  split_sino_recon relies on this -- it passes host halves, so the full
+    # tensors stitch on-device.  recon_split_sino relies on this -- it passes host halves, so the full
     # volume is never reassembled on one GPU (which would defeat the half-at-a-time memory saving and
     # OOM for a recon too large to fit whole).  float32 weights avoid upcasting a float32 recon to f64.
     is_torch = any(isinstance(a, torch.Tensor) for a in array_list)
     if is_torch:
-        device = next(a.device for a in array_list if isinstance(a, torch.Tensor))
+        device = next(iter(tensor_devices))  # exactly one device, checked above
         ramp = (torch.arange(ramp_overlap, dtype=torch.float32, device=device) + 1) / (ramp_overlap + 1)
         weights = torch.cat([torch.zeros(flat_pad, dtype=torch.float32, device=device), ramp,
                              torch.ones(flat_pad, dtype=torch.float32, device=device)])
@@ -838,7 +1008,9 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
     Each geometry names its per-view parameters differently, and the copy uses whichever name the model's own
     constructor takes: ``new_angles`` for the three angle-based geometries (a 1D vector for parallel and cone, a
     (num_views, 2) array of (azimuth, elevation) pairs for multiaxis) and ``new_translation_vectors`` for
-    TranslationModel.  Passing the argument that does not apply to the given model raises rather than being ignored.
+    TranslationModel.  Passing ``new_translation_vectors`` for an angle-based model raises ValueError, and passing
+    ``new_angles`` or ``new_helical_z_shifts`` for a TranslationModel raises ValueError.  Passing
+    ``new_helical_z_shifts`` for a ParallelBeamModel or MultiAxisParallelModel is silently ignored.
 
     If the user explicitly set the devices on ct_model with configure_devices, the copy
     gets the same devices.  Otherwise the copy chooses its own devices when it is used.
@@ -849,7 +1021,7 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
             ConeBeamModel, or a (num_views, 2) array of (azimuth, elevation) pairs for MultiAxisParallelModel.
             If None, then use the angles in ct_model. Defaults to None.
         new_helical_z_shifts (ndarray of float, optional): 1D vector of per-view axial shifts in ALU for ConeBeamModel.
-            Defaults to None.
+            Ignored for ParallelBeamModel and MultiAxisParallelModel.  Defaults to None.
         new_num_det_rows (int, optional): Number of detector rows in the new model.
             If None, then use the num_det_rows in ct_model. Defaults to None.
         new_num_det_cols (int, optional): Number of detector columns in the new model.
@@ -1089,15 +1261,15 @@ def get_ct_model(geometry_type, sinogram_shape, angles=None, source_detector_dis
 
     Args:
         geometry_type (str): 'parallel', 'cone', 'multiaxis' or 'translation'
-        sinogram_shape (tuple list of int): (num_views, num_rows, num_channels)
+        sinogram_shape (tuple of int): (num_views, num_rows, num_channels)
         angles (ndarray of float, optional): Projection angles in radians -- a 1D vector for 'parallel' and 'cone', or a
             (num_views, 2) array of (azimuth, elevation) pairs for 'multiaxis'.  Not used by 'translation', which takes
             translation_vectors instead.  Defaults to None.
         source_detector_dist (float or None, optional): Distance in ALU from source to detector.  Defaults to None for geometries that don't need this.
         source_iso_dist (float or None, optional): Distance in ALU from source to iso.  Defaults to None for geometries that don't need this.
-        helical_z_shifts (ndarray, optional):
-            Per-view axial shifts (ALU), same length as angles.
-            Required when use_helical=True.
+        helical_z_shifts (ndarray, optional): Per-view axial shifts in ALU, same length as angles.
+            Used only by geometry_type 'cone', where it gives a helical scan.  For 'parallel' and
+            'multiaxis' it is ignored with a warning.  Defaults to None.
         translation_vectors (ndarray of float, optional): (num_views, 3) array of object translations (x, y, z) in ALU.
             Required for geometry_type 'translation' and unused by the others.  Defaults to None.
 
@@ -1176,10 +1348,10 @@ def generate_3d_shepp_logan_reference(phantom_shape):
     Kak AC, Slaney M. Principles of computerized tomographic imaging. Page.102. IEEE Press, New York, 1988. https://engineering.purdue.edu/~malcolm/pct/CTI_Ch03.pdf
 
     Args:
-        phantom_shape (tuple or list of ints): num_rows, num_cols, num_slices
+        phantom_shape (tuple or list of ints): (num_rows, num_cols, num_slices)
 
     Return:
-        out_image: 3D array, num_slices*num_rows*num_cols
+        out_image: 3D numpy array with shape (num_rows, num_cols, num_slices)
 
     Note:
         This function produces 6 intermediate arrays that each have shape phantom_shape, so if phantom_shape is
@@ -1215,7 +1387,12 @@ def generate_3d_shepp_logan_reference(phantom_shape):
                                gamma=el_paras['gamma'] / 180.0 * np.pi,
                                gray_level=el_paras['gray_level'])
 
-    return image.transpose((1, 0, 2))
+    # The meshgrid already puts y on axis 0 (rows) and x on axis 1 (cols), so
+    # the image is in (rows, cols, slices) order.  An earlier implementation
+    # applied a final transpose((1, 0, 2)) here, which swaps rows and columns;
+    # that transpose was identified as a bug (2026-08-14) and is deliberately
+    # not applied.
+    return image
 
 
 def gen_translation_phantom(recon_shape, option, text, fill_rate=0.05, font_size=20, text_row_indices=None,
@@ -1226,15 +1403,19 @@ def gen_translation_phantom(recon_shape, option, text, fill_rate=0.05, font_size
     Args:
         recon_shape (tuple[int, int, int]): Shape of the reconstruction volume.
         option (str): Phantom type to generate. Options are 'dots' or 'text'.
-        text (list[str]): List of ASCII text strings to render.
-        fill_rate (float, optional): Fill rate of the reconstruction volume. Default is 0.05.
-        font_size (int, optional): Font size of the ASCII words. Default is 20.
-        text_row_indices (list[int], optional): List of row indices where each text string should be placed. Default is None.
-                                           If None, words are automatically distributed evenly across the first dimension.
-                                           Must have the same length as 'words' if provided.
-        horizontal_offset (int, optional): Horizontal offset of the text to be rendered. Positive value shifts the phantom right. Default is 0.
-        vertical_offset (int, optional): Vertical offset of the text to be rendered. Positive value shifts the phantom up. Default is 0.
-        voxel_slice_aspect (float, optional): Ratio between slice voxel spacing and column voxel spacing. Default is 1.0.
+        text (list[str]): List of ASCII text strings to render. Used by 'text' only.
+        fill_rate (float, optional): Fill rate of the reconstruction volume. Used by 'dots' only. Default is 0.05.
+        font_size (int, optional): Font size of the ASCII text. Used by 'text' only. Default is 20.
+        text_row_indices (list[int], optional): List of row indices where each string in 'text' should be placed.
+                                           Used by 'text' only. Default is None.
+                                           If None, the strings are automatically distributed evenly across the first dimension.
+                                           Must have the same length as 'text' if provided.
+        horizontal_offset (int, optional): Horizontal offset of the text to be rendered. Positive value shifts the phantom right.
+                                           Used by 'text' only. Default is 0.
+        vertical_offset (int, optional): Vertical offset of the text to be rendered. Positive value shifts the phantom up.
+                                           Used by 'text' only. Default is 0.
+        voxel_slice_aspect (float, optional): Ratio between slice voxel spacing and column voxel spacing.
+                                           Used by 'text' only. Default is 1.0.
 
     Returns:
         np.ndarray: Generated phantom volume.
@@ -1438,8 +1619,7 @@ def gen_cube_phantom(recon_shape, device=None):
     phantom_rows = num_recon_rows // 4  # Phantom height
     phantom_cols = num_recon_cols // 4  # Phantom width
 
-    # Allocate phantom memory.  float32 explicitly: mbirjax's jnp.array does
-    # this downcast for free (jax defaults to 32-bit), torch.as_tensor keeps
+    # Allocate phantom memory.  float32 explicitly: torch.as_tensor keeps
     # whatever numpy gave it, and float64 both doubles the memory and is
     # unsupported on mps.
     phantom = np.zeros((num_recon_rows, num_recon_cols, num_recon_slices),
@@ -1539,7 +1719,6 @@ def generate_demo_data(
     num_det_rows=96,
     delta_det_row=1,
     num_det_channels=128,
-    delta_det_channel=1,
     num_x_translations=7,
     num_z_translations=7,
     x_spacing=22,
@@ -1562,17 +1741,22 @@ def generate_demo_data(
     parameters to create a simulated sinogram.  The object type 'shepp-logan' gives a simplified version of the
     classic Shepp-Logan test phantom, and type 'cube' gives a simple cube object.
 
+    The 'translation' model type is the exception: it reconstructs a volume only a few voxels thick, on which both
+    of those objects come out empty, so it always uses :func:`gen_translation_phantom` (a sparse pattern of dots)
+    and ignores object_type.
+
     The output sinogram has shape (num_views, num_det_rows, num_det_channels); each 2D array
     sinogram[view_index] is a simulated image from the detector, with num_det_rows indicating the
     vertical size and num_det_channels the horizontal size.
 
     Args:
         object_type (str, optional): One of 'shepp-logan' or 'cube'.  Defaults to 'shepp-logan'.
-        model_type (str, optional): One of 'parallel' or 'cone'.  Defaults to 'cone'.  The
-            translation geometry is not available yet, and asking for it raises
-            NotImplementedError.
+            Ignored when model_type is 'translation', which uses its own phantom (see above).
+        model_type (str, optional): One of 'parallel', 'cone', 'translation' or 'multiaxis'.  Defaults to 'cone'.
         num_views (int, optional):  Number of views in the output sinogram.  Defaults to 64. Ignored when model_type is 'translation'
         num_det_rows (int, optional): Number of rows (vertical) in the output sinogram.  Defaults to 96.
+        delta_det_row (float, optional): Detector row pitch in ALU.  Used only to compute the helical
+            trajectory, so it has no effect unless model_type is 'cone' and use_helical is True.  Defaults to 1.
         num_det_channels (int, optional): Number of channels (horizontal) in the output sinogram.  Defaults to 128.
         num_x_translations (int, optional): Number of horizontal translations for translation mode.  Defaults to 7.
         num_z_translations (int, optional): Number of vertical translations for translation mode.  Defaults to 7.
@@ -1591,7 +1775,8 @@ def generate_demo_data(
             constant tilt of every view out of the horizontal plane, in degrees.
             Defaults to 0.0.
         voxel_row_aspect (float, optional): Aspect ratio for recon rows relative to columns.  Defaults to 1.0.
-        voxel_slice_aspect (float, optional): Aspect ratio for recon slices relative to rows.  Defaults to 1.0.
+        voxel_slice_aspect (float, optional): Ratio of the slice voxel spacing to the in-plane voxel spacing
+            delta_voxel, so that delta_voxel_slice = voxel_slice_aspect * delta_voxel.  Defaults to 1.0.
         target_max_attenuation (float, optional): Target max sinogram attenuation for Shepp-Logan phantom.  Defaults to None, for which each voxel is in the range [0, 1].  May not be accurate if any detector or voxel dimensions are not 1.
         devices (sequence of devices, optional): Devices to run the generation on.  Defaults to None,
             which uses the model's automatic selection.  This only affects where the work runs, not
@@ -1602,7 +1787,11 @@ def generate_demo_data(
             - object: the phantom volume, shape recon_shape = (num_rows, num_cols, num_slices).
               A host numpy float32 array, for either object type.
             - sinogram: shape (num_views, num_det_rows, num_det_channels).
-            - params (dict): contains 'angles' and, for 'cone', also 'source_detector_dist' and 'source_iso_dist'.
+            - params (dict): the geometry parameters used for the simulation.  For model_type
+              'parallel', 'cone' and 'multiaxis' it contains 'angles' plus the voxel aspect ratios;
+              'cone' adds 'source_detector_dist', 'source_iso_dist' and 'use_curved_detector', and a
+              helical cone scan also adds 'helical_z_shifts'; 'multiaxis' adds 'elevation_degrees'.
+              For model_type 'translation' it contains 'translation_vectors' only.
 
         sinogram is always a host NumPy array (what ``recon`` prefers).
     """
@@ -1730,10 +1919,18 @@ def generate_demo_data(
     # sinogram share one layout.  None leaves the automatic selection in place.
     if devices is not None:
         ct_model_for_generation.configure_devices(devices=list(devices))
-    # Name where the layout came from.  This entry decides a device set outside
-    # the reconstruction device policy, so without the word the run log cannot
-    # tell a set the caller named from the one the library fell back to -- and
-    # the two can differ from the devices the recon that consumes this sinogram
+    # Settle the layout before projecting, so the generation spreads over the
+    # devices the widening speed floors admit rather than running whole on the
+    # lead one.  The capacity preflight is skipped for this model alone: it
+    # exists for one forward projection and is deleted below, so it has no
+    # reconstruction lifetime to size for, and an overflow the preflight would
+    # have caught arrives as the allocator's error instead.  A pinned model
+    # returns from the call at once, so no branch guards it.
+    ct_model_for_generation.skip_memory_preflight = True
+    ct_model_for_generation._apply_device_policy()
+    # Name where the layout came from.  Without the word the run log cannot
+    # tell a set the caller named from the one the policy chose here -- and
+    # either can differ from the devices the recon that consumes this sinogram
     # goes on to use.
     device_provenance = 'requested' if devices is not None else 'default'
 
@@ -1755,13 +1952,21 @@ def generate_demo_data(
             recon_shape[1],
             embed_slice_stop - embed_slice_start,
         )
-    if object_type == ObjectType.SHEPP_LOGAN:
+    if model_type == ModelType.TRANSLATION:
+        # The translation geometry reconstructs a thin slab -- often a single row of voxels -- and
+        # the two generic phantoms come out empty on a volume that thin: at one recon row every
+        # Shepp-Logan grid point lands outside all of the ellipsoids, and the cube's row band rounds
+        # away to nothing.  Use the phantom written for this geometry instead, so the demo has
+        # something to project.  object_type does not apply here; the result is a sparse pattern of
+        # dots, already host numpy float32 as the other branches return.
+        phantom_core = gen_translation_phantom(phantom_shape, option='dots', text=None)
+    elif object_type == ObjectType.SHEPP_LOGAN:
         phantom_core = generate_3d_shepp_logan_low_dynamic_range(
             phantom_shape, target_max_attenuation=target_max_attenuation)
     elif object_type == ObjectType.CUBE:
-        # gen_cube_phantom returns a tensor, as its mbirjax counterpart returns
-        # a jax array.  This function promises host numpy for both object
-        # types, so convert here rather than hand back two different things.
+        # gen_cube_phantom returns a tensor.  This function promises host numpy
+        # for both object types, so convert here rather than hand back two
+        # different things.
         phantom_core = gen_cube_phantom(phantom_shape).cpu().numpy()
     else:
         raise ValueError(f'Invalid object type. Expected one of {[o.value for o in ObjectType]}, got {object_type}')
