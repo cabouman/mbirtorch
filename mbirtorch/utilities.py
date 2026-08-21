@@ -864,10 +864,19 @@ def stitch_arrays(array_list, overlap, axis=2, ramp_overlap=None):
 
     All non‑`axis` dimensions must match across inputs.
 
+    Accepted forms: a list of NumPy arrays, or a list of torch tensors that are all on one device,
+    possibly mixed with NumPy arrays (the NumPy arrays are moved to that device).  Two forms are
+    refused rather than handled: tensors spread over more than one device, and an array in the
+    divided device form (a ``Shards`` container, as produced by the multi-GPU projectors).  In both
+    cases the caller decides where the data should go -- by moving the tensors to a common device,
+    or by gathering the shards to the host -- because the right choice depends on how much memory
+    the stitched result needs and where it is used next.
+
     Args:
         array_list (list of ndarray or tensor): Sequence of 2+ arrays to stitch.  The result is
             built on the inputs' own array module, so host (NumPy) inputs stitch on the host (no
-            gather to a single device) and device tensors stitch on-device.
+            gather to a single device) and device tensors stitch on-device.  All tensors must be
+            on the same device, and none of the elements may be a ``Shards`` container.
         overlap (int): Number of elements overlapped between arrays.
             Must not exceed the length of any input along `axis`.
         axis (int, optional): Axis along which to stitch. Defaults to 2.
@@ -884,8 +893,9 @@ def stitch_arrays(array_list, overlap, axis=2, ramp_overlap=None):
 
     Raises:
         ValueError: If fewer than two arrays are provided, if non‑`axis`
-            dimensions differ, or if any array is shorter than
-            `overlap` along `axis`.
+            dimensions differ, if any array is shorter than
+            `overlap` along `axis`, or if the tensors are not all on one device.
+        TypeError: If any element is a ``Shards`` container.
 
     Example:
         >>> import numpy as np
@@ -902,6 +912,27 @@ def stitch_arrays(array_list, overlap, axis=2, ramp_overlap=None):
     # Check for valid input
     if not isinstance(array_list, list) or len(array_list) < 2:
         raise ValueError('array_list must be a list of 2 or more arrays.')
+
+    # A Shards holds one tensor per device rather than one array, so it has no shape of its own.
+    # Left alone it would fail further down on a missing attribute, with nothing in the message to
+    # say what the caller did wrong, so it is refused here.
+    for array in array_list:
+        if isinstance(array, _sharding.Shards):
+            raise TypeError(
+                'stitch_arrays does not accept an array in the divided device form.  Gather the '
+                'shards to the host first with shards.gather(), then stitch the host arrays.')
+
+    # Tensors on different devices cannot be combined by torch, and picking one of the devices for
+    # the caller would move data across the bus behind their back -- possibly a whole volume onto a
+    # GPU that cannot hold it.  Refuse instead and let the caller choose.
+    tensor_devices = {array.device for array in array_list if isinstance(array, torch.Tensor)}
+    if len(tensor_devices) > 1:
+        found = ', '.join(sorted(str(device) for device in tensor_devices))
+        raise ValueError(
+            'stitch_arrays requires all tensors in array_list to be on one device, but found '
+            'tensors on {}.  Move them to a common device before calling, for example with '
+            'array.to(device).'.format(found))
+
     for dim in range(array_list[0].ndim):
         lengths = [array.shape[dim] for array in array_list]
         if dim != axis:
@@ -928,7 +959,7 @@ def stitch_arrays(array_list, overlap, axis=2, ramp_overlap=None):
     # OOM for a recon too large to fit whole).  float32 weights avoid upcasting a float32 recon to f64.
     is_torch = any(isinstance(a, torch.Tensor) for a in array_list)
     if is_torch:
-        device = next(a.device for a in array_list if isinstance(a, torch.Tensor))
+        device = next(iter(tensor_devices))  # exactly one device, checked above
         ramp = (torch.arange(ramp_overlap, dtype=torch.float32, device=device) + 1) / (ramp_overlap + 1)
         weights = torch.cat([torch.zeros(flat_pad, dtype=torch.float32, device=device), ramp,
                              torch.ones(flat_pad, dtype=torch.float32, device=device)])
@@ -1710,12 +1741,17 @@ def generate_demo_data(
     parameters to create a simulated sinogram.  The object type 'shepp-logan' gives a simplified version of the
     classic Shepp-Logan test phantom, and type 'cube' gives a simple cube object.
 
+    The 'translation' model type is the exception: it reconstructs a volume only a few voxels thick, on which both
+    of those objects come out empty, so it always uses :func:`gen_translation_phantom` (a sparse pattern of dots)
+    and ignores object_type.
+
     The output sinogram has shape (num_views, num_det_rows, num_det_channels); each 2D array
     sinogram[view_index] is a simulated image from the detector, with num_det_rows indicating the
     vertical size and num_det_channels the horizontal size.
 
     Args:
         object_type (str, optional): One of 'shepp-logan' or 'cube'.  Defaults to 'shepp-logan'.
+            Ignored when model_type is 'translation', which uses its own phantom (see above).
         model_type (str, optional): One of 'parallel', 'cone', 'translation' or 'multiaxis'.  Defaults to 'cone'.
         num_views (int, optional):  Number of views in the output sinogram.  Defaults to 64. Ignored when model_type is 'translation'
         num_det_rows (int, optional): Number of rows (vertical) in the output sinogram.  Defaults to 96.
@@ -1916,7 +1952,15 @@ def generate_demo_data(
             recon_shape[1],
             embed_slice_stop - embed_slice_start,
         )
-    if object_type == ObjectType.SHEPP_LOGAN:
+    if model_type == ModelType.TRANSLATION:
+        # The translation geometry reconstructs a thin slab -- often a single row of voxels -- and
+        # the two generic phantoms come out empty on a volume that thin: at one recon row every
+        # Shepp-Logan grid point lands outside all of the ellipsoids, and the cube's row band rounds
+        # away to nothing.  Use the phantom written for this geometry instead, so the demo has
+        # something to project.  object_type does not apply here; the result is a sparse pattern of
+        # dots, already host numpy float32 as the other branches return.
+        phantom_core = gen_translation_phantom(phantom_shape, option='dots', text=None)
+    elif object_type == ObjectType.SHEPP_LOGAN:
         phantom_core = generate_3d_shepp_logan_low_dynamic_range(
             phantom_shape, target_max_attenuation=target_max_attenuation)
     elif object_type == ObjectType.CUBE:

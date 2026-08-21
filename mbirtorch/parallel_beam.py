@@ -304,7 +304,7 @@ class ParallelBeamModel(TomographyModel):
         """
         # Voxel-size scaling factor: adjusts the filter to account for voxel
         # size.  For the theoretical derivation see the zip linked at
-        # https://mbirjax.readthedocs.io/en/latest/theory.html
+        # https://mbirtorch.readthedocs.io/en/latest/theory.html
         # The FBP weight pi/num_views is folded into the filter by the shared
         # method; parallel beam has no FDK cosine pre-weight.
         delta_voxel, voxel_row_aspect = self.get_params(['delta_voxel',

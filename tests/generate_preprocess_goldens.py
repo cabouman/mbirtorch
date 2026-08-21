@@ -17,8 +17,10 @@ curve family, and the small helpers.  It also carries the demo-data utilities:
 the reference Shepp-Logan phantom on a non-cubic shape, the phantom, sinogram
 and view geometry that generate_demo_data produces for the parallel, cone, and
 helical-cone cases, and the recon shapes get_ct_model builds.  The HDF5 file is
-an mbirjax-written save_cone_preprocessing output, pinning the on-disk format as
-shared between the two packages.
+an mbirjax-written save_cone_preprocessing output, pinning the on-disk layout as
+shared between the two packages.  It carries the format tag
+'mbirjax_preprocessing_v1'; mbirtorch now writes 'mbirtorch_preprocessing_v1'
+and accepts both when loading, so this file does not need regenerating.
 """
 
 import os
@@ -318,7 +320,8 @@ def main():
                               h5_vol, recon_dict={'scan_id': 'sample1'}, remove_flash=True,
                               radial_margin=2, top_margin=2, bottom_margin=3)
 
-    # mbirjax-written cone-preprocessing save: pins the on-disk format.
+    # mbirjax-written cone-preprocessing save: pins the on-disk layout, and carries the older
+    # format tag that the mbirtorch loader still accepts.
     h5_path = os.path.join(OUT_DIR, 'preprocess_goldens_cone_save.h5')
     mjp.save_cone_preprocessing(
         h5_path, sino_trans,

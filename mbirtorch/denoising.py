@@ -434,6 +434,10 @@ class QGGMRFDenoiser(TomographyModel):
                                  [100 * float(v) for v in nmae_update[:num_iters]],
                                  [float(v) for v in alpha_values[:num_iters]],
                                  None]))
+        # This call has written its last log line, so finish the file rather
+        # than holding it open, as recon and prox_map do.  A call continuing
+        # this run reopens it.
+        self.close_log_file()
         notes = 'Reconstruction completed: {}\n\n'.format(datetime.datetime.now())
         denoiser_dict = self.get_recon_dict(recon_params, notes=notes)
         return (denoised if output_sharded else self._gather_recon(denoised)), denoiser_dict

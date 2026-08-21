@@ -1548,6 +1548,13 @@ def correct_zinger_pixels(sino, zinger_pixel_ratio=0.1, num_passes=3, batch_size
                                      devices=pipeline.permitted_devices(devices))
 
 
+# Value written into the 'format' attribute of new files.
+_CONE_PREPROCESSING_FORMAT = 'mbirtorch_preprocessing_v1'
+# Tags the loader accepts.  The mbirjax tag is the name this format was written under before the
+# package was renamed; files carrying it have the same layout, so they keep loading.
+_ACCEPTED_CONE_PREPROCESSING_FORMATS = ('mbirtorch_preprocessing_v1', 'mbirjax_preprocessing_v1')
+
+
 def save_cone_preprocessing(file_path, sinogram, cone_beam_params, optional_params, weights=None):
     """Save a preprocessed sinogram and its geometry parameters to an HDF5 file.
 
@@ -1558,6 +1565,10 @@ def save_cone_preprocessing(file_path, sinogram, cone_beam_params, optional_para
     Only the parameters in the two dicts are saved.  Regularization parameters such as sharpness,
     sigma_x, and snr_db are not saved; set them at recon time.  For geometry plus regularization,
     use the parameter-handler save and load instead.
+
+    The file records a ``'format'`` attribute of ``'mbirtorch_preprocessing_v1'``.  Files written
+    before the package was renamed carry ``'mbirjax_preprocessing_v1'`` instead; the layout is the
+    same and :func:`load_cone_preprocessing` accepts both.
 
     Args:
         file_path (str): Output HDF5 path.  Parent directories are created.
@@ -1596,14 +1607,24 @@ def save_cone_preprocessing(file_path, sinogram, cone_beam_params, optional_para
                     scalar_params[dname][key] = value
         # numpy scalars -> Python via .item(); tuples -> JSON lists (sinogram_shape restored on load).
         f.attrs['params'] = json.dumps(scalar_params, default=lambda o: o.item())
-        f.attrs['format'] = 'mbirjax_preprocessing_v1'
+        f.attrs['format'] = _CONE_PREPROCESSING_FORMAT
 
 
 def load_cone_preprocessing(file_path):
     """Load a sinogram and geometry parameters saved by :func:`save_cone_preprocessing`.
 
+    Two values of the file's ``'format'`` attribute are accepted:
+    ``'mbirtorch_preprocessing_v1'`` (written by the current
+    :func:`save_cone_preprocessing`) and ``'mbirjax_preprocessing_v1'`` (the name the same format
+    was written under before the package was renamed).  Any other value raises a ValueError.  A
+    file with no ``'format'`` attribute is loaded without complaint, so the oldest files and files
+    from other tools still work.
+
     Args:
         file_path (str): Path to the HDF5 file written by :func:`save_cone_preprocessing`.
+
+    Raises:
+        ValueError: If the file has a ``'format'`` attribute that is neither accepted value.
 
     Returns:
         tuple: ``(sinogram, cone_beam_params, optional_params, weights)``.
@@ -1622,6 +1643,16 @@ def load_cone_preprocessing(file_path):
     import json
     params = {'cone_beam_params': {}, 'optional_params': {}}
     with h5py.File(file_path, 'r') as f:
+        # A missing 'format' attribute is allowed; a present one must name a layout we can read.
+        file_format = f.attrs.get('format')
+        if file_format is not None:
+            if isinstance(file_format, bytes):
+                file_format = file_format.decode('utf-8', errors='replace')
+            if file_format not in _ACCEPTED_CONE_PREPROCESSING_FORMATS:
+                raise ValueError(
+                    "{} has format '{}', which cannot be read.  Accepted formats are {}.".format(
+                        file_path, file_format,
+                        ' and '.join("'{}'".format(name) for name in _ACCEPTED_CONE_PREPROCESSING_FORMATS)))
         sinogram = f['sinogram'][()]
         weights = f['weights'][()] if 'weights' in f else None
         scalar_params = json.loads(f.attrs['params'])

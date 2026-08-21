@@ -173,7 +173,7 @@ class Shards:
     array.  It is
     a plain container -- no arithmetic; the drivers and the VCD loop operate on
     the per-device tensors directly.  ``gather()`` is the host exit
-    (:math:`\\to` numpy, concatenated on the sharded axis).
+    (:math:`\\to` numpy, the shards laid end to end on the sharded axis).
     """
 
     def __init__(self, tensors, placement):
@@ -201,9 +201,79 @@ class Shards:
         return self.tensors[0].dtype
 
     def gather(self):
-        """Concatenate the shards on the host along the sharded axis."""
-        parts = [t.detach().cpu().numpy() for t in self.tensors]
-        return np.concatenate(parts, axis=self.placement.axis % parts[0].ndim)
+        """Return the whole array on the host, as one numpy array.
+
+        The shards are laid end to end along the sharded axis in device order,
+        which is global order, so the result is the array the shards stand
+        for.  It is a fresh, C-contiguous host array of the shards' own dtype;
+        nothing in it aliases a shard.
+
+        The host array is allocated ONCE, at full size, and each shard is
+        copied straight into its own slice of it.  The obvious alternative --
+        bring every shard over as its own host array and concatenate them --
+        holds the whole volume twice on the host at the peak, once as the
+        separate pieces and once as the joined result.  It is also slow in the
+        layout that matters most: a recon shards on its LAST axis, and joining
+        on the last axis means neither the reading nor the writing runs along
+        contiguous memory.  Copying each shard into place avoids the second
+        full-size array and lets each shard move as one large piece.
+
+        Returns:
+            numpy.ndarray: the assembled array on the host.
+        """
+        first = self.tensors[0]
+        # The sharded axis may be given as a negative number, so resolve it
+        # against the rank before it is used as an index into the shape.
+        axis = self.placement.axis % first.ndim
+        # The whole array has one shard's shape with the sharded axis grown to
+        # the total the shards cover between them.  Shards may differ in
+        # length on that axis, and a device that owns nothing contributes a
+        # length of zero.
+        lengths = [int(t.shape[axis]) for t in self.tensors]
+        shape = [int(n) for n in first.shape]
+        shape[axis] = sum(lengths)
+        axis_len = self.placement.axis_len
+        if axis_len is not None and axis_len != shape[axis]:
+            raise ValueError(
+                f'The shards cover {shape[axis]} entries of axis {axis}, but '
+                f'their placement says that axis is {axis_len} long.')
+        # The destination is made as a host TENSOR so that each shard can be
+        # copied into it with torch's own copy, which is the fast one.  Its
+        # numpy view at the end shares this same memory -- no copy, and no
+        # translating torch dtypes into numpy dtypes by hand.
+        out = torch.empty(shape, dtype=first.dtype, device='cpu')
+        start = 0
+        for tensor, length in zip(self.tensors, lengths):
+            # `block` is a VIEW of the finished array, covering just the part
+            # this shard owns, so copying into it writes the shard's values
+            # straight to their final position with nothing staged in between.
+            block = out.narrow(axis, start, length)
+            start += length
+            if tuple(tensor.shape) != tuple(block.shape):
+                # Shards that disagree on their other axes do not describe one
+                # array.  Say so, rather than letting the copy below quietly
+                # stretch a too-small shard to fill the block.
+                raise ValueError(
+                    f'A shard of shape {tuple(tensor.shape)} does not fill the '
+                    f'{tuple(block.shape)} block of the whole array it covers.')
+            if length == 0:
+                continue                # this device holds nothing to copy
+            source = tensor.detach()
+            try:
+                block.copy_(source)
+            except RuntimeError:
+                # A block that is not at the very start of the array begins at
+                # some byte offset into it, and not every backend will write to
+                # an arbitrary offset: Metal copies only at 4-byte boundaries,
+                # which a 1- or 2-byte dtype can easily fall between.  Bring
+                # that shard to the host on its own and copy it into place
+                # here, where there is no such restriction.  This costs one
+                # shard-sized temporary and is taken only for shards that need
+                # it; the ordinary 4-byte-and-wider cases never reach it.
+                block.copy_(source.cpu())
+        # Shares memory with `out` rather than copying it, and `out` is
+        # contiguous, so this is a C-contiguous host array as promised.
+        return out.numpy()
 
 
 # ── safe transfer ─────────────────────────────────────────────────────────────

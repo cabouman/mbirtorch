@@ -113,6 +113,74 @@ def test_the_split_is_balanced_and_the_gather_keeps_every_element():
         assert np.array_equal(sh.gather(), full), (size, count)
 
 
+def test_the_gather_rebuilds_the_array_exactly_on_either_axis():
+    """A gather only moves bytes, so what comes back has to be the original
+    array element for element rather than merely close to it.
+
+    Nothing here computes a value, so allowing a tolerance would hide the one
+    way this can really go wrong -- a shard copied into the wrong place -- so
+    the comparison is exact.  The cases cover both axes a sharded array is cut
+    on (a recon's last axis, a sinogram's view axis), splits that divide
+    evenly and splits that do not, one, two and three devices, and several
+    dtypes, since the copy works in bytes and dtypes of different widths move
+    different amounts of them.
+    """
+    # (6, 4, 6) divides evenly by 2 and by 3 on both of the axes below, so
+    # every shard is the same length; (7, 4, 5) divides evenly by neither, so
+    # the shards differ in length and each one lands at a different offset.
+    for shape in [(6, 4, 6), (7, 4, 5)]:
+        for axis in [0, -1]:
+            for count in [1, 2, 3]:
+                for dtype in [torch.float32, torch.float64, torch.int64,
+                              torch.uint8]:
+                    case = (shape, axis, count, dtype)
+                    full = torch.arange(shape[0] * shape[1] * shape[2]).reshape(
+                        shape).to(dtype)
+                    ref = full.numpy()
+                    p = Placement(["cpu"] * count, axis=axis,
+                                  axis_len=shape[axis])
+                    index = [slice(None)] * 3
+                    parts = []
+                    for _dev, (start, end) in p.shard_ranges():
+                        index[axis] = slice(start, end)
+                        parts.append(full[tuple(index)].contiguous())
+                    untouched = [t.clone() for t in parts]
+
+                    gathered = Shards(parts, p).gather()
+                    assert gathered.shape == shape, case
+                    assert gathered.dtype == ref.dtype, case
+                    assert np.array_equal(gathered, ref), case
+                    # Callers may index the result any way they like, and the
+                    # concatenate this replaced always handed back a
+                    # C-contiguous array, so this one must as well.
+                    assert gathered.flags["C_CONTIGUOUS"], case
+
+                    # It must also be an array of its own: writing to it may
+                    # not reach back into the shards it was built from.
+                    gathered[:] = 0
+                    assert all(torch.equal(t, u)
+                               for t, u in zip(parts, untouched)), case
+
+
+def test_the_gather_refuses_shards_that_do_not_describe_one_array():
+    """Two cheap checks the gather makes before it copies anything.
+
+    Each catches a container that was built wrong.  Without them the result
+    would be a quietly mis-shaped or wrongly filled host array instead of an
+    error, because the gather sizes the whole array itself and then fills it.
+    """
+    # The shards cover six entries of the axis; the placement says nine.
+    p = Placement(["cpu", "cpu"], axis=0, axis_len=9)
+    with pytest.raises(ValueError, match="says that axis is 9 long"):
+        Shards([torch.zeros(3, 2), torch.zeros(3, 2)], p).gather()
+
+    # The shards agree on the sharded axis but disagree on the other one, so
+    # there is no single array they are the pieces of.
+    q = Placement(["cpu", "cpu"], axis=0, axis_len=5)
+    with pytest.raises(ValueError, match="does not fill"):
+        Shards([torch.zeros(3, 4), torch.zeros(2, 1)], q).gather()
+
+
 def test_band_reduce_values():
     # The back projection's reduce reproduces a single-device sum on the
     # virtual 2-CPU placement (transfers are no-ops; the pattern is real).

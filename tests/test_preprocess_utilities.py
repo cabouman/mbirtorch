@@ -15,6 +15,7 @@ Comparisons run on CPU (the deterministic-per-process backend).
 
 import os
 
+import h5py
 import numpy as np
 import pytest
 import torch
@@ -250,7 +251,8 @@ def test_small_helpers(golden):
 
 @pytest.mark.skipif(not os.path.exists(_h5_path), reason="no mbirjax-written cone save golden")
 def test_load_mbirjax_cone_save(golden):
-    # Golden read of an mbirjax-written file: pins the on-disk format as shared.
+    # Golden read of an mbirjax-written file: the two packages share the on-disk layout, and that
+    # file carries the older format tag, which the loader still accepts.
     sino, cone_params, opt_params, weights = mtp.load_cone_preprocessing(_h5_path)
     assert np.allclose(sino, golden["sino_trans"], rtol=1e-6, atol=1e-7)
     assert cone_params['sinogram_shape'] == tuple(golden["sino_trans"].shape)
@@ -258,15 +260,57 @@ def test_load_mbirjax_cone_save(golden):
     assert weights is not None and weights.shape == golden["sino_trans"].shape
 
 
-def test_save_load_round_trip(tmp_path, golden):
-    path = os.path.join(str(tmp_path), 'pp.h5')
+def _write_cone_save(tmp_path, golden, name='pp.h5'):
+    """Write a small cone-preprocessing file; return its path and the angles it was given."""
+    path = os.path.join(str(tmp_path), name)
     angles = np.linspace(0, np.pi, golden["sino_trans"].shape[0]).astype(np.float32)
     mtp.save_cone_preprocessing(path, golden["sino_trans"],
                                 {'sinogram_shape': tuple(golden["sino_trans"].shape),
                                  'angles': angles},
                                 {'sharpness': 1.0})
+    return path, angles
+
+
+def test_save_load_round_trip(tmp_path, golden):
+    path, angles = _write_cone_save(tmp_path, golden)
+    with h5py.File(path, 'r') as f:
+        assert f.attrs['format'] == 'mbirtorch_preprocessing_v1'
     sino, cone_params, opt_params, weights = mtp.load_cone_preprocessing(path)
     assert np.array_equal(sino, golden["sino_trans"])
     assert cone_params['sinogram_shape'] == tuple(golden["sino_trans"].shape)
     assert np.allclose(cone_params['angles'], angles)
     assert opt_params == {'sharpness': 1.0} and weights is None
+
+
+def test_load_accepts_older_format_tag(tmp_path, golden):
+    # Files written before the package was renamed carry the mbirjax tag and must keep loading.
+    path, _ = _write_cone_save(tmp_path, golden)
+    with h5py.File(path, 'r+') as f:
+        f.attrs['format'] = 'mbirjax_preprocessing_v1'
+    sino, cone_params, opt_params, weights = mtp.load_cone_preprocessing(path)
+    assert np.array_equal(sino, golden["sino_trans"])
+    assert cone_params['sinogram_shape'] == tuple(golden["sino_trans"].shape)
+    assert opt_params == {'sharpness': 1.0} and weights is None
+
+
+def test_load_accepts_missing_format_tag(tmp_path, golden):
+    # The oldest files and files from other tools have no format attribute at all.
+    path, _ = _write_cone_save(tmp_path, golden)
+    with h5py.File(path, 'r+') as f:
+        del f.attrs['format']
+    sino, cone_params, opt_params, weights = mtp.load_cone_preprocessing(path)
+    assert np.array_equal(sino, golden["sino_trans"])
+    assert cone_params['sinogram_shape'] == tuple(golden["sino_trans"].shape)
+    assert opt_params == {'sharpness': 1.0} and weights is None
+
+
+def test_load_rejects_unknown_format_tag(tmp_path, golden):
+    path, _ = _write_cone_save(tmp_path, golden)
+    with h5py.File(path, 'r+') as f:
+        f.attrs['format'] = 'some_other_preprocessing_v9'
+    with pytest.raises(ValueError) as excinfo:
+        mtp.load_cone_preprocessing(path)
+    message = str(excinfo.value)
+    # The error has to name the tag found and both tags that would have worked.
+    assert 'some_other_preprocessing_v9' in message
+    assert 'mbirtorch_preprocessing_v1' in message and 'mbirjax_preprocessing_v1' in message

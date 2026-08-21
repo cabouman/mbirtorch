@@ -15,7 +15,6 @@ iteration, so do not reorder the arithmetic.
 import contextlib
 import datetime
 import io
-import logging
 import math
 import os
 import warnings
@@ -121,6 +120,10 @@ class TomographyModel(ParameterHandler):
 
     def __init__(self, sinogram_shape, view_batch_size=None,
                  compile_mode='auto', **kwargs):
+        # super().__init__ gives this model a logger of its own, with a console
+        # handler for the messages that happen before a run starts.  The runs
+        # log to that same logger, so everything this model says goes to one
+        # place and one setup governs it.
         super().__init__()
         # Device state resolves lazily on first use, so inspecting a model or
         # calling configure_devices first never touches an unchosen device.
@@ -176,12 +179,6 @@ class TomographyModel(ParameterHandler):
         # The per-device thread pool is owned by vcd_recon and is None
         # outside a recon.
         self._per_device_pool = None
-        self.logger = logging.getLogger('mbirtorch')
-        if not self.logger.handlers:
-            handler = logging.StreamHandler()
-            handler.setFormatter(logging.Formatter('%(message)s'))
-            self.logger.addHandler(handler)
-            self.logger.setLevel(logging.INFO)
 
         # Insert the geometry's own parameters (e.g. angles, view_params_name)
         # as new Param entries, then record the sinogram shape.
@@ -542,6 +539,10 @@ class TomographyModel(ParameterHandler):
                                     title=f'Iteration {i + 1}: Comparison of Plastic and Metal Masks')
         finally:
             if log_path:
+                # Each pass closes its own log file when it finishes, but a
+                # pass that failed partway may have left one open, and the
+                # merge below deletes the files it merges.
+                self.close_log_file()
                 labels = ['recon_plastic_metal: BH pass {}'.format(i + 1) for i in range(num_BH_iterations)]
                 merge_log_files(log_path, zip(labels, pass_log_paths))
 
@@ -1483,9 +1484,12 @@ class TomographyModel(ParameterHandler):
         Calling this is OPTIONAL: every reconstruction method applies the
         same placement automatically to a plain input.  Use this function to
         transfer just once when running several reconstructions on
-        the same large sinogram.  If the device configuration changes
-        afterwards, the prepared array no longer matches, and the
-        reconstruction methods raise an error; re-run this method to fix it.
+        the same large sinogram.  What it returns goes straight into
+        :meth:`recon`, :meth:`prox_map` and :meth:`vcd_recon` in place of the
+        sinogram (and the weights), so those calls do no transfer of their own.
+        If the device configuration changes afterwards, the prepared array no
+        longer matches, and the reconstruction methods raise an error; re-run
+        this method to fix it.
 
         On a model whose device layout is still automatic, this call also
         decides the layout, and every later reconstruction on the model
@@ -1712,6 +1716,41 @@ class TomographyModel(ParameterHandler):
         return self._shard_recon(_sharding.Shards(
             [t.reshape(num_pixels, t.shape[-1]) for t in tensors],
             prox_input.placement))
+
+    def _check_sinogram_shards(self, sinogram, sinogram_shape):
+        """Check that a sinogram ALREADY in the device form describes the
+        model's whole sinogram.
+
+        This is the sinogram counterpart of :meth:`_flatten_prox_shards`'s
+        whole-volume check, for a sinogram that came from
+        :meth:`prepare_sino_for_devices` and can therefore be handed straight
+        to a reconstruction.  The container has no shape of its own, so the
+        per-shard tensors are checked instead: the view axis is the sharded
+        one, so each shard holds a block of views together with every detector
+        row and channel, and the blocks' view counts add up to the sinogram's.
+        A shard that owns no views is legal and contributes zero to the total.
+
+        Only the shapes are checked here.  Which devices the shards are on is
+        checked in :meth:`_shard_sinogram`, where every sinogram-like array
+        enters, so it is not repeated.
+        """
+        views, rows, channels = (int(sinogram_shape[0]), int(sinogram_shape[1]),
+                                 int(sinogram_shape[2]))
+        tensors = sinogram.tensors
+        total_views = 0
+        detector_matches = True
+        for tensor in tensors:
+            if tensor.ndim != 3 or tuple(tensor.shape[1:]) != (rows, channels):
+                detector_matches = False
+                break
+            total_views += int(tensor.shape[0])
+        if not detector_matches or total_views != views:
+            raise ValueError(
+                'sinogram does not have the shape in sinogram_shape. \n'
+                f'Expected shards covering {(views, rows, channels)}: each '
+                f'shard (local_views, {rows}, {channels}), with the local view '
+                f'counts summing to {views}.  Got shapes '
+                f'{[tuple(t.shape) for t in tensors]}.')
 
     def _flatten_hessian(self, fm_hessian):
         """The Hessian diagonal in the VCD loop's flat layout, for either
@@ -2028,7 +2067,48 @@ class TomographyModel(ParameterHandler):
         views (axis 0) as a host numpy array.  The statistical sinogram
         estimates run on such a subsample.  The stride depends only on the
         view count, so a second call with the same arguments subsamples a
-        companion array (e.g. weights) the same way."""
+        companion array (e.g. weights) the same way.
+
+        A sinogram already divided across devices (a ``Shards``) is subsampled
+        without assembling it: each shard's strided block is taken on the
+        device that holds it, and only those views cross to the host.
+
+        For sharded input the result is EXACT -- the same views in the same
+        order as striding the assembled sinogram -- because this is data
+        movement rather than an approximation.  Shard k owns global views
+        ``[start_k, end_k)``, so the sampled global positions
+        ``0, step, 2 * step, ...`` that land in that block are the local
+        positions ``j`` with ``(start_k + j) % step == 0`` -- they begin at
+        local offset ``(-start_k) % step`` and continue by ``step``.  Taking
+        each shard's block from that offset and concatenating on the view axis
+        reproduces the strided sinogram view for view.  A shard that owns no
+        views, or one in which no sampled position lands, contributes an empty
+        block, which changes nothing.
+        """
+        if isinstance(array, _sharding.Shards):
+            placement = array.placement
+            # The sharded axis may be written as a negative number, so resolve
+            # it against the rank before comparing it with the view axis.
+            if placement.axis % array.tensors[0].ndim != 0:
+                raise ValueError(
+                    'A sinogram must be sharded on its first (view) axis; got '
+                    f'a placement on axis {placement.axis}.')
+            num_views = sum(int(t.shape[0]) for t in array.tensors)
+            axis_len = placement.axis_len
+            if axis_len is not None and int(axis_len) != num_views:
+                raise ValueError(
+                    f'The shards cover {num_views} views, but their placement '
+                    f'says the view axis is {int(axis_len)} long.')
+            max_views_to_use = min(max_views_to_use, num_views)
+            step_size = max(num_views // max_views_to_use, 1)
+            blocks = []
+            for tensor, (_dev, (start, _end)) in zip(
+                    array.tensors, placement.shard_ranges(num_views)):
+                block = tensor[(-start) % step_size::step_size]
+                # Made dense on the shard's own device so that the copy
+                # crossing to the host carries only the sampled views.
+                blocks.append(block.detach().contiguous().cpu().numpy())
+            return np.concatenate(blocks, axis=0)
         num_views = array.shape[0]
         max_views_to_use = min(max_views_to_use, num_views)
         step_size = max(num_views // max_views_to_use, 1)
@@ -2519,16 +2599,20 @@ class TomographyModel(ParameterHandler):
         partition sequence.
 
         Args:
-            sinogram (numpy or tensor): 3D sinogram data with shape
-                (num_views, num_det_rows, num_det_channels).
+            sinogram (numpy or tensor or Shards): 3D sinogram data with shape
+                (num_views, num_det_rows, num_det_channels).  The device form
+                as returned by :meth:`prepare_sino_for_devices` is accepted
+                too, so repeated reconstructions of one large sinogram pay the
+                host-to-device transfer once.
             partitions (list): K partitions, each an (N_subsets, N_indices)
                 integer index tensor of voxels to update.
             partition_sequence (ndarray): which partition to use at each
                 iteration.
             stop_threshold_change_pct (float): stop when the NMAE percent
                 change between iterations falls below this value.
-            weights (numpy or tensor, optional): 3D positive weights with the
-                same shape as the sinogram.  Defaults to all 1s.
+            weights (numpy or tensor or Shards, optional): 3D positive weights
+                with the same shape as the sinogram, in a plain array or in the
+                device form.  Defaults to all 1s.
             init_recon (array or int or None): initial reconstruction.  None
                 uses direct_recon; an int gives a constant volume.
             prox_input (array or Shards, optional): input to a proximal map,
@@ -2564,7 +2648,12 @@ class TomographyModel(ParameterHandler):
         dev = self.torch_device
         recon_shape = self.get_params('recon_shape')
         sinogram_shape = self.get_params('sinogram_shape')
-        if tuple(sinogram.shape) != tuple(sinogram_shape):
+        if isinstance(sinogram, _sharding.Shards):
+            # Already in the device form -- what prepare_sino_for_devices
+            # returns.  The container has no shape of its own, so the
+            # per-shard tensors are checked instead.
+            self._check_sinogram_shards(sinogram, sinogram_shape)
+        elif tuple(sinogram.shape) != tuple(sinogram_shape):
             raise ValueError('sinogram does not have the shape in sinogram_shape. \n'
                              f'Expected {tuple(sinogram_shape)}, got '
                              f'{tuple(sinogram.shape)}.')
@@ -2838,24 +2927,54 @@ class TomographyModel(ParameterHandler):
             partition_sequence, max_iterations=max_iterations)
         partition_sequence = partition_sequence[first_iteration:]
 
-        sinogram_np = np.asarray(sinogram) if not torch.is_tensor(sinogram) \
-            else sinogram.cpu().numpy()
-        if np.iscomplexobj(sinogram_np):
-            raise TypeError("sinogram must be real-valued; got complex dtype.")
-        if not np.isfinite(sinogram_np).all():
-            raise ValueError("sinogram contains NaN and/or Inf values.")
+        # The input checks run where the data already is.  A host array or a
+        # single tensor is checked as a whole, as before.  A sinogram already
+        # divided across devices is checked one shard at a time, on the device
+        # that holds it, so a prepared sinogram is never pulled back to the
+        # host just to be validated.
+        if isinstance(sinogram, _sharding.Shards):
+            for tensor in sinogram.tensors:
+                if tensor.is_complex():
+                    raise TypeError(
+                        "sinogram must be real-valued; got complex dtype.")
+                if not bool(torch.isfinite(tensor).all()):
+                    raise ValueError("sinogram contains NaN and/or Inf values.")
+            # Passed on as it is: the statistics below reduce it to a small
+            # view subsample before anything reaches the host.
+            sinogram_for_stats = sinogram
+        else:
+            sinogram_np = np.asarray(sinogram) if not torch.is_tensor(sinogram) \
+                else sinogram.cpu().numpy()
+            if np.iscomplexobj(sinogram_np):
+                raise TypeError("sinogram must be real-valued; got complex dtype.")
+            if not np.isfinite(sinogram_np).all():
+                raise ValueError("sinogram contains NaN and/or Inf values.")
+            sinogram_for_stats = sinogram_np
         if weights is not None:
-            weights_np = np.asarray(weights) if not torch.is_tensor(weights) \
-                else weights.cpu().numpy()
-            if not np.isfinite(weights_np).all():
-                raise ValueError("weights contains NaN and/or Inf values.")
-            if (weights_np < 0).any():
-                raise ValueError("weights contain negative values.")
-            if (weights_np == 0).all():
-                raise ValueError("all weights are zero.")
+            if isinstance(weights, _sharding.Shards):
+                # "All zero" is a statement about the whole array, so it holds
+                # only when every shard is entirely zero.
+                all_zero = True
+                for tensor in weights.tensors:
+                    if not bool(torch.isfinite(tensor).all()):
+                        raise ValueError("weights contains NaN and/or Inf values.")
+                    if bool((tensor < 0).any()):
+                        raise ValueError("weights contain negative values.")
+                    all_zero = all_zero and bool((tensor == 0).all())
+                if all_zero:
+                    raise ValueError("all weights are zero.")
+            else:
+                weights_np = np.asarray(weights) if not torch.is_tensor(weights) \
+                    else weights.cpu().numpy()
+                if not np.isfinite(weights_np).all():
+                    raise ValueError("weights contains NaN and/or Inf values.")
+                if (weights_np < 0).any():
+                    raise ValueError("weights contain negative values.")
+                if (weights_np == 0).all():
+                    raise ValueError("all weights are zero.")
 
-        regularization_params = self.auto_set_regularization_params(sinogram_np,
-                                                                    weights=weights)
+        regularization_params = self.auto_set_regularization_params(
+            sinogram_for_stats, weights=weights)
         return (sinogram, weights, init_recon, partitions, partition_sequence,
                 granularity, regularization_params)
 
@@ -2891,10 +3010,14 @@ class TomographyModel(ParameterHandler):
         device count, and that difference decays as iterations proceed.
 
         Args:
-            sinogram (numpy or tensor): 3D sinogram data with shape
-                (num_views, num_det_rows, num_det_channels).
-            weights (numpy or tensor, optional): 3D positive weights with the
-                same shape as the sinogram.  Defaults to None (all 1s).
+            sinogram (numpy or tensor or Shards): 3D sinogram data with shape
+                (num_views, num_det_rows, num_det_channels).  The device form
+                as returned by :meth:`prepare_sino_for_devices` is accepted
+                too, so repeated reconstructions of one large sinogram pay the
+                host-to-device transfer once.
+            weights (numpy or tensor or Shards, optional): 3D positive weights
+                with the same shape as the sinogram, in a plain array or in the
+                device form.  Defaults to None (all 1s).
             init_recon (array, int, or None, optional): initial reconstruction.
                 If None, direct_recon is called with default arguments.
             max_iterations (int, optional): maximum number of VCD iterations.
@@ -2949,6 +3072,11 @@ class TomographyModel(ParameterHandler):
                 os.path.abspath(os.path.expanduser(logfile_path))))
         for h in list(self.logger.handlers):  # Make sure the log files are up to date
             h.flush()
+        # This call has written its last line, so finish the file rather than
+        # holding it open: the caller may want to read, move, or delete it, and
+        # a run made of parts merges and deletes each part's log.  A call that
+        # continues this run reopens it.
+        self.close_log_file()
 
         notes = 'Reconstruction completed: {}\n\n'.format(datetime.datetime.now())
         recon_dict = self.get_recon_dict(recon_params, notes=notes)
@@ -3021,13 +3149,18 @@ class TomographyModel(ParameterHandler):
                 too, so a Plug-and-Play loop can feed back what a denoiser
                 returned with ``output_sharded=True``, provided the two models
                 share a device layout (see :meth:`configure_devices`).
-            sinogram (numpy or tensor): 3D sinogram data with shape
-                (num_views, num_det_rows, num_det_channels).
+            sinogram (numpy or tensor or Shards): 3D sinogram data with shape
+                (num_views, num_det_rows, num_det_channels).  The device form
+                as returned by :meth:`prepare_sino_for_devices` is accepted
+                too, so a Plug-and-Play loop that prepares its sinogram once
+                pays the host-to-device transfer once rather than on every
+                call.
             sigma_prox (None or float, optional): standard deviation of the
                 proximal map prior term.  If None, set automatically from the
                 sinogram.  Defaults to None.
-            weights (numpy or tensor, optional): 3D positive weights with the
-                same shape as the sinogram.  Defaults to None (all 1s).
+            weights (numpy or tensor or Shards, optional): 3D positive weights
+                with the same shape as the sinogram, in a plain array or in the
+                device form.  Defaults to None (all 1s).
             init_recon (numpy or tensor, optional): reconstruction used for
                 initialization.  Defaults to None (determined by vcd_recon).
             do_initialization (bool, optional): If True, initialize parameters
@@ -3067,6 +3200,11 @@ class TomographyModel(ParameterHandler):
         else:
             (partitions, partition_sequence, granularity,
              regularization_params) = self.prox_data
+            # This pass skips the initialization, and with it the run header
+            # that reopens the log file the previous pass closed, so reopen it
+            # here.  Without this the loop's later passes would be missing
+            # from the file.
+            self._reopen_log_file()
 
         # Override the auto sigma_prox if requested, restoring it afterward.
         self_sigma_prox = self.get_params('sigma_prox')
@@ -3100,6 +3238,8 @@ class TomographyModel(ParameterHandler):
                 os.path.abspath(os.path.expanduser(logfile_path))))
         for h in list(self.logger.handlers):  # Make sure the log files are up to date
             h.flush()
+        # As in recon: the file is finished here and reopened by the next pass.
+        self.close_log_file()
 
         notes = 'Proximal map completed: {}\n\n'.format(datetime.datetime.now())
         recon_dict = self.get_recon_dict(recon_params, notes=notes)

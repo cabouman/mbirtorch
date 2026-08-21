@@ -2021,3 +2021,229 @@ def test_like_refuses_a_transverse_shape_mismatch():
         denoiser.configure_devices(like=ct_model)
     message = str(excinfo.value)
     assert str(wider) in message and str(recon_shape) in message
+
+
+# ── the prepared sinogram, straight into a reconstruction ────────────────────
+# prepare_sino_for_devices divides a sinogram across the devices once, and the
+# reconstruction entries take that divided form as it stands.  A Plug-and-Play
+# loop can therefore prepare its sinogram once and pay the host-to-device
+# transfer once, rather than on every prox_map call.  The tests below drive
+# that on two virtual CPU devices, against the same runs on host arrays, at the
+# small cell and phantom the section above already builds.
+
+
+def model_on_devices(sino_shape, num_devices):
+    """A parallel-beam model whose sinogram is divided across ``num_devices``
+    virtual CPU devices."""
+    angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
+    model = mbirtorch.ParallelBeamModel(sino_shape, angles)
+    model.configure_devices(devices=['cpu'] * num_devices)
+    model.set_params(no_warning=True, verbose=0)
+    return model
+
+
+def view_shards(model, sinogram):
+    """A sinogram in the divided device form, one tensor per device.
+
+    This is what prepare_sino_for_devices returns, built here directly so that
+    a single-device placement gives shards too: that call hands back a plain
+    tensor when there is only one device, and the subsample arithmetic below
+    is about the divided form at every device count.
+    """
+    return _sharding.Shards(
+        [torch.as_tensor(sinogram[start:end]) for _d, (start, end)
+         in model.sino_placement.shard_ranges()], model.sino_placement)
+
+
+def max_relative_difference(out, ref):
+    """The comparison the value tests in this file use: the largest pointwise
+    difference as a fraction of the reference's largest magnitude."""
+    return float(np.max(np.abs(out - ref)) / np.max(np.abs(ref)))
+
+
+def run_recon(model, sinogram, weights=None, max_iterations=2):
+    """One short reconstruction, seeded so that two runs draw the same pixel
+    partitions and differ only in the form their sinogram arrived in."""
+    np.random.seed(0)
+    recon, _ = model.recon(sinogram, weights=weights,
+                           max_iterations=max_iterations,
+                           stop_threshold_change_pct=0.0,
+                           logfile_path=None, print_logs=False)
+    return recon
+
+
+@pytest.mark.parametrize('num_devices', [1, 2, 3])
+@pytest.mark.parametrize('num_views', [12, 13, 40, 41, 63])
+def test_a_divided_sinogram_subsamples_exactly_like_a_whole_one(num_views,
+                                                                num_devices):
+    """The statistics that set the regularization parameters run on an
+    evenly-spaced subsample of the views, and taking that subsample from the
+    divided form is data movement rather than an approximation.  It therefore
+    has to give the very same views in the very same order as subsampling the
+    assembled sinogram.
+
+    The parameters cover both things the arithmetic depends on.  12 and 13
+    views are subsampled view by view (stride 1), 40 and 41 stride by 2, and
+    63 strides by 3; and against 2 and 3 devices some of those counts divide
+    evenly while others leave the first devices one view longer, so every
+    stride is exercised with the views split both ways.
+    """
+    model = model_on_devices((num_views, 4, 6), num_devices)
+    whole = np.random.RandomState(num_views).rand(
+        num_views, 4, 6).astype(np.float32)
+    divided = model.subsample_views(view_shards(model, whole))
+    assert np.array_equal(divided, model.subsample_views(whole))
+
+
+def test_a_sinogram_divided_on_the_wrong_axis_is_refused():
+    """The subsample walks the VIEW axis, so shards cut on any other axis
+    would be read as views that they are not.  A recon-like placement, which
+    divides the last axis, is the way that would happen."""
+    model = model_on_devices(PAIR_CELL, 2)
+    volume = np.random.RandomState(1).rand(
+        *model.get_params('recon_shape')).astype(np.float32)
+    with pytest.raises(ValueError, match='first .view. axis'):
+        model.subsample_views(model._shard_recon(volume))
+
+
+def test_a_prepared_sinogram_reconstructs_like_a_host_one():
+    """The point of the whole seam: recon takes the divided form directly and
+    returns what the same call on the host array returns.
+
+    Not bit-for-bit -- the per-device sums this model runs on CPU vary a
+    little from run to run whatever their input was -- so the comparison is
+    the relative one the value tests in this file use.
+    """
+    model = model_on_devices(PAIR_CELL, 2)
+    phantom = pair_phantom(model)
+    sinogram = model.forward_project(phantom)
+    prepared = model.prepare_sino_for_devices(sinogram)
+    assert isinstance(prepared, _sharding.Shards)
+
+    from_host = run_recon(model, sinogram)
+    from_prepared = run_recon(model, prepared)
+    assert max_relative_difference(from_prepared, from_host) <= 1e-4
+
+
+def test_prepared_weights_reconstruct_like_host_weights():
+    """Weights are placed by the same call and travel the same path, so a
+    weighted reconstruction takes the prepared pair as readily as the host
+    pair."""
+    model = model_on_devices(PAIR_CELL, 2)
+    phantom = pair_phantom(model)
+    sinogram = model.forward_project(phantom)
+    weights = 0.5 + np.random.RandomState(5).rand(
+        *PAIR_CELL).astype(np.float32)
+
+    prepared, prepared_weights = model.prepare_sino_for_devices(
+        sinogram, weights=weights)
+    assert isinstance(prepared_weights, _sharding.Shards)
+
+    from_host = run_recon(model, sinogram, weights=weights)
+    from_prepared = run_recon(model, prepared, weights=prepared_weights)
+    assert max_relative_difference(from_prepared, from_host) <= 1e-4
+
+
+def test_a_prepared_sinogram_carries_a_plug_and_play_loop():
+    """The shape a Plug-and-Play loop actually has: prepare the sinogram once,
+    then call prox_map repeatedly, each pass feeding back the volume the last
+    one returned in the device form and skipping the initialization the first
+    pass did.  The whole loop stays on the devices and matches the same loop
+    run on host arrays."""
+    model = model_on_devices(PAIR_CELL, 2)
+    phantom = pair_phantom(model)
+    sinogram = model.forward_project(phantom)
+
+    def two_passes(sino):
+        np.random.seed(0)
+        first, _ = model.prox_map(0.5 * phantom, sino, sigma_prox=0.5,
+                                  init_recon=phantom, max_iterations=1,
+                                  stop_threshold_change_pct=0.0,
+                                  logfile_path=None, print_logs=False,
+                                  output_sharded=True)
+        np.random.seed(0)
+        second, _ = model.prox_map(first, sino, sigma_prox=0.5,
+                                   init_recon=phantom,
+                                   do_initialization=False, max_iterations=1,
+                                   stop_threshold_change_pct=0.0,
+                                   logfile_path=None, print_logs=False,
+                                   output_sharded=True)
+        return second
+
+    on_host = two_passes(sinogram)
+    on_devices = two_passes(model.prepare_sino_for_devices(sinogram))
+    assert isinstance(on_devices, _sharding.Shards)
+    assert max_relative_difference(on_devices.gather(),
+                                   on_host.gather()) <= 1e-4
+
+
+def test_a_prepared_sinogram_is_refused_after_the_layout_changes():
+    """A prepared sinogram belongs to the layout it was prepared on.  Once the
+    model is configured differently the reconstruction says so, naming both
+    placements, rather than reconstructing from a division that no longer
+    matches."""
+    model = model_on_devices(PAIR_CELL, 2)
+    sinogram = model.forward_project(pair_phantom(model))
+    prepared = model.prepare_sino_for_devices(sinogram)
+
+    model.configure_devices(devices=['cpu'])
+    with pytest.raises(ValueError,
+                       match='different device configuration') as excinfo:
+        run_recon(model, prepared, max_iterations=1)
+    message = str(excinfo.value)
+    assert repr(prepared.placement) in message
+    assert repr(model.sino_placement) in message
+
+
+def test_a_divided_sinogram_that_misses_the_detector_is_refused_clearly():
+    """The divided form has to describe the whole sinogram: every shard holds
+    a block of views with all the detector rows and channels, and the blocks'
+    view counts add up.
+
+    The container carries no shape of its own, so without this check a
+    mis-shaped set of shards would surface as a tensor error deep in the loop.
+    The message names what was expected and what arrived, in the same voice as
+    the one a mis-shaped host array gets.
+    """
+    model = model_on_devices(PAIR_CELL, 2)
+    sinogram = model.forward_project(pair_phantom(model))
+    prepared = model.prepare_sino_for_devices(sinogram)
+
+    def run(tensors):
+        shards = _sharding.Shards(tensors, prepared.placement)
+        return run_recon(model, shards, max_iterations=1)
+
+    # A detector channel short on every shard: caught at the reconstruction
+    # entry, which is where the whole sinogram's shape is checked.
+    short_detector = [t[:, :, :-1] for t in prepared.tensors]
+    with pytest.raises(ValueError,
+                       match='sinogram does not have the shape') as excinfo:
+        run(short_detector)
+    message = str(excinfo.value)
+    assert str(tuple(PAIR_CELL)) in message
+    assert str([tuple(t.shape) for t in short_detector]) in message
+    # Shards a view short no longer cover the views their placement says they
+    # do, and the view subsample says so before the reconstruction starts.
+    with pytest.raises(ValueError, match='shards cover'):
+        run([t[:-1] for t in prepared.tensors])
+
+
+def test_a_prepared_sinogram_is_checked_shard_by_shard():
+    """The input checks a host sinogram gets apply to the divided form too,
+    and they run on the shards where they are, so nothing has to come back to
+    the host to be validated."""
+    model = model_on_devices(PAIR_CELL, 2)
+    sinogram = model.forward_project(pair_phantom(model))
+    prepared = model.prepare_sino_for_devices(sinogram)
+
+    # A single bad value, in the second shard rather than the first.
+    with_nan = _sharding.Shards([t.clone() for t in prepared.tensors],
+                                prepared.placement)
+    with_nan.tensors[-1][0, 0, 0] = float('nan')
+    with pytest.raises(ValueError, match='NaN and/or Inf'):
+        run_recon(model, with_nan, max_iterations=1)
+
+    complex_shards = _sharding.Shards(
+        [t.to(torch.complex64) for t in prepared.tensors], prepared.placement)
+    with pytest.raises(TypeError, match='must be real-valued'):
+        run_recon(model, complex_shards, max_iterations=1)

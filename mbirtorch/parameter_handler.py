@@ -8,6 +8,7 @@ typing machinery.
 """
 
 import io
+import itertools
 import logging
 import os
 import warnings
@@ -18,6 +19,10 @@ import numpy as np
 from . import _utils
 from ._utils import Param
 
+# Counts the model instances created in this process, to give each one a
+# logger name of its own (see ParameterHandler.__init__).
+_instance_counter = itertools.count(1)
+
 
 class ParameterHandler:
     """Store and access model parameters.  ``TomographyModel`` inherits its
@@ -26,12 +31,31 @@ class ParameterHandler:
 
     def __init__(self):
         self.params = _utils.get_default_params()
-        self.logger = None
+        # Every instance gets a logger of its own, named for the class plus a
+        # count that is never reused.  Python's logging module hands out one
+        # shared logger per name, so a name shared by all instances of a class
+        # would mean that setting up the log for a second model tears down the
+        # handlers of a first model that is still running: its later lines
+        # would land in the second model's file and log buffer.  The count is
+        # used instead of id(self) because ids are recycled once an object is
+        # freed, so a new model could inherit a dead one's logger.
+        self.logger_name = 'mbirtorch.{}.{}'.format(type(self).__name__,
+                                                    next(_instance_counter))
+        # Messages logged before a run starts go to the console only; a run
+        # replaces these handlers in setup_logger.
+        self.logger = logging.getLogger(self.logger_name)
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(logging.Formatter('%(message)s'))
+        self.logger.addHandler(console_handler)
+        self.logger.setLevel(logging.INFO)
         self.log_buffer = None
+        # The log file of the run in progress, remembered so that a call
+        # continuing that run can reopen the file the previous call closed.
+        self._logfile_path = None
 
     def setup_logger(self, *, logfile_path: str = "~/.mbirtorch/logs/recon.log", print_logs: bool = True):
         """
-        Initialize self.logger and self.log_buffer.
+        Set up this instance's logger (self.logger) and self.log_buffer for a run.
         The logging level comes from the model's 'verbose' parameter (0 -> WARNING, 1 -> INFO, 2+ -> DEBUG).
 
         Args:
@@ -54,8 +78,10 @@ class ParameterHandler:
         else:
             level = logging.DEBUG
 
-        # Configure logger
-        logger = logging.getLogger(self.__class__.__name__)
+        # Configure logger.  This is the instance's own logger (see
+        # __init__), so setting it up here cannot disturb the log of another
+        # model that is still running.
+        logger = self.logger
         logger.setLevel(level)
         # The handlers attached below are the complete set of intended outputs:
         # the in-memory buffer, the console when print_logs is on, and the file
@@ -87,17 +113,66 @@ class ParameterHandler:
             console_handler.setFormatter(console_formatter)
             logger.addHandler(console_handler)
 
-        # File handler (optional)
+        # File handler (optional).  mode='w' starts a new log for a new run.
+        self._logfile_path = logfile_path if logfile_path else None
         if logfile_path:
-            from .utilities import makedirs
-            makedirs(logfile_path)
-            file_handler = logging.FileHandler(logfile_path, mode='w')
-            file_handler.setLevel(level)
-            file_formatter = logging.Formatter('%(message)s')
-            file_handler.setFormatter(file_formatter)
-            logger.addHandler(file_handler)
+            self._add_log_file_handler(logfile_path, mode='w', level=level)
 
-        self.logger = logger
+    def _add_log_file_handler(self, logfile_path, mode, level):
+        """Attach a handler that copies the log to ``logfile_path``.
+
+        ``delay=True`` leaves the file unopened until the first line is
+        actually written to it.  Without it, opening in mode 'w' would create
+        the file (and truncate an existing one) right here, so a run that logs
+        nothing -- at verbose=0 only warnings are logged at all -- would leave
+        an empty file behind.
+        """
+        from .utilities import makedirs
+        makedirs(logfile_path)
+        file_handler = logging.FileHandler(logfile_path, mode=mode, delay=True)
+        file_handler.setLevel(level)
+        file_handler.setFormatter(logging.Formatter('%(message)s'))
+        self.logger.addHandler(file_handler)
+
+    def close_log_file(self):
+        """Finish the log file: flush it, close it, and detach its handler.
+
+        Called when a run has written its last line.  An open file handler
+        keeps writing to whatever file it opened, even after that file has
+        been renamed or deleted, and on Windows it would block the delete
+        outright.  So the composite runs that merge and then delete the log of
+        each part (split_sino_recon, recon_plastic_metal) need each part's
+        file closed first.
+
+        The in-memory buffer handler is left alone, so the run's log text is
+        still available for recon_dict['recon_log'].  A later call continuing
+        the same run reopens the file in append mode; see ``_reopen_log_file``.
+        """
+        if self.logger is None:
+            return
+        for h in list(self.logger.handlers):
+            if isinstance(h, logging.FileHandler):
+                try:
+                    h.flush()
+                finally:
+                    h.close()
+                    self.logger.removeHandler(h)
+
+    def _reopen_log_file(self):
+        """Reattach the log file of a run that is being continued.
+
+        A run's last call closed the file (see ``close_log_file``), so a call
+        that continues that run -- a resumed recon, or a later pass of a
+        Plug-and-Play loop -- has to open it again.  Mode 'a' keeps what the
+        earlier calls wrote.  Nothing happens if the run never had a log file,
+        or if one is already attached.
+        """
+        if self.logger is None or not self._logfile_path:
+            return
+        if any(isinstance(h, logging.FileHandler) for h in self.logger.handlers):
+            return
+        self._add_log_file_handler(self._logfile_path, mode='a',
+                                   level=self.logger.level)
 
     def _log_run_header(self, first_iteration, logfile_path, print_logs):
         """Set up the run logger (on the first iteration, or whenever none has been set up) and log
@@ -115,6 +190,10 @@ class ParameterHandler:
         # ever creates the buffer.
         if first_iteration == 0 or self.log_buffer is None:
             self.setup_logger(logfile_path=logfile_path, print_logs=print_logs)
+        else:
+            # Continuing a run that is already set up: reopen the log file the
+            # previous call closed, so this call's lines join it.
+            self._reopen_log_file()
         from . import __version__
         self.logger.info('MBIRTorch Version = {}'.format(__version__))
 
