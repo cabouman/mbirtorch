@@ -21,6 +21,11 @@ cd ..
 /bin/rm -r build &> /dev/null
 cd dev_scripts
 
+# Remove the torch compile cache.  It is keyed to the torch files that are about to be
+# replaced, so a leftover cache makes the first compiled kernel fail to build.
+/bin/rm -rf "${TORCHINDUCTOR_CACHE_DIR:-$HOME/.mbirtorch/torch_cache}" &> /dev/null
+/bin/rm -rf "${TMPDIR:-/tmp}/torchinductor_$USER" "/tmp/torchinductor_$USER" &> /dev/null
+
 # Create and activate new conda environment
 # First check if the target environment is active and deactivate if so
 

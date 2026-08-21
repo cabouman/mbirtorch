@@ -6,6 +6,10 @@ done
 
 rm -rf ~/.conda/* ~/.cache/conda/* ~/.cache/pip/* ~/.local/lib/python*
 
+# The torch compile cache is keyed to the installed torch files, so it must go too.
+rm -rf "${TORCHINDUCTOR_CACHE_DIR:-$HOME/.mbirtorch/torch_cache}"
+rm -rf "${TMPDIR:-/tmp}/torchinductor_$USER" "/tmp/torchinductor_$USER"
+
 # Also remove pip entry-point shims in ~/.local/bin whose packages (~/.local/lib/python*) were
 # just deleted above; a leftover shim (e.g. pytest) shadows the conda env's copy with a stale
 # interpreter. Only python-shebang files are removed, keeping non-python tools (claude, micro).
