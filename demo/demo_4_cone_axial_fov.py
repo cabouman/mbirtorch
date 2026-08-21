@@ -79,4 +79,5 @@ mbirtorch.slice_viewer(
     phantom_fov, recon_default, padded_fov,
     data_dicts=[None, dict_default, dict_padded], vmin=0.0, slice_axis=1,
     title='Phantom (left), default recon with axial artifacts (center),\n'
-          'axially padded recon (right)')
+          'axially padded recon (right)', block=False)
+mbirtorch.slice_viewer(sinogram, title='Sinogram', slice_axis=0)

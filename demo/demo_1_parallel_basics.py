@@ -39,4 +39,5 @@ print(f'Normalized RMS error between reconstruction and phantom: {nrmse:.3f}')
 
 # View them side by side.  Use the sliders to change slice and intensity.
 mbirtorch.slice_viewer(phantom, recon, data_dicts=[None, recon_dict], vmin=0.0,
-                       title='Phantom (left) and MBIR reconstruction (right)')
+                       title='Phantom (left) and MBIR reconstruction (right)', block=False)
+mbirtorch.slice_viewer(sinogram, title='Sinogram', slice_axis=0)

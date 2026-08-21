@@ -26,5 +26,5 @@ def nrmse(image):
 print(f'Error of the noisy image:    {nrmse(noisy):.3f}')
 print(f'Error of the denoised image: {nrmse(denoised):.3f}')
 
-mbirtorch.slice_viewer(noisy, denoised, data_dicts=[None, denoise_dict], vmin=0.0,
+mbirtorch.slice_viewer(noisy, denoised, data_dicts=[None, denoise_dict], vmin=0.0, vmax=1.2,
                        title='Noisy image (left) and qGGMRF denoised image (right)')

@@ -64,4 +64,5 @@ print(f'Thick-slice reconstruction error vs its phantom: {nrmse:.3f}')
 
 mbirtorch.slice_viewer(phantom, recon, data_dicts=[None, recon_dict], vmin=0.0,
                        title='Thick-slice (voxel_slice_aspect = 2) phantom '
-                             'and reconstruction')
+                             'and reconstruction', block=False)
+mbirtorch.slice_viewer(sinogram, title='Sinogram', slice_axis=0)

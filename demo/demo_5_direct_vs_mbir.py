@@ -46,8 +46,9 @@ print(f'16 views:   FBP error {nrmse(fbp_sparse, phantom):.3f},  '
 # View the sparse-view case: phantom, FBP, MBIR.
 mbirtorch.slice_viewer(
     phantom, fbp_sparse, mbir_sparse,
-    data_dicts=[None, None, mbir_sparse_dict], vmin=0.0,
-    title='16 views: phantom (left), FBP with streaks (center), MBIR (right)')
+    data_dicts=[None, None, mbir_sparse_dict], vmin=0.0, vmax=1.2,
+    title='16 views: phantom (left), FBP with streaks (center), MBIR (right)', block=False)
+mbirtorch.slice_viewer(sinogram, title='Sinogram', slice_axis=0)
 
 # The practical rule: with many views and low noise, FBP is fast and good
 # enough, and MBIR uses it internally as a starting point.  With few views,
