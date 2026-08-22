@@ -264,9 +264,42 @@ class MultiAxisParallelModel(TomographyModel):
     _floor_family = 'multiaxis'
 
     def _view_batch_bodies(self):
-        # No hand-written kernels for multiaxis yet; the compiled torch bodies
-        # are the only bodies.
-        return _multiaxis_forward_view_batch, _multiaxis_back_view_batch
+        # The hand-written kernels are alternative BODIES: same signatures, so
+        # nothing downstream of this hook changes.  Each is available wherever
+        # BOTH availability gates pass -- the triton probe and the first-use
+        # value self-check on the actual device (the probe-the-hardware
+        # protocol; MBIRTORCH_DISABLE_TRITON=1 is the kill switch inside the
+        # probe) -- and the two directions are asked separately, so a machine
+        # may bind one kernel and keep the other direction's torch body.
+        #
+        # What the gates say here is that the kernels REPRODUCE the torch
+        # bodies on the device that will run them.  No composed performance
+        # measurement has been made for this geometry: the tile constants were
+        # adopted from the cone kernels rather than swept, and nothing has yet
+        # timed a multiaxis reconstruction with them bound.  The speed sweep
+        # and the composed gate the cone and parallel kernels passed are still
+        # owed here; the kill switch above is the handle until they run.
+        #
+        # The kernel module is imported INSIDE the method because it imports
+        # this one (for the two eager geometry builders and the torch bodies);
+        # a module-level import would close that cycle.
+        from .kernel_availability import (multiaxis_back_kernel_usable,
+                                          multiaxis_forward_kernel_usable)
+        if multiaxis_back_kernel_usable(self)[0]:
+            from .triton_multiaxis import _multiaxis_back_view_batch_triton
+            back_body = _multiaxis_back_view_batch_triton
+        else:
+            back_body = _multiaxis_back_view_batch
+        # Selection is layout-independent, as in the other geometries: the
+        # wrappers bracket every launch on the tensors' own device, so a
+        # sharded model binds exactly what a single device binds (the launch
+        # discipline that tests/test_kernels_sharded.py holds).
+        if multiaxis_forward_kernel_usable(self)[0]:
+            from .triton_multiaxis import _multiaxis_forward_view_batch_triton
+            fwd_body = _multiaxis_forward_view_batch_triton
+        else:
+            fwd_body = _multiaxis_forward_view_batch
+        return fwd_body, back_body
 
     def _view_batch_args(self):
         gp_names = ['delta_det_row', 'delta_det_channel', 'det_row_offset',

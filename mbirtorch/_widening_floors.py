@@ -314,15 +314,19 @@ _SHARED_COST_INPUTS = (
 #: What prices each family's floors, so staleness is detected PER FAMILY and
 #: a refresh can be scoped to the families whose costs actually moved.  On
 #: top of the shared set, each projection family adds its geometry body file,
-#: and the two kernel families add their kernel files -- ``triton_cone.py``
-#: appears in both because it hosts the shared kernel helpers that
-#: ``triton_parallel.py`` imports.  The denoiser runs no projector at all, so
-#: its set is its own two modules and none of the shared set.
+#: and the three kernel families add their kernel files -- ``triton_cone.py``
+#: appears in all three because it hosts the shared kernel helpers (the
+#: Triton language shims and the compiled-launch key set) that
+#: ``triton_parallel.py`` and ``triton_multiaxis.py`` import.  The denoiser
+#: runs no projector at all, so its set is its own two modules and none of
+#: the shared set.
 FAMILY_COST_INPUTS = {
     'parallel': _SHARED_COST_INPUTS + ('triton_parallel.py', 'triton_cone.py',
                                        'parallel_beam.py'),
     'cone': _SHARED_COST_INPUTS + ('triton_cone.py', 'cone_beam.py'),
-    'multiaxis': _SHARED_COST_INPUTS + ('multiaxis_parallel.py',),
+    'multiaxis': _SHARED_COST_INPUTS + ('triton_multiaxis.py',
+                                        'triton_cone.py',
+                                        'multiaxis_parallel.py'),
     'translation': _SHARED_COST_INPUTS + ('translation_model.py',),
     'denoiser': ('denoising.py', 'qggmrf.py'),
 }
@@ -351,6 +355,17 @@ COST_INPUT_METHODS = tuple(name.split('.', 1)[1] for name in _ALL_COST_INPUTS
 #: ``multiaxis_parallel.py`` and ``translation_model.py``.  No executable
 #: line moved in any of the three, so the mg48 measurements above still
 #: describe the code these hashes cover.
+#:
+#: NOT re-recorded on 2026-08-22, when MultiAxisParallelModel began
+#: selecting the Triton multiaxis kernels and ``triton_multiaxis.py``
+#: joined the multiaxis family's cost inputs.  Binding those kernels
+#: changes what a multiaxis projection costs, so the multiaxis rows above
+#: are owed a re-measure rather than a fresh hash; and six other inputs
+#: (``_sharding.py``, ``cone_beam.py``, ``denoising.py``,
+#: ``parallel_beam.py``, ``qggmrf.py``, ``translation_model.py``) had
+#: already moved in earlier commits with no re-measurement either.  The
+#: hashes therefore stay as they are, and :func:`stale_note` keeps naming
+#: all of it until a refresh clears it.
 BLESSED_COST_HASHES = {
     'TomographyModel._sparse_back_project_sharded':
         'f73fa28f32d2393fac3f06139d8ddeccc55260fceb28bbca7f102334839fb5a4',

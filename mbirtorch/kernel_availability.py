@@ -15,8 +15,9 @@ wanted to know whether it was there.
 
 The probe answers "can this node run a triton kernel at all".  The second gate
 is per KERNEL and per DEVICE: :func:`cone_back_kernel_usable`,
-:func:`cone_forward_kernel_usable`, :func:`parallel_back_kernel_usable` and
-:func:`parallel_forward_kernel_usable` each run one kernel-vs-torch-body
+:func:`cone_forward_kernel_usable`, :func:`parallel_back_kernel_usable`,
+:func:`parallel_forward_kernel_usable`, :func:`multiaxis_back_kernel_usable`
+and :func:`multiaxis_forward_kernel_usable` each run one kernel-vs-torch-body
 comparison at a tiny shape on the device that will run it (milliseconds) and
 fall back on a tolerance breach.  This is the guard the kernel design puts on
 the correct axis -- probe the hardware you are on, never trust a vendor list
@@ -47,6 +48,10 @@ DISABLE_ENV_VAR = 'MBIRTORCH_DISABLE_TRITON'
 # parallel later the same day), so every switch below is retired and no
 # selection reads them; they stay defined so any script still exporting one
 # is harmless.  MBIRTORCH_DISABLE_TRITON is the kill switch for all kernels.
+# The multiaxis pair, routed later, never had a switch of its own: its
+# selection reads the availability gates alone, and no composed performance
+# measurement has been made for that geometry yet (see
+# MultiAxisParallelModel._view_batch_bodies, which says so at the selection).
 ENABLE_FWD_ENV_VAR = 'MBIRTORCH_ENABLE_TRITON_FWD'
 ENABLE_PBACK_ENV_VAR = 'MBIRTORCH_ENABLE_TRITON_PBACK'
 ENABLE_PFWD_ENV_VAR = 'MBIRTORCH_ENABLE_TRITON_PFWD'
@@ -58,14 +63,18 @@ ENABLE_PFWD_ENV_VAR = 'MBIRTORCH_ENABLE_TRITON_PFWD'
 # parallel kernels carry no such carve-out (no vertical fan, so no divisor and
 # no center rounding) and differ from their bodies by float summation order
 # alone; they share the figure rather than a tighter one of their own, because
-# what a self-check must catch is a miscompile, not a ULP.
+# what a self-check must catch is a miscompile, not a ULP.  The multiaxis
+# kernels have no cone-angle divisor either, and their one carve-out -- the
+# floor-vs-round row center -- moves only taps whose weight is exactly zero
+# (see the module docstring of triton_multiaxis.py), so they share the figure
+# for the same reason the parallel pair does.
 SELF_CHECK_REL_TOL = 1e-4
 
 # Module-level cache of the single probe result: compiling even a trivial
 # kernel costs real time, and the answer cannot change within a process.
 _PROBE_RESULT = None
 
-# Per-device caches of the four self-checks, keyed by device string: each
+# Per-device caches of the six self-checks, keyed by device string: each
 # check builds a model, compiles a kernel, and runs both bodies, so it must
 # happen once per process -- and its answer is a property of the DEVICE and
 # its toolchain, not of the calling model.
@@ -73,11 +82,13 @@ _CONE_BACK_RESULTS = {}
 _CONE_FWD_RESULTS = {}
 _PARALLEL_BACK_RESULTS = {}
 _PARALLEL_FWD_RESULTS = {}
+_MULTIAXIS_BACK_RESULTS = {}
+_MULTIAXIS_FWD_RESULTS = {}
 
 # Re-entrancy flag: a self-check builds its own tiny model, whose
 # create_projectors asks this same module which bodies to use.  While ANY
 # check runs, every answer must be "the torch body" -- otherwise the probe
-# model would recurse into the check it is part of.  One flag covers all four
+# model would recurse into the check it is part of.  One flag covers all six
 # checks because the recursion it blocks is not per geometry: the flag is read
 # by every gate, so a parallel check's model cannot trip a cone gate either.
 _SELF_CHECK_ACTIVE = False
@@ -201,8 +212,41 @@ def parallel_forward_kernel_usable(model):
                           _parallel_forward_self_check)
 
 
+def multiaxis_back_kernel_usable(model):
+    """(usable, reason): whether the Triton multiaxis back body may replace the
+    torch one for ``model``, on ``model.torch_device``.
+
+    The same two gates in the same order as :func:`cone_back_kernel_usable`,
+    with the multiaxis back body's own value comparison at coefficient powers 1
+    and 2, run both unbanded and on an interior SLICE band -- multiaxis bands
+    its back projection the way cone does, through the ``slice_start`` and
+    ``band_slices`` keywords, with the slice-to-row map anchored on the full
+    slice count.  Cached per device string and exception-safe.
+
+    This answers CAPABILITY only; whether the kernel is selected is policy, and
+    that is decided in the geometry's ``_view_batch_bodies``, which says there
+    what this pair's selection does and does not rest on.
+    """
+    return _kernel_usable(model, _MULTIAXIS_BACK_RESULTS,
+                          _multiaxis_back_self_check)
+
+
+def multiaxis_forward_kernel_usable(model):
+    """(usable, reason): whether the Triton multiaxis forward body may replace
+    the torch one for ``model``, on ``model.torch_device``.
+
+    The same two gates in the same order, with the multiaxis forward body's own
+    value comparison -- unbanded and on an interior band, which the forward
+    carries in the COLUMNS of its values beside a ``slice_start``, as the cone
+    forward does.  Cached per device string and exception-safe; capability
+    only, as above.
+    """
+    return _kernel_usable(model, _MULTIAXIS_FWD_RESULTS,
+                          _multiaxis_forward_self_check)
+
+
 def _kernel_usable(model, cache, self_check):
-    """The shape all four gates above share: the re-entrancy guard, the
+    """The shape all six gates above share: the re-entrancy guard, the
     process-wide probe, then this device's cached value self-check."""
     if _SELF_CHECK_ACTIVE:
         result = (False, 'kernel self-check in progress (its own probe model '
@@ -264,6 +308,40 @@ def _parallel_self_check_cell(device_key):
     angles = np.linspace(0, np.pi, cell[0], endpoint=False)
     model = ParallelBeamModel(cell, angles, 
                               compile_mode='off')
+    model.configure_devices(devices=[device_key])
+    device = model.torch_device
+    pixel_indices = torch.as_tensor(
+        gen_full_indices(model.get_params('recon_shape')),
+        dtype=torch.int64, device=device)[:-1]
+    view_params = torch.as_tensor(model.get_params('angles'),
+                                  dtype=torch.float32, device=device)
+    return model, pixel_indices, view_params, model._view_batch_args()
+
+
+def _multiaxis_self_check_cell(device_key):
+    """The tiny multiaxis problem both multiaxis self-checks run on: (model,
+    pixel_indices, view_params, body kwargs) -- the cone and parallel cells'
+    twin, at the same size and with the same padded last pixel block, over a
+    half turn of azimuths so the horizontal footprint varies from view to view.
+
+    The elevations carry a REAL spread rather than sitting at zero.  At zero
+    elevation this geometry is parallel beam: the vertical footprint is the
+    voxel slice pitch, the mass-conserving amplitude is 1, and the slope of the
+    slice-to-row map is fixed, so a zero-elevation cell would leave untested
+    every term the geometry adds.  The spread stays well inside the model's
+    45-degree warning, so the check builds its model without a warning.
+    """
+    import numpy as np
+
+    from .multiaxis_parallel import MultiAxisParallelModel
+    from .vcd_utils import gen_full_indices
+
+    cell = (4, 10, 10)
+    azimuth = np.linspace(0, np.pi, cell[0], endpoint=False)
+    elevation = np.linspace(-0.4, 0.4, cell[0])
+    model = MultiAxisParallelModel(cell,
+                                   np.stack([azimuth, elevation], axis=1),
+                                   compile_mode='off')
     model.configure_devices(devices=[device_key])
     device = model.torch_device
     pixel_indices = torch.as_tensor(
@@ -439,6 +517,92 @@ def _parallel_forward_self_check(device_key):
     return result
 
 
+def _multiaxis_back_self_check(device_key):
+    """Run the multiaxis back kernel-vs-torch-body comparison once on one
+    device (see :func:`multiaxis_back_kernel_usable`); never raises."""
+    global _SELF_CHECK_ACTIVE
+    _SELF_CHECK_ACTIVE = True
+    try:
+        from .multiaxis_parallel import _multiaxis_back_view_batch
+        from .triton_multiaxis import _multiaxis_back_view_batch_triton
+
+        model, pixel_indices, view_params, args = _multiaxis_self_check_cell(
+            device_key)
+        # A private generator: the seeded recon gates depend on the global RNG
+        # streams, and an availability check must not advance them.
+        generator = torch.Generator().manual_seed(0)
+        sinogram = torch.rand(tuple(model.get_params('sinogram_shape')),
+                              generator=generator).to(model.torch_device)
+
+        worst_rel = 0.0
+        # The whole volume, then an interior slice band: the band exercises the
+        # band_slices seam, whose row anchor stays on the full slice count, and
+        # its length is not a multiple of the kernel's padded launch width.
+        num_slices = int(args['num_slices'])
+        interior = max(1, num_slices // 3)
+        bands = ((0, num_slices), (interior, num_slices - 2 * interior))
+        for coeff_power in (1, 2):
+            for slice_start, band_slices in bands:
+                reference = _multiaxis_back_view_batch(
+                    sinogram, pixel_indices, view_params,
+                    coeff_power=coeff_power, slice_start=slice_start,
+                    band_slices=band_slices, **args)
+                kernel_out = _multiaxis_back_view_batch_triton(
+                    sinogram, pixel_indices, view_params,
+                    coeff_power=coeff_power, slice_start=slice_start,
+                    band_slices=band_slices, **args)
+                worst_rel = max(worst_rel, _rel_diff(kernel_out, reference))
+        result = _self_check_verdict('multiaxis back', device_key, worst_rel)
+    except Exception as e:                                        # noqa: BLE001
+        result = (False, f'multiaxis back self-check failed to run: '
+                         f'{type(e).__name__}: {e}')
+    finally:
+        _SELF_CHECK_ACTIVE = False
+    return result
+
+
+def _multiaxis_forward_self_check(device_key):
+    """Run the multiaxis forward kernel-vs-torch-body comparison once on one
+    device (see :func:`multiaxis_forward_kernel_usable`); never raises."""
+    global _SELF_CHECK_ACTIVE
+    _SELF_CHECK_ACTIVE = True
+    try:
+        from .multiaxis_parallel import _multiaxis_forward_view_batch
+        from .triton_multiaxis import _multiaxis_forward_view_batch_triton
+
+        model, pixel_indices, view_params, args = _multiaxis_self_check_cell(
+            device_key)
+        num_slices = int(args['num_slices'])
+        generator = torch.Generator().manual_seed(0)
+        values = torch.rand((int(pixel_indices.shape[0]), num_slices),
+                            generator=generator).to(model.torch_device)
+
+        worst_rel = 0.0
+        # The whole volume, then an interior band: the band exercises the
+        # slice_start seam, whose row anchor stays on the full slice count (the
+        # forward carries its band in the VALUES, so nothing else says which
+        # slices these are).
+        interior = max(1, num_slices // 3)
+        bands = ((0, num_slices), (interior, num_slices - 2 * interior))
+        for slice_start, band_len in bands:
+            band_values = values[:, slice_start:slice_start + band_len]
+            reference = _multiaxis_forward_view_batch(
+                band_values, pixel_indices, view_params,
+                slice_start=slice_start, **args)
+            kernel_out = _multiaxis_forward_view_batch_triton(
+                band_values, pixel_indices, view_params,
+                slice_start=slice_start, **args)
+            worst_rel = max(worst_rel, _rel_diff(kernel_out, reference))
+        result = _self_check_verdict('multiaxis forward', device_key,
+                                     worst_rel)
+    except Exception as e:                                        # noqa: BLE001
+        result = (False, f'multiaxis forward self-check failed to run: '
+                         f'{type(e).__name__}: {e}')
+    finally:
+        _SELF_CHECK_ACTIVE = False
+    return result
+
+
 def _self_check_verdict(name, device_key, worst_rel):
     """(usable, reason) from a self-check's worst relative difference."""
     if worst_rel <= SELF_CHECK_REL_TOL:
@@ -467,3 +631,5 @@ def _reset_self_check_cache():
     _CONE_FWD_RESULTS.clear()
     _PARALLEL_BACK_RESULTS.clear()
     _PARALLEL_FWD_RESULTS.clear()
+    _MULTIAXIS_BACK_RESULTS.clear()
+    _MULTIAXIS_FWD_RESULTS.clear()
