@@ -313,17 +313,19 @@ def test_the_measurement_envelope_is_stated():
 
 
 # ── the accessor ─────────────────────────────────────────────────────────────
-def test_multiaxis_floors_admit_at_the_512_class():
-    """Multiaxis is admitted on speed at and above the 512-class, at every
-    measured count, and refused below it.
+def test_multiaxis_floors_split_by_count():
+    """Multiaxis admits two devices from the 512-class and four only from
+    the 1024-class, and refuses both below their floors.
 
-    Both rows were sentinels until 2026-08-20: the two-device wins came
-    and went with problem size, and the mechanism was torch recompiling
-    the projection bodies per device against one shared budget (the rows'
-    notes and multigpu_findings.md sections 1.36 through 1.38 in the plans
-    repository carry the history).  The mg48 refresh on the remedied tree
-    measured wins at every probed cell -- 1.5x at two devices and above
-    2x at four -- so both floors now sit at the 512-class, and counts
+    The history in brief.  Both rows were sentinels until 2026-08-20,
+    when the recompile remedy cleared them and the mg48 refresh placed
+    both floors at the 512-class.  The Triton multiaxis kernels then cut
+    the one-device wall about four-fold, and the mg56 refresh on that
+    tree (with the mg55 1024-class reading) kept the two-device floor at
+    the 512-class and RAISED the four-device floor to the 1024-class:
+    small cells no longer amortize a four-way fan-out when one device is
+    this fast.  The rows' notes and multigpu_findings.md sections 1.45
+    and 1.46 in the plans repository carry the measurements.  Counts
     with no row of their own (3, and anything above 4) inherit the n=4
     floor.
     """
@@ -331,12 +333,19 @@ def test_multiaxis_floors_admit_at_the_512_class():
 
     assert mbirtorch.MultiAxisParallelModel._floor_family == 'multiaxis'
     at_the_512_class = wf.sinogram_elements((512, 448, 384))
-    below_the_floor = wf.sinogram_elements((384, 336, 288))
+    at_the_1024_class = wf.sinogram_elements((1024, 1008, 992))
+    below_every_floor = wf.sinogram_elements((384, 336, 288))
+    ok, why = wf.admitted('multiaxis', 2, at_the_512_class)
+    assert ok, why
     for count in (2, 3, 4, 8):
-        ok, why = wf.admitted('multiaxis', count, at_the_512_class)
+        ok, why = wf.admitted('multiaxis', count, at_the_1024_class)
         assert ok, (count, why)
+    for count in (3, 4, 8):
+        ok, why = wf.admitted('multiaxis', count, at_the_512_class)
+        assert not ok, (count, why)
+        assert 'held by the speed floor' in why, why
     for count in (2, 3, 4, 8):
-        ok, why = wf.admitted('multiaxis', count, below_the_floor)
+        ok, why = wf.admitted('multiaxis', count, below_every_floor)
         assert not ok, (count, why)
         assert 'held by the speed floor' in why, why
         assert 'configure_devices' in why, why
