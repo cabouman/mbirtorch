@@ -98,6 +98,35 @@ def _resolve_device(device):
     return torch.device('cpu')
 
 
+def _array_extremes(array):
+    """``(minimum, maximum)`` of ``array``, read where the array already is.
+
+    The pair answers every question the input checks below ask.  A NaN
+    anywhere propagates into both, so an array holding one cannot report two
+    finite extremes; an infinity of either sign appears in the extreme on its
+    side; and whether an array has a negative value, or is entirely zero, is
+    the pair's to answer directly.  Asking each question separately costs one
+    full pass and one full-length temporary per question, which at a
+    1024-class sinogram was measured at about half a second per pass.
+
+    Both reductions run through torch on the array's own device, so a host
+    array is read across the process's threads rather than on one, and an
+    array already on a device is never pulled back to the host to be checked.
+    A numpy array is wrapped rather than copied.
+    """
+    if torch.is_tensor(array):
+        tensor = array
+    else:
+        with warnings.catch_warnings():
+            # This function only READS the array.  A read-only host array is
+            # an ordinary input -- a memory-mapped load makes one -- so
+            # torch's not-writable notice would be noise from a check the
+            # caller did not ask about.
+            warnings.filterwarnings('ignore', message='.*not writable.*')
+            tensor = torch.as_tensor(array)
+    return float(tensor.min()), float(tensor.max())
+
+
 class TomographyModel(ParameterHandler):
     """
     Base class for all tomography geometries.  It provides projection
@@ -3053,7 +3082,8 @@ class TomographyModel(ParameterHandler):
                 if tensor.is_complex():
                     raise TypeError(
                         "sinogram must be real-valued; got complex dtype.")
-                if not bool(torch.isfinite(tensor).all()):
+                low, high = _array_extremes(tensor)
+                if not (math.isfinite(low) and math.isfinite(high)):
                     raise ValueError("sinogram contains NaN and/or Inf values.")
             # Passed on as it is: the statistics below reduce it to a small
             # view subsample before anything reaches the host.
@@ -3063,7 +3093,8 @@ class TomographyModel(ParameterHandler):
                 else sinogram.cpu().numpy()
             if np.iscomplexobj(sinogram_np):
                 raise TypeError("sinogram must be real-valued; got complex dtype.")
-            if not np.isfinite(sinogram_np).all():
+            low, high = _array_extremes(sinogram_np)
+            if not (math.isfinite(low) and math.isfinite(high)):
                 raise ValueError("sinogram contains NaN and/or Inf values.")
             sinogram_for_stats = sinogram_np
         if weights is not None:
@@ -3072,21 +3103,23 @@ class TomographyModel(ParameterHandler):
                 # only when every shard is entirely zero.
                 all_zero = True
                 for tensor in weights.tensors:
-                    if not bool(torch.isfinite(tensor).all()):
+                    low, high = _array_extremes(tensor)
+                    if not (math.isfinite(low) and math.isfinite(high)):
                         raise ValueError("weights contains NaN and/or Inf values.")
-                    if bool((tensor < 0).any()):
+                    if low < 0:
                         raise ValueError("weights contain negative values.")
-                    all_zero = all_zero and bool((tensor == 0).all())
+                    all_zero = all_zero and low == 0 and high == 0
                 if all_zero:
                     raise ValueError("all weights are zero.")
             else:
                 weights_np = np.asarray(weights) if not torch.is_tensor(weights) \
                     else weights.cpu().numpy()
-                if not np.isfinite(weights_np).all():
+                low, high = _array_extremes(weights_np)
+                if not (math.isfinite(low) and math.isfinite(high)):
                     raise ValueError("weights contains NaN and/or Inf values.")
-                if (weights_np < 0).any():
+                if low < 0:
                     raise ValueError("weights contain negative values.")
-                if (weights_np == 0).all():
+                if low == 0 and high == 0:
                     raise ValueError("all weights are zero.")
 
         regularization_params = self.auto_set_regularization_params(

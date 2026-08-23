@@ -25,6 +25,16 @@ import os as _os
 _os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR",
                        _os.path.expanduser("~/.mbirtorch/torch_cache"))
 _os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
+# Triton keeps a SEPARATE cache of the kernels it compiles at their first
+# launch, and the two settings above do not cover it; its own default is
+# ~/.triton/cache.  Pin it beside the inductor cache, so that both halves of
+# the compile cache live in one place and clear_cache() clears both rather
+# than emptying one and leaving the other where nothing names it.  The
+# hand-written kernels compile through this path: a run that finds it empty
+# paid about 1.2 s on one device and 4.8 s on four at the 1024-class parallel
+# cell (multigpu_findings.md section 1.48 in the plans repository).
+_os.environ.setdefault("TRITON_CACHE_DIR",
+                       _os.path.expanduser("~/.mbirtorch/triton_cache"))
 
 from .parallel_beam import ParallelBeamModel, recon_simple_parallel
 from .cone_beam import ConeBeamModel, recon_simple_cone
