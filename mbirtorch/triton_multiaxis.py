@@ -643,15 +643,29 @@ def _multiaxis_forward_kernel(n_p_ptr, centers_ptr, m0_ptr,
     ``slope_floor`` instead, against a degenerate view rather than against
     padding.
 
-    ``out_row_stride`` is the detector row count the WRAPPER allocated, which
-    is the real count rounded up to a multiple of 16 (see
-    :func:`mbirtorch._utils.padded_kernel_width`); ``num_rows`` is the real
-    count.  Row lanes between the two are padded lanes whose atomics are masked
-    off by ``r_mask``, so the extra output rows keep the zeros they were
-    allocated with and the wrapper slices them away.  That mask is also where
-    the torch body's ``(m >= 0) & (m < num_rows_r)`` row-range factor lives:
-    every row this kernel writes is a real detector row, so the factor is 1 on
-    every lane that stores and the mask carries the rest.
+    The row axis works as it does in the cone forward kernel.  ``num_rows`` is
+    the row count the WRAPPER launches, which is the detector's real row count
+    rounded up to a multiple of 16 (see
+    :func:`mbirtorch._utils.padded_kernel_width`), and ``out_row_stride`` is
+    that same count, because it is what the wrapper allocated.  Row lanes
+    between the real count and that rounded-up value are ordinary live lanes:
+    they gather from ``values`` and their atomics land.  Two things make that
+    safe.  The gather's index is clamped into the slice band it was handed and
+    masked by that band, so no read leaves ``values``.  And those atomics land
+    in the extra output rows, which the wrapper slices off before it returns.
+
+    Masking those lanes off instead would leave the extra rows at zero and
+    reach the same values, and that is what this kernel did until 2026-08-24.
+    It cost a factor of 3.1: Triton compiles a separate kernel for each
+    divisibility class of an integer argument, and a bound it cannot prove a
+    multiple of 16 lands in the slow class.  The measurement is in the plans
+    repository, multigpu_findings.md section 1.51.
+
+    The row mask is therefore no longer where the torch body's
+    ``(m >= 0) & (m < num_rows_r)`` row-range factor lives.  It does not need
+    to be.  Every REAL row this kernel writes is a real detector row, so the
+    factor is 1 on every lane whose store a caller reads, and the lanes past
+    the real count write only into the rows the wrapper discards.
     """
     p_offs = tl.program_id(0) * BLOCK_P + tl.arange(0, BLOCK_P)     # (BLOCK_P,)
     r_offs = tl.program_id(1) * BLOCK_R + tl.arange(0, BLOCK_R)     # (BLOCK_R,)
@@ -766,12 +780,15 @@ def _multiaxis_forward_view_batch_triton(values, pixel_indices,
 
     The detector row count is rounded up to a multiple of 16 before the launch,
     because Triton compiles a faster kernel for an integer argument it can
-    prove divisible by 16, and that count is the output's row stride.  The
-    return is then the real-row slice of a slightly taller output.  A row count
-    that IS a multiple of 16 takes exactly the path it took before, with the
-    same allocations.  ``values`` needs no such padding: the slice gather is
-    clamped into the band it was handed and masked by that band, so no read
-    leaves it.
+    prove divisible by 16.  That rounded-up count is the output's row stride,
+    the grid's row extent, and the bound the kernel masks its row lanes
+    against; all three take it, which is what the cone forward wrapper does.
+    The return is then the real-row slice of a slightly taller output.  A row
+    count that IS a multiple of 16 takes exactly the path it took before, with
+    the same allocations.  ``values`` needs no such padding: the slice gather
+    is clamped into the band it was handed and masked by that band, so no read
+    leaves it, and a measurement found no time in padding it either
+    (multigpu_findings.md section 1.51 in the plans repository).
 
     Eager python by construction, declared twice over because the two
     mechanisms cover different callers: ``torch.compiler.disable`` keeps dynamo
@@ -819,13 +836,13 @@ def _multiaxis_forward_view_batch_triton(values, pixel_indices,
 
     num_views, num_pixels = n_p.shape
     band_len = int(values.shape[1])
-    # The detector row count the OUTPUT is allocated and addressed at, rounded
-    # up to a multiple of 16 so that Triton compiles the faster specialization
-    # of that stride.  A row count that is already a multiple gets its own value
-    # back, so every allocation and every argument below is exactly what it was
-    # before this padding existed.  The geometry builders above keep the REAL
-    # row count, and so does the kernel's row mask; only the stride and the
-    # allocation move.
+    # The detector row count the OUTPUT is allocated and addressed at, and the
+    # count the kernel launches and masks against, rounded up to a multiple of
+    # 16 so that Triton compiles the faster specialization of it.  A row count
+    # that is already a multiple gets its own value back, so every allocation
+    # and every argument below is exactly what it was before this padding
+    # existed.  The geometry builders above keep the REAL row count, because
+    # the slice-to-row map is anchored on the detector the model has.
     launch_rows = padded_kernel_width(int(num_rows_r))
     values = values.contiguous()
     # Per-(view, pixel): three arrays, 12 bytes a pixel a view.
@@ -845,10 +862,9 @@ def _multiaxis_forward_view_batch_triton(values, pixel_indices,
                          MULTIAXIS_FWD_MIN_TILE)
     block_r = _tile_size(MULTIAXIS_FWD_BLOCK_R, launch_rows,
                          MULTIAXIS_FWD_MIN_TILE)
-    # The row grid covers the REAL rows: a program past them would be masked
-    # off on every lane, so launching it would only cost a scheduling slot.
-    grid = (-(-num_pixels // block_p), -(-int(num_rows_r) // block_r),
-            num_views)
+    # The row grid covers the PADDED rows, because those lanes are live (see
+    # the kernel's row-axis paragraph).
+    grid = (-(-num_pixels // block_p), -(-launch_rows // block_r), num_views)
     # The inert bounds on the slice center (see the kernel).
     k_center_lo = float(int(slice_start) - slice_radius - 1)
     k_center_hi = float(int(slice_start) + band_len + slice_radius)
@@ -866,7 +882,7 @@ def _multiaxis_forward_view_batch_triton(values, pixel_indices,
     with torch.cuda.device(values.device), guard:
         _multiaxis_forward_kernel[grid](
             *contract, values, out,
-            int(num_pixels), int(num_channels), int(num_rows_r),
+            int(num_pixels), int(num_channels), launch_rows,
             launch_rows, int(num_channels) * launch_rows,
             band_len, int(slice_start), int(num_slices),
             _SLOPE_FLOOR, k_center_lo, k_center_hi,
@@ -877,9 +893,8 @@ def _multiaxis_forward_view_batch_triton(values, pixel_indices,
     _COMPILED_LAUNCH_KEYS.add(launch_key)
     if launch_rows == int(num_rows_r):
         return out.permute(0, 2, 1)
-    # The extra detector rows hold nothing any caller reads -- the kernel's row
-    # mask left them at the zeros they were allocated with -- so they are sliced
-    # off before the transpose.
+    # The extra detector rows hold what the padded row lanes scattered into
+    # them, which no caller reads, so they are sliced off before the transpose.
     return out[:, :, :int(num_rows_r)].permute(0, 2, 1)
 
 
