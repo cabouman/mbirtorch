@@ -2413,3 +2413,6 @@ def slice_viewer(*datasets, data_dicts=None, title='', vmin=None, vmax=None,
         import gc
         gc.collect()
     return viewer
+
+if __name__ == '__main__':
+    slice_viewer(np.zeros((20, 20, 20)), np.zeros((20, 20, 20)))
