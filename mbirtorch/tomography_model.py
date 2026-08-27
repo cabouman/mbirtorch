@@ -3321,9 +3321,16 @@ class TomographyModel(ParameterHandler):
                 prox_map call on this model already initialized this sinogram.
             stop_threshold_change_pct (float, optional): stop when the NMAE
                 percent change drops below this value.  Defaults to 0.2.
-            max_iterations (int, optional): maximum VCD iterations.  Defaults to 3.
-            first_iteration (int, optional): partition-sequence offset for
-                restarts.  Defaults to 0.
+            max_iterations (int, optional): maximum VCD iterations, counted
+                from iteration 0: a call resuming at ``first_iteration=k``
+                runs ``max_iterations - k`` iterations.  Defaults to 3.
+            first_iteration (int, optional): cumulative iteration count for
+                restarts.  The partition sequence is advanced by this amount
+                (on the cached ``do_initialization=False`` path too), so a
+                Plug-and-Play loop that passes the total number of prox
+                iterations completed so far walks the sequence coarse to fine
+                and, past its end, stays on its last (typically finest)
+                entry.  Defaults to 0.
             logfile_path (str, optional): Path to the output log file ('~' expands to the
                 user's home directory).  If None or empty, no log file is written.
                 Defaults to '~/.mbirtorch/logs/prox.log'.  A Plug-and-Play loop
@@ -3358,6 +3365,17 @@ class TomographyModel(ParameterHandler):
         else:
             (partitions, partition_sequence, granularity,
              regularization_params) = self.prox_data
+            # The cache holds the expensive pieces: the pixel partitions and
+            # the regularization estimates.  The partition SEQUENCE is cheap
+            # and is recomputed the way initialize_recon computes it, so that
+            # first_iteration keeps its documented meaning on this path too:
+            # a Plug-and-Play loop passing its cumulative iteration count
+            # advances through the model's partition_sequence and, past its
+            # end, stays on its last (typically finest) entry.
+            partition_sequence = vcd_utils.gen_partition_sequence(
+                self.get_params('partition_sequence'),
+                max_iterations=max_iterations)
+            partition_sequence = partition_sequence[first_iteration:]
             # This pass skips the initialization, and with it the run header
             # that reopens the log file the previous pass closed, so reopen it
             # here.  Without this the loop's later passes would be missing
