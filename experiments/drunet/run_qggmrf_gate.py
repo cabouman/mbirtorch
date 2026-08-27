@@ -32,7 +32,6 @@ import torch
 import mbirtorch
 
 from agents import ForwardProxAgent, QGGMRFDenoiserAgent
-from cone_beam_2d import get_data
 from mace import mace
 
 GATE_TOL = 0.01
@@ -88,8 +87,14 @@ def main():
                         help='add a run initialized at zero')
     parser.add_argument('--view', action='store_true',
                         help='show phantom / direct / MACE in the viewer')
+    parser.add_argument('--problem', choices=['2d', '3d'], default='2d',
+                        help='the 2D mid-slice problem or the full 3D one')
     args = parser.parse_args()
 
+    if args.problem == '3d':
+        from cone_beam_3d import get_data
+    else:
+        from cone_beam_2d import get_data
     phantom, sinogram, params = get_data()
     ct_model = mbirtorch.ConeBeamModel(
         sinogram.shape, params['angles'],
@@ -156,7 +161,8 @@ def main():
         saved[f'{name}_recon'] = volume.cpu().numpy()
         for trace_name, values in info.items():
             saved[f'{name}_{trace_name}'] = np.asarray(values)
-    out_path = './output/qggmrf_gate.npz'
+    out_path = ('./output/qggmrf_gate.npz' if args.problem == '2d'
+                else './output/qggmrf_gate_3d.npz')
     np.savez(out_path, **saved)
     print(f'Volumes and traces saved to {out_path}')
 
