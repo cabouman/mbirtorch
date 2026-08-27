@@ -1,14 +1,17 @@
 """Sandbox: standard recon vs DRUNet postprocessing vs DRUNet-MACE.
 
-Edit the parameters just below, run, and compare three reconstructions of
-the 2D noisy cone-beam problem (from cone_beam_2d.py) side by side:
+Edit the parameters just below, run, and compare the reconstructions side
+by side.  PROBLEM selects the 2D mid-slice problem or the full 3D one (both
+from the cone_beam_* modules); the 3D problem adds multi-slice fusion:
 
   1. the STANDARD recon -- recon() with the qGGMRF prior ("direct recon" is
      reserved for the FDK-style initialization recon_direct produces);
   2. DRUNet POSTPROCESSING -- one application of the denoiser to the
-     standard recon;
-  3. the DRUNet MACE recon -- the denoiser as the prior agent, equilibrated
-     with the data-fit proximal map.
+     standard recon (in 3D, the average of the three slice orientations);
+  3. the single-orientation DRUNet MACE recon -- the denoiser as the prior
+     agent, equilibrated with the data-fit proximal map;
+  4. (3D only) the MACE FUSION recon -- the forward prox plus three
+     orientation denoiser agents at weights (1/2, 1/6, 1/6, 1/6).
 
 The standard recon is cached in ./output/ and reused while the problem is
 unchanged, so parameter tweaks to the denoiser and the MACE loop rerun in
@@ -25,27 +28,34 @@ import torch
 import mbirtorch
 
 from agents import DRUNetAgent, ForwardProxAgent, load_drunet
-from cone_beam_2d import get_data
 from mace import mace
 
 # ------------------------------------------------------------- parameters --
 
-# DENOISER STRENGTH, in the network's own scale.  DRUNet is a Gaussian
-# denoiser conditioned on the noise standard deviation of images valued in
-# [0, 1].  The recon is mapped into that range by a fixed intensity scale c
-# (chosen once: the standard recon's 99.9th-percentile value goes to 0.9),
-# the network runs at noise level SIGMA_SCALED, and the result is mapped
-# back, so in recon units the strength is SIGMA_SCALED / c.  For reference,
-# a natural-image noise level of 25/255 is about 0.1.  The useful range here
-# is roughly 0.02 (light) to 0.2 (heavy); in the 2026-08 sweep the best MACE
-# recon used 0.075 and the best postprocessing 0.10.  In the MACE recon this
-# is the one regularization-strength knob (the data-prox strength sigma_prox
-# stays at the model's auto value).
+# Which problem: '3d' is the full cone-beam demo problem with the fusion
+# recon included; '2d' is the single-slice problem (no fusion -- the extra
+# orientations are degenerate on one slice).
+PROBLEM = '3d'
+
+# DENOISER STRENGTH for the MACE priors, in the network's own scale.  DRUNet
+# is a Gaussian denoiser conditioned on the noise standard deviation of
+# images valued in [0, 1].  The recon is mapped into that range by a fixed
+# intensity scale c (chosen once: the standard recon's 99.9th-percentile
+# value goes to 0.9), the network runs at noise level SIGMA_SCALED, and the
+# result is mapped back, so in recon units the strength is SIGMA_SCALED / c.
+# For reference, a natural-image noise level of 25/255 is about 0.1.  The
+# useful range here is roughly 0.02 (light) to 0.2 (heavy); 0.075 was the
+# best MACE value in both the 2026-08 2D and 3D sweeps.
 SIGMA_SCALED = 0.075
 
+# Strength for the postprocessing panel (in the 3D sweep, 0.10 was best for
+# single-orientation postprocessing and 0.075 for the three-orientation
+# average, nearly tied with 0.10).
+SIGMA_SCALED_POST = 0.10
+
 # MACE outer iterations.  Each runs INNER_PROX_ITERATIONS of the data prox
-# plus one DRUNet application.  30 gets close; 60 was converged (consensus
-# spread below 1e-3) in the 2026-08 sweep.
+# plus one DRUNet application per orientation agent.  30 gets close; 60 was
+# converged (consensus spread below 1e-3) in the 2026-08 2D sweep.
 NUM_ITERATIONS = 20
 
 # Mann averaging parameter in (0, 1): 0.5 is the ADMM / Douglas-Rachford
@@ -67,7 +77,9 @@ REUSE_STANDARD_RECON = True
 # Show the interactive slice viewer at the end.
 SHOW_VIEWER = True
 
-CACHE_PATH = './output/sandbox_standard.npz'
+# The 3D cache is shared with the run_fusion_* scripts.
+CACHE_PATH = ('./output/fusion_standard_3d.npz' if PROBLEM == '3d'
+              else './output/sandbox_standard.npz')
 
 # ----------------------------------------------------------------------------
 
@@ -115,6 +127,11 @@ def standard_recon(ct_model, sinogram, weights):
 
 
 def main():
+    if PROBLEM == '3d':
+        from cone_beam_3d import get_data
+    else:
+        from cone_beam_2d import get_data
+
     np.random.seed(0)
     phantom, sinogram, params = get_data()
     ct_model = mbirtorch.ConeBeamModel(
@@ -134,7 +151,6 @@ def main():
     # range; see the SIGMA_SCALED comment.
     robust_max = float(torch.quantile(standard.flatten(), 0.999))
     intensity_scale = 0.9 / robust_max
-    sigma_noise = SIGMA_SCALED / intensity_scale
 
     if ct_model.get_params('use_ror_mask'):
         mask = mbirtorch.get_2d_ror_mask(tuple(standard.shape))
@@ -144,48 +160,66 @@ def main():
         ror_mask = None
 
     net = load_drunet(device)
-    denoiser = DRUNetAgent(net, sigma_noise, intensity_scale,
-                           ror_mask=ror_mask)
+
+    def make_denoiser(sigma_scaled, axis=2):
+        return DRUNetAgent(net, sigma_scaled / intensity_scale,
+                           intensity_scale, ror_mask=ror_mask,
+                           slice_axis=axis)
 
     print(f'Problem: {tuple(standard.shape)} recon on {device}, '
-          f'sigma_scaled {SIGMA_SCALED:g} '
-          f'({sigma_noise:.5f} in recon units), sigma_prox {sigma_prox:.5f}')
+          f'sigma_scaled {SIGMA_SCALED:g} (MACE) / {SIGMA_SCALED_POST:g} '
+          f'(postprocessing), sigma_prox {sigma_prox:.5f}')
 
     with torch.no_grad():
-        postproc = denoiser(standard)
+        if PROBLEM == '3d':
+            postproc = sum(make_denoiser(SIGMA_SCALED_POST, axis)(standard)
+                           for axis in (0, 1, 2)) / 3.0
+            post_name = 'DRUNet postproc (3-orient)'
+        else:
+            postproc = make_denoiser(SIGMA_SCALED_POST)(standard)
+            post_name = 'DRUNet postprocessing'
+
+    def run_mace_case(label, axes, mu):
+        np.random.seed(0)
+        forward = ForwardProxAgent(
+            ct_model, sinogram, weights=weights, sigma_prox=sigma_prox,
+            inner_iterations=INNER_PROX_ITERATIONS,
+            init_recon=standard.clone())
+        agents = [forward] + [make_denoiser(SIGMA_SCALED, axis)
+                              for axis in axes]
+
+        def progress(iteration, x_bar):
+            if (iteration + 1) % 5 == 0 or iteration == NUM_ITERATIONS - 1:
+                print(f'  {label} iteration {iteration + 1:3d}: '
+                      f'NRMSE vs phantom {nrmse(x_bar, phantom_t):.5f}')
+
+        result, info = mace(agents, standard.clone(), mu=mu, rho=RHO,
+                            num_iterations=NUM_ITERATIONS, callback=progress)
+        print(f'  {label} consensus spread at exit: '
+              f'{info["consensus_spread"][-1]:.2e}')
+        return result
 
     print(f'Running MACE: {NUM_ITERATIONS} outer iterations, rho {RHO:g}, '
           f'{INNER_PROX_ITERATIONS} prox inner iterations')
-    np.random.seed(0)
-    forward = ForwardProxAgent(
-        ct_model, sinogram, weights=weights, sigma_prox=sigma_prox,
-        inner_iterations=INNER_PROX_ITERATIONS,
-        init_recon=standard.clone())
+    mace_recon = run_mace_case('single-orientation', [2], [0.5, 0.5])
+    results = [('Standard recon', standard), (post_name, postproc),
+               ('DRUNet MACE (1 orient)', mace_recon)]
+    if PROBLEM == '3d':
+        fusion = run_mace_case('fusion', [0, 1, 2],
+                               [0.5, 1 / 6, 1 / 6, 1 / 6])
+        results.append(('DRUNet MACE fusion', fusion))
 
-    def progress(iteration, x_bar):
-        if (iteration + 1) % 5 == 0 or iteration == NUM_ITERATIONS - 1:
-            print(f'  iteration {iteration + 1:3d}: '
-                  f'NRMSE vs phantom {nrmse(x_bar, phantom_t):.5f}')
-
-    mace_recon, info = mace([forward, denoiser], standard.clone(), rho=RHO,
-                            num_iterations=NUM_ITERATIONS, callback=progress)
-
-    results = [('Standard recon', standard),
-               ('DRUNet postprocessing', postproc),
-               ('DRUNet MACE recon', mace_recon)]
     print('NRMSE vs phantom:')
     for name, volume in results:
-        print(f'  {name:22s} {nrmse(volume, phantom_t):.5f}')
-    print(f'MACE consensus spread at exit: '
-          f'{info["consensus_spread"][-1]:.2e}')
+        print(f'  {name:26s} {nrmse(volume, phantom_t):.5f}')
 
     if SHOW_VIEWER:
         labels = ['Phantom'] + [
             f'{name} (NRMSE {nrmse(volume, phantom_t):.3f})'
             for name, volume in results]
         mbirtorch.slice_viewer(
-            phantom, standard_np, postproc.cpu().numpy(),
-            mace_recon.cpu().numpy(), vmin=0.0, slice_label=labels,
+            phantom, *[volume.cpu().numpy() for _, volume in results],
+            vmin=0.0, slice_label=labels,
             title=f'sigma_scaled {SIGMA_SCALED:g}, '
                   f'{NUM_ITERATIONS} MACE iterations')
 
