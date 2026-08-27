@@ -361,3 +361,53 @@ def test_median_filter3d_refuses_the_divided_form():
 
     # The whole-array forms still go through.
     assert mbirtorch.median_filter3d(volume).shape == volume.shape
+
+
+def test_denoise_pinned_params_keep_sigma_noise_knob(device):
+    """With auto-regularization pinned off (the Plug-and-Play agent
+    configuration: sigma_x fixed so the denoiser is the same operator every
+    call), sigma_noise still sets the denoising strength.  For the identity
+    forward model sigma_y IS sigma_noise, so denoise must keep them equal on
+    the pinned path too -- before that sync, a pinned denoiser silently ran
+    at a stale sigma_y and this knob was dead."""
+    shape = (32, 32, 1)
+    rng = np.random.default_rng(0)
+    clean = np.zeros(shape, dtype=np.float32)
+    clean[8:24, 8:24, :] = 1.0
+    noisy = clean + 0.1 * rng.standard_normal(shape).astype(np.float32)
+
+    denoiser = mbirtorch.QGGMRFDenoiser(shape)
+    denoiser.configure_devices(devices=[device])
+    denoiser.set_params(no_warning=True, verbose=0, sigma_x=0.05,
+                        auto_regularize_flag=False)
+
+    np.random.seed(0)
+    weak, _ = denoiser.denoise(noisy, sigma_noise=0.01, max_iterations=4,
+                               stop_threshold_change_pct=0.0)
+    assert float(denoiser.get_params('sigma_y')) == pytest.approx(0.01)
+
+    np.random.seed(0)
+    strong, _ = denoiser.denoise(noisy, sigma_noise=0.5, max_iterations=4,
+                                 stop_threshold_change_pct=0.0)
+    assert float(denoiser.get_params('sigma_y')) == pytest.approx(0.5)
+
+    # Small sigma_noise hugs the input; large sigma_noise smooths it hard.
+    dist_weak = float(np.linalg.norm(weak - noisy))
+    dist_strong = float(np.linalg.norm(strong - noisy))
+    assert dist_weak < 0.5 * dist_strong, (dist_weak, dist_strong)
+
+
+def test_denoise_accepts_zero_image(device):
+    """An all-zero image is a legitimate input (a Plug-and-Play loop
+    initialized at zero feeds one in): the denoiser must return it unchanged
+    instead of dividing its NMAE statistic by the zero image norm."""
+    shape = (16, 16, 1)
+    denoiser = mbirtorch.QGGMRFDenoiser(shape)
+    denoiser.configure_devices(devices=[device])
+    denoiser.set_params(no_warning=True, verbose=0, sigma_x=0.05,
+                        auto_regularize_flag=False)
+    np.random.seed(0)
+    out, _ = denoiser.denoise(np.zeros(shape, dtype=np.float32),
+                              sigma_noise=0.1, max_iterations=2,
+                              stop_threshold_change_pct=0.0)
+    assert np.array_equal(np.asarray(out), np.zeros(shape, dtype=np.float32))

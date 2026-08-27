@@ -304,7 +304,9 @@ class QGGMRFDenoiser(TomographyModel):
                 :meth:`~mbirtorch.TomographyModel.configure_devices` and its
                 ``like=`` argument).
             sigma_noise (float, optional): estimated noise std in the image.
-                If None, estimated from the image.
+                If None, estimated from the image.  ``sigma_y`` is kept equal
+                to ``sigma_noise`` (for the identity forward model they are
+                the same parameter), whether or not auto-regularization is on.
             use_ror_mask: restrict denoising to a masked region (False default;
                 True for the inscribed ellipse, or a custom 2D mask).
             init_image (numpy or tensor or Shards, optional): initial image
@@ -351,7 +353,12 @@ class QGGMRFDenoiser(TomographyModel):
             # whatever form the caller supplied.  Handing it the row subsample
             # built below would change the estimate.
             sigma_noise = self.estimate_image_noise_std(image)
-        self.set_params(no_warning=True, sigma_noise=sigma_noise)
+        # For the identity forward model sigma_y IS sigma_noise, so the two
+        # are kept equal here rather than only in the flag-gated auto path:
+        # a pinned denoiser (auto_regularize_flag=False, the Plug-and-Play
+        # agent configuration) must still take its strength from sigma_noise.
+        self.set_params(no_warning=True, sigma_noise=sigma_noise,
+                        sigma_y=sigma_noise)
         self.logger.info('Initializing QGGMRFDenoiser')
 
         # Auto-regularization with the background-estimation warning suppressed.
@@ -423,8 +430,13 @@ class QGGMRFDenoiser(TomographyModel):
 
                     # Chunked rather than sum(abs) over the whole image: see
                     # image_ell1 for the temporary this avoids and for why the
-                    # fused norm is not used instead.
-                    nmae = float(ell1_accum) / float(image_ell1(flat_image))
+                    # fused norm is not used instead.  A zero image gives nan
+                    # rather than raising ZeroDivisionError, as in _vcd_recon's
+                    # iteration statistics (a Plug-and-Play loop initialized
+                    # at zero feeds one in).
+                    image_l1 = float(image_ell1(flat_image))
+                    nmae = (float(ell1_accum) / image_l1 if image_l1
+                            else float('nan'))
                     nmae_update[i] = nmae
                     alpha_values[i] = float(alpha_accum) / partition.shape[0]
                     num_iters += 1
@@ -577,9 +589,12 @@ class QGGMRFDenoiser(TomographyModel):
                     # Chunked per shard, for the reason image_ell1 gives: it
                     # spares each device an image-shaped array of absolute
                     # values at the pass's one synchronization point.
-                    image_l1 = combine_on_lead([image_ell1(t)
-                                                for t in flat_image.tensors])
-                    nmae = float(ell1_accum) / float(image_l1)
+                    image_l1 = float(combine_on_lead(
+                        [image_ell1(t) for t in flat_image.tensors]))
+                    # A zero image gives nan rather than raising, as on the
+                    # single-device path.
+                    nmae = (float(ell1_accum) / image_l1 if image_l1
+                            else float('nan'))
                     nmae_update[i] = nmae
                     alpha_values[i] = float(alpha_accum) / partition.shape[0]
                     num_iters += 1
