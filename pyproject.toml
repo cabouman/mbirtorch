@@ -26,7 +26,7 @@ dependencies = [
     # known-bad exclusions as they are found (none yet).
     # Re-test on each torch bump via the metrics
     # harness backend cells before advancing it.
-    "torch>=2.13",
+    "torch>=2.14",
     "numpy",
     # The slice viewer (mbirtorch/viewer.py) needs matplotlib always and h5py
     # for HDF5 load/save (imported lazily, but required for full function).
