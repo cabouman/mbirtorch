@@ -454,7 +454,7 @@ class ConeBeamModel(TomographyModel):
         nz = recon_shape[2]
         L = recon_shape[0] * dv
         dz = slice_aspect * dv
-        z = (np.arange(nz) - (nz - 1) / 2.0) * dz + oz
+        z = self.recon_slice_z()
 
         def profile(t):
             return (c * t ** p + a * b ** p) / (t ** p + b ** p)
@@ -569,6 +569,45 @@ class ConeBeamModel(TomographyModel):
         """Integer radius of the channel psf (see :meth:`get_psf_radii`)."""
         return self.get_psf_radii()[0]
 
+    def pixel_magnification_bounds(self, support_radius=None):
+        """The smallest and largest per-pixel magnification over the support.
+
+        A voxel at in-plane depth ``y`` toward the detector projects with
+        magnification ``sdd / (sid - y)`` (``_cone_pixel_xy_mag``).  Over the
+        support radius ``r`` of :func:`get_support_radius` that runs from
+        ``sdd / (sid + r)`` at the far side to ``sdd / (sid - r)`` at the near
+        side.  The reciprocal of the smallest magnification is the axial reach
+        per unit of detector height at the far side, which
+        :meth:`auto_set_recon_geometry` uses to pad the volume axially.  A
+        parallel source (infinite ``source_detector_dist``) gives 1 and 1.
+        :meth:`get_psf_radii` computes its own bounds over the half width of
+        the grid rather than the masked support, and is left as it is, because
+        those bounds set the integer tap radii of the compiled bodies.
+
+        Args:
+            support_radius (float, optional): the support radius in ALU.  None
+                (the default) computes it from the model's recon geometry.
+                ``auto_set_recon_geometry`` passes its own, because it calls
+                this before the recon geometry it is deriving has been set.
+
+        Returns:
+            tuple of float: ``(min_magnification, max_magnification)``.  The
+            largest is ``inf`` when the support reaches the source.
+        """
+        source_detector_dist, source_iso_dist = self.get_params(
+            ['source_detector_dist', 'source_iso_dist'])
+        if np.isinf(source_detector_dist):
+            return 1.0, 1.0
+        if support_radius is None:
+            recon_shape, delta_voxel, voxel_row_aspect, use_ror_mask = self.get_params(
+                ['recon_shape', 'delta_voxel', 'voxel_row_aspect', 'use_ror_mask'])
+            support_radius = get_support_radius(recon_shape, voxel_row_aspect * delta_voxel,
+                                                delta_voxel, use_ror_mask=use_ror_mask)
+        min_magnification = source_detector_dist / (source_iso_dist + support_radius)
+        if source_iso_dist - support_radius <= 0:
+            return float(min_magnification), float('inf')
+        return float(min_magnification), float(source_detector_dist / (source_iso_dist - support_radius))
+
     @staticmethod
     def detector_mn_to_uv(m, n, delta_det_channel, delta_det_row, det_channel_offset,
                           det_row_offset, num_det_rows, num_det_channels):
@@ -630,9 +669,9 @@ class ConeBeamModel(TomographyModel):
                                                num_det_rows, num_det_channels)
         v_bot = max(float(v_row_low), float(v_row_high))
         v_top = min(float(v_row_low), float(v_row_high))
-        z_per_v_far_side = 1.0 / float(magnification)
-        if not np.isinf(source_detector_dist):
-            z_per_v_far_side += support_radius / float(source_detector_dist)
+        # The far-side reach per unit of detector height is the reciprocal of
+        # the smallest magnification over the support.
+        z_per_v_far_side = 1.0 / self.pixel_magnification_bounds(support_radius)[0]
         excess_bot = max(0.0, v_bot * z_per_v_far_side - float(H_iso) / 2)
         excess_top = max(0.0, -v_top * z_per_v_far_side - float(H_iso) / 2)
 
@@ -718,9 +757,7 @@ class ConeBeamModel(TomographyModel):
                 w = torch.as_tensor(w_full[s0:s1].astype(np.float32), device=dev)
                 tensors.append(recon.tensors[i] * w[None, None, :])
             return _sharding.Shards(tensors, rp)
-        num_slices = recon_shape[2]
-        k = np.arange(num_slices)
-        z_k = delta_voxel_slice * (k - (num_slices - 1) / 2.0) + recon_slice_offset
+        z_k = self.recon_slice_z()
         det_half_height_iso = 0.5 * num_rows * delta_det_row / M_0
         visible = np.abs(z_k[:, None] - helical_z_shifts[None, :]) <= det_half_height_iso
         coverage = np.sum(visible, axis=1)
@@ -740,10 +777,7 @@ class ConeBeamModel(TomographyModel):
              'recon_slice_offset', 'delta_det_row'])
         M_0 = self.get_magnification()
         delta_voxel_slice = voxel_slice_aspect * delta_voxel
-        num_slices = recon_shape[2]
-        k = np.arange(num_slices)
-        z_k = delta_voxel_slice * (k - (num_slices - 1) / 2.0) \
-            + recon_slice_offset
+        z_k = self.recon_slice_z()
         det_half_height_iso = 0.5 * num_rows * delta_det_row / M_0
         visible = np.abs(z_k[:, None] - helical_z_shifts[None, :]) \
             <= det_half_height_iso

@@ -61,10 +61,16 @@ reject_shards = _sharding.reject_shards
 
 
 def _stage_batch(batch, device):
-    """Stage one host batch onto the device: contiguous (a flipped/strided source view, e.g. the
+    """Stage one batch onto the device: contiguous (a flipped/strided source view, e.g. the
     NSI reader's np.flip, cannot be wrapped as a tensor) and floating point (integer scans, e.g.
     the Zeiss reader's uint16, promote to float32 as the kernels' arithmetic expects).  The copy
-    is one batch, not the full array."""
+    is one batch, not the full array.  A batch that is already a tensor is moved to the device
+    with the same dtype rule, and a tensor already on that device is not copied."""
+    if torch.is_tensor(batch):
+        batch = batch.detach()
+        if not torch.is_floating_point(batch):
+            batch = batch.to(torch.float32)
+        return batch.to(device).contiguous()
     batch = np.ascontiguousarray(batch)
     if not np.issubdtype(batch.dtype, np.floating):
         batch = batch.astype(np.float32)

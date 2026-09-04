@@ -207,7 +207,7 @@ def interpolate_defective_pixels(sino, defective_pixel_array=(), num_passes=3):
     return _fill_nan_pixels(sino, num_passes).numpy()
 
 
-def _rotation_kernel(sino_batch, det_rotation):
+def _rotation_kernel(sino_batch, det_rotation, center=None):
     """Per-view-batch detector-rotation kernel (pure device-tensor op): rotate each view's
     (row, channel) plane by ``det_rotation`` radians with bilinear interpolation, zero outside.
 
@@ -220,14 +220,22 @@ def _rotation_kernel(sino_batch, det_rotation):
     Args:
         sino_batch (tensor): (num_views, num_det_rows, num_det_channels).
         det_rotation (float): rotation angle in radians.
+        center (tuple of float or None): the ``(row, channel)`` point the rotation turns about, in the
+            index coordinates of ``sino_batch``.  None (the default) is the center of the array.  A
+            caller that rotates a band of rows cut from a taller detector passes the full detector's
+            center, expressed in the band's row indices, so that the band rotates exactly as it would
+            inside the full detector.
     """
     num_views, num_rows, num_cols = sino_batch.shape
     device = sino_batch.device
     dtype = sino_batch.dtype
     cos_a = math.cos(det_rotation)
     sin_a = math.sin(det_rotation)
-    center_row = (num_rows - 1) / 2.0
-    center_col = (num_cols - 1) / 2.0
+    if center is None:
+        center_row = (num_rows - 1) / 2.0
+        center_col = (num_cols - 1) / 2.0
+    else:
+        center_row, center_col = (float(c) for c in center)
 
     # For each OUTPUT pixel (i, j), find the INPUT location it samples:
     # coord = R @ pixel + offset, with offset = center - R @ center (rotation about the center).

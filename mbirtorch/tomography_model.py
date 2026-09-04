@@ -3453,6 +3453,41 @@ class TomographyModel(ParameterHandler):
         self.set_params(recon_shape=(new_rows, new_cols, new_slices))
         return new_rows - old_rows, new_cols - old_cols, new_slices - old_slices
 
+    def recon_slice_z(self, slice_indices=None):
+        """The axial coordinate, in ALU, of the center of each recon slice.
+
+        Slices are spaced by the slice pitch ``voxel_slice_aspect * delta_voxel``
+        and centered on ``recon_slice_offset``, which is zero for a geometry
+        that has no such parameter.  This is the one host-side statement of
+        the map the projectors use: the compiled cone and multiaxis bodies
+        write the same expression in ``_cone_vertical_affine`` and
+        ``_multiaxis_vertical_terms``, where a Python call cannot be traced.
+
+        Args:
+            slice_indices (int, sequence of int, or None): the slices to map.
+                None (the default) maps every slice.
+
+        Returns:
+            float or ndarray: the coordinate of each requested slice.
+        """
+        recon_shape = self.get_params('recon_shape')
+        delta_voxel, voxel_slice_aspect = self.get_params(['delta_voxel', 'voxel_slice_aspect'])
+        offset = self.get_params('recon_slice_offset') if 'recon_slice_offset' in self.params else 0.0
+        num_slices = int(recon_shape[2])
+        k = np.arange(num_slices) if slice_indices is None else np.asarray(slice_indices)
+        return voxel_slice_aspect * delta_voxel * (k - (num_slices - 1) / 2.0) + offset
+
+    def nearest_recon_slice(self, z):
+        """The index of the recon slice whose center is nearest the axial
+        coordinate ``z`` in ALU, clipped to the volume.  The inverse of
+        :meth:`recon_slice_z`."""
+        recon_shape = self.get_params('recon_shape')
+        delta_voxel, voxel_slice_aspect = self.get_params(['delta_voxel', 'voxel_slice_aspect'])
+        offset = self.get_params('recon_slice_offset') if 'recon_slice_offset' in self.params else 0.0
+        num_slices = int(recon_shape[2])
+        index = int(round((z - offset) / (voxel_slice_aspect * delta_voxel) + (num_slices - 1) / 2.0))
+        return min(max(index, 0), num_slices - 1)
+
     def reshape_recon(self, recon):
         """Reshape a recon-like array to the model's ``recon_shape``.
 
