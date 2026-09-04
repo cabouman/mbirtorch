@@ -6,7 +6,9 @@ stack has the shape the slice viewer pages through, a candidate equal to the mod
 reproduces the full direct reconstruction, the reduced model keeps the full model's field of view in
 ALU, the reduced sinogram equals a plain numpy reduction, a binned reconstruction puts the object in
 the same place in ALU, nothing except apply_calibration changes the caller's state, and the refused
-inputs raise.
+inputs raise.  A second group of tests covers the conjugate-view estimator: it recovers a known
+channel offset on parallel and cone data, it follows a roll of the data, and its search helpers
+behave as their docstrings say.
 
 Everything runs on CPU.  Almost every model is built with compile_mode='off', which keeps the suite
 fast and is inherited by the reduced models the module builds.  One test uses the default compile
@@ -18,10 +20,16 @@ import pytest
 import torch
 
 import mbirtorch
-from mbirtorch.preprocess.geometry_calibration import (CalibrationResult, apply_calibration,
+from mbirtorch.preprocess.geometry_calibration import (_require_conjugate_geometry,
+                                                       CalibrationResult, apply_calibration,
                                                        build_reduced_problem,
-                                                       check_rotation_direction, parameter_sweep,
+                                                       check_rotation_direction,
+                                                       conjugate_difference,
+                                                       estimate_det_channel_offset,
+                                                       estimate_det_rotation, parameter_sweep,
                                                        reduce_sinogram)
+from mbirtorch.preprocess.geometry_calibration import (_angular_coverage, _fourier_shift_channels,
+                                                       _search_minimum)
 from mbirtorch.preprocess.utilities import correct_det_rotation
 from mbirtorch.viewer import VolumeStack
 
@@ -536,3 +544,335 @@ def test_curved_detector_refuses_rotation_and_sweeps_offset():
     error = _rel_max(stack[:, :, 0], np.asarray(model.recon_direct(sino))[:, :, middle])
     print(f'curved detector parity rel_max = {error:.2e}')
     assert error <= 1e-5
+
+
+# ── the conjugate-view estimator ──────────────────────────────────────────────────────────────────
+
+# The models below are larger than the ones above, because the conjugate-view comparison needs a
+# full rotation of views and enough channels to leave an interior after the edge margin.  They are
+# still small enough that one forward projection takes a fraction of a second.
+
+def _conjugate_parallel_model(det_channel_offset):
+    """A 64-view parallel model over a full rotation, at the given channel offset in ALU."""
+    angles = np.linspace(0, 2 * np.pi, 64, endpoint=False)
+    model = mbirtorch.ParallelBeamModel((64, 16, 64), angles, compile_mode='off')
+    model.configure_devices(devices=['cpu'])
+    model.set_params(no_warning=True, verbose=0, det_channel_offset=det_channel_offset)
+    return model
+
+
+def _conjugate_cone_model(det_channel_offset, use_curved_detector=False):
+    """A 128-view cone model over a full rotation, at the given channel offset in ALU.  The source
+    distance puts the 64 channels of the detector across a full fan angle of 20 degrees."""
+    angles = np.linspace(0, 2 * np.pi, 128, endpoint=False)
+    source_detector_dist = 64 / 2 / np.tan(np.deg2rad(10.0))
+    model = mbirtorch.ConeBeamModel((128, 16, 64), angles,
+                                    source_detector_dist=source_detector_dist,
+                                    source_iso_dist=source_detector_dist / 2,
+                                    use_curved_detector=use_curved_detector, compile_mode='off')
+    model.configure_devices(devices=['cpu'])
+    model.set_params(no_warning=True, verbose=0, det_channel_offset=det_channel_offset)
+    return model
+
+
+_CONJUGATE_SINOGRAMS = {}
+
+
+def _conjugate_sinogram(geometry, true_offset):
+    """The phantom sinogram of one geometry at one true channel offset, projected once per run."""
+    key = (geometry, true_offset)
+    if key not in _CONJUGATE_SINOGRAMS:
+        build = _conjugate_parallel_model if geometry == 'parallel' else _conjugate_cone_model
+        _CONJUGATE_SINOGRAMS[key] = _phantom_sinogram(build(true_offset))
+    return _CONJUGATE_SINOGRAMS[key]
+
+
+def _check_offset_result(result, true_offset, tolerance):
+    """Check that an offset estimate is within tolerance of the true value and that the search
+    record is well formed.  Returns the signed error in ALU."""
+    assert result.parameter == 'det_channel_offset'
+    assert result.method == 'conjugate'
+    assert np.all(np.diff(result.candidates) > 0)
+    assert result.candidates.size == result.scores.size
+    assert result.score == result.scores.min()
+    assert result.reduction['search_notes'] == []
+    error = result.value - true_offset
+    assert abs(error) < tolerance
+    return error
+
+
+@pytest.mark.parametrize('true_offset', [1.3, -2.2])
+def test_estimate_det_channel_offset_on_parallel_beam(true_offset):
+    """On parallel-beam data the conjugate-view estimator recovers the offset the data were
+    simulated with, from clean data and from data with 2 percent Gaussian noise."""
+    sino = _conjugate_sinogram('parallel', true_offset)
+    result = estimate_det_channel_offset(_conjugate_parallel_model(0.0), sino)
+    error = _check_offset_result(result, true_offset, 0.1)
+    print(f'parallel offset {true_offset}: estimate {result.value:.4f}, error {error:.4f} channels')
+
+    noise = np.random.default_rng(0).normal(0.0, 0.02 * float(sino.max()), sino.shape)
+    noisy_sino = (sino + noise).astype(np.float32)
+    noisy_result = estimate_det_channel_offset(_conjugate_parallel_model(0.0), noisy_sino)
+    noisy_error = _check_offset_result(noisy_result, true_offset, 0.1)
+    print(f'parallel offset {true_offset} with noise: error {noisy_error:.4f} channels')
+
+
+@pytest.mark.parametrize('true_offset', [1.3, -2.2])
+def test_estimate_det_channel_offset_on_cone_beam(true_offset):
+    """On cone-beam data at a full fan angle of 20 degrees the estimator recovers the offset to
+    better than half a channel.  The fan angle biases the estimate, so the error is printed."""
+    sino = _conjugate_sinogram('cone', true_offset)
+    result = estimate_det_channel_offset(_conjugate_cone_model(0.0), sino)
+    error = _check_offset_result(result, true_offset, 0.5)
+    print(f'cone offset {true_offset} at a 20 degree fan: estimate {result.value:.4f}, '
+          f'bias {error:.4f} channels')
+
+
+def test_estimate_det_channel_offset_follows_a_channel_roll():
+    """Rolling the sinogram by two channels raises the estimate by two channel pitches.  np.roll
+    moves whole samples, so the data are unchanged apart from the shift."""
+    true_offset = 1.3
+    sino = _conjugate_sinogram('cone', true_offset)
+    delta_det_channel = _conjugate_cone_model(0.0).get_params('delta_det_channel')
+
+    base = estimate_det_channel_offset(_conjugate_cone_model(0.0), sino)
+    rolled = estimate_det_channel_offset(_conjugate_cone_model(0.0), np.roll(sino, 2, axis=2))
+    difference = rolled.value - base.value
+    print(f'roll of 2 channels: {base.value:.4f} to {rolled.value:.4f}, '
+          f'difference {difference:.4f} against {2 * delta_det_channel}')
+    assert abs(difference - 2 * delta_det_channel) < 0.1
+
+
+def test_conjugate_difference_image():
+    """The difference image has the shape and type of the band the estimator compares.  At the
+    model's true offset its mean absolute value is at least three times smaller than at an offset
+    two channels away."""
+    true_offset = 1.3
+    sino = _conjugate_sinogram('cone', true_offset)
+    model = _conjugate_cone_model(true_offset)
+    estimate = estimate_det_channel_offset(_conjugate_cone_model(0.0), sino)
+
+    difference = conjugate_difference(model, sino)
+    assert difference.dtype == np.float32
+    assert difference.shape == estimate.reduction['sinogram_shape']
+    assert difference.shape[2] == 64
+
+    wrong_difference = conjugate_difference(model, sino, det_channel_offset=true_offset + 2.0)
+    at_true = float(np.mean(np.abs(difference)))
+    at_wrong = float(np.mean(np.abs(wrong_difference)))
+    print(f'conjugate difference mean absolute value: {at_true:.4f} at the true offset, '
+          f'{at_wrong:.4f} two channels away')
+    assert at_wrong >= 3.0 * at_true
+
+
+def test_conjugate_refusals(cone_model, cone_sino):
+    """Every input the conjugate-view functions document as refused raises: a half rotation, a
+    helical scan, a multiaxis model, an unknown method, a rotation candidate past five degrees, and
+    a detector rotation on a curved detector.  Estimating det_rotation is not available at all."""
+    half_turn_model = mbirtorch.ParallelBeamModel((NUM_VIEWS, NUM_ROWS, NUM_CHANNELS),
+                                                  np.linspace(0, np.pi, NUM_VIEWS, endpoint=False),
+                                                  compile_mode='off')
+    half_turn_model.configure_devices(devices=['cpu'])
+    half_turn_model.set_params(no_warning=True, verbose=0)
+    with pytest.raises(ValueError, match='full rotation'):
+        estimate_det_channel_offset(half_turn_model, cone_sino)
+
+    angles = np.linspace(0, 2 * np.pi, NUM_VIEWS, endpoint=False)
+    helical_model = mbirtorch.ConeBeamModel((NUM_VIEWS, NUM_ROWS, NUM_CHANNELS), angles,
+                                            source_detector_dist=4 * NUM_CHANNELS,
+                                            source_iso_dist=2 * NUM_CHANNELS,
+                                            helical_z_shifts=np.linspace(-2, 2, NUM_VIEWS),
+                                            compile_mode='off')
+    helical_model.configure_devices(devices=['cpu'])
+    helical_model.set_params(no_warning=True, verbose=0)
+    with pytest.raises(ValueError):
+        estimate_det_channel_offset(helical_model, cone_sino)
+
+    multiaxis_angles = np.column_stack([np.linspace(0, 2 * np.pi, NUM_VIEWS, endpoint=False),
+                                        np.zeros(NUM_VIEWS)]).astype(np.float32)
+    multiaxis_model = mbirtorch.MultiAxisParallelModel((NUM_VIEWS, NUM_ROWS, NUM_CHANNELS),
+                                                       multiaxis_angles, compile_mode='off')
+    multiaxis_model.configure_devices(devices=['cpu'])
+    multiaxis_model.set_params(no_warning=True, verbose=0)
+    with pytest.raises(ValueError):
+        estimate_det_channel_offset(multiaxis_model, cone_sino)
+
+    with pytest.raises(ValueError):
+        estimate_det_channel_offset(cone_model, cone_sino, method='residual')
+
+    with pytest.raises(ValueError, match='degree'):
+        estimate_det_rotation(cone_model, cone_sino, bounds=(-0.2, 0.2))
+
+    with pytest.raises(ValueError, match='degrees'):
+        parameter_sweep(cone_model, cone_sino, 'det_rotation', [0.0, 0.2])
+    parameter_sweep(cone_model, cone_sino, 'det_rotation', [0.0, 0.05])
+
+    curved_model = mbirtorch.ConeBeamModel((NUM_VIEWS, NUM_ROWS, NUM_CHANNELS), angles,
+                                           source_detector_dist=4 * NUM_CHANNELS,
+                                           source_iso_dist=2 * NUM_CHANNELS,
+                                           use_curved_detector=True, compile_mode='off')
+    curved_model.configure_devices(devices=['cpu'])
+    curved_model.set_params(no_warning=True, verbose=0)
+    with pytest.raises(ValueError):
+        conjugate_difference(curved_model, cone_sino, det_rotation=0.01)
+
+
+def test_search_minimum():
+    """The search finds the minimum of a smooth function, returns every evaluation sorted by
+    candidate, and notes a minimum at an edge of the bounds and more than one local minimum."""
+    best, candidates, scores, notes = _search_minimum(lambda x: (x - 0.37) ** 2, (-1.0, 1.0), 11,
+                                                      1e-3)
+    print(f'search minimum at {best:.6f}, {candidates.size} evaluations, notes {notes}')
+    assert abs(best - 0.37) < 1e-3
+    assert np.all(np.diff(candidates) > 0)
+    assert np.allclose(scores, (candidates - 0.37) ** 2)
+    assert notes == []
+
+    _, _, _, edge_notes = _search_minimum(lambda x: -abs(x), (-1.0, 1.0), 11, 1e-3)
+    print(f'edge notes {edge_notes}')
+    assert any('edge' in note for note in edge_notes)
+
+    _, _, _, double_notes = _search_minimum(lambda x: (x * x - 0.25) ** 2, (-1.0, 1.0), 11, 1e-3)
+    print(f'double minimum notes {double_notes}')
+    assert any('local minima' in note for note in double_notes)
+
+
+def test_angular_coverage():
+    """The coverage is the full circle minus the largest gap between distinct view angles.  Equally
+    spaced views over a full rotation cover 2 pi minus one spacing, views over a half rotation
+    cover pi minus one spacing, and two turns cover the same as one."""
+    spacing = 2 * np.pi / 32
+    full = _angular_coverage(np.linspace(0, 2 * np.pi, 32, endpoint=False))
+    half = _angular_coverage(np.linspace(0, np.pi, 32, endpoint=False))
+    two_turns = _angular_coverage(np.linspace(0, 4 * np.pi, 64, endpoint=False))
+    print(f'coverage: full {full:.9f}, half {half:.9f}, two turns {two_turns:.9f}')
+    assert abs(full - (2 * np.pi - spacing)) < 1e-9
+    assert abs(half - (np.pi - spacing / 2)) < 1e-9
+    assert abs(two_turns - full) < 1e-9
+
+
+def test_irregular_full_rotations_are_accepted():
+    """A full rotation with irregular spacing and a scan of two turns both pass the coverage rule,
+    which refuses only a scan whose largest gap between neighboring views is three times the
+    median gap."""
+    rng = np.random.default_rng(0)
+    jittered = np.linspace(0, 2 * np.pi, 64, endpoint=False) + rng.uniform(-0.4, 0.4, 64) * (2 * np.pi / 64)
+    two_turns = np.linspace(0, 4 * np.pi, 64, endpoint=False)
+    for angles in (jittered, two_turns):
+        model = mbirtorch.ParallelBeamModel((64, 8, 32), angles, compile_mode='off')
+        model.configure_devices(devices=['cpu'])
+        model.set_params(no_warning=True, verbose=0)
+        _require_conjugate_geometry(model, 'det_channel_offset')
+
+
+def test_fourier_shift_channels():
+    """A Fourier shift of one channel equals a roll of one channel, and a shift of zero returns the
+    input itself."""
+    array = np.random.default_rng(0).standard_normal((3, 4, 32)).astype(np.float32)
+    shifted = _fourier_shift_channels(array, 1.0)
+    difference = float(np.max(np.abs(shifted - np.roll(array, 1, axis=2))))
+    print(f'fourier shift against roll, max abs difference = {difference:.2e}')
+    assert difference < 1e-5
+    assert _fourier_shift_channels(array, 0.0) is array
+
+
+def test_conjugate_functions_do_not_change_the_caller_state(cone_model, cone_sino):
+    """The estimator and the difference image leave the model's parameters and the sinogram as they
+    were."""
+    params_before = _copy_params(cone_model.get_all_params())
+    sino_before = cone_sino.copy()
+
+    estimate_det_channel_offset(cone_model, cone_sino)
+    conjugate_difference(cone_model, cone_sino)
+
+    assert _params_equal(params_before, cone_model.get_all_params())
+    assert np.array_equal(cone_sino, sino_before)
+    assert cone_model.get_params('det_channel_offset') == 0.0
+
+
+# ── the rotation estimate ─────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize('geometry', ['parallel', 'cone'])
+def test_estimate_det_rotation_recovers_a_rotation(geometry):
+    """A rotation of 2 or -3 degrees applied to the sinogram is recovered to within 12 percent,
+    which is the accuracy the cubic resampling gives when the rotation displaces the edge pixel by
+    more than half a pixel.  A rotation of zero is recovered to within 0.05 degrees.  A rotation
+    of 0.3 degrees displaces the edge pixel of this detector by 0.17 pixels, and the estimate then
+    carries a warning about the sub-pixel regime."""
+    if geometry == 'parallel':
+        model = _conjugate_parallel_model(0.0)
+    else:
+        model = _conjugate_cone_model(0.0)
+    sino = _conjugate_sinogram(geometry, 0.0)
+    for true_degrees in (2.0, -3.0):
+        tilted = correct_det_rotation(sino, -np.radians(true_degrees))
+        result = estimate_det_rotation(model, tilted)
+        estimate = np.degrees(result.value)
+        print(f'{geometry} rotation {true_degrees:+.1f} degrees: estimate {estimate:+.3f}')
+        assert result.parameter == 'det_rotation' and result.method == 'conjugate'
+        assert abs(estimate - true_degrees) < 0.12 * abs(true_degrees)
+        assert result.reduction['search_notes'] == []
+    result = estimate_det_rotation(model, sino)
+    print(f'{geometry} rotation 0.0 degrees: estimate {np.degrees(result.value):+.4f}')
+    assert abs(np.degrees(result.value)) < 0.05
+    with pytest.warns(UserWarning, match='edge channels'):
+        result = estimate_det_rotation(model, correct_det_rotation(sino, -np.radians(0.3)))
+    print(f'{geometry} rotation 0.3 degrees: estimate {np.degrees(result.value):+.3f}, with a warning')
+
+
+def test_estimate_det_rotation_refuses_a_curved_detector(cone_sino):
+    """A curved detector cannot be rotated as a plane, so the rotation estimate refuses it."""
+    angles = np.linspace(0, 2 * np.pi, NUM_VIEWS, endpoint=False)
+    curved = mbirtorch.ConeBeamModel((NUM_VIEWS, NUM_ROWS, NUM_CHANNELS), angles,
+                                     source_detector_dist=4 * NUM_CHANNELS,
+                                     source_iso_dist=2 * NUM_CHANNELS, use_curved_detector=True,
+                                     compile_mode='off')
+    curved.configure_devices(devices=['cpu'])
+    curved.set_params(no_warning=True, verbose=0)
+    with pytest.raises(ValueError, match='curved'):
+        estimate_det_rotation(curved, cone_sino)
+
+
+def test_estimate_det_channel_offset_widens_its_range():
+    """A true offset outside the default window of four channels is still found, because the
+    window moves to center on the edge where the coarse minimum sits, at the same width.  A
+    range the caller gives is not moved, and the estimate then stops at its edge with a warning."""
+    sino = np.asarray(_conjugate_cone_model(7.5).forward_project(
+        mbirtorch.generate_3d_shepp_logan_low_dynamic_range(_conjugate_cone_model(7.5).get_params('recon_shape'))),
+        dtype=np.float32)
+    result = estimate_det_channel_offset(_conjugate_cone_model(0.0), sino)
+    print(f'offset 7.5 with a moved window: estimate {result.value:.4f}, bounds {result.reduction["bounds"]}')
+    assert abs(result.value - 7.5) < 0.1
+    assert result.reduction['bounds'][1] > 7.5 > result.reduction['bounds'][0]
+    assert result.reduction['bounds'][1] - result.reduction['bounds'][0] == pytest.approx(8.0)
+    with pytest.warns(UserWarning, match='edge'):
+        fixed = estimate_det_channel_offset(_conjugate_cone_model(0.0), sino, bounds=(-4.0, 4.0))
+    assert fixed.value == 4.0
+
+
+def test_estimate_det_channel_offset_on_golden_angle_views():
+    """A scan whose views advance by the golden angle over a full rotation has irregular gaps
+    between neighboring angles, no larger than 1.6 times the median.  The coverage rule accepts
+    it, the partner of each channel is interpolated across an irregular gap, and a known offset is
+    still recovered to within 0.1 channels on cone beam."""
+    num_views = 128
+    angles = np.mod(np.arange(num_views) * np.pi * (3.0 - np.sqrt(5.0)), 2 * np.pi)
+    sdd = 64 / 2 / np.tan(np.radians(10.0))
+
+    def model(offset):
+        m = mbirtorch.ConeBeamModel((num_views, 16, 64), angles, source_detector_dist=sdd,
+                                    source_iso_dist=sdd / 2, compile_mode='off')
+        m.configure_devices(devices=['cpu'])
+        m.set_params(no_warning=True, verbose=0, det_channel_offset=offset)
+        return m
+
+    generating = model(1.3)
+    sino = np.asarray(generating.forward_project(
+        mbirtorch.generate_3d_shepp_logan_low_dynamic_range(generating.get_params('recon_shape'))),
+        dtype=np.float32)
+    gaps = np.diff(np.append(np.sort(angles), np.sort(angles)[0] + 2 * np.pi))
+    result = estimate_det_channel_offset(model(0.0), sino)
+    print(f'golden angle: largest gap {gaps.max() / np.median(gaps):.2f} times the median, '
+          f'estimate {result.value:.4f} for a true 1.3')
+    assert abs(result.value - 1.3) < 0.1
+    assert result.reduction['search_notes'] == []
