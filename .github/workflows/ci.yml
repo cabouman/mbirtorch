@@ -45,6 +45,37 @@ jobs:
       - name: Run tests
         run: python -m pytest -n 4 tests ci
 
+  floor:
+    # The oldest supported torch, so the floor in pyproject is a tested fact rather than a
+    # claim.  The job installs pyproject's own torch requirement pinned to the floor minor
+    # (exclusions honored) from the CPU index, on the oldest matrix Python.  The floor moves
+    # only by the dependency watch's window rule (plans repo:
+    # plans/mbirtorch_metrics/torch_version_policy_plan.md).
+    needs: versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ fromJSON(needs.versions.outputs.test)[0] }}
+      - name: Install the floor torch from the CPU index
+        run: |
+          SPEC="$(python - <<'PY'
+          import re, tomllib
+          d = tomllib.load(open("pyproject.toml", "rb"))
+          dep = next(x.replace(" ", "") for x in d["project"]["dependencies"] if re.match(r"^torch\b", x))
+          m = re.match(r"torch>=([0-9.]+)(.*)", dep)
+          print(f"torch=={m.group(1)}.*{m.group(2)}")
+          PY
+          )"
+          echo "floor requirement: $SPEC"
+          pip install "$SPEC" --index-url https://download.pytorch.org/whl/cpu
+          python -c "import torch; print('torch', torch.__version__)"
+      - name: Install package and test extra
+        run: pip install -e ".[test]"
+      - name: Run tests
+        run: python -m pytest -n 4 tests ci
+
   docs:
     needs: versions
     runs-on: ubuntu-latest
