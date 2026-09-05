@@ -15,7 +15,8 @@ pp = pprint.PrettyPrinter(indent=4)
 
 def get_sino_and_model(dataset_dir, *, downsample_factor=(1, 1), subsample_view_factor=1,
                        crop_pixels_sides=0, crop_pixels_top=0, crop_pixels_bottom=0, alu_unit='mm',
-                       bg_option="global", zinger_correction=True, auto_crop=False, verbose=1):
+                       bg_option="global", zinger_correction=True, auto_crop=False,
+                       det_rotation=0.0, verbose=1):
     """
     Load a Zeiss Ultra/Versa scan dataset, compute its sinogram, and return a ready-to-reconstruct model.
 
@@ -41,6 +42,11 @@ def get_sino_and_model(dataset_dir, *, downsample_factor=(1, 1), subsample_view_
         zinger_correction (bool, optional): Detect and interpolate zinger pixels. Defaults to ``True``.
         auto_crop (bool, optional): If True, detect and remove blank sinogram margins after the sinogram
             is computed, shrinking the reconstruction. Defaults to False.
+        det_rotation (float, optional): Detector rotation in radians, applied to every view as the
+            sinogram is computed. This is the same rotation that
+            :func:`mbirtorch.preprocess.correct_det_rotation` applies. The value to pass is the estimate
+            returned by :func:`mbirtorch.preprocess.geometry_calibration.estimate_det_rotation`.
+            Defaults to ``0.0``, which leaves the views unrotated.
         verbose (int, optional): Verbosity level. Defaults to ``1``.
 
     Returns:
@@ -63,11 +69,11 @@ def get_sino_and_model(dataset_dir, *, downsample_factor=(1, 1), subsample_view_
         dataset_dir, downsample_factor=downsample_factor, subsample_view_factor=subsample_view_factor,
         crop_pixels_sides=crop_pixels_sides, crop_pixels_top=crop_pixels_top,
         crop_pixels_bottom=crop_pixels_bottom, alu_unit=alu_unit, bg_option=bg_option,
-        zinger_correction=zinger_correction, verbose=verbose)
+        zinger_correction=zinger_correction, det_rotation=det_rotation, verbose=verbose)
     return mtp.finalize_model(sino, required_params, optional_params, auto_crop=auto_crop)
 
 
-def _compute_sino_and_params(dataset_dir, downsample_factor=(1, 1), subsample_view_factor=1, crop_pixels_sides=0, crop_pixels_top=0, crop_pixels_bottom=0, alu_unit='mm', bg_option="global", zinger_correction=True, verbose=1):
+def _compute_sino_and_params(dataset_dir, downsample_factor=(1, 1), subsample_view_factor=1, crop_pixels_sides=0, crop_pixels_top=0, crop_pixels_bottom=0, alu_unit='mm', bg_option="global", zinger_correction=True, det_rotation=0.0, verbose=1):
     """
     Compute the sinogram and build_model-ready parameters from a Zeiss Ultra/Versa ``.txrm`` dataset.
 
@@ -88,6 +94,8 @@ def _compute_sino_and_params(dataset_dir, downsample_factor=(1, 1), subsample_vi
         alu_unit (str, optional): The physical unit used to define 1 ALU. Defaults to ``'mm'``.
         bg_option (str or None): Background offset correction (``None``, ``'global'``, ``'per_view'``). Defaults to ``'global'``.
         zinger_correction (bool, optional): Detect and interpolate zinger pixels. Defaults to ``True``.
+        det_rotation (float, optional): Detector rotation in radians, applied to every view as the
+            sinogram is computed. Defaults to ``0.0``.
         verbose (int, optional): Verbosity level. Defaults to ``1``.
 
     Returns:
@@ -117,7 +125,7 @@ def _compute_sino_and_params(dataset_dir, downsample_factor=(1, 1), subsample_vi
     if verbose > 0:
         print("\n\n########## Computing sinogram")
     sino = mtp.scan_to_sino(obj_scan, blank_scan, dark_scan, defective_pixel_array,
-                            downsample_factor=downsample_factor, det_rotation=0.0)
+                            downsample_factor=downsample_factor, det_rotation=det_rotation)
 
     if verbose > 0:
         print("\n\n########## Correcting any residual background sinogram offset")

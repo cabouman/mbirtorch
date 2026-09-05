@@ -73,8 +73,8 @@ class CalibrationResult(NamedTuple):
         parameter (str): the name of the estimated quantity, for example ``'det_channel_offset'``.
         value (float): the estimate.
         score (float): the score at the estimate.  Lower is better for every method here.
-        candidates (ndarray): the values that were scored, shape ``(num_candidates,)``.
-        scores (ndarray): the score at each candidate, shape ``(num_candidates,)``.
+        candidates (numpy.ndarray): the values that were scored, shape ``(num_candidates,)``.
+        scores (numpy.ndarray): the score at each candidate, shape ``(num_candidates,)``.
         method (str): the name of the scoring method.
         reduction (dict): the reduced problem the scores were computed on, as returned by
             :func:`build_reduced_problem`.
@@ -214,7 +214,7 @@ def build_reduced_problem(ct_model, *, view_stride=4, bin_factor=2, num_slab_sli
     The slab is selected differently per geometry.  In parallel beam detector row r is recon slice
     r, so the slab is a band of detector rows.  In cone beam and multiaxis parallel beam the slab is
     set through ``recon_shape`` and ``recon_slice_offset``.  The detector rows are then cropped to
-    the rows that rays through the slab can reach, which :func:`_slab_row_window` computes, and
+    the rows that rays through the slab can reach, which ``_slab_row_window`` computes, and
     the row offset is compensated for the crop.
 
     A thin slab makes a search cheap, and it has a cost.  Rays through the slab also cross material
@@ -601,15 +601,18 @@ def check_rotation_direction(ct_model, sino, *, view_stride=4, bin_factor=2):
     channel, and a direct reconstruction does not reproduce them.
 
     The score is the high-pass residual of a direct reconstruction over the central detector rows,
-    computed by :func:`_direct_residual_score`.  It runs on a reduced problem that keeps every
+    computed by ``_direct_residual_score``.  It runs on a reduced problem that keeps every
     fourth view and bins the detector by two, and that keeps the whole axial extent.  The whole
     extent is kept because a thin slab cannot explain the measurements that pass through material
     outside it, and on synthetic scans that unexplained part hid the difference between the two
-    directions.  The separation grows with the fan angle, so the check is most reliable on a scan
-    with a wide fan.  Both scores are returned so the caller can see the margin, and the function
-    warns when the worse score is less than 1.5 times the better one.  That threshold is
-    provisional.  The scores depend on the size of the reduced problem and on the fixed pixel
-    widths of the high-pass filter, so a ratio measured on one scan does not transfer to another.
+    directions.  On synthetic scans the separation grows with the fan angle.  On real scans it also
+    depends on the scale of the high-pass filter, whose widths are fixed in pixels.  On one real
+    scan of 200 views the default binning left the score dominated by pixel-scale noise, and the
+    check gave the wrong answer with a small margin; a ``bin_factor`` of 8 gave the right answer
+    with a margin of 3.7.  Both scores are returned so the caller can see the margin, and the
+    function warns when the worse score is less than 1.5 times the better one.  Treat an answer
+    that comes with that warning as undecided, and try a larger ``bin_factor``.  The threshold is
+    provisional, and a ratio measured on one scan does not transfer to another.
 
     Only cone beam is supported.  For parallel beam, negating the angles mirrors
     the reconstruction and changes nothing else, so the direction cannot be decided from the data.
@@ -660,8 +663,9 @@ def check_rotation_direction(ct_model, sino, *, view_stride=4, bin_factor=2):
     if ratio < _DIRECTION_MIN_RATIO:
         warnings.warn(f'check_rotation_direction: the worse direction scored only {ratio:.2f} times '
                       f'the better one, below the margin of {_DIRECTION_MIN_RATIO} that the check '
-                      'expects.  The answer may be unreliable; a narrow fan angle gives a small '
-                      'margin.')
+                      'expects.  Treat the answer as undecided.  A small margin comes from a narrow '
+                      'fan angle or from a score dominated by pixel-scale noise, and a larger '
+                      'bin_factor raises the margin in the second case.')
     return CalibrationResult(parameter='rotation_direction', value=float(candidates[best]),
                              score=float(scores[best]), candidates=candidates, scores=scores,
                              method='direct_residual', reduction=reduction)
@@ -725,7 +729,7 @@ def apply_calibration(ct_model, sino, results):
         sino (ndarray or tensor): the sinogram, changed in place when a rotation is applied.  A host
             array must be writable and floating point.
         results (CalibrationResult, or dict or sequence of CalibrationResult): the results to apply.
-            A dict is read for its values, as :func:`calibrate_geometry` returns one.
+            A dict is read for its values, so a mapping from parameter name to result is accepted.
 
     Returns:
         tuple: ``(ct_model, sino)``, the same two objects after the changes.
@@ -823,7 +827,12 @@ def _require_conjugate_geometry(ct_model, parameter, det_rotation=0.0):
     if gaps.max() > max(_CONJUGATE_MAX_GAP_RATIO * np.median(gaps), _CONJUGATE_MAX_GAP):
         raise ValueError('The conjugate-view method needs views over a full rotation.  The angles '
                          f'cover {math.degrees(2 * np.pi - gaps.max()):.1f} degrees, with a gap of '
-                         f'{math.degrees(gaps.max()):.1f} degrees between neighboring views.')
+                         f'{math.degrees(gaps.max()):.1f} degrees between neighboring views.  An '
+                         'automatic estimate for a scan without a full rotation is not available '
+                         'yet, and parameter_sweep reconstructs one slice per candidate value so '
+                         'the value can be chosen by eye.  On a short scan those slices carry '
+                         'limited-angle artifacts at every candidate, because the direct '
+                         'reconstruction applies no short-scan weighting.')
     if det_rotation != 0.0:
         _check_det_rotation(det_rotation)
         if kind == 'cone' and ct_model.get_params('use_curved_detector'):
@@ -1162,8 +1171,8 @@ def estimate_det_channel_offset(ct_model, sino, *, method='auto', bounds=None, n
         ct_model (TomographyModel): a parallel or cone model.  Not modified.
         sino (ndarray or tensor): the sinogram.  Not modified.
         method (str, optional): ``'auto'`` or ``'conjugate'``.  Both select the conjugate-view
-            method.  A scan the method cannot serve raises; a later method will be the fallback.
-            Defaults to ``'auto'``.
+            method.  A scan the method cannot serve raises.  For such a scan, use
+            :func:`parameter_sweep` and choose the value by eye.  Defaults to ``'auto'``.
         bounds (tuple of float, optional): the search range in ALU.  None (the default) is a window
             of four channels on each side of the model's current value.  When the coarse minimum
             sits at an edge of that window, the window moves to center on the edge, at the same
@@ -1258,9 +1267,15 @@ def estimate_det_channel_offset(ct_model, sino, *, method='auto', bounds=None, n
 
 
 # Defaults of the rotation estimate.  The search covers the five degree cap on each side of zero
-# and stops at this many radians.  Below this edge displacement, in pixels, the estimate is in the
-# regime where the resampling of a candidate angle biases it, and the function warns.  On the
-# cluster the error was 4.5 percent at 0.89 pixels and under 0.5 percent from 1.34 pixels upward.
+# and stops at this many radians.  The second value is an edge displacement in pixels, and the
+# function warns below it.  Below one pixel of edge displacement the estimate is uncertain.  On
+# synthetic data at 512 and 1024 channels its error left under 0.06 pixels at the detector edge.
+# On real scans the estimate followed known rotations added to the data with a slope of one, but on
+# one scan it read 0.044 degrees where direct reconstructions showed the vendor's recorded tilt of
+# 0.167 degrees to be right, so the synthetic figure is not a bound on the zero point.  Applying a
+# rotation this small also
+# resamples the whole sinogram bilinearly, which is a cost the user weighs against the
+# misregistration the correction removes.
 _CONJUGATE_ROTATION_TOLERANCE = math.radians(0.005)
 _CONJUGATE_MIN_EDGE_DISPLACEMENT = 1.0
 
@@ -1318,14 +1333,22 @@ def estimate_det_rotation(ct_model, sino, *, method='auto', bounds=None, num_coa
     when the rotation displaces the edge pixel of the detector by less than about one pixel.  On
     synthetic data at 512 and 1024 channels the cubic kernel's bias was 10 to 24 percent of the
     angle below half a pixel of edge displacement, 4.5 percent at 0.89 pixels, and under 0.5
-    percent from 1.34 pixels upward.  The function warns when the estimate displaces the edge
-    pixel by less than one pixel.  A rotation handled inside the projectors would need no
-    resampling.
+    percent from 1.34 pixels upward.  Those figures do not transfer to every detector or object.
+    On real scans the estimate followed known rotations added to the data with a slope of one, but
+    its zero point depended on the object.  On a scan whose structure ran along the detector rows it
+    read 0.044 degrees where direct reconstructions showed the vendor's recorded tilt of 0.167
+    degrees to be right, and on the same object with a metal insert it read 0.149 degrees.  Prefer
+    the vendor's tilt when the reader supplies one, and check the slices far from the central plane,
+    which a detector rotation displaces most, before applying an estimate.  The function warns when
+    the estimate displaces the edge pixel by less than one pixel.  A rotation handled inside the
+    projectors would need no resampling.
 
     Args:
         ct_model (TomographyModel): a parallel or flat-detector cone model.  Not modified.
         sino (ndarray or tensor): the sinogram.  Not modified.
-        method (str, optional): ``'auto'`` or ``'conjugate'``.  Defaults to ``'auto'``.
+        method (str, optional): ``'auto'`` or ``'conjugate'``.  Both select the conjugate-view
+            method.  A scan the method cannot serve raises.  For such a scan, use
+            :func:`parameter_sweep` and choose the value by eye.  Defaults to ``'auto'``.
         bounds (tuple of float, optional): the search range in radians, within five degrees of
             zero.  None (the default) is the full five degrees on each side.
         num_coarse (int, optional): candidates in the coarse pass.  Defaults to 11.
@@ -1372,8 +1395,15 @@ def estimate_det_rotation(ct_model, sino, *, method='auto', bounds=None, num_coa
                                                       _CONJUGATE_ROTATION_TOLERANCE)
     edge_displacement = abs(best) * problem.num_channels / 2.0
     if edge_displacement < _CONJUGATE_MIN_EDGE_DISPLACEMENT:
-        notes.append(f'the estimate displaces the edge channels by {edge_displacement:.2f} pixels, '
-                     'where the resampling of each candidate biases it by up to 25 percent of the angle')
+        notes.append(f'the estimate displaces the edge channels by {edge_displacement:.2f} pixels. '
+                     'Below one pixel of edge displacement the estimate is uncertain. On synthetic '
+                     'data at 512 and 1024 channels its error left under 0.06 pixels at the detector '
+                     'edge. On one real scan the estimate was 0.044 degrees where direct '
+                     'reconstructions showed the vendor\'s recorded tilt of 0.167 degrees to be '
+                     'right, so prefer the vendor\'s tilt when the reader supplies one and check '
+                     'the slices far from the central plane. Applying a rotation this small also '
+                     'resamples the whole sinogram bilinearly, so weigh that blur against the '
+                     'misregistration the correction removes')
     for note in notes:
         warnings.warn(f'estimate_det_rotation: {note}.')
     record = dict(problem.reduction, num_pairs=problem.num_views, pairs_kept=int(keep.size),

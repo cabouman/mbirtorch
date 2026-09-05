@@ -35,6 +35,8 @@ Each is short and self-contained; adjust the parameters near the top and rerun t
      - Physical units (ALUs), detector spacing, voxel shape, and auto_set_recon_geometry().
    * - ``demo_9_denoiser.py``
      - The qGGMRF denoiser applied to a noisy 3D image.
+   * - ``demo_10_geometry_calibration.py``
+     - Estimating the center of rotation and the detector rotation from the sinogram, and the effect of the correction on the reconstruction.
 
 
 Data Generation
@@ -98,9 +100,13 @@ A:  If your reconstruction is blurry, the first thing to try is to increase the 
 You can also increase the assumed SNR by setting the parameter ``snr_db=35`` or ``snr_db=40``. This is similar to increasing sharpness but will also create higher contrast edges in the reconstruction.
 
 If the reconstruction remains blurry, it is often the case that some geometry parameter is incorrectly set for your data.
-Typical problems include an incorrect center of rotation (change ``det_channel_offset``), incorrect rotation direction
-(reverse the angles using ``angles[::-1]``), or an incorrect ``source_detector_dist`` or  ``source_iso_dist`` for
-cone beam reconstructions.
+A common problem is an incorrect center of rotation, which is the parameter ``det_channel_offset``.
+You can estimate that parameter from the sinogram with
+:func:`~mbirtorch.preprocess.geometry_calibration.estimate_det_channel_offset`, or you can reconstruct one slice per
+candidate value with :func:`~mbirtorch.preprocess.geometry_calibration.parameter_sweep` and choose the value by eye.
+The next thing to check is the rotation direction, which
+:func:`~mbirtorch.preprocess.geometry_calibration.check_rotation_direction` decides from the sinogram.
+A blurry cone beam reconstruction can also come from an incorrect ``source_detector_dist`` or ``source_iso_dist``.
 
 Q: How can I do larger reconstructions?
 +++++++++++++++++++++++++++++++++++++++
@@ -141,12 +147,16 @@ We provide simple preprocessing utilities in ``mbirtorch.preprocess`` for doing 
 
 In cone-beam scans, it is sometimes the case that the rotation direction is reversed.
 The symptom is a reconstruction that is subtly warped, with shapes distorted and the top and
-bottom of the object mirrored.  You can correct this by taking the negative of your view
-angles, or equivalently reversing their order with ``angles[::-1]``.
+bottom of the object mirrored.  The function
+:func:`~mbirtorch.preprocess.geometry_calibration.check_rotation_direction` decides the direction from the sinogram
+and reports the margin between the two answers.  You can also correct the direction by hand, by taking the negative
+of your view angles, or equivalently by reversing their order with ``angles[::-1]``.
 
 A common artifact is rings near the center of the reconstruction that are generated when the center-of-rotation is
-not in the center of the detector.  This can be corrected by setting the parameter ``det_channel_offset`` to reposition
-the center-of-rotation.
+not in the center of the detector.  The parameter that repositions the center-of-rotation is ``det_channel_offset``.
+Estimate it from the sinogram with :func:`~mbirtorch.preprocess.geometry_calibration.estimate_det_channel_offset`,
+or choose it from the slices that :func:`~mbirtorch.preprocess.geometry_calibration.parameter_sweep` reconstructs,
+and apply it with :func:`~mbirtorch.preprocess.geometry_calibration.apply_calibration`.
 
 If your reconstruction is blurry, see the FAQ above.
 
