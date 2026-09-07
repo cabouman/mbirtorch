@@ -142,9 +142,10 @@ The estimators were checked on synthetic data and on real scans from an NSI scan
 Versa scanner.  On the real scans the channel offset agreed with the vendor's value to better than
 a tenth of a channel.  The detector rotation estimate followed known rotations added to the real
 scans with a slope of one, but its zero point depended on the object.  On one scan it read 0.044
-degrees where direct reconstructions showed the vendor's recorded tilt of 0.167 degrees to be
-right.  When the reader supplies a tilt, prefer it, and check the slices far from the central plane
-before applying an estimate, because a detector rotation displaces those slices most.  The
+degrees.  A fine sweep of directly reconstructed slices far from the central plane put the detector
+rotation of that scan near 0.15 degrees, and the vendor's recorded tilt was 0.167 degrees.  When
+the reader supplies a tilt, prefer it, and check the slices far from the central plane before
+applying an estimate, because a detector rotation displaces those slices most.  The
 rotation-direction
 check gave the right answer whenever its margin was above its warning threshold, and it warned on
 the one scan where it did not.  Treat an answer that comes with the warning as undecided.

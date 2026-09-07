@@ -1,24 +1,16 @@
 """Geometric calibration from the sinogram.
 
-The functions here run after a scanner reader's ``get_sino_and_model`` and before
-reconstruction.  They estimate scan geometry that the vendor metadata got wrong or left out, and
-they show a user the evidence behind an estimate.  This module includes the reduced problem
-that every estimator runs on, a parameter sweep that reconstructs one slice per candidate value,
-a rotation-direction check, the conjugate-view estimators for ``det_channel_offset`` and
-``det_rotation``, and the one function that applies a result.
-
-Every function takes the sinogram and the model and works through the model's own
-``forward_project``, ``back_project``, and ``recon_direct``.  No function here changes the caller's
-model or sinogram except :func:`apply_calibration`, which is documented as the one that does.
+The functions here estimate scan geometry that the vendor metadata got wrong or left out, and they
+show the evidence behind an estimate.  Only :func:`apply_calibration` changes the caller's model or
+sinogram.
 
 The order of preprocessing matters.  Run in this order:
  1. defective-pixel interpolation, background offset correction, and stripe removal
  2. the functions here
  3. ``align_sino_views``.
-Stripe removal comes first because a gain stripe sits at a fixed channel and a geometry estimate
-would take it for a feature of the object.  ``align_sino_views`` comes last because it shifts each
-view on its own.  A wrong ``det_channel_offset`` looks like a per-view shift, so aligning first
-would remove part of the error a calibration is meant to find.
+Stripe removal comes first because a gain stripe sits at a fixed channel, and a geometry estimate
+would take it for a feature of the object.  ``align_sino_views`` comes last because a wrong
+``det_channel_offset`` looks like a per-view shift, which aligning first would partly remove.
 """
 
 import math
@@ -45,9 +37,8 @@ __all__ = ['CalibrationResult', 'build_reduced_problem', 'reduce_sinogram', 'par
 # by resampling the sinogram, and the sweep does that per candidate.
 _SWEEP_PARAMETERS = ('det_channel_offset', 'det_row_offset', 'det_rotation')
 
-# Views of the full sinogram read per step when a reduced sinogram is built.  One step's block
-# holds this many views by the kept rows, plus the rotation margin when there is one, by every
-# channel, so the transient stays small at any sinogram size.
+# Views of the full sinogram read per step when a reduced sinogram is built.  The block held per
+# step is this many views by the kept rows by every channel, so the transient stays small.
 _REDUCE_VIEW_BATCH = 64
 
 # Views rotated per step when a detector rotation is applied in place.
@@ -117,22 +108,15 @@ def _is_helical(ct_model):
 def _slab_row_window(ct_model, z_lo, z_hi, binned_row_margin=0):
     """The detector rows ``[lo, hi)`` that any ray through the slab ``z_lo <= z <= z_hi`` can reach.
 
-    The window is computed from the model's own geometry, so a sinogram cropped to it carries every
-    measurement the slab contributes to.  Cropping to the window makes the reduced problem small.
-    It also removes most of the measurements that come only from material outside the slab.
-
-    For cone beam a voxel at axial position z lands on the detector at height ``v = z * pixel_mag``.
-    The magnification ``pixel_mag`` depends on the voxel's in-plane depth, and its range over the
-    support is ``ConeBeamModel.pixel_magnification_bounds``, which is also what the axial padding
-    in ``ConeBeamModel.auto_set_recon_geometry`` uses in the other direction, from rows to z.  For
-    multiaxis parallel beam a voxel at axial position z and in-plane depth y lands at
-    ``v = z * cos(elevation) + y * sin(elevation)``, with ``|y| <= r`` for the support radius
-    ``r``, as ``_multiaxis_vertical_terms`` writes it.  In both geometries the detector row of a
-    height v is ``(v + det_row_offset) / delta_det_row + center_row``.
-
-    The window takes the extreme v over the slab's two faces and the support.  It then widens that
-    range by one voxel's vertical footprint at each end, by one row below and two above for the
-    rounding, and by ``binned_row_margin`` rows at each end.
+    A sinogram cropped to this window carries every measurement the slab contributes to, which
+    makes the reduced problem small.  For cone beam a voxel at axial position z lands on the
+    detector at height ``v = z * pixel_mag``, where ``pixel_mag`` ranges over
+    ``ConeBeamModel.pixel_magnification_bounds``.  For multiaxis parallel beam a voxel at axial
+    position z and in-plane depth y lands at ``v = z * cos(elevation) + y * sin(elevation)``, with
+    ``|y| <= r`` for the support radius ``r``.  In both geometries the detector row of a height v is
+    ``(v + det_row_offset) / delta_det_row + center_row``.  The window takes the extreme v over the
+    slab's two faces and the support, then widens it by one voxel's vertical footprint at each end,
+    by one row below and two above for the rounding, and by ``binned_row_margin`` rows at each end.
 
     Args:
         ct_model: a cone or multiaxis model.
@@ -202,32 +186,22 @@ def build_reduced_problem(ct_model, *, view_stride=4, bin_factor=2, num_slab_sli
     """Build the smaller model that a calibration search scores candidates on.
 
     The reduced model keeps every ``view_stride``-th view, bins the detector by ``bin_factor`` in
-    rows and in channels, and reconstructs a thin slab of ``num_slab_slices`` slices centered on
-    recon slice ``slice_index`` of the full model.  Each of the three reductions keeps the geometry
-    in ALU unchanged, so a value estimated on the reduced model applies to the full model as it is.
-    The detector pitches are multiplied by the bin factor, and the reconstruction geometry is
-    recomputed from them, so the reduced model's field of view equals the full model's.  The
-    detector offsets are in ALU and do not change.  The bin factor must divide the row and channel
-    counts exactly.  A dropped leftover channel would move the detector center by half a bin, and
-    that is a bias in ``det_channel_offset`` of the size this module exists to find.
+    rows and in channels, and reconstructs a slab of ``num_slab_slices`` slices around recon slice
+    ``slice_index`` of the full model.  Each reduction leaves the geometry in ALU unchanged, so a
+    value estimated on the reduced model applies to the full model as it is.  The bin factor must
+    divide the row and channel counts exactly, because a dropped leftover channel would move the
+    detector center by half a bin.
 
-    The slab is selected differently per geometry.  In parallel beam detector row r is recon slice
-    r, so the slab is a band of detector rows.  In cone beam and multiaxis parallel beam the slab is
-    set through ``recon_shape`` and ``recon_slice_offset``.  The detector rows are then cropped to
-    the rows that rays through the slab can reach, which ``_slab_row_window`` computes, and
-    the row offset is compensated for the crop.
+    The slab is chosen per geometry.  In parallel beam detector row r is recon slice r, so the slab
+    is a band of detector rows.  In cone beam and multiaxis parallel beam the slab is set through
+    ``recon_shape`` and ``recon_slice_offset``, and the detector rows are cropped to the rows that
+    rays through the slab can reach.  Rays through a slab also cross material outside it, which no
+    score can explain, so a caller that needs the whole axial extent passes
+    ``num_slab_slices=None``.  A helical cone-beam scan always keeps the whole extent, because
+    every ray through a slab comes from a different axial position.
 
-    A thin slab makes a search cheap, and it has a cost.  Rays through the slab also cross material
-    outside it, which the slab does not represent.  A score that compares the data with a
-    projection of the slab therefore carries a term that the slab cannot explain.  A caller that
-    needs the whole axial extent passes ``num_slab_slices=None``, which keeps every detector row
-    and the automatic slice count.  A helical cone-beam scan always keeps the whole extent,
-    because every ray through a slab comes from a different axial position.
-
-    The reduced model is pinned to the full model's lead device, so the scores are reproducible and
-    the model does not run its own device search.  It inherits the full model's ``compile_mode``.
-    A caller-supplied ``use_ror_mask`` array has the full model's shape and cannot serve the
-    reduced one, so the reduced model uses the default mask instead.
+    The reduced model runs on the full model's lead device with the full model's ``compile_mode``,
+    and it uses the default ``use_ror_mask`` because a caller's mask has the full model's shape.
 
     Args:
         ct_model (TomographyModel): a cone, parallel, or multiaxis parallel model.  Not modified.
@@ -244,9 +218,9 @@ def build_reduced_problem(ct_model, *, view_stride=4, bin_factor=2, num_slab_sli
             Parallel beam ignores it.  Defaults to 0.
 
     Returns:
-        tuple: ``(reduced_model, reduction)``.  ``reduction`` is a dict that records the reduction,
-        and it is what :func:`reduce_sinogram` needs to reduce a sinogram or a weights array to
-        match.  Its entries are these:
+        tuple: ``(reduced_model, reduction)``.  ``reduction`` records the reduction, and it is what
+        :func:`reduce_sinogram` needs to reduce a sinogram or a weights array to match.  Its
+        entries are these:
 
         - ``'geometry'``, ``'view_stride'``, ``'bin_factor'``;
         - ``'row_window'``, the full-resolution rows kept, as ``(lo, hi)``;
@@ -256,8 +230,8 @@ def build_reduced_problem(ct_model, *, view_stride=4, bin_factor=2, num_slab_sli
         - ``'num_slab_slices'`` and ``'slab_z_center'``, which is None unless a cone or multiaxis
           slab was selected;
         - ``'det_row_offset_shift'``, what the row crop added to the reduced model's
-          ``det_row_offset``, so that a candidate value for the full model is set on the reduced
-          model as the candidate plus this shift;
+          ``det_row_offset``, so a candidate value for the full model is set on the reduced model
+          as the candidate plus this shift;
         - ``'full_sinogram_shape'``, ``'sinogram_shape'``, ``'recon_shape'``, and ``'devices'``.
 
     Raises:
@@ -386,12 +360,9 @@ def reduce_sinogram(sino, reduction, *, det_rotation=0.0):
     The reduction keeps every ``view_stride``-th view, crops the rows to the reduced model's row
     window, and averages each ``bin_factor`` by ``bin_factor`` block of detector pixels.  A nonzero
     ``det_rotation`` rotates the kept rows first, at full resolution and about the full detector's
-    center, so the result equals a crop of the rotated full sinogram.  The full sinogram is read in
-    view batches and never copied whole, and the result is a small new array.
-
-    A weights array reduced this way holds the mean weight of each bin.  For inverse-variance
-    weights the weight of a binned measurement would be ``bin_factor ** 2`` times that mean.  The
-    factor is the same for every candidate, so it does not change which candidate scores lowest.
+    center, so the result equals a crop of the rotated full sinogram.  A reduced weights array
+    holds the mean weight of each bin, which is a fixed factor away from the inverse-variance
+    weight and so does not change which candidate scores lowest.
 
     Args:
         sino (ndarray or tensor): the full sinogram, shape ``reduction['full_sinogram_shape']``.  A
@@ -457,19 +428,12 @@ def parameter_sweep(ct_model, sino, parameter, values, *, slice_index=None, filt
     This is the manual calibration workflow.  A user looks at the stack in the slice viewer, picks
     the candidate whose slice is sharpest or free of rings, and sets the value on the model.  Each
     slice is a direct reconstruction from every view at the full channel resolution, with no view
-    stride and no binning.  For a parallel or circular cone-beam scan it comes from a one-slice
-    problem built with :func:`build_reduced_problem`, whose detector is cropped to the rows that
-    rays through the slice can reach.  Each candidate then costs one filter pass over those rows
-    and one back projection into one slice.  The row crop is small for a slice near the center of
-    the volume and grows with the slice's distance from it, because the cone widens.  A helical
-    scan keeps every row and every slice, and the requested slice is read out of the whole volume.
+    stride and no binning.  For a parallel or circular cone-beam scan the detector is cropped to
+    the rows that rays through the slice can reach, so each candidate costs one filter pass over
+    those rows and one back projection into one slice.  A helical scan keeps every row and every
+    slice, and the requested slice is read out of the whole volume.
 
-    Until the detector offsets become call-time inputs of the projectors, setting one on the
-    reduced model rebuilds its projector bindings, and the first changed value costs one retrace of
-    the compiled projection bodies.  Later values do not.
-
-    The candidate index is the last axis, which is the axis the slice viewer pages through by
-    default::
+    The candidate index is the last axis, the axis the slice viewer pages through by default::
 
         from mbirtorch.preprocess import geometry_calibration
         values = np.linspace(-4.0, 4.0, 17)
@@ -482,10 +446,8 @@ def parameter_sweep(ct_model, sino, parameter, values, *, slice_index=None, filt
             Not modified.
         parameter (str): ``'det_channel_offset'`` or ``'det_row_offset'``, in ALU, or
             ``'det_rotation'``, in radians.  ``det_row_offset`` is refused for parallel beam, which
-            does not use it.  A row-offset sweep on a cone-beam scan shows the object at a
-            different height in each candidate, because a wrong row offset shifts the volume.  Its
-            sharpness changes only in proportion to the cone angle, so the stack is a way to see
-            where the object sits rather than a way to pick the offset by sharpness.
+            does not use it.  A row-offset sweep shows the object at a different height in each
+            candidate, so read the stack for where the object sits rather than for sharpness.
             ``det_rotation`` is refused for a curved detector, whose channel coordinate is an arc
             rather than a distance in the detector plane.
         values (sequence of float): the candidate values.
@@ -527,6 +489,7 @@ def parameter_sweep(ct_model, sino, parameter, values, *, slice_index=None, filt
     recon_rows, recon_cols, _ = reduction['recon_shape']
     slice_in_slab = reduction['slice_in_slab']
     stack = np.empty((recon_rows, recon_cols, values.size), dtype=np.float32)
+    # Setting an offset rebuilds the projector bindings, so the first changed value retraces once.
     for k, value in enumerate(values):
         if parameter == 'det_rotation':
             sino_reduced = reduce_sinogram(sino, reduction, det_rotation=float(value))
@@ -547,17 +510,11 @@ def _direct_residual_score(ct_model, sino, filtered_sino=None, row_fraction=0.5)
     The model reconstructs the sinogram directly, forward projects the result, and high-pass
     filters both the sinogram and the projection with ``sino_high_pass_filtering``.  The score is
     the mean squared difference divided by the mean squared filtered sinogram.  A direct
-    reconstruction is one filtered back projection and does not iterate against the data, so the
-    residual measures how consistent the data are with the model's geometry.  The high-pass filter
-    removes the smooth mismatch that scatter, cupping, and the cone-beam approximation leave, and
-    it keeps the edges that a geometry error displaces.
-
-    The residual is taken over the central ``row_fraction`` of the detector rows.  The direct
-    reconstruction's own error grows with the cone angle, so the outer rows add error that has
-    nothing to do with the geometry under test.  On synthetic cone-beam scans, restricting the
-    residual from every row to the central half raised the ratio of the wrong-direction score to
-    the right-direction score by a factor of 1.35 to 2.3.  Narrower bands changed the ratio by
-    less than 20 percent.
+    reconstruction does not iterate against the data, so the residual measures how consistent the
+    data are with the model's geometry.  The high-pass filter removes the smooth mismatch that
+    scatter, cupping, and the cone-beam approximation leave, and it keeps the edges that a geometry
+    error displaces.  Only the central ``row_fraction`` of the detector rows is scored, because the
+    direct reconstruction's own error grows with the cone angle.
 
     Args:
         ct_model: the reduced model.
@@ -584,40 +541,31 @@ def _direct_residual_score(ct_model, sino, filtered_sino=None, row_fraction=0.5)
 
 
 # The ratio of the worse direction's score to the better one below which check_rotation_direction
-# warns that its answer rests on a small margin.  The value is provisional.  The smallest ratio seen
-# on synthetic data was 2.2, at 32 views, 16 rows, and 32 channels, and the ratio falls with the
-# fan angle, so a narrow-fan scan may sit below it.
+# warns that its answer rests on a small margin.  The value is provisional, and the ratio falls
+# with the fan angle, so a narrow-fan scan may sit below it.
 _DIRECTION_MIN_RATIO = 1.5
 
 
 def check_rotation_direction(ct_model, sino, *, view_stride=4, bin_factor=2):
     """Decide whether the view angles run in the right direction for a cone-beam scan.
 
-    A reversed rotation direction is a common metadata failure, and its symptom is a
-    reconstruction that is subtly warped rather than obviously wrong.  The check scores the
-    geometry as given and the geometry with every view angle negated, and reports which scores
-    lower.  With the wrong direction each measurement is assigned to a ray whose angle is off by
-    twice its fan angle.  The data are then inconsistent with the model away from the center
-    channel, and a direct reconstruction does not reproduce them.
+    A reversed rotation direction is a common metadata failure, and its symptom is a reconstruction
+    that is subtly warped rather than obviously wrong.  The check reconstructs the data directly
+    with the angles as given and again with every angle negated, scores each reconstruction by its
+    high-pass residual over the central detector rows, and reports which scores lower.  With the
+    wrong direction each measurement is assigned to a ray whose angle is off by twice its fan
+    angle, so the reconstruction cannot reproduce the data away from the center channel.  Both
+    reconstructions cover the whole axial extent, because a thin slab cannot explain the rays that
+    cross material outside it.
 
-    The score is the high-pass residual of a direct reconstruction over the central detector rows,
-    computed by ``_direct_residual_score``.  It runs on a reduced problem that keeps every
-    fourth view and bins the detector by two, and that keeps the whole axial extent.  The whole
-    extent is kept because a thin slab cannot explain the measurements that pass through material
-    outside it, and on synthetic scans that unexplained part hid the difference between the two
-    directions.  On synthetic scans the separation grows with the fan angle.  On real scans it also
-    depends on the scale of the high-pass filter, whose widths are fixed in pixels.  On one real
-    scan of 200 views the default binning left the score dominated by pixel-scale noise, and the
-    check gave the wrong answer with a small margin; a ``bin_factor`` of 8 gave the right answer
-    with a margin of 3.7.  Both scores are returned so the caller can see the margin, and the
-    function warns when the worse score is less than 1.5 times the better one.  Treat an answer
-    that comes with that warning as undecided, and try a larger ``bin_factor``.  The threshold is
-    provisional, and a ratio measured on one scan does not transfer to another.
+    Both scores are returned, so the caller can see the margin between them.  The function warns
+    when the worse score is less than 1.5 times the better one, and an answer that comes with that
+    warning is undecided.  A larger ``bin_factor`` raises the margin when the score is dominated by
+    pixel-scale noise.
 
-    Only cone beam is supported.  For parallel beam, negating the angles mirrors
-    the reconstruction and changes nothing else, so the direction cannot be decided from the data.
-    For multiaxis parallel beam with nonzero elevation the two directions do differ, and the check
-    does not support that geometry yet.  A helical scan is refused as well.
+    Only cone beam is supported.  In parallel beam, negating the angles mirrors the reconstruction
+    and changes nothing else, so the direction cannot be decided from the data.  A multiaxis
+    parallel model and a helical scan are refused.
 
     Args:
         ct_model (ConeBeamModel): the model.  Not modified.
@@ -863,37 +811,28 @@ def _fourier_shift_channels(array, shift, spectrum=None):
 class _ConjugatePairs:
     """The data behind a conjugate-view score.
 
-    An instance holds a band of detector rows from every kept view.  For each kept view and
-    channel it records which view holds the opposite ray.  The opposite of the ray at view angle
-    ``beta`` and fan angle ``gamma`` lies at view angle ``beta + pi - 2 * gamma`` and fan angle
-    ``-gamma``, in the sign conventions of ``cone_beam._cone_pixel_xy_mag``.  Parallel beam is the
-    case ``gamma = 0``.  The partner view is interpolated linearly between the two kept views
-    nearest that angle.
+    An instance holds a band of detector rows from every kept view, and, for each kept view and
+    channel, which view holds the opposite ray.  The opposite of the ray at view angle ``beta`` and
+    fan angle ``gamma`` lies at view angle ``beta + pi - 2 * gamma`` and fan angle ``-gamma``, in
+    the sign conventions of ``cone_beam._cone_pixel_xy_mag``.  Parallel beam is the case
+    ``gamma = 0``.  The partner view is interpolated linearly between the two kept views nearest
+    that angle.
 
     The reference views are every view at the record's view stride, and their partners are drawn
-    from every view.  A stride therefore thins the references without moving any partner, so it
-    saves memory at the cost of fewer pairs and does not blur the partners.  Every view is a
-    reference at stride 1, so each unordered pair is compared from both sides.  Comparing each pair
-    from one side only, with the references limited to a half rotation, raised the first-pass error
-    on an off-axis rod from 0.03 to 0.3 channels, because the interpolation of a partner view
-    errs in opposite directions on the two sides and the two cancel.  The memory held is one band
-    for the references, one for their opposites, one for the partner views, and the spectrum of
-    the opposites.
-
-    The fan angle of a channel depends on the channel offset.  The partners are computed once, at
-    ``pairing_offset``, and a candidate offset ``d`` channels away moves a channel's partner angle
-    by ``2 d delta / sdd``.  The estimator therefore makes a second pass with the pairs rebuilt
-    at its first estimate.
+    from every view.  At stride 1 every view is a reference, so each unordered pair is compared
+    from both sides and the interpolation errors of the two sides cancel.  The fan angle of a
+    channel depends on the channel offset, so the partners are computed once at ``pairing_offset``,
+    and a candidate offset ``d`` channels away moves a channel's partner angle by
+    ``2 d delta / sdd``.
 
     Args:
         ct_model: a parallel or cone model.
         reduction (dict or None): a record from :func:`build_reduced_problem`, whose view stride,
-            bin factor, and row window are used.  None builds a record that keeps every view,
-            bins nothing, and takes a band of rows around the row that the central plane of the
-            scan reaches.
+            bin factor, and row window are used.  None builds a record that keeps every view, bins
+            nothing, and takes a band of rows around the central plane of the scan.
         num_rows (int or None): the band height when ``reduction`` is None.  None takes the
-            default, reduced for cone beam so that the opposite rays through the band land within
-            about one row of each other across the support.
+            default, reduced for cone beam so that opposite rays through the band land within about
+            one row of each other.
         pairing_offset (float or None): the channel offset in ALU that the fan angles are computed
             at.  None is the model's current value.
     """
@@ -1141,44 +1080,34 @@ def estimate_det_channel_offset(ct_model, sino, *, method='auto', bounds=None, n
 
     In a scan over a full rotation every ray is measured twice, once from each side.  A voxel at
     in-plane position x projects to channel ``(x + det_channel_offset) / delta_det_channel`` from
-    the detector center.  After a half rotation it projects to the mirrored position, so a view
-    and its mirrored opposite differ by a shift of twice the offset.  The estimator scores
-    candidate offsets by that shift and returns the one at which the views and their opposites
-    agree best.
+    the detector center, and after a half rotation it projects to the mirrored position.  A view
+    and its mirrored opposite therefore differ by a shift of twice the offset, and the estimate is
+    the candidate offset at which they agree best.  For cone beam the opposite of a channel lies at
+    a view angle that depends on the fan angle, and the comparison uses a band of rows around the
+    central plane.  On synthetic data at a full fan angle of 20 degrees the bias was 0.02 to 0.03
+    channels.
 
-    For cone beam each channel's opposite ray lies at a view angle that depends on the fan angle,
-    and the method pairs each channel with that view, interpolated between the two nearest.
-    Opposite rays through points off the central plane reach the detector at different heights.
-    The cone-beam comparison therefore uses a band of rows around the central plane, and the
-    estimate degrades as the fan angle and the cone angle grow.  On synthetic data at a full fan
-    angle of 20 degrees the bias was 0.02 to 0.03 channels.
+    The search scores ``num_coarse`` candidates across ``bounds`` and then narrows the bracket by
+    golden section to a hundredth of a channel, and it returns every candidate and score, so a flat
+    or double minimum is visible.  It warns when the coarse curve has more than one minimum or its
+    minimum sits at an edge of the bounds.  A trimmed mean drops the tenth of the view pairs that
+    agree worst, so a few corrupted views do not move the estimate.
 
-    The search evaluates ``num_coarse`` candidates across ``bounds``, then narrows the bracket
-    around the best one by golden section to a hundredth of a channel, in about 24 evaluations.
-    Every candidate and score of that search is returned, so a flat or double minimum is visible.
-    The function warns when the coarse curve has more than one minimum or its minimum sits at an
-    edge of the bounds.  A trimmed mean over view pairs drops the tenth of the pairs that agree
-    worst at the best candidate of a first coarse grid, which costs ``num_coarse`` more
-    evaluations, so a few corrupted views do not move the estimate.
-
-    Three limits apply.  The comparison holds the kept views' band, its mirrored opposites, and the
-    spectrum of the opposites, which is about three times the band in memory, so the view stride
-    and the band height bound it.  An offset scan, whose detector is displaced by hundreds of
-    channels, is not served: the search range is a few channels and the comparison excludes only
-    the channels the shift wraps.  A sinogram in the divided device form is refused.
+    The method needs views over a full rotation and an opposite view at the same axial position, so
+    it refuses a short scan and a helical scan.  A multiaxis parallel model is not supported yet.
+    An offset scan, whose detector is displaced by hundreds of channels, is not served, because the
+    search range is a few channels.  A sinogram in the divided device form is refused.
 
     Args:
         ct_model (TomographyModel): a parallel or cone model.  Not modified.
         sino (ndarray or tensor): the sinogram.  Not modified.
         method (str, optional): ``'auto'`` or ``'conjugate'``.  Both select the conjugate-view
-            method.  A scan the method cannot serve raises.  For such a scan, use
-            :func:`parameter_sweep` and choose the value by eye.  Defaults to ``'auto'``.
+            method.  For a scan the method cannot serve, use :func:`parameter_sweep` and choose the
+            value by eye.  Defaults to ``'auto'``.
         bounds (tuple of float, optional): the search range in ALU.  None (the default) is a window
-            of four channels on each side of the model's current value.  When the coarse minimum
-            sits at an edge of that window, the window moves to center on the edge, at the same
-            width, up to eight times, so the default reaches offsets of about 36 channels.  The
-            window stops moving when the channels excluded for the circular shift would leave less
-            than a quarter of the detector to compare.  A range given here is not moved.
+            of four channels on each side of the model's current value.  That window moves to
+            center on the edge where the coarse minimum sits, at the same width, up to eight times.
+            A range given here is not moved.
         num_coarse (int, optional): candidates in the coarse pass.  Defaults to 11.
         reduction (dict, optional): a record from :func:`build_reduced_problem` whose view stride,
             bin factor, and row window the comparison uses.  None (the default) keeps every view
@@ -1225,12 +1154,9 @@ def estimate_det_channel_offset(ct_model, sino, *, method='auto', bounds=None, n
                                bounds, num_coarse, tolerance) + (keep,)
 
     # A coarse minimum at an edge of the window means the window is in the wrong place, so the
-    # window, at its fixed width, moves to center on that edge and the search repeats, up to a
-    # limit.  The width is kept so that the coarse grid keeps its spacing.  The default window of
-    # four channels on each side does not hold the offset of an uncalibrated scan in general; a
-    # 7.5 channel offset on a 512 channel detector needed one move.  The channels excluded at each
-    # edge grow with the largest offset in the window, and the window stops moving when they
-    # would leave less than a quarter of the channels to compare.
+    # window moves to center on that edge and the search repeats, up to a limit.  The width is kept
+    # so that the coarse grid keeps its spacing.  The window stops moving when the channels
+    # excluded for the circular shift would leave less than a quarter of the detector to compare.
     best, candidates, scores, notes, keep = search(problem)
     slides = 0
     while ('the coarse minimum sits at an edge of the bounds' in notes and user_bounds is None
@@ -1248,8 +1174,7 @@ def estimate_det_channel_offset(ct_model, sino, *, method='auto', bounds=None, n
 
     # Two passes for cone beam.  The fan angle of a channel, and so its partner view, depends on
     # the offset, and the first pass pairs at the model's value.  The second pass pairs at the
-    # first estimate.  On synthetic data at a 20 degree fan the first pass alone erred by about
-    # one percent of the offset, and the second pass removed that trend; it doubles the cost.
+    # first estimate, which removes a small trend in the result and doubles the cost.
     first_pass = best
     if problem.kind == 'cone' and abs(best - problem.pairing_offset) > tolerance:
         problem = _ConjugatePairs(ct_model, reduction, num_rows, pairing_offset=best)
@@ -1266,16 +1191,10 @@ def estimate_det_channel_offset(ct_model, sino, *, method='auto', bounds=None, n
                              reduction=record)
 
 
-# Defaults of the rotation estimate.  The search covers the five degree cap on each side of zero
-# and stops at this many radians.  The second value is an edge displacement in pixels, and the
-# function warns below it.  Below one pixel of edge displacement the estimate is uncertain.  On
-# synthetic data at 512 and 1024 channels its error left under 0.06 pixels at the detector edge.
-# On real scans the estimate followed known rotations added to the data with a slope of one, but on
-# one scan it read 0.044 degrees where direct reconstructions showed the vendor's recorded tilt of
-# 0.167 degrees to be right, so the synthetic figure is not a bound on the zero point.  Applying a
-# rotation this small also
-# resamples the whole sinogram bilinearly, which is a cost the user weighs against the
-# misregistration the correction removes.
+# The rotation estimate's search stops when its bracket is shorter than the first constant, in
+# radians, and the second constant is an edge displacement in pixels.  Below one pixel of edge
+# displacement the estimate is uncertain, and the function warns.  On one real scan its zero point
+# was off by about a tenth of a degree.
 _CONJUGATE_ROTATION_TOLERANCE = math.radians(0.005)
 _CONJUGATE_MIN_EDGE_DISPLACEMENT = 1.0
 
@@ -1286,11 +1205,8 @@ def _rotated_band(sino, reduction, det_rotation):
 
     The band is read from the sinogram with a margin of rows on each side, so the rotation samples
     nothing outside the rows it has, and it is cropped afterward.  The cubic kernel is used because
-    the bilinear one smooths the data by an amount that grows with the angle, which biases a
-    search over the angle toward its bounds on cone-beam data.  The cubic kernel's bias is 10 to 24
-    percent of the angle when the rotation displaces the edge pixel by less than half a pixel, a
-    few percent up to one pixel, and under 0.5 percent beyond that; the measurement is recorded
-    with the plans for this feature.
+    the bilinear one smooths the data by an amount that grows with the angle, which biases a search
+    over the angle toward its bounds on cone-beam data.
     """
     import cv2
     num_views, num_rows, num_channels = reduction['full_sinogram_shape']
@@ -1320,35 +1236,26 @@ def estimate_det_rotation(ct_model, sino, *, method='auto', bounds=None, num_coa
                           reduction=None, det_channel_offset=None, num_rows=None):
     """Estimate the detector rotation, in radians, by comparing each view with its opposite.
 
-    A detector rotated by an angle about the optical axis records every view rotated by that
-    angle.  Mirroring a view in channels reverses the sign of that rotation, so a view and its
-    mirrored opposite differ by twice the angle.  Each candidate angle is applied to a band of
-    rows from every kept view by cubic resampling about the detector center, the views are paired
-    with their opposites as in :func:`estimate_det_channel_offset`, and the candidate at which
-    they agree best is returned.  The comparison shifts the opposites by twice the channel
-    offset, which is the model's current value unless ``det_channel_offset`` is given, so
-    estimate the offset first.
+    A detector rotated about the optical axis records every view rotated by that angle, and
+    mirroring a view in channels reverses the sign of that rotation, so a view and its mirrored
+    opposite differ by twice the angle.  Each candidate angle is applied to a band of rows from
+    every kept view by cubic resampling about the detector center, the views are paired with their
+    opposites as in :func:`estimate_det_channel_offset`, and the candidate at which they agree best
+    is returned.  The comparison shifts the opposites by twice the channel offset, which is the
+    model's current value unless ``det_channel_offset`` is given, so estimate the offset first.
 
-    Resampling the band at a candidate angle smooths it, and the smoothing biases the estimate
-    when the rotation displaces the edge pixel of the detector by less than about one pixel.  On
-    synthetic data at 512 and 1024 channels the cubic kernel's bias was 10 to 24 percent of the
-    angle below half a pixel of edge displacement, 4.5 percent at 0.89 pixels, and under 0.5
-    percent from 1.34 pixels upward.  Those figures do not transfer to every detector or object.
-    On real scans the estimate followed known rotations added to the data with a slope of one, but
-    its zero point depended on the object.  On a scan whose structure ran along the detector rows it
-    read 0.044 degrees where direct reconstructions showed the vendor's recorded tilt of 0.167
-    degrees to be right, and on the same object with a metal insert it read 0.149 degrees.  Prefer
-    the vendor's tilt when the reader supplies one, and check the slices far from the central plane,
-    which a detector rotation displaces most, before applying an estimate.  The function warns when
-    the estimate displaces the edge pixel by less than one pixel.  A rotation handled inside the
-    projectors would need no resampling.
+    Resampling smooths the band, so an estimate that displaces the edge channels by less than about
+    one pixel is uncertain, and the function warns in that case.  On one real scan the estimate read
+    0.044 degrees where a sweep of far slices put the rotation near 0.15 degrees and the vendor's
+    recorded tilt was 0.167 degrees, so prefer a vendor tilt when the reader supplies one and check
+    the slices far from the central plane before applying an estimate.
 
     Args:
         ct_model (TomographyModel): a parallel or flat-detector cone model.  Not modified.
         sino (ndarray or tensor): the sinogram.  Not modified.
         method (str, optional): ``'auto'`` or ``'conjugate'``.  Both select the conjugate-view
-            method.  A scan the method cannot serve raises.  For such a scan, use
-            :func:`parameter_sweep` and choose the value by eye.  Defaults to ``'auto'``.
+            method.  For a scan the method cannot serve, use :func:`parameter_sweep` and choose the
+            value by eye.  Defaults to ``'auto'``.
         bounds (tuple of float, optional): the search range in radians, within five degrees of
             zero.  None (the default) is the full five degrees on each side.
         num_coarse (int, optional): candidates in the coarse pass.  Defaults to 11.
@@ -1395,15 +1302,10 @@ def estimate_det_rotation(ct_model, sino, *, method='auto', bounds=None, num_coa
                                                       _CONJUGATE_ROTATION_TOLERANCE)
     edge_displacement = abs(best) * problem.num_channels / 2.0
     if edge_displacement < _CONJUGATE_MIN_EDGE_DISPLACEMENT:
-        notes.append(f'the estimate displaces the edge channels by {edge_displacement:.2f} pixels. '
-                     'Below one pixel of edge displacement the estimate is uncertain. On synthetic '
-                     'data at 512 and 1024 channels its error left under 0.06 pixels at the detector '
-                     'edge. On one real scan the estimate was 0.044 degrees where direct '
-                     'reconstructions showed the vendor\'s recorded tilt of 0.167 degrees to be '
-                     'right, so prefer the vendor\'s tilt when the reader supplies one and check '
-                     'the slices far from the central plane. Applying a rotation this small also '
-                     'resamples the whole sinogram bilinearly, so weigh that blur against the '
-                     'misregistration the correction removes')
+        notes.append(f'the estimate displaces the edge channels by {edge_displacement:.2f} pixels, '
+                     'below the one pixel at which it is reliable.  Prefer a vendor tilt when the '
+                     'reader supplies one, and check the slices far from the central plane before '
+                     'applying it')
     for note in notes:
         warnings.warn(f'estimate_det_rotation: {note}.')
     record = dict(problem.reduction, num_pairs=problem.num_views, pairs_kept=int(keep.size),
@@ -1419,11 +1321,11 @@ def conjugate_difference(ct_model, sino, *, det_channel_offset=None, det_rotatio
     """The difference between each view and its mirrored opposite, as an image stack for viewing.
 
     The conjugate-view score is a normalized mean square of this image, so the stack shows what
-    that number summarizes.  At the true channel offset and rotation the difference holds noise
-    and the residue of the fan and cone angles.  A wrong offset shows as doubled edges displaced
-    along the channel axis.  A wrong rotation shows as edges displaced vertically, by an amount
-    that grows toward the edge channels.  The shift is circular, so the channels within a few
-    samples of the edges are not meaningful.
+    that number summarizes.  A wrong channel offset shows as doubled edges displaced along the
+    channel axis, and a wrong rotation shows as edges displaced vertically, by an amount that grows
+    toward the edge channels.  At the true values the difference holds only noise and the residue
+    of the fan and cone angles.  The shift is circular, so the channels within a few samples of the
+    edges are not meaningful.
 
     Args:
         ct_model (TomographyModel): a parallel or cone model.  Not modified.
