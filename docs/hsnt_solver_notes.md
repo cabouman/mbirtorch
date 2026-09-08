@@ -102,8 +102,41 @@ loss (Hong, Kolda & Duersch 2020). `rel_tol` maps onto ftol. On the 4k phantom (
 pairs it stalls 6e-4 above the joint optimum at dose 3 even at ftol 1e-9 (623 iterations; the relative-decrease
 test fires on a slow crawl), with 20 pairs it reaches the optimum to 3e-7 in 1152 iterations and 13.5 s against
 joint Newton's 45 steps and 1.5 s; at dose 100, 588 iterations and 6.8 s against 20 steps and 0.4 s (m = 10
-suffices there). Default memory 20. H100 numbers and the pixel-count scaling: see the timing table below once the
-cluster runs are in.
+suffices there). Default memory 20. H100 (2026-09-08, dose 3, seed 129, ftol 1e-9, m = 20): 4.5 s at 4k pixels,
+where it converges to joint Newton's loss (joint: 0.20 s), then 47 / 288 / 1880 s at 65k / 262k / 1M against joint
+Newton's 1.2 / 3.7 / 14.1 s (40-133x), and from 16k pixels up it stops short: spectral SNR 27.6 / 30.1 / 30.5 /
+30.4 dB against the MLE's 31.9 / 37.0 / 40.4 / 41.6 (loss gap +1.5e-3 at 1M), the relative-decrease test firing
+on a slow crawl. Its wall clock is therefore a lower bound on the time to the MLE, and it grows faster than
+linearly (log-log slope 1.33 above 65k) from the CPU-side vector work on 3M parameters and the transfers.
+
+**Wall clock versus pixel count (H100 80 GB, 2026-09-08).** Dose 3, seed 129, rank 3, K = 1200; joint / multiplicative /
+block at rel_tol 1e-8, L-BFGS-B at 1e-9; medians of 3 order-reversed repeats (2 at 1M, 1 for joint at 1M: the job hit
+its 1h50 walltime in the third repeat because of L-BFGS-B's 31-minute runs). Post-estimators are the increment on the
+MLE they start from. Seconds per solve:
+
+| method | 4k | 16k | 65k | 262k | 1M | us/px at 1M | vs joint at 1M |
+|---|---|---|---|---|---|---|---|
+| joint-Newton (MLE) | 0.20 | 0.36 | 1.21 | 3.66 | 14.1 | 13.4 | 1.0x |
+| multiplicative | 0.38 | 0.39 | 1.65 | 3.51 | 12.3 | 11.7 | 0.9x (0.8 dB short on spectra) |
+| block-Newton | 1.35 | 3.02 | 11.1 | 46.9 | 206 | 197 | 14.6x |
+| L-BFGS-B | 4.48 | 8.70 | 46.7 | 288 | 1880 | 1793 | 134x (not converged from 16k up) |
+| + unconstrained spectra | 0.18 | 0.20 | 0.69 | 2.04 | 9.2 | 8.8 | 0.7x |
+| + support selection | 0.39 | 0.96 | 2.76 | 11.1 | 45.6 | 43.5 | 3.2x |
+| + pure-pixel gauge | 0.08 | 0.18 | 0.62 | 2.34 | 28.5 | 27.2 | 2.0x |
+| L2 (scipy NMF, 14 CPU cores) | 4.47 | 20.2 | 81.0 | 136 | -- | 518 at 262k | 37x at 262k |
+
+Joint Newton's per-pixel cost falls from 49.7 us at 4k to 18.4 at 65k, 14.0 at 262k and 13.4 at 1M: linear in pixel
+count from 65k up (log-log slope 0.89 over that range), fixed overheads below. Peak memory 61.4 GB at 1M for the
+Newton solvers, 36 GB for the multiplicative update. The gauge fix's W re-solve jumps from 2.3 s at 262k to 28.5 s at
+1M (slope 1.38): the re-solve from the remixed start converges slowly at scale and is worth a look. L2 was not run at
+1M (136 s at 262k on the CPU). Data: sweep_out/pscaling_h100.json in the scratch tree; Slurm job 16050171.
+
+**Dose sweep on the H100 (2026-09-08).** 33 doses (8/decade, 1 to 1e4) x 10 seeds at 4k pixels, 8 methods, 37 min.
+L-BFGS-B matches the MLE on spectra and maps at every dose (it converges at 4k); the pure-pixel gauge fix adds +5 to
++6 dB to the maps at every dose above ~3 (dose 100: 22.3 -> 27.7; 1e4: 42.2 -> 47.9), support selection + gauge is
+best above dose 100 by a few tenths; the spectra remedies do not help at 4k, below the ~65k crossover. Per-solve
+seconds: L2 2.9 (CPU), MLE 0.06, multiplicative 0.56, L-BFGS-B 1.44, + unconstrained 0.19, + support selection
+0.40, + gauge 0.13, support selection + gauge 1.08. Slurm job 16049816.
 
 **Stopping rule.** `rel_tol` means the relative loss change per step (float64 sum) for every method, with a KKT
 fallback `gnorm <= max(rel_tol^2, 100 eps) gnorm0` for data a rank-R model fits exactly (the shifted loss then
