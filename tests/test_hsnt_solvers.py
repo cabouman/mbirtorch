@@ -10,6 +10,7 @@ import torch
 
 hsnt = pytest.importorskip("mbirtorch.hsnt")
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+LBFGSB_GAP = 1e-4        # relative loss gap L-BFGS-B may leave against joint Newton on _problem() (measured below 1e-5)
 ALIGN_MIN = 0.998        # pure_pixel_gauge on _problem(): 0.9992-0.9993 for seeds 0-2, against 0.991-0.994 for the MLE
 
 
@@ -30,7 +31,7 @@ def _loss(W, H, T):
 
 
 @cuda
-@pytest.mark.parametrize("method", ["joint_newton", "block_newton", "multiplicative"])
+@pytest.mark.parametrize("method", ["joint_newton", "block_newton", "multiplicative", "lbfgsb"])
 def test_every_method_decreases_the_loss_and_stays_nonnegative(method):
     T, _, _ = _problem()
     W, H, steps = hsnt.nnal_factorization(T, method=method, num_materials=3, max_steps=300, rel_tol=1e-6)
@@ -39,6 +40,15 @@ def test_every_method_decreases_the_loss_and_stays_nonnegative(method):
     real = T > 1e-12; floor = 0.5 * T[real].min()
     W0, H0 = hsnt.nndsvda(-torch.log(torch.where(real, T, floor)), n_components=3)
     assert _loss(W, H, T) < _loss(W0, H0, T)
+
+
+@cuda
+def test_lbfgsb_converges_to_the_joint_newton_loss():
+    T, _, _ = _problem()
+    Wj, Hj, _ = hsnt.nnal_factorization(T, method="joint_newton", num_materials=3, max_steps=300, rel_tol=1e-8)
+    Wl, Hl, it = hsnt.nnal_factorization(T, method="lbfgsb", num_materials=3, max_steps=3000, rel_tol=1e-9)
+    assert it > 10 and Wl.min() >= 0 and Hl.min() >= 0
+    assert _loss(Wl, Hl, T) <= (1 + LBFGSB_GAP) * _loss(Wj, Hj, T)
 
 
 @cuda

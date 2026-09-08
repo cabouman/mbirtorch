@@ -37,6 +37,7 @@ from ._newton import (_COMPILED_KERNELS, _ARMIJO_FLOOR, _TRUST_FLOOR, _ACTIVE_TO
                       block_newton_optimize, _joint_newton_pcg, joint_newton_optimize)
 from ._streaming import _h_stats_accumulate, _h_direction, stream_factorization
 from .factorization import optimize, nnal_factorization
+from ._lbfgsb import lbfgsb_optimize
 from .spectra import unconstrained_spectra, support_selected_spectra, pure_pixel_gauge
 from .denoise import hyper_denoise, dehydrate, rehydrate, _estimate_subspace_dimension
 from .io import (KEY_DESCRIPTIONS, VALIDATION_RULES, ALLOWED_KEYS, _validate_key, _with_key_docstring,
@@ -52,5 +53,5 @@ __all__ = [
     "compare_spectra",
     "stream_factorization",
     "unconstrained_spectra", "support_selected_spectra", "pure_pixel_gauge",
-    "nndsvda", "optimize", "block_newton_optimize", "joint_newton_optimize", "block_newton_step",
+    "nndsvda", "optimize", "block_newton_optimize", "joint_newton_optimize", "lbfgsb_optimize", "block_newton_step",
 ]

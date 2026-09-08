@@ -51,6 +51,7 @@ Grouped by technique, with the part of the code each reference explains.
 - Singh, Ma, Yang & Solomonik, *Comparison of accuracy and scalability of Gauss-Newton and alternating least squares for CANDECOMP/PARAFAC decomposition*, SIAM J. Sci. Comput. (2021) (venue: verify). Gauss-Newton reaches exact decompositions where alternating least squares stalls.
 - Phan, Tichavsky & Cichocki, *Low complexity damped Gauss-Newton algorithms for CANDECOMP/PARAFAC*, SIAM J. Matrix Anal. Appl. 34 (2013), and *Fast damped Gauss-Newton algorithm for sparse and nonnegative tensor factorization*, ICASSP (2011). All-at-once damped Gauss-Newton with nonnegativity.
 - Golub & Pereyra, *The differentiation of pseudo-inverses and nonlinear least squares problems whose variables separate*, SIAM J. Numer. Anal. 10 (1973); Ruhe & Wedin, *Algorithms for separable nonlinear least squares problems*, SIAM Review 22 (1980). Variable projection, and the linear rate of alternating schemes that the streamed H step inherits.
+- Zhu, Byrd, Lu & Nocedal, *Algorithm 778: L-BFGS-B*, ACM Trans. Math. Software 23 (1997), via scipy.optimize.minimize; Hong, Kolda & Duersch (2020, section 2). The all-at-once bound-constrained baseline `lbfgsb_optimize`, with ftol as the relative-decrease stop that `rel_tol` maps onto.
 
 ## 5. IRLS and majorization (the former `quadratic_update`, removed in the 2026-09 cleanup as dominated)
 - Green, *Iteratively reweighted least squares for maximum likelihood estimation, and some robust and resistant alternatives*, JRSS B 46 (1984).

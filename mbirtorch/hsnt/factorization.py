@@ -5,6 +5,7 @@ from ._linalg import nndsvda
 from ._loss import _nnal_prep, stable_nnal
 from ._multiplicative import multiplicative_update
 from ._newton import block_newton_optimize, joint_newton_optimize
+from ._lbfgsb import lbfgsb_optimize
 
 
 def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_H=True,
@@ -41,7 +42,7 @@ def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_
     elif H_init.numel() == 0:
         H_init = torch.linalg.lstsq(W_init, T)[0].clamp(min=0)
 
-    if update in (block_newton_optimize, joint_newton_optimize):
+    if update in (block_newton_optimize, joint_newton_optimize, lbfgsb_optimize):
         return update(T, num_materials, max_steps, rel_tol,
                       update_H=update_H, W_init=W_init, H_init=H_init,
                       convergence_check_interval=convergence_check_interval,
@@ -140,6 +141,9 @@ def nnal_factorization(T: torch.Tensor, method='joint_newton', num_materials=3, 
     'quadratic' (IRLS) and 'quasi_newton' (diagonal Hessian) methods were removed
     in the 2026-09 cleanup as dominated. Measurements: docs/hsnt_solver_notes.md,
     section 3.
+    'lbfgsb' is the generic bound-constrained baseline: scipy's L-BFGS-B over
+    both factors at once on the same gradient (see lbfgsb_optimize); it is what a
+    second-order method has to beat, and is typically 10-100x slower here.
 
     rel_tol is the relative change in the loss per step (summed in float64) at
     which a method stops, and means the same thing for every method. It is not
@@ -167,8 +171,12 @@ def nnal_factorization(T: torch.Tensor, method='joint_newton', num_materials=3, 
         update = block_newton_optimize
     elif method == 'joint_newton':
         update = joint_newton_optimize
+    elif method == 'lbfgsb':
+        if batch_size is not None:
+            raise ValueError("method 'lbfgsb' optimises all pixels at once and cannot be batched")
+        update = lbfgsb_optimize
     else:
-        raise ValueError("Invalid method. Choose 'joint_newton', 'block_newton' or 'multiplicative'.")
+        raise ValueError("Invalid method. Choose 'joint_newton', 'block_newton', 'multiplicative' or 'lbfgsb'.")
 
     if update is multiplicative_update:
         # Nesterov extrapolation is on by default for the multiplicative update:
@@ -178,7 +186,7 @@ def nnal_factorization(T: torch.Tensor, method='joint_newton', num_materials=3, 
         # the plain sweeps, stopping 0.06% above the optimum instead of 0.009%.
         kwargs.setdefault('extrapolate', True)
 
-    if update in (block_newton_optimize, joint_newton_optimize):
+    if update in (block_newton_optimize, joint_newton_optimize, lbfgsb_optimize):
         # These take compile_mode themselves and compile their hot kernels, not the
         # driver: see _kernels. Wrapping the driver in torch.compile, as is done for
         # the other methods below, does nothing useful here.

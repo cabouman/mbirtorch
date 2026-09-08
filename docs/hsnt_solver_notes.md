@@ -96,6 +96,15 @@ minimized `(1/2) sum T (X + log T)^2`, which converges somewhere other than the 
 discards a large fraction of the data (17.7% of entries at dose 3). Gauss-Newton style: single steps are not
 guaranteed to decrease the loss.
 
+**lbfgsb (added 2026-09-08).** scipy's L-BFGS-B over both factors at once under W, H >= 0, on the package's own
+gradient: the generic bound-constrained baseline, and the solver generalized CP uses for the same Poisson log-link
+loss (Hong, Kolda & Duersch 2020). `rel_tol` maps onto ftol. On the 4k phantom (laptop GPU): with 10 correction
+pairs it stalls 6e-4 above the joint optimum at dose 3 even at ftol 1e-9 (623 iterations; the relative-decrease
+test fires on a slow crawl), with 20 pairs it reaches the optimum to 3e-7 in 1152 iterations and 13.5 s against
+joint Newton's 45 steps and 1.5 s; at dose 100, 588 iterations and 6.8 s against 20 steps and 0.4 s (m = 10
+suffices there). Default memory 20. H100 numbers and the pixel-count scaling: see the timing table below once the
+cluster runs are in.
+
 **Stopping rule.** `rel_tol` means the relative loss change per step (float64 sum) for every method, with a KKT
 fallback `gnorm <= max(rel_tol^2, 100 eps) gnorm0` for data a rank-R model fits exactly (the shifted loss then
 goes to zero and its relative change stays O(1)). A KKT rule alone is relative to the gradient at the start, so
