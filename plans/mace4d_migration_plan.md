@@ -1,15 +1,27 @@
 # Plan for porting MACE4D to mbirtorch
 
 This document describes what the MACE4D code in mbirjax does, which of its
-dependencies already exist in mbirtorch, and a plan for writing the mbirtorch
-version.  It was written on 2026-09-09.  The general porting conventions it
-assumes are in `mbirjax_to_mbirtorch_migration.md`.
+dependencies already exist in mbirtorch, and a staged plan for writing the
+mbirtorch version.  It was written on 2026-09-09 and revised on 2026-09-11.
+The revision reorganized the work into stages, added Section 3 on the utility
+functions that MACE4D needs but that live outside the class, and added Stage 9
+on the application workflow.  The general porting conventions it assumes are in
+`mbirjax_to_mbirtorch_migration.md`.
 
 The source files are `mbirjax/mbirjax/mace4d.py` at 1039 lines,
 `mbirjax/tests/test_mace4d.py` at 305 lines, and
 `mbirjax/docs/source/usr_mace4d.rst` at 55 lines.  The files to be written are
 `mbirtorch/mbirtorch/mace4d.py`, `mbirtorch/tests/test_mace4d.py`, and
 `mbirtorch/docs/source/usr_mace4d.rst`.
+
+Two further sources informed the revision.  The first is the mbirjax release
+history.  MACE4D entered mbirjax in release v0.7.3, and that release and
+v0.7.2 also added the utility functions the class depends on.  Section 3 lists
+those utilities and their status in mbirtorch.  The second source is the
+application driver `mbirjax_applications/nsi_4d/Lilly_recon_4d.py`, which runs
+a complete 4D reconstruction on an NSI dataset.  The driver shows which parts
+of the interface a real run uses, and Stage 9 turns that workflow into the
+final check of the port.
 
 ## Summary
 
@@ -35,8 +47,18 @@ One refactoring in mbirtorch is needed before the port can start.  The method
 mbirtorch.  Its code was written inline inside `denoise()` instead.  Extracting
 it is a small change that `tests/test_denoiser.py` can verify.
 
-The estimated size of the port is 1200 to 1400 lines.  Section 7 gives the
-suggested order of work.
+MACE4D also depends on utility functions that live outside the class.  Most of
+these utilities were added to mbirjax in the same releases that added MACE4D,
+which are v0.7.2 and v0.7.3.  Six of them are missing from mbirtorch: the
+frame construction function, the device-pool helpers, the extracted
+single-device denoiser sweep, the batched hyperplane denoiser, the DCT-I
+temporal filter, and the 4D form of `save_volume_as_gif`.  Section 3 lists
+each one, where it was added, and how to write the PyTorch version.
+
+The work is organized as ten stages, numbered 0 through 9.  Each stage ends at
+a stated exit condition, so that progress can be checked before the next stage
+starts.  The estimated size of the port is 1300 to 1500 lines.  Section 7
+gives the sizes and the order.
 
 ## 1. What MACE4D computes
 
@@ -261,7 +283,12 @@ code halves the batch size and recompiles.
 ## 2. The interface to reproduce
 
 The documentation page describes four members.  The property `devices` is public
-but not documented.
+but not documented.  Two attributes, `num_frames` and `view_slices`, are also
+set in the constructor and read by application code, so the port must keep
+them.  The driver `Lilly_recon_4d.py` reads `mace_model.num_frames` for its
+output file names and `mace_model.view_slices[0]` for its progress message.
+The driver also reads `recon_dict['recon_params']['iterations completed']`
+after the run, so that key name must be kept exactly.
 
 ```python
 MACE4DModel(ct_model, frames_per_rotation=6, frame_overlap_factor=2.0, num_frames=None)
@@ -333,9 +360,156 @@ it is set, not when it is used.
 The dictionary returned as the second value of `recon` has four keys.  These are
 `recon_params`, `timing`, `notes`, and `model_params`.
 
-## 3. Which dependencies already exist in mbirtorch
+## 3. The utility supports outside the class
 
-### 3.1 Available with no change
+MACE4D depends on utility functions that live outside `MACE4DModel`.  The
+mbirjax release history identifies them.  Release v0.7.3 (commit `bb4244c`)
+added `mace4d.py`, and the same release changed `utilities.py`,
+`parameter_handler.py`, and the viewer to support it.  Release v0.7.2 added the
+device helpers in `_device_setup.py` that `mace4d.py` imports at line 24.  This
+section lists each utility, its status in mbirtorch, and the plan for the
+PyTorch version.
+
+Six utilities are missing from mbirtorch.  Searching mbirtorch for `mace`,
+`time_frame`, `frames_per_rotation`, `save_volume_as_gif`, `gpu_devices`, and
+`_denoise_single_device` returns nothing.
+
+| Utility | Where it lives in mbirjax | Added in | Needed by | Stage |
+|---|---|---|---|---|
+| `_construct_time_frame_models` | `utilities.py:1915-1985` | v0.7.3 | The constructor | 2 |
+| Device-pool helpers | `_device_setup.py:183-225` | v0.7.2 | `set_device_pool` | 2 |
+| `QGGMRFDenoiser._denoise_single_device` | `denoising.py:309` | earlier | The batched denoiser | 0 |
+| The batched hyperplane denoiser | `mace4d.py:938-1039` | v0.7.3 | The three prior agents | 1, 4 |
+| The DCT-I temporal filter | `mace4d.py:736-812` | v0.7.3 | `_dejitter` | 5 |
+| `save_volume_as_gif` for 4D volumes | `utilities.py:65-222` | v0.7.3 | The application driver | 9 |
+
+### 3.1 `_construct_time_frame_models`
+
+This function splits a full rotation into overlapping time frames and builds
+one `TomographyModel` per frame with `copy_ct_model`.  Section 1.1 describes
+what it computes.  It uses only NumPy, `get_all_params`, `set_params`, and
+`copy_ct_model`, and all four exist in mbirtorch.  `copy_ct_model` is at
+`mbirtorch/utilities.py:1001`.
+
+The port goes into `mbirtorch/utilities.py` and keeps five behaviors.  The
+angle step is computed as `np.median(np.abs(np.diff(angles)))`, so the frame
+division stays correct under view subsampling.  Trailing views that cannot
+fill a whole frame are discarded.  The four `ValueError` conditions are kept:
+zero angle spacing, a frame span smaller than one view, a stride smaller than
+one view, and a frame span longer than the scan.  Printing is suppressed after
+the first frame, because every frame would print the same geometry report.
+The source model's verbosity is restored in a `finally` block.  The estimated
+size is 75 lines including the docstring.
+
+The test is the 24-view case from Section 1.1.  It must produce 5 frames, and
+`view_slices[1]` must equal `slice(4, 12)`.
+
+### 3.2 The device-pool helpers
+
+`mace4d.py` imports `gpu_devices`, `cpu_devices`, and `default_devices` from
+`mbirjax/_device_setup.py`.  The function `_resolve_devices` at
+`mbirjax/mace4d.py:665` builds the device pool from them.  mbirtorch has no
+equivalent of any of these.  The closest existing code is
+`TomographyModel._resolve_device`, which resolves a single device rather than
+a pool.
+
+The PyTorch versions are small.  `gpu_devices()` returns
+`tuple(torch.device('cuda', i) for i in range(torch.cuda.device_count()))`,
+or a single MPS device when `torch.backends.mps.is_available()` and CUDA is
+absent, or an empty tuple.  `cpu_devices()` returns `(torch.device('cpu'),)`.
+`default_devices()` returns the GPU list when it is nonempty and otherwise the
+CPU list.  These helpers should sit next to `TomographyModel._resolve_device`
+or in a small module of their own, so that other multi-device drivers can use
+them later.
+
+The pool resolution must accept the same six inputs as mbirjax.  `None` gives
+every GPU, or one CPU device when there is no GPU.  The string `'cpu'` gives
+the CPU devices.  The string `'gpu'` gives the GPUs and raises when there are
+none.  Any other string raises.  An integer `n` gives the first `n` default
+devices and raises when `n` exceeds the pool.  A sequence of integers indexes
+the default pool, and a sequence of `torch.device` objects passes through.
+
+One behavior changes.  JAX can present several virtual CPU devices, and
+PyTorch presents one.  A request for a pool of CPU devices therefore returns
+one device in mbirtorch.  Mark this with a `DIVERGENCE(cpu device pool)`
+comment, and let the multiple-device tests skip on CPU rather than simulate a
+second device.
+
+### 3.3 `QGGMRFDenoiser._denoise_single_device`
+
+The batched denoiser calls the single-device VCD sweep as a function.  In
+mbirjax that function is `_denoise_single_device` at
+`mbirjax/denoising.py:309`.  In mbirtorch the same sweep is written inline
+inside `denoise()` at `mbirtorch/denoising.py:412-448`.  Stage 0 extracts it
+into a method with the signature given there.  The extraction is a refactoring
+with no change in behavior, and `tests/test_denoiser.py` verifies it.
+
+### 3.4 The batched hyperplane denoiser
+
+MACE4D denoises hundreds of planes as one compiled program, written in JAX as
+`jax.jit(jax.vmap(sweep))` at `mbirjax/mace4d.py:938-1039`.  PyTorch has no
+direct equivalent, for the two reasons given in the Summary.
+`vcd_subset_denoiser` modifies its inputs in place at
+`mbirtorch/denoising.py:77-81`, which `torch.func.vmap` does not allow.  And
+`jax.lax.while_loop` gives each plane its own stopping test, which no batched
+PyTorch construct provides.  Section 4 gives three options and recommends
+one.  Stage 1 measures the options, and Stage 4 implements the choice.
+
+The out-of-memory retry also changes.  The mbirjax code reads
+`device.memory_stats()['bytes_limit']` and `['bytes_in_use']` to choose the
+batch size, and matches the string `RESOURCE_EXHAUSTED` to detect an
+out-of-memory failure.  The PyTorch version reads
+`torch.cuda.mem_get_info(idx)`, catches `torch.cuda.OutOfMemoryError` and any
+`RuntimeError` whose text contains "out of memory", and calls
+`torch.cuda.empty_cache()` before retrying.  CPU and MPS report no memory
+limit, so the fixed fallback batch size of 4 is kept for them.  A better
+option is to compute the batch size with `_memory_ledger.py`, which already
+models memory for the rest of the package.
+
+### 3.5 The DCT-I temporal filter
+
+The filter `_dejitter_4d_dct` works on the type-I discrete cosine transform,
+computed as `scipy.fft.dct(..., type=1, norm="ortho", axis=0)`.  `torch.fft`
+does not provide any discrete cosine transform, and no use of `dct` appears
+anywhere in mbirtorch today.  The recommendation is to keep the filter in
+SciPy on the host, which is where MACE4D already runs it.  SciPy is already a
+declared mbirtorch dependency, listed in `pyproject.toml` for the preprocess
+package, so no dependency change is needed.  Stage 5 ports the filter.
+
+### 3.6 `save_volume_as_gif` for 4D volumes
+
+Release v0.7.3 rewrote `save_volume_as_gif` to accept 4D volumes.  The new
+signature is `(volume, filename, frame_axis=None, slice_axis=None,
+slice_index=None, vmin=None, vmax=None, fps=5)`.  A 4D volume is reduced to 3D
+by holding `slice_axis` fixed at `slice_index`, and the GIF plays over
+`frame_axis`.  The application driver calls it three times per run, once per
+spatial plane, with `slice_axis` and `slice_index` chosen per plane.
+
+mbirtorch has no `save_volume_as_gif` at all.  The function is pure NumPy,
+matplotlib, and imageio, so the port is a copy with the `mj.` references
+renamed.  Two additions are needed.  The function should call `np.asarray` on
+its input so that a `torch.Tensor` on the CPU is accepted, and a CUDA tensor
+raises with a clear message to move it to the host first.  And imageio is not
+in mbirtorch's dependencies, so it must be added to `pyproject.toml` and
+`environment.yml`.  The mbirjax function is 158 lines including the
+docstring, and the port should be about the same size.  Stage 9 ports it,
+because only the application driver needs it.
+
+### 3.7 Per-instance loggers, already done
+
+Release v0.7.3 also fixed a logging bug that MACE4D exposed.  Loggers keyed on
+the class name were shared by every model of that class, so concurrent models
+rebuilt each other's handlers, and one thread could close a log file another
+thread was writing.  The fix gave each instance its own logger.
+
+mbirtorch already has this fix.  Each `ParameterHandler` instance builds a
+logger named with a never-reused counter, at
+`mbirtorch/parameter_handler.py:32-51`, and `setup_logger` reuses that
+instance logger.  No work is needed.  Stage 6 should still confirm that
+concurrent frame models write separate logs, because MACE4D is the first
+mbirtorch code to run many models in threads at once.
+
+### 3.8 Available with no change
 
 Twelve dependencies are available and have compatible signatures.
 
@@ -377,7 +551,7 @@ The mechanism for registering new parameters works.  `set_params` at
 `mbirtorch/parameter_handler.py:260` adds an unrecognized name as a new
 parameter when `no_warning=True`, and its docstring at `:277-280` documents this.
 
-### 3.2 Available with a small change to the call
+### 3.9 Available with a small change to the call
 
 Four dependencies need the call site adjusted.
 
@@ -396,57 +570,18 @@ compatible.
 
 `recon` lacks `compute_prior_loss`, which MACE4D does not pass.
 
-### 3.3 Requires new work
-
-Five pieces do not exist in mbirtorch.
-
-The method `_denoise_single_device` is missing.  In mbirtorch the single-device
-sweep is written inline inside `denoise()` at `mbirtorch/denoising.py:406-436`.
-MACE4D's batching depends on being able to call that sweep as a function.  This
-is the largest gap.  Section 4 discusses it.
-
-The function `_construct_time_frame_models` is missing.  Searching mbirtorch for
-`time_frame`, `frames_per_rotation`, and `frame_overlap` returns nothing.  The
-function uses only NumPy, `copy_ct_model`, `get_all_params`, and `set_params`,
-all of which exist.  The port is straightforward.
-
-The device-pool helpers are missing.  mbirtorch has no `gpu_devices`,
-`cpu_devices`, `default_devices`, or `get_platform`.  The function
-`_resolve_devices` must be rewritten using `torch.cuda.device_count()` and
-`torch.backends.mps.is_available()`, and must return `torch.device` objects.
-One behavior changes here.  JAX can present several virtual CPU devices, and
-PyTorch presents one.  A request for a pool of CPU devices therefore returns one
-device in mbirtorch, and the tests that exercise multiple devices on CPU cannot
-work the same way.
-
-The batch-size choice and the out-of-memory retry are missing.  The mbirjax code
-reads `device.memory_stats()['bytes_limit']` and `['bytes_in_use']`.  The
-PyTorch equivalent is `torch.cuda.mem_get_info(idx)`.  The mbirjax retry matches
-the string `RESOURCE_EXHAUSTED` in the error text.  The PyTorch version should
-catch `torch.cuda.OutOfMemoryError`, and also a `RuntimeError` whose text
-contains "out of memory", and should call `torch.cuda.empty_cache()` before
-retrying.  CPU and MPS report no memory limit, so the fixed fallback batch size
-of 4 should be kept for them.  A better option is to compute the batch size with
-`_memory_ledger.py`, which already models memory for the rest of the package.
-
-The temporal filter has no PyTorch equivalent.  `torch.fft` does not provide the
-type-I discrete cosine transform.  The recommendation is to keep this filter in
-SciPy on the host, which is where MACE4D already runs it.  The alternative is to
-build it from a fast Fourier transform of the even-symmetric extension.  No use
-of `dct` appears anywhere in mbirtorch today.
-
-### 3.4 Absent entirely
+### 3.10 Absent entirely
 
 The module `mace4d.py`, the class `MACE4DModel`, the type alias
 `MACE4DParamNames`, the page `usr_mace4d.rst`, and the file `test_mace4d.py` do
 not exist in mbirtorch.  Searching mbirtorch for `mace`, ignoring case, returns
 nothing.
 
-### 3.5 Differences between the two `denoising.py` files
+### 3.11 Differences between the two `denoising.py` files
 
 | Item | mbirjax, 663 lines | mbirtorch, 684 lines |
 |---|---|---|
-| Single-device sweep | `_denoise_single_device` at `:309`, using two nested `@jax.jit` closures, `lax.fori_loop`, `lax.while_loop`, and history arrays on the device | Written inline in `denoise()` at `:406-436`, using Python `for` loops, `maybe_compile(vcd_subset_denoiser)`, NumPy history arrays, and `torch.no_grad()` |
+| Single-device sweep | `_denoise_single_device` at `:309`, using two nested `@jax.jit` closures, `lax.fori_loop`, `lax.while_loop`, and history arrays on the device | Written inline in `denoise()` at `:412-448`, using Python `for` loops, `maybe_compile(vcd_subset_denoiser)`, NumPy history arrays, and `torch.no_grad()` |
 | Multiple-device sweep | `_denoise_sharded` at `:427` | `_denoise_sharded` at `:452`, with one thread pool per device |
 | Regularization setup | Uses `auto_set_regularization_params` | The same, plus `_subsample_to_host` at `:100-152` and `:365-374`, which subsamples rows to avoid transferring the whole volume |
 | Additional functions | None | `_volume_shape`, `_subsample_to_host`, a chunked `image_ell1`, `compile_mode`, and `_apply_device_policy(workload='denoise')` |
@@ -454,7 +589,7 @@ nothing.
 | `_log_denoise_progress` | A method at `:303`, which MACE4D replaces with a function that does nothing | Not a method.  Logging is written inline at `:429-431`.  The equivalent is `set_params(verbose=0)`. |
 | `vcd_subset_denoiser` | At `:511`, and functional | At `:35`, and it modifies its inputs in place with `flat_image.index_add_` and `flat_error_image.index_copy_` at `:77-81`.  It returns `(flat_image, flat_error_image, ell1, alpha)`.  The in-place updates prevent the use of `torch.func.vmap`. |
 
-### 3.6 The existing test of `prox_map`
+### 3.12 The existing test of `prox_map`
 
 The file `mbirtorch/tests/test_prox_map.py` has 44 lines and one test,
 `test_prox_map_pulls_toward_input(device)`.  It already exercises most of what
@@ -540,14 +675,19 @@ unnecessary arithmetic on planes that converge early.  The second is to accept
 that the result differs from mbirjax and to relax the corresponding test.
 Record the choice with a `DIVERGENCE(mace4d batched convergence)` comment.
 
-## 5. The plan
+## 5. The stages
 
-The plan has eight phases.  Each phase ends at a stated condition.
+The work has ten stages, numbered 0 through 9.  Each stage names the files it
+touches, the tests that check it, and the condition at which it ends.  A stage
+is not started until the stages it depends on have ended.  Section 7 gives the
+dependency order.
 
-### Phase 0: refactor `_denoise_single_device` out of `denoise()`
+### Stage 0: refactor `_denoise_single_device` out of `denoise()`
 
-Extract the code at `mbirtorch/denoising.py:406-436` into a method with this
-signature.
+Files touched: `mbirtorch/denoising.py`.
+
+Extract the single-device sweep at `mbirtorch/denoising.py:412-448` into a
+method with this signature.
 
 ```python
 _denoise_single_device(flat_image, flat_error_image, partition, fm_constant,
@@ -560,45 +700,62 @@ Then have `denoise()` call it.  This is a refactoring with no change in
 behavior.  It is worth doing regardless of which option in Section 4 is chosen,
 because it gives MACE4D a function to call.
 
-Phase 0 ends when `tests/test_denoiser.py` passes without modification.
+Stage 0 ends when `tests/test_denoiser.py` passes without modification.
 
-### Phase 1: measure the batched denoiser options
+### Stage 1: measure the batched denoiser options
+
+Files touched: a script under `dev_scripts/`, and no package code.
 
 Write the Option C loop as the reference result, using the same denoiser
-configuration that MACE4D uses.  Write the Option A prototype, both with and
-without rows of zeros between planes.  Measure two quantities for Option A
-against the reference.  The first is the maximum relative difference.  The
-second is the elapsed time, on a realistic number of planes.
+configuration that MACE4D uses.  That configuration comes from
+`_configure_denoiser` and `_denoise_constants`, described in Stage 4.  Write
+the Option A prototype, both with and without rows of zeros between planes.
+Measure two quantities for Option A against the reference.  The first is the
+maximum relative difference.  The second is the elapsed time, on a realistic
+number of planes.  A realistic case is the driver's default problem: several
+hundred planes per orientation at full detector resolution.
 
 If Option A meets the iterated tolerance of 1e-3, adopt it.  If it does not,
-plan Option B as a separate change to `denoising.py` before starting Phase 3.
+plan Option B as a separate change to `denoising.py` before starting Stage 3.
 Record the measurement and its date in the module docstring.
 
-Phase 1 ends when one option is chosen and its measured difference and speed are
-recorded.  Phase 1 blocks Phase 3.
+Stage 1 ends when one option is chosen and its measured difference and speed
+are recorded.  Stage 1 blocks Stage 3.
 
-### Phase 2: the supporting functions
+### Stage 2: the supporting utilities
 
-This phase has two parts, which are independent of Phase 1 and of each other.
+Files touched: `mbirtorch/utilities.py`, the device-helper location chosen in
+Section 3.2, and `mbirtorch/tests/`.
 
-Port `_construct_time_frame_models` into `mbirtorch/utilities.py`.  Keep the
-angular step computed as `np.median(np.abs(np.diff(angles)))`, the discarding of
-trailing views, and the suppression of printing after the first frame.  Test it
-with the 24-view case from Section 1.1, checking for 5 frames and
-`view_slices[1] == slice(4, 12)`.
+This stage ports the first two missing utilities from Section 3.  The two
+parts are independent of Stage 1 and of each other.
 
-Write the device-pool helper.  It may be private to `mace4d.py`, or it may sit
-next to `TomographyModel._resolve_device`, which is preferable.  It must accept
-`None`, the string `cpu`, the strings `gpu` and `cuda`, an integer count, a
-sequence of integers, and a sequence of `torch.device` objects.  It must raise
-for a count larger than the number of available devices, and for an unknown
-platform string.  Mark the change in CPU behavior described in Section 3.3 with
-a `DIVERGENCE(cpu device pool)` comment.
+Port `_construct_time_frame_models` into `mbirtorch/utilities.py` as Section
+3.1 describes.  Keep the angular step computed as
+`np.median(np.abs(np.diff(angles)))`, the discarding of trailing views, the
+four `ValueError` conditions, and the suppression of printing after the first
+frame.  Test it with the 24-view case from Section 1.1, checking for 5 frames
+and `view_slices[1] == slice(4, 12)`.  Also test one `ValueError` case, such
+as `frames_per_rotation` large enough to give a stride below one view.
 
-### Phase 3: the module and the consensus loop
+Write the device-pool helpers as Section 3.2 describes.  They may be private
+to `mace4d.py`, or they may sit next to `TomographyModel._resolve_device`,
+which is preferable.  The pool resolution must accept `None`, the string
+`cpu`, the strings `gpu` and `cuda`, an integer count, a sequence of integers,
+and a sequence of `torch.device` objects.  It must raise for a count larger
+than the number of available devices, and for an unknown platform string.
+Mark the change in CPU behavior described in Section 3.2 with a
+`DIVERGENCE(cpu device pool)` comment.
 
-Write `mbirtorch/mace4d.py` with the class `MACE4DModel(ParameterHandler)`.
-This phase covers six items.
+Stage 2 ends when the frame-construction test and the device-resolution tests
+pass on both CPU and GPU.
+
+### Stage 3: the module and the consensus loop
+
+Files touched: a new `mbirtorch/mace4d.py`.
+
+Write the class `MACE4DModel(ParameterHandler)`.  This stage covers six
+items.
 
 The constructor and parameter registration, including the special handling of
 `sigma_prox` and the validation of `mace_prior_weight` when it is set.
@@ -609,7 +766,9 @@ The host-side helper functions.  These are `_normalize_prior_weights`,
 `_write_run_info`.  All are pure NumPy and Python, and port with almost no
 change.
 
-The methods `set_device_pool` and `devices`, built on the Phase 2 helper.
+The methods `set_device_pool` and `devices`, built on the Stage 2 helpers, and
+the public attributes `num_frames` and `view_slices`, which Section 2 requires
+because the application driver reads them.
 
 The method `recon`.  This covers the choice of initial reconstruction, the host
 arrays `W` and `X`, the in-place consensus update with one reused temporary
@@ -628,13 +787,17 @@ once and leave it on that device for the whole run, as mbirjax does at
 device form directly to `prox_map`, which accepts it.  That would avoid a
 transfer through host memory that the mbirjax code cannot avoid.
 
-Phase 3 ends when a reconstruction with 3 frames, one device, and
+Stage 3 ends when a reconstruction with 3 frames, one device, and
 `dejitter=False` runs, produces only finite values, and has shape
-`(3,) + recon_shape`.
+`(3,) + recon_shape`.  The prior agents are not yet written at this point,
+so for this check the three denoiser calls are stubbed to return their input
+unchanged.  The stub is removed in Stage 4.
 
-### Phase 4: the three prior agents
+### Stage 4: the three prior agents
 
-This phase has six items.
+Files touched: `mbirtorch/mace4d.py`.
+
+This stage has six items.
 
 Write `_get_qggmrf_denoiser(shape, device)`, which caches one denoiser per pair
 of shape and device in thread-local storage.  Pin each denoiser to its device
@@ -658,9 +821,11 @@ and cached.  The partition is drawn from the global NumPy random number
 generator, so computing it again would change the order of the VCD subsets
 between calls.
 
-Write `_batched_hyperplane_denoise` according to the choice made in Phase 1.
-Rewrite the out-of-memory retry for `torch.cuda.OutOfMemoryError`, and call
-`torch.cuda.empty_cache()` before retrying.
+Write `_batched_hyperplane_denoise` according to the choice made in Stage 1.
+Rewrite the batch-size choice and the out-of-memory retry as Section 3.4
+describes: read `torch.cuda.mem_get_info`, catch `torch.cuda.OutOfMemoryError`
+and a `RuntimeError` whose text contains "out of memory", and call
+`torch.cuda.empty_cache()` before retrying with half the batch size.
 
 Write `_denoiser_wrapper(x, permute_vector, sigma, device, config_token=None)`.
 It permutes with `np.ascontiguousarray(np.transpose(...))`, reconfigures the
@@ -670,23 +835,30 @@ denoiser only when the token changes, and permutes back with
 Write `_estimate_global_sigma`.  Reshape to `(T * nx, ny, nz)` and keep the
 error for a value that is not finite or not positive.
 
-Phase 4 ends when the adapted test of the batched denoiser passes and a
+Stage 4 ends when the adapted test of the batched denoiser passes and a
 reconstruction using all four agents runs.
 
-### Phase 5: the temporal filter
+### Stage 5: the temporal filter
+
+Files touched: `mbirtorch/mace4d.py`.
 
 Port `_dejitter_4d_dct` unchanged, using SciPy.  It runs on the host and does
-not involve PyTorch.  Keep the block processing controlled by `chunk_size`,
-including the explicit `del block, C`.
+not involve PyTorch.  Section 3.5 gives the reason.  Keep the block processing
+controlled by `chunk_size`, including the explicit `del block, C`.  SciPy is
+already a declared mbirtorch dependency, so no dependency change is needed.
 
 Write the wrapper `MACE4DModel._dejitter` with `period=frames_per_rotation`,
 `harmonics=True`, `band_width=1`, and `dtype=np.float32`, and with printing
 controlled by `dejitter_verbose`.
 
-Check whether SciPy is already a required dependency.  If it is not, add it to
-`environment.yml` and `pyproject.toml`.
+Stage 5 ends when a direct test of the filter passes.  The test builds a 4D
+array that is a smooth signal plus a sinusoid with period `frames_per_rotation`
+along the frame axis, and checks that the filter removes the sinusoid and
+keeps the smooth signal to within a stated tolerance.
 
-### Phase 6: task parallelism and logging
+### Stage 6: task parallelism and logging
+
+Files touched: `mbirtorch/mace4d.py`.
 
 Create one `ThreadPoolExecutor` per device, each with one worker thread.
 Section 1.8 gives the two reasons.
@@ -703,10 +875,17 @@ therefore raise its own recompilation budget.  Verify that no thread exceeds the
 budget.  Exceeding it produces no message and was measured to cost a factor of 5
 to 11.
 
-Phase 6 ends when the multiple-device test finds log rows from both devices in
+Confirm that concurrent frame models write separate logs.  Section 3.7
+explains why this works in mbirtorch already, and this stage is the first code
+that exercises it with many models in threads at once.
+
+Stage 6 ends when the multiple-device test finds log rows from both devices in
 `task_log.csv`.
 
-### Phase 7: tests
+### Stage 7: tests
+
+Files touched: a new `mbirtorch/tests/test_mace4d.py`, and
+`tests/generate_goldens.py`.
 
 Rewrite `tests/test_mace4d.py` in pytest style, since the mbirjax version uses
 `unittest`.  Use the existing `device` fixture.
@@ -720,7 +899,7 @@ computes zero divided by zero.
 |---|---|
 | Prior weights | `0.5` gives `[0.5, 1/6, 1/6, 1/6]`.  `[0.1,0.2,0.3]` gives `[0.4,0.1,0.2,0.3]`.  The values `1.5`, `-0.1`, `[0.5,0.5,0.5]`, and `[0.1,0.2]` each raise. |
 | Task assignment | `_assign_tasks(25, [192,65,65], 4)` returns 25 frame assignments and 3 orientation assignments, all in the range 0 to 3, and places the three denoiser tasks on three different devices.  `_assign_tasks(5, [8,6,7], 1)` returns all zeros. |
-| Device resolution | The inputs `None`, `1`, an explicit list, `[0]`, and `cpu` all work.  A count above the number of devices raises, and `tpu` raises.  `set_device_pool(1)` gives a pool of length 1.  Adjust for the CPU behavior in Section 3.3. |
+| Device resolution | The inputs `None`, `1`, an explicit list, `[0]`, and `cpu` all work.  A count above the number of devices raises, and `tpu` raises.  `set_device_pool(1)` gives a pool of length 1.  Adjust for the CPU behavior in Section 3.2. |
 | Construction | `num_frames` is 5, `len(model_list)` is 5, and `view_slices[1]` is `slice(4, 12)`.  A sinogram of the wrong shape raises, and weights of the wrong shape raise, both before any computation. |
 | Parameters | `dejitter` defaults to True.  `set_params(rho_mann=0.25, dejitter=False)` is readable afterward.  `mace_prior_weight=1.5` raises when set. |
 | A complete reconstruction | Use `np.random.seed(0)`, `num_frames=3`, `dejitter=False`, and one device.  Use `dejitter=False` because a filter with period 6 applied to 3 frames removes the entire temporal spectrum.  Check the shape, that all values are finite, that the three log files exist, that the keys of the returned dictionary are `model_params`, `notes`, `recon_params`, and `timing`, that `timing` has one entry, that the recorded iteration count is 1, that `weights` is recorded as `unit (weights=None)`, and that `init_recon.npy` is written and then reused.  Also check that `stop_threshold_change_pct=1e9` stops after one iteration, that a supplied `init_recon` is recorded as provided by the caller, and that an `init_recon` of the wrong shape raises. |
@@ -736,7 +915,13 @@ is the strongest available check that the port computes the same thing.
 Note that `pin_device_count` sets `MBIRTORCH_NUM_DEVICES=1` for the whole test
 session.  The multiple-device test must override it.
 
-### Phase 8: documentation and registration
+Stage 7 ends when every group in the table passes and the stored-array
+comparison passes at the iterated tolerance.
+
+### Stage 8: documentation and registration
+
+Files touched: `mbirtorch/mace4d.py`, `mbirtorch/__init__.py`, and
+`docs/source/`.
 
 Set `__all__ = ['MACE4DModel']` in `mbirtorch/mace4d.py`.  Do not port
 `MACE4DParamNames`, because the `Literal` type annotations were not ported to
@@ -758,45 +943,86 @@ hidden `toctree`, placing it between `usr_denoising` and `usr_preprocess`.  Add 
 section to `usr_api_overview.rst` with an autosummary entry for
 `MACE4DModel.recon`.
 
-If Phase 3 is complete but Phase 4 is not, put the page in
+If Stage 3 is complete but Stage 4 is not, put the page in
 `docs/source/_pending/` and add a row to that directory's README.
 
-Consider writing a demonstration script, `demo/demo_10_mace4d.py`.  There is
-nothing to port for this.  The directory `mbirjax/experiments/MACE_4D_CT/`
-contains only a stale `__pycache__` directory.
+Stage 8 ends when the documentation builds without warnings and
+`from mbirtorch import MACE4DModel` works through the lazy loader.
+
+### Stage 9: the application workflow
+
+Files touched: `mbirtorch/utilities.py`, `pyproject.toml`, `environment.yml`,
+and a new `demo/demo_10_mace4d.py`.
+
+This stage checks the port against the way MACE4D is actually used.  The
+reference is the driver `mbirjax_applications/nsi_4d/Lilly_recon_4d.py`, which
+runs the complete workflow: NSI preprocessing, model construction, weight
+generation, reconstruction with an initialization cache and log directory, and
+GIF output.
+
+Port `save_volume_as_gif` as Section 3.6 describes, and add imageio to
+`pyproject.toml` and `environment.yml`.  Test it with a small 4D array,
+checking that a GIF file is written for each of the four axis combinations in
+the mbirjax docstring, and that a 5D input raises `ValueError`.
+
+Write `demo/demo_10_mace4d.py`, modeled on the driver.  There is nothing to
+port for this, because the directory `mbirjax/experiments/MACE_4D_CT/`
+contains only a stale `__pycache__` directory.  The demo follows the driver's
+sequence: `preprocess.nsi.get_sino_and_model` with `auto_crop=True`, then
+`MACE4DModel` construction, then `gen_weights(sino,
+weight_type='transmission_root')`, then `recon` with `init_dir` and `log_dir`,
+then `np.save` and `save_volume_as_gif`.  Every step already exists in
+mbirtorch except the two written in this plan, so the demo is also a check
+that no import or signature was missed.
+
+Run the demo end to end on the 4DCT phantom dataset with a small
+`num_frames`, such as 3, and `downsampling=4`.  Confirm four behaviors the
+driver depends on: `num_frames` and `view_slices` are readable after
+construction, `recon_dict['recon_params']['iterations completed']` exists,
+`run_info.txt` is present and can be appended to after the run, and a second
+run with the same `init_dir` loads the cached `init_recon.npy` instead of
+recomputing it.
+
+Stage 9 ends when the demo runs end to end on the phantom dataset and writes
+the reconstruction, the three log files, and the GIFs.
 
 ## 6. Risks
 
 | Risk | Severity | How to handle it |
 |---|---|---|
-| The batched denoiser has no direct PyTorch equivalent | High | Phase 1 measures the options before any other work.  Option C is the reference result. |
+| The batched denoiser has no direct PyTorch equivalent | High | Stage 1 measures the options before any other work.  Option C is the reference result. |
 | Per-plane stopping tests cannot be expressed on a batch | Medium | Run every plane to the iteration limit and freeze converged planes with a mask.  This costs arithmetic, not accuracy.  Record it as a divergence. |
 | Extracting `_denoise_single_device` changes the single-image denoiser | Medium | The change is a refactoring.  Use `tests/test_denoiser.py` as the check, and make this change on its own. |
 | A MACE4D worker thread exceeds the recompilation budget | Medium | Raise the budget in each worker thread.  Check for recompilation warnings in the multiple-device test.  The cost of missing this is a factor of 5 to 11, with no message. |
 | The CPU device pool has one device in PyTorch | Low | Record it as a divergence.  The multiple-device test should skip rather than simulate a second CPU device. |
 | Host memory holds eight full four-dimensional arrays plus two more | Medium | This is also the mbirjax behavior.  Keep every array `float32` and keep the in-place consensus update.  Consider predicting this peak with `_memory_ledger.py`, so that an over-large problem raises an error rather than being killed by the operating system. |
 | Regenerating the pixel partition changes the VCD subset order | Low | Compute the partition once per configuration and cache it, as mbirjax does.  Seed the random number generator in the tests. |
-| PyTorch has no type-I discrete cosine transform | Low | Keep the temporal filter in SciPy on the host.  Confirm SciPy is a declared dependency. |
+| PyTorch has no type-I discrete cosine transform | Low | Keep the temporal filter in SciPy on the host.  SciPy is already a declared dependency. |
 | Numerical differences from mbirjax accumulate over 10 iterations | Medium | Compare against stored arrays at the iterated tolerance of 1e-3.  If the comparison fails, compare one agent at a time rather than the whole reconstruction. |
+| The end-to-end NSI run fails only at full scale | Medium | Stage 9 runs the demo on the phantom dataset with a small `num_frames` first.  The init cache and the logs make a failed full run resumable and diagnosable. |
 
 ## 7. Size and order of the work
 
-| Phase | Content | Approximate size |
+| Stage | Content | Approximate size |
 |---|---|---|
 | 0 | Extract `_denoise_single_device` | 40 lines, a refactoring |
 | 1 | Measure the batched denoiser options | Small, and the main source of uncertainty |
-| 2 | `_construct_time_frame_models` and the device-pool helper | 160 lines |
+| 2 | `_construct_time_frame_models` and the device-pool helpers | 160 lines |
 | 3 | The module, the consensus loop, and the data-fit agent | 450 lines |
 | 4 | The three prior agents | 250 lines |
 | 5 | The temporal filter | 90 lines, almost unchanged |
 | 6 | Task parallelism and logging | 120 lines |
 | 7 | Tests | 320 lines |
 | 8 | Documentation and registration | 80 lines of reStructuredText |
+| 9 | `save_volume_as_gif` and the demo | 160 lines of utility plus 200 lines of demo |
 
-The total is 1200 to 1400 lines.  For comparison, the mbirjax code is 1039 lines
-of module, 305 lines of tests, and 55 lines of documentation.
+The total is 1300 to 1500 lines.  For comparison, the mbirjax code is 1039
+lines of module, 305 lines of tests, 55 lines of documentation, and 209 lines
+of application driver.
 
-Do the phases in numerical order.  Phase 0 comes first because Phase 1 needs the
-function it creates.  Phase 2 can be done at any time, including in parallel
-with Phase 1.  Phase 1 governs the schedule, because its result determines the
-structure of Phase 4.
+Do the stages in numerical order.  Stage 0 comes first because Stage 1 needs
+the function it creates.  Stage 2 can be done at any time, including in
+parallel with Stage 1.  Stage 1 governs the schedule, because its result
+determines the structure of Stage 4.  Stage 9 comes last because it exercises
+everything the earlier stages built, though `save_volume_as_gif` itself
+depends on nothing else and can be ported at any time.
