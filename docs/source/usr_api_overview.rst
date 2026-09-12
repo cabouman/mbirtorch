@@ -118,6 +118,7 @@ generating synthetic data, and clearing the on-disk compile cache.
 .. autosummary::
 
    view_utils.slice_viewer
+   view_utils.geometry_viewer
    vcd_utils.gen_weights
    vcd_utils.gen_weights_mar
    utilities.download_and_extract

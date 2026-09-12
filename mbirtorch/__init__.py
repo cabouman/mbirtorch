@@ -80,6 +80,7 @@ __all__ = [
     "import_recon_hdf5",
     "generate_3d_shepp_logan_low_dynamic_range", "clear_cache",
     "get_memory_stats", "SliceViewer", "VolumeStack", "slice_viewer",
+    "GeometryScene", "GeometryFigure", "geometry_viewer",
     "stitch_arrays", "get_ct_model", "copy_ct_model",
     "generate_demo_data", "generate_3d_shepp_logan_reference",
     # Documented hsnt and vcls names; these resolve lazily through __getattr__.
@@ -89,7 +90,8 @@ __all__ = [
 ]
 
 # ── lazy exports (PEP 562) ───────────────────────────────────────────────────
-# The viewer names resolve on first attribute access so that a headless
+# The names of the two viewers -- the slice viewer and the geometry viewer --
+# resolve on first attribute access so that a headless
 # `import mbirtorch` never imports matplotlib; most mbirtorch runs (batch
 # recons, tests) never open a viewer.  The preprocess, hsnt, and vcls
 # modules resolve the same way, so `import mbirtorch` never pays for their
@@ -100,7 +102,8 @@ __all__ = [
 # star-exported FUNCTION names (mbirtorch.dehydrate, mbirtorch.get_opt_views,
 # ...) resolve through _LAZY_NAMES, so the public surface is exactly what eager
 # star imports would give; only WHEN each module loads changes.
-_VIEWER_EXPORTS = ("SliceViewer", "VolumeStack", "slice_viewer")
+_VIEWER_EXPORTS = ("SliceViewer", "VolumeStack", "slice_viewer",
+                   "GeometryScene", "GeometryFigure", "geometry_viewer")
 
 _LAZY_MODULES = ("preprocess", "hsnt", "vcls")
 

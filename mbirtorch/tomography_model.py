@@ -1977,6 +1977,96 @@ class TomographyModel(ParameterHandler):
             recon = recon.reshape(tuple(recon_shape[:2]) + (cylinders.shape[-1],))
         return recon if output_sharded else self._gather_recon(recon)
 
+    def project_points(self, points_xyz, view_index):
+        """Map object points to fractional detector indices, for one view or several.
+
+        This is the geometric map the projectors implement, stated for points
+        instead of voxels.  Each geometry class computes it from the same
+        functions its projection bodies use, so the answer here is the answer
+        the projector gives, up to the projector's float32 rounding and its
+        footprint weights.
+
+        The object frame is the right-handed (x, y, z) frame in which voxel
+        (i, j, k) of the reconstruction has its center at
+
+            x = delta_voxel * (j - (num_cols - 1) / 2)
+            y = voxel_row_aspect * delta_voxel * (i - (num_rows - 1) / 2)
+            z = voxel_slice_aspect * delta_voxel * (k - (num_slices - 1) / 2) + recon_slice_offset
+
+        so the column index runs along x, the row index along y, and the slice
+        index along z, the rotation axis.  ``recon_slice_offset`` is zero for a
+        geometry that has no such parameter.  Points are given in this frame,
+        before the view's own action on the object: a view rotates the object
+        about z by its angle (parallel, cone, and multiaxis), shifts it by its
+        helical z shift (cone), or translates it by minus its translation
+        vector (translation).  This method applies that action itself.
+
+        The result is a pair of fractional indices into a sinogram of shape
+        ``(num_views, num_det_rows, num_det_channels)``.  Integer index m is
+        the center of detector row m, and index -0.5 is the outer edge of row
+        0.  A point outside the detector gets an index outside
+        ``[-0.5, num - 0.5]``; nothing is clipped.
+
+        Args:
+            points_xyz (array_like): the points, (N, 3) as (x, y, z) in ALU,
+                or one point as (3,).
+            view_index (int or sequence of int): one view, or several.
+
+        Returns:
+            tuple of ndarray: ``(row, channel)`` as float64 arrays.  For one
+            view each has shape (N,); for a sequence of views each has shape
+            (num_selected_views, N).
+
+        Raises:
+            ValueError: if ``points_xyz`` is not (N, 3) or (3,), or if a view
+                index is not an integer.
+            IndexError: if a view index is outside ``[0, num_views)``.
+
+        Example:
+            >>> row, channel = model.project_points([[0.0, 0.0, 0.0]], 0)
+        """
+        points = np.asarray(points_xyz, dtype=np.float64)
+        if points.ndim == 1 and points.shape == (3,):
+            points = points[None, :]
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError('points_xyz must have shape (N, 3) or (3,); '
+                             f'got {points.shape}.')
+        single_view = np.ndim(view_index) == 0
+        indices = np.atleast_1d(np.asarray(view_index))
+        if indices.ndim != 1 or not np.issubdtype(indices.dtype, np.integer):
+            raise ValueError('view_index must be an integer or a sequence of '
+                             f'integers; got {view_index!r}.')
+        num_views = int(self.get_params('sinogram_shape')[0])
+        if indices.size and (indices.min() < 0 or indices.max() >= num_views):
+            raise IndexError(f'view_index {view_index!r} is outside '
+                             f'[0, {num_views}).')
+        view_params = np.asarray(self.get_params(self.get_params('view_params_name')))[indices]
+        # The computation is float64 on the host: it is a small geometric
+        # query, and a device transfer would cost more than the arithmetic.
+        row, channel = self._project_points_batch(
+            torch.as_tensor(points, dtype=torch.float64),
+            torch.as_tensor(view_params, dtype=torch.float64))
+        row = np.ascontiguousarray(row.numpy())
+        channel = np.ascontiguousarray(channel.numpy())
+        if single_view:
+            return row[0], channel[0]
+        return row, channel
+
+    def _project_points_batch(self, points, view_params):
+        """The geometry's own part of :meth:`project_points`.
+
+        Args:
+            points: (N, 3) float64 CPU tensor of object-frame points.
+            view_params: the selected rows of the model's per-view parameter
+                array, as a float64 CPU tensor: (V,) angles for parallel beam,
+                (V, 2) for cone and multiaxis, (V, 3) for translation.
+
+        Returns:
+            (row, channel): float64 CPU tensors, each (V, N).
+        """
+        raise NotImplementedError(
+            f'{type(self).__name__} does not implement project_points.')
+
     def compute_hessian_diagonal(self, weights=None, output_sharded=False,
                                  indices=None):
         """
@@ -3477,15 +3567,23 @@ class TomographyModel(ParameterHandler):
         k = np.arange(num_slices) if slice_indices is None else np.asarray(slice_indices)
         return voxel_slice_aspect * delta_voxel * (k - (num_slices - 1) / 2.0) + offset
 
-    def nearest_recon_slice(self, z):
-        """The index of the recon slice whose center is nearest the axial
-        coordinate ``z`` in ALU, clipped to the volume.  The inverse of
-        :meth:`recon_slice_z`."""
+    def _fractional_slice_index(self, z):
+        """The fractional recon slice index of axial coordinate ``z``, the
+        inverse of :meth:`recon_slice_z` without rounding.  ``z`` may be a
+        float, a numpy array, or a torch tensor; the result has the same
+        form."""
         recon_shape = self.get_params('recon_shape')
         delta_voxel, voxel_slice_aspect = self.get_params(['delta_voxel', 'voxel_slice_aspect'])
         offset = self.get_params('recon_slice_offset') if 'recon_slice_offset' in self.params else 0.0
         num_slices = int(recon_shape[2])
-        index = int(round((z - offset) / (voxel_slice_aspect * delta_voxel) + (num_slices - 1) / 2.0))
+        return (z - offset) / (voxel_slice_aspect * delta_voxel) + (num_slices - 1) / 2.0
+
+    def nearest_recon_slice(self, z):
+        """The index of the recon slice whose center is nearest the axial
+        coordinate ``z`` in ALU, clipped to the volume.  The inverse of
+        :meth:`recon_slice_z`."""
+        num_slices = int(self.get_params('recon_shape')[2])
+        index = int(round(float(self._fractional_slice_index(z))))
         return min(max(index, 0), num_slices - 1)
 
     def reshape_recon(self, recon):

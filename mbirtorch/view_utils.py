@@ -5,6 +5,10 @@ imports only numpy, matplotlib, and (lazily) h5py.  This wrapper supplies the
 mbirtorch-specific conversions on the way in: torch tensors (including CUDA and MPS tensors)
 become numpy arrays, and rich data dicts -- e.g. the recon_dict returned by
 :meth:`TomographyModel.recon` -- are serialized to dicts of display strings.
+
+The geometry viewer needs no conversion on the way in, because its scene reads
+the model directly and its figure converts a tensor overlay itself, so the
+function is re-exported as it is.
 """
 
 import pprint
@@ -13,9 +17,12 @@ import numpy as np
 
 from .viewer import SliceViewer, VolumeStack
 from .viewer import slice_viewer as _slice_viewer
+from .geometry_scene import GeometryScene
+from .geometry_figure import GeometryFigure, geometry_viewer
 
 __all__ = ['SliceViewer', 'VolumeStack', 'convert_subdicts_to_strings',
-           'slice_viewer']
+           'slice_viewer', 'GeometryScene', 'GeometryFigure',
+           'geometry_viewer']
 
 
 def _to_numpy(dataset):

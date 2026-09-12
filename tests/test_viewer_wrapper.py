@@ -45,17 +45,21 @@ def open_viewer():
 
 class TestLazyExport:
     def test_viewer_names_in_public_api(self):
-        for name in ('slice_viewer', 'SliceViewer', 'VolumeStack'):
+        for name in ('slice_viewer', 'SliceViewer', 'VolumeStack',
+                     'geometry_viewer', 'GeometryFigure', 'GeometryScene'):
             assert name in mbirtorch.__all__
 
     def test_headless_import_is_silent_and_lazy(self):
         # -W error turns any warning into a failure, and the module listing
         # proves matplotlib and the viewer modules were not imported.
+        # geometry_rules is not a viewer module: it holds the projection rules
+        # the four model classes share, so it loads with them.
         code = (
             "import sys, os; import mbirtorch; "
             "loaded = [m for m in sys.modules "
             "if m.startswith('matplotlib') or 'viewer' in m "
-            "or 'view_utils' in m]; "
+            "or 'view_utils' in m "
+            "or ('geometry_' in m and 'geometry_rules' not in m)]; "
             "print(','.join(loaded) or 'CLEAN')"
         )
         result = subprocess.run(
