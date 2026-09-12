@@ -608,14 +608,37 @@ def _resolve_geometry_class(geometry_type):
     raise ValueError(f"Cannot resolve a model class for geometry_type {geometry_type!r}.")
 
 
+# The reconstruction geometry the automatic pass sets.  build_model applies supplied values of these after
+# the pass, and copy_ct_model decides axis by axis which of the parent's to keep.
+_RECON_GEOMETRY_NAMES = ('recon_shape', 'delta_voxel', 'recon_slice_offset')
+
+
+def _is_parallel_beam(model):
+    return type(model).__name__ == 'ParallelBeamModel'
+
+
+def _recon_shape_at_pitch(recon_shape, automatic_pitch, pitch, slices_are_rows=False):
+    """The automatic ``recon_shape``, which was sized at ``automatic_pitch``, rescaled to cover the same
+    extent at ``pitch``.  With ``slices_are_rows`` the slice count is left alone: in parallel beam one
+    slice per detector row is structural."""
+    if np.isclose(pitch, automatic_pitch):
+        return tuple(int(n) for n in recon_shape)
+    scaled = [int(np.ceil(n * automatic_pitch / pitch)) for n in recon_shape]
+    if slices_are_rows:
+        scaled[2] = int(recon_shape[2])
+    return tuple(scaled)
+
+
 def build_model(required_params, optional_params=None, regularization=None):
     """
     Construct a model from the parameter dicts returned by
     :meth:`~mbirtorch.TomographyModel.get_all_params`.
 
     The model class is taken from the ``geometry_type`` entry of ``required_params``.  The model is
-    constructed, the optional parameters and regularization are applied, and the reconstruction
-    geometry is set with ``auto_set_recon_geometry``.
+    constructed, the optional parameters and regularization are applied, and ``auto_set_recon_geometry``
+    sets the reconstruction geometry the dicts do not carry.  A ``recon_shape``, ``delta_voxel``, or
+    ``recon_slice_offset`` the dicts do carry, from a reader or from a model whose values were set by
+    hand, is kept; when a pitch is supplied without a shape, the automatic shape is sized at that pitch.
 
     Args:
         required_params (dict): The model constructor's arguments, including ``geometry_type`` (as
@@ -633,10 +656,10 @@ def build_model(required_params, optional_params=None, regularization=None):
     model = model_class(**required_params)
 
     optional_params = dict(optional_params) if optional_params else {}
-    # A pinned recon_shape must be applied AFTER auto_set_recon_geometry, or the automatic pass would
-    # overwrite it (the translation reader pins recon_shape; a faithful save/load round-trip relies
-    # on this ordering).
-    pinned_recon_shape = optional_params.pop('recon_shape', None)
+    # The automatic pass fills in the reconstruction geometry the dicts do not carry.  Whatever they do
+    # carry is applied AFTER the pass, or the pass would overwrite it; a faithful save/load round trip
+    # relies on this ordering.
+    supplied = {name: optional_params.pop(name) for name in _RECON_GEOMETRY_NAMES if name in optional_params}
     # Apply the structural/optional params WITH name validation, so a typo'd key still raises; then
     # apply the regularization knobs with no_warning to suppress the "directly setting regularization"
     # advisory (this is a faithful rebuild, not a user hand-setting sigma_x).
@@ -645,8 +668,14 @@ def build_model(required_params, optional_params=None, regularization=None):
     if regularization:
         model.set_params(no_warning=True, **regularization)
     model.auto_set_recon_geometry()
-    if pinned_recon_shape is not None:
-        model.set_params(no_warning=True, recon_shape=pinned_recon_shape)
+    # A supplied pitch with no supplied shape: the automatic shape was sized at the automatic pitch, so
+    # it is rescaled to cover the same extent at the supplied one.
+    if 'delta_voxel' in supplied and 'recon_shape' not in supplied:
+        supplied['recon_shape'] = _recon_shape_at_pitch(
+            model.get_params('recon_shape'), float(model.get_params('delta_voxel')),
+            float(supplied['delta_voxel']), slices_are_rows=_is_parallel_beam(model))
+    if supplied:
+        model.set_params(no_warning=True, **supplied)
     return model
 
 
@@ -998,8 +1027,23 @@ def stitch_arrays(array_list, overlap, axis=2, ramp_overlap=None):
     return swap(stitched, 0, axis)
 
 
+def _automatic_recon_geometry(required, optional, regularization):
+    """The reconstruction geometry the automatic pass gives a model built from these parameter dicts, as
+    (recon_shape, recon_slice_offset), with the offset None for a geometry that has no such parameter.  A value
+    set by hand is recognized by differing from this."""
+    optional = {name: value for name, value in optional.items() if name not in _RECON_GEOMETRY_NAMES}
+    optional['verbose'] = 0
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        reference = build_model(dict(required), optional, regularization)
+    recon_shape = tuple(int(n) for n in reference.get_params('recon_shape'))
+    has_offset = 'recon_slice_offset' in reference.get_all_params()[1]
+    offset = float(reference.get_params('recon_slice_offset')) if has_offset else None
+    return recon_shape, offset
+
+
 def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_det_rows=None, new_num_det_cols=None,
-                  new_translation_vectors=None):
+                  new_translation_vectors=None, no_warning=False):
     """
     Create a TomographyModel with the same type and parameters as the given ct_model except with the new per-view
     parameters and a corresponding sinogram shape.  Supports the ParallelBeam, ConeBeam, MultiAxisParallel and
@@ -1015,6 +1059,15 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
     If the user explicitly set the devices on ct_model with configure_devices, the copy
     gets the same devices.  Otherwise the copy chooses its own devices when it is used.
 
+    The copy keeps the parent's reconstruction geometry: the voxel pitch (``delta_voxel``) and aspect ratios
+    always, and ``recon_shape`` and ``recon_slice_offset`` along every axis whose inputs did not change.  Only the
+    axes fed by a changed input are re-derived by ``auto_set_recon_geometry``: the slice count and slice offset
+    when the detector row count or the helical travel changes, the in-plane shape when the channel count changes,
+    and, for a TranslationModel, the whole shape when either changes.  A re-derived count is sized at the parent's
+    voxel pitch.  Changing only the per-view parameters keeps the parent's geometry, which is right for a subset of
+    the views; a copy over views the parent never had may need a larger volume, which the caller sets.  When a
+    re-derived value replaces one the parent had set by hand, a warning names it unless ``no_warning`` is True.
+
     Args:
         ct_model (TomographyModel): The model to copy.
         new_angles (ndarray of float, optional): Projection angles in radians -- a 1D vector for ParallelBeamModel and
@@ -1028,12 +1081,15 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
             If None, then use the num_det_cols in ct_model. Defaults to None.
         new_translation_vectors (ndarray of float, optional): (num_views, 3) array of object translations (x, y, z) in
             ALU for TranslationModel.  If None, then use the translation_vectors in ct_model. Defaults to None.
+        no_warning (bool, optional): Suppress the warning about hand-set reconstruction geometry that the copy
+            re-derived.  Defaults to False.
 
     Returns:
         An instance of the same model class as ct_model
     """
     model_name = str(type(ct_model))
     is_cone = model_name.find('ConeBeamModel') > 0
+    is_parallel = model_name.find('ParallelBeamModel') > 0
     is_translation = model_name.find('TranslationModel') > 0
     # MultiAxisParallelModel is matched on its own name rather than through 'ParallelBeamModel', which is not a
     # substring of it.
@@ -1046,6 +1102,7 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
     # constructor args with the view components already unpacked (angles + helical_z_shifts for cone)
     # and geometry_type in required, so build_model can reconstruct the class.
     required, optional, regularization = ct_model.get_all_params()
+    parent_required = dict(required)   # the parent's own constructor arguments, for the hand-set check below
 
     # The key the per-view parameters arrive under is the one the constructor declares, so the copy reads and writes
     # that key rather than assuming every geometry has angles.  Translation carries translation_vectors and no angles
@@ -1063,6 +1120,7 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
 
     old_view_params = required[view_key]
     new_shape = list(required['sinogram_shape'])
+    old_num_det_rows, old_num_det_cols = new_shape[1], new_shape[2]
 
     if is_cone:
         old_helical_z_shifts = required['helical_z_shifts']
@@ -1080,6 +1138,12 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
                 raise ValueError('copy_ct_model: new_helical_z_shifts must have the same length as the existing angles.')
         required['helical_z_shifts'] = new_helical_z_shifts
 
+    # The automatic pass reads the helical shifts only through their range, so that is what counts as a change.
+    travel_changed = False
+    if is_cone:
+        old_z, new_z = np.asarray(old_helical_z_shifts, dtype=float), np.asarray(new_helical_z_shifts, dtype=float)
+        travel_changed = not np.allclose([old_z.min(), old_z.max()], [new_z.min(), new_z.max()])
+
     if new_view_params is None:
         new_view_params = old_view_params
     # len() is the view count for every form here: one entry per view, whether that entry is a scalar angle or a row
@@ -1092,9 +1156,71 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
     required[view_key] = new_view_params
     required['sinogram_shape'] = tuple(new_shape)
 
-    # The sinogram shape changed, so drop recon_shape and let build_model's auto pass recompute it.
-    optional.pop('recon_shape', None)
+    # Hold back the parent's recon geometry so build_model's automatic pass sizes the copy for the new
+    # sinogram; the parent's values are applied below, axis by axis.
+    parent_geometry = {name: optional.pop(name) for name in _RECON_GEOMETRY_NAMES if name in optional}
     new_model = build_model(required, optional, regularization)
+
+    # That pass sized the whole volume for the new sinogram and replaced the voxel pitch with the detector-derived
+    # value.  The copy keeps the parent's geometry instead, except along the axes whose inputs changed: the slices
+    # when the row count or the helical travel changed, the in-plane shape when the channel count changed, and for
+    # a translation model the whole shape, since its heuristic mixes both detector axes into every recon axis.  The
+    # pitch always stays the parent's, so a re-derived count is rescaled from the automatic pitch to the parent's to
+    # cover the same extent; parallel beam is the exception, where one slice per detector row is structural.
+    rows_changed = new_shape[1] != old_num_det_rows
+    cols_changed = new_shape[2] != old_num_det_cols
+    if is_translation:
+        redo_in_plane = redo_slices = rows_changed or cols_changed
+    else:
+        redo_in_plane = cols_changed
+        redo_slices = rows_changed or travel_changed
+    automatic_pitch = float(new_model.get_params('delta_voxel'))
+    parent_pitch = (automatic_pitch if parent_geometry.get('delta_voxel') is None
+                    else float(parent_geometry['delta_voxel']))
+    automatic_shape = tuple(int(n) for n in new_model.get_params('recon_shape'))
+    parent_shape = tuple(int(n) for n in ct_model.get_params('recon_shape'))
+
+    def at_parent_pitch(count):
+        if np.isclose(parent_pitch, automatic_pitch):
+            return count
+        return int(np.ceil(count * automatic_pitch / parent_pitch))
+
+    in_plane = tuple(at_parent_pitch(n) for n in automatic_shape[:2]) if redo_in_plane else parent_shape[:2]
+    if not redo_slices:
+        slices = parent_shape[2]
+    elif is_parallel:
+        slices = automatic_shape[2]
+    else:
+        slices = at_parent_pitch(automatic_shape[2])
+    recon_shape = tuple(in_plane) + (slices,)
+    has_offset = 'recon_slice_offset' in parent_geometry
+    geometry = dict(delta_voxel=parent_pitch, recon_shape=recon_shape)
+    if has_offset and not redo_slices:
+        geometry['recon_slice_offset'] = parent_geometry['recon_slice_offset']
+    new_model.set_params(no_warning=True, **geometry)
+
+    if not no_warning and (redo_in_plane or redo_slices):
+        # A re-derived value replaces the parent's silently only when the parent's was automatic too.  Anything the
+        # parent had set by hand is named, so the caller can set it on the copy.
+        automatic_parent_shape, automatic_parent_offset = _automatic_recon_geometry(
+            parent_required, optional, regularization)
+        lost = []
+        if redo_in_plane and parent_shape[:2] != automatic_parent_shape[:2] and recon_shape[:2] != parent_shape[:2]:
+            lost.append('the in-plane recon shape')
+        if redo_slices and parent_shape[2] != automatic_parent_shape[2] and recon_shape[2] != parent_shape[2]:
+            lost.append('the slice count')
+        if redo_slices and has_offset:
+            parent_offset = float(parent_geometry['recon_slice_offset'])
+            if not np.isclose(parent_offset, automatic_parent_offset) \
+                    and not np.isclose(float(new_model.get_params('recon_slice_offset')), parent_offset):
+                lost.append('recon_slice_offset')
+        if lost:
+            changed = [name for flag, name in ((rows_changed, 'detector row count'),
+                                               (cols_changed, 'detector channel count'),
+                                               (travel_changed, 'helical travel')) if flag]
+            warnings.warn(f"copy_ct_model: the {' and '.join(changed)} changed, so the automatic pass re-derived "
+                          f"{' and '.join(lost)}, which the parent had set by hand.  Set them on the copy to keep "
+                          "the parent's values, or pass no_warning=True.")
     # If the user explicitly set the devices, the copy inherits them.
     if not ct_model.device_layout_is_automatic:
         new_model.configure_devices(devices=list(ct_model.sino_placement.devices))

@@ -127,17 +127,21 @@ def test_zeiss_tct_asymmetric_crop_shifts_row_offset():
 
 
 def test_auto_crop_sino_consistent_and_survives_build_model():
-    # A cone model's params round-trip through _auto_crop_sino + build_model (see the mbirjax test
-    # of the same name for the full rationale).
+    # A cone model's params round-trip through _auto_crop_sino + build_model: the cropped sinogram
+    # shape and the shifted det_row_offset survive; a recon_slice_offset the dicts carry moves with
+    # the automatic center, which follows the detector through the crop, and build_model then keeps
+    # it; without one, build_model centers the volume on the cropped detector's band.
     angles = np.linspace(0, np.pi, 12, endpoint=False)
     model = mbirtorch.ConeBeamModel((12, 80, 100), angles, source_detector_dist=200,
                                     source_iso_dist=100)
     model.configure_devices(devices=['cpu'])
     model.set_params(no_warning=True, delta_det_row=0.5, delta_det_channel=0.5)
+    model.auto_set_recon_geometry()            # the pitch a reader supplies is the automatic one
     required, optional, regularization = model.get_all_params()
     optional.pop('recon_shape', None)          # reader flow: let auto size the recon from the crop
     row_offset_before = optional['det_row_offset']
     recon_slice_offset_before = optional['recon_slice_offset']
+    magnification = model.get_magnification()
 
     obj_row0, obj_col0 = 25, 30
     sino = np.zeros((12, 80, 100), dtype=np.float32)
@@ -147,25 +151,33 @@ def test_auto_crop_sino_consistent_and_survives_build_model():
     sino, required, optional = mtp.utilities._auto_crop_sino(sino, required, optional, safety_buffer=5)
     assert tuple(required['sinogram_shape']) == sino.shape                  # array <-> geometry
     assert optional['det_row_offset'] == pytest.approx(row_offset_before + (cb - ct) / 2 * 0.5)
-    assert optional['recon_slice_offset'] == recon_slice_offset_before      # crop leaves it alone
+    row_offset_shift = optional['det_row_offset'] - row_offset_before
+    assert row_offset_shift != 0                                            # an asymmetric crop
+    assert optional['recon_slice_offset'] == pytest.approx(
+        recon_slice_offset_before - row_offset_shift / magnification)       # moved with the detector
     nz_rows = np.asarray(np.any(sino != 0, axis=(0, 2)))
     nz_cols = np.asarray(np.any(sino != 0, axis=(0, 1)))
     assert int(np.argmax(nz_rows)) == obj_row0 - ct
     assert int(np.argmax(nz_cols)) == obj_col0 - cl
 
-    # Sentinel: a value the crop never wrote must be overwritten by auto_set_recon_geometry,
-    # proving build_model re-derives recon_slice_offset.
+    # build_model keeps a supplied recon_slice_offset: a sentinel the crop never wrote survives.
     optional['recon_slice_offset'] = 999.0
     rebuilt = mbirtorch.build_model(required, optional, regularization)
     assert tuple(rebuilt.get_params('sinogram_shape')) == sino.shape        # survives build
+    assert float(rebuilt.get_params('recon_slice_offset')) == pytest.approx(999.0)
+    # Without one, the volume is centered on the band the cropped detector illuminates.
+    automatic = mbirtorch.build_model(
+        required, {k: v for k, v in optional.items() if k != 'recon_slice_offset'}, regularization)
+    assert float(automatic.get_params('recon_slice_offset')) == pytest.approx(
+        -optional['det_row_offset'] / magnification)
     reference = mbirtorch.ConeBeamModel(
         **{k: v for k, v in required.items() if k != 'geometry_type'})
     reference.configure_devices(devices=['cpu'])
     reference.set_params(**{k: v for k, v in optional.items() if k != 'recon_slice_offset'})
     reference.auto_set_recon_geometry()
-    derived = float(rebuilt.get_params('recon_slice_offset'))
-    assert derived != pytest.approx(999.0)                                  # sentinel overwritten
-    assert derived == pytest.approx(float(reference.get_params('recon_slice_offset')))
+    assert float(automatic.get_params('recon_slice_offset')) == pytest.approx(
+        float(reference.get_params('recon_slice_offset')))
+    assert tuple(automatic.get_params('recon_shape')) == tuple(reference.get_params('recon_shape'))
     assert tuple(rebuilt.get_params('recon_shape')) == tuple(reference.get_params('recon_shape'))
 
 

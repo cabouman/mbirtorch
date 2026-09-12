@@ -28,13 +28,23 @@ GOLDEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "goldens")
 _npz_path = os.path.join(GOLDEN_DIR, "preprocess_goldens.npz")
 
 
-def _small_cone_case():
+def _set_hand_pitch(model, delta_voxel_scale):
+    """Scale the model's voxel pitch as a user setting it by hand would: the recon shape stays the
+    automatic one, so the volume covers a different physical extent than the detector's field of
+    view, and a copy of the model must keep that pitch to describe the same volume."""
+    if delta_voxel_scale != 1.0:
+        model.set_params(no_warning=True,
+                         delta_voxel=delta_voxel_scale * float(model.get_params('delta_voxel')))
+
+
+def _small_cone_case(delta_voxel_scale=1.0):
     cell = (32, 32, 32)
     angles = np.linspace(0, 2 * np.pi, cell[0], endpoint=False)
     model = mbirtorch.ConeBeamModel(cell, angles, source_detector_dist=4 * cell[2],
                                     source_iso_dist=2 * cell[2])
     model.configure_devices(devices=['cpu'])
     model.set_params(no_warning=True, verbose=0)
+    _set_hand_pitch(model, delta_voxel_scale)
     rshape = tuple(model.get_params('recon_shape'))
     phantom = mbirtorch.generate_3d_shepp_logan_low_dynamic_range(rshape)
     sino = model.forward_project(phantom)
@@ -56,6 +66,25 @@ def test_split_approximates_full_recon():
     sp = split_dict['split_params']
     assert sp['half_overlap_sino'] >= 4 and sp['half_overlap_recon'] > sp['half_overlap_sino'] // 2
     assert 'recon_params_top' in split_dict and 'recon_params_bottom' in split_dict
+
+
+def test_split_keeps_a_hand_set_voxel_pitch():
+    """A parent whose voxel pitch was set by hand hands that pitch to both halves, so the split
+    reconstructs the same physical volume as recon() and approximates it as closely as it does at
+    the automatic pitch."""
+    model, sino, weights = _small_cone_case(delta_voxel_scale=0.8)
+    pitch = float(model.get_params('delta_voxel'))
+    np.random.seed(0)
+    full, _ = model.recon(sino, weights=weights, max_iterations=8)
+    np.random.seed(0)
+    split, split_dict = model.recon_split_sino(sino, weights=weights, half_overlap=4,
+                                               max_iterations=8)
+    for key in ('model_params_top', 'model_params_bottom'):
+        assert float(split_dict[key]['delta_voxel']) == pytest.approx(pitch)
+    assert split.shape == full.shape
+    nrmse = float(np.linalg.norm(split - full) / np.linalg.norm(full))
+    print(f"hand-set pitch: split vs full NRMSE = {nrmse:.4f}")
+    assert nrmse < 0.1
 
 
 def test_split_preserves_device_layout():
@@ -100,7 +129,7 @@ def test_split_rejects_bad_inputs():
         model.recon_split_sino(sino, weights=weights[:, :4, :])
 
 
-def _small_parallel_case():
+def _small_parallel_case(delta_voxel_scale=1.0):
     # (views, detector rows, detector channels).  Rows are recon slices in this geometry, so the
     # 20 rows give 20 slices: enough for a 2-part and a 3-part split at half_overlap=3, which
     # needs 2 * half_overlap slices in every part.
@@ -109,6 +138,7 @@ def _small_parallel_case():
     model = mbirtorch.ParallelBeamModel(cell, angles)
     model.configure_devices(devices=['cpu'])
     model.set_params(no_warning=True, verbose=0)
+    _set_hand_pitch(model, delta_voxel_scale)
     rshape = tuple(model.get_params('recon_shape'))
     phantom = mbirtorch.generate_3d_shepp_logan_low_dynamic_range(rshape)
     sino = model.forward_project(phantom)
@@ -145,6 +175,23 @@ def test_parallel_split_approximates_full_recon():
     assert sp['half_overlap_sino'] == 3 and sp['half_overlap_recon'] == 3
     assert sp['part_slice_ranges'] == [(0, 10), (10, 20)]
     assert sp['slices_per_part'] == 10
+
+
+def test_parallel_split_keeps_a_hand_set_voxel_pitch():
+    """The parallel parts take a hand-set voxel pitch from the parent as well."""
+    model, sino, weights = _small_parallel_case(delta_voxel_scale=0.8)
+    pitch = float(model.get_params('delta_voxel'))
+    np.random.seed(0)
+    full, _ = model.recon(sino, weights=weights, max_iterations=8)
+    np.random.seed(0)
+    split, split_dict = model.recon_split_sino(sino, weights=weights, half_overlap=3,
+                                               max_iterations=8, slices_per_part=10)
+    assert all(float(params['delta_voxel']) == pytest.approx(pitch)
+               for params in split_dict['model_params_parts'])
+    assert split.shape == full.shape
+    nrmse = float(np.linalg.norm(split - full) / np.linalg.norm(full))
+    print(f"parallel hand-set pitch: split vs full NRMSE = {nrmse:.4f}")
+    assert nrmse < 0.1
 
 
 def test_parallel_split_in_three_parts():

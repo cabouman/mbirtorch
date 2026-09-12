@@ -37,6 +37,8 @@ Each is short and self-contained; adjust the parameters near the top and rerun t
      - The qGGMRF denoiser applied to a noisy 3D image.
    * - ``demo_10_geometry_calibration.py``
      - Estimating the center of rotation and the detector rotation from the sinogram, and the effect of the correction on the reconstruction.
+   * - ``demo_11_geometry_viewer.py``
+     - The geometry viewer: the scan geometry drawn from the model, with a sinogram and a phantom overlaid and a second geometry compared.
 
 
 Data Generation
@@ -91,6 +93,17 @@ Note that the scale factor need only be large enough to give some padding around
 it does not need to match the size of the true object.  Larger scale factors will lead to increased time and memory.
 
 See ``demo_3_parallel_roi.py`` for an example of this.
+
+Q: How can I check my scan geometry before reconstructing?
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+A: Open the geometry viewer on the model: ``mbirtorch.geometry_viewer(ct_model)``.
+It draws the source, the detector, the reconstruction volume, and the
+rotation axis for one view at a time, marks detector pixel (0, 0) and
+voxel (0, 0, 0), and reports whether the region of reconstruction
+projects inside the detector.  Pass ``sinogram=`` to paint a view of the
+data on the detector face, and ``compare=dict(det_channel_offset=...)``
+to draw a second geometry over the first.  See :ref:`GeometryViewerDocs`.
 
 Q: Why is my reconstruction blurry?
 +++++++++++++++++++++++++++++++++++
@@ -206,8 +219,10 @@ see :ref:`ConeBeamModelDocs`).
 Q: How can I shift region-of-reconstruction up or down for a conebeam reconstruction?
 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
-A: You can shift the region of reconstruction up or down using ``ct_model.set_params(recon_slice_offset=offset)``
-before calling recon.
+A: By default the region is centered on the band of the object the detector sees, at
+``-det_row_offset / magnification`` plus the center of any helical travel, so a detector row offset moves the
+region with the detector.  You can shift the region of reconstruction up or down using
+``ct_model.set_params(recon_slice_offset=offset)`` before calling recon.
 Positive values of ``offset`` will shift the region down relative to the detector.
 This is useful if you would like to reconstruct the top or bottom half of a conebeam reconstruction in order to save memory.
 

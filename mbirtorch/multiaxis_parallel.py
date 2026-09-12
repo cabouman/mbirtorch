@@ -23,6 +23,7 @@ import warnings
 import numpy as np
 import torch
 
+from .geometry_rules import channel_index, pixel_xy, rotate_about_z, row_index
 from .horizontal_fan import fan_back_batch, fan_forward_batch
 from .tomography_model import TomographyModel
 
@@ -38,21 +39,25 @@ def _multiaxis_horizontal_data(pixel_indices, azimuth, num_rows, num_cols,
     depends only on the azimuth (parallel beam, no magnification).  Also
     returns the rotated in-plane depth y (Vb, P) for the vertical fan.
     """
-    row_index = (pixel_indices // num_cols).to(_F32)
-    col_index = (pixel_indices % num_cols).to(_F32)
-    y_tilde = delta_voxel_row * (row_index - (num_rows - 1) / 2.0)
-    x_tilde = delta_voxel * (col_index - (num_cols - 1) / 2.0)
+    x_tilde, y_tilde = pixel_xy(pixel_indices, num_rows, num_cols, delta_voxel,
+                                delta_voxel_row)
     cosine = torch.cos(azimuth)[:, None]
     sine = torch.sin(azimuth)[:, None]
-    x = cosine * x_tilde[None, :] - sine * y_tilde[None, :]
-    y = sine * x_tilde[None, :] + cosine * y_tilde[None, :]
-    n_p = (x + det_channel_offset) / delta_det_channel + (num_channels - 1) / 2.0
+    x, y = rotate_about_z(x_tilde, y_tilde, cosine, sine)
+    n_p = channel_index(x, delta_det_channel, det_channel_offset, num_channels)
     footprint_xy = torch.maximum(cosine.abs() * delta_voxel,
                                  sine.abs() * delta_voxel_row)       # (Vb, 1)
     W_p_c = footprint_xy / delta_det_channel
     weight_scale = (delta_voxel * delta_voxel_row) / footprint_xy
     centers = torch.round(n_p).to(torch.int32)
     return n_p, centers, W_p_c, weight_scale, y
+
+
+def _multiaxis_row_coordinate(y, z, cos_el, sin_el):
+    """The detector coordinate v along the rows: the height z of a point
+    turned by the elevation, which picks up the in-plane depth y as well.
+    ``cos_el`` and ``sin_el`` are per view, (Vb, 1)."""
+    return z * cos_el + y * sin_el
 
 
 def _multiaxis_vertical_terms(y, azimuth, elevation, num_slices,
@@ -76,8 +81,8 @@ def _multiaxis_vertical_terms(y, azimuth, elevation, num_slices,
     cos_el = torch.cos(elevation)[:, None]                           # (Vb, 1)
     sin_el = torch.sin(elevation)[:, None]
     z_0 = -delta_voxel_slice * (num_slices - 1) / 2.0 + recon_slice_offset
-    v_0 = z_0 * cos_el + y * sin_el                                  # (Vb, P)
-    m0 = (v_0 + det_row_offset) / delta_det_row + (num_rows_r - 1) / 2.0
+    v_0 = _multiaxis_row_coordinate(y, z_0, cos_el, sin_el)          # (Vb, P)
+    m0 = row_index(v_0, delta_det_row, det_row_offset, num_rows_r)
     slope = (delta_voxel_slice * cos_el) / delta_det_row             # (Vb, 1)
 
     z_edge = delta_voxel_slice * cos_el.abs()
@@ -220,7 +225,14 @@ class MultiAxisParallelModel(TomographyModel):
     Each view has two angles:
       - Azimuth: rotation around the object's z-axis (the standard tomography
         rotation, as in ParallelBeamModel).
-      - Elevation: tilt of the ray vector out of the xy plane.
+      - Elevation: the angle, measured from the xy plane, at which the source
+        looks at the object.  The source sits on the +y side of the object.
+        For a positive elevation the rays run from the source through the
+        object toward +z, so the center of the detector sits on the +z side
+        of the xy plane, and a point at (x, y, z) lands at the detector row
+        coordinate v = z cos(elevation) + y sin(elevation).  Its row index
+        therefore grows with y as well as with z.  At zero elevation the rays
+        lie in the xy plane and the model matches ParallelBeamModel.
 
     When elevation = 0 this model is mathematically equivalent to
     ParallelBeamModel.  Parallel beam laminography is a special case.
@@ -301,6 +313,24 @@ class MultiAxisParallelModel(TomographyModel):
             fwd_body = _multiaxis_forward_view_batch
         return fwd_body, back_body
 
+    def _project_points_batch(self, points, view_params):
+        # points (N, 3) float64 on the CPU; view_params (V, 2) as
+        # (azimuth, elevation).  Returns (row, channel), each (V, N).
+        ddr, ddc, dro, dco = self.get_params(
+            ['delta_det_row', 'delta_det_channel', 'det_row_offset',
+             'det_channel_offset'])
+        _, num_rows_r, num_channels = self.get_params('sinogram_shape')
+        azimuth = view_params[:, 0]
+        elevation = view_params[:, 1]
+        cosine = torch.cos(azimuth)[:, None]
+        sine = torch.sin(azimuth)[:, None]
+        x, y = rotate_about_z(points[:, 0], points[:, 1], cosine, sine)
+        cos_el = torch.cos(elevation)[:, None]
+        sin_el = torch.sin(elevation)[:, None]
+        v = _multiaxis_row_coordinate(y, points[:, 2][None, :], cos_el, sin_el)
+        return (row_index(v, ddr, dro, num_rows_r),
+                channel_index(x, ddc, dco, num_channels))
+
     def _view_batch_args(self):
         gp_names = ['delta_det_row', 'delta_det_channel', 'det_row_offset',
                     'det_channel_offset', 'delta_voxel', 'voxel_row_aspect',
@@ -373,7 +403,9 @@ class MultiAxisParallelModel(TomographyModel):
 
     def auto_set_recon_geometry(self, no_compile=False, no_warning=False):
         """Set the reconstruction shape from the largest bounding box that
-        projects onto the detector at the given angles."""
+        projects onto the detector at the given angles, centered on the z band
+        the rows illuminate, so a row offset moves the volume with the
+        detector."""
         sinogram_shape = self.get_params('sinogram_shape')
         num_views, num_det_rows, num_det_channels = sinogram_shape
         delta_det_channel, delta_det_row = self.get_params(
@@ -389,9 +421,16 @@ class MultiAxisParallelModel(TomographyModel):
         # (v = z*cos(el) - t*sin(el); the cos is clamped so a top-down view
         # does not imply infinite z).
         max_R_xy = max_u
-        min_cos_el = np.min(np.abs(np.cos(elevations)))
-        min_cos_el = max(min_cos_el, 0.1)
-        max_R_z = max_v / min_cos_el
+        # The z band each view illuminates on the rotation axis: its rows span v
+        # in [-max_v, max_v] shifted by the row offset, and v = z * cos(el)
+        # there.  The volume covers the union of the bands over the views and is
+        # centered on it.  With no row offset this is the height
+        # 2 * max_v / min |cos(el)| about z = 0.
+        det_row_offset = self.get_params('det_row_offset')
+        cos_el = np.maximum(np.abs(np.cos(elevations)), 0.1)
+        z_low = float(np.min((-max_v - det_row_offset) / cos_el))
+        z_high = float(np.max((max_v - det_row_offset) / cos_el))
+        recon_slice_offset = 0.5 * (z_low + z_high)
 
         voxel_row_aspect, voxel_slice_aspect = self.get_params(
             ['voxel_row_aspect', 'voxel_slice_aspect'])
@@ -400,10 +439,10 @@ class MultiAxisParallelModel(TomographyModel):
         delta_voxel_slice = voxel_slice_aspect * delta_voxel
         num_recon_cols = int(np.floor(2 * max_R_xy / delta_voxel))
         num_recon_rows = int(np.floor(2 * max_R_xy / delta_voxel_row))
-        num_recon_slices = int(np.floor(2 * max_R_z / delta_voxel_slice))
+        num_recon_slices = int(np.floor((z_high - z_low) / delta_voxel_slice))
 
         self.set_params(recon_shape=(num_recon_rows, num_recon_cols, num_recon_slices),
-                        delta_voxel=delta_voxel,
+                        delta_voxel=delta_voxel, recon_slice_offset=recon_slice_offset,
                         no_compile=no_compile, no_warning=no_warning)
 
     # ── direct recon (stacked 2-D FBP) ────────────────────────────────────────

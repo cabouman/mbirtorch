@@ -995,9 +995,10 @@ def _auto_crop_sino(sino, required_params, optional_params, safety_buffer=20):
 
     This packages :func:`detect_blank_margins` (find the blank margins), array slicing, and
     :func:`apply_detector_crop` (update ``sinogram_shape`` and the detector offsets) into the
-    automatic-crop step.  It is geometry-general and detector-plane only, so ``recon_slice_offset``
-    is (re)derived by the subsequent ``auto_set_recon_geometry``: run it before ``build_model``
-    (or before ``auto_set_recon_geometry`` when constructing a model by hand).
+    automatic-crop step.  It is geometry-general and detector-plane only.  A ``recon_slice_offset``
+    the dicts carry is moved by the change in the automatic center, which follows the detector
+    through the crop; run this before ``build_model`` (or before ``auto_set_recon_geometry`` when
+    constructing a model by hand).
 
     Args:
         sino (np.ndarray): Sinogram, shape ``(num_views, num_det_rows, num_det_channels)``.
@@ -1012,8 +1013,17 @@ def _auto_crop_sino(sino, required_params, optional_params, safety_buffer=20):
     """
     crop_top, crop_bottom, crop_left, crop_right = detect_blank_margins(sino, safety_buffer)
     sino = sino[:, crop_top:sino.shape[1] - crop_bottom, crop_left:sino.shape[2] - crop_right]
+    # A supplied recon_slice_offset keeps its place relative to the automatic center, which the crop
+    # moves along with the row offset.
+    supplied_offset = optional_params.get('recon_slice_offset')
+    if supplied_offset is not None:
+        _, automatic_before = mt.utilities._automatic_recon_geometry(required_params, optional_params, None)
     required_params, optional_params = apply_detector_crop(
         required_params, optional_params, crop_top, crop_bottom, crop_left, crop_right)
+    if supplied_offset is not None and automatic_before is not None:
+        _, automatic_after = mt.utilities._automatic_recon_geometry(required_params, optional_params, None)
+        optional_params = dict(optional_params)
+        optional_params['recon_slice_offset'] = float(supplied_offset) + (automatic_after - automatic_before)
     return sino, required_params, optional_params
 
 

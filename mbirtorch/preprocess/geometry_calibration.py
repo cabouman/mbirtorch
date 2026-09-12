@@ -24,7 +24,7 @@ from .. import _sharding
 from ..cone_beam import ConeBeamModel
 from ..multiaxis_parallel import MultiAxisParallelModel
 from ..parallel_beam import ParallelBeamModel
-from ..utilities import copy_ct_model
+from ..utilities import _automatic_recon_geometry, copy_ct_model
 from ..vcd_utils import get_support_radius
 from . import pipeline
 from .utilities import _rotation_kernel, sino_high_pass_filtering
@@ -80,6 +80,12 @@ class CalibrationResult(NamedTuple):
 
 
 # ── geometry helpers ──────────────────────────────────────────────────────────────────────────────
+
+def _automatic_slice_offset(ct_model):
+    """The recon_slice_offset the automatic pass gives for the model's current detector, or None for
+    a geometry without that parameter."""
+    return _automatic_recon_geometry(*ct_model.get_all_params())[1]
+
 
 def _geometry_kind(ct_model):
     """Classify a model as 'parallel', 'cone', or 'multiaxis', or raise for anything else.
@@ -275,7 +281,7 @@ def build_reduced_problem(ct_model, *, view_stride=4, bin_factor=2, num_slab_sli
                        new_num_det_cols=num_det_channels // bin_factor)
     if kind == 'cone':
         copy_kwargs['new_helical_z_shifts'] = np.asarray(required['helical_z_shifts'])[::view_stride]
-    binned = copy_ct_model(ct_model, **copy_kwargs)
+    binned = copy_ct_model(ct_model, no_warning=True, **copy_kwargs)
     if not isinstance(ct_model.get_params('use_ror_mask'), bool):
         binned.set_params(use_ror_mask=True)
     delta_det_channel, delta_det_row = ct_model.get_params(['delta_det_channel', 'delta_det_row'])
@@ -307,7 +313,7 @@ def build_reduced_problem(ct_model, *, view_stride=4, bin_factor=2, num_slab_sli
                           'asked for was cut off by the detector edge.  Candidates that move the '
                           'slab toward that edge lose part of their data.')
 
-    reduced = copy_ct_model(binned, new_num_det_rows=row_hi - row_lo)
+    reduced = copy_ct_model(binned, new_num_det_rows=row_hi - row_lo, no_warning=True)
     # The model reads compile_mode when it first builds its projectors, which has not happened yet.
     reduced.compile_mode = ct_model.compile_mode
     det_row_offset_shift = 0.0
@@ -599,7 +605,7 @@ def check_rotation_direction(ct_model, sino, *, view_stride=4, bin_factor=2):
     # both.
     required, _, _ = ct_model.get_all_params()
     reversed_full = copy_ct_model(ct_model, new_angles=-np.asarray(required['angles']),
-                                  new_helical_z_shifts=np.asarray(required['helical_z_shifts']))
+                                  new_helical_z_shifts=np.asarray(required['helical_z_shifts']), no_warning=True)
     reversed_full.compile_mode = ct_model.compile_mode
     reversed_reduced, _ = build_reduced_problem(reversed_full, **reduction_kwargs)
 
@@ -668,9 +674,9 @@ def apply_calibration(ct_model, sino, results):
     by rotating every view of ``sino`` in place, one batch of views at a time, with no second
     full-size sinogram.  A rotation direction of -1 negates every view angle of the model.
 
-    After a change to ``det_row_offset`` the cone-beam recon geometry that was derived from the
-    old value stays as it was.  Re-running ``ct_model.auto_set_recon_geometry()`` afterward is the
-    caller's decision, because it also resets any ``recon_shape`` the caller chose.
+    A change to ``det_row_offset`` moves the volume's axial center with the detector, by the change
+    in the automatic ``recon_slice_offset``, so a center the caller chose keeps its place relative to
+    the detector; the recon shape and voxel pitch are left as they were.
 
     Args:
         ct_model (TomographyModel): the model to change.
@@ -699,7 +705,12 @@ def apply_calibration(ct_model, sino, results):
     for result in results:
         name, value = result.parameter, float(result.value)
         if name in ('det_channel_offset', 'det_row_offset'):
+            before = _automatic_slice_offset(ct_model) if name == 'det_row_offset' else None
             ct_model.set_params(**{name: value})
+            if before is not None:
+                shift = _automatic_slice_offset(ct_model) - before
+                ct_model.set_params(no_warning=True, recon_slice_offset=float(
+                    ct_model.get_params('recon_slice_offset')) + shift)
         elif name == 'det_rotation':
             if value != 0.0:
                 _sharding.reject_shards('apply_calibration', sino=sino)
