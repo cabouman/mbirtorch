@@ -21,11 +21,6 @@ phantom, sinogram, params = mbirtorch.generate_demo_data(
     num_views=num_views, num_det_rows=num_det_rows,
     num_det_channels=num_det_channels)
 
-# View the sinogram.  Each view looks at the object from 30 degrees above
-# the horizontal, so the projections show the object at an angle.
-mbirtorch.slice_viewer(sinogram, slice_axis=0, slice_label='View', vmin=0.0,
-                       title=f'Sinogram at {elevation_degrees:.0f} degree tilt')
-
 # The generator also returns the (azimuth, elevation) angle pairs it used.
 angles = params['angles']
 
@@ -36,6 +31,9 @@ recon, recon_dict = ct_model.recon(sinogram)
 nrmse = np.linalg.norm(recon - phantom) / np.linalg.norm(phantom)
 print(f'Normalized RMS error between reconstruction and phantom: {nrmse:.3f}')
 
+# Display the geometry, phantom, recon, and sinogram
+mbirtorch.geometry_viewer(ct_model, show_trajectory=True, sinogram=sinogram, recon=recon,
+                          title='Multiaxis model', block=False)
 mbirtorch.slice_viewer(phantom, recon, data_dicts=[None, recon_dict], vmin=0.0,
                        title='Phantom (left) and laminography reconstruction (right)', block=False)
 mbirtorch.slice_viewer(sinogram, title='Sinogram', slice_axis=0)

@@ -485,9 +485,9 @@ class GeometryScene:
                               ('parallel', 'parallel')):
             if keyword in text:
                 return kind
-        raise ValueError('Cannot tell the geometry kind of a model whose '
-                         f'geometry_type is {geometry_type!r} and whose class '
-                         f'is {type(model).__name__}.')
+        raise ValueError('Geometry viewer not implemented for  '
+                         f'geometry_type {geometry_type!r} and class '
+                         f'{type(model).__name__}.')
 
     def _read_shapes(self):
         """Read the sinogram and reconstruction shapes and the voxel pitches."""

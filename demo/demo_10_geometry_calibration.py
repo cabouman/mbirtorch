@@ -69,6 +69,8 @@ def nrmse(recon):
 
 # Reconstruct with the uncalibrated model, to see what the two errors cost.
 recon_before = ct_model.recon_direct(sino)
+ct_model_before = mbirtorch.copy_ct_model(ct_model)
+
 print(f'Uncalibrated direct reconstruction: NRMSE {nrmse(recon_before):.3f}')
 
 # Check that the view angles run in the right direction.  The check scores the
@@ -95,6 +97,7 @@ print(f'det_rotation: true {true_rotation_degrees:.3f} degrees, '
 # applied to the sinogram, which apply_calibration rotates in place.
 ct_model, sino = gc.apply_calibration(ct_model, sino, [rotation, offset])
 recon_after = ct_model.recon_direct(sino)
+ct_model_after = mbirtorch.copy_ct_model(ct_model)
 print(f'Calibrated direct reconstruction: NRMSE {nrmse(recon_after):.3f}')
 
 # The manual workflow reconstructs one slice per candidate offset.  The
@@ -103,6 +106,10 @@ print(f'Calibrated direct reconstruction: NRMSE {nrmse(recon_after):.3f}')
 sweep_offsets = offset.value + delta_det_channel * np.linspace(-2.0, 2.0, 5)
 sweep = gc.parameter_sweep(ct_model, sino, 'det_channel_offset', sweep_offsets)
 
+# Display the geometry, phantom, recon, and sinogram
+mbirtorch.geometry_viewer(ct_model_after, show_trajectory=True, sinogram=sino, recon=recon_after,
+                          title='Calibrated and uncalibrated models',
+                          compare=ct_model_before, show_compare=True, block=False)
 # View the phantom and the two reconstructions, then the sweep.
 mbirtorch.slice_viewer(phantom, recon_before, recon_after, vmin=0.0,
                        title='Phantom (left), uncalibrated (center), calibrated (right)',
