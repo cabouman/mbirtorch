@@ -36,7 +36,7 @@ def open_viewer():
         return viewer
 
     yield _open
-    import mbirtorch.viewer as viewer_module
+    import mbirtorch.viewers.slice_figure as viewer_module
     for viewer in created:
         plt.close(viewer.fig)
         if viewer in viewer_module._NONBLOCKING_VIEWERS:
@@ -144,7 +144,7 @@ class TestDictConversion:
 
 class TestWrapperBehavior:
     def test_returns_viewer_with_keepalive(self, open_viewer):
-        import mbirtorch.viewer as viewer_module
+        import mbirtorch.viewers.slice_figure as viewer_module
         viewer = open_viewer(make_volume((4, 4, 4)))
         assert isinstance(viewer, mbirtorch.SliceViewer)
         assert viewer in viewer_module._NONBLOCKING_VIEWERS

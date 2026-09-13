@@ -10,7 +10,7 @@ npy/npz/h5 load branches including the 4D case.  No matplotlib is touched.
 import numpy as np
 import pytest
 
-from mbirtorch.viewer import VolumeStack, PLACEHOLDER_SHAPE
+from mbirtorch.viewers.slice_figure import VolumeStack, PLACEHOLDER_SHAPE
 
 
 def make_volume(shape, seed=0):

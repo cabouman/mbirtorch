@@ -31,7 +31,7 @@ from mbirtorch.preprocess.geometry_calibration import (_require_conjugate_geomet
 from mbirtorch.preprocess.geometry_calibration import (_angular_coverage, _fourier_shift_channels,
                                                        _search_minimum)
 from mbirtorch.preprocess.utilities import correct_det_rotation
-from mbirtorch.viewer import VolumeStack
+from mbirtorch.viewers import VolumeStack
 
 NUM_VIEWS = 32
 NUM_ROWS = 16

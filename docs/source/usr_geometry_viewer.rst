@@ -113,7 +113,7 @@ The figure object
 returns it.  A script that does not want a window can build the same figure
 directly and save it.
 
-.. autoclass:: mbirtorch.geometry_figure.GeometryFigure
+.. autoclass:: mbirtorch.viewers.geometry_figure.GeometryFigure
    :members: set_view, set_show_trajectory, set_zoom, set_show_reference, set_compare, set_sinogram, set_recon, set_show_sinogram, set_show_recon, set_show_compare, save, show
 
 

@@ -28,8 +28,9 @@ dependencies = [
     # harness backend cells before advancing it.
     "torch>=2.13",
     "numpy",
-    # The slice viewer (mbirtorch/viewer.py) needs matplotlib always and h5py
-    # for HDF5 load/save (imported lazily, but required for full function).
+    # The slice viewer (mbirtorch/viewers/slice_figure.py) needs matplotlib
+    # always, and h5py for HDF5 load/save (imported lazily, but required for
+    # full function).
     "matplotlib",
     "h5py",
     # The preprocess package needs scipy (filters, fitting), tifffile (scan

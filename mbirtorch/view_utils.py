@@ -1,7 +1,7 @@
 """mbirtorch-side wrapper for the slice viewer.
 
-The viewer module itself (mbirtorch/viewer.py) is package-independent: it
-imports only numpy, matplotlib, and (lazily) h5py.  This wrapper supplies the
+The viewer module itself (mbirtorch/viewers/slice_figure.py) is
+package-independent: it imports only numpy, matplotlib, and (lazily) h5py.  This wrapper supplies the
 mbirtorch-specific conversions on the way in: torch tensors (including CUDA and MPS tensors)
 become numpy arrays, and rich data dicts -- e.g. the recon_dict returned by
 :meth:`TomographyModel.recon` -- are serialized to dicts of display strings.
@@ -15,10 +15,10 @@ import pprint
 
 import numpy as np
 
-from .viewer import SliceViewer, VolumeStack
-from .viewer import slice_viewer as _slice_viewer
-from .geometry_scene import GeometryScene
-from .geometry_figure import GeometryFigure, geometry_viewer
+from .viewers.slice_figure import SliceViewer, VolumeStack
+from .viewers.slice_figure import slice_viewer as _slice_viewer
+from .viewers.geometry_scene import GeometryScene
+from .viewers.geometry_figure import GeometryFigure, geometry_viewer
 
 __all__ = ['SliceViewer', 'VolumeStack', 'convert_subdicts_to_strings',
            'slice_viewer', 'GeometryScene', 'GeometryFigure',

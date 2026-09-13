@@ -74,7 +74,7 @@ twenty pixels wide.  Its third turns the angle-0 reference on and off.  The
 bottom row turns each of the three overlays on and off: the sinogram, the
 phantom, and the comparison.  An overlay the figure does not hold has a toggle
 all the same, so that an array added later has its toggle ready.  The widgets
-follow the slice viewer of ``mbirtorch/viewer.py``: an integer-stepped
+follow the slice viewer of ``slice_figure.py``: an integer-stepped
 ``Slider`` with ``drawon`` off, and ``CheckButtons`` for the toggles.
 
 The labels.  The source and the detector carry a short text label in the 3D
@@ -157,7 +157,7 @@ Import discipline.  This module imports numpy and the matplotlib base package
 at import time, and nothing else.  ``pyplot``, the widgets, and the 3D toolkit
 are imported inside :func:`_load_pyplot`, on the first figure construction.
 Importing this module therefore never resolves a matplotlib backend and never
-touches a GUI toolkit, which is the rule ``mbirtorch/viewer.py`` follows.
+touches a GUI toolkit, which is the rule ``slice_figure.py`` follows.
 
 Colors.  One color per element, listed in :data:`COLORS`, is used in every
 panel where the element appears.  The two index markers are the ones to look at
@@ -702,7 +702,7 @@ _XY_FOOTPRINT_WALK = (0, 2, 6, 4, 0)
 _YZ_FACE_WALK = (0, 1, 3, 2, 0)
 
 #: Backends where the partial-redraw (blit) fast path is used.  These are the
-#: two ``mbirtorch/viewer.py`` verifies: Agg for headless runs and TkAgg for
+#: two ``slice_figure.py`` verifies: Agg for headless runs and TkAgg for
 #: the interactive sessions the fast path exists for.  Everywhere else a view
 #: change repaints the whole figure.
 BLIT_BACKENDS = {'agg', 'tkagg'}
@@ -2141,7 +2141,7 @@ class GeometryFigure:
         The slider steps by one view and never by a fraction, and its own draw
         is turned off so that a step goes through this class's redraw instead.
         A scan with one view has nothing to slide, so the slider axes is
-        hidden.  These are the conventions ``mbirtorch/viewer.py`` uses for its
+        hidden.  These are the conventions ``slice_figure.py`` uses for its
         slice slider.
 
         The three overlay toggles are built whatever data the figure holds, so
@@ -4682,7 +4682,7 @@ class GeometryFigure:
     def _blit_usable(self):
         """Whether the partial-redraw fast path can be used right now.
 
-        The rule follows ``mbirtorch/viewer.py``: only on a backend where the
+        The rule follows ``slice_figure.py``: only on a backend where the
         fast path is verified, and only when the canvas reports blit support.
         Everywhere else a view change repaints the whole figure, which is
         correct and slower.  A save suspends the path for its duration.
@@ -4774,7 +4774,7 @@ class GeometryFigure:
         The slider's bar and value text are not animated, so the background
         carries them as they were when it was taken.  An opaque rectangle is
         painted over the row and the slider axes is drawn again on top, which
-        is what ``mbirtorch/viewer.py`` does for its own slider rows.
+        is what ``slice_figure.py`` does for its own slider rows.
         """
         if self.view_slider is None or not self._slider_axes.get_visible():
             return
@@ -4810,7 +4810,7 @@ def _finish_2d_panel(axes):
 
 # Figures opened with block=False, kept alive here in case the caller drops
 # the return value.  The next blocking call closes them, as the slice viewer's
-# registry does (mbirtorch/viewer.py, _NONBLOCKING_VIEWERS).
+# registry does (slice_figure.py, _NONBLOCKING_VIEWERS).
 _NONBLOCKING_FIGURES = []
 
 
@@ -4825,10 +4825,10 @@ def geometry_viewer(model_or_scene, view_index=0, show_trajectory=False,
     """Launch the interactive geometry viewer on a model.
 
     This function builds a
-    :class:`~mbirtorch.geometry_figure.GeometryFigure`, shows it, and returns
-    it.  It is used the way ``mbirtorch.slice_viewer`` is used: one call opens
-    the window, and ``block`` decides whether the call waits for the window to
-    close.
+    :class:`~mbirtorch.viewers.geometry_figure.GeometryFigure`, shows it, and
+    returns it.  It is used the way ``mbirtorch.slice_viewer`` is used: one
+    call opens the window, and ``block`` decides whether the call waits for
+    the window to close.
 
     The window shows five panels for one view of the scan: a 3D view, a top
     view of the xy plane, a side view of the yz plane, the detector face in row

@@ -1,4 +1,4 @@
-"""Headless tests for mbirtorch/geometry_scene.py.
+"""Headless tests for mbirtorch/viewers/geometry_scene.py.
 
 The gate test is ``test_projection_matches_projector``.  For each of the six
 scan geometries of ``geometry_probe.py`` it forward-projects single voxels
@@ -17,14 +17,14 @@ import pytest
 
 import mbirtorch
 import geometry_probe as probe
-from mbirtorch.geometry_scene import (CLOCKWISE_FROM_PLUS_Z,
-                                      COUNTERCLOCKWISE_FROM_PLUS_Z,
-                                      CURVED_ARC_SAMPLES,
-                                      DIFFERENCE_EXCLUDED_QUANTITIES,
-                                      GeometryScene, RIM_SAMPLES,
-                                      ROTATION_ARC_SAMPLES,
-                                      required_parameter_names,
-                                      values_are_equal)
+from mbirtorch.viewers.geometry_scene import (CLOCKWISE_FROM_PLUS_Z,
+                                              COUNTERCLOCKWISE_FROM_PLUS_Z,
+                                              CURVED_ARC_SAMPLES,
+                                              DIFFERENCE_EXCLUDED_QUANTITIES,
+                                              GeometryScene, RIM_SAMPLES,
+                                              ROTATION_ARC_SAMPLES,
+                                              required_parameter_names,
+                                              values_are_equal)
 
 # The gate: the largest allowed difference between a measured footprint
 # centroid and the scene's prediction, in detector pixels.  Half a pixel is the
@@ -1039,7 +1039,8 @@ def test_default_drawing_distance_keeps_the_source_off_the_volume_box():
     the number: the drawn source is farther from the origin than the volume
     box's farthest corner.
     """
-    from mbirtorch.geometry_scene import DEFAULT_DRAWING_DISTANCE_FACTOR
+    from mbirtorch.viewers.geometry_scene import (
+        DEFAULT_DRAWING_DISTANCE_FACTOR)
     assert DEFAULT_DRAWING_DISTANCE_FACTOR > 2.0
     for name in ('parallel', 'multiaxis'):
         cfg = CONFIGS_BY_NAME[name]

@@ -1,4 +1,4 @@
-"""Headless tests for mbirtorch/geometry_figure.py.
+"""Headless tests for mbirtorch/viewers/geometry_figure.py.
 
 The tests cover five things.  The first is the import discipline: importing
 the figure module must not import ``matplotlib.pyplot``, which is checked in a
@@ -48,11 +48,11 @@ import matplotlib
 matplotlib.use('Agg')  # tests write files and open no window
 
 import geometry_probe as probe
-from mbirtorch.geometry_scene import GeometryScene
-import mbirtorch.geometry_figure as geometry_figure
-from mbirtorch.geometry_figure import (COLORS, GeometryFigure,
-                                       SOURCE_MARKER_SIZE, VOLUME_BOX_EDGES,
-                                       TOP_PANEL_COLUMNS, SIDE_PANEL_COLUMNS)
+from mbirtorch.viewers.geometry_scene import GeometryScene
+import mbirtorch.viewers.geometry_figure as geometry_figure
+from mbirtorch.viewers.geometry_figure import (COLORS, GeometryFigure,
+                                               SOURCE_MARKER_SIZE, VOLUME_BOX_EDGES,
+                                               TOP_PANEL_COLUMNS, SIDE_PANEL_COLUMNS)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -101,10 +101,10 @@ def test_import_does_not_load_pyplot():
     The check runs in a separate interpreter, because this test process has
     already imported pyplot itself.  A module that imported pyplot at import
     time would resolve a matplotlib backend, and on a machine with no display
-    that can fail or open a window nobody asked for.  ``mbirtorch/viewer.py``
+    that can fail or open a window nobody asked for.  The slice viewer
     follows the same rule.
     """
-    program = ('import sys; import mbirtorch.geometry_figure; '
+    program = ('import sys; import mbirtorch.viewers.geometry_figure; '
                "print('matplotlib.pyplot' in sys.modules); "
                "print('mpl_toolkits.mplot3d' in sys.modules)")
     result = subprocess.run([sys.executable, '-c', program], cwd=HERE,
@@ -114,14 +114,15 @@ def test_import_does_not_load_pyplot():
 
 def test_pyplot_loads_on_first_figure():
     """The first figure built does import pyplot."""
-    program = ('import sys; import mbirtorch.geometry_figure; '
+    program = ('import sys; import mbirtorch.viewers.geometry_figure; '
                "import matplotlib; matplotlib.use('Agg'); "
                'import geometry_probe as probe; '
-               'from mbirtorch.geometry_scene import GeometryScene; '
+               'from mbirtorch.viewers.geometry_scene import GeometryScene; '
                "cfg = [c for c in probe.CONFIGS "
                "if c['name'] == 'parallel'][0]; "
                'scene = GeometryScene.from_model(probe.build_model(cfg)); '
-               'figure = mbirtorch.geometry_figure.GeometryFigure(scene); '
+               'figure = mbirtorch.viewers.geometry_figure'
+               '.GeometryFigure(scene); '
                "print('matplotlib.pyplot' in sys.modules)")
     environment = dict(os.environ)
     result = subprocess.run([sys.executable, '-c', program], cwd=HERE,

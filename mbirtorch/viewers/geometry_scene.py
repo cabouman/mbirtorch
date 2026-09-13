@@ -10,7 +10,7 @@ display.
 The two layers.  ``GeometryScene`` is the model layer: it holds the parameters,
 maps object points to detector indices, and returns the primitives for one
 view.  A separate matplotlib module draws those primitives and owns the widgets.
-This split follows the slice viewer of ``mbirtorch/viewer.py``, whose pure-numpy
+This split follows the slice viewer of ``slice_figure.py``, whose pure-numpy
 ``VolumeStack`` carries all of the data logic.  The scene reads the model's
 parameters through ``get_params`` and projects points through
 :meth:`TomographyModel.project_points`, so it holds no projection formula of

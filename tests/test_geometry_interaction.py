@@ -54,12 +54,13 @@ import matplotlib
 matplotlib.use('Agg')  # the tests draw into a buffer and open no window
 
 import geometry_probe as probe
-from mbirtorch.geometry_scene import GeometryScene, required_parameter_names
-import mbirtorch.geometry_figure as geometry_figure
-from mbirtorch.geometry_figure import (COLORS, GeometryFigure,
-                                       VOLUME_BOX_EDGES,
-                                       ZOOM_VOLUME_WIDTH_FACTOR,
-                                       TOP_PANEL_COLUMNS, SIDE_PANEL_COLUMNS)
+from mbirtorch.viewers.geometry_scene import (GeometryScene,
+                                              required_parameter_names)
+import mbirtorch.viewers.geometry_figure as geometry_figure
+from mbirtorch.viewers.geometry_figure import (COLORS, GeometryFigure,
+                                               VOLUME_BOX_EDGES,
+                                               ZOOM_VOLUME_WIDTH_FACTOR,
+                                               TOP_PANEL_COLUMNS, SIDE_PANEL_COLUMNS)
 
 #: The object coordinates the top and side panels put on their two axes, as
 #: lists for indexing.  The top view is the xy plane seen from -z, so it draws
@@ -663,7 +664,7 @@ def test_plain_draw_paints_the_moving_artists_without_blitting():
     """
     import numpy as np
     import mbirtorch
-    from mbirtorch.geometry_figure import GeometryFigure
+    from mbirtorch.viewers.geometry_figure import GeometryFigure
     angles = np.linspace(0.0, 2.0 * np.pi, 12, endpoint=False)
     model = mbirtorch.ConeBeamModel((12, 16, 24), angles,
                                     source_detector_dist=200.0,
@@ -693,7 +694,7 @@ def test_moving_artists_are_animated_only_on_a_blit_backend():
     artists are animated; with blitting disabled they are not."""
     import numpy as np
     import mbirtorch
-    from mbirtorch.geometry_figure import GeometryFigure
+    from mbirtorch.viewers.geometry_figure import GeometryFigure
     angles = np.linspace(0.0, np.pi, 4, endpoint=False)
     model = mbirtorch.ParallelBeamModel((4, 6, 16), angles, compile_mode='off')
     with_blit = GeometryFigure(model, blit=True, widgets=False)
@@ -1508,7 +1509,7 @@ def test_geometry_viewer_mirrors_slice_viewer_nonblocking_registry():
     """geometry_viewer keeps a nonblocking figure alive in a module registry,
     and the next blocking call closes it, as mbirtorch.slice_viewer does."""
     import matplotlib.pyplot as plt
-    import mbirtorch.geometry_figure as module
+    import mbirtorch.viewers.geometry_figure as module
     cfg = CONFIGS_BY_NAME['parallel']
     model = probe.build_model(cfg)
     module._NONBLOCKING_FIGURES.clear()
@@ -1527,7 +1528,7 @@ def test_geometry_viewer_mirrors_slice_viewer_nonblocking_registry():
 def test_geometry_viewer_takes_the_viewer_options_explicitly():
     """The entry point exposes the figure's options as named arguments."""
     import matplotlib.pyplot as plt
-    import mbirtorch.geometry_figure as module
+    import mbirtorch.viewers.geometry_figure as module
     cfg = CONFIGS_BY_NAME['cone flat']
     model = probe.build_model(cfg)
     figure = module.geometry_viewer(model, view_index=1, show_trajectory=True,
