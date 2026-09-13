@@ -36,6 +36,8 @@ _os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
 _os.environ.setdefault("TRITON_CACHE_DIR",
                        _os.path.expanduser("~/.mbirtorch/triton_cache"))
 
+from typing import TYPE_CHECKING
+
 from .parallel_beam import ParallelBeamModel, recon_simple_parallel
 from .cone_beam import ConeBeamModel, recon_simple_cone
 from .translation_model import TranslationModel
@@ -123,6 +125,29 @@ _LAZY_NAMES = {
     # The blue-noise pattern (a 382 KB array literal), loaded on first use.
     'bn256': 'bn256',
 }
+
+# Tools that read the source without running it -- editors resolving a name for
+# a hover or a jump to its definition, and static type checkers -- never call
+# __getattr__, so a lazy name would resolve no further than its string in
+# __all__.  The block below lists exactly those names as ordinary imports,
+# guarded by a constant that is false at runtime: nothing in it executes, the
+# lazy modules still load only on first use, and a reader of the source sees
+# where each name is defined.  tests/test_lazy_exports.py checks the block
+# against the three tables above, so a name added to a table without a line
+# here fails the tests.
+if TYPE_CHECKING:
+    from . import preprocess, hsnt, vcls
+    from .view_utils import (SliceViewer, VolumeStack, slice_viewer,
+                             GeometryScene, GeometryFigure, geometry_viewer)
+    from .hsnt import (hyper_denoise, dehydrate, rehydrate,
+                       import_hsnt_data_hdf5, create_hsnt_metadata,
+                       export_hsnt_data_hdf5, generate_hyper_data)
+    from .vcls import (subsample_R_gamma, max_abs_neighbor_diff, get_opt_views,
+                       compute_view_basis_functions, compute_cov_matrix,
+                       compute_vcl, compute_opt_angle_subset,
+                       get_2d_subsampling_indices,
+                       show_image_with_projection_rays, reorder_by_priority)
+    from .bn256 import bn256
 
 
 def __getattr__(name):
