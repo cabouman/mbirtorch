@@ -98,6 +98,35 @@ def _resolve_device(device):
     return torch.device('cpu')
 
 
+def gpu_devices():
+    """The GPU devices torch can use, as a tuple.
+
+    Every CUDA device when CUDA is available, the MPS device alone when CUDA
+    is absent and MPS is present, and an empty tuple when there is no GPU.
+    The tuple reports the hardware and reads no environment variable.
+    """
+    if torch.cuda.is_available():
+        return tuple(torch.device('cuda', i) for i in range(torch.cuda.device_count()))
+    if torch.backends.mps.is_available():
+        return (torch.device('mps'),)
+    return ()
+
+
+def cpu_devices():
+    """The CPU device, as a one-element tuple.
+
+    torch presents one CPU device however many cores the machine has, so a
+    pool of CPU devices has one entry.
+    """
+    return (torch.device('cpu'),)
+
+
+def default_devices():
+    """The devices a run uses when none are named, as a list: the GPU devices
+    when there are any, and otherwise the CPU device."""
+    return list(gpu_devices()) or list(cpu_devices())
+
+
 def _array_extremes(array):
     """``(minimum, maximum)`` of ``array``, read where the array already is.
 

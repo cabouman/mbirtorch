@@ -1227,6 +1227,81 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
     return new_model
 
 
+def construct_time_frame_models(model, frames_per_rotation=6, frame_overlap_factor=2.0):
+    """
+    Split a scan into overlapping time frames and build one model per frame.
+
+    The views are taken to be recorded in time order at a uniform angular rate, and each
+    frame is a window of consecutive views.  ``frames_per_rotation`` sets the angular step
+    between the starts of consecutive frames, one full rotation divided by that count.
+    ``frame_overlap_factor`` sets the span of a frame in units of that step, and it is also
+    the number of frames that share a view.  With the defaults a frame spans 120 degrees and a
+    new frame starts every 60 degrees, so every view belongs to two frames.
+
+    The angular step per view is the median of the absolute differences between consecutive
+    angles.  A median is used so that the frame arithmetic is unchanged by view subsampling
+    and by angles stored modulo one rotation, where each wrap adds one large difference.  The
+    views per frame and the stride between frames are the frame span and the frame step
+    divided by that angular step, rounded to the nearest integer.  Trailing views that cannot
+    fill a whole frame are discarded.  Each frame model is a copy of ``model`` over the
+    frame's angles, made with :func:`copy_ct_model`, so it keeps the parent's reconstruction
+    geometry.  No sinogram is needed, so the frames can be built before any data is loaded.
+
+    Args:
+        model (TomographyModel): the model of the full scan, with one angle per view (a
+            ConeBeamModel or a ParallelBeamModel).
+        frames_per_rotation (int, optional): number of frames per full rotation.  Defaults to 6.
+        frame_overlap_factor (float, optional): span of a frame in units of the step between
+            frames.  Defaults to 2.0.
+
+    Returns:
+        (model_list, view_slices): one model and one slice per frame.
+            - model_list (list of TomographyModel): the per-frame models.
+            - view_slices (list of slice): the views of the full sinogram that belong to each
+              frame, so that ``sinogram[view_slices[k]]`` is the sinogram of frame ``k``.
+
+    Raises:
+        ValueError: if the model has no one-dimensional angle vector, if the angles have zero
+            spacing, if the frame span or the stride is smaller than one view, or if a frame
+            would be longer than the scan.
+
+    Example:
+        >>> frames, view_slices = mbirtorch.utilities.construct_time_frame_models(ct_model)
+        >>> sinogram_of_frame_1 = sinogram[view_slices[1]]
+    """
+    angle_stride = 2.0 * np.pi / frames_per_rotation
+    angle_span_per_frame = frame_overlap_factor * angle_stride
+
+    required_params, _, _ = model.get_all_params()
+    angles = required_params.get('angles')
+    if angles is None or np.asarray(angles).ndim != 1:
+        raise ValueError('construct_time_frame_models needs a model with one angle per view, such '
+                         f'as a ConeBeamModel or a ParallelBeamModel; got {type(model).__name__}.')
+    angles = np.asarray(angles)
+    num_views = len(angles)
+
+    angle_step = float(np.median(np.abs(np.diff(angles)))) if num_views > 1 else 0.0
+    if not angle_step > 0:
+        raise ValueError('The model angles must have nonzero spacing.')
+    views_per_frame = int(round(angle_span_per_frame / angle_step))
+    stride = int(round(angle_stride / angle_step))
+
+    if views_per_frame <= 0:
+        raise ValueError('frame_overlap_factor gives a frame span smaller than one view.')
+    if stride <= 0:
+        raise ValueError('frames_per_rotation gives a stride smaller than one view.')
+    if views_per_frame > num_views:
+        raise ValueError('The frame span cannot exceed the full scan.')
+
+    model_list = []
+    view_slices = []
+    for start in range(0, num_views - views_per_frame + 1, stride):
+        view_slice = slice(start, start + views_per_frame)
+        view_slices.append(view_slice)
+        model_list.append(copy_ct_model(model, new_angles=angles[view_slice]))
+    return model_list, view_slices
+
+
 def calc_tct_recon_params(source_det_dist, source_iso_dist, delta_det_row, delta_det_channel, sinogram_shape, translation_vectors, voxel_row_aspect=1.0, voxel_slice_aspect=1.0):
     """
     Calculate the translation geometry parameters: recon_shape, delta_voxel, voxel_row_aspect

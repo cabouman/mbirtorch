@@ -16,6 +16,12 @@ the axes whose inputs changed: rows or helical travel for the slices and the
 slice offset, channels for the in-plane shape, both for a translation model.
 A re-derived count is sized at the parent's voxel pitch, and a warning names
 any value the parent had set by hand that the copy re-derived.
+
+construct_time_frame_models splits a scan into overlapping windows of
+consecutive views and builds one model per window.  The view slices are
+integers, so they are checked exactly against pinned values, including a
+scan over more than one rotation with its angles stored modulo one rotation.
+The device helpers are checked against what torch reports.
 """
 
 import warnings
@@ -26,6 +32,8 @@ import torch
 
 import mbirtorch
 from mbirtorch import _sharding
+from mbirtorch.tomography_model import cpu_devices, default_devices, gpu_devices
+from mbirtorch.utilities import construct_time_frame_models
 
 requires_two_cuda = pytest.mark.skipif(
     torch.cuda.device_count() < 2,
@@ -273,3 +281,111 @@ def test_translation_copy_re_derives_the_whole_shape_when_the_detector_changes()
     with pytest.warns(UserWarning, match='in-plane recon shape and the slice count'):
         copy = mbirtorch.copy_ct_model(parent, new_num_det_rows=12)
     assert _shape(copy) == _shape(automatic)
+
+
+# ── construct_time_frame_models splits a scan into overlapping frames ────────
+def _scan_model(num_views, degrees_per_view, wrap=False):
+    """A small cone-beam scan with one angle per view.  ``wrap`` stores the
+    angles modulo one rotation, as scanner metadata often does."""
+    degrees = degrees_per_view * np.arange(num_views)
+    if wrap:
+        degrees = degrees % 360.0
+    model = mbirtorch.ConeBeamModel((num_views, 8, 10), np.deg2rad(degrees), source_detector_dist=100.0,
+                                    source_iso_dist=50.0, compile_mode='off')
+    model.set_params(no_warning=True, verbose=0)
+    return model
+
+
+def _pairs(view_slices):
+    return [(view_slice.start, view_slice.stop) for view_slice in view_slices]
+
+
+def test_time_frames_of_a_one_rotation_scan():
+    """24 views over one rotation with the default parameters give five frames
+    of eight views starting every four views.  Each frame model is a copy of
+    the parent over the frame's angles: its sinogram shape has the frame's
+    view count, its angles are exactly the parent's over the frame's slice,
+    and its reconstruction geometry is the parent's."""
+    parent = _scan_model(24, 15.0)
+    model_list, view_slices = construct_time_frame_models(parent)
+    assert len(model_list) == 5
+    assert view_slices[1] == slice(4, 12)
+    assert _pairs(view_slices) == [(0, 8), (4, 12), (8, 16), (12, 20), (16, 24)]
+    parent_angles = np.asarray(parent.get_all_params()[0]['angles'])
+    for frame, view_slice in zip(model_list, view_slices):
+        assert tuple(frame.get_params('sinogram_shape')) == (8, 8, 10)
+        assert _shape(frame) == _shape(parent)
+        assert np.array_equal(np.asarray(frame.get_all_params()[0]['angles']), parent_angles[view_slice])
+
+
+@pytest.mark.parametrize(
+    'num_views, degrees_per_view, wrap, frames_per_rotation, frame_overlap_factor, expected',
+    [
+        # 600 degrees of views with the angles stored modulo one rotation: nine
+        # frames of 48 views starting every 24 views.  The wrap adds one large
+        # difference per rotation, which the median angular step ignores.
+        (240, 2.5, True, 6, 2.0,
+         [(0, 48), (24, 72), (48, 96), (72, 120), (96, 144), (120, 168), (144, 192), (168, 216), (192, 240)]),
+        # The same scan with monotonic angles gives the same frames.
+        (240, 2.5, False, 6, 2.0,
+         [(0, 48), (24, 72), (48, 96), (72, 120), (96, 144), (120, 168), (144, 192), (168, 216), (192, 240)]),
+        # A span of 135 degrees at 10 degrees per view is 13.5 views, rounded
+        # to 14 (round half to even); the stride is 9 views; the last four
+        # views fill no frame and are discarded.
+        (36, 10.0, False, 4, 1.5, [(0, 14), (9, 23), (18, 32)]),
+        # Three frames share each view: a span of 60 views at a stride of 20.
+        (100, 3.6, False, 5, 3.0, [(0, 60), (20, 80), (40, 100)]),
+    ],
+    ids=['multi_rotation_wrapped', 'multi_rotation_monotonic', 'half_view_rounding', 'three_frame_overlap'])
+def test_time_frame_view_slices(num_views, degrees_per_view, wrap, frames_per_rotation, frame_overlap_factor,
+                                expected):
+    """The view slices for a parameter set, checked exactly: they are integers
+    fixed by the frame arithmetic, and each frame model's view count is the
+    slice's length."""
+    model_list, view_slices = construct_time_frame_models(
+        _scan_model(num_views, degrees_per_view, wrap=wrap), frames_per_rotation=frames_per_rotation,
+        frame_overlap_factor=frame_overlap_factor)
+    assert _pairs(view_slices) == expected
+    assert len(model_list) == len(expected)
+    for frame, (start, stop) in zip(model_list, expected):
+        assert tuple(frame.get_params('sinogram_shape')) == (stop - start, 8, 10)
+
+
+def test_time_frames_reject_parameters_that_give_no_frames():
+    """A stride or a span below one view, a span longer than the scan, angles
+    with no spacing, and a model without one angle per view are each refused
+    with a message that names the cause."""
+    parent = _scan_model(24, 15.0)
+    # At the default overlap factor the span is twice the stride, so a stride
+    # below one view is caught by the span check first.
+    with pytest.raises(ValueError, match='smaller than one view'):
+        construct_time_frame_models(parent, frames_per_rotation=100)     # a 3.6 degree stride
+    with pytest.raises(ValueError, match='stride smaller than one view'):
+        construct_time_frame_models(parent, frames_per_rotation=100, frame_overlap_factor=5.0)   # an 18 degree span
+    with pytest.raises(ValueError, match='frame span smaller than one view'):
+        construct_time_frame_models(parent, frame_overlap_factor=0.05)   # a 3 degree span
+    with pytest.raises(ValueError, match='cannot exceed the full scan'):
+        construct_time_frame_models(parent, frame_overlap_factor=10.0)   # a 600 degree span
+    with pytest.raises(ValueError, match='nonzero spacing'):
+        construct_time_frame_models(_scan_model(24, 0.0))
+    for model in (_multiaxis_model(), _translation_model()):
+        with pytest.raises(ValueError, match='one angle per view'):
+            construct_time_frame_models(model)
+
+
+# ── the device helpers report the hardware ───────────────────────────────────
+def test_device_helpers_report_the_hardware():
+    """cpu_devices has one entry, gpu_devices lists every CUDA device or the
+    MPS device or nothing, and default_devices is the GPU list when it is
+    nonempty and the CPU device otherwise."""
+    assert cpu_devices() == (torch.device('cpu'),)
+    gpus = gpu_devices()
+    if torch.cuda.is_available():
+        assert gpus == tuple(torch.device('cuda', i) for i in range(torch.cuda.device_count()))
+    elif torch.backends.mps.is_available():
+        assert gpus == (torch.device('mps'),)
+    else:
+        assert gpus == ()
+    defaults = default_devices()
+    assert isinstance(defaults, list) and len(defaults) >= 1
+    assert defaults == (list(gpus) or [torch.device('cpu')])
