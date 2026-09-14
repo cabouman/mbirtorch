@@ -107,7 +107,7 @@ __all__ = [
 _VIEWER_EXPORTS = ("SliceViewer", "VolumeStack", "slice_viewer",
                    "GeometryScene", "GeometryFigure", "geometry_viewer")
 
-_LAZY_MODULES = ("preprocess", "hsnt", "vcls")
+_LAZY_MODULES = ("preprocess", "hsnt", "vcls", "mace")
 
 # The names exposed at package level via `from .hsnt import *` and
 # `from .vcls import *`, mapped to their owning module (neither module
@@ -124,6 +124,13 @@ _LAZY_NAMES = {
     'show_image_with_projection_rays': 'vcls', 'reorder_by_priority': 'vcls',
     # The blue-noise pattern (a 382 KB array literal), loaded on first use.
     'bn256': 'bn256',
+    # The MACE consensus loop and its agents.  `mbirtorch.mace` resolves to
+    # the module, so the one-call function is reached as `mbirtorch.mace.mace`
+    # and is not exported at package level.
+    'MACE': 'mace', 'Task': 'mace', 'ForwardProxAgent': 'mace',
+    'QGGMRFDenoiserAgent': 'mace', 'HyperplaneAgent': 'mace',
+    'temporal_filter_matrix': 'mace', 'apply_temporal_filter': 'mace',
+    'resolve_device_pool': 'mace',
 }
 
 # Tools that read the source without running it -- editors resolving a name for
@@ -136,9 +143,11 @@ _LAZY_NAMES = {
 # against the three tables above, so a name added to a table without a line
 # here fails the tests.
 if TYPE_CHECKING:
-    from . import preprocess, hsnt, vcls
+    from . import preprocess, hsnt, vcls, mace
     from .view_utils import (SliceViewer, VolumeStack, slice_viewer,
                              GeometryScene, GeometryFigure, geometry_viewer)
+    from .mace import (MACE, Task, ForwardProxAgent, QGGMRFDenoiserAgent, HyperplaneAgent,
+                       temporal_filter_matrix, apply_temporal_filter, resolve_device_pool)
     from .hsnt import (hyper_denoise, dehydrate, rehydrate,
                        import_hsnt_data_hdf5, create_hsnt_metadata,
                        export_hsnt_data_hdf5, generate_hyper_data)

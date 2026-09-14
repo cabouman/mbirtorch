@@ -1,11 +1,16 @@
 """Agents for the MACE loop: callables mapping a volume tensor to a volume
 tensor on a fixed device.
 
+The two model-based agents, ``ForwardProxAgent`` and ``QGGMRFDenoiserAgent``,
+are defined in the package module :mod:`mbirtorch.mace` and are imported here
+under the names the scripts use.  The DRUNet agent stays in this file because
+it needs ``deepinv``, which is not a dependency of the package.
+
 Every knob is bound at construction so that each agent is a fixed operator
 across the loop.  The one deliberate exception is the forward agent's
 partition schedule: it walks the model's partition sequence coarse to fine as
-the cumulative iteration count grows, and settles on the finest partitions
-for the rest of the run (operators may follow a schedule early, but must be
+the loop's iteration count grows, and settles on the finest partitions for
+the rest of the run (operators may follow a schedule early, but must be
 fixed in the tail so the equilibrium is well defined).  Warm starts are the
 other piece of cross-call state: each agent initializes its inner solve from
 its own previous OUTPUT, which converges to the consensus; the input
@@ -16,105 +21,7 @@ accurately a fixed number of inner iterations approximates it.
 
 import torch
 
-import mbirtorch
-
-
-class ForwardProxAgent:
-    """Proximal map of the tomography data-fit term, via
-    :meth:`TomographyModel.prox_map`.
-
-    The sinogram, weights, and sigma_prox are bound at construction.  Each
-    call runs a fixed number of warm-started VCD iterations, and the
-    cumulative count is passed as ``first_iteration`` so the model's
-    partition sequence advances coarse to fine across calls.  Use one agent
-    per model instance: the agent relies on the model's cached prox
-    initialization.
-
-    Args:
-        model (TomographyModel): the projection model; its device layout is
-            settled on the first call (or beforehand by
-            ``configure_devices``).
-        sinogram: measured sinogram (numpy or tensor).
-        weights (optional): sinogram weights, as for ``prox_map``.
-        sigma_prox (float, optional): proximal strength.  None uses the
-            model's auto value.
-        inner_iterations (int, optional): VCD iterations per call.
-        init_recon (optional): warm start for the first call.  None lets
-            prox_map fall back to its own direct-recon initialization.
-    """
-
-    def __init__(self, model, sinogram, weights=None, sigma_prox=None,
-                 inner_iterations=3, init_recon=None):
-        self.model = model
-        self.sinogram = sinogram
-        self.weights = weights
-        self.sigma_prox = sigma_prox
-        self.inner_iterations = inner_iterations
-        self._previous_output = init_recon
-        self._iterations_done = 0
-
-    def __call__(self, v):
-        first = self._iterations_done
-        output, _ = self.model.prox_map(
-            v, self.sinogram, sigma_prox=self.sigma_prox,
-            weights=self.weights, init_recon=self._previous_output,
-            do_initialization=(first == 0),
-            max_iterations=first + self.inner_iterations,
-            first_iteration=first,
-            stop_threshold_change_pct=0.0,
-            print_logs=False, output_sharded=True)
-        self._previous_output = output
-        self._iterations_done = first + self.inner_iterations
-        return output
-
-
-class QGGMRFDenoiserAgent:
-    """qGGMRF prior agent: the proximal map of the qGGMRF regularizer, via
-    :meth:`QGGMRFDenoiser.denoise`.
-
-    The prior parameters are pinned at construction (auto-regularization
-    off), so the agent is the same operator on every call and ``sigma_noise``
-    is its one strength knob -- the same role sigma plays for a
-    noise-conditioned network denoiser.
-
-    Args:
-        image_shape (tuple): volume shape (rows, cols, slices).
-        sigma_noise (float): denoising strength, in recon units.
-        pinned_params (dict, optional): prior parameters to fix, e.g.
-            ``{'sigma_x': ...}`` read from a direct recon's
-            regularization_params.
-        inner_iterations (int, optional): VCD sweeps per call.
-        like_model (TomographyModel, optional): model whose device layout to
-            share, so volumes pass between the agents without leaving the
-            devices.
-        use_ror_mask (bool, optional): restrict updates to the inscribed
-            ellipse, matching a reconstruction model that does the same.
-    """
-
-    def __init__(self, image_shape, sigma_noise, pinned_params=None,
-                 inner_iterations=8, like_model=None, use_ror_mask=False):
-        self.model = mbirtorch.QGGMRFDenoiser(tuple(int(n) for n in image_shape))
-        if like_model is not None:
-            self.model.configure_devices(like=like_model)
-        self.model.set_params(no_warning=True, verbose=0)
-        if pinned_params:
-            self.model.set_params(no_warning=True, **pinned_params)
-        self.model.set_params(no_warning=True, auto_regularize_flag=False)
-        self.sigma_noise = float(sigma_noise)
-        self.inner_iterations = inner_iterations
-        self.use_ror_mask = use_ror_mask
-        self._previous_output = None
-
-    def __call__(self, v):
-        output, _ = self.model.denoise(
-            v, sigma_noise=self.sigma_noise,
-            use_ror_mask=self.use_ror_mask,
-            init_image=self._previous_output,
-            max_iterations=self.inner_iterations,
-            stop_threshold_change_pct=0.0,
-            print_logs=False, output_sharded=True)
-        self._previous_output = output
-        return output
+from mbirtorch.mace import ForwardProxAgent, QGGMRFDenoiserAgent  # noqa: F401
 
 
 def load_drunet(device):
@@ -171,7 +78,7 @@ class DRUNetAgent:
         self.slice_batch = slice_batch
         self.slice_axis = slice_axis
 
-    def __call__(self, v):
+    def __call__(self, v, iteration=0):
         import torch.nn.functional as functional
         x = torch.moveaxis(self.intensity_scale * v,
                            self.slice_axis, 0).unsqueeze(1)
