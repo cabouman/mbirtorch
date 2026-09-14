@@ -161,6 +161,25 @@ def image_ell1(flat_image):
                         in torch.chunk(flat_image, n_chunks, dim=0)]).sum()
 
 
+def stack_ell1(flat_stack):
+    """The ell-1 norm of each volume in a stack of recon-shaped arrays,
+    without a stack-shaped temporary.
+
+    ``flat_stack`` has shape ``(num_volumes, num_pixels, num_slices)`` and
+    the result has shape ``(num_volumes,)``.  This is :func:`image_ell1` with
+    a leading volume axis.  The chunk count follows the same rule, applied to
+    the whole stack, so the temporary is bounded by the same number of bytes,
+    and the chunks are cut along the pixel axis, so every volume is reduced
+    over the same pixel ranges.  A stack below one chunk is reduced whole.
+    """
+    n_bytes = flat_stack.numel() * flat_stack.element_size()
+    n_chunks = min(ELL1_MAX_CHUNKS, max(1, round(n_bytes / ELL1_CHUNK_BYTES)))
+    if n_chunks == 1:
+        return torch.sum(torch.abs(flat_stack), dim=(1, 2))
+    return torch.stack([torch.sum(torch.abs(chunk), dim=(1, 2)) for chunk
+                        in torch.chunk(flat_stack, n_chunks, dim=1)]).sum(dim=0)
+
+
 def ell1_chunk_bytes(image_bytes):
     """What one chunk of image_ell1 holds, for an array of ``image_bytes``.
 
@@ -1508,6 +1527,63 @@ def layout_fits(ledger, budgets, credits=None, margin=0.15):
         fits = fits and ok
         rows.append((device, demand, budget))
     return fits, rows
+
+
+# ── the batched denoise sweep's batch size ───────────────────────────────────
+# QGGMRFDenoiser.denoise_stack sweeps several same-shaped volumes at once on
+# one device.  Every image-shaped term of the denoise plan is then held once
+# per volume in the batch.  These terms are not: the library workspace is one
+# allocation per process, the pixel partition is drawn once and shared by every
+# volume, and the halo columns belong to the sharded sweep, which a batched
+# sweep never runs.
+DENOISE_BATCH_FIXED_TERMS = frozenset({'library workspace', 'subset indices',
+                                       'qggmrf halos'})
+
+
+def _denoise_batch_phase_split(phase):
+    """One denoise phase's bytes on its single device, as (fixed, per volume)."""
+    fixed = sum(vals[0] for name, vals in phase.terms
+                if name in DENOISE_BATCH_FIXED_TERMS)
+    per_volume = sum(vals[0] for name, vals in phase.terms
+                     if name not in DENOISE_BATCH_FIXED_TERMS)
+    return int(fixed), int(per_volume)
+
+
+def denoise_batch_peak_bytes(ledger, batch_size):
+    """The modeled peak of one batched denoise sweep holding ``batch_size``
+    volumes, from the one-volume, one-device denoise ledger.
+
+    Each phase is repriced as its fixed terms plus ``batch_size`` times its
+    per-volume terms, and the peak is the largest phase.  The ell-1 chunk is
+    scaled with the rest although the reduction bounds it at any size that
+    chunks, so this charges more than the sweep holds there, never less.
+    """
+    peaks = []
+    for phase in ledger.phases:
+        fixed, per_volume = _denoise_batch_phase_split(phase)
+        peaks.append(fixed + int(batch_size) * per_volume)
+    return max(peaks)
+
+
+def largest_denoise_batch(ledger, budget, margin=0.15):
+    """The largest number of volumes whose batched sweep fits ``budget``
+    bytes, judged as :func:`layout_fits` judges a layout: the modeled peak
+    times ``1 + margin`` must not exceed the budget.
+
+    Every phase grows linearly with the batch, so the answer is the smallest
+    of the per-phase limits.  Returns 0 when one volume does not fit.
+    """
+    allowed = float(budget) / (1.0 + margin)
+    limit = None
+    for phase in ledger.phases:
+        fixed, per_volume = _denoise_batch_phase_split(phase)
+        if per_volume <= 0:
+            room = 0 if fixed > allowed else None
+        else:
+            room = math.floor((allowed - fixed) / per_volume)
+        if room is not None:
+            limit = room if limit is None else min(limit, room)
+    return max(0, limit if limit is not None else 0)
 
 
 def format_shortfall(ledger, rows, num_devices_tried, closest_count=None,

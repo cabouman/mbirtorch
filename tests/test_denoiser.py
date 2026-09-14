@@ -1,5 +1,6 @@
-"""QGGMRFDenoiser gates: golden parity vs mbirjax and a denoising smoke on
-every backend."""
+"""QGGMRFDenoiser gates: golden parity vs mbirjax, a denoising smoke on
+every backend, and the stack denoiser against a loop of single-volume
+calls."""
 
 import glob
 import os
@@ -10,7 +11,8 @@ import torch
 
 import mbirtorch
 from mbirtorch import _memory_ledger, _sharding, denoising
-from mbirtorch._memory_ledger import image_ell1
+from mbirtorch import qggmrf as _qggmrf
+from mbirtorch._memory_ledger import image_ell1, stack_ell1
 
 GOLDEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "goldens")
 _paths = sorted(glob.glob(os.path.join(GOLDEN_DIR, "golden_*.npz")))
@@ -411,3 +413,273 @@ def test_denoise_accepts_zero_image(device):
                               sigma_noise=0.1, max_iterations=2,
                               stop_threshold_change_pct=0.0)
     assert np.array_equal(np.asarray(out), np.zeros(shape, dtype=np.float32))
+
+
+# ── denoise_stack: a stack of volumes against a loop of single volumes ───────
+
+def _ramp_stack(num_volumes, shape, seed=3, noise_lo=0.02, noise_hi=0.08):
+    """num_volumes noisy copies of one ramp volume.  The noise amplitude rises
+    with the volume index, so the volumes reach the stopping threshold at
+    different iterations."""
+    rng = np.random.default_rng(seed)
+    base = np.linspace(0, 1, int(np.prod(shape))).reshape(shape)
+    amplitudes = np.linspace(noise_lo, noise_hi, num_volumes)
+    return np.stack([base + a * rng.normal(size=shape)
+                     for a in amplitudes]).astype(np.float32)
+
+
+def _pinned_denoiser(shape, device, sigma_x=0.02):
+    """A denoiser with its prior parameters pinned, so that every call is the
+    same operator and the only statistic left to compute is none."""
+    denoiser = mbirtorch.QGGMRFDenoiser(shape)
+    denoiser.configure_devices(devices=[device])
+    denoiser.set_params(no_warning=True, verbose=0, sigma_x=sigma_x,
+                        auto_regularize_flag=False)
+    return denoiser
+
+
+def test_batched_gradient_and_hessian_equal_the_single_image_function(device):
+    """The batched prior repeats the single-image formulas with a leading
+    volume axis, so on each volume of a stack it must give the single-image
+    values.  Both run eagerly, on subset 0 of a seeded partition.  The gate is
+    a relative maximum difference rather than equality, because a gather and
+    an elementwise chain on a 3D tensor need not round exactly as on a 2D
+    one; the difference seen is printed."""
+    shape = (6, 24, 24)
+    num_volumes = 4
+    stack = _ramp_stack(num_volumes, shape)
+    denoiser = _pinned_denoiser(shape, device, sigma_x=0.05)
+    nbr_wts, sigma_x, p, q, T = denoiser.get_params(
+        ['qggmrf_nbr_wts', 'sigma_x', 'p', 'q', 'T'])
+    qggmrf_params = (_qggmrf.get_b_from_nbr_wts(nbr_wts), sigma_x, p, q, T)
+    np.random.seed(0)
+    partition = mbirtorch.gen_set_of_pixel_partitions(
+        shape, [4], device=device, use_ror_mask=False)[0]
+    flat = torch.as_tensor(stack, device=device).reshape(
+        num_volumes, shape[0] * shape[1], shape[2])
+
+    with torch.no_grad():
+        grad_b, hess_b = _qggmrf.qggmrf_gradient_and_hessian_batched(
+            flat, shape, partition[0], qggmrf_params)
+        worst = 0.0
+        for volume in range(num_volumes):
+            grad, hess = _qggmrf.qggmrf_gradient_and_hessian_at_indices(
+                flat[volume], shape, partition[0], qggmrf_params)
+            worst = max(worst, _rel_max(grad_b[volume].cpu(), grad.cpu()),
+                        _rel_max(hess_b[volume].cpu(), hess.cpu()))
+    print(f"batched gradient and hessian vs single image on {device}: "
+          f"rel_max = {worst:.2e}")
+    assert grad_b.shape == (num_volumes, partition.shape[1], shape[2])
+    assert worst < 1e-7
+
+
+def test_denoise_stack_equals_a_loop_of_denoise_calls(device):
+    """The stack sweep gives each volume its own step size and its own
+    stopping test, so it must reproduce a loop of single-volume denoise calls
+    with the same pinned parameters and the same seeded partition, volume by
+    volume, including the iteration count at which each volume stops.  The
+    noise amplitude differs per volume so that the counts differ.
+
+    The gate is a relative maximum difference of 1e-6, not equality: the
+    line-search sums are reductions, and a reduction over one axis of a 3D
+    tensor need not accumulate in the order of a full reduction of a 2D one.
+    The difference seen is printed."""
+    shape = (8, 10, 12)
+    num_volumes = 6
+    sigma_noise = 0.1
+    stack = _ramp_stack(num_volumes, shape)
+
+    reference = np.empty_like(stack)
+    reference_counts = []
+    single = _pinned_denoiser(shape, device)
+    for volume in range(num_volumes):
+        np.random.seed(0)     # the same partition for every volume
+        out, out_dict = single.denoise(stack[volume], sigma_noise=sigma_noise,
+                                       max_iterations=15,
+                                       stop_threshold_change_pct=0.2,
+                                       logfile_path=None, print_logs=False)
+        reference[volume] = out
+        reference_counts.append(int(out_dict['recon_params']['num_iterations']))
+
+    np.random.seed(0)
+    denoised, info = _pinned_denoiser(shape, device).denoise_stack(
+        stack, sigma_noise=sigma_noise, max_iterations=15,
+        stop_threshold_change_pct=0.2)
+
+    rel = _rel_max(denoised, reference)
+    counts = [int(n) for n in info['num_iterations']]
+    print(f"denoise_stack vs loop of denoise on {device}: rel_max = {rel:.2e}, "
+          f"iteration counts {counts}")
+    assert denoised.shape == stack.shape and denoised.dtype == np.float32
+    assert rel < 1e-6
+    assert counts == reference_counts
+    assert len(set(counts)) >= 2, 'the volumes must stop at different iterations'
+    assert [len(h) for h in info['nmae_pct']] == counts
+    assert info['batch_size'] == num_volumes
+    assert set(info['regularization_params']) == {'sigma_y', 'sigma_x', 'sigma_prox'}
+    # The volumes changed: this is a denoise, not a copy.
+    assert _rel_max(denoised, stack) > 1e-3
+
+
+def test_denoise_stack_returns_the_kind_of_array_it_was_given(device):
+    """A numpy stack comes back as numpy, and a tensor comes back as a tensor
+    on the device it arrived on, whatever device the sweep ran on."""
+    shape = (8, 10, 12)
+    stack = _ramp_stack(3, shape)
+    denoiser = _pinned_denoiser(shape, device)
+
+    np.random.seed(0)
+    from_numpy, _ = denoiser.denoise_stack(stack, sigma_noise=0.1)
+    assert isinstance(from_numpy, np.ndarray)
+
+    np.random.seed(0)
+    from_host_tensor, _ = denoiser.denoise_stack(torch.as_tensor(stack),
+                                                 sigma_noise=0.1)
+    assert torch.is_tensor(from_host_tensor)
+    assert from_host_tensor.device.type == 'cpu'
+
+    np.random.seed(0)
+    from_device_tensor, _ = denoiser.denoise_stack(
+        torch.as_tensor(stack).to(device), sigma_noise=0.1)
+    assert torch.is_tensor(from_device_tensor)
+    assert from_device_tensor.device.type == torch.device(device).type
+
+    # Data movement only: the three forms hold the same values.
+    assert np.array_equal(from_host_tensor.numpy(), from_numpy)
+    assert np.array_equal(from_device_tensor.cpu().numpy(), from_numpy)
+
+
+def test_denoise_stack_padded_last_batch_matches_one_batch(device):
+    """Five volumes in batches of two leave a last batch of one, which is
+    padded to two by repeating its volume.  The padding is discarded, so the
+    result must match one batch of five.  The volumes are independent, so the
+    gate is float rounding, and the difference seen is printed."""
+    shape = (8, 10, 12)
+    stack = _ramp_stack(5, shape)
+    denoiser = _pinned_denoiser(shape, device)
+
+    np.random.seed(0)
+    whole, whole_info = denoiser.denoise_stack(stack, sigma_noise=0.1)
+    np.random.seed(0)
+    batched, batched_info = denoiser.denoise_stack(stack, sigma_noise=0.1,
+                                                   batch_size=2)
+    rel = _rel_max(batched, whole)
+    print(f"batches of 2 vs one batch of 5 on {device}: rel_max = {rel:.2e}")
+    assert whole_info['batch_size'] == 5 and batched_info['batch_size'] == 2
+    assert rel < 1e-6
+    assert list(batched_info['num_iterations']) == list(whole_info['num_iterations'])
+
+
+def test_denoise_stack_takes_an_init_stack_and_checks_shapes(device):
+    """An initial stack starts the sweep where it says; a wrong shape in
+    either argument, or a batch size below one, is refused before any
+    computation."""
+    shape = (8, 10, 12)
+    stack = _ramp_stack(3, shape)
+    denoiser = _pinned_denoiser(shape, device)
+
+    # Starting every volume at zero moves the result away from the default
+    # start at the input, so the argument is read.
+    np.random.seed(0)
+    from_input, _ = denoiser.denoise_stack(stack, sigma_noise=0.1, max_iterations=1,
+                                           stop_threshold_change_pct=0.0)
+    np.random.seed(0)
+    from_zero, _ = denoiser.denoise_stack(stack, sigma_noise=0.1, max_iterations=1,
+                                          stop_threshold_change_pct=0.0,
+                                          init_stack=np.zeros_like(stack))
+    assert _rel_max(from_zero, from_input) > 1e-3
+
+    with pytest.raises(ValueError):
+        denoiser.denoise_stack(stack[0], sigma_noise=0.1)          # a single volume
+    with pytest.raises(ValueError):
+        denoiser.denoise_stack(stack[:, :, :, :-1], sigma_noise=0.1)
+    with pytest.raises(ValueError):
+        denoiser.denoise_stack(stack, sigma_noise=0.1, init_stack=stack[:2])
+    with pytest.raises(ValueError):
+        denoiser.denoise_stack(stack, sigma_noise=0.1, batch_size=0)
+
+
+def test_denoise_stack_refuses_a_multi_device_denoiser():
+    """The stack sweep runs on one device; a denoiser configured with two
+    refuses rather than silently using the first.  Two 'virtual' CPU devices
+    build the layout, so this runs everywhere."""
+    shape = (8, 10, 12)
+    denoiser = mbirtorch.QGGMRFDenoiser(shape)
+    denoiser.configure_devices(devices=['cpu', 'cpu'])
+    denoiser.set_params(no_warning=True, verbose=0)
+    with pytest.raises(ValueError, match='one device'):
+        denoiser.denoise_stack(_ramp_stack(2, shape), sigma_noise=0.1)
+
+
+def test_stack_ell1_matches_image_ell1_per_volume(device):
+    """The per-volume reduction behind the stack sweep's stopping test agrees
+    with the single-image reduction on each volume, at a size that chunks and
+    at one that does not.  Below one chunk both reduce whole, so the small
+    case is the same arithmetic, checked at float rounding; the chunked case
+    cuts different chunks and is checked against a float64 reference."""
+    torch.manual_seed(11)
+    small = torch.randn(3, 32 * 32, 32, device=device)
+    assert small.numel() * small.element_size() < _memory_ledger.ELL1_CHUNK_BYTES
+    per_volume = torch.stack([image_ell1(small[b]) for b in range(3)])
+    rel = float((stack_ell1(small) - per_volume).abs().max() / per_volume.abs().max())
+    assert rel < 1e-6
+
+    large = torch.randn(4, 512 * 512, 8, device=device)
+    assert large.numel() * large.element_size() > _memory_ledger.ELL1_CHUNK_BYTES
+    # The float64 reference is formed on the host: MPS has no float64.
+    reference = large.cpu().double().abs().sum(dim=(1, 2))
+    rel = float((stack_ell1(large).cpu().double() - reference).abs().max()
+                / reference.abs().max())
+    print(f"stack_ell1 on {device} at a size that chunks: rel vs float64 = {rel:.2e}")
+    assert rel < 1e-5
+
+
+# ── the automatic batch size ─────────────────────────────────────────────────
+
+def test_auto_batch_size_follows_the_device_budget():
+    """Without a readable memory budget the size is None, which
+    denoise_stack takes as the whole stack; a CUDA device gets a positive
+    count.  A shape other than the denoiser's is refused."""
+    shape = (8, 10, 12)
+    denoiser = _pinned_denoiser(shape, 'cpu')
+    assert denoiser.auto_batch_size() is None
+    assert denoiser.auto_batch_size(shape) is None
+    with pytest.raises(ValueError):
+        denoiser.auto_batch_size((8, 10, 13))
+    if torch.cuda.is_available():
+        on_cuda = _pinned_denoiser(shape, 'cuda')
+        batch = on_cuda.auto_batch_size()
+        print(f"auto_batch_size on cuda for {shape}: {batch}")
+        assert isinstance(batch, int) and batch >= 1
+        assert on_cuda.auto_batch_size(init_supplied=True) <= batch
+
+
+def test_denoise_batch_ledger_scales_the_per_volume_terms_only():
+    """The batch rule reprices the one-volume denoise ledger as fixed terms
+    plus the batch count times the per-volume terms.  On the real plan this
+    must reproduce the one-volume peak at a batch of one, grow by the same
+    amount per added volume, and leave the shared partition and the library
+    workspace uncounted in that growth."""
+    shape = (16, 20, 24)
+    denoiser = _pinned_denoiser(shape, 'cpu')
+    ledger = denoiser._build_memory_ledger(devices=['cpu'], workload='denoise')
+    peaks = [_memory_ledger.denoise_batch_peak_bytes(ledger, b) for b in (1, 2, 3)]
+    assert peaks[0] == ledger.peak_bytes(0)
+    per_volume = peaks[1] - peaks[0]
+    assert per_volume > 0 and peaks[2] - peaks[1] == per_volume
+    # The growth is image-shaped: at least the three resident images of the
+    # sweep, and never the 64 MiB workspace.
+    volume_bytes = 4 * int(np.prod(shape))
+    assert 3 * volume_bytes <= per_volume < _memory_ledger.FIXED_DEVICE_OVERHEAD_BYTES
+
+    # The largest batch that fits is the largest whose scaled peak, under the
+    # margin, stays within the budget.
+    margin = 0.15
+    for batch in (1, 2, 7, 40):
+        budget = int((1.0 + margin) * peaks[0]) + (batch - 1) * int((1.0 + margin) * per_volume)
+        chosen = _memory_ledger.largest_denoise_batch(ledger, budget, margin=margin)
+        assert (1.0 + margin) * _memory_ledger.denoise_batch_peak_bytes(ledger, chosen) <= budget
+        assert (1.0 + margin) * _memory_ledger.denoise_batch_peak_bytes(ledger, chosen + 1) > budget
+        assert chosen >= batch - 1
+    # Less than one volume's worth gives zero, which auto_batch_size refuses.
+    assert _memory_ledger.largest_denoise_batch(ledger, peaks[0] // 2, margin=margin) == 0

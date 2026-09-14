@@ -13,6 +13,11 @@ the sweep runs shard by shard, with the qGGMRF halos staged once per pass and
 the four line-search sums combined on the lead device into one step size.
 Both paths keep the line search on device, so neither forces a host
 synchronization per subset.
+
+A third form, :meth:`QGGMRFDenoiser.denoise_stack`, denoises a stack of
+same-shaped volumes with shared parameters on one device.  Its update carries
+a leading volume axis, so every volume has its own step size and its own
+stopping test, and the result equals denoising the volumes one at a time.
 """
 
 import datetime
@@ -20,11 +25,11 @@ import datetime
 import numpy as np
 import torch
 
-from . import _sharding
+from . import _memory_ledger, _sharding
 
 from . import qggmrf as _qggmrf
 from . import vcd_utils
-from ._memory_ledger import image_ell1
+from ._memory_ledger import image_ell1, stack_ell1
 from ._utils import recon_param_names
 from .projectors import maybe_compile
 from .tomography_model import TomographyModel
@@ -79,6 +84,63 @@ def vcd_subset_denoiser(flat_image, flat_error_image, pixel_indices,
     cur_error_image = cur_error_image - alpha * delta_sinogram
     flat_error_image.index_copy_(0, pixel_indices, cur_error_image)
     ell1_for_subset = torch.sum(torch.abs(delta_recon_at_indices))
+    return flat_image, flat_error_image, ell1_for_subset, alpha
+
+
+def vcd_subset_denoiser_batched(flat_image, flat_error_image, pixel_indices,
+                                fm_constant, qggmrf_params, image_shape, active):
+    """One VCD subset update for a stack of images under the identity forward
+    model: :func:`vcd_subset_denoiser` with a leading volume axis.
+
+    The formulas are those of the single-image function.  The four line-search
+    sums are reduced over the pixel and slice axes of each volume, so the step
+    size ``alpha`` has one entry per volume and the volumes do not interact.
+    ``active`` is a boolean tensor with one entry per volume; a volume whose
+    entry is False gets a step of zero, so its image and its residual do not
+    change.  Both state tensors, of shape (num_volumes, num_pixels,
+    num_slices), are mutated in place.
+
+    Returns:
+        (flat_image, flat_error_image, ell1, alpha): the two state tensors,
+        the ell-1 norm of each volume's step, shape (num_volumes,), and the
+        step size of each volume, shape (num_volumes,).
+    """
+    prior_grad, prior_hess = _qggmrf.qggmrf_gradient_and_hessian_batched(
+        flat_image, image_shape, pixel_indices, qggmrf_params)
+
+    # The forward Hessian is all 1s for the qggmrf proximal map.
+    cur_error_image = flat_error_image[:, pixel_indices]
+    forward_grad = -fm_constant * cur_error_image
+    forward_hess = 1
+
+    delta_recon_at_indices = -((forward_grad + prior_grad)
+                               / (forward_hess + prior_hess))
+
+    # The line-search sums, one per volume.
+    prior_linear = torch.sum(prior_grad * delta_recon_at_indices, dim=(1, 2))
+    prior_quadratic_approx = torch.sum(prior_hess * delta_recon_at_indices ** 2,
+                                       dim=(1, 2))
+
+    delta_sinogram = delta_recon_at_indices
+    forward_linear = fm_constant * torch.sum(cur_error_image * delta_sinogram,
+                                             dim=(1, 2))
+    forward_quadratic = fm_constant * torch.sum(delta_sinogram * delta_sinogram,
+                                                dim=(1, 2))
+
+    alpha_numerator = forward_linear - prior_linear
+    alpha_denominator = forward_quadratic + prior_quadratic_approx + _F32_EPS
+    alpha = alpha_numerator / alpha_denominator
+    max_alpha = 1.5
+    alpha = torch.clamp(alpha, _F32_EPS, max_alpha)
+    # A frozen volume takes no step.
+    alpha = torch.where(active, alpha, torch.zeros_like(alpha))
+
+    delta_scaled = alpha[:, None, None] * delta_recon_at_indices
+    flat_image.index_add_(1, pixel_indices, delta_scaled)
+
+    cur_error_image = cur_error_image - delta_scaled
+    flat_error_image.index_copy_(1, pixel_indices, cur_error_image)
+    ell1_for_subset = torch.sum(torch.abs(delta_scaled), dim=(1, 2))
     return flat_image, flat_error_image, ell1_for_subset, alpha
 
 
@@ -608,6 +670,297 @@ class QGGMRFDenoiser(TomographyModel):
                 self._per_device_pool.shutdown(wait=True)
                 self._per_device_pool = None
         return flat_image, nmae_update, alpha_values, num_iters
+
+    # ── denoising a stack of volumes at once ──────────────────────────────────
+    def auto_batch_size(self, volume_shape=None, init_supplied=False):
+        """
+        Return the number of volumes :meth:`denoise_stack` sweeps at once when
+        its ``batch_size`` is None.
+
+        On a CUDA device this is the largest batch whose sweep fits the
+        device's free memory.  The sweep holds every image-shaped array of one
+        volume's denoise plan once per volume in the batch, so the plan is
+        priced for one volume by the memory ledger, scaled by the batch count,
+        and compared with the free memory under the same margin the
+        reconstruction preflight uses.  The free memory is read when this
+        method is called.  On other devices no memory budget can be read, and
+        the result is None, which :meth:`denoise_stack` takes to mean the
+        whole stack.
+
+        Args:
+            volume_shape (tuple of int, optional): the shape of one volume.
+                Defaults to the denoiser's image shape, which is the only
+                shape this denoiser sweeps; any other shape raises.
+            init_supplied (bool, optional): whether the sweep will be given an
+                initial stack, which is one more image-shaped array per
+                volume.  Defaults to False.
+
+        Returns:
+            int or None: volumes per batch, or None when the device reports no
+            memory budget.
+
+        Raises:
+            ValueError: if ``volume_shape`` is not the denoiser's image shape.
+            MemoryPreflightError: if a batch of one volume does not fit.
+        """
+        image_shape = tuple(int(n) for n in self.get_params('recon_shape'))
+        if volume_shape is not None and \
+                tuple(int(n) for n in volume_shape) != image_shape:
+            raise ValueError(
+                'auto_batch_size prices the sweep this denoiser runs, which is '
+                f'over volumes of shape {image_shape}; got volume_shape '
+                f'{tuple(volume_shape)}.  Build a QGGMRFDenoiser at that shape.')
+        device = self.torch_device
+        budget = _memory_ledger.device_budget_bytes(device)
+        if budget is None:
+            return None
+        plan = _memory_ledger.plan_from_model(self, [device], workload='denoise')
+        plan.init_recon_supplied = bool(init_supplied)
+        ledger = _memory_ledger.estimate_peak_device_bytes(plan)
+        batch = _memory_ledger.largest_denoise_batch(
+            ledger, budget, margin=self.memory_preflight_margin)
+        if batch < 1:
+            need = _memory_ledger.denoise_batch_peak_bytes(ledger, 1)
+            raise _memory_ledger.MemoryPreflightError(
+                'a denoise sweep of one volume of shape {} is modeled at {:.2f} GB '
+                'against {:.2f} GB free on {} (with a {:.0%} margin), so no batch '
+                'fits.  Pass batch_size to denoise_stack to run anyway.'.format(
+                    image_shape, need / 2 ** 30, budget / 2 ** 30, device,
+                    self.memory_preflight_margin))
+        return int(batch)
+
+    def denoise_stack(self, stack, sigma_noise=None, init_stack=None,
+                      max_iterations=15, stop_threshold_change_pct=0.2,
+                      batch_size=None):
+        """
+        Denoise a stack of same-shaped volumes with shared parameters, each
+        volume as :meth:`denoise` would denoise it alone.
+
+        The volumes are independent.  The sweep carries a leading volume axis,
+        each volume has its own line-search step size, and each volume has its
+        own stopping test: a volume whose change falls below the threshold is
+        frozen, its step is zero from then on, and the other volumes keep
+        iterating.  The result and the per-volume iteration counts therefore
+        equal those of calling :meth:`denoise` once per volume with the same
+        parameters and the same pixel partition.
+
+        The parameters are set once for the whole stack.  ``sigma_noise`` is
+        shared by every volume, and ``sigma_y`` is kept equal to it.  When
+        auto-regularization is on, the regularization parameters are set from
+        a row subsample of the stack merged into one 3D array, so the
+        statistics see every volume.  One pixel partition is drawn from the
+        global numpy random generator and used by every volume, so a seeded
+        call is reproducible.
+
+        The sweep runs on the denoiser's device, in batches of ``batch_size``
+        volumes.  The last batch is padded to the full size by repeating its
+        last volume, so one compiled shape serves every batch of a call, and
+        the padded results are discarded.  This method uses one device: a
+        denoiser configured with more than one device raises.  No log file is
+        written.
+
+        Args:
+            stack (numpy or tensor): the volumes to denoise, with shape
+                (num_volumes,) + image_shape.
+            sigma_noise (float, optional): noise std shared by every volume.
+                None estimates it from the merged stack.
+            init_stack (numpy or tensor, optional): initial image for each
+                volume, with the shape of ``stack``.  Defaults to ``stack``.
+            max_iterations (int, optional): maximum VCD iterations per volume.
+            stop_threshold_change_pct (float, optional): a volume stops when
+                100 * ||delta||_1 / ||volume||_1 drops below this.  0 runs
+                every volume for exactly max_iterations.
+            batch_size (int, optional): volumes swept at once.  None chooses
+                the size with :meth:`auto_batch_size`, which is the whole stack
+                on a device without a readable memory budget.
+
+        Returns:
+            (denoised_stack, info): the denoised volumes, numpy for numpy input
+            and a tensor on the input's device for tensor input; and a dict
+            with 'num_iterations' (one count per volume), 'nmae_pct' (one list
+            per volume holding the percent change at each of its iterations),
+            'regularization_params', and 'batch_size'.
+
+        Raises:
+            ValueError: if ``stack`` or ``init_stack`` has the wrong shape, if
+                ``batch_size`` is below 1, or if the denoiser is configured
+                with more than one device.
+            TypeError: if ``stack`` or ``init_stack`` is in the divided device
+                form.
+
+        Example:
+            >>> denoiser = mbirtorch.QGGMRFDenoiser(stack.shape[1:])
+            >>> denoised, info = denoiser.denoise_stack(stack, sigma_noise=0.1)
+        """
+        _sharding.reject_shards('denoise_stack', stack=stack, init_stack=init_stack)
+        if self.recon_placement.n_devices > 1:
+            raise ValueError(
+                'denoise_stack runs on one device, and this denoiser is '
+                f'configured with {self.recon_placement.n_devices}.  Configure '
+                'it with one device, or call denoise for the sharded sweep.')
+        device = self.torch_device
+        image_shape = tuple(int(n) for n in self.get_params('recon_shape'))
+        stack_shape = tuple(int(n) for n in stack.shape)
+        if len(stack_shape) != 4 or stack_shape[1:] != image_shape:
+            raise ValueError(
+                f'stack must have shape (num_volumes,) + {image_shape}; got '
+                f'{stack_shape}.')
+        if init_stack is not None and tuple(int(n) for n in init_stack.shape) != stack_shape:
+            raise ValueError(
+                f'init_stack must have the shape of stack, {stack_shape}; got '
+                f'{tuple(init_stack.shape)}.')
+        num_volumes = stack_shape[0]
+        num_pixels = image_shape[0] * image_shape[1]
+        num_slices = image_shape[2]
+
+        # The output is allocated before the batch size is chosen, so that a
+        # tensor output living on the sweep device is already counted in the
+        # free-memory reading the automatic choice makes.
+        stack_is_tensor = torch.is_tensor(stack)
+        if stack_is_tensor:
+            out = torch.empty(stack_shape, dtype=torch.float32, device=stack.device)
+        else:
+            out = np.empty(stack_shape, dtype=np.float32)
+        if batch_size is None:
+            batch_size = self.auto_batch_size(init_supplied=init_stack is not None)
+        if batch_size is None or int(batch_size) > num_volumes:
+            batch_size = num_volumes
+        batch_size = int(batch_size)
+        if batch_size < 1:
+            raise ValueError(f'batch_size must be at least 1; got {batch_size}.')
+
+        # The statistics run on the stack merged into one 3D array, through
+        # the same two subsampled paths denoise uses: the noise estimate strides
+        # all three axes itself, and the auto-regularization path reads a row
+        # subsample, which for the merged stack spans every volume.
+        merged = stack.reshape(-1, image_shape[1], image_shape[2])
+        if sigma_noise is None:
+            sigma_noise = self.estimate_image_noise_std(merged)
+        # For the identity forward model sigma_y IS sigma_noise; kept equal
+        # here for the pinned path too, as in denoise.
+        self.set_params(no_warning=True, sigma_noise=sigma_noise,
+                        sigma_y=sigma_noise)
+        num_rows = int(merged.shape[0])
+        sampled_rows = self.subsample_views(np.arange(num_rows))
+        row_step = int(sampled_rows[1] - sampled_rows[0]) if sampled_rows.size > 1 else 1
+        small_image = _subsample_to_host(merged, row_step=row_step)
+        verbose = self.get_params('verbose')
+        self.set_params(no_warning=True, verbose=0)
+        regularization_params = self.auto_set_regularization_params(small_image)
+        self.set_params(no_warning=True, verbose=verbose)
+
+        # One fixed partition over one volume's pixel grid, shared by every
+        # volume.
+        granularity = self.get_params('granularity')
+        partition_sequence = self.get_params('partition_sequence')
+        use_ror_mask = self.get_params('use_ror_mask')
+        partition = vcd_utils.gen_set_of_pixel_partitions(
+            image_shape, [granularity[partition_sequence[0]]],
+            device=device, use_ror_mask=use_ror_mask)[0]
+
+        fm_constant = 1.0 / (self.get_params('sigma_y') ** 2.0)
+        qggmrf_nbr_wts, sigma_x, p, q, T = self.get_params(
+            ['qggmrf_nbr_wts', 'sigma_x', 'p', 'q', 'T'])
+        qggmrf_params = (_qggmrf.get_b_from_nbr_wts(qggmrf_nbr_wts), sigma_x, p, q, T)
+        stop_thresh = stop_threshold_change_pct / 100.0
+        # One compiled instance per device, as the per-device threads of the
+        # reconstruction loop keep, so that concurrent sweeps on different
+        # devices share no compiled state.
+        subset_denoiser = maybe_compile(vcd_subset_denoiser_batched,
+                                        self.compile_enabled, instance_key=str(device))
+
+        def flat_on_device(block):
+            """A block of volumes as a float32 (B, num_pixels, num_slices)
+            tensor on the sweep device."""
+            tensor = block if torch.is_tensor(block) else torch.as_tensor(block)
+            tensor = tensor.to(device=device, dtype=torch.float32)
+            return tensor.reshape(tensor.shape[0], num_pixels, num_slices)
+
+        def padded(flat, pad):
+            """The block with its last volume repeated pad more times."""
+            if pad == 0:
+                return flat
+            return torch.cat([flat, flat[-1:].expand(pad, -1, -1)])
+
+        num_iterations = np.zeros(num_volumes, dtype=int)
+        nmae_pct = [[] for _ in range(num_volumes)]
+        with torch.no_grad():
+            for b0 in range(0, num_volumes, batch_size):
+                b1 = min(b0 + batch_size, num_volumes)
+                pad = batch_size - (b1 - b0)
+                flat = padded(flat_on_device(stack[b0:b1]), pad)
+                init_flat = (flat if init_stack is None
+                             else padded(flat_on_device(init_stack[b0:b1]), pad))
+                flat_image = init_flat.clone().contiguous()
+                flat_error_image = (flat - flat_image).contiguous()
+                counts, history = self._sweep_stack(
+                    flat_image, flat_error_image, partition, fm_constant,
+                    qggmrf_params, image_shape, max_iterations, stop_thresh,
+                    subset_denoiser)
+                real = b1 - b0
+                result = flat_image[:real].reshape((real,) + image_shape)
+                if stack_is_tensor:
+                    out[b0:b1] = result.to(out.device)
+                else:
+                    out[b0:b1] = result.cpu().numpy()
+                num_iterations[b0:b1] = counts[:real]
+                nmae_pct[b0:b1] = history[:real]
+
+        if verbose >= 1:
+            self.logger.info(
+                'Denoised {} volumes in batches of {}: {} to {} iterations per '
+                'volume.'.format(num_volumes, batch_size,
+                                 int(num_iterations.min()), int(num_iterations.max())))
+        info = dict(num_iterations=num_iterations, nmae_pct=nmae_pct,
+                    regularization_params=regularization_params,
+                    batch_size=batch_size)
+        return out, info
+
+    @staticmethod
+    def _sweep_stack(flat_image, flat_error_image, partition, fm_constant,
+                     qggmrf_params, image_shape, max_iters, stop_thresh,
+                     subset_denoiser):
+        """Run the batched sweep in place on one batch of flat volumes.
+
+        Each volume runs until its own change falls below ``stop_thresh`` or
+        until ``max_iters``.  A volume that has stopped is frozen: it keeps
+        its place in the batch with a step of zero.  The loop ends when no
+        volume is active.
+
+        Returns:
+            (num_iterations, nmae_pct): the iteration count of each volume,
+            and one list per volume of the percent change at each of its
+            iterations.
+        """
+        num_vols = int(flat_image.shape[0])
+        device = flat_image.device
+        active_host = np.ones(num_vols, dtype=bool)
+        active = torch.ones(num_vols, dtype=torch.bool, device=device)
+        counts = np.zeros(num_vols, dtype=int)
+        history = [[] for _ in range(num_vols)]
+        for i in range(max_iters):
+            ell1_accum = torch.zeros(num_vols, dtype=flat_image.dtype, device=device)
+            for k in range(partition.shape[0]):
+                flat_image, flat_error_image, ell1_subset, _alpha = subset_denoiser(
+                    flat_image, flat_error_image, partition[k], fm_constant,
+                    qggmrf_params, tuple(image_shape), active)
+                ell1_accum = ell1_accum + ell1_subset
+            # One host read per iteration: the stopping test needs Python
+            # numbers.  The ratio is formed in float64 on the host, as
+            # denoise forms it, and a zero volume gives nan rather than
+            # raising, as there.
+            stats = torch.stack([ell1_accum, stack_ell1(flat_image)])
+            stats = stats.cpu().numpy().astype(np.float64)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                nmae = stats[0] / stats[1]
+            for j in np.flatnonzero(active_host):
+                history[j].append(100.0 * float(nmae[j]))
+                counts[j] = i + 1
+            active_host &= ~(nmae < stop_thresh)
+            if not active_host.any():
+                break
+            active = torch.tensor(active_host, device=device)
+        return counts, history
 
 
 def median_filter3d(x, max_block_gb=4.0, return_min_max=False):

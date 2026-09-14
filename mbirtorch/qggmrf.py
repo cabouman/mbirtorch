@@ -183,6 +183,94 @@ def qggmrf_gradient_and_hessian_at_indices(flat_recon, recon_shape, pixel_indice
     return gradient, hessian
 
 
+def qggmrf_gradient_and_hessian_batched(flat_stack, recon_shape, pixel_indices,
+                                        qggmrf_params):
+    """
+    Calculate the qGGMRF gradient and hessian at each index location for every
+    volume of a stack of reconstructed images.
+
+    This is :func:`qggmrf_gradient_and_hessian_at_indices` with a leading
+    volume axis.  The formulas are the same, with every gather taken along
+    the pixel axis and the slice differences along the last axis, and there
+    are no halos: the stack lives on one device.  The volumes do not interact,
+    so the result for one volume equals the single-image function applied to
+    that volume alone.
+
+    Args:
+        flat_stack (tensor): 3D array with shape
+            (num_volumes, num_recon_rows x num_recon_cols, num_recon_slices),
+            one flattened reconstruction per volume.
+        recon_shape (tuple of ints): shape of one volume:
+            (num_recon_rows, num_recon_cols, num_recon_slices).  Only the
+            in-slice term uses it, and it ignores the slice count.
+        pixel_indices (int tensor): 1D array of shape (N_indices,) holding
+            indices into the flattened (num_recon_rows x num_recon_cols) grid
+            of voxel cylinders to be updated.  The same pixels are updated in
+            every volume.
+        qggmrf_params (tuple): The parameters b, sigma_x, p, q, T, with b the
+            6-entry direction tuple from :func:`get_b_from_nbr_wts`.
+
+    Returns:
+        tuple of two tensors (first_derivative, second_derivative), each of
+        shape (num_volumes, N_indices, num_recon_slices).
+
+    Raises:
+        TypeError: If ``flat_stack`` is in the divided device form.
+    """
+    _sharding.reject_shards('qggmrf_gradient_and_hessian_batched',
+                            flat_stack=flat_stack)
+    # Neighborhood weight order is [row+1, row-1, col+1, col-1, slice+1, slice-1]
+    # (see the definition in _utils.py).
+    b, sigma_x, p, q, T = qggmrf_params
+    num_rows, num_cols = recon_shape[0], recon_shape[1]
+
+    # ── cylinder (slice-axis) term ────────────────────────────────────────────
+    # delta[j] = v[j] - v[j-1] for interior positions.  The boundary value at
+    # each end is the edge slice itself, so the boundary delta is exactly zero:
+    # the reflected boundary condition of the single-image function with no
+    # halo.
+    cylinders = flat_stack[:, pixel_indices]                   # (B, N, S)
+    left_val = cylinders[..., :1]
+    right_val = cylinders[..., -1:]
+    delta = torch.cat((cylinders[..., :1] - left_val,
+                       cylinders[..., 1:] - cylinders[..., :-1],
+                       right_val - cylinders[..., -1:]), dim=-1)  # (B, N, S+1)
+
+    # Compute the primary quantity used for the gradient and Hessian.
+    # Use b_for_delta = 1 here and scale by the slice-direction b below.
+    b_tilde_2 = get_2_b_tilde(delta, 1.0, qggmrf_params)
+    b_tilde_2_delta = b_tilde_2 * delta
+
+    # slice+1 uses -delta[1:] and slice-1 uses delta[:-1], for the reason the
+    # single-image function gives.
+    b_slice_plus, b_slice_minus = b[4], b[5]
+    gradient = (-b_slice_plus * b_tilde_2_delta[..., 1:]
+                + b_slice_minus * b_tilde_2_delta[..., :-1])
+    hessian = (b_slice_plus * b_tilde_2[..., 1:]
+               + b_slice_minus * b_tilde_2[..., :-1])
+
+    # ── in-slice (row/col) term ──────────────────────────────────────────────
+    # The 4 in-plane neighbors, with the neighbor index clamped at the grid
+    # border so that an edge pixel's out-of-grid neighbor is itself.
+    row_index = pixel_indices // num_cols
+    col_index = pixel_indices % num_cols
+    xs0 = cylinders                                            # (B, N, S)
+
+    offsets_and_b = [((1, 0), b[0]), ((-1, 0), b[1]),
+                     ((0, 1), b[2]), ((0, -1), b[3])]
+    for (dr, dc), b_value in offsets_and_b:
+        r = (row_index + dr).clamp(0, num_rows - 1)
+        c = (col_index + dc).clamp(0, num_cols - 1)
+        neighbor = flat_stack[:, r * num_cols + c]             # (B, N, S)
+        delta = xs0 - neighbor
+
+        b_tilde_2 = get_2_b_tilde(delta, b_value, qggmrf_params)
+        gradient = gradient + b_tilde_2 * delta
+        hessian = hessian + b_tilde_2
+
+    return gradient, hessian
+
+
 def prox_gradient_at_indices(recon, prox_input, pixel_indices, sigma_prox):
     """
     Calculate the gradient at each pixel index location in a reconstructed image
