@@ -349,6 +349,13 @@ def test_get_memory_stats_structure():
     import io
     stats = mbirtorch.get_memory_stats(print_results=False)
     assert stats[-1]['id'] == 'CPU'
+    if stats[0]['id'].startswith('GPU'):
+        # CUDA entries separate the arrays in use from the allocator's pool
+        # and carry the pool's high-water mark beside the in-use peak.
+        assert 'peak_reserved_bytes' in stats[0]
+        assert 'cache_bytes' in stats[0]
+        assert stats[0]['cache_bytes'] == (stats[0]['reserved_bytes']
+                                           - stats[0]['bytes_in_use'])
     for entry in stats:
         for key, value in entry.items():
             if key != 'id':
