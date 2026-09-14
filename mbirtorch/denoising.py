@@ -927,11 +927,11 @@ class QGGMRFDenoiser(TomographyModel):
             ['qggmrf_nbr_wts', 'sigma_x', 'p', 'q', 'T'])
         qggmrf_params = (_qggmrf.get_b_from_nbr_wts(qggmrf_nbr_wts), sigma_x, p, q, T)
         stop_thresh = stop_threshold_change_pct / 100.0
-        # One compiled instance per device, as the per-device threads of the
-        # reconstruction loop keep, so that concurrent sweeps on different
-        # devices share no compiled state.
+        # One compiled instance per denoiser object, so that two denoisers
+        # swept at the same time from different threads, on the same device or
+        # on different ones, share no compiled state.
         subset_denoiser = maybe_compile(vcd_subset_denoiser_batched,
-                                        self.compile_enabled, instance_key=str(device))
+                                        self.compile_enabled, instance_key=id(self))
 
         def flat_on_device(block):
             """A block of volumes as a float32 (B, num_pixels, num_slices)
