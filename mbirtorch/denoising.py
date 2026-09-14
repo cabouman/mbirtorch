@@ -30,11 +30,14 @@ from . import _memory_ledger, _sharding
 from . import qggmrf as _qggmrf
 from . import vcd_utils
 from ._memory_ledger import image_ell1, stack_ell1
-from ._utils import recon_param_names
+from ._utils import _AUTO_REGULARIZATION_PARAM_NAMES, recon_param_names
 from .projectors import maybe_compile
 from .tomography_model import TomographyModel
 
 _F32_EPS = float(np.finfo(np.float32).eps)
+# The smallest sigma_x the stack statistics will set; see
+# QGGMRFDenoiser.auto_set_regularization_params_from_stack.
+_SIGMA_X_FLOOR = 1e-6
 
 
 def vcd_subset_denoiser(flat_image, flat_error_image, pixel_indices,
@@ -672,6 +675,71 @@ class QGGMRFDenoiser(TomographyModel):
         return flat_image, nmae_update, alpha_values, num_iters
 
     # ── denoising a stack of volumes at once ──────────────────────────────────
+    def auto_set_regularization_params_from_stack(self, stack):
+        """
+        Set the regularization parameters (sigma_y, sigma_x, and sigma_prox)
+        from a subsample of whole volumes of a stack, and return them as a
+        dict.  The parameters change only when ``auto_regularize_flag`` is
+        True, as in :meth:`auto_set_regularization_params`.
+
+        About 20 volumes are chosen, evenly spaced along the volume axis:
+        every volume when the stack holds at most 39, and every
+        ``num_volumes // 20``-th volume otherwise, which is the rule
+        :meth:`subsample_views` applies to views.  Only the chosen volumes
+        cross to the host; a tensor is indexed on its own device first.  The
+        chosen volumes are merged into one 3D array of shape
+        ``(k * d0, d1, d2)`` and the statistics run on it with no further
+        subsampling, so the neighbor differences along the first axis are
+        between adjacent frames of one volume, except at the ``k - 1`` joins
+        where the last frame of one chosen volume meets the first frame of the
+        next.  :meth:`auto_set_regularization_params` reads a row subsample
+        instead, whose row neighbors lie a stride apart, which is not what a
+        stack of volumes needs.
+
+        Args:
+            stack (numpy or tensor): the volumes, with shape
+                ``(num_volumes,) + image_shape``, on any device.
+
+        Returns:
+            dict: the values of ``sigma_y``, ``sigma_x``, and ``sigma_prox``.
+
+        Raises:
+            TypeError: if ``stack`` is in the divided device form.
+        """
+        _sharding.reject_shards('auto_set_regularization_params_from_stack',
+                                stack=stack)
+        names = list(_AUTO_REGULARIZATION_PARAM_NAMES)
+        if self.get_params('auto_regularize_flag'):
+            if not torch.is_tensor(stack):
+                stack = np.asarray(stack)
+            num_volumes = int(stack.shape[0])
+            d0, d1, d2 = (int(n) for n in stack.shape[1:])
+            # The volumes chosen are the ones subsample_views keeps when it is
+            # handed the volume indices.  The same stride, applied to the stack
+            # viewed as (num_volumes, d0 * d1, d2), picks those volumes on the
+            # device that holds them and brings only them to the host.
+            chosen = self.subsample_views(np.arange(num_volumes))
+            step = int(chosen[1] - chosen[0]) if chosen.size > 1 else 1
+            volumes = _subsample_to_host(stack.reshape(num_volumes, d0 * d1, d2),
+                                         row_step=step)
+            merged = volumes.reshape(-1, d1, d2)
+
+            sino_indicator = self._get_sino_indicator(merged)
+            self.auto_set_sigma_y(merged, sino_indicator)
+            recon_std = self._get_estimate_of_recon_std(merged, sino_indicator)
+            if not np.isfinite(recon_std):
+                recon_std = 0.0
+            self.auto_set_sigma_x(recon_std)
+            self.auto_set_sigma_prox(recon_std)
+            # A stack dominated by background gives a sigma_x near zero, and
+            # the sweep then divides by it and returns NaN for every volume.
+            # The floor keeps sigma_x positive.
+            sigma_x = self.get_params('sigma_x')
+            if not np.isfinite(sigma_x) or sigma_x < _SIGMA_X_FLOOR:
+                self.set_params(no_warning=True, sigma_x=_SIGMA_X_FLOOR)
+        values = [float(v) for v in self.get_params(names)]
+        return dict(zip(names, values))
+
     def auto_batch_size(self, volume_shape=None, init_supplied=False):
         """
         Return the number of volumes :meth:`denoise_stack` sweeps at once when
@@ -746,11 +814,13 @@ class QGGMRFDenoiser(TomographyModel):
 
         The parameters are set once for the whole stack.  ``sigma_noise`` is
         shared by every volume, and ``sigma_y`` is kept equal to it.  When
-        auto-regularization is on, the regularization parameters are set from
-        a row subsample of the stack merged into one 3D array, so the
-        statistics see every volume.  One pixel partition is drawn from the
-        global numpy random generator and used by every volume, so a seeded
-        call is reproducible.
+        auto-regularization is on, the regularization parameters are set by
+        :meth:`auto_set_regularization_params_from_stack` from a subsample of
+        about 20 whole volumes, evenly spaced, with the neighbor differences
+        taken between adjacent frames.  This differs from :meth:`denoise`,
+        which reads a row subsample of a single image.  One pixel partition is
+        drawn from the global numpy random generator and used by every volume,
+        so a seeded call is reproducible.
 
         The sweep runs on the denoiser's device, in batches of ``batch_size``
         volumes.  The last batch is padded to the full size by repeating its
@@ -829,25 +899,19 @@ class QGGMRFDenoiser(TomographyModel):
         if batch_size < 1:
             raise ValueError(f'batch_size must be at least 1; got {batch_size}.')
 
-        # The statistics run on the stack merged into one 3D array, through
-        # the same two subsampled paths denoise uses: the noise estimate strides
-        # all three axes itself, and the auto-regularization path reads a row
-        # subsample, which for the merged stack spans every volume.
-        merged = stack.reshape(-1, image_shape[1], image_shape[2])
+        # The noise estimate strides all three axes of the stack merged into
+        # one 3D array, as denoise strides a single image.
         if sigma_noise is None:
-            sigma_noise = self.estimate_image_noise_std(merged)
+            sigma_noise = self.estimate_image_noise_std(
+                stack.reshape(-1, image_shape[1], image_shape[2]))
         # For the identity forward model sigma_y IS sigma_noise; kept equal
         # here for the pinned path too, as in denoise.
         self.set_params(no_warning=True, sigma_noise=sigma_noise,
                         sigma_y=sigma_noise)
-        num_rows = int(merged.shape[0])
-        sampled_rows = self.subsample_views(np.arange(num_rows))
-        row_step = int(sampled_rows[1] - sampled_rows[0]) if sampled_rows.size > 1 else 1
-        small_image = _subsample_to_host(merged, row_step=row_step)
+        # The regularization parameters come from whole volumes, so the
+        # neighbor differences they measure are between adjacent frames.
+        regularization_params = self.auto_set_regularization_params_from_stack(stack)
         verbose = self.get_params('verbose')
-        self.set_params(no_warning=True, verbose=0)
-        regularization_params = self.auto_set_regularization_params(small_image)
-        self.set_params(no_warning=True, verbose=verbose)
 
         # One fixed partition over one volume's pixel grid, shared by every
         # volume.

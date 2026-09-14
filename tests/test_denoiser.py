@@ -683,3 +683,185 @@ def test_denoise_batch_ledger_scales_the_per_volume_terms_only():
         assert chosen >= batch - 1
     # Less than one volume's worth gives zero, which auto_batch_size refuses.
     assert _memory_ledger.largest_denoise_batch(ledger, peaks[0] // 2, margin=margin) == 0
+
+
+# ── the regularization parameters of a stack ─────────────────────────────────
+
+def _auto_denoiser(shape, device, sigma_noise=0.1):
+    """A denoiser with auto-regularization on and its noise level set, which
+    is the state denoise_stack leaves before it sets the parameters."""
+    denoiser = mbirtorch.QGGMRFDenoiser(shape)
+    denoiser.configure_devices(devices=[device])
+    denoiser.set_params(no_warning=True, verbose=0, sigma_noise=sigma_noise,
+                        sigma_y=sigma_noise)
+    return denoiser
+
+
+def _whole_stack_sigma_x(denoiser, volumes):
+    """The reference statistic: the estimator on the given volumes merged into
+    one 3D array with no subsampling, followed by the sigma_x rule."""
+    merged = np.asarray(volumes).reshape(-1, volumes.shape[2], volumes.shape[3])
+    indicator = denoiser._get_sino_indicator(merged)
+    recon_std = denoiser._get_estimate_of_recon_std(merged, indicator)
+    return 0.2 * (2 ** denoiser.get_params('sharpness')) * recon_std
+
+
+def _rel(a, b):
+    return abs(float(a) - float(b)) / abs(float(b))
+
+
+def test_stack_regularization_uses_every_volume_of_a_small_stack():
+    """Up to 39 volumes every volume is chosen, so sigma_x is the whole-stack
+    statistic: the estimator on the merged stack with its neighbor
+    differences between adjacent frames.  The value stored is float32, so the
+    gate is relative rather than exact.  With auto-regularization off the
+    method changes nothing and returns the current values."""
+    shape = (8, 10, 12)
+    stack = _ramp_stack(6, shape)
+    denoiser = _auto_denoiser(shape, 'cpu')
+    params = denoiser.auto_set_regularization_params_from_stack(stack)
+    expected = _whole_stack_sigma_x(denoiser, stack)
+    rel = _rel(params['sigma_x'], expected)
+    print(f"sigma_x from the method {params['sigma_x']:.8g} vs whole stack "
+          f"{expected:.8g} (rel {rel:.2e})")
+    assert set(params) == {'sigma_y', 'sigma_x', 'sigma_prox'}
+    assert rel < 1e-6
+    assert params['sigma_y'] == pytest.approx(0.1)
+    assert _rel(params['sigma_prox'], expected) < 1e-6
+    assert denoiser.get_params('sigma_x') == params['sigma_x']
+
+    denoiser.set_params(no_warning=True, sigma_x=0.5, auto_regularize_flag=False)
+    unchanged = denoiser.auto_set_regularization_params_from_stack(stack)
+    assert unchanged['sigma_x'] == 0.5
+    assert denoiser.get_params('sigma_x') == 0.5
+
+
+def test_stack_regularization_subsamples_whole_volumes_of_a_large_stack(monkeypatch):
+    """Above 39 volumes about 20 are chosen, evenly spaced, by the rule
+    subsample_views applies to views.  Which volumes cross to the host is
+    data movement and is checked exactly; the statistic on them is checked
+    at float rounding."""
+    shape = (6, 16, 16)
+    num_volumes = 60
+    stack = _ramp_stack(num_volumes, shape)
+    denoiser = _auto_denoiser(shape, 'cpu')
+    chosen = denoiser.subsample_views(np.arange(num_volumes))
+    assert len(chosen) == 20 and chosen[1] - chosen[0] == 3
+
+    moved = []
+    real_subsample = denoising._subsample_to_host
+
+    def recording_subsample(image, *args, **kwargs):
+        result = real_subsample(image, *args, **kwargs)
+        moved.append(result)
+        return result
+
+    monkeypatch.setattr(denoising, '_subsample_to_host', recording_subsample)
+    params = denoiser.auto_set_regularization_params_from_stack(stack)
+    assert len(moved) == 1
+    assert np.array_equal(moved[0].reshape((len(chosen),) + shape), stack[chosen])
+
+    expected = _whole_stack_sigma_x(denoiser, stack[chosen])
+    rel = _rel(params['sigma_x'], expected)
+    print(f"sigma_x from the method {params['sigma_x']:.8g} vs the chosen volumes "
+          f"{expected:.8g} (rel {rel:.2e})")
+    assert rel < 1e-6
+
+
+def test_denoise_stack_auto_regularization_moves_only_the_parameter(device):
+    """With auto-regularization on, denoise_stack reports the method's
+    sigma_x, and its result equals a loop of denoise calls with sigma_x
+    pinned to that value on the same seeded partition.  So the parameter
+    moved and the sweep did not."""
+    shape = (8, 10, 12)
+    num_volumes = 6
+    sigma_noise = 0.1
+    stack = _ramp_stack(num_volumes, shape)
+
+    auto = mbirtorch.QGGMRFDenoiser(shape)
+    auto.configure_devices(devices=[device])
+    auto.set_params(no_warning=True, verbose=0)
+    np.random.seed(0)
+    denoised, info = auto.denoise_stack(stack, sigma_noise=sigma_noise)
+    reported = info['regularization_params']['sigma_x']
+    from_method = _auto_denoiser(shape, device, sigma_noise) \
+        .auto_set_regularization_params_from_stack(stack)['sigma_x']
+    rel_param = _rel(reported, from_method)
+    assert rel_param < 1e-6
+
+    pinned = _pinned_denoiser(shape, device, sigma_x=reported)
+    reference = np.empty_like(stack)
+    reference_counts = []
+    for volume in range(num_volumes):
+        np.random.seed(0)
+        out, out_dict = pinned.denoise(stack[volume], sigma_noise=sigma_noise,
+                                       max_iterations=15, stop_threshold_change_pct=0.2,
+                                       logfile_path=None, print_logs=False)
+        reference[volume] = out
+        reference_counts.append(int(out_dict['recon_params']['num_iterations']))
+
+    rel = _rel_max(denoised, reference)
+    print(f"auto-regularized denoise_stack vs pinned loop on {device}: sigma_x "
+          f"{reported:.8g} (rel {rel_param:.2e}), rel_max = {rel:.2e}")
+    assert rel < 1e-6
+    assert [int(n) for n in info['num_iterations']] == reference_counts
+
+
+def test_stack_regularization_is_the_same_from_a_device_tensor(device, monkeypatch):
+    """A tensor on the device gives the parameters the numpy stack gives, and
+    only the chosen volumes cross to the host: the stack is indexed on its
+    own device and nothing gathers the whole of it.  The parameters are
+    computed floats, so they are gated at float rounding; the element count
+    is data movement and is checked exactly."""
+    shape = (6, 16, 16)
+    num_volumes = 60
+    stack = _ramp_stack(num_volumes, shape)
+    from_numpy = _auto_denoiser(shape, device).auto_set_regularization_params_from_stack(stack)
+
+    moved, gathered = [], []
+    real_subsample = denoising._subsample_to_host
+    real_gather = _sharding.Shards.gather
+
+    def counting_subsample(image, *args, **kwargs):
+        result = real_subsample(image, *args, **kwargs)
+        moved.append(int(result.size))
+        return result
+
+    def counting_gather(self):
+        result = real_gather(self)
+        gathered.append(int(result.size))
+        return result
+
+    monkeypatch.setattr(denoising, '_subsample_to_host', counting_subsample)
+    monkeypatch.setattr(_sharding.Shards, 'gather', counting_gather)
+    on_device = torch.as_tensor(stack).to(device)
+    from_tensor = _auto_denoiser(shape, device).auto_set_regularization_params_from_stack(on_device)
+
+    chosen = len(_auto_denoiser(shape, device).subsample_views(np.arange(num_volumes)))
+    assert gathered == []
+    assert moved == [chosen * int(np.prod(shape))]
+    print(f"moved {moved[0]} of {stack.size} elements ({chosen} of {num_volumes} volumes) on {device}")
+    for name in from_numpy:
+        rel = _rel(from_tensor[name], from_numpy[name])
+        print(f"{name}: tensor {from_tensor[name]:.8g} vs numpy {from_numpy[name]:.8g} (rel {rel:.2e})")
+        assert rel < 1e-6, name
+
+
+def test_stack_regularization_floors_sigma_x_on_a_zero_stack(device):
+    """A stack of zeros has no neighbor differences, so the estimate is zero
+    and sigma_x takes the floor; denoise_stack on it returns the zeros with
+    no NaN."""
+    shape = (8, 10, 12)
+    zeros = np.zeros((3,) + shape, dtype=np.float32)
+    params = _auto_denoiser(shape, device).auto_set_regularization_params_from_stack(zeros)
+    assert params['sigma_x'] == denoising._SIGMA_X_FLOOR
+
+    denoiser = mbirtorch.QGGMRFDenoiser(shape)
+    denoiser.configure_devices(devices=[device])
+    denoiser.set_params(no_warning=True, verbose=0)
+    np.random.seed(0)
+    out, info = denoiser.denoise_stack(zeros, sigma_noise=0.1, max_iterations=2,
+                                       stop_threshold_change_pct=0.0)
+    assert info['regularization_params']['sigma_x'] == denoising._SIGMA_X_FLOOR
+    assert np.all(np.isfinite(out))
+    assert np.array_equal(out, zeros)
