@@ -567,6 +567,75 @@ def test_initial_error_state_forms_the_error_in_the_projection_buffer(
         assert err.data_ptr() == given.data_ptr()
 
 
+@pytest.mark.parametrize("n_devices", (1, 2))
+@pytest.mark.parametrize("weighted", (False, True),
+                         ids=("unweighted", "weighted"))
+def test_initial_scale_matches_the_unchunked_dot_products(
+        monkeypatch, n_devices, weighted):
+    """The initial scale is built from two chunked reductions.
+
+    Both branches used to bind the weighted projection `weights * fwd` and
+    reduce `sum(wf * fwd)` and `sum(wf * sinogram)` through whole
+    sinogram-shaped products, which is what made the initialization the
+    measured peak of a weighted run.  The reductions now walk a block of
+    views at a time and multiply the weights inside the block.
+
+    That reassociates both sums and drops the rounding the weighted
+    projection used to introduce, so the scale is gated at a relative
+    tolerance against the old expression rather than bit for bit.  Every
+    later iterate follows the scale, so nothing downstream can be gated bit
+    for bit against the old code either; the goldens' relative gates are what
+    carries the trajectory.
+
+    The chunk size is lowered so the chunked branch really runs: this
+    sinogram is far below one chunk and would otherwise take the unchunked
+    path, where the arithmetic is unchanged.
+    """
+    from mbirtorch import _memory_ledger
+    model = _small_model()
+    if n_devices > 1:
+        model.configure_devices(devices=["cpu"] * n_devices)
+    sino_shape = tuple(model.get_params("sinogram_shape"))
+    recon_shape = tuple(model.get_params("recon_shape"))
+    rng = np.random.RandomState(11)
+    sinogram = model._shard_sinogram(rng.rand(*sino_shape).astype(np.float32))
+    weights = model._shard_sinogram(
+        (rng.rand(*sino_shape) + 0.5).astype(np.float32)) if weighted else 1
+    init_recon = model._shard_recon(np.ones(recon_shape, dtype=np.float32))
+
+    projection = model.forward_project(init_recon, output_sharded=True)
+    # The old expression, per shard, on the projection the call will be
+    # handed: bind the weighted projection and reduce whole products.
+    norm, cross = 0.0, 0.0
+    for i, fwd in enumerate(_state_tensors(projection)):
+        w = 1 if not weighted else _state_tensors(weights)[i]
+        wf = fwd if not weighted else w * fwd
+        norm += float(torch.sum(wf * fwd))
+        cross += float(torch.sum(wf * _state_tensors(sinogram)[i]))
+    reference = cross / norm
+
+    # Cloned OUTSIDE the measured block: the call consumes the buffer it is
+    # given, and the copy is the harness's cost rather than the call's.
+    handed = _clone_state(projection)
+    monkeypatch.setattr(model, "forward_project",
+                        lambda recon, output_sharded=False: handed)
+    monkeypatch.setattr(_memory_ledger, "ELL1_CHUNK_BYTES", 2048)
+    with _LargestAllocation() as seen:
+        _error, scaled_init = model._initial_error_state(
+            sinogram, init_recon, weights, not weighted, True)
+
+    alpha = float(_state_tensors(scaled_init)[0].reshape(-1)[0])
+    assert abs(alpha - reference) <= 1e-6 * abs(reference), (alpha, reference)
+    # No weighted projection and no whole array of products: the largest new
+    # array is a reduction block, well under one shard of the sinogram.  The
+    # sharded branch runs its reductions in worker threads, where a dispatch
+    # mode does not reach, so this bites on the single-device layout; the
+    # scale above is what covers both.
+    shard_bytes = max(t.numel() * t.element_size()
+                      for t in _state_tensors(projection))
+    assert seen.nbytes < shard_bytes
+
+
 def test_forward_model_loss_and_stats_match_the_unchunked_products(monkeypatch):
     """The per-iteration statistics reduce a block of views at a time.
 

@@ -1707,11 +1707,14 @@ class TomographyModel(ParameterHandler):
         fwd = self.forward_project(init_recon, output_sharded=True)
         if isinstance(fwd, _sharding.Shards):
             def dots_worker(i, d):
+                # Both sums are reduced a block of views at a time, so the
+                # shard never holds a weighted projection or a whole array of
+                # products.  See _memory_ledger.weighted_dot.
                 f = fwd.tensors[i]
-                w = 1 if constant_weights else weights.tensors[i]
-                wf = f if constant_weights else w * f
-                return (float(torch.sum(wf * f)),
-                        float(torch.sum(wf * sinogram.tensors[i])))
+                w = None if constant_weights else weights.tensors[i]
+                return (float(_memory_ledger.weighted_square_sum(f, w)),
+                        float(_memory_ledger.weighted_dot(
+                            f, sinogram.tensors[i], w)))
             dots = _sharding.run_per_device(self.sino_placement.devices,
                                             dots_worker)
             wtd_err_sino_norm = sum(a for a, _ in dots)
@@ -1736,17 +1739,17 @@ class TomographyModel(ParameterHandler):
             init_recon = _sharding.Shards(
                 [alpha * t for t in init_recon.tensors], self.recon_placement)
         else:
-            weighted_fwd = fwd if constant_weights else weights * fwd
-            wtd_err_sino_norm = torch.sum(weighted_fwd * fwd)
+            # Reduced a block of views at a time, as in the sharded branch
+            # above: no weighted projection and no whole array of products is
+            # built, and holding those made this function the measured peak of
+            # a weighted reconstruction.
+            w = None if constant_weights else weights
+            wtd_err_sino_norm = _memory_ledger.weighted_square_sum(fwd, w)
             if wtd_err_sino_norm > 0 and scale_recon_to_sinogram:
-                alpha = (torch.sum(weighted_fwd * sinogram)
+                alpha = (_memory_ledger.weighted_dot(fwd, sinogram, w)
                          / wtd_err_sino_norm).item()
             else:
                 alpha = 1
-            # Drop the weights product before the error sinogram is formed:
-            # holding it made this function the measured peak of a weighted
-            # reconstruction.
-            weighted_fwd = None
             # Formed in the projection's own buffer, as in the sharded branch
             # above: scaling by -alpha and adding the sinogram is the same
             # arithmetic as sinogram - alpha * fwd, with nothing allocated.

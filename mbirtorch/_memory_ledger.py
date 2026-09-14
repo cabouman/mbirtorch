@@ -117,13 +117,14 @@ DENOISE_APPLY_CYLINDERS = 3
 # from.  The two end devices hold one halo rather than two, and this charges
 # them four as well.
 DENOISE_HALO_COLUMNS = 4
-# The statistics reductions -- the ell-1 of an image, and the weighted sum of
-# squares of an error sinogram -- run a chunk at a time so that no whole array
-# of absolute values, squares or weighted squares is allocated.  These two set
-# the chunk for both.  They live here, beside the charges that model them,
-# because a second definition elsewhere could drift from this one and quietly
-# mis-price the phase; the reductions themselves are image_ell1 and
-# weighted_square_sum just below, for the same reason.
+# The sinogram and image reductions -- the ell-1 of an image, and the weighted
+# dot product and sum of squares of sinograms -- run a chunk at a time so that
+# no whole array of absolute values, products or weighted products is
+# allocated.  These two set the chunk for all of them.  They live here, beside
+# the charges that model them, because a second definition elsewhere could
+# drift from this one and quietly mis-price the phase; the reductions
+# themselves are image_ell1, weighted_dot and weighted_square_sum just below,
+# for the same reason.
 # The size is the measured knee on both backends; image_ell1 documents the
 # measurement and why the fused torch.linalg.vector_norm is not used instead.
 # The cap bounds the kernel launches for a very large array; past it the chunk
@@ -166,26 +167,42 @@ def image_ell1(flat_image):
                         in torch.chunk(flat_image, n_chunks, dim=0)]).sum()
 
 
-def _square_sum(block, weights):
-    """One block's weighted sum of squares, in the operand order the
-    unchunked expression uses."""
+def _block_dot(a_block, b_block, weights):
+    """One block's weighted dot product, in the operand order the unchunked
+    expression uses."""
     if weights is None:
-        return torch.sum(block * block)
-    return torch.sum(block * block * weights)
+        return torch.sum(a_block * b_block)
+    return torch.sum(a_block * b_block * weights)
 
 
-def weighted_square_sum(error_sinogram, weights=None):
-    """The weighted sum of squares of a sinogram, without a sinogram-shaped
+def _paired_blocks(operand, reference, n_chunks, n_blocks):
+    """The blocks of a second operand that pair with the reference's blocks.
+
+    An operand that carries the reference's view axis is split the same way,
+    so each block meets the values that belong to it.  Anything else -- None,
+    a scalar, or an array that broadcasts over the view axis rather than
+    spanning it -- is handed to every block whole, which is the broadcast the
+    unchunked expression does.
+    """
+    if (torch.is_tensor(operand) and operand.ndim == reference.ndim
+            and operand.shape[0] == reference.shape[0]):
+        return torch.chunk(operand, n_chunks, dim=0)
+    return [operand] * n_blocks
+
+
+def weighted_dot(a, b, weights=None):
+    """The weighted dot product of two sinograms, without a sinogram-shaped
     temporary.
 
-    ``torch.sum(e * e * w)`` allocates a whole array of squares and then a
-    whole array of weighted squares before it reduces.  Reducing a block of
+    ``torch.sum(a * b * w)`` allocates a whole array of products and then a
+    whole array of weighted products before it reduces.  Reducing a block of
     views at a time bounds both to one block, so they stop scaling with the
     sinogram.
 
-    ``weights`` is None (the plain sum of squares), a scalar, or an array of
-    the sinogram's shape.  An array is split into the same blocks as the
-    sinogram, so each block multiplies the values that belong to it.
+    ``b`` is a sinogram of ``a``'s shape.  ``weights`` is None (the plain dot
+    product), a scalar, or an array of that shape.  Either one is split into
+    the same blocks as ``a`` when it spans the view axis, so each block meets
+    the values that belong to it.
 
     Chunking keeps torch's pairwise summation inside each block and adds only
     the block totals, so it tracks the unchunked value the way image_ell1
@@ -193,33 +210,38 @@ def weighted_square_sum(error_sinogram, weights=None):
     arithmetic this replaced, so small problems -- the goldens among them --
     are unchanged bit for bit.
     """
-    n_chunks = _chunk_count(error_sinogram.numel()
-                            * error_sinogram.element_size())
+    n_chunks = _chunk_count(a.numel() * a.element_size())
     if n_chunks == 1:
-        return _square_sum(error_sinogram, weights)
-    blocks = torch.chunk(error_sinogram, n_chunks, dim=0)
-    # A weights array that carries the sinogram's view axis is split the same
-    # way, so each block meets its own weights.  Anything else -- a scalar, or
-    # an array that broadcasts over the view axis rather than spanning it --
-    # is handed to every block whole, which is the broadcast the unchunked
-    # expression does.
-    if (torch.is_tensor(weights) and weights.ndim == error_sinogram.ndim
-            and weights.shape[0] == error_sinogram.shape[0]):
-        weight_blocks = torch.chunk(weights, n_chunks, dim=0)
-    else:
-        weight_blocks = [weights] * len(blocks)
-    totals = [_square_sum(block, block_weights)
-              for block, block_weights in zip(blocks, weight_blocks)]
+        return _block_dot(a, b, weights)
+    blocks = torch.chunk(a, n_chunks, dim=0)
+    b_blocks = _paired_blocks(b, a, n_chunks, len(blocks))
+    weight_blocks = _paired_blocks(weights, a, n_chunks, len(blocks))
+    totals = [_block_dot(block, b_block, block_weights)
+              for block, b_block, block_weights
+              in zip(blocks, b_blocks, weight_blocks)]
     return torch.stack(totals).sum()
+
+
+def weighted_square_sum(error_sinogram, weights=None):
+    """The weighted sum of squares of a sinogram, without a sinogram-shaped
+    temporary.
+
+    The sum of squares is the dot product of a sinogram with itself, so this
+    is weighted_dot on one array; routing it through that one routine is what
+    keeps the two reductions on the same chunk rule and the same accumulation
+    pattern.  See weighted_dot for what chunking costs in accuracy and for
+    how weights are split.
+    """
+    return weighted_dot(error_sinogram, error_sinogram, weights)
 
 
 def reduction_chunk_bytes(array_bytes):
     """What ONE chunk of a chunked reduction holds, for an array of
     ``array_bytes``.
 
-    Shared by the ell-1 and the weighted sum of squares, which chunk by the
-    same rule.  A phase that holds more than one array per chunk -- the sum of
-    squares holds the squares and their weighted form -- multiplies this.
+    Shared by the ell-1 and the weighted dot products, which chunk by the
+    same rule.  A phase that holds more than one array per chunk -- a weighted
+    dot product holds the products and their weighted form -- multiplies this.
 
     An array small enough to want a single chunk is reduced whole, so the
     temporary is the array itself; that is the unchunked case and it is only
@@ -460,6 +482,27 @@ def estimate_peak_device_bytes(plan):
 
     def cyl(i, num_pixels):
         return int(num_pixels) * plan.slice_blocks[i] * _F32_BYTES
+
+    def sino_reduction_block(i):
+        """One block of a chunked sinogram reduction, at the size really
+        allocated.
+
+        The reduction splits the VIEW axis, so a block is a whole number of
+        views and cannot be finer than one view.  A sinogram with few views
+        and large detector planes therefore holds a block LARGER than the
+        byte rule alone would give, which is the direction the ledger may not
+        miss.
+
+        Every phase that reduces a sinogram a block at a time prices its
+        block here, so the initial dot products and the per-iteration
+        statistics cannot drift apart.
+        """
+        chunk, n_chunks = reduction_chunk_bytes(sino_dev(i))
+        views = int(plan.view_blocks[i])
+        if n_chunks == 1 or views <= 0:
+            return chunk
+        return (math.ceil(views / n_chunks) * num_rows_dev * num_channels
+                * _F32_BYTES)
 
     def back_block(i, num_pixels):
         """One live (pixels, band) back partial, at the size really allocated.
@@ -1131,22 +1174,22 @@ def estimate_peak_device_bytes(plan):
         # The error sinogram is formed in the projection's own buffer, so the
         # projection and the error are ONE array rather than two; the initial
         # volume is then briefly doubled by its scaling.
-        # Both branches bind the weights product `weights * fwd` for their two
-        # dot products -- the single-device branch as `weighted_fwd`, the
-        # sharded one as a per-shard local inside the worker -- and while it
-        # is alive it is co-live with the product temporary of
-        # `sum(weighted_fwd * fwd)`.  That is this sub-peak, and it is the
-        # widest instant of a weighted initialization.  The single-device
-        # branch releases the product before the error sinogram is formed;
-        # the sharded locals die on worker return.
-        weighted_fwd = per_dev(
-            lambda i: sino_dev(i) if plan.weights_supplied else 0)
+        # The two dot products that set the scale are reduced a block of views
+        # at a time on both branches, so neither builds a weighted projection
+        # nor a whole array of products.  A block of a weighted reduction holds
+        # the products and their weighted form, which is two blocks; that is
+        # charged on both branches, because the unweighted form's single block
+        # is smaller and the ledger may over-charge but never under-charge.
+        # The two reductions run one after the other, so only one pair of
+        # blocks is live.  This sub-phase used to hold a whole weighted
+        # projection beside a whole product temporary, and that made it the
+        # widest instant of a weighted initialization.
         dot_terms = [
             ('sinogram', per_dev(sino_dev)),
             ('weights', per_dev(supplied_weights_term)),
             ('forward projection', per_dev(sino_dev)),
-            ('weighted forward projection', weighted_fwd),
-            ('dot product temporary', per_dev(sino_dev)),
+            ('dot product blocks', per_dev(
+                lambda i: 2 * sino_reduction_block(i))),
             ('init recon', per_dev(recon_dev)),
         ]
         error_terms = [
@@ -1224,27 +1267,10 @@ def estimate_peak_device_bytes(plan):
     # recon exceeds two sinograms is the case that missed.  image_ell1 now
     # bounds the L1's temporary to one chunk, so what could have been a whole
     # second recon is the chunk instead.
-    def squared_error_block(i):
-        """One block of the squared-error reduction, at the size really
-        allocated.
-
-        The reduction splits the VIEW axis, so a block is a whole number of
-        views and cannot be finer than one view.  A sinogram with few views
-        and large detector planes therefore holds a block LARGER than the
-        byte rule alone would give, which is the direction the ledger may not
-        miss.
-        """
-        chunk, n_chunks = reduction_chunk_bytes(sino_dev(i))
-        views = int(plan.view_blocks[i])
-        if n_chunks == 1 or views <= 0:
-            return chunk
-        return (math.ceil(views / n_chunks) * num_rows_dev * num_channels
-                * _F32_BYTES)
-
     stats_sub_phases = (
         ('squared error',
          ('squared-error products',
-          per_dev(lambda i: 2 * squared_error_block(i)))),
+          per_dev(lambda i: 2 * sino_reduction_block(i)))),
         ('recon ell-1',
          ('recon ell-1 chunk',
           per_dev(lambda i: reduction_chunk_bytes(recon_dev(i))[0]))),
