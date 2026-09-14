@@ -82,7 +82,13 @@ def _apply_update(flat_recon, error_sinogram, pixel_indices, delta_scaled,
     # functionally rather than relying on the side effect.
     flat_recon.index_add_(0, pixel_indices, delta_scaled)
     delta_sumsq = torch.sum(delta_scaled * delta_scaled, dim=0)
-    error_sinogram.sub_(alpha * delta_sinogram)
+    # error -= alpha * delta, with no sinogram-sized temporary: the scaled
+    # subtraction reads the step straight out of the 0-d device tensor the
+    # line search produced, so nothing is materialized and nothing is copied
+    # back to the host.  (The sub_ form's alpha keyword takes a NUMBER, so a
+    # 0-d tensor there would be read with .item() -- a host synchronization
+    # per subset, which this loop is built to avoid.)
+    error_sinogram.addcmul_(delta_sinogram, alpha, value=-1)
     ell1 = torch.sum(torch.abs(delta_scaled))
     return flat_recon, error_sinogram, delta_sumsq, ell1
 
@@ -1713,13 +1719,19 @@ class TomographyModel(ParameterHandler):
                 alpha = sum(b for _, b in dots) / wtd_err_sino_norm
             else:
                 alpha = 1
+            # The error is formed IN the projection's own shards: scaling a
+            # shard by -alpha and adding the sinogram into it gives exactly
+            # the values of sinogram - alpha * fwd, since a - b and a + (-b)
+            # round identically, and it allocates nothing.  Nothing else
+            # reads fwd, so the buffer is free to become the error sinogram.
             error_sinogram = _sharding.Shards(
                 _sharding.run_per_device(
                     self.sino_placement.devices,
-                    lambda i, d: sinogram.tensors[i] - alpha * fwd.tensors[i]),
+                    lambda i, d: fwd.tensors[i].mul_(-alpha).add_(
+                        sinogram.tensors[i])),
                 self.sino_placement)
-            # The init projection is folded into the error; free its
-            # sino-sized shards before the Hessian and the loop.
+            # The projection's shards ARE the error sinogram now, so dropping
+            # this name releases only the container.
             fwd = None
             init_recon = _sharding.Shards(
                 [alpha * t for t in init_recon.tensors], self.recon_placement)
@@ -1731,11 +1743,14 @@ class TomographyModel(ParameterHandler):
                          / wtd_err_sino_norm).item()
             else:
                 alpha = 1
-            # Drop the weights product before the two sinogram-sized
-            # allocations below: holding it made this function the measured
-            # peak of a weighted reconstruction.
+            # Drop the weights product before the error sinogram is formed:
+            # holding it made this function the measured peak of a weighted
+            # reconstruction.
             weighted_fwd = None
-            error_sinogram = sinogram - alpha * fwd
+            # Formed in the projection's own buffer, as in the sharded branch
+            # above: scaling by -alpha and adding the sinogram is the same
+            # arithmetic as sinogram - alpha * fwd, with nothing allocated.
+            error_sinogram = fwd.mul_(-alpha).add_(sinogram)
             fwd = None
             init_recon = alpha * init_recon
         return error_sinogram, init_recon
@@ -2475,13 +2490,16 @@ class TomographyModel(ParameterHandler):
             weights = torch.as_tensor(weights, dtype=torch.float32,
                                       device=error_sinogram.device)
             avg_weight = torch.mean(weights)
+        # Chunked: sum(error * error * weights) allocated two whole
+        # sinogram-shaped arrays here, the squares and their weighted form.
+        # See _memory_ledger.weighted_square_sum.
+        weighted_sq_sum = _memory_ledger.weighted_square_sum(error_sinogram,
+                                                             weights)
         if normalize:
-            weighted_sq_sum = torch.sum(error_sinogram * error_sinogram * weights)
             loss = torch.sqrt(weighted_sq_sum
                               / (avg_weight * float(error_sinogram.numel()))) / sigma_y
         else:
-            loss = (1.0 / (2 * sigma_y ** 2)) * torch.sum(
-                (error_sinogram * error_sinogram) * weights)
+            loss = (1.0 / (2 * sigma_y ** 2)) * weighted_sq_sum
         return loss
 
     @staticmethod
@@ -2507,7 +2525,9 @@ class TomographyModel(ParameterHandler):
         # not only a logging one.  No golden covers it: every recon test runs
         # with stop_threshold_change_pct=0.0, which disables early stopping.
         recon_l1 = _memory_ledger.image_ell1(flat_recon)
-        es_rmse = torch.sqrt(torch.sum(error_sinogram * error_sinogram)
+        # Chunked for the reason above: sum(error * error) allocated a whole
+        # second sinogram.
+        es_rmse = torch.sqrt(_memory_ledger.weighted_square_sum(error_sinogram)
                              / float(error_sinogram.numel()))
         return fm_loss, recon_l1, es_rmse
 
@@ -3340,13 +3360,16 @@ class TomographyModel(ParameterHandler):
             weights_shards = None if constant_weights else weights
 
             def sino_worker(i, d):
+                # Chunked per shard, for the reason weighted_square_sum
+                # gives: the squares and their weighted form were two whole
+                # sinogram shards per device, once per iteration.
                 e = error_shards.tensors[i]
+                sq = float(_memory_ledger.weighted_square_sum(e))
                 if weights_shards is None:
-                    return (float(torch.sum(e * e)), 0.0,
-                            float(torch.sum(e * e)))
+                    return sq, 0.0, sq
                 w = weights_shards.tensors[i]
-                return (float(torch.sum(e * e * w)), float(torch.sum(w)),
-                        float(torch.sum(e * e)))
+                return (float(_memory_ledger.weighted_square_sum(e, w)),
+                        float(torch.sum(w)), sq)
             parts = _sharding.run_per_device(error_shards.placement.devices,
                                              sino_worker)
             weighted_sq = sum(a for a, _, _ in parts)
