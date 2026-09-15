@@ -1,15 +1,17 @@
 """Tests for the 4D reconstruction model and the frame-axis filter.
 
 The filter matrix is checked against the transform it replaces.  The model
-is checked on a 24-view cone-beam scan with a smooth sinogram: a run with
-three frames on one device gives finite values and the three log files, a
+is checked on a 24-view cone-beam scan with a smooth sinogram.  A run with
+three frames on one device gives finite values and the three log files.  A
 run with two workers on the CPU equals the one-worker run and shows tasks
-from both workers, no compiled body falls back and no function exceeds
-torch's recompile budget, and the initial image is cached and reused.  Two
-worker threads on one MPS device crash inside Metal, so the two-worker run
-is on the CPU only.  The smooth sinogram is kept because a
-random one reconstructs to a volume with extreme values, on which the
-qGGMRF line search computes zero over zero.
+from both workers.  The initial image is written to the cache and read
+back.  The compile check runs a reconstruction in a fresh process, because
+torch keeps its variant counters per function for the whole process; it
+asserts that no compiled body falls back and no function exceeds the
+recompile budget.  Two worker threads on one MPS device crash inside Metal,
+so the two-worker runs are on the CPU only.  The smooth sinogram is kept
+because a random one reconstructs to a volume with extreme values, on which
+the qGGMRF line search computes zero over zero.
 """
 
 import csv
@@ -21,7 +23,6 @@ import torch
 from scipy.fft import dct, idct
 
 import mbirtorch
-from mbirtorch import projectors
 from mbirtorch.mace import MACE
 from mbirtorch.mace4d import (MACE4DModel, _DataFitAgent, apply_temporal_filter,
                               temporal_filter_matrix)
@@ -132,59 +133,27 @@ def _read_rows(path):
         return list(csv.DictReader(f))
 
 
-def _inductor_compiles_on(device):
-    """Whether torch.compile can build a kernel for the device on this machine.
-    A machine whose C++ toolchain cannot build inductor's CPU kernels makes
-    every compiled body fall back to eager, which is not a defect of the code
-    under test."""
-    try:
-        torch.compile(lambda x: (x * 2 + 1).sum())(torch.ones(8, device=device))
-        return True
-    except Exception:   # noqa: BLE001 - any failure means the backend is unusable here
-        return False
-
-
-def _check_compiled_bodies(device, errors_before):
-    """After a run: no compiled body fell back to eager, where the machine can
-    compile for the device at all, and no function holds as many compiled
-    variants as torch's recompile budget allows."""
-    import torch._dynamo.config as dynamo_config
-    from torch._dynamo.eval_frame import _debug_get_cache_entry_list
-
-    new_errors = {k: v for k, v in projectors._COMPILE_ERRORS.items() if k not in errors_before}
-    if _inductor_compiles_on(device):
-        assert new_errors == {}, f'compiled bodies fell back to eager: {sorted(new_errors)}'
-    else:
-        # Every fallback must be the toolchain's compile error, and nothing else.
-        print(f"{device}: this machine cannot build inductor kernels for the device; "
-              f"{len(new_errors)} compiled bodies ran eagerly")
-        assert all(v.startswith('InductorError') for v in new_errors.values()), new_errors
-    limit = int(dynamo_config.recompile_limit)
-    worst = 0
-    for key in projectors._COMPILE_CACHE:
-        fn = key[0] if isinstance(key, tuple) else key
-        entries = len(_debug_get_cache_entry_list(fn.__code__))
-        worst = max(worst, entries)
-        assert entries < limit, f'{fn.__name__} holds {entries} variants against a budget of {limit}'
-    print(f"{device}: largest compiled variant count {worst} against a budget of {limit}")
-
-
 def test_a_three_frame_reconstruction_runs_and_logs(device, tmp_path):
-    """One iteration on three frames and one device gives finite values of
-    the 4D shape, the three log files, the four result keys, and an
-    iteration count of 1.  The initial image is written to the cache on the
-    first run and read from it on the second."""
+    """One iteration on three frames and one device gives finite, nonzero
+    values of the 4D shape, the three log files, the four result keys, and
+    an iteration count of 1.  Three frames are fewer than the default filter
+    period of 6, so the filter turns itself off with a warning and the run
+    settings say so.  The initial image is written to the cache on the first
+    run and read from it on the second."""
     np.random.seed(0)
-    errors_before = set(projectors._COMPILE_ERRORS)
     mace = MACE4DModel(_small_model(), num_frames=3)
-    mace.set_params(dejitter=False, verbose=0)
+    mace.set_params(verbose=0)
     mace.set_device_pool([device])
     init_dir, log_dir = str(tmp_path / 'init'), str(tmp_path / 'logs')
 
-    recon, recon_dict = mace.recon(_smooth_sino(), max_iterations=1, stop_threshold_change_pct=0,
-                                   init_dir=init_dir, log_dir=log_dir)
+    with pytest.warns(UserWarning, match='fewer than the filter period'):
+        recon, recon_dict = mace.recon(_smooth_sino(), max_iterations=1, stop_threshold_change_pct=0,
+                                       init_dir=init_dir, log_dir=log_dir)
     assert recon.shape == (3,) + mace.recon_shape
-    assert np.all(np.isfinite(recon))
+    assert np.all(np.isfinite(recon)) and np.max(np.abs(recon)) > 0
+    assert recon_dict['recon_params']['dejitter'] is False
+    assert 'fewer than' in recon_dict['recon_params']['temporal filter']
+    assert 'temporal filter' in open(os.path.join(log_dir, 'run_info.txt')).read()
     for name in ('run_info.txt', 'timing_log.csv', 'task_log.csv'):
         assert os.path.isfile(os.path.join(log_dir, name))
     assert sorted(recon_dict) == ['model_params', 'notes', 'recon_params', 'timing']
@@ -202,21 +171,22 @@ def test_a_three_frame_reconstruction_runs_and_logs(device, tmp_path):
     assert float(timing['denoise_mean_iterations']) >= 1
 
     assert os.path.isfile(os.path.join(init_dir, 'init_recon.npy'))
+    mace.set_params(dejitter=False)
     np.random.seed(0)
     again, again_dict = mace.recon(_smooth_sino(), max_iterations=1, stop_threshold_change_pct=0,
                                    init_dir=init_dir)
     assert again_dict['recon_params']['init source'].startswith('cached')
     assert again.shape == recon.shape
-    _check_compiled_bodies(device, errors_before)
 
 
 def test_two_workers_equal_one_worker_and_both_take_tasks(tmp_path):
-    """With the pixel partitions made trivial, so that the order in which
-    the worker threads draw from the random generator cannot matter, a run
-    on two CPU workers equals the run on one to float32 rounding, and the
-    task log shows tasks from both workers.  The compiled bodies are checked
-    after the run as in the one-worker test."""
-    device = 'cpu'
+    """The scan model is set to one pixel subset, so the worker threads draw
+    nothing from the random generator that can change the result.  Under
+    that setting a run on two CPU workers equals the run on one to within
+    1e-5, which is float32 rounding over two iterations, and the task log
+    shows tasks from both workers.  At the model's default partitions the
+    two runs differ, because the threads draw the partitions in schedule
+    order; that is recorded as an open decision."""
     shape = (4,) + MACE4DModel(_small_model(), num_frames=4).recon_shape
     init = np.linspace(0.0, 0.1, int(np.prod(shape)), dtype=np.float32).reshape(shape)
     init += 0.01 * np.random.default_rng(4).standard_normal(shape).astype(np.float32)
@@ -232,21 +202,134 @@ def test_two_workers_equal_one_worker_and_both_take_tasks(tmp_path):
                               stop_threshold_change_pct=0, log_dir=log_dir)
         return recon
 
-    errors_before = set(projectors._COMPILE_ERRORS)
-    one = run([device], str(tmp_path / 'one'))
-    two = run([device, device], str(tmp_path / 'two'))
+    init_before = init.copy()
+    one = run(['cpu'], str(tmp_path / 'one'))
+    two = run(['cpu', 'cpu'], str(tmp_path / 'two'))
+    assert np.array_equal(init, init_before)     # the caller's initial image is not written
     rel = _rel_max(two, one)
-    print(f"{device}: two workers vs one: rel_max = {rel:.2e}")
+    print(f"cpu: two workers vs one: rel_max = {rel:.2e}")
     assert np.all(np.isfinite(two))
     assert rel < 1e-5
     rows = _read_rows(str(tmp_path / 'two' / 'task_log.csv'))
-    assert {row['device'] for row in rows} == {'0', '1'}
-
-    _check_compiled_bodies(device, errors_before)
+    assert {row['worker'] for row in rows} == {'0', '1'}
 
 
-def test_wrong_shapes_are_refused_before_any_computation():
-    """A sinogram, weights, or initial image of the wrong shape raises at once."""
+_COMPILE_CHECK_SCRIPT = r'''
+import json, sys
+import numpy as np
+import torch
+import mbirtorch
+from mbirtorch import projectors
+from mbirtorch.mace4d import MACE4DModel
+from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+
+device, workers = sys.argv[1], int(sys.argv[2])
+angles = np.radians(360.0 / 24) * np.arange(24)
+model = mbirtorch.ConeBeamModel((24, 8, 10), angles, source_detector_dist=100.0, source_iso_dist=50.0)
+model.set_params(no_warning=True, verbose=0)
+v, c = np.linspace(-1.0, 1.0, 8), np.linspace(-1.0, 1.0, 10)
+base = np.exp(-(v[:, None] ** 2 + c[None, :] ** 2))
+sinogram = np.stack([base * (1.0 + 0.1 * np.sin(0.5 * a)) for a in range(24)]).astype(np.float32)
+mace = MACE4DModel(model, num_frames=4)
+mace.set_params(dejitter=False, verbose=0)
+mace.set_device_pool([device] * workers)
+shape = (4,) + mace.recon_shape
+init = np.linspace(0.0, 0.1, int(np.prod(shape)), dtype=np.float32).reshape(shape)
+init += 0.01 * np.random.default_rng(4).standard_normal(shape).astype(np.float32)
+np.random.seed(0)
+mace.recon(sinogram, init_recon=init, max_iterations=2, stop_threshold_change_pct=0)
+
+entries = {}
+for key in projectors._COMPILE_CACHE:
+    fn = key[0] if isinstance(key, tuple) else key
+    count = len(_debug_get_cache_entry_list(fn.__code__))
+    entries[fn.__name__] = max(entries.get(fn.__name__, 0), count)
+try:
+    torch.compile(lambda x: (x * 2 + 1).sum())(torch.ones(8, device=device))
+    compiles = True
+except Exception:
+    compiles = False
+print(json.dumps(dict(compiles=compiles, errors={k: v[:40] for k, v in projectors._COMPILE_ERRORS.items()},
+                      entries=entries, floor=projectors._RECOMPILE_LIMIT_FLOOR)))
+'''
+
+
+def test_compiled_bodies_stay_within_the_recompile_budget(device):
+    """After a reconstruction in a fresh process, two CPU workers or one
+    worker on another device, no compiled body fell back to eager where the
+    machine can compile for the device, every fallback is the toolchain's
+    where it cannot, and no function holds as many compiled variants as the
+    budget the compile module sets.  The run is a separate process so that
+    the counters, which torch keeps per function for the whole process,
+    belong to this run alone."""
+    import json
+    import subprocess
+    import sys
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(mbirtorch.__file__)))
+    workers = 2 if device == 'cpu' else 1
+    result = subprocess.run([sys.executable, '-c', _COMPILE_CHECK_SCRIPT, device, str(workers)],
+                            cwd=root, capture_output=True, text=True, timeout=900)
+    assert result.returncode == 0, result.stderr[-2000:]
+    report = json.loads(result.stdout.strip().splitlines()[-1])
+    if report['compiles']:
+        assert report['errors'] == {}, f"compiled bodies fell back to eager: {sorted(report['errors'])}"
+    else:
+        print(f"{device}: this machine cannot build inductor kernels for the device; "
+              f"{len(report['errors'])} compiled bodies ran eagerly")
+        assert all(v.startswith('InductorError') for v in report['errors'].values()), report['errors']
+    floor = report['floor']
+    worst = max(report['entries'].values(), default=0)
+    print(f"{device}, {workers} worker(s): largest compiled variant count {worst} against the budget "
+          f"floor of {floor}; per function {report['entries']}")
+    for name, count in report['entries'].items():
+        assert count < floor, f'{name} holds {count} variants against a budget of {floor}'
+
+
+def test_a_batch_size_that_does_not_divide_the_hyperplanes_sweeps_one_shape(monkeypatch):
+    """With a batch size the hyperplane counts do not divide, every sweep
+    still sees a stack of exactly that many volumes, the short last slab
+    padded, so one compiled shape serves all of them; and the result equals
+    the run that sweeps each orientation whole, to the rounding of a batched
+    sweep.  The batch size is forced, because no memory budget can be read
+    here."""
+    shape = (3,) + MACE4DModel(_small_model(), num_frames=3).recon_shape
+    init = np.linspace(0.0, 0.1, int(np.prod(shape)), dtype=np.float32).reshape(shape)
+    init += 0.01 * np.random.default_rng(4).standard_normal(shape).astype(np.float32)
+
+    def run():
+        mace = MACE4DModel(_small_model(), num_frames=3)
+        mace.set_params(dejitter=False, verbose=0)
+        mace.set_device_pool(['cpu'])
+        np.random.seed(0)
+        recon, _ = mace.recon(_smooth_sino(), init_recon=init, max_iterations=1,
+                              stop_threshold_change_pct=0)
+        return recon
+
+    whole = run()
+
+    seen = []
+    original = mbirtorch.QGGMRFDenoiser.denoise_stack
+
+    def recording(self, stack, *args, **kwargs):
+        seen.append((int(stack.shape[0]), kwargs.get('batch_size')))
+        return original(self, stack, *args, **kwargs)
+    monkeypatch.setattr(mbirtorch.QGGMRFDenoiser, 'denoise_stack', recording)
+    monkeypatch.setattr(mbirtorch.QGGMRFDenoiser, 'auto_batch_size', lambda self, **kwargs: 3)
+    batched = run()
+
+    # 8 and 10 hyperplanes in slabs of 3: 3 + 4 + 4 = 11 sweeps, every one at 3 volumes.
+    assert len(seen) == 11
+    assert all(volumes == 3 and batch == 3 for volumes, batch in seen), seen
+    rel = _rel_max(batched, whole)
+    print(f"slabs of 3 vs whole orientations: rel_max = {rel:.2e}")
+    assert rel < 1e-6
+
+
+def test_wrong_inputs_are_refused():
+    """A sinogram, weights, or initial image of the wrong shape raises
+    ValueError, and so does a constant initial image, from which no denoiser
+    noise level can be estimated."""
     mace = MACE4DModel(_small_model(), num_frames=3)
     mace.set_params(verbose=0)
     sinogram = _smooth_sino()
@@ -256,6 +339,9 @@ def test_wrong_shapes_are_refused_before_any_computation():
         mace.recon(sinogram, weights=np.ones((NUM_VIEWS, DET_ROWS, DET_COLS + 1), dtype=np.float32))
     with pytest.raises(ValueError, match='init_recon shape'):
         mace.recon(sinogram, init_recon=np.zeros((1, 2, 3, 4), dtype=np.float32))
+    mace.set_params(dejitter=False)
+    with pytest.raises(ValueError, match='constant initial image'):
+        mace.recon(sinogram, init_recon=np.zeros((3,) + mace.recon_shape, dtype=np.float32))
 
 
 # ── the data-fit agent's filter path ─────────────────────────────────────────
@@ -278,6 +364,57 @@ class _StubFrameAgent:
     def __call__(self, w, iteration=0):
         self.warm_starts.append(self._previous_output.clone())
         return 2.0 * w + self._previous_output
+
+
+def test_data_fit_agent_filters_in_several_slabs(monkeypatch):
+    """With the slab size forced small, the agent's pieces cover the last
+    axis in several regions whose concatenation equals the filter applied to
+    the whole stack.  This is data movement, so the check is exact."""
+    import mbirtorch.mace4d as mace4d
+    monkeypatch.setattr(mace4d, '_FILTER_SLAB_BYTES', 12 * 3 * 4 * 4 * 2)   # two slices per slab
+    torch.manual_seed(4)
+    x0 = torch.randn(12, 3, 4, 5)
+    matrix = temporal_filter_matrix(12, period=6)
+    agent = _DataFitAgent([_StubFrameAgent() for _ in range(12)], ['cpu'] * 12, x0, matrix,
+                          keep_stack=True, adopt_stack=False)
+    pieces = list(agent.pieces())
+    assert len(pieces) == 3                  # slices 0:2, 2:4, 4:5
+    assembled = torch.empty_like(x0)
+    for region, piece in pieces:
+        assembled[region] = piece
+    assert torch.equal(assembled, apply_temporal_filter(x0, matrix, axis=0))
+
+
+def test_data_fit_agent_checkpoint_round_trip():
+    """The agent's state holds its stack; loading a saved state restores the
+    stack exactly and hands each frame agent its own saved state."""
+    torch.manual_seed(5)
+    x0 = torch.randn(3, 2, 2, 2)
+    stubs = [_StubFrameAgent() for _ in range(3)]
+    agent = _DataFitAgent(stubs, ['cpu'] * 3, x0, None, keep_stack=True)
+    with MACE([agent], x0, mu=[1.0], rho=0.5) as loop:
+        loop.step()
+        saved = agent.state_dict()
+        stack_after_one = agent._stack.clone()
+        loop.step()
+    assert not torch.equal(agent._stack, stack_after_one)
+    agent.load_state_dict(saved)
+    assert torch.equal(agent._stack, stack_after_one)
+    assert saved['stack'].data_ptr() != agent._stack.data_ptr()   # the saved state is a copy
+
+
+def test_data_fit_agent_adopts_or_copies_its_initial_stack():
+    """The agent's stack is the initial image itself when told to adopt it,
+    and a copy otherwise, so a caller's array is never written.  This is
+    data movement, so the check is on storage."""
+    x0 = torch.zeros(2, 3, 4, 5)
+    stubs = [_StubFrameAgent(), _StubFrameAgent()]
+    adopted = _DataFitAgent(stubs, ['cpu', 'cpu'], x0, None, keep_stack=True, adopt_stack=True)
+    copied = _DataFitAgent(stubs, ['cpu', 'cpu'], x0, None, keep_stack=True, adopt_stack=False)
+    none = _DataFitAgent(stubs, ['cpu', 'cpu'], x0, None, keep_stack=False, adopt_stack=True)
+    assert adopted._stack.data_ptr() == x0.data_ptr()
+    assert copied._stack.data_ptr() != x0.data_ptr() and torch.equal(copied._stack, x0)
+    assert none._stack is None
 
 
 def test_data_fit_agent_folds_the_filtered_stack_and_warm_starts_from_the_unfiltered_one():
@@ -307,9 +444,11 @@ def test_data_fit_agent_folds_the_filtered_stack_and_warm_starts_from_the_unfilt
 
 def test_the_filter_path_runs_end_to_end(tmp_path):
     """A run with the filter on, at a period the frame count can carry,
-    gives finite values and records the filter in the run settings.  Four
-    frames per rotation with no overlap give four frames from the 24 views,
-    and the period-4 filter keeps the frame mean of each voxel."""
+    gives finite values that differ from the filter-off run, and records the
+    filter in the run settings.  Four frames per rotation with no overlap
+    give four frames from the 24 views, and at four frames the period-4
+    filter keeps one mode, the zeroth cosine mode, so the filtered stack is
+    not zero."""
     np.random.seed(0)
     mace = MACE4DModel(_small_model(), frames_per_rotation=4, frame_overlap_factor=1.0)
     assert mace.num_frames == 4
@@ -322,6 +461,17 @@ def test_the_filter_path_runs_end_to_end(tmp_path):
     recon, recon_dict = mace.recon(_smooth_sino(), init_recon=init, max_iterations=2,
                                    stop_threshold_change_pct=0, log_dir=log_dir)
     assert recon.shape == shape and np.all(np.isfinite(recon))
+    mace.set_params(dejitter=False)
+    np.random.seed(0)
+    unfiltered, _ = mace.recon(_smooth_sino(), init_recon=init, max_iterations=2,
+                               stop_threshold_change_pct=0)
+    rel = _rel_max(recon, unfiltered)
+    print(f"filter on vs off: rel_max = {rel:.2e}")
+    assert rel > 1e-2                        # the filter is applied, not merely recorded
     assert recon_dict['recon_params']['dejitter'] is True
+    # Period 4 over 4 frames: harmonics 1 and 2, periods 4 and 2; three modes removed, one kept.
+    assert recon_dict['recon_params']['temporal filter'] == \
+        'removes periods of 4, 2 frames; 3 of 4 modes removed, 1 kept'
+    assert 'temporal filter' in open(os.path.join(log_dir, 'run_info.txt')).read()
     assert recon_dict['recon_params']['iterations completed'] == 2
     print(f"filter path: change {[round(r['consensus_change_pct'], 3) for r in recon_dict['timing']]}%")

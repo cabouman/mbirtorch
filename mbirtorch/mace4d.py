@@ -1,13 +1,14 @@
 """4D reconstruction of one continuous scan of a moving object.
 
 The scan is divided into overlapping angular windows, one per time frame,
-and one volume is reconstructed per frame.  :class:`MACE4DModel` computes
-the volumes as the consensus of four agents on the 4D array of shape
-``(frames, x, y, z)``: the proximal map of each frame's data-fit term, and
-qGGMRF denoisers on the three sets of hyperplane volumes that hold the
-frame axis and two spatial axes.  :func:`temporal_filter_matrix` builds the
-frame-axis filter that removes the modulation the overlapping windows
-imprint, and :func:`apply_temporal_filter` applies it.
+and one volume is reconstructed per frame.  The volumes are held in one
+array of shape ``(frames, x, y, z)``.  :class:`MACE4DModel` computes them as
+the consensus of four agents.  The first agent is the proximal map of each
+frame's data-fit term.  The other three are qGGMRF denoisers, one for each
+pair of spatial axes, on the volumes that hold the frame axis and that pair.
+:func:`temporal_filter_matrix` builds the frame-axis filter that removes the
+modulation the overlapping windows produce, and :func:`apply_temporal_filter`
+applies it.
 """
 
 import concurrent.futures
@@ -32,7 +33,7 @@ _INIT_ITERATIONS = 15
 # Iterations and stop threshold of each denoiser sweep.
 _DENOISE_MAX_ITERATIONS = 15
 _DENOISE_STOP_THRESHOLD_PCT = 0.2
-# The filter is applied to the prox outputs in slabs of about this size.
+# The filter is applied to the data-fit outputs in slabs of about this size.
 _FILTER_SLAB_BYTES = 64 * 2 ** 20
 
 # The three hyperplane orientations: the name and the spatial axis that is
@@ -41,7 +42,7 @@ _ORIENTATIONS = [('XY-t', 3), ('YZ-t', 1), ('XZ-t', 2)]
 
 _TIMING_FIELDS = ['iteration', 'prox_total_sec', 'denoise_total_sec', 'makespan_sec',
                   'iteration_total_sec', 'consensus_change_pct', 'denoise_mean_iterations']
-_TASK_FIELDS = ['iteration', 'kind', 'index', 'part', 'device', 'start_sec', 'end_sec']
+_TASK_FIELDS = ['iteration', 'kind', 'index', 'part', 'worker', 'start_sec', 'end_sec']
 
 
 # ── the frame-axis filter as a matrix ────────────────────────────────────────
@@ -49,16 +50,16 @@ def temporal_filter_matrix(num_frames, period, harmonics=True, band_width=1):
     """
     The matrix of the frame-axis filter that removes a periodic modulation.
 
-    A scan divided into overlapping angular windows imprints a modulation
+    A scan divided into overlapping angular windows produces a modulation
     along the frame axis with a period equal to the number of frames per
     rotation.  The filter zeroes the type-I discrete cosine modes at that
     period and its harmonics, with ``band_width`` modes on each side.  It
     acts along the frame axis alone, so it is one matrix of shape
     ``(num_frames, num_frames)``.  Apply it with :func:`apply_temporal_filter`.
 
-    At small frame counts the filter removes every mode.  At a period of 6
-    and three frames the matrix is zero, and a run at that period needs well
-    over eight frames for any temporal content to survive.
+    At a period of 6 and three frames the matrix is zero, so the filtered
+    array is zero.  The number of frames must be several times the period
+    before the filter leaves much variation along the frame axis.
 
     Args:
         num_frames (int): number of frames, at least 2.
@@ -137,7 +138,7 @@ def _normalize_prior_weights(prior_weight):
 
 
 def _write_run_info(path, run_settings):
-    """Write the run settings as one ``key = value`` line each."""
+    """Write each run setting to ``path`` as one ``key = value`` line."""
     width = max(len(key) for key in run_settings)
     lines = ['# MACE4DModel run settings']
     lines += ['{:<{width}} = {}'.format(key, value, width=width)
@@ -146,9 +147,21 @@ def _write_run_info(path, run_settings):
         f.write('\n'.join(lines) + '\n')
 
 
+def _describe_filter(matrix, num_frames, period):
+    """One line saying which periods the filter removes and how many of the
+    frame axis's modes it removes and keeps.  The filter is a projection, so
+    the modes it keeps are its trace."""
+    harmonics = list(range(1, int(np.floor(period / 2)) + 1))
+    periods = [period / h for h in harmonics]
+    kept = int(round(float(matrix.trace())))
+    removed = num_frames - kept
+    words = ', '.join(f'{p:g}' for p in periods)
+    return (f'removes periods of {words} frames; {removed} of {num_frames} modes removed, '
+            f'{kept} kept')
+
+
 def _permutation(axis):
-    """The permutation of a 4D array that puts the hyperplane axis first and
-    the frame axis second."""
+    """The axis order that puts ``axis`` first and the frame axis second."""
     return (axis,) + tuple(d for d in range(4) if d != axis)
 
 
@@ -158,19 +171,26 @@ class _DataFitAgent:
     The proximal maps of every frame's data-fit term, as one agent of the
     4D array.
 
-    One :class:`ForwardProxAgent` per frame runs on the frame's device.  The
-    frame outputs are kept in one host stack when the filter is on or the
-    frame agents warm-start, and that stack is each frame's warm start.  With
-    the filter on, the agent folds after all frames have run and yields the
-    filtered stack in slabs, leaving the stack itself unfiltered.
+    One :class:`ForwardProxAgent` per frame runs on the frame's device.  Each
+    frame starts from its own previous output.  With the filter on, the
+    agent's contribution to the consensus is the filter applied along the
+    frame axis to the stack of frame outputs.
     """
 
-    def __init__(self, frame_agents, frame_devices, init_stack, filter_matrix, keep_stack):
+    def __init__(self, frame_agents, frame_devices, init_stack, filter_matrix, keep_stack,
+                 adopt_stack=False):
         self.agents = list(frame_agents)
         self.devices = list(frame_devices)
         self.filter_matrix = filter_matrix
         self.fold_after_all = filter_matrix is not None
-        self._stack = init_stack.clone() if keep_stack else None
+        if not keep_stack:
+            self._stack = None
+        elif adopt_stack:
+            # The array is written in place from here on, so it is adopted
+            # only when the caller made it and no one else holds it.
+            self._stack = init_stack
+        else:
+            self._stack = init_stack.clone()
 
     def tasks(self, w, iteration=0):
         tasks = []
@@ -187,8 +207,8 @@ class _DataFitAgent:
         output = agent(w[t], iteration)
         if self._stack is not None:
             self._stack[t].copy_(output)
-            # The warm start lives in the host stack, so the copy the frame
-            # agent keeps on its device is released.
+            # The warm start is held in the host stack, so the frame agent's
+            # device copy is dropped.
             agent._previous_output = None
         if self.fold_after_all:
             return None
@@ -225,18 +245,23 @@ class MACE4DModel(ParameterHandler):
     into overlapping time frames, each a window of consecutive views, and
     :meth:`recon` returns one volume per frame.  The constructor fixes the
     frames; the reconstruction parameters are set with :meth:`set_params`.
-    The sinogram is passed to :meth:`recon`.
+    The sinogram is passed to :meth:`recon`.  By default the reconstruction
+    applies a filter along the frame axis, which removes the periodic
+    modulation that the overlapping frames produce; when the frames are too
+    few for the filter it is turned off with a warning.
 
     Args:
         ct_model (TomographyModel): the model of the full scan, a
             ConeBeamModel or a ParallelBeamModel with one angle per view.
         frames_per_rotation (int, optional): frames per full rotation.  This
             is also the period of the temporal filter.  Defaults to 6.
-        frame_overlap_factor (float, optional): frames that share a view.
-            Each frame spans ``frame_overlap_factor * 360 / frames_per_rotation``
-            degrees.  Defaults to 2.0.
-        num_frames (int, optional): reconstruct only the first frames.
-            Defaults to None, every frame.
+        frame_overlap_factor (float, optional): the number of frames that
+            cover any one view.  Each frame spans
+            ``frame_overlap_factor * 360 / frames_per_rotation`` degrees.
+            Defaults to 2.0.
+        num_frames (int, optional): reconstruct only this many frames,
+            counted from the start of the scan.  Defaults to None, every
+            frame.
 
     Attributes:
         model_list (list of TomographyModel): one model per frame.
@@ -259,11 +284,11 @@ class MACE4DModel(ParameterHandler):
         self.frame_overlap_factor = frame_overlap_factor
         self.sinogram_shape = tuple(int(n) for n in ct_model.get_params('sinogram_shape'))
 
+        if num_frames is not None and num_frames < 1:
+            raise ValueError(f'num_frames must be at least 1; got {num_frames}.')
         self.model_list, self.view_slices = construct_time_frame_models(
             ct_model, frames_per_rotation=frames_per_rotation,
             frame_overlap_factor=frame_overlap_factor)
-        if num_frames is not None and num_frames < 1:
-            raise ValueError(f'num_frames must be at least 1; got {num_frames}.')
         if num_frames is not None and num_frames < len(self.model_list):
             self.model_list = self.model_list[:num_frames]
             self.view_slices = self.view_slices[:num_frames]
@@ -278,27 +303,46 @@ class MACE4DModel(ParameterHandler):
         self._devices = None
 
     def refresh_device_bindings(self):
-        """This model has no projectors of its own; the frame models keep theirs."""
+        """Do nothing.  This model holds no projectors, and each frame model
+        refreshes its own."""
 
     def set_params(self, no_warning=False, no_compile=False, **kwargs):
         """
         Set reconstruction parameters by keyword.
 
-        The parameters are ``mace_prior_weight`` (a scalar, or a list of
-        three for the XY-t, YZ-t, and XZ-t priors), ``rho_mann``,
-        ``prox_num_iterations``, ``prox_stop_threshold``,
-        ``prox_partition_advance``, ``prox_warm_start``,
-        ``denoiser_warm_start``, ``sigma_prox``, ``dejitter``,
-        ``dejitter_verbose``, and ``verbose``.  Parameters of the geometry and
-        of the regularization belong to ``ct_model``; set them there before
-        constructing this model.  ``mace_prior_weight`` is checked when it is
-        set.
+        Parameters of the geometry and of the regularization belong to
+        ``ct_model``; set them there before constructing this model.
 
         Args:
             no_warning (bool, optional): disable the parameter-name check and
                 warnings.  Defaults to False.
             no_compile (bool, optional): kept for the base class interface.
-            **kwargs: parameter names and values.
+            mace_prior_weight (float or list of 3 floats): the total weight of
+                the three priors, or one weight each for XY-t, YZ-t, and
+                XZ-t.  The data-fit agent gets the rest of 1.  Checked when
+                set.  Defaults to 0.5.
+            rho_mann (float): the step of the consensus iteration.  Defaults
+                to 0.5.
+            prox_num_iterations (int): iterations of each data-fit call.
+                Defaults to 3.
+            prox_stop_threshold (float): the stop threshold, in percent, of
+                the per-frame reconstruction that initializes the run.
+                Defaults to 0.02.
+            prox_partition_advance (float): how many entries of the partition
+                sequence each data-fit call moves forward per iteration.
+                Defaults to 1.0.
+            prox_warm_start (bool): start each data-fit call from the frame's
+                previous output.  Defaults to True.
+            denoiser_warm_start (bool): start each denoiser sweep from its
+                previous output, at the cost of one full-size array per
+                orientation.  Defaults to False.
+            sigma_prox (float or None): the strength of every data-fit call.
+                None sets it from the data.  Defaults to None.
+            dejitter (bool): apply the temporal filter along the frame axis.
+                Defaults to True.
+            dejitter_verbose (int): log the periods the filter removes and
+                the modes it keeps.  Defaults to 0.
+            verbose (int): 0 is silent, 1 reports progress.  Defaults to 1.
 
         Example:
             >>> mace.set_params(mace_prior_weight=0.5, rho_mann=0.5, dejitter=True)
@@ -310,14 +354,10 @@ class MACE4DModel(ParameterHandler):
         # about that is not raised.
         sigma_prox_given = 'sigma_prox' in kwargs
         sigma_prox = kwargs.pop('sigma_prox', None)
-        recompile_flag = False
         if sigma_prox_given:
-            recompile_flag |= bool(super().set_params(no_warning=True, no_compile=no_compile,
-                                                      sigma_prox=sigma_prox))
+            super().set_params(no_warning=True, no_compile=no_compile, sigma_prox=sigma_prox)
         if kwargs:
-            recompile_flag |= bool(super().set_params(no_warning=no_warning, no_compile=no_compile,
-                                                      **kwargs))
-        return recompile_flag
+            super().set_params(no_warning=no_warning, no_compile=no_compile, **kwargs)
 
     def set_device_pool(self, devices=None):
         """
@@ -340,7 +380,7 @@ class MACE4DModel(ParameterHandler):
 
     @property
     def devices(self):
-        """The device pool, or the pool for None when none was set."""
+        """The device pool.  When no pool has been set, this is the default pool."""
         return list(self._devices) if self._devices is not None else resolve_device_pool(None)
 
     # ── the public entry point ───────────────────────────────────────────────
@@ -355,9 +395,9 @@ class MACE4DModel(ParameterHandler):
             weights (numpy or tensor, optional): positive weights of the
                 sinogram's shape.  Defaults to None, unit weights.
             init_recon (numpy, optional): the initial 4D image, of shape
-                ``(num_frames,) + recon_shape``.  Defaults to None: the image
-                is loaded from ``init_dir`` when a valid one is there, and is
-                otherwise computed by reconstructing each frame alone.
+                ``(num_frames,) + recon_shape``.  Defaults to None.  The
+                image is then read from ``init_dir`` when one is there, and
+                is otherwise computed by reconstructing each frame alone.
             max_iterations (int, optional): consensus iterations.  Defaults
                 to 10.
             stop_threshold_change_pct (float, optional): stop when the percent
@@ -374,12 +414,19 @@ class MACE4DModel(ParameterHandler):
             (recon, recon_dict): the 4D reconstruction as a numpy array of
             shape ``(num_frames,) + recon_shape``, and a dict with the run
             settings under ``'recon_params'``, the per-iteration timing under
-            ``'timing'``, ``'notes'``, and ``'model_params'``.
+            ``'timing'``, a completion time under ``'notes'``, and a copy of
+            the model's parameters under ``'model_params'``.
 
         Raises:
             ValueError: if ``sinogram``, ``weights``, or ``init_recon`` has
                 the wrong shape, or if the initial image is constant so that
                 no denoiser noise level can be estimated.
+
+        Warns:
+            UserWarning: if the temporal filter is on but the frames are too
+                few for it, fewer than ``frames_per_rotation``, in which case
+                the run proceeds with the filter off and the run settings
+                say so.
 
         Example:
             >>> recon_4d, recon_dict = mace.recon(sinogram, weights=weights, log_dir='./logs')
@@ -395,9 +442,36 @@ class MACE4DModel(ParameterHandler):
         sinogram = self._validate_sinogram(sinogram, 'sinogram')
         if weights is not None:
             weights = self._validate_sinogram(weights, 'weights')
+        # An initial image the caller supplies stays the caller's; one that
+        # recon reads or computes is its own to reuse.
+        init_is_own = init_recon is None
         if init_recon is not None:
             init_recon = self._validate_init_recon(init_recon)
             init_source = 'provided by caller'
+
+        # The filter is decided before any computation.  It is turned off when
+        # the frame count is below the period, or when the matrix would remove
+        # every mode, since a zero matrix would zero the whole reconstruction.
+        filter_matrix = None
+        dejitter_note = None
+        if dejitter:
+            if num_frames < self.frames_per_rotation:
+                dejitter_note = (f'turned off: {num_frames} frames are fewer than the filter period '
+                                 f'of {self.frames_per_rotation}')
+            else:
+                filter_matrix = temporal_filter_matrix(num_frames, period=self.frames_per_rotation)
+                if not bool(torch.any(filter_matrix != 0)):
+                    filter_matrix = None
+                    dejitter_note = (f'turned off: the filter removes every mode of {num_frames} '
+                                     f'frames at a period of {self.frames_per_rotation}')
+            if filter_matrix is None:
+                dejitter = False
+                warnings.warn(f'The temporal filter was {dejitter_note}.  Use more frames, or set '
+                              'dejitter=False to silence this warning.')
+            else:
+                dejitter_note = _describe_filter(filter_matrix, num_frames, self.frames_per_rotation)
+                if self.get_params('dejitter_verbose'):
+                    self.logger.info(f'[MACE] Temporal filter: {dejitter_note}')
 
         pool = self.devices
         frame_devices = [pool[t % len(pool)] for t in range(num_frames)]
@@ -430,21 +504,19 @@ class MACE4DModel(ParameterHandler):
         x0 = torch.as_tensor(init_recon, dtype=torch.float32).contiguous()
 
         # ── the denoiser noise level, shared by the three orientations ───────
-        global_sigma = self._estimate_global_sigma(init_recon)
+        global_sigma = self._estimate_global_sigma(init_recon, pool[0])
         if not np.isfinite(global_sigma) or global_sigma <= 0:
             raise ValueError(
                 f'The denoiser noise level estimated from the initial image is {global_sigma}, '
-                'which happens when that image is constant (all zeros, for instance).  Supply '
-                'a non-constant init_recon, or omit init_recon and let the model compute the '
+                'which cannot be used.  A constant initial image gives this value.  Supply a '
+                'non-constant init_recon, or omit init_recon and let the model compute the '
                 'per-frame initialization.')
         if verbose:
             self.logger.info(f'[MACE] Global denoiser sigma = {global_sigma:.6g}')
 
         # ── the agents ───────────────────────────────────────────────────────
-        filter_matrix = (temporal_filter_matrix(num_frames, period=self.frames_per_rotation)
-                         if dejitter else None)
         data_fit = _DataFitAgent(frame_agents, frame_devices, x0, filter_matrix,
-                                 keep_stack=dejitter or prox_warm_start)
+                                 keep_stack=dejitter or prox_warm_start, adopt_stack=init_is_own)
         iteration_counts = []
         counts_lock = threading.Lock()
         priors = []
@@ -455,18 +527,21 @@ class MACE4DModel(ParameterHandler):
                 axis, x0, global_sigma, pool[0], denoiser_warm_start)
             sigma_x_values.append(params['sigma_x'])
             batch_sizes.append(batch_size)
-            make = self._stack_denoiser_factory(image_shape, params, global_sigma,
+            make = self._stack_denoiser_factory(image_shape, params, global_sigma, batch_size,
                                                 iteration_counts, counts_lock)
             priors.append(HyperplaneAgent(axis, make, batch_size=batch_size,
                                           filter_matrix=filter_matrix,
                                           use_warm_start=denoiser_warm_start))
         if verbose:
-            self.logger.info(f'[MACE] Denoiser sigma_x per orientation = {sigma_x_values}; '
-                             f'batch sizes = {batch_sizes}')
+            self.logger.info(f'[MACE] Denoiser sigma_x [xyt, yzt, xzt] = {sigma_x_values}; '
+                             f'batch sizes [xyt, yzt, xzt] = {batch_sizes}')
 
         run_settings = self._run_settings(pool, init_source, global_sigma, weights,
                                           max_iterations, stop_threshold_change_pct,
                                           sigma_x_values, batch_sizes)
+        run_settings['dejitter'] = dejitter
+        if dejitter_note is not None:
+            run_settings['temporal filter'] = dejitter_note
 
         # ── the log files ────────────────────────────────────────────────────
         timing_log_path = task_log_path = None
@@ -483,6 +558,9 @@ class MACE4DModel(ParameterHandler):
         # ── the consensus loop ───────────────────────────────────────────────
         timing_rows = []
         loop = MACE([data_fit] + priors, x0, mu=beta, rho=rho_mann, devices=pool)
+        # The loop holds its own copies, so the initial image is released here;
+        # when the data-fit agent adopted it, the agent's stack is that array.
+        del x0, init_recon
 
         def after_step(iteration, x_bar):
             rows = loop.info['tasks'][-1]
@@ -522,6 +600,8 @@ class MACE4DModel(ParameterHandler):
             x_bar, _ = loop.run(max_iterations=max_iterations,
                                 stop_threshold_change_pct=stop_threshold_change_pct,
                                 callback=after_step)
+        # The result shares storage with the loop's average buffer, which is
+        # safe because the loop is not used after this call returns.
         result = x_bar.cpu().numpy()
         if verbose:
             self.logger.info('[MACE] Reconstruction complete.')
@@ -560,34 +640,49 @@ class MACE4DModel(ParameterHandler):
         return image_shape, params, batch_size
 
     @staticmethod
-    def _stack_denoiser_factory(image_shape, params, sigma, iteration_counts, lock):
-        """A ``make_stack_denoiser(device)`` for :class:`HyperplaneAgent`:
-        each call builds a denoiser pinned to the device with the given
-        parameters, whose sweeps record their per-volume iteration counts."""
+    def _stack_denoiser_factory(image_shape, params, sigma, batch_size, iteration_counts, lock):
+        """A ``make_stack_denoiser(device)`` for :class:`HyperplaneAgent`.
+        Each denoiser it returns is pinned to its device, uses the given
+        parameters, sweeps every slab at ``batch_size`` volumes, and records
+        the iteration count of every volume it sweeps."""
         def make_stack_denoiser(device):
             denoiser = QGGMRFDenoiser(image_shape)
             denoiser.configure_devices(devices=[device])
             denoiser.set_params(no_warning=True, verbose=0, **params)
 
+            def padded(stack, count):
+                """The stack with its last volume repeated up to ``count``
+                volumes, so that a short last slab is swept at the shape of
+                the others and compiles no second variant."""
+                short = count - int(stack.shape[0])
+                if short <= 0:
+                    return stack
+                return torch.cat([stack, stack[-1:].expand(short, *stack.shape[1:])])
+
             def denoise(stack, init_stack=None):
+                real = int(stack.shape[0])
+                count = real if batch_size is None else max(int(batch_size), real)
                 out, info = denoiser.denoise_stack(
-                    stack, sigma_noise=sigma, init_stack=init_stack,
+                    padded(stack, count), sigma_noise=sigma,
+                    init_stack=None if init_stack is None else padded(init_stack, count),
                     max_iterations=_DENOISE_MAX_ITERATIONS,
                     stop_threshold_change_pct=_DENOISE_STOP_THRESHOLD_PCT,
-                    batch_size=int(stack.shape[0]))
+                    batch_size=count)
                 with lock:
-                    iteration_counts.extend(int(n) for n in info['num_iterations'])
-                return out
+                    iteration_counts.extend(int(n) for n in info['num_iterations'][:real])
+                return out[:real]
             return denoise
         return make_stack_denoiser
 
     @staticmethod
-    def _estimate_global_sigma(init_recon):
-        """One noise level for every denoiser, from the initial image merged
-        to a 3D array."""
+    def _estimate_global_sigma(init_recon, device):
+        """The noise level used by all three denoisers, estimated from the
+        initial image."""
         init_recon = np.asarray(init_recon, dtype=np.float32)
         image_3d = init_recon.reshape(-1, init_recon.shape[2], init_recon.shape[3])
-        return float(QGGMRFDenoiser(image_3d.shape).estimate_image_noise_std(image_3d))
+        denoiser = QGGMRFDenoiser(image_3d.shape)
+        denoiser.configure_devices(devices=[device])
+        return float(denoiser.estimate_image_noise_std(image_3d))
 
     # ── the initial image ────────────────────────────────────────────────────
     def _compute_init_recon(self, frame_agents, pool, init_dir):
@@ -630,8 +725,8 @@ class MACE4DModel(ParameterHandler):
 
     def _load_cached_init(self, init_dir):
         """The image in ``init_dir/init_recon.npy``, or None when the file is
-        missing.  A file that cannot be loaded or has the wrong shape warns and
-        gives None."""
+        missing.  When the file cannot be loaded or has the wrong shape, a
+        warning is issued and the result is None."""
         path = os.path.join(init_dir, 'init_recon.npy')
         if not os.path.isfile(path):
             return None
@@ -646,7 +741,7 @@ class MACE4DModel(ParameterHandler):
 
     # ── validation and the run record ────────────────────────────────────────
     def _validate_sinogram(self, sinogram, name):
-        """The array unchanged, or a ValueError when its shape is not the
+        """The array unchanged.  Raises ValueError when its shape is not the
         sinogram shape."""
         if not torch.is_tensor(sinogram):
             sinogram = np.asarray(sinogram)
@@ -660,7 +755,7 @@ class MACE4DModel(ParameterHandler):
         return (self.num_frames,) + self.recon_shape
 
     def _validate_init_recon(self, init_recon):
-        """The initial image as float32 numpy, or a ValueError on a wrong shape."""
+        """The initial image as float32 numpy.  Raises ValueError on a wrong shape."""
         init_recon = np.asarray(init_recon, dtype=np.float32)
         expected = self._expected_init_shape()
         if init_recon.shape != expected:
@@ -679,7 +774,7 @@ class MACE4DModel(ParameterHandler):
             'time frames': self.num_frames,
             'frame shape': self.recon_shape,
             'views per frame': self.view_slices[0].stop - self.view_slices[0].start,
-            'mode': f'{len(pool)} worker(s): ' + ', '.join(str(d) for d in pool),
+            'workers': f'{len(pool)}: ' + ', '.join(str(d) for d in pool),
             'init source': init_source,
             'weights': 'unit (weights=None)' if weights is None else 'supplied by caller',
             'beta [fwd, xyt, yzt, xzt]': [round(float(b), 4) for b in beta],

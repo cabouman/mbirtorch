@@ -47,7 +47,7 @@ def _canonical_device(device):
 def _filter_along_axis(x, matrix, axis):
     """Apply a square matrix along one axis of a tensor, on the tensor's
     device and in its dtype.  :func:`mbirtorch.mace4d.apply_temporal_filter`
-    is the public form."""
+    is the public version of this helper."""
     matrix = matrix.to(device=x.device, dtype=x.dtype)
     moved = x.movedim(axis, 0)
     filtered = torch.tensordot(matrix, moved, dims=1)
@@ -776,9 +776,9 @@ class HyperplaneAgent:
             orientation in one task, which copies the whole array to one
             device.  On a GPU pass the size the stack denoiser reports, so
             that a task holds one batch and the tasks spread over the pool.
-        filter_matrix (torch.Tensor, optional): a square matrix of the frame
-            count, applied along the frame axis of each batch before
-            denoising, such as the matrix from
+        filter_matrix (torch.Tensor, optional): a square matrix whose size is
+            the number of frames, applied along the frame axis of each batch
+            before denoising, such as the matrix from
             :func:`mbirtorch.mace4d.temporal_filter_matrix`.
         use_warm_start (bool, optional): keep the previous call's output, one
             array of the input's shape on the input's device, and pass the
