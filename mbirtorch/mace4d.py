@@ -522,9 +522,13 @@ class MACE4DModel(ParameterHandler):
         priors = []
         sigma_x_values = []
         batch_sizes = []
+        # The denoisers receive filtered inputs when the filter is on, so
+        # their strength is estimated from the filtered initial image.
+        image_for_statistics = (x0 if filter_matrix is None
+                                else apply_temporal_filter(x0, filter_matrix, axis=0))
         for _, axis in _ORIENTATIONS:
             image_shape, params, batch_size = self._configure_orientation(
-                axis, x0, global_sigma, pool[0], denoiser_warm_start)
+                axis, image_for_statistics, global_sigma, pool[0], denoiser_warm_start)
             sigma_x_values.append(params['sigma_x'])
             batch_sizes.append(batch_size)
             make = self._stack_denoiser_factory(image_shape, params, global_sigma, batch_size,
@@ -532,6 +536,7 @@ class MACE4DModel(ParameterHandler):
             priors.append(HyperplaneAgent(axis, make, batch_size=batch_size,
                                           filter_matrix=filter_matrix,
                                           use_warm_start=denoiser_warm_start))
+        del image_for_statistics
         if verbose:
             self.logger.info(f'[MACE] Denoiser sigma_x [xyt, yzt, xzt] = {sigma_x_values}; '
                              f'batch sizes [xyt, yzt, xzt] = {batch_sizes}')

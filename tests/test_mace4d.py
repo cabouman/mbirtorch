@@ -600,8 +600,9 @@ def test_data_fit_agent_folds_the_filtered_stack_and_warm_starts_from_the_unfilt
 
 def test_the_filter_path_runs_end_to_end(tmp_path):
     """A run with the filter on, at a period the frame count can carry,
-    gives finite values that differ from the filter-off run, and records the
-    filter in the run settings.  Four frames per rotation with no overlap
+    gives finite values that differ from the filter-off run, records the
+    filter in the run settings, and estimates the denoiser strengths from
+    the filtered initial image.  Four frames per rotation with no overlap
     give four frames from the 24 views, and at four frames the period-4
     filter keeps one mode, the zeroth cosine mode, so the filtered stack is
     not zero."""
@@ -619,11 +620,15 @@ def test_the_filter_path_runs_end_to_end(tmp_path):
     assert recon.shape == shape and np.all(np.isfinite(recon))
     mace.set_params(dejitter=False)
     np.random.seed(0)
-    unfiltered, _ = mace.recon(_smooth_sino(), init_recon=init, max_iterations=2,
-                               stop_threshold_change_pct=0)
+    unfiltered, unfiltered_dict = mace.recon(_smooth_sino(), init_recon=init, max_iterations=2,
+                                             stop_threshold_change_pct=0)
     rel = _rel_max(recon, unfiltered)
     print(f"filter on vs off: rel_max = {rel:.2e}")
     assert rel > 1e-2                        # the filter is applied, not merely recorded
+    # With the filter on, the denoiser strengths are estimated from the
+    # filtered initial image, so they differ from the filter-off values.
+    assert recon_dict['recon_params']['denoiser sigma_x [xyt, yzt, xzt]'] != \
+        unfiltered_dict['recon_params']['denoiser sigma_x [xyt, yzt, xzt]']
     assert recon_dict['recon_params']['dejitter'] is True
     # Period 4 over 4 frames: harmonics 1 and 2, periods 4 and 2; three modes removed, one kept.
     assert recon_dict['recon_params']['temporal filter'] == \
