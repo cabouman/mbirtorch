@@ -15,7 +15,9 @@ the qGGMRF line search computes zero over zero.
 """
 
 import csv
+import math
 import os
+import warnings
 
 import numpy as np
 import pytest
@@ -23,9 +25,10 @@ import torch
 from scipy.fft import dct, idct
 
 import mbirtorch
+from mbirtorch import mace as mace_module
 from mbirtorch.mace import MACE
-from mbirtorch.mace4d import (MACE4DModel, _DataFitAgent, apply_temporal_filter,
-                              temporal_filter_matrix)
+from mbirtorch.mace4d import (MACE4DModel, _DataFitAgent, _normalize_prior_weights,
+                              apply_temporal_filter, temporal_filter_matrix)
 
 NUM_VIEWS = 24          # 24 views over 360 degrees, 15 degrees per view
 DET_ROWS = 8
@@ -133,6 +136,92 @@ def _read_rows(path):
         return list(csv.DictReader(f))
 
 
+# ── the unit groups: no reconstruction ───────────────────────────────────────
+def test_prior_weights_normalize_and_are_checked():
+    """A scalar prior weight w gives the agent weights [1 - w, w/3, w/3, w/3]
+    and a list of three gives [1 - sum, w1, w2, w3]; a weight above one,
+    below zero, a list summing above one, or a list of two is refused."""
+    assert np.allclose(_normalize_prior_weights(0.5), [0.5, 1 / 6, 1 / 6, 1 / 6])
+    assert np.allclose(_normalize_prior_weights([0.1, 0.2, 0.3]), [0.4, 0.1, 0.2, 0.3])
+    for bad in (1.5, -0.1, [0.5, 0.5, 0.5], [0.1, 0.2]):
+        with pytest.raises(ValueError):
+            _normalize_prior_weights(bad)
+
+
+def test_the_model_holds_the_device_pool_it_is_given():
+    """set_device_pool stores the resolved pool and devices reads it back;
+    before any call, devices is the pool for None.  A count above the pool
+    and an unknown platform string are refused."""
+    mace = MACE4DModel(_small_model(), num_frames=2)
+    mace.set_params(verbose=0)
+    assert mace.devices == mbirtorch.resolve_device_pool(None)
+    mace.set_device_pool(1)
+    assert len(mace.devices) == 1
+    mace.set_device_pool([0])
+    assert mace.devices == mbirtorch.resolve_device_pool(None)[:1]
+    mace.set_device_pool('cpu')
+    assert mace.devices == [torch.device('cpu')]
+    mace.set_device_pool(['cpu', 'cpu'])
+    assert mace.devices == [torch.device('cpu'), torch.device('cpu')]
+    with pytest.raises(ValueError):
+        mace.set_device_pool(len(mbirtorch.resolve_device_pool(None)) + 1)
+    with pytest.raises(ValueError):
+        mace.set_device_pool('tpu')
+
+
+def test_construction_builds_the_frames_of_the_scan():
+    """The 24-view scan at the defaults gives 5 frames of 8 views with a
+    stride of 4; num_frames keeps the first frames, refuses zero, and is
+    truncated silently above the count."""
+    mace = MACE4DModel(_small_model())
+    assert mace.num_frames == 5 and len(mace.model_list) == 5 and len(mace.view_slices) == 5
+    assert mace.view_slices[1] == slice(4, 12)
+    assert mace.recon_shape == tuple(mace.model_list[0].get_params('recon_shape'))
+    assert mace.sinogram_shape == (NUM_VIEWS, DET_ROWS, DET_COLS)
+    assert MACE4DModel(_small_model(), num_frames=2).num_frames == 2
+    assert MACE4DModel(_small_model(), num_frames=99).num_frames == 5
+    with pytest.raises(ValueError, match='at least 1'):
+        MACE4DModel(_small_model(), num_frames=0)
+
+
+def test_parameters_default_and_read_back():
+    """The reconstruction parameters hold the plan's defaults, read back what
+    they are set to, and an invalid prior weight or an unknown name is
+    refused when set."""
+    mace = MACE4DModel(_small_model(), num_frames=2)
+    defaults = dict(mace_prior_weight=0.5, rho_mann=0.5, prox_num_iterations=3, prox_stop_threshold=0.02,
+                    prox_partition_advance=1.0, prox_warm_start=True, denoiser_warm_start=False,
+                    sigma_prox=None, dejitter=True, dejitter_verbose=0, verbose=1)
+    for name, value in defaults.items():
+        assert mace.get_params(name) == value, name
+    mace.set_params(rho_mann=0.25, dejitter=False, sigma_prox=0.1)
+    assert mace.get_params('rho_mann') == 0.25 and mace.get_params('dejitter') is False
+    assert mace.get_params('sigma_prox') == 0.1
+    with pytest.raises(ValueError):
+        mace.set_params(mace_prior_weight=1.5)
+    with pytest.raises(ValueError):
+        mace.set_params(not_a_parameter=1)
+
+
+def test_the_initialization_cache_is_read_when_valid(tmp_path):
+    """An absent cache file gives None silently; a file of the wrong shape
+    gives None with one warning naming it invalid; a valid file loads as
+    float32."""
+    mace = MACE4DModel(_small_model())
+    mace.set_params(verbose=0)
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        assert mace._load_cached_init(str(tmp_path)) is None
+    np.save(tmp_path / 'init_recon.npy', np.zeros((1, 2, 3, 4), dtype=np.float32))
+    with pytest.warns(UserWarning, match='invalid') as caught:
+        assert mace._load_cached_init(str(tmp_path)) is None
+    assert len(caught) == 1
+    good = np.zeros((mace.num_frames,) + mace.recon_shape, dtype=np.float64)
+    np.save(tmp_path / 'init_recon.npy', good)
+    loaded = mace._load_cached_init(str(tmp_path))
+    assert loaded.dtype == np.float32 and loaded.shape == good.shape
+
+
 def test_a_three_frame_reconstruction_runs_and_logs(device, tmp_path):
     """One iteration on three frames and one device gives finite, nonzero
     values of the 4D shape, the three log files, the four result keys, and
@@ -164,11 +253,15 @@ def test_a_three_frame_reconstruction_runs_and_logs(device, tmp_path):
     rows = _read_rows(os.path.join(log_dir, 'task_log.csv'))
     assert sorted(row['kind'] for row in rows) == ['denoise'] * 3 + ['prox'] * 3
     assert all(row['part'] == '' for row in rows if row['kind'] == 'prox')
+    # One task per orientation here, since no memory budget can be read.
+    assert all(row['part'] == '0' for row in rows if row['kind'] == 'denoise')
     timing = _read_rows(os.path.join(log_dir, 'timing_log.csv'))[0]
     print(f"{device}: change {float(timing['consensus_change_pct']):.3f}%, "
           f"mean denoiser iterations {float(timing['denoise_mean_iterations']):.1f}, "
           f"sigma_x {recon_dict['recon_params']['denoiser sigma_x [xyt, yzt, xzt]']}")
-    assert float(timing['denoise_mean_iterations']) >= 1
+    # From a cold start the sweeps never reach the 0.2 percent threshold on
+    # this problem, so every volume runs the cap of 15 iterations.
+    assert float(timing['denoise_mean_iterations']) == 15.0
 
     assert os.path.isfile(os.path.join(init_dir, 'init_recon.npy'))
     mace.set_params(dejitter=False)
@@ -177,6 +270,69 @@ def test_a_three_frame_reconstruction_runs_and_logs(device, tmp_path):
                                    init_dir=init_dir)
     assert again_dict['recon_params']['init source'].startswith('cached')
     assert again.shape == recon.shape
+
+    # A huge stop threshold ends the loop after one iteration of five; a
+    # supplied initial image, supplied weights, and a tensor sinogram are
+    # taken and recorded.
+    np.random.seed(0)
+    _, early = mace.recon(torch.as_tensor(_smooth_sino()), weights=np.ones_like(_smooth_sino()),
+                          init_recon=again, max_iterations=5, stop_threshold_change_pct=1e9)
+    assert len(early['timing']) == 1 and early['recon_params']['iterations completed'] == 1
+    assert early['recon_params']['init source'] == 'provided by caller'
+    assert early['recon_params']['weights'] == 'supplied by caller'
+
+
+def test_the_other_settings_run_and_are_recorded(tmp_path):
+    """Both warm starts the other way round, a given sigma_prox, a list prior
+    weight, and verbose logging run to finite values, and the run settings
+    record every one of them; the given sigma_prox reaches the frame agents."""
+    mace = MACE4DModel(_small_model(), num_frames=3)
+    mace.set_params(dejitter=False, verbose=1, prox_warm_start=False, denoiser_warm_start=True,
+                    sigma_prox=0.05, mace_prior_weight=[0.1, 0.2, 0.3], rho_mann=0.4)
+    mace.set_device_pool(['cpu'])
+    shape = (3,) + mace.recon_shape
+    init = np.linspace(0.0, 0.1, int(np.prod(shape)), dtype=np.float32).reshape(shape)
+    init += 0.01 * np.random.default_rng(4).standard_normal(shape).astype(np.float32)
+    log_dir = str(tmp_path / 'logs')
+    np.random.seed(0)
+    recon, recon_dict = mace.recon(_smooth_sino(), init_recon=init, max_iterations=2,
+                                   stop_threshold_change_pct=0, log_dir=log_dir)
+    assert np.all(np.isfinite(recon))
+    settings = recon_dict['recon_params']
+    assert settings['prox_warm_start'] is False and settings['denoiser_warm_start'] is True
+    assert settings['sigma_prox'] == 0.05 and settings['rho_mann'] == 0.4
+    assert settings['beta [fwd, xyt, yzt, xzt]'] == [0.4, 0.1, 0.2, 0.3]
+    text = open(os.path.join(log_dir, 'run_info.txt')).read()
+    assert 'sigma_prox' in text and '0.05' in text
+    # The denoiser warm start shows in the second iteration's sweep count,
+    # which is below the cap the cold start always reaches.
+    assert recon_dict['timing'][1]['denoise_mean_iterations'] < 15.0
+
+
+def test_data_fit_agent_without_a_stack_folds_each_frame_as_it_completes():
+    """With the filter off and the prox warm start off, the agent keeps no
+    stack, folds each frame's output as it arrives, and the loop's average
+    after one step is the stack of the frame outputs."""
+
+    class _Doubler:
+        use_warm_start = False
+
+        def __call__(self, w, iteration=0):
+            return 2.0 * w
+
+        def state_dict(self):
+            return {}
+
+        def load_state_dict(self, state):
+            pass
+
+    torch.manual_seed(6)
+    x0 = torch.randn(3, 2, 2, 2)
+    agent = _DataFitAgent([_Doubler() for _ in range(3)], ['cpu'] * 3, x0, None, keep_stack=False)
+    assert agent._stack is None and not agent.fold_after_all
+    with MACE([agent], x0, mu=[1.0], rho=0.5) as loop:
+        loop.step()
+    assert torch.equal(loop.x_bar, 2.0 * x0)
 
 
 def test_two_workers_equal_one_worker_and_both_take_tasks(tmp_path):
@@ -475,3 +631,102 @@ def test_the_filter_path_runs_end_to_end(tmp_path):
     assert 'temporal filter' in open(os.path.join(log_dir, 'run_info.txt')).read()
     assert recon_dict['recon_params']['iterations completed'] == 2
     print(f"filter path: change {[round(r['consensus_change_pct'], 3) for r in recon_dict['timing']]}%")
+
+
+# ── the one-frame equality gate ──────────────────────────────────────────────
+def test_one_frame_consensus_reproduces_the_standard_reconstruction(monkeypatch):
+    """With one frame the three priors denoise the same volume along three
+    axis pairs.  At the agent weights [1/2, 1/6, 1/6, 1/6], with the denoiser
+    sigma at sigma_prox times the square root of 3/2 and sigma_x pinned to
+    the value the standard reconstruction used, the consensus must reproduce
+    that reconstruction on the frame's views within 1 percent NRMSE after 40
+    iterations.  The reference is a 200-iteration recon; its own convergence
+    is measured against the 100-iteration recon and must be below 0.5
+    percent.  The start is the 30-iteration recon, more than 1 percent away,
+    so the loop is seen to move.  The problem is the 64-view Shepp-Logan
+    cone-beam scan at 32 channels and 4 rows; one frame at one frame per
+    rotation holds every view, which converges where a limited-angle frame
+    does not.  With one frame each hyperplane volume has 32 pixels, so the
+    denoisers run one subset, the regime the class is verified in.  The
+    denoiser sigma and sigma_x are pinned through a test-only subclass,
+    because no public parameter reaches them."""
+    num_views, det = 64, 32
+    phantom, sinogram, params = mbirtorch.generate_demo_data(
+        model_type='cone', object_type='shepp-logan', num_views=num_views,
+        num_det_rows=det, num_det_channels=det, target_max_attenuation=6.0)
+    rng = np.random.default_rng(0)
+    sinogram = (sinogram + np.sqrt(np.exp(sinogram) / 500.0) * rng.standard_normal(sinogram.shape))
+    sinogram = np.ascontiguousarray(sinogram[:, det // 2 - 2:det // 2 + 2].astype(np.float32))
+    weights = mbirtorch.gen_weights(sinogram, weight_type='transmission_root')
+
+    def scan_model():
+        model = mbirtorch.ConeBeamModel(sinogram.shape, params['angles'],
+                                        source_detector_dist=params['source_detector_dist'],
+                                        source_iso_dist=params['source_iso_dist'])
+        model.set_params(no_warning=True, sharpness=1.0, verbose=0)
+        return model
+
+    def nrmse(a, b):
+        a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
+        return float(np.linalg.norm(a - b) / np.linalg.norm(b))
+
+    frames = dict(frames_per_rotation=1, frame_overlap_factor=1.0)
+    plain = MACE4DModel(scan_model(), num_frames=1, **frames)
+    assert plain.num_frames == 1 and plain.view_slices[0] == slice(0, num_views)
+    frame_model = plain.model_list[0]
+    frame_model.configure_devices(devices=['cpu'])
+
+    def reference(iterations):
+        np.random.seed(0)
+        return frame_model.recon(sinogram, weights=weights, max_iterations=iterations,
+                                 stop_threshold_change_pct=0.0, logfile_path=None, print_logs=False)
+
+    recon_200, _ = reference(200)
+    recon_100, recon_100_dict = reference(100)
+    start, _ = reference(30)
+    reference_error = nrmse(recon_100, recon_200)
+    start_distance = nrmse(start, recon_200)
+    regularization = recon_100_dict['recon_params']['regularization_params']
+    sigma_prox, sigma_x = float(regularization['sigma_prox']), float(regularization['sigma_x'])
+    print(f"reference: recon(100) vs recon(200) NRMSE {reference_error:.2e}; start recon(30) is "
+          f"{start_distance:.4f} away; sigma_prox {sigma_prox:.5f}, sigma_x {sigma_x:.5f}")
+    assert reference_error < 5e-3
+    assert start_distance > 0.01
+
+    class _Pinned(MACE4DModel):
+        """The model with the denoiser sigma and sigma_x pinned to the values
+        the gate needs, which no public parameter reaches."""
+
+        @staticmethod
+        def _estimate_global_sigma(init_recon, device):
+            return sigma_prox * math.sqrt(1.5)
+
+        def _configure_orientation(self, axis, x0, sigma, device, init_supplied):
+            shape, denoiser_params, batch_size = super()._configure_orientation(
+                axis, x0, sigma, device, init_supplied)
+            return shape, dict(denoiser_params, sigma_x=sigma_x), batch_size
+
+    trace = []
+    original_step = mace_module.MACE.step
+
+    def recording_step(self):
+        change = original_step(self)
+        trace.append(nrmse(self.x_bar.numpy(), recon_200))
+        return change
+    monkeypatch.setattr(mace_module.MACE, 'step', recording_step)
+
+    gate = _Pinned(scan_model(), num_frames=1, **frames)
+    gate.set_params(dejitter=False, verbose=0, mace_prior_weight=0.5, rho_mann=0.5)
+    gate.set_device_pool(['cpu'])
+    np.random.seed(0)
+    x, recon_dict = gate.recon(sinogram, weights=weights, init_recon=start[None],
+                               max_iterations=40, stop_threshold_change_pct=0.0)
+    settings = recon_dict['recon_params']
+    assert settings['denoiser sigma (global)'] == pytest.approx(sigma_prox * math.sqrt(1.5))
+    assert settings['denoiser sigma_x [xyt, yzt, xzt]'] == [sigma_x] * 3
+    assert settings['beta [fwd, xyt, yzt, xzt]'] == [0.5, 0.1667, 0.1667, 0.1667]
+    print(f"one-frame gate: NRMSE to recon(200) after 10/20/30/40 iterations = "
+          f"{trace[9]:.4f} / {trace[19]:.4f} / {trace[29]:.4f} / {trace[39]:.4f}")
+    assert len(trace) == 40
+    assert trace[39] < 0.01
+    assert trace[39] < trace[9]                # the loop moved toward the reference
