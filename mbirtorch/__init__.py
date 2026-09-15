@@ -129,8 +129,9 @@ _LAZY_NAMES = {
     # and is not exported at package level.
     'MACE': 'mace', 'Task': 'mace', 'ForwardProxAgent': 'mace',
     'QGGMRFDenoiserAgent': 'mace', 'HyperplaneAgent': 'mace',
-    'temporal_filter_matrix': 'mace', 'apply_temporal_filter': 'mace',
     'resolve_device_pool': 'mace',
+    # The frame-axis filter of the 4D reconstruction.
+    'temporal_filter_matrix': 'mace4d', 'apply_temporal_filter': 'mace4d',
 }
 
 # Tools that read the source without running it -- editors resolving a name for
@@ -147,7 +148,8 @@ if TYPE_CHECKING:
     from .view_utils import (SliceViewer, VolumeStack, slice_viewer,
                              GeometryScene, GeometryFigure, geometry_viewer)
     from .mace import (MACE, Task, ForwardProxAgent, QGGMRFDenoiserAgent, HyperplaneAgent,
-                       temporal_filter_matrix, apply_temporal_filter, resolve_device_pool)
+                       resolve_device_pool)
+    from .mace4d import temporal_filter_matrix, apply_temporal_filter
     from .hsnt import (hyper_denoise, dehydrate, rehydrate,
                        import_hsnt_data_hdf5, create_hsnt_metadata,
                        export_hsnt_data_hdf5, generate_hyper_data)
