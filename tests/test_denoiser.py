@@ -599,6 +599,63 @@ def test_denoise_stack_takes_an_init_stack_and_checks_shapes(device):
         denoiser.denoise_stack(stack, sigma_noise=0.1, batch_size=0)
 
 
+def test_denoise_stack_never_writes_the_caller_s_arrays(device):
+    """The sweep writes its image in place, starting from the initial stack
+    when one is given.  An initial stack that arrives as a copy, from the
+    host or from another device, becomes that image directly; a caller's
+    tensor already on the sweep device is cloned first.  Either way the call
+    leaves both of the caller's arrays as it found them."""
+    shape = (8, 10, 12)
+    denoiser = _pinned_denoiser(shape, device)
+    torch_device = denoiser.torch_device
+
+    for kind in ('numpy', 'tensor on the sweep device'):
+        stack = _ramp_stack(3, shape)
+        init = np.zeros_like(stack) + 0.25
+        if kind != 'numpy':
+            stack = torch.as_tensor(stack).to(torch_device)
+            init = torch.as_tensor(init).to(torch_device)
+        before_stack = stack.clone() if torch.is_tensor(stack) else stack.copy()
+        before_init = init.clone() if torch.is_tensor(init) else init.copy()
+
+        out, _ = denoiser.denoise_stack(stack, sigma_noise=0.1, init_stack=init,
+                                        max_iterations=2, stop_threshold_change_pct=0.0)
+        moved = (float(torch.max(torch.abs(out - before_init))) if torch.is_tensor(out)
+                 else float(np.max(np.abs(out - before_init))))
+        print(f"{kind}: the sweep moved the image by {moved:.3e}")
+        assert moved > 0                        # the sweep did run
+        if torch.is_tensor(stack):
+            assert torch.equal(stack, before_stack) and torch.equal(init, before_init)
+        else:
+            assert np.array_equal(stack, before_stack) and np.array_equal(init, before_init)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='needs a CUDA memory counter')
+def test_a_denoise_sweep_holds_the_same_memory_with_and_without_an_init_stack():
+    """The sweep holds two arrays per volume either way, so its peak does not
+    depend on whether an initial stack is given.  Only CUDA reports the peak,
+    so this runs there alone; it is the check that auto_batch_size no longer
+    needs to be told."""
+    shape = (16, 32, 32)
+    denoiser = _pinned_denoiser(shape, 'cuda')
+    stack = torch.as_tensor(_ramp_stack(4, shape)).cuda()
+
+    peaks = {}
+    for label, init in (('without init', None), ('with init', torch.zeros_like(stack) + 0.25)):
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        denoiser.denoise_stack(stack, sigma_noise=0.1, init_stack=init, batch_size=4,
+                               max_iterations=2, stop_threshold_change_pct=0.0)
+        torch.cuda.synchronize()
+        peaks[label] = torch.cuda.max_memory_allocated()
+    ratio = peaks['with init'] / peaks['without init']
+    print(f"peak bytes without init {peaks['without init']}, with init "
+          f"{peaks['with init']}, ratio {ratio:.3f}")
+    # One more array per volume would be a ratio near 1.5, since the sweep
+    # holds two; the tolerance covers the allocator's own rounding.
+    assert ratio < 1.15
+
+
 def test_denoise_stack_refuses_a_multi_device_denoiser():
     """The stack sweep runs on one device; a denoiser configured with two
     refuses rather than silently using the first.  Two 'virtual' CPU devices
@@ -651,7 +708,6 @@ def test_auto_batch_size_follows_the_device_budget():
         batch = on_cuda.auto_batch_size()
         print(f"auto_batch_size on cuda for {shape}: {batch}")
         assert isinstance(batch, int) and batch >= 1
-        assert on_cuda.auto_batch_size(init_supplied=True) <= batch
 
 
 def test_denoise_batch_ledger_scales_the_per_volume_terms_only():

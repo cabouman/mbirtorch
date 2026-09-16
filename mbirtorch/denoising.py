@@ -863,7 +863,7 @@ class QGGMRFDenoiser(TomographyModel):
         values = [float(v) for v in self.get_params(names)]
         return dict(zip(names, values))
 
-    def auto_batch_size(self, volume_shape=None, init_supplied=False):
+    def auto_batch_size(self, volume_shape=None):
         """
         Return the number of volumes :meth:`denoise_stack` sweeps at once when
         its ``batch_size`` is None.
@@ -876,15 +876,19 @@ class QGGMRFDenoiser(TomographyModel):
         reconstruction preflight uses.  The free memory is read when this
         method is called.  On other devices no memory budget can be read, and
         the result is None, which :meth:`denoise_stack` takes to mean the
-        whole stack.
+        whole stack.  A budget can be read on a CUDA device and on no other,
+        so on the CPU and on an Apple GPU the whole stack is swept at once.
+
+        The count does not depend on whether an initial stack is given.  The
+        sweep holds two arrays per volume either way: it writes its image in
+        place, starting from the initial stack when there is one and from a
+        copy of the input when there is not, and it releases the input once
+        the residual is formed.
 
         Args:
             volume_shape (tuple of int, optional): the shape of one volume.
                 Defaults to the denoiser's image shape, which is the only
                 shape this denoiser sweeps; any other shape raises.
-            init_supplied (bool, optional): whether the sweep will be given an
-                initial stack, which is one more image-shaped array per
-                volume.  Defaults to False.
 
         Returns:
             int or None: volumes per batch, or None when the device reports no
@@ -906,7 +910,6 @@ class QGGMRFDenoiser(TomographyModel):
         if budget is None:
             return None
         plan = _memory_ledger.plan_from_model(self, [device], workload='denoise')
-        plan.init_recon_supplied = bool(init_supplied)
         ledger = _memory_ledger.estimate_peak_device_bytes(plan)
         batch = _memory_ledger.largest_denoise_batch(
             ledger, budget, margin=self.memory_preflight_margin)
@@ -1015,7 +1018,7 @@ class QGGMRFDenoiser(TomographyModel):
         else:
             out = np.empty(stack_shape, dtype=np.float32)
         if batch_size is None:
-            batch_size = self.auto_batch_size(init_supplied=init_stack is not None)
+            batch_size = self.auto_batch_size()
         if batch_size is None or int(batch_size) > num_volumes:
             batch_size = num_volumes
         batch_size = int(batch_size)
@@ -1058,10 +1061,17 @@ class QGGMRFDenoiser(TomographyModel):
 
         def flat_on_device(block):
             """A block of volumes as a float32 (B, num_pixels, num_slices)
-            tensor on the sweep device."""
+            tensor on the sweep device, and whether that tensor is a copy.
+
+            A block that crosses from the host, or changes device or dtype,
+            arrives as a copy the sweep may write into.  A caller's tensor
+            that already sits on the sweep device in float32 is returned as
+            it is, and must be cloned before the sweep writes it.
+            """
             tensor = block if torch.is_tensor(block) else torch.as_tensor(block)
-            tensor = tensor.to(device=device, dtype=torch.float32)
-            return tensor.reshape(tensor.shape[0], num_pixels, num_slices)
+            moved = tensor.to(device=device, dtype=torch.float32)
+            return (moved.reshape(moved.shape[0], num_pixels, num_slices),
+                    moved is not tensor)
 
         def padded(flat, pad):
             """The block with its last volume repeated pad more times."""
@@ -1075,11 +1085,27 @@ class QGGMRFDenoiser(TomographyModel):
             for b0 in range(0, num_volumes, batch_size):
                 b1 = min(b0 + batch_size, num_volumes)
                 pad = batch_size - (b1 - b0)
-                flat = padded(flat_on_device(stack[b0:b1]), pad)
-                init_flat = (flat if init_stack is None
-                             else padded(flat_on_device(init_stack[b0:b1]), pad))
-                flat_image = init_flat.clone().contiguous()
+                flat, _ = flat_on_device(stack[b0:b1])
+                flat = padded(flat, pad)
+                if init_stack is None:
+                    # The sweep writes its image in place, so it starts from a
+                    # copy of the input rather than from the input itself.
+                    flat_image = flat.clone()
+                else:
+                    init_flat, owned = flat_on_device(init_stack[b0:b1])
+                    if pad:
+                        init_flat, owned = padded(init_flat, pad), True
+                    # A copy made on the way to the device already belongs to
+                    # the sweep; a caller's tensor that was already here does
+                    # not, and is cloned so that the call never writes it.
+                    flat_image = init_flat if owned else init_flat.clone()
+                flat_image = flat_image.contiguous()
                 flat_error_image = (flat - flat_image).contiguous()
+                # The identity forward model carries the data term in the
+                # residual, so the input block is not read again.  Releasing
+                # it here leaves the sweep holding two arrays per volume
+                # whether or not an initial stack was given.
+                del flat
                 counts, history = self._sweep_stack(
                     flat_image, flat_error_image, partition, fm_constant,
                     qggmrf_params, image_shape, max_iterations, stop_thresh,

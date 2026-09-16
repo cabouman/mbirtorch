@@ -649,7 +649,7 @@ class MACE4DModel(ParameterHandler):
             image_for_statistics, global_sigma, pool[0])
         for _, axis in _ORIENTATIONS:
             image_shape, params, batch_size = self._configure_orientation(
-                axis, image_for_statistics, global_sigma, sigma_x, pool[0], denoiser_warm_start)
+                axis, image_for_statistics, global_sigma, sigma_x, pool[0])
             batch_sizes.append(batch_size)
             make = self._stack_denoiser_factory(image_shape, params, global_sigma, batch_size,
                                                 iteration_counts, counts_lock)
@@ -781,7 +781,7 @@ class MACE4DModel(ParameterHandler):
         regularization = denoiser.auto_set_regularization_params_from_stack(image)
         return (float(regularization['sigma_x']), 'estimated from the initial image', spread)
 
-    def _configure_orientation(self, axis, x0, sigma, sigma_x, device, init_supplied):
+    def _configure_orientation(self, axis, x0, sigma, sigma_x, device):
         """The volume shape, the denoiser parameters, and the batch size of
         one orientation.
 
@@ -798,7 +798,7 @@ class MACE4DModel(ParameterHandler):
         num_subsets = max(1, min(int(denoiser.get_params('granularity')[0]), num_pixels // 64))
         denoiser.set_params(no_warning=True, granularity=[num_subsets], partition_sequence=[0],
                             auto_regularize_flag=False)
-        batch_size = denoiser.auto_batch_size(init_supplied=init_supplied)
+        batch_size = denoiser.auto_batch_size()
         params = dict(sigma_noise=sigma, sigma_y=sigma, sigma_x=sigma_x,
                       granularity=[num_subsets], partition_sequence=[0],
                       auto_regularize_flag=False, **self._prior_params())
