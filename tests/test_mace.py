@@ -319,19 +319,23 @@ def test_fold_after_all_folds_the_agents_pieces():
         fold_after_all = True
 
         def tasks(self, w, iteration=0):
-            self._held = {}
+            # The pieces are held as (region, output) pairs rather than in a
+            # dict keyed by the region.  A slice is hashable only from Python
+            # 3.12, and the package supports 3.11, where a region used as a
+            # dict key raises TypeError.
+            self._held = []
             tasks = []
             for start in range(0, int(w.shape[0]), 2):
                 region = (slice(start, start + 2),) + (slice(None),) * (w.ndim - 1)
 
                 def run(device, region=region, w=w):
-                    self._held[region] = self._apply(w[region])
+                    self._held.append((region, self._apply(w[region])))
                     return None
                 tasks.append(Task(run, device=None, region=region))
             return tasks
 
         def pieces(self):
-            for region, out in self._held.items():
+            for region, out in self._held:
                 yield region, 2.0 * out
 
     x0 = torch.randn(6, 3)
