@@ -736,6 +736,43 @@ def test_stack_regularization_uses_every_volume_of_a_small_stack():
     assert denoiser.get_params('sigma_x') == 0.5
 
 
+def test_the_recon_std_estimate_matches_the_form_it_replaced(device):
+    """The estimate is read from shifted views of the image instead of from
+    an index array, which holds about a quarter of the memory.  The value is
+    unchanged: the two forms agree on a random image, on an object with a
+    background around it, and on a ramp, over the whole image and over the
+    thresholded support."""
+    def gathered(image, support):
+        """The form this replaced: gather the voxel and its three backward
+        neighbors through np.where, then take the spread of the four."""
+        inds = np.where(support)
+        values = np.stack([image[inds[0], inds[1], inds[2]],
+                           image[inds[0] - 1, inds[1], inds[2]],
+                           image[inds[0], inds[1] - 1, inds[2]],
+                           image[inds[0], inds[1], inds[2] - 1]], axis=0)
+        return np.mean(np.std(values, axis=0))
+
+    shape = (20, 24, 18)
+    rng = np.random.default_rng(0)
+    images = {'random': rng.standard_normal(shape).astype(np.float32)}
+    block = np.zeros(shape, np.float32)
+    block[5:15, 6:18, 4:14] = 1.0
+    images['object'] = block + 0.05 * rng.standard_normal(shape).astype(np.float32)
+    axes = np.meshgrid(*[np.linspace(0, 1, n) for n in shape], indexing='ij')
+    images['ramp'] = (axes[0] + 2 * axes[1] - axes[2]).astype(np.float32)
+
+    denoiser = _auto_denoiser(shape, device)
+    for name, image in images.items():
+        for label, support in (('whole', np.ones(shape, np.int8)),
+                               ('support', denoiser._get_sino_indicator(image, sigma_noise=0.0))):
+            new_value = denoiser._get_estimate_of_recon_std(image, support)
+            old_value = gathered(image, support)
+            rel = _rel(float(new_value), float(old_value))
+            print(f"{name} over the {label}: {float(new_value):.9g} vs {float(old_value):.9g} "
+                  f"(rel {rel:.2e})")
+            assert rel < 1e-6
+
+
 def test_stack_regularization_subsamples_whole_volumes_of_a_large_stack(monkeypatch):
     """Above 39 volumes about 20 are chosen, evenly spaced, by the rule
     subsample_views applies to views.  Which volumes cross to the host is

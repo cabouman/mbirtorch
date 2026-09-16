@@ -322,13 +322,42 @@ class QGGMRFDenoiser(TomographyModel):
 
     def _get_estimate_of_recon_std(self, noisy_image, support_indicator):
         """Neighbor-difference std over the support (the denoiser's own recon-std
-        estimate, replacing the projection-path-length formula)."""
-        inds = np.where(support_indicator)
-        vals = np.stack([noisy_image[inds[0], inds[1], inds[2]],
-                         noisy_image[inds[0] - 1, inds[1], inds[2]],
-                         noisy_image[inds[0], inds[1] - 1, inds[2]],
-                         noisy_image[inds[0], inds[1], inds[2] - 1]], axis=0)
-        return np.mean(np.std(vals, axis=0))
+        estimate, replacing the projection-path-length formula).
+
+        Each voxel of the support is compared with itself and with its three
+        backward neighbors, one per axis, and the mean of those per-voxel
+        standard deviations is returned.  A voxel on an edge takes its
+        neighbor from the far side, which is what indexing with -1 did.
+
+        The four values are read as shifted views of the image rather than
+        gathered through an index array.  The gather held about sixteen
+        arrays of the image's size, because ``np.where`` returns three int64
+        arrays and the stack of four gathered copies doubles again; the
+        shifted views hold about five at their peak, and the spread is taken
+        in two passes, which is stable.
+        """
+        def views():
+            """The voxel and its three backward neighbors, one array at a
+            time, so that only one shifted copy exists at once."""
+            yield noisy_image
+            for axis in range(3):
+                yield np.roll(noisy_image, 1, axis=axis)
+
+        count = 4
+        mean = np.array(noisy_image, dtype=noisy_image.dtype, copy=True)
+        for index, value in enumerate(views()):
+            if index:
+                mean += value
+        mean /= count
+        spread = np.zeros_like(mean)
+        deviation = np.empty_like(mean)
+        for value in views():
+            np.subtract(value, mean, out=deviation)
+            deviation *= deviation
+            spread += deviation
+        spread /= count
+        np.sqrt(spread, out=spread)
+        return np.mean(spread[support_indicator.astype(bool)])
 
     def _get_sino_indicator(self, noisy_image, sigma_noise=None, verbose=1):
         """Binary support indicator for the noisy image: threshold at a small
