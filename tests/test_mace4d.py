@@ -258,7 +258,7 @@ def test_a_three_frame_reconstruction_runs_and_logs(device, tmp_path):
     timing = _read_rows(os.path.join(log_dir, 'timing_log.csv'))[0]
     print(f"{device}: change {float(timing['consensus_change_pct']):.3f}%, "
           f"mean denoiser iterations {float(timing['denoise_mean_iterations']):.1f}, "
-          f"sigma_x {recon_dict['recon_params']['denoiser sigma_x [xyt, yzt, xzt]']}")
+          f"sigma_x {recon_dict['recon_params']['denoiser sigma_x']}")
     # From a cold start the sweeps never reach the 0.2 percent threshold on
     # this problem, so every volume runs the cap of 15 iterations.
     assert float(timing['denoise_mean_iterations']) == 15.0
@@ -304,9 +304,89 @@ def test_the_other_settings_run_and_are_recorded(tmp_path):
     assert settings['beta [fwd, xyt, yzt, xzt]'] == [0.4, 0.1, 0.2, 0.3]
     text = open(os.path.join(log_dir, 'run_info.txt')).read()
     assert 'sigma_prox' in text and '0.05' in text
-    # The denoiser warm start shows in the second iteration's sweep count,
-    # which is below the cap the cold start always reaches.
-    assert recon_dict['timing'][1]['denoise_mean_iterations'] < 15.0
+    assert settings['denoiser stop_threshold_change_pct'] == 0.05
+    # The denoiser warm start changes the result.  It no longer shows in the
+    # sweep counts: at the 0.05 percent stop threshold both settings run every
+    # sweep to the cap of 15 on this problem, so the two runs are compared.
+    mace.set_params(denoiser_warm_start=False)
+    np.random.seed(0)
+    cold, _ = mace.recon(_smooth_sino(), init_recon=init, max_iterations=2,
+                         stop_threshold_change_pct=0)
+    print(f"denoiser warm start on vs off: rel_max = {_rel_max(recon, cold):.2e}")
+    assert _rel_max(recon, cold) > 1e-2
+
+
+def test_set_device_pool_refuses_a_repeated_gpu_and_honors_the_pin():
+    """The pool of a 4D model refuses a GPU named twice, keeps a repeated CPU,
+    and honors the device-count pin: the suite pins the count to one, so the
+    automatic pool holds one device and a request for two raises with a
+    message that names the variable."""
+    mace = MACE4DModel(_small_model(), num_frames=3)
+    for spelling in ('cuda:0', 'mps'):
+        with pytest.raises(ValueError, match='more than once'):
+            mace.set_device_pool([spelling, spelling])
+    mace.set_device_pool(['cpu', 'cpu'])
+    assert mace.devices == [torch.device('cpu')] * 2
+    mace.set_device_pool()
+    assert len(mace.devices) == 1
+    with pytest.raises(ValueError, match='MBIRTORCH_NUM_DEVICES'):
+        mace.set_device_pool(2)
+
+
+def test_the_denoiser_strength_parameters_are_public(tmp_path):
+    """sigma_noise and sigma_x pin the denoisers' strength through the public
+    interface, and the run settings record both values, where each came from,
+    the neighbor weight of the frame direction, and the spread of the initial
+    image along time against space."""
+    mace = MACE4DModel(_small_model(), num_frames=3)
+    mace.set_params(dejitter=False, verbose=0, sigma_noise=0.01)
+    with pytest.warns(UserWarning, match='auto-regularization'):
+        mace.set_params(sigma_x=0.002)
+    mace.set_device_pool(['cpu'])
+    shape = (3,) + mace.recon_shape
+    init = np.linspace(0.0, 0.1, int(np.prod(shape)), dtype=np.float32).reshape(shape)
+    init += 0.01 * np.random.default_rng(4).standard_normal(shape).astype(np.float32)
+    log_dir = str(tmp_path / 'logs')
+    np.random.seed(0)
+    recon, recon_dict = mace.recon(_smooth_sino(), init_recon=init, max_iterations=1,
+                                   stop_threshold_change_pct=0, log_dir=log_dir)
+    assert np.all(np.isfinite(recon))
+    settings = recon_dict['recon_params']
+    assert settings['denoiser sigma (global)'] == pytest.approx(0.01)
+    assert settings['denoiser sigma source'] == 'set by sigma_noise'
+    assert settings['denoiser sigma_x'] == pytest.approx(0.002)
+    assert settings['denoiser sigma_x source'] == 'set by sigma_x'
+    assert settings['nbr_weight_time'] == 1.0
+    ratio = settings['temporal over spatial spread']
+    assert np.isfinite(ratio) and ratio > 0
+    assert settings['spread read from'].startswith('3 frames, stride 1')
+    assert 'nbr_weight_time' in open(os.path.join(log_dir, 'run_info.txt')).read()
+    print(f"strength parameters: sigma {settings['denoiser sigma (global)']}, "
+          f"sigma_x {settings['denoiser sigma_x']}, temporal/spatial spread {ratio:.3f}")
+
+
+def test_nbr_weight_time_reaches_the_denoisers():
+    """The frame-direction neighbor weight changes the reconstruction, and
+    qggmrf_nbr_wts is refused because its three entries would name different
+    directions in the three hyperplane volumes."""
+    shape = None
+    results = {}
+    for weight in (1.0, 0.1):
+        mace = MACE4DModel(_small_model(), num_frames=3)
+        mace.set_params(dejitter=False, verbose=0, nbr_weight_time=weight)
+        mace.set_device_pool(['cpu'])
+        shape = (3,) + mace.recon_shape
+        init = np.linspace(0.0, 0.1, int(np.prod(shape)), dtype=np.float32).reshape(shape)
+        init += 0.01 * np.random.default_rng(4).standard_normal(shape).astype(np.float32)
+        np.random.seed(0)
+        results[weight], _ = mace.recon(_smooth_sino(), init_recon=init, max_iterations=2,
+                                        stop_threshold_change_pct=0)
+    rel = _rel_max(results[1.0], results[0.1])
+    print(f"nbr_weight_time 1.0 vs 0.1: rel_max = {rel:.2e}")
+    assert rel > 1e-3
+
+    with pytest.raises(ValueError, match='nbr_weight_time'):
+        MACE4DModel(_small_model(), num_frames=3).set_params(qggmrf_nbr_wts=[1.0, 1.0, 1.0])
 
 
 def test_data_fit_agent_without_a_stack_folds_each_frame_as_it_completes():
@@ -625,10 +705,10 @@ def test_the_filter_path_runs_end_to_end(tmp_path):
     rel = _rel_max(recon, unfiltered)
     print(f"filter on vs off: rel_max = {rel:.2e}")
     assert rel > 1e-2                        # the filter is applied, not merely recorded
-    # With the filter on, the denoiser strengths are estimated from the
-    # filtered initial image, so they differ from the filter-off values.
-    assert recon_dict['recon_params']['denoiser sigma_x [xyt, yzt, xzt]'] != \
-        unfiltered_dict['recon_params']['denoiser sigma_x [xyt, yzt, xzt]']
+    # With the filter on, the denoiser strength is estimated from the
+    # filtered initial image, so it differs from the filter-off value.
+    assert recon_dict['recon_params']['denoiser sigma_x'] != \
+        unfiltered_dict['recon_params']['denoiser sigma_x']
     assert recon_dict['recon_params']['dejitter'] is True
     # Period 4 over 4 frames: harmonics 1 and 2, periods 4 and 2; three modes removed, one kept.
     assert recon_dict['recon_params']['temporal filter'] == \
@@ -653,8 +733,8 @@ def test_one_frame_consensus_reproduces_the_standard_reconstruction(monkeypatch)
     rotation holds every view, which converges where a limited-angle frame
     does not.  With one frame each hyperplane volume has 32 pixels, so the
     denoisers run one subset, the regime the class is verified in.  The
-    denoiser sigma and sigma_x are pinned through a test-only subclass,
-    because no public parameter reaches them."""
+    denoiser sigma and sigma_x are pinned through the public parameters
+    sigma_noise and sigma_x."""
     num_views, det = 64, 32
     phantom, sinogram, params = mbirtorch.generate_demo_data(
         model_type='cone', object_type='shepp-logan', num_views=num_views,
@@ -698,19 +778,6 @@ def test_one_frame_consensus_reproduces_the_standard_reconstruction(monkeypatch)
     assert reference_error < 5e-3
     assert start_distance > 0.01
 
-    class _Pinned(MACE4DModel):
-        """The model with the denoiser sigma and sigma_x pinned to the values
-        the gate needs, which no public parameter reaches."""
-
-        @staticmethod
-        def _estimate_global_sigma(init_recon, device):
-            return sigma_prox * math.sqrt(1.5)
-
-        def _configure_orientation(self, axis, x0, sigma, device, init_supplied):
-            shape, denoiser_params, batch_size = super()._configure_orientation(
-                axis, x0, sigma, device, init_supplied)
-            return shape, dict(denoiser_params, sigma_x=sigma_x), batch_size
-
     trace = []
     original_step = mace_module.MACE.step
 
@@ -720,15 +787,23 @@ def test_one_frame_consensus_reproduces_the_standard_reconstruction(monkeypatch)
         return change
     monkeypatch.setattr(mace_module.MACE, 'step', recording_step)
 
-    gate = _Pinned(scan_model(), num_frames=1, **frames)
-    gate.set_params(dejitter=False, verbose=0, mace_prior_weight=0.5, rho_mann=0.5)
+    gate = MACE4DModel(scan_model(), num_frames=1, **frames)
+    gate.set_params(dejitter=False, verbose=0, mace_prior_weight=0.5, rho_mann=0.5,
+                    sigma_noise=sigma_prox * math.sqrt(1.5))
+    # Setting sigma_x pins the denoisers' strength, and disables the estimate
+    # with the warning every model gives for a directly-set regularization
+    # parameter.
+    with pytest.warns(UserWarning, match='auto-regularization'):
+        gate.set_params(sigma_x=sigma_x)
     gate.set_device_pool(['cpu'])
     np.random.seed(0)
     x, recon_dict = gate.recon(sinogram, weights=weights, init_recon=start[None],
                                max_iterations=40, stop_threshold_change_pct=0.0)
     settings = recon_dict['recon_params']
     assert settings['denoiser sigma (global)'] == pytest.approx(sigma_prox * math.sqrt(1.5))
-    assert settings['denoiser sigma_x [xyt, yzt, xzt]'] == [sigma_x] * 3
+    assert settings['denoiser sigma_x'] == pytest.approx(sigma_x)
+    assert settings['denoiser sigma_x source'] == 'set by sigma_x'
+    assert settings['denoiser sigma source'] == 'set by sigma_noise'
     assert settings['beta [fwd, xyt, yzt, xzt]'] == [0.5, 0.1667, 0.1667, 0.1667]
     print(f"one-frame gate: NRMSE to recon(200) after 10/20/30/40 iterations = "
           f"{trace[9]:.4f} / {trace[19]:.4f} / {trace[29]:.4f} / {trace[39]:.4f}")

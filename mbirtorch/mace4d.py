@@ -30,9 +30,13 @@ from .utilities import construct_time_frame_models
 
 # Iterations of the per-frame reconstruction that initializes the 4D image.
 _INIT_ITERATIONS = 15
-# Iterations and stop threshold of each denoiser sweep.
+# Iterations and stop threshold of each denoiser sweep.  The threshold is
+# tighter than the 0.2 percent a standalone denoise uses.  Each sweep here can
+# start from the denoiser's previous output, and it then changes the image
+# little per iteration, so the looser value stops the sweep before it reaches
+# the solution it is converging to.
 _DENOISE_MAX_ITERATIONS = 15
-_DENOISE_STOP_THRESHOLD_PCT = 0.2
+_DENOISE_STOP_THRESHOLD_PCT = 0.05
 # The filter is applied to the data-fit outputs in slabs of about this size.
 _FILTER_SLAB_BYTES = 64 * 2 ** 20
 
@@ -163,6 +167,80 @@ def _describe_filter(matrix, num_frames, period):
 def _permutation(axis):
     """The axis order that puts ``axis`` first and the frame axis second."""
     return (axis,) + tuple(d for d in range(4) if d != axis)
+
+
+def _centered_block(shape, num_frames, point_budget):
+    """The slices of a block centered in each axis of ``shape`` that holds at
+    most ``point_budget`` entries over ``num_frames`` frames."""
+    total = int(num_frames) * int(np.prod(shape))
+    scale = 1.0 if total <= point_budget else (point_budget / total) ** (1.0 / len(shape))
+    block = []
+    for extent in shape:
+        width = int(min(int(extent), max(1, round(int(extent) * scale))))
+        start = (int(extent) - width) // 2
+        block.append(slice(start, start + width))
+    return tuple(block)
+
+
+def _rms_neighbor_difference(values, support, axes):
+    """The root mean square of the difference between neighboring entries
+    along ``axes``, over the entries that ``support`` holds.  None when the
+    support holds no such pair."""
+    total, count = 0.0, 0
+    for axis in axes:
+        if values.shape[axis] < 2:
+            continue
+        head, tail = [slice(None)] * values.ndim, [slice(None)] * values.ndim
+        head[axis], tail[axis] = slice(1, None), slice(None, -1)
+        mask = support[tuple(head)]
+        difference = (values[tuple(head)] - values[tuple(tail)])[mask]
+        total += float(np.sum(np.square(difference, dtype=np.float64)))
+        count += int(difference.size)
+    return None if count == 0 else float(np.sqrt(total / count))
+
+
+def _spread_along_time(image, chosen, sigma_noise, point_budget=5_000_000):
+    """The spread of the image along the frame axis against its spread along
+    the three spatial axes.
+
+    Each spread is the root mean square of a neighbor difference over the
+    voxels that hold the object.  Their ratio says how much a voxel changes
+    between frames compared with how much it changes between adjacent voxels,
+    which is the quantity ``nbr_weight_time`` balances.  A ratio well below
+    one means the object is nearly still at this frame rate, so the denoisers
+    can smooth along time without blurring motion.
+
+    The ratio is read from the frames in ``chosen``, which are the frames the
+    strength estimate reads, over a block centered in the three spatial axes
+    that holds at most ``point_budget`` voxels.  Those frames are evenly
+    spaced, so when they lie a stride apart the temporal difference is taken
+    across that stride rather than between adjacent frames.
+
+    Args:
+        image (tensor): the 4D image, of shape ``(frames, x, y, z)``.
+        chosen (numpy): the indices of the frames to read.
+        sigma_noise (float): the noise level, which sets the threshold that
+            separates the object from the background.
+        point_budget (int, optional): the most voxels to read per frame set.
+
+    Returns:
+        dict: the ratio, the two spreads, the number of frames read, the
+        stride between them, and the shape of the block.  The ratio is None
+        when fewer than two frames are chosen or the object is not found.
+    """
+    chosen = np.asarray(chosen, dtype=int).ravel()
+    stride = int(chosen[1] - chosen[0]) if chosen.size > 1 else 1
+    block = _centered_block(tuple(int(n) for n in image.shape[1:]), chosen.size, point_budget)
+    frames = np.stack([np.asarray(image[int(t)][block], dtype=np.float32) for t in chosen])
+    threshold = 0.05 * float(np.mean(np.abs(frames))) + float(sigma_noise)
+    threshold = min(threshold, float(np.amax(frames)))
+    support = frames >= threshold
+    temporal = _rms_neighbor_difference(frames, support, (0,))
+    spatial = _rms_neighbor_difference(frames, support, (1, 2, 3))
+    ratio = None if temporal is None or not spatial else temporal / spatial
+    return {'ratio': ratio, 'temporal': temporal, 'spatial': spatial,
+            'frames read': int(chosen.size), 'stride': stride,
+            'block': tuple(int(n) for n in frames.shape[1:])}
 
 
 # ── the data-fit agent ───────────────────────────────────────────────────────
@@ -299,7 +377,8 @@ class MACE4DModel(ParameterHandler):
                         mace_prior_weight=0.5, rho_mann=0.5, prox_num_iterations=3,
                         prox_stop_threshold=0.02, prox_partition_advance=1.0,
                         prox_warm_start=True, denoiser_warm_start=False, sigma_prox=None,
-                        dejitter=True, dejitter_verbose=0)
+                        dejitter=True, dejitter_verbose=0,
+                        sigma_noise=None, nbr_weight_time=1.0, sharpness=0.0)
         self._devices = None
 
     def refresh_device_bindings(self):
@@ -342,13 +421,41 @@ class MACE4DModel(ParameterHandler):
                 Defaults to True.
             dejitter_verbose (int): log the periods the filter removes and
                 the modes it keeps.  Defaults to 0.
+            sigma_noise (float or None): the noise level of all three
+                denoisers.  None estimates it from the initial image.
+                Defaults to None.
+            sigma_x (float): the prior strength of all three denoisers.
+                Setting it disables the automatic estimate, as it does for
+                every model.  Defaults to the estimate.
+            sharpness (float): scales the automatic ``sigma_x``.  It scales
+                the denoisers alone; each frame's own prior takes its
+                sharpness from ``ct_model``.  Defaults to 0.
+            nbr_weight_time (float): the weight of a frame neighbor against a
+                spatial neighbor in the denoisers' priors.  The frame
+                direction appears in all three hyperplane volumes and each
+                spatial direction in two of them, so the default of 1.0 gives
+                a frame neighbor 1.5 times the weight of a spatial one, and
+                2/3 makes the two equal.  Defaults to 1.0.
             verbose (int): 0 is silent, 1 reports progress.  Defaults to 1.
+
+        Raises:
+            ValueError: if ``qggmrf_nbr_wts`` is set.  Use
+                ``nbr_weight_time``.
 
         Example:
             >>> mace.set_params(mace_prior_weight=0.5, rho_mann=0.5, dejitter=True)
         """
         if 'mace_prior_weight' in kwargs:
             _normalize_prior_weights(kwargs['mace_prior_weight'])
+        if 'qggmrf_nbr_wts' in kwargs:
+            raise ValueError(
+                'qggmrf_nbr_wts cannot be set on MACE4DModel.  Its three entries name '
+                'the row, column, and slice directions of one volume, but the three '
+                'hyperplane volumes are (t, x, y), (t, y, z), and (t, x, z), so the '
+                'column direction is x in one volume and y in another.  Only the frame '
+                'direction means the same thing in all three volumes.  Set '
+                'nbr_weight_time instead, which weights a frame neighbor against a '
+                'spatial neighbor.')
         # This model runs no reconstruction of its own, so setting sigma_prox
         # does not disable an auto-regularization, and the base class warning
         # about that is not raised.
@@ -370,8 +477,14 @@ class MACE4DModel(ParameterHandler):
         Args:
             devices (optional): None for every GPU or the CPU; ``'cpu'`` or
                 ``'gpu'``; a count of devices; a list of device indices; or a
-                list of devices, repeats allowed, one worker per entry.  See
+                list of devices, one worker per entry.  The CPU may be
+                repeated; a repeated GPU is refused.  None and a count are
+                capped by the count ``MBIRTORCH_NUM_DEVICES`` pins.  See
                 :func:`mbirtorch.mace.resolve_device_pool`.
+
+        Raises:
+            ValueError: if the pool names a GPU more than once, or if a
+                requested count exceeds the devices available.
 
         Example:
             >>> mace.set_device_pool(2)
@@ -504,15 +617,22 @@ class MACE4DModel(ParameterHandler):
         x0 = torch.as_tensor(init_recon, dtype=torch.float32).contiguous()
 
         # ── the denoiser noise level, shared by the three orientations ───────
-        global_sigma = self._estimate_global_sigma(init_recon, pool[0])
+        given_sigma = self.get_params('sigma_noise')
+        if given_sigma is None:
+            global_sigma = self._estimate_global_sigma(init_recon, pool[0])
+            sigma_source = 'estimated from the initial image'
+        else:
+            global_sigma = float(given_sigma)
+            sigma_source = 'set by sigma_noise'
         if not np.isfinite(global_sigma) or global_sigma <= 0:
             raise ValueError(
-                f'The denoiser noise level estimated from the initial image is {global_sigma}, '
-                'which cannot be used.  A constant initial image gives this value.  Supply a '
-                'non-constant init_recon, or omit init_recon and let the model compute the '
-                'per-frame initialization.')
+                f'The denoiser noise level {sigma_source} is {global_sigma}, which cannot be '
+                'used.  A constant initial image gives this value.  Supply a non-constant '
+                'init_recon, omit init_recon and let the model compute the per-frame '
+                'initialization, or set sigma_noise to a positive value.')
         if verbose:
-            self.logger.info(f'[MACE] Global denoiser sigma = {global_sigma:.6g}')
+            self.logger.info(f'[MACE] Global denoiser sigma = {global_sigma:.6g} '
+                             f'({sigma_source})')
 
         # ── the agents ───────────────────────────────────────────────────────
         data_fit = _DataFitAgent(frame_agents, frame_devices, x0, filter_matrix,
@@ -520,16 +640,16 @@ class MACE4DModel(ParameterHandler):
         iteration_counts = []
         counts_lock = threading.Lock()
         priors = []
-        sigma_x_values = []
         batch_sizes = []
         # The denoisers receive filtered inputs when the filter is on, so
-        # their strength is estimated from the filtered initial image.
+        # their strength is set from the filtered initial image.
         image_for_statistics = (x0 if filter_matrix is None
                                 else apply_temporal_filter(x0, filter_matrix, axis=0))
+        sigma_x, sigma_x_source, spread = self._denoiser_sigma_x(
+            image_for_statistics, global_sigma, pool[0])
         for _, axis in _ORIENTATIONS:
             image_shape, params, batch_size = self._configure_orientation(
-                axis, image_for_statistics, global_sigma, pool[0], denoiser_warm_start)
-            sigma_x_values.append(params['sigma_x'])
+                axis, image_for_statistics, global_sigma, sigma_x, pool[0], denoiser_warm_start)
             batch_sizes.append(batch_size)
             make = self._stack_denoiser_factory(image_shape, params, global_sigma, batch_size,
                                                 iteration_counts, counts_lock)
@@ -538,12 +658,12 @@ class MACE4DModel(ParameterHandler):
                                           use_warm_start=denoiser_warm_start))
         del image_for_statistics
         if verbose:
-            self.logger.info(f'[MACE] Denoiser sigma_x [xyt, yzt, xzt] = {sigma_x_values}; '
+            self.logger.info(f'[MACE] Denoiser sigma_x = {sigma_x:.6g} ({sigma_x_source}); '
                              f'batch sizes [xyt, yzt, xzt] = {batch_sizes}')
 
-        run_settings = self._run_settings(pool, init_source, global_sigma, weights,
-                                          max_iterations, stop_threshold_change_pct,
-                                          sigma_x_values, batch_sizes)
+        run_settings = self._run_settings(pool, init_source, global_sigma, sigma_source,
+                                          weights, max_iterations, stop_threshold_change_pct,
+                                          sigma_x, sigma_x_source, spread, batch_sizes)
         run_settings['dejitter'] = dejitter
         if dejitter_note is not None:
             run_settings['temporal filter'] = dejitter_note
@@ -623,15 +743,55 @@ class MACE4DModel(ParameterHandler):
         return result, recon_dict
 
     # ── the denoisers ────────────────────────────────────────────────────────
-    def _configure_orientation(self, axis, x0, sigma, device, init_supplied):
+    def _prior_params(self):
+        """The qGGMRF parameters the class gives to every denoiser.
+
+        ``sharpness`` is not among them.  It scales the automatic strength,
+        which is estimated once for the whole volume, and setting it on a
+        denoiser would turn that denoiser's own automatic regularization back
+        on.  The frame axis is the row axis of every hyperplane volume, so
+        ``nbr_weight_time`` is the first neighbor weight.
+        """
+        p, q, T = self.get_params(['p', 'q', 'T'])
+        nbr_weight_time = float(self.get_params('nbr_weight_time'))
+        return dict(p=float(p), q=float(q), T=float(T),
+                    qggmrf_nbr_wts=[nbr_weight_time, 1.0, 1.0])
+
+    def _denoiser_sigma_x(self, image, global_sigma, device):
+        """The prior strength of all three denoisers, where it came from, and
+        the spread of the image along time against space.
+
+        One strength is used for the whole 4D volume, because the three
+        hyperplane priors add up to one 4D prior only when they share it.  It
+        is estimated from the image as a stack of frames, so that every
+        neighbor difference the estimate reads lies inside one frame.
+        Setting ``sigma_x`` disables the estimate and the given value is used.
+        """
+        num_frames = int(image.shape[0])
+        frame_shape = tuple(int(n) for n in image.shape[1:])
+        denoiser = QGGMRFDenoiser(frame_shape)
+        denoiser.configure_devices(devices=[device])
+        denoiser.set_params(no_warning=True, verbose=0, sigma_noise=global_sigma,
+                            sigma_y=global_sigma, sharpness=self.get_params('sharpness'),
+                            **self._prior_params())
+        chosen = denoiser.subsample_views(np.arange(num_frames))
+        spread = _spread_along_time(image, chosen, global_sigma)
+        if not self.get_params('auto_regularize_flag'):
+            return float(self.get_params('sigma_x')), 'set by sigma_x', spread
+        regularization = denoiser.auto_set_regularization_params_from_stack(image)
+        return (float(regularization['sigma_x']), 'estimated from the initial image', spread)
+
+    def _configure_orientation(self, axis, x0, sigma, sigma_x, device, init_supplied):
         """The volume shape, the denoiser parameters, and the batch size of
-        one orientation, set from the initial image."""
-        stack = x0.permute(_permutation(axis)).contiguous()
-        image_shape = tuple(int(n) for n in stack.shape[1:])
+        one orientation.
+
+        Every orientation is given the same noise level and the same prior
+        strength, so that the three priors add up to one 4D prior.
+        """
+        image_shape = tuple(int(x0.shape[d]) for d in _permutation(axis)[1:])
         denoiser = QGGMRFDenoiser(image_shape)
         denoiser.configure_devices(devices=[device])
         denoiser.set_params(no_warning=True, verbose=0, sigma_noise=sigma, sigma_y=sigma)
-        regularization = denoiser.auto_set_regularization_params_from_stack(stack)
         # A subset with fewer than about 64 pixels makes the line search
         # compute zero over zero on flat regions.
         num_pixels = image_shape[0] * image_shape[1]
@@ -639,9 +799,9 @@ class MACE4DModel(ParameterHandler):
         denoiser.set_params(no_warning=True, granularity=[num_subsets], partition_sequence=[0],
                             auto_regularize_flag=False)
         batch_size = denoiser.auto_batch_size(init_supplied=init_supplied)
-        params = dict(sigma_noise=sigma, sigma_y=sigma, sigma_x=regularization['sigma_x'],
-                      sigma_prox=regularization['sigma_prox'], granularity=[num_subsets],
-                      partition_sequence=[0], auto_regularize_flag=False)
+        params = dict(sigma_noise=sigma, sigma_y=sigma, sigma_x=sigma_x,
+                      granularity=[num_subsets], partition_sequence=[0],
+                      auto_regularize_flag=False, **self._prior_params())
         return image_shape, params, batch_size
 
     @staticmethod
@@ -767,8 +927,9 @@ class MACE4DModel(ParameterHandler):
             raise ValueError(f'init_recon shape {init_recon.shape} does not match expected {expected}.')
         return init_recon
 
-    def _run_settings(self, pool, init_source, global_sigma, weights, max_iterations,
-                      stop_threshold_change_pct, sigma_x_values, batch_sizes):
+    def _run_settings(self, pool, init_source, global_sigma, sigma_source, weights,
+                      max_iterations, stop_threshold_change_pct, sigma_x, sigma_x_source,
+                      spread, batch_sizes):
         """The settings of a run, for ``run_info.txt`` and the result dict."""
         from . import __version__
         beta = _normalize_prior_weights(self.get_params('mace_prior_weight'))
@@ -793,7 +954,17 @@ class MACE4DModel(ParameterHandler):
             'denoiser_warm_start': self.get_params('denoiser_warm_start'),
             'sigma_prox': 'auto' if sigma_prox is None else sigma_prox,
             'denoiser sigma (global)': float(global_sigma),
-            'denoiser sigma_x [xyt, yzt, xzt]': [float(s) for s in sigma_x_values],
+            'denoiser sigma source': sigma_source,
+            'denoiser sigma_x': float(sigma_x),
+            'denoiser sigma_x source': sigma_x_source,
+            'denoiser sharpness': self.get_params('sharpness'),
+            'denoiser stop_threshold_change_pct': _DENOISE_STOP_THRESHOLD_PCT,
+            'nbr_weight_time': float(self.get_params('nbr_weight_time')),
+            'nbr_weight_time note': ('1.0 weights a frame neighbor 1.5 times a spatial '
+                                     'neighbor; 2/3 weights them equally'),
+            'temporal over spatial spread': spread['ratio'],
+            'spread read from': (f"{spread['frames read']} frames, stride {spread['stride']}, "
+                                 f"block {spread['block']}"),
             'denoise batch sizes [xyt, yzt, xzt]': list(batch_sizes),
             'dejitter': self.get_params('dejitter'),
             'frames_per_rotation': self.frames_per_rotation,
