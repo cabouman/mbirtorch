@@ -51,7 +51,8 @@ extensions = [
     'sphinxcontrib.bibtex',
     'sphinx.ext.viewcode',
     'sphinx_design',
-    'sphinx_copybutton'
+    'sphinx_copybutton',
+    'sphinxext.opengraph'
 ]
 
 
@@ -155,6 +156,17 @@ html_static_path = ["_static"]
 html_css_files = [
     'custom_styles.css',
 ]
+
+# Open Graph / social link preview.  Pasting a documentation URL into a
+# chat, a post, or a message shows the card in _static/mbirtorch_card.png,
+# made by dev_scripts/make_social_card.py.  ogp_site_url makes the card and
+# page URLs absolute, which link-preview crawlers require.
+ogp_site_url = 'https://mbirtorch.readthedocs.io/en/latest/'
+ogp_image = 'https://mbirtorch.readthedocs.io/en/latest/_static/mbirtorch_card.png'
+ogp_image_alt = 'MBIRTorch: model-based iterative tomographic reconstruction in PyTorch'
+ogp_type = 'website'
+ogp_enable_meta_description = True
+ogp_social_cards = {'enable': False}    # use the card image, not per-page cards
 
 # Output file base name for HTML help builder.
 htmlhelp_basename = project + 'doc'
