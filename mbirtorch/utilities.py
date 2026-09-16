@@ -882,6 +882,176 @@ def get_top_level_tar_dir(tar_path, max_entries=1):
     return dir_name
 
 
+def save_volume_as_gif(volume, filename, frame_axis=None, slice_axis=None, slice_index=None,
+                       vmin=None, vmax=None, fps=5):
+    """
+    Save a 3D or 4D volume as an animated GIF by looping over one axis.
+
+    ``frame_axis`` is the looping axis, and the GIF gets one frame per index along it.
+    For a 3D volume, each frame shows the two remaining axes.  A 4D volume must first be
+    reduced to 3D, so ``slice_axis`` is held fixed at ``slice_index``.  With the defaults,
+    a 4D volume of shape (num_times, nx, ny, nz) plays over time at the middle x slice,
+    and a 3D volume of shape (nx, ny, nz) plays over x.
+
+    Choosing both axes selects the displayed plane.  For a 4D volume, the four useful
+    combinations give a movie of a YZ, XZ or XY plane playing over time, or a movie that
+    steps through the slices of a single time frame (``slice_axis=0``).
+
+    A frame shows its two axes in increasing order, with the lower-numbered axis
+    vertical.  This is the layout that :func:`mbirtorch.slice_viewer` uses for the same
+    plane.  The axes are selected by indexing and reordering only, so the volume is not
+    copied.
+
+    The frames are drawn with matplotlib and written with Pillow, which matplotlib
+    already requires.  A GIF stores its frame durations in hundredths of a second and
+    holds at most 256 colors, so an ``fps`` that does not divide 100 is rounded and the
+    frames are quantized; both are properties of the format.
+
+    Args:
+        volume (numpy): 3D array (nx, ny, nz) or 4D array (num_times, nx, ny, nz).
+        filename (str): Output path for the GIF file.
+        frame_axis (int, optional): The looping axis, numbered as in ``volume``.  Negative
+            values count from the end.  Defaults to None, which means axis 0, or axis 1
+            when axis 0 is held fixed by ``slice_axis``.
+        slice_axis (int, optional): The axis held fixed to reduce a 4D volume to 3D.
+            Negative values count from the end.  Must differ from ``frame_axis``.
+            Defaults to None, which means axis 1 (x).  Passing this for a 3D volume is an
+            error, since it would leave a single image rather than a movie.
+        slice_index (int, optional): Index along ``slice_axis``.  Defaults to None, the
+            middle of that axis.
+        vmin (float, optional): Min pixel value for display normalization.  Defaults to
+            None, the minimum over the frames shown.  The window is computed once for the
+            whole movie, not per frame, so intensity changes from frame to frame remain
+            visible.
+        vmax (float, optional): Max pixel value for display normalization.  Defaults to
+            None, the maximum over the frames shown.
+        fps (float, optional): Frames per second in the saved GIF.  Defaults to 5.
+
+    Raises:
+        ValueError: If ``volume`` is not 3D or 4D, ``frame_axis`` and ``slice_axis`` are
+            the same axis, ``slice_axis`` or ``slice_index`` is given for a 3D volume, or
+            ``fps`` is not positive.
+        IndexError: If an axis or index is out of range for ``volume``.  These come from
+            numpy when the volume is indexed, not from a check here.
+
+    Example:
+        >>> # A 3D reconstruction, scaled to its own data range.
+        >>> mbirtorch.save_volume_as_gif(recon, 'recon.gif')
+        >>> # A 4D reconstruction: the middle x slice, playing over time.
+        >>> mbirtorch.save_volume_as_gif(recon_4d, 'recon_4d.gif', vmax=0.06)
+        >>> # A 4D reconstruction: an XY plane at the middle z, playing over time.
+        >>> mbirtorch.save_volume_as_gif(recon_4d, 'recon_4d_xy.gif', slice_axis=3)
+        >>> # A single time frame, stepping through z.
+        >>> mbirtorch.save_volume_as_gif(recon_4d, 'frame0_z.gif', frame_axis=3, slice_axis=0,
+        ...                              slice_index=0)
+    """
+
+    def _save_frames_as_gif(frames, filename, titles, vmin, vmax, fps):
+        """Write a stack of 2D frames, indexed along axis 0, as an animated GIF.
+
+        frames may be a strided view.  Each frame is rendered one at a time, so the stack
+        is never copied as a whole.  titles gives one label per frame.
+        """
+        if vmin is None or vmax is None:
+            # Scale to the frames actually shown, so a slice that is never displayed
+            # cannot consume the dynamic range.
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', RuntimeWarning)  # An all-NaN frame warns.
+                data_min, data_max = float(np.nanmin(frames)), float(np.nanmax(frames))
+            if not (np.isfinite(data_min) and np.isfinite(data_max)):
+                data_min, data_max = 0.0, 1.0   # Nothing finite to scale to.
+            vmin = data_min if vmin is None else vmin
+            vmax = data_max if vmax is None else vmax
+        if vmin == vmax:
+            # A constant volume gives imshow a zero-width window.  Widen it as
+            # slice_viewer does.
+            scale = max(1e-6 * abs(vmax), 1e-6)
+            vmin, vmax = vmin - scale, vmax + scale
+
+        import matplotlib.pyplot as plt
+        from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+        from PIL import Image
+
+        # One figure is used for the whole movie.  This is cheaper than rebuilding it per
+        # frame, and it guarantees that every frame has the same size, which a GIF
+        # requires.
+        fig, ax = plt.subplots()
+        canvas = FigureCanvas(fig)
+        image_artist = ax.imshow(frames[0], cmap='gray', vmin=vmin, vmax=vmax)
+        ax.axis('off')
+        title_artist = ax.set_title('')
+        images = []
+        for i, frame in enumerate(frames):
+            image_artist.set_data(frame)
+            title_artist.set_text(titles[i])
+            canvas.draw()
+            # The RGBA buffer is reused on the next draw, so each frame is copied out
+            # rather than viewed, and the alpha channel is dropped.
+            buf = canvas.get_renderer().buffer_rgba()
+            image = np.frombuffer(buf, dtype=np.uint8).reshape(
+                canvas.get_width_height()[::-1] + (4,))
+            images.append(Image.fromarray(image[..., :3].copy(), mode='RGB'))
+        plt.close(fig)
+
+        makedirs(filename)
+        images[0].save(filename, save_all=True, append_images=images[1:],
+                       duration=round(1000 / fps), loop=0)
+
+    volume = np.asarray(volume)
+    if volume.ndim not in (3, 4):
+        raise ValueError('volume must be 3D (nx, ny, nz) or 4D (num_times, nx, ny, nz); '
+                         'got shape {}.'.format(volume.shape))
+    if fps <= 0:
+        raise ValueError('fps must be positive; got {}.'.format(fps))
+
+    # Negative axes count from the end, as they do throughout numpy.  Only an in-range
+    # negative is wrapped, so an out-of-range value stays out of range for numpy to
+    # reject.  Everything below then works in one numbering.
+    if frame_axis is not None and -volume.ndim <= frame_axis < 0:
+        frame_axis += volume.ndim
+    if slice_axis is not None and -volume.ndim <= slice_axis < 0:
+        slice_axis += volume.ndim
+
+    # Axis names are fixed by the mbirtorch layout, so frame titles can name the axes
+    # rather than print bare numbers.
+    axis_names = ('x', 'y', 'z') if volume.ndim == 3 else ('t', 'x', 'y', 'z')
+
+    if volume.ndim == 3:
+        if slice_axis is not None or slice_index is not None:
+            raise ValueError('slice_axis and slice_index apply only to a 4D volume; fixing '
+                             'an axis of a 3D volume would leave a single image, not a movie.')
+        if frame_axis is None:
+            frame_axis = 0
+        frames = np.moveaxis(volume, frame_axis, 0)
+        titles = ['{} = {}'.format(axis_names[frame_axis], i) for i in range(len(frames))]
+    else:
+        if slice_axis is None:
+            slice_axis = 1
+        # Default to axis 0, except when axis 0 is held fixed.  That case produces a movie
+        # that steps through the slices of a single time frame.
+        if frame_axis is None:
+            frame_axis = 0 if slice_axis != 0 else 1
+        if frame_axis == slice_axis:
+            raise ValueError('frame_axis and slice_axis must differ; both are {} ({}).'
+                             .format(frame_axis, axis_names[frame_axis]))
+        num_slices = volume.shape[slice_axis]
+        if slice_index is None:
+            slice_index = num_slices // 2
+
+        # Basic indexing and moveaxis both return views, so a large 4D volume is never
+        # copied.  Removing slice_axis renumbers every axis above it, so frame_axis shifts
+        # down by one when it was above.  Dropping one axis and moving another to the front
+        # leaves the remaining two in ascending order, the layout slice_viewer uses.
+        index = [slice(None)] * 4
+        index[slice_axis] = slice_index
+        frames = np.moveaxis(volume[tuple(index)], frame_axis - (frame_axis > slice_axis), 0)
+        titles = ['{} slice = {}, {} = {}'.format(axis_names[slice_axis], slice_index,
+                                                  axis_names[frame_axis], i)
+                  for i in range(len(frames))]
+
+    _save_frames_as_gif(frames, filename, titles, vmin, vmax, fps)
+
+
 def stitch_arrays(array_list, overlap, axis=2, ramp_overlap=None):
     """
     Concatenate arrays along one axis while linearly blending a fixed overlap

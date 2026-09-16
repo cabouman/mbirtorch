@@ -32,6 +32,9 @@ dependencies = [
     # always, and h5py for HDF5 load/save (imported lazily, but required for
     # full function).
     "matplotlib",
+    # Pillow writes the animated GIF of save_volume_as_gif.  matplotlib already
+    # requires it, so this declares what is imported rather than adding a install.
+    "pillow",
     "h5py",
     # The preprocess package needs scipy (filters, fitting), tifffile (scan
     # readers), tqdm (batch progress), and pywavelets (wavelet-FFT stripe

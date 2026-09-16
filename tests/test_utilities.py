@@ -26,6 +26,8 @@ The device helpers are checked against what torch reports.
 
 import warnings
 
+import os
+
 import numpy as np
 import pytest
 import torch
@@ -389,3 +391,50 @@ def test_device_helpers_report_the_hardware():
     defaults = default_devices()
     assert isinstance(defaults, list) and len(defaults) >= 1
     assert defaults == (list(gpus) or [torch.device('cpu')])
+
+
+# ── save_volume_as_gif writes a real animation ───────────────────────────────
+def test_save_volume_as_gif_writes_the_frames_each_form_selects(tmp_path):
+    """Each form of the call selects its own set of frames, and every one of
+    them reaches the file: a 4D volume plays over time by default, over time in
+    a chosen plane when slice_axis names one, and through the slices of a
+    single frame when slice_axis is the frame axis; a 3D volume plays over its
+    first axis.  The frame count of the written file is the length of the axis
+    the movie loops over, so the file is read back rather than trusted."""
+    from PIL import Image
+
+    volume_4d = np.random.default_rng(0).random((6, 12, 14, 10)).astype(np.float32)
+    volume_3d = volume_4d[0]
+    cases = [
+        ('over time at the middle x', volume_4d, {}, 6),
+        ('over time in an XY plane', volume_4d, dict(slice_axis=3), 6),
+        ('through z of one frame', volume_4d, dict(frame_axis=3, slice_axis=0, slice_index=0), 10),
+        ('a 3D volume over x', volume_3d, {}, 12),
+    ]
+    for name, volume, kwargs, expected in cases:
+        path = str(tmp_path / f"{name.replace(' ', '_')}.gif")
+        mbirtorch.save_volume_as_gif(volume, path, vmin=0, vmax=1, **kwargs)
+        with Image.open(path) as written:
+            print(f"{name}: {written.n_frames} frames, {os.path.getsize(path)} bytes")
+            assert written.n_frames == expected
+
+    # The frame duration is what fps asks for, in the hundredths of a second a
+    # GIF stores.  Five frames per second is 200 ms.
+    path = str(tmp_path / 'timed.gif')
+    mbirtorch.save_volume_as_gif(volume_4d, path, fps=5, vmin=0, vmax=1)
+    with Image.open(path) as written:
+        assert written.info['duration'] == 200
+
+    # A constant volume gives the display a zero-width window, which is widened
+    # rather than left to divide by zero.
+    flat = np.full((4, 6, 6, 6), 0.25, dtype=np.float32)
+    mbirtorch.save_volume_as_gif(flat, str(tmp_path / 'flat.gif'))
+
+    with pytest.raises(ValueError, match='3D volume'):
+        mbirtorch.save_volume_as_gif(volume_3d, str(tmp_path / 'x.gif'), slice_axis=1)
+    with pytest.raises(ValueError, match='must differ'):
+        mbirtorch.save_volume_as_gif(volume_4d, str(tmp_path / 'x.gif'), frame_axis=1, slice_axis=1)
+    with pytest.raises(ValueError, match='must be positive'):
+        mbirtorch.save_volume_as_gif(volume_4d, str(tmp_path / 'x.gif'), fps=0)
+    with pytest.raises(ValueError, match='3D .* or 4D'):
+        mbirtorch.save_volume_as_gif(volume_3d[0], str(tmp_path / 'x.gif'))
