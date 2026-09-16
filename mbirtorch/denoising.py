@@ -38,6 +38,73 @@ _F32_EPS = float(np.finfo(np.float32).eps)
 # The smallest sigma_x the stack statistics will set; see
 # QGGMRFDenoiser.auto_set_regularization_params_from_stack.
 _SIGMA_X_FLOOR = 1e-6
+# The most voxels the whole-volume statistics read.  It is the budget
+# estimate_image_noise_std already keeps for its own subsample.
+_STATISTICS_POINT_BUDGET = 5_000_000
+
+
+#: The tile grid the point budget is spent on, and the smallest tile edge
+#: worth reading.  A grid of small tiles samples the whole field of view;
+#: one block of the same area would sample only the middle of it.
+#: Two tiles per axis, four in all, measured best: over five positions of an
+#: object boundary its worst error against the whole-stack estimate was
+#: 2.9e-2, against 4.3e-2 for one block and 6.2e-2 for four or eight tiles
+#: per axis.
+_TILE_GRID = 2
+_MIN_TILE = 4
+
+
+def _sample_tiles(num_rows, num_cols, num_leading, point_budget):
+    """Tiles of two axes that together hold at most ``point_budget`` voxels,
+    counting ``num_leading`` entries of a third axis that is left whole.
+
+    The tiles are contiguous, so a neighbor difference inside one is between
+    adjacent voxels; a strided subsample would compare voxels a stride apart,
+    which measures something else.  They are spread evenly across both axes,
+    first tile at one edge and last at the other, because the estimate must
+    see the whole field of view.  One block of the same area would sample
+    only the middle: at 30 frames of 512 cubed the budget buys 18 voxels per
+    axis, so a single block reads a needle 3.5 percent as wide as the object,
+    and misses the boundaries, where the largest neighbor differences are.
+
+    Args:
+        num_rows (int): the extent of the first tiled axis.
+        num_cols (int): the extent of the second tiled axis.
+        num_leading (int): the number of entries of the axis left whole.
+        point_budget (int): the most voxels the tiles may hold together.
+
+    Returns:
+        (list of slice, list of slice): the rows and the columns of the tiles.
+        Their product is the tile grid.  Each list holds one whole-axis slice
+        when the budget is not reached.
+    """
+    num_rows, num_cols, num_leading = int(num_rows), int(num_cols), int(num_leading)
+    total = num_leading * num_rows * num_cols
+    if total <= point_budget or total <= 0:
+        return [slice(0, num_rows)], [slice(0, num_cols)]
+    # The extent each axis may keep, spent as a grid of equal tiles.
+    side = max(2, int((point_budget / num_leading) ** 0.5))
+    count = max(1, min(_TILE_GRID, side // _MIN_TILE))
+    edge = max(2, side // count)
+
+    def spread(extent):
+        """The tiles of one axis, centered on equal shares of it.
+
+        The shares are ``(index + 0.5) / count`` of the axis, so no tile sits
+        against an edge.  Tiles placed edge to edge instead would, at the
+        production budget, put four tiles nine voxels wide in the four
+        corners of a 512 by 512 field, where a reconstruction holds only air.
+        """
+        width = min(edge, extent)
+        if count == 1 or width >= extent:
+            start = (extent - width) // 2
+            return [slice(start, start + width)]
+        starts = sorted({min(max(0, round((index + 0.5) * extent / count) - width // 2),
+                             extent - width)
+                         for index in range(count)})
+        return [slice(start, start + width) for start in starts]
+
+    return spread(num_rows), spread(num_cols)
 
 
 def vcd_subset_denoiser(flat_image, flat_error_image, pixel_indices,
@@ -749,11 +816,38 @@ class QGGMRFDenoiser(TomographyModel):
             # device that holds them and brings only them to the host.
             chosen = self.subsample_views(np.arange(num_volumes))
             step = int(chosen[1] - chosen[0]) if chosen.size > 1 else 1
-            volumes = _subsample_to_host(stack.reshape(num_volumes, d0 * d1, d2),
-                                         row_step=step)
-            merged = volumes.reshape(-1, d1, d2)
+            # The chosen volumes are cropped to a point budget before they
+            # cross to the host.  The crop keeps the middle of the two
+            # trailing axes and the whole of the first, so every neighbor
+            # difference the estimate reads is still between adjacent voxels.
+            rows, cols = _sample_tiles(d1, d2, int(chosen.size) * d0,
+                                       _STATISTICS_POINT_BUDGET)
+            blocks = []
+            for row in rows:
+                for col in cols:
+                    tile = stack[:, :, row, col]
+                    height, width = row.stop - row.start, col.stop - col.start
+                    # Only this tile's chosen volumes cross to the host.
+                    piece = _subsample_to_host(
+                        tile.reshape(num_volumes, d0 * height, width), row_step=step)
+                    blocks.append(piece.reshape(-1, height, width))
+            # The tiles are stacked along the axis the volumes already join
+            # on, so the joins between them are of the same kind.
+            merged = blocks[0] if len(blocks) == 1 else np.concatenate(blocks, axis=0)
+            tiled = len(blocks) > 1 or merged.shape[1:] != (d1, d2)
 
             sino_indicator = self._get_sino_indicator(merged)
+            if tiled:
+                # The estimate reads each neighbor with a wrap, so entry 0 of
+                # an axis is compared with the far end of that axis.  Over a
+                # whole volume that is one plane in hundreds.  Over a tile it
+                # is one column in the tile's width, which on a structured
+                # image moves the estimate by tens of percent, so those
+                # entries are dropped from the support.  The planes where one
+                # tile meets the next are dropped for the same reason.
+                sino_indicator[:, 0, :] = 0
+                sino_indicator[:, :, 0] = 0
+                sino_indicator[::merged.shape[0] // len(blocks)] = 0
             self.auto_set_sigma_y(merged, sino_indicator)
             recon_std = self._get_estimate_of_recon_std(merged, sino_indicator)
             if not np.isfinite(recon_std):

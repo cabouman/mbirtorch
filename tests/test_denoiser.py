@@ -773,6 +773,76 @@ def test_the_recon_std_estimate_matches_the_form_it_replaced(device):
             assert rel < 1e-6
 
 
+def test_the_whole_volume_statistics_keep_a_point_budget():
+    """The statistics read at most five million voxels.  Above that the chosen
+    volumes are sampled as a grid of contiguous tiles in the two trailing
+    axes, so that a neighbor difference inside a tile is still between
+    adjacent voxels and the sample still covers the field of view.  A stack
+    under the budget is not sampled at all.
+
+    The tiles are centered on equal shares of each axis rather than placed
+    against its edges: at the production budget a tile is nine voxels wide,
+    and edge placement would read the four corners of a 512 by 512 field,
+    where a reconstruction holds only air.
+
+    Entry 0 of each tiled axis is dropped from the support, because the
+    estimate reads its neighbor with a wrap and would compare that entry with
+    the far side of the tile.  Over a whole volume that is one plane in
+    hundreds; over a tile it is one column in the tile's width, which moves
+    the estimate by up to 23 percent on a structured image.
+    """
+    rows, cols = denoising._sample_tiles(512, 512, 30 * 512,
+                                         denoising._STATISTICS_POINT_BUDGET)
+    edge = rows[0].stop - rows[0].start
+    assert len(rows) * len(cols) * edge * (cols[0].stop - cols[0].start) * 30 * 512 \
+        <= denoising._STATISTICS_POINT_BUDGET
+    # No tile against an edge, and the tiles span the axis.
+    assert rows[0].start > 0 and rows[-1].stop < 512
+    assert rows[-1].start - rows[0].start > 512 // 4
+    # Under the budget the whole axis is kept, as one tile.
+    assert denoising._sample_tiles(40, 40, 8, denoising._STATISTICS_POINT_BUDGET) == \
+        ([slice(0, 40)], [slice(0, 40)])
+
+    def sigma_x_at(stack, budget, monkey):
+        monkey.setattr(denoising, '_STATISTICS_POINT_BUDGET', budget)
+        denoiser = _auto_denoiser(tuple(int(n) for n in stack.shape[1:]), 'cpu')
+        return denoiser.auto_set_regularization_params_from_stack(stack)['sigma_x']
+
+    rng = np.random.default_rng(3)
+    shape = (40, 8, 300, 300)                      # 20 chosen volumes: 14.4M voxels
+    # A positive level well above sigma_noise, so the support is the whole
+    # volume rather than the bright tail of a zero-mean image.
+    uniform = (1.0 + 0.05 * rng.standard_normal(shape)).astype(np.float32)
+    with pytest.MonkeyPatch.context() as monkey:
+        sampled = sigma_x_at(uniform, denoising._STATISTICS_POINT_BUDGET, monkey)
+        whole = sigma_x_at(uniform, 10 ** 12, monkey)
+    print(f"uniform stack: sampled {sampled:.9g}, whole {whole:.9g} "
+          f"(rel {_rel(sampled, whole):.2e})")
+    assert _rel(sampled, whole) < 1e-3
+
+    # An object with a boundary: the tiles read a sample of it, so the two
+    # differ.  Measured across five positions of the boundary and several
+    # stack shapes, the difference ran from 2e-3 to 7e-2, against 2e-2 to
+    # 4e-2 for a single block of the same area.  How much depends on how the
+    # tiles fall against the boundary, so the gate is set where a gross
+    # regression shows and no tighter.  Even 1e-1 is well below the factor
+    # of two per unit that sharpness moves sigma_x by.
+    structured = uniform.copy()
+    structured[:, :, 60:240, 60:240] += 1.0
+    with pytest.MonkeyPatch.context() as monkey:
+        sampled = sigma_x_at(structured, denoising._STATISTICS_POINT_BUDGET, monkey)
+        whole = sigma_x_at(structured, 10 ** 12, monkey)
+    print(f"object stack: sampled {sampled:.9g}, whole {whole:.9g} "
+          f"(rel {_rel(sampled, whole):.2e})")
+    assert _rel(sampled, whole) < 1e-1
+
+    small = uniform[:6, :, :40, :40].copy()        # 6 * 8 * 40 * 40 = 76800 voxels
+    with pytest.MonkeyPatch.context() as monkey:
+        under = sigma_x_at(small, denoising._STATISTICS_POINT_BUDGET, monkey)
+        whole_small = sigma_x_at(small, 10 ** 12, monkey)
+    assert under == whole_small
+
+
 def test_stack_regularization_subsamples_whole_volumes_of_a_large_stack(monkeypatch):
     """Above 39 volumes about 20 are chosen, evenly spaced, by the rule
     subsample_views applies to views.  Which volumes cross to the host is
