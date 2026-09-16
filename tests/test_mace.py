@@ -19,6 +19,7 @@ import pytest
 import torch
 
 import mbirtorch
+import mbirtorch.mace as mace_module
 from mbirtorch import _sharding
 from mbirtorch.mace import (MACE, ForwardProxAgent, HyperplaneAgent, QGGMRFDenoiserAgent, Task,
                             mace, resolve_device_pool)
@@ -39,7 +40,19 @@ def _indexed(device):
     return device if device.type == 'cpu' or device.index is not None else torch.device(device.type, 0)
 
 
-def test_device_pool_resolves_every_form():
+@pytest.fixture
+def unpinned(monkeypatch):
+    """Clear the suite's device-count pin.
+
+    The conftest fixture pins every test to one device, which is what keeps
+    the suite deterministic on a multi-GPU host.  A test of the pool's
+    hardware forms has to opt out of it, and doing so explicitly keeps the
+    pin's reach visible.
+    """
+    monkeypatch.delenv('MBIRTORCH_NUM_DEVICES', raising=False)
+
+
+def test_device_pool_resolves_every_form(unpinned):
     """Each accepted form resolves to the devices it names, with an explicit
     index on every device that takes one; the refused forms raise by name."""
     defaults = [_indexed(d) for d in default_devices()]
@@ -64,10 +77,47 @@ def test_device_pool_resolves_every_form():
         resolve_device_pool(True)
     with pytest.raises(ValueError, match='at least one'):
         resolve_device_pool([])
-    # A device without an index names the same device as index 0, so the two
-    # spellings resolve to one entry and a task pinned either way matches.
-    assert resolve_device_pool([torch.device('cuda'), 'cuda:0']) == [torch.device('cuda', 0)] * 2
+    # A device without an index names the same device as index 0.  The two
+    # spellings therefore name one GPU, which the pool refuses, and a task
+    # pinned either way matches.
+    with pytest.raises(ValueError, match='more than once'):
+        resolve_device_pool([torch.device('cuda'), 'cuda:0'])
     assert Task(lambda d: None, device='cuda').device == torch.device('cuda', 0)
+
+
+def test_a_repeated_gpu_is_refused_and_a_repeated_cpu_is_kept():
+    """Two workers on one GPU share it and gain nothing, and on an Apple GPU
+    they fail inside Metal, so a pool that names a GPU twice raises and names
+    the device.  Repeating the CPU stays the way a pool runs more than one
+    worker on a machine with no GPU."""
+    assert resolve_device_pool(['cpu', 'cpu', 'cpu']) == [torch.device('cpu')] * 3
+    for spelling in ('cuda:0', 'mps'):
+        with pytest.raises(ValueError, match='more than once'):
+            resolve_device_pool([spelling, spelling])
+    # The refusal reads the whole pool, not just neighboring entries.
+    with pytest.raises(ValueError, match='cuda:1'):
+        resolve_device_pool(['cuda:1', 'cpu', 'cuda:1'])
+    if gpu_devices():
+        gpu = _indexed(gpu_devices()[0])
+        assert resolve_device_pool([gpu]) == [gpu]
+
+
+def test_the_device_count_pin_caps_the_automatic_pool(monkeypatch):
+    """MBIRTORCH_NUM_DEVICES pins the count for the whole process, so the
+    automatic forms honor it: None gives the pinned count, and a larger count
+    raises with a message that names the variable.  A list of devices is the
+    caller's and keeps every device it names."""
+    four = [torch.device('cuda', index) for index in range(4)]
+    monkeypatch.setattr(mace_module, 'default_devices', lambda: tuple(four))
+    monkeypatch.setenv('MBIRTORCH_NUM_DEVICES', '2')
+    assert resolve_device_pool(None) == four[:2]
+    assert resolve_device_pool(2) == four[:2]
+    with pytest.raises(ValueError, match='MBIRTORCH_NUM_DEVICES'):
+        resolve_device_pool(3)
+    assert resolve_device_pool([f'cuda:{index}' for index in range(4)]) == four
+    monkeypatch.delenv('MBIRTORCH_NUM_DEVICES')
+    assert resolve_device_pool(None) == four
+    assert resolve_device_pool(3) == four[:3]
 
 
 # ── stub agents ──────────────────────────────────────────────────────────────

@@ -29,7 +29,8 @@ import numpy as np
 import torch
 
 from . import _sharding
-from ._memory_ledger import ELL1_CHUNK_BYTES, ELL1_MAX_CHUNKS
+from ._memory_ledger import (DEVICE_COUNT_ENV_VAR, ELL1_CHUNK_BYTES, ELL1_MAX_CHUNKS,
+                             pinned_device_count)
 from .denoising import QGGMRFDenoiser
 from .tomography_model import cpu_devices, default_devices, gpu_devices
 
@@ -71,19 +72,62 @@ def resolve_device_pool(devices=None):
               ``n`` exceeds them.
             * a sequence of integers: those indices into the default devices.
             * a sequence of devices (``torch.device`` or device strings):
-              those devices, in that order, repeats allowed.  A repeated
-              device gives one worker per entry on that device.
+              those devices, in that order.  The CPU may be repeated, which
+              gives one worker per entry; a repeated GPU is refused.
+
+    The automatic forms, None and a count, are capped by the device count
+    ``MBIRTORCH_NUM_DEVICES`` pins, because that variable pins the count for
+    the whole process and the reconstruction policy already reads it as an
+    explicit choice.  A list of devices or of indices is the caller's and is
+    not capped, and :func:`default_devices` and its siblings still report the
+    hardware.
 
     Returns:
         list of torch.device
 
     Raises:
         ValueError: for a platform string other than ``'cpu'`` or ``'gpu'``,
-            a request for GPUs when there are none, or a count or index
-            beyond the default devices.
+            a request for GPUs when there are none, a count or index beyond
+            the available devices, or a GPU named more than once.
     """
+    return _reject_repeated_gpu(_device_pool(devices))
+
+
+def _reject_repeated_gpu(pool):
+    """Return ``pool`` unchanged, or raise when it names a GPU twice.
+
+    Two workers on one GPU gain nothing: on a CUDA device they share one
+    stream, and on an Apple GPU they crash inside Metal.  A repeated CPU entry
+    stays allowed, because repeating the CPU is how a pool exercises its
+    threaded path on a machine with no GPU.
+    """
+    seen = set()
+    for device in pool:
+        if device.type == 'cpu':
+            continue
+        if device in seen:
+            raise ValueError(
+                f'the device pool names {device} more than once.  Two workers on one GPU '
+                'share that GPU and gain nothing, and on an Apple GPU they fail inside '
+                'Metal.  Repeat the CPU instead to run more than one worker.')
+        seen.add(device)
+    return pool
+
+
+def _available_devices():
+    """The default devices, capped by the count ``MBIRTORCH_NUM_DEVICES``
+    pins.  The pin holds for the whole process, so the automatic pool honors
+    it."""
+    pool = [_canonical_device(d) for d in default_devices()]
+    pinned = pinned_device_count()
+    return pool if pinned is None else pool[:pinned]
+
+
+def _device_pool(devices):
+    """The pool of :func:`resolve_device_pool`, before the repeated-GPU
+    check."""
     if devices is None:
-        return [_canonical_device(d) for d in default_devices()]
+        return _available_devices()
     if isinstance(devices, torch.device):
         return [_canonical_device(devices)]
     if isinstance(devices, bool):
@@ -99,10 +143,14 @@ def resolve_device_pool(devices=None):
             return pool
         raise ValueError(f"a device pool string must be 'cpu' or 'gpu'; got {devices!r}.")
     if isinstance(devices, (int, np.integer)):
-        pool = [_canonical_device(d) for d in default_devices()]
+        pool = _available_devices()
         count = int(devices)
         if not 1 <= count <= len(pool):
-            raise ValueError(f'{count} device(s) were requested, but {len(pool)} are available.')
+            pinned = pinned_device_count()
+            pin_note = ('' if pinned is None else
+                        f'  {DEVICE_COUNT_ENV_VAR} pins the count to {pinned}.')
+            raise ValueError(f'{count} device(s) were requested, but {len(pool)} '
+                             f'are available.{pin_note}')
         return pool[:count]
     devices = list(devices)
     if not devices:
@@ -247,7 +295,7 @@ class MACE:
             Defaults to 0.5.
         devices (optional): None runs every task inline, in order.  Otherwise
             a device pool in any form :func:`resolve_device_pool` accepts, with
-            one worker thread per entry.  Each worker runs the tasks fixed to
+            one worker thread per entry.  A GPU may not be named twice.  Each worker runs the tasks fixed to
             its device and then takes tasks that accept any device from a
             shared queue.  The workers start on the first step and stop in
             :meth:`close`.  A task with a fixed device must name a device of
