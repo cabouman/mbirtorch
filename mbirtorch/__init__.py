@@ -84,6 +84,7 @@ __all__ = [
     "get_memory_stats", "SliceViewer", "VolumeStack", "slice_viewer",
     "GeometryScene", "GeometryFigure", "geometry_viewer",
     "stitch_arrays", "get_ct_model", "copy_ct_model", "save_volume_as_gif",
+    "MACE4DModel",
     "generate_demo_data", "generate_3d_shepp_logan_reference",
     # Documented hsnt and vcls names; these resolve lazily through __getattr__.
     "hyper_denoise", "dehydrate", "rehydrate", "import_hsnt_data_hdf5",
@@ -130,7 +131,8 @@ _LAZY_NAMES = {
     'MACE': 'mace', 'Task': 'mace', 'ForwardProxAgent': 'mace',
     'QGGMRFDenoiserAgent': 'mace', 'HyperplaneAgent': 'mace',
     'resolve_device_pool': 'mace',
-    # The frame-axis filter of the 4D reconstruction.
+    # The 4D reconstruction: the model, and the frame-axis filter it applies.
+    'MACE4DModel': 'mace4d',
     'temporal_filter_matrix': 'mace4d', 'apply_temporal_filter': 'mace4d',
 }
 
@@ -149,7 +151,7 @@ if TYPE_CHECKING:
                              GeometryScene, GeometryFigure, geometry_viewer)
     from .mace import (MACE, Task, ForwardProxAgent, QGGMRFDenoiserAgent, HyperplaneAgent,
                        resolve_device_pool)
-    from .mace4d import temporal_filter_matrix, apply_temporal_filter
+    from .mace4d import MACE4DModel, temporal_filter_matrix, apply_temporal_filter
     from .hsnt import (hyper_denoise, dehydrate, rehydrate,
                        import_hsnt_data_hdf5, create_hsnt_metadata,
                        export_hsnt_data_hdf5, generate_hyper_data)
