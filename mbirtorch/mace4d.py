@@ -786,7 +786,9 @@ class MACE4DModel(ParameterHandler):
         one orientation.
 
         Every orientation is given the same noise level and the same prior
-        strength, so that the three priors add up to one 4D prior.
+        strength, so that the three priors add up to one 4D prior.  The batch
+        is at most the number of hyperplanes the orientation holds, so that a
+        stack that fits in one slab is swept as it is.
         """
         image_shape = tuple(int(x0.shape[d]) for d in _permutation(axis)[1:])
         denoiser = QGGMRFDenoiser(image_shape)
@@ -798,7 +800,15 @@ class MACE4DModel(ParameterHandler):
         num_subsets = max(1, min(int(denoiser.get_params('granularity')[0]), num_pixels // 64))
         denoiser.set_params(no_warning=True, granularity=[num_subsets], partition_sequence=[0],
                             auto_regularize_flag=False)
+        # The batch never exceeds the number of volumes this orientation has.
+        # A short slab is padded up to the batch so that every slab of a call
+        # compiles one shape, and an unclamped batch would pad the whole stack
+        # up to a size no slab ever reaches: at 25 frames of (260, 260, 728)
+        # the estimate was 2690 volumes against the 728 that exist, which
+        # padded every array by 3.7x and exhausted an 80 GB device.
         batch_size = denoiser.auto_batch_size()
+        if batch_size is not None:
+            batch_size = min(int(batch_size), int(x0.shape[axis]))
         params = dict(sigma_noise=sigma, sigma_y=sigma, sigma_x=sigma_x,
                       granularity=[num_subsets], partition_sequence=[0],
                       auto_regularize_flag=False, **self._prior_params())

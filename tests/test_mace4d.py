@@ -562,6 +562,42 @@ def test_a_batch_size_that_does_not_divide_the_hyperplanes_sweeps_one_shape(monk
     assert rel < 1e-6
 
 
+def test_a_batch_size_above_the_hyperplane_count_pads_nothing(monkeypatch):
+    """A batch size larger than an orientation's hyperplane count is clamped
+    to that count, so each sweep sees the volumes that exist rather than the
+    stack padded up to the batch with copies of its last volume.  The padding
+    serves a short last slab, and a stack that fits in one slab has none; on
+    the first run with real data the estimate was 2690 volumes against the 728
+    that exist, which made every array of the sweep 3.7 times larger than it
+    needed to be and exhausted an 80 GB device.  The batch size is forced,
+    because no memory budget can be read here."""
+    shape = (3,) + MACE4DModel(_small_model(), num_frames=3).recon_shape
+    init = np.linspace(0.0, 0.1, int(np.prod(shape)), dtype=np.float32).reshape(shape)
+    init += 0.01 * np.random.default_rng(4).standard_normal(shape).astype(np.float32)
+
+    seen = []
+    original = mbirtorch.QGGMRFDenoiser.denoise_stack
+
+    def recording(self, stack, *args, **kwargs):
+        seen.append((int(stack.shape[0]), kwargs.get('batch_size')))
+        return original(self, stack, *args, **kwargs)
+    monkeypatch.setattr(mbirtorch.QGGMRFDenoiser, 'denoise_stack', recording)
+    monkeypatch.setattr(mbirtorch.QGGMRFDenoiser, 'auto_batch_size',
+                        lambda self, **kwargs: 100)
+
+    mace = MACE4DModel(_small_model(), num_frames=3)
+    mace.set_params(dejitter=False, verbose=0)
+    mace.set_device_pool(['cpu'])
+    np.random.seed(0)
+    mace.recon(_smooth_sino(), init_recon=init, max_iterations=1,
+               stop_threshold_change_pct=0)
+
+    # A (3, 10, 10, 8) volume gives 8 hyperplanes in one orientation and 10 in
+    # each of the others, so one sweep each, at the count the orientation has.
+    print(f"batch of 100 against orientations of 8, 10, 10 hyperplanes: {sorted(seen)}")
+    assert sorted(seen) == [(8, 8), (10, 10), (10, 10)], seen
+
+
 def test_wrong_inputs_are_refused():
     """A sinogram, weights, or initial image of the wrong shape raises
     ValueError, and so does a constant initial image, from which no denoiser
