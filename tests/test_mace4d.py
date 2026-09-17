@@ -28,7 +28,7 @@ import mbirtorch
 from mbirtorch import mace as mace_module
 from mbirtorch.mace import MACE
 from mbirtorch.mace4d import (MACE4DModel, _DataFitAgent, _normalize_prior_weights,
-                              apply_temporal_filter, temporal_filter_matrix)
+                              _slab_batch_size, apply_temporal_filter, temporal_filter_matrix)
 
 NUM_VIEWS = 24          # 24 views over 360 degrees, 15 degrees per view
 DET_ROWS = 8
@@ -191,7 +191,8 @@ def test_parameters_default_and_read_back():
     mace = MACE4DModel(_small_model(), num_frames=2)
     defaults = dict(mace_prior_weight=0.5, rho_mann=0.5, prox_num_iterations=3, prox_stop_threshold=0.02,
                     prox_partition_advance=1.0, prox_warm_start=True, denoiser_warm_start=False,
-                    sigma_prox=None, dejitter=True, dejitter_verbose=0, verbose=1)
+                    sigma_prox=None, dejitter=True, dejitter_verbose=0, verbose=1,
+                    denoise_slab_gb=2.0)
     for name, value in defaults.items():
         assert mace.get_params(name) == value, name
     mace.set_params(rho_mann=0.25, dejitter=False, sigma_prox=0.1)
@@ -201,6 +202,8 @@ def test_parameters_default_and_read_back():
         mace.set_params(mace_prior_weight=1.5)
     with pytest.raises(ValueError):
         mace.set_params(not_a_parameter=1)
+    with pytest.raises(ValueError, match='denoise_slab_gb'):
+        mace.set_params(denoise_slab_gb=0)
 
 
 def test_the_initialization_cache_is_read_when_valid(tmp_path):
@@ -357,6 +360,7 @@ def test_the_denoiser_strength_parameters_are_public(tmp_path):
     assert settings['denoiser sigma_x'] == pytest.approx(0.002)
     assert settings['denoiser sigma_x source'] == 'set by sigma_x'
     assert settings['nbr_weight_time'] == 1.0
+    assert settings['denoise slab budget (GB)'] == 2.0
     ratio = settings['temporal over spatial spread']
     assert np.isfinite(ratio) and ratio > 0
     assert settings['spread read from'].startswith('3 frames, stride 1')
@@ -522,20 +526,37 @@ def test_compiled_bodies_stay_within_the_recompile_budget(device):
         assert count < floor, f'{name} holds {count} variants against a budget of {floor}'
 
 
+def test_slab_batch_size_fits_the_budget_and_divides_the_planes_evenly():
+    """The hyperplanes per slab are the most whose volumes fit the budget,
+    never more than the orientation holds, and the planes are divided into
+    equal slabs so that the padded last slab is nearly full.  At the 99-frame
+    scan that exhausted an 80 GB device, 2 GB gives ten slabs per orientation:
+    80 XY-t volumes of 25.5 MiB fit, and 28 of the 71.5 MiB YZ-t volumes."""
+    assert _slab_batch_size(728, (99, 260, 260), 2.0) == 73
+    assert _slab_batch_size(260, (99, 260, 728), 2.0) == 26
+    # A budget that holds three of the test volumes gives three per slab.
+    assert _slab_batch_size(8, (3, 10, 10), 3700 / 2 ** 30) == 3
+    assert _slab_batch_size(10, (3, 10, 8), 3700 / 2 ** 30) == 3
+    # The count never exceeds the planes, and never falls below one.
+    assert _slab_batch_size(10, (3, 10, 8), 2.0) == 10
+    assert _slab_batch_size(5, (1000, 1000, 1000), 2.0) == 1
+
+
 def test_a_batch_size_that_does_not_divide_the_hyperplanes_sweeps_one_shape(monkeypatch):
     """With a batch size the hyperplane counts do not divide, every sweep
     still sees a stack of exactly that many volumes, the short last slab
     padded, so one compiled shape serves all of them; and the result equals
     the run that sweeps each orientation whole, to the rounding of a batched
-    sweep.  The batch size is forced, because no memory budget can be read
-    here."""
+    sweep.  The slab budget is given in bytes so that every orientation gets
+    three hyperplanes per slab: the test volumes are 1200 and 960 bytes, and
+    3700 bytes holds three of either and not four."""
     shape = (3,) + MACE4DModel(_small_model(), num_frames=3).recon_shape
     init = np.linspace(0.0, 0.1, int(np.prod(shape)), dtype=np.float32).reshape(shape)
     init += 0.01 * np.random.default_rng(4).standard_normal(shape).astype(np.float32)
 
-    def run():
+    def run(slab_gb=2.0):
         mace = MACE4DModel(_small_model(), num_frames=3)
-        mace.set_params(dejitter=False, verbose=0)
+        mace.set_params(dejitter=False, verbose=0, denoise_slab_gb=slab_gb)
         mace.set_device_pool(['cpu'])
         np.random.seed(0)
         recon, _ = mace.recon(_smooth_sino(), init_recon=init, max_iterations=1,
@@ -551,8 +572,7 @@ def test_a_batch_size_that_does_not_divide_the_hyperplanes_sweeps_one_shape(monk
         seen.append((int(stack.shape[0]), kwargs.get('batch_size')))
         return original(self, stack, *args, **kwargs)
     monkeypatch.setattr(mbirtorch.QGGMRFDenoiser, 'denoise_stack', recording)
-    monkeypatch.setattr(mbirtorch.QGGMRFDenoiser, 'auto_batch_size', lambda self, **kwargs: 3)
-    batched = run()
+    batched = run(slab_gb=3700 / 2 ** 30)
 
     # 8 and 10 hyperplanes in slabs of 3: 3 + 4 + 4 = 11 sweeps, every one at 3 volumes.
     assert len(seen) == 11
@@ -569,8 +589,9 @@ def test_a_batch_size_above_the_hyperplane_count_pads_nothing(monkeypatch):
     serves a short last slab, and a stack that fits in one slab has none; on
     the first run with real data the estimate was 2690 volumes against the 728
     that exist, which made every array of the sweep 3.7 times larger than it
-    needed to be and exhausted an 80 GB device.  The batch size is forced,
-    because no memory budget can be read here."""
+    needed to be and exhausted an 80 GB device.  The default slab budget
+    holds far more than these small orientations, so the clamp alone sets
+    the count."""
     shape = (3,) + MACE4DModel(_small_model(), num_frames=3).recon_shape
     init = np.linspace(0.0, 0.1, int(np.prod(shape)), dtype=np.float32).reshape(shape)
     init += 0.01 * np.random.default_rng(4).standard_normal(shape).astype(np.float32)
@@ -582,8 +603,6 @@ def test_a_batch_size_above_the_hyperplane_count_pads_nothing(monkeypatch):
         seen.append((int(stack.shape[0]), kwargs.get('batch_size')))
         return original(self, stack, *args, **kwargs)
     monkeypatch.setattr(mbirtorch.QGGMRFDenoiser, 'denoise_stack', recording)
-    monkeypatch.setattr(mbirtorch.QGGMRFDenoiser, 'auto_batch_size',
-                        lambda self, **kwargs: 100)
 
     mace = MACE4DModel(_small_model(), num_frames=3)
     mace.set_params(dejitter=False, verbose=0)
@@ -594,7 +613,7 @@ def test_a_batch_size_above_the_hyperplane_count_pads_nothing(monkeypatch):
 
     # A (3, 10, 10, 8) volume gives 8 hyperplanes in one orientation and 10 in
     # each of the others, so one sweep each, at the count the orientation has.
-    print(f"batch of 100 against orientations of 8, 10, 10 hyperplanes: {sorted(seen)}")
+    print(f"the default budget against orientations of 8, 10, 10 hyperplanes: {sorted(seen)}")
     assert sorted(seen) == [(8, 8), (10, 10), (10, 10)], seen
 
 

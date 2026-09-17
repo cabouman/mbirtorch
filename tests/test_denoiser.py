@@ -630,6 +630,74 @@ def test_denoise_stack_never_writes_the_caller_s_arrays(device):
             assert np.array_equal(stack, before_stack) and np.array_equal(init, before_init)
 
 
+def test_overwrite_input_takes_the_caller_s_tensors_over(device):
+    """With ``overwrite_input`` a float32 tensor already on the sweep device
+    becomes the sweep's own: the input is the working image when no initial
+    stack is given, and the residual's buffer when one is, while the initial
+    stack becomes the image.  The result is the one the default gives, and a
+    numpy array is left alone whatever the flag says."""
+    shape = (8, 10, 12)
+    denoiser = _pinned_denoiser(shape, device)
+    torch_device = denoiser.torch_device
+    kwargs = dict(sigma_noise=0.1, max_iterations=2, stop_threshold_change_pct=0.0)
+
+    # No initial stack: the input becomes the image, and the result is it.
+    stack = torch.as_tensor(_ramp_stack(3, shape)).to(torch_device)
+    np.random.seed(0)
+    reference, _ = denoiser.denoise_stack(stack.clone(), **kwargs)
+    np.random.seed(0)
+    out, _ = denoiser.denoise_stack(stack, overwrite_input=True, **kwargs)
+    rel = _rel_max(out.cpu().numpy(), reference.cpu().numpy())
+    print(f"overwrite_input on {device}: rel_max = {rel:.2e}")
+    assert rel < 1e-6
+    assert out.data_ptr() == stack.data_ptr() and torch.equal(out, stack)
+
+    # An initial stack: the image is the initial stack, and the input holds
+    # the final residual, the input minus the image.
+    stack = torch.as_tensor(_ramp_stack(3, shape)).to(torch_device)
+    init = torch.zeros_like(stack) + 0.25
+    before = stack.clone()
+    np.random.seed(0)
+    reference, _ = denoiser.denoise_stack(stack.clone(), init_stack=init.clone(), **kwargs)
+    np.random.seed(0)
+    out, _ = denoiser.denoise_stack(stack, init_stack=init, overwrite_input=True, **kwargs)
+    assert _rel_max(out.cpu().numpy(), reference.cpu().numpy()) < 1e-6
+    assert out.data_ptr() == init.data_ptr()
+    assert torch.allclose(stack, before - out, atol=1e-5)
+
+    # A numpy array is never written.
+    stack = _ramp_stack(3, shape)
+    before = stack.copy()
+    np.random.seed(0)
+    out, _ = denoiser.denoise_stack(stack, overwrite_input=True, **kwargs)
+    assert isinstance(out, np.ndarray) and np.array_equal(stack, before)
+    assert _rel_max(out, before) > 1e-3
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='needs a CUDA memory counter')
+def test_overwrite_input_saves_one_array_per_volume():
+    """By default a one-batch sweep of a tensor on its own device holds the
+    input, the working image, and the residual; with ``overwrite_input`` the
+    input is the image, so the peak drops by about one stack in three, less
+    the subset temporaries both hold.  Only CUDA reports the peak."""
+    shape = (16, 64, 64)
+    denoiser = _pinned_denoiser(shape, 'cuda')
+
+    peaks = {}
+    for flag in (False, True):
+        stack = torch.as_tensor(_ramp_stack(8, shape)).cuda()
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        denoiser.denoise_stack(stack, sigma_noise=0.1, batch_size=8, overwrite_input=flag,
+                               max_iterations=2, stop_threshold_change_pct=0.0)
+        torch.cuda.synchronize()
+        peaks[flag] = torch.cuda.max_memory_allocated()
+        del stack
+    ratio = peaks[True] / peaks[False]
+    print(f"peak bytes without overwrite {peaks[False]}, with {peaks[True]}, ratio {ratio:.3f}")
+    assert ratio < 0.85
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='needs a CUDA memory counter')
 def test_a_denoise_sweep_holds_the_same_memory_with_and_without_an_init_stack():
     """The sweep holds two arrays per volume either way, so its peak does not

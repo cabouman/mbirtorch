@@ -818,12 +818,15 @@ class HyperplaneAgent:
             the stack denoiser for that device, a callable ``denoise(stack)``,
             or ``denoise(stack, init_stack=...)`` when the warm start is on.
             The stack is a tensor of shape ``(hyperplanes, frames, d1, d2)``
-            on that device, and the result has the same shape.  One stack
+            on that device, and the result has the same shape.  The stack
+            and the initial stack are copies the agent made and does not
+            read again, so the denoiser may write them in place.  One stack
             denoiser is made per worker thread and kept.
         batch_size (int, optional): hyperplanes per task.  None puts the whole
             orientation in one task, which copies the whole array to one
-            device.  On a GPU pass the size the stack denoiser reports, so
-            that a task holds one batch and the tasks spread over the pool.
+            device.  Pass the number of hyperplanes whose volumes fit the
+            memory one task may use, so that a task holds one slab and the
+            tasks spread over the pool.
         filter_matrix (torch.Tensor, optional): a square matrix whose size is
             the number of frames, applied along the frame axis of each batch
             before denoising, such as the matrix from
@@ -890,14 +893,28 @@ class HyperplaneAgent:
             output[task.region] = task.run(w.device)
         return output
 
+    def _slab_copy(self, source, region, device):
+        """The slab of ``source`` over ``region`` as a fresh contiguous tensor
+        on ``device`` with the hyperplane axis first.
+
+        Always a copy, because the stack denoiser may write what it is handed
+        and the array itself must not be written.  Moving a slab's axis first
+        leaves a view only when that axis has length one and the array is
+        already on ``device``, and that view is cloned."""
+        slab = source[region].to(device).movedim(self.axis, 0)
+        return slab.contiguous() if not slab.is_contiguous() else slab.clone()
+
     def _run_slab(self, w, region, device):
         device = torch.device(device)
-        stack = w[region].to(device).movedim(self.axis, 0).contiguous()
+        stack = self._slab_copy(w, region, device)
         if self.filter_matrix is not None:
-            stack = _filter_along_axis(stack, self.filter_matrix, axis=1)
+            # Contiguous, so that the stack denoiser's reshape to (volumes,
+            # pixels, slices) is a view and not a slab-sized copy held for
+            # the whole sweep; the filter's output is a permuted view.
+            stack = _filter_along_axis(stack, self.filter_matrix, axis=1).contiguous()
         denoiser = self._denoiser_for(device)
         if self.use_warm_start and self._have_previous:
-            init_stack = self._previous_output[region].to(device).movedim(self.axis, 0).contiguous()
+            init_stack = self._slab_copy(self._previous_output, region, device)
             denoised = denoiser(stack, init_stack=init_stack)
         else:
             denoised = denoiser(stack)

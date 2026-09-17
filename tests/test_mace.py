@@ -550,6 +550,34 @@ def test_hyperplane_agent_applies_the_filter_along_the_frame_axis():
     assert rel < 1e-6
 
 
+@pytest.mark.parametrize('axis', [1, 2, 3])
+def test_hyperplane_agent_never_hands_the_denoiser_a_view_of_its_input(axis):
+    """The stack denoiser may write the stack it is given, so the agent hands
+    it a copy.  Moving an axis of length one to the front of an array that is
+    already on the worker's device leaves a view of that array, the one case
+    where the copy has to be made on purpose: a denoiser that zeroes its
+    stack in place must leave the agent's input, the loop's state, as it was,
+    with the filter off and with the warm start on or off."""
+    shape = [3, 4, 5, 6]
+    shape[axis] = 1
+    torch.manual_seed(3)
+    w = torch.randn(*shape)
+    before = w.clone()
+
+    def zeroing(stack, init_stack=None):
+        stack.zero_()
+        if init_stack is not None:
+            init_stack.zero_()
+        return stack
+
+    for warm in (False, True):
+        agent = HyperplaneAgent(axis, lambda dev: zeroing, use_warm_start=warm)
+        for iteration in range(2):
+            out = agent(w, iteration)
+            assert torch.equal(out, torch.zeros_like(w))
+            assert torch.equal(w, before), f'axis {axis}, warm start {warm}, call {iteration}'
+
+
 @pytest.mark.parametrize('batch_size', [6, 2])
 def test_hyperplane_agent_warm_start_passes_its_previous_output(batch_size):
     """With the warm start on, every task of the first call passes no

@@ -169,6 +169,41 @@ def _permutation(axis):
     return (axis,) + tuple(d for d in range(4) if d != axis)
 
 
+def _slab_batch_size(num_planes, volume_shape, slab_gb):
+    """The hyperplanes per denoiser task.
+
+    A task sweeps one slab, a stack of hyperplane volumes, on one device, and
+    holds a few arrays of the slab's size while it does: the slab, which the
+    sweep writes in place, the residual, the subset temporaries, and a second
+    slab while the frame-axis filter runs.  The slab is sized by a byte
+    budget, ``slab_gb`` of ``2 ** 30`` bytes, so that a task's footprint is a
+    known multiple of a known number.  The budget is fixed rather than read
+    from the device, because a task gains nothing from a larger slab: the
+    sweep saturates a GPU well below this size, and smaller slabs spread more
+    evenly over the pool.  At 99 frames of (260, 260, 728) a slab sized to
+    fill the device held a whole orientation, 18 GiB, and the slab-sized
+    arrays of one task exhausted an 80 GB device.
+
+    The count is the largest that fits the budget, at most ``num_planes``,
+    and the planes are then divided into equal slabs so that the padded last
+    slab is nearly full: 728 planes at 80 per slab would leave a tenth slab of
+    8 planes padded to 80, where ten slabs of 73 pad almost nothing.
+
+    Args:
+        num_planes (int): the hyperplanes of the orientation.
+        volume_shape (tuple of int): the shape of one hyperplane volume.
+        slab_gb (float): the budget, in units of ``2 ** 30`` bytes.
+
+    Returns:
+        int: the hyperplanes per slab, between 1 and ``num_planes``.
+    """
+    num_planes = int(num_planes)
+    volume_bytes = 4 * int(np.prod(volume_shape))
+    fit = max(1, int(float(slab_gb) * 2 ** 30) // volume_bytes)
+    num_slabs = -(-num_planes // min(num_planes, fit))
+    return -(-num_planes // num_slabs)
+
+
 def _centered_block(shape, num_frames, point_budget):
     """The slices of a block centered in each axis of ``shape`` that holds at
     most ``point_budget`` entries over ``num_frames`` frames."""
@@ -378,7 +413,8 @@ class MACE4DModel(ParameterHandler):
                         prox_stop_threshold=0.02, prox_partition_advance=1.0,
                         prox_warm_start=True, denoiser_warm_start=False, sigma_prox=None,
                         dejitter=True, dejitter_verbose=0,
-                        sigma_noise=None, nbr_weight_time=1.0, sharpness=0.0)
+                        sigma_noise=None, nbr_weight_time=1.0, sharpness=0.0,
+                        denoise_slab_gb=2.0)
         self._devices = None
 
     def refresh_device_bindings(self):
@@ -415,6 +451,11 @@ class MACE4DModel(ParameterHandler):
             denoiser_warm_start (bool): start each denoiser sweep from its
                 previous output, at the cost of one full-size array per
                 orientation.  Defaults to False.
+            denoise_slab_gb (float): the size, in GB of ``2**30`` bytes, of
+                the stack of hyperplane volumes one denoiser task sweeps.
+                Each orientation is divided into slabs of at most this size,
+                and a task holds about three arrays of the slab's size on its
+                device.  Defaults to 2.0.
             sigma_prox (float or None): the strength of every data-fit call.
                 None sets it from the data.  Defaults to None.
             dejitter (bool): apply the temporal filter along the frame axis.
@@ -439,14 +480,16 @@ class MACE4DModel(ParameterHandler):
             verbose (int): 0 is silent, 1 reports progress.  Defaults to 1.
 
         Raises:
-            ValueError: if ``qggmrf_nbr_wts`` is set.  Use
-                ``nbr_weight_time``.
+            ValueError: if ``qggmrf_nbr_wts`` is set, in which case use
+                ``nbr_weight_time``, or if ``denoise_slab_gb`` is not positive.
 
         Example:
             >>> mace.set_params(mace_prior_weight=0.5, rho_mann=0.5, dejitter=True)
         """
         if 'mace_prior_weight' in kwargs:
             _normalize_prior_weights(kwargs['mace_prior_weight'])
+        if 'denoise_slab_gb' in kwargs and not float(kwargs['denoise_slab_gb']) > 0:
+            raise ValueError(f"denoise_slab_gb must be positive; got {kwargs['denoise_slab_gb']!r}.")
         if 'qggmrf_nbr_wts' in kwargs:
             raise ValueError(
                 'qggmrf_nbr_wts cannot be set on MACE4DModel.  Its three entries name '
@@ -649,7 +692,7 @@ class MACE4DModel(ParameterHandler):
             image_for_statistics, global_sigma, pool[0])
         for _, axis in _ORIENTATIONS:
             image_shape, params, batch_size = self._configure_orientation(
-                axis, image_for_statistics, global_sigma, sigma_x, pool[0])
+                axis, image_for_statistics, global_sigma, sigma_x)
             batch_sizes.append(batch_size)
             make = self._stack_denoiser_factory(image_shape, params, global_sigma, batch_size,
                                                 iteration_counts, counts_lock)
@@ -659,7 +702,8 @@ class MACE4DModel(ParameterHandler):
         del image_for_statistics
         if verbose:
             self.logger.info(f'[MACE] Denoiser sigma_x = {sigma_x:.6g} ({sigma_x_source}); '
-                             f'batch sizes [xyt, yzt, xzt] = {batch_sizes}')
+                             f'batch sizes [xyt, yzt, xzt] = {batch_sizes} at '
+                             f"{float(self.get_params('denoise_slab_gb')):g} GB per slab")
 
         run_settings = self._run_settings(pool, init_source, global_sigma, sigma_source,
                                           weights, max_iterations, stop_threshold_change_pct,
@@ -781,34 +825,25 @@ class MACE4DModel(ParameterHandler):
         regularization = denoiser.auto_set_regularization_params_from_stack(image)
         return (float(regularization['sigma_x']), 'estimated from the initial image', spread)
 
-    def _configure_orientation(self, axis, x0, sigma, sigma_x, device):
+    def _configure_orientation(self, axis, x0, sigma, sigma_x):
         """The volume shape, the denoiser parameters, and the batch size of
         one orientation.
 
         Every orientation is given the same noise level and the same prior
         strength, so that the three priors add up to one 4D prior.  The batch
-        is at most the number of hyperplanes the orientation holds, so that a
-        stack that fits in one slab is swept as it is.
+        is the number of hyperplanes whose volumes fit ``denoise_slab_gb``,
+        at most the number the orientation holds, with the hyperplanes
+        divided into equal slabs; see :func:`_slab_batch_size`.
         """
         image_shape = tuple(int(x0.shape[d]) for d in _permutation(axis)[1:])
-        denoiser = QGGMRFDenoiser(image_shape)
-        denoiser.configure_devices(devices=[device])
-        denoiser.set_params(no_warning=True, verbose=0, sigma_noise=sigma, sigma_y=sigma)
         # A subset with fewer than about 64 pixels makes the line search
-        # compute zero over zero on flat regions.
+        # compute zero over zero on flat regions.  The count starts from the
+        # denoiser class's default.
         num_pixels = image_shape[0] * image_shape[1]
-        num_subsets = max(1, min(int(denoiser.get_params('granularity')[0]), num_pixels // 64))
-        denoiser.set_params(no_warning=True, granularity=[num_subsets], partition_sequence=[0],
-                            auto_regularize_flag=False)
-        # The batch never exceeds the number of volumes this orientation has.
-        # A short slab is padded up to the batch so that every slab of a call
-        # compiles one shape, and an unclamped batch would pad the whole stack
-        # up to a size no slab ever reaches: at 25 frames of (260, 260, 728)
-        # the estimate was 2690 volumes against the 728 that exist, which
-        # padded every array by 3.7x and exhausted an 80 GB device.
-        batch_size = denoiser.auto_batch_size()
-        if batch_size is not None:
-            batch_size = min(int(batch_size), int(x0.shape[axis]))
+        default_subsets = int(QGGMRFDenoiser(image_shape).get_params('granularity')[0])
+        num_subsets = max(1, min(default_subsets, num_pixels // 64))
+        batch_size = _slab_batch_size(int(x0.shape[axis]), image_shape,
+                                      float(self.get_params('denoise_slab_gb')))
         params = dict(sigma_noise=sigma, sigma_y=sigma, sigma_x=sigma_x,
                       granularity=[num_subsets], partition_sequence=[0],
                       auto_regularize_flag=False, **self._prior_params())
@@ -837,12 +872,15 @@ class MACE4DModel(ParameterHandler):
             def denoise(stack, init_stack=None):
                 real = int(stack.shape[0])
                 count = real if batch_size is None else max(int(batch_size), real)
+                # The agent hands over its own copies of the slab, which
+                # nothing reads again, so the sweep writes them in place
+                # rather than holding a clone beside each.
                 out, info = denoiser.denoise_stack(
                     padded(stack, count), sigma_noise=sigma,
                     init_stack=None if init_stack is None else padded(init_stack, count),
                     max_iterations=_DENOISE_MAX_ITERATIONS,
                     stop_threshold_change_pct=_DENOISE_STOP_THRESHOLD_PCT,
-                    batch_size=count)
+                    batch_size=count, overwrite_input=True)
                 with lock:
                     iteration_counts.extend(int(n) for n in info['num_iterations'][:real])
                 return out[:real]
@@ -976,6 +1014,7 @@ class MACE4DModel(ParameterHandler):
             'spread read from': (f"{spread['frames read']} frames, stride {spread['stride']}, "
                                  f"block {spread['block']}"),
             'denoise batch sizes [xyt, yzt, xzt]': list(batch_sizes),
+            'denoise slab budget (GB)': float(self.get_params('denoise_slab_gb')),
             'dejitter': self.get_params('dejitter'),
             'frames_per_rotation': self.frames_per_rotation,
             'frame_overlap_factor': self.frame_overlap_factor,

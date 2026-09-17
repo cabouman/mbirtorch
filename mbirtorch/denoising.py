@@ -880,10 +880,12 @@ class QGGMRFDenoiser(TomographyModel):
         so on the CPU and on an Apple GPU the whole stack is swept at once.
 
         The count does not depend on whether an initial stack is given.  The
-        sweep holds two arrays per volume either way: it writes its image in
-        place, starting from the initial stack when there is one and from a
-        copy of the input when there is not, and it releases the input once
-        the residual is formed.
+        sweep holds two arrays per volume either way, the working image and
+        the residual.  The image starts from the initial stack when there is
+        one and from the input when there is not, each taken over when the
+        sweep owns it and copied otherwise, and the residual is formed in the
+        input's own buffer when the sweep owns that and in a new array when
+        it does not; see ``overwrite_input`` on :meth:`denoise_stack`.
 
         Args:
             volume_shape (tuple of int, optional): the shape of one volume.
@@ -925,7 +927,7 @@ class QGGMRFDenoiser(TomographyModel):
 
     def denoise_stack(self, stack, sigma_noise=None, init_stack=None,
                       max_iterations=15, stop_threshold_change_pct=0.2,
-                      batch_size=None):
+                      batch_size=None, overwrite_input=False):
         """
         Denoise a stack of same-shaped volumes with shared parameters, each
         volume as :meth:`denoise` would denoise it alone.
@@ -955,6 +957,15 @@ class QGGMRFDenoiser(TomographyModel):
         denoiser configured with more than one device raises.  No log file is
         written.
 
+        The sweep holds two arrays per volume, the working image and the
+        residual.  A stack swept as one batch is returned as that working
+        image, with no separate output array; several batches write into
+        one.  By default the caller's tensors are never written: a tensor
+        already on the sweep device in float32 is cloned into the working
+        image, so the call holds the input beside the two.  With
+        ``overwrite_input`` the sweep takes such a tensor over instead, which
+        saves one array per volume; the caller must not read it afterward.
+
         Args:
             stack (numpy or tensor): the volumes to denoise, with shape
                 (num_volumes,) + image_shape.
@@ -969,10 +980,16 @@ class QGGMRFDenoiser(TomographyModel):
             batch_size (int, optional): volumes swept at once.  None chooses
                 the size with :meth:`auto_batch_size`, which is the whole stack
                 on a device without a readable memory budget.
+            overwrite_input (bool, optional): let the sweep write ``stack``
+                and ``init_stack`` in place when they are float32 tensors
+                already on the sweep device, rather than clone them.  A numpy
+                array is never written.  Defaults to False.
 
         Returns:
             (denoised_stack, info): the denoised volumes, numpy for numpy input
-            and a tensor on the input's device for tensor input; and a dict
+            and a tensor on the input's device for tensor input, which shares
+            the input's storage when ``overwrite_input`` let the sweep write
+            it; and a dict
             with 'num_iterations' (one count per volume), 'nmae_pct' (one list
             per volume holding the percent change at each of its iterations),
             'regularization_params', and 'batch_size'.
@@ -1005,25 +1022,38 @@ class QGGMRFDenoiser(TomographyModel):
             raise ValueError(
                 f'init_stack must have the shape of stack, {stack_shape}; got '
                 f'{tuple(init_stack.shape)}.')
+        if init_stack is stack:
+            # The default start is the input, so the input passed twice means
+            # the same thing, and reading it so keeps the in-place forms below
+            # from writing one buffer as both the image and the residual.
+            init_stack = None
         num_volumes = stack_shape[0]
         num_pixels = image_shape[0] * image_shape[1]
         num_slices = image_shape[2]
 
-        # The output is allocated before the batch size is chosen, so that a
-        # tensor output living on the sweep device is already counted in the
-        # free-memory reading the automatic choice makes.
         stack_is_tensor = torch.is_tensor(stack)
-        if stack_is_tensor:
-            out = torch.empty(stack_shape, dtype=torch.float32, device=stack.device)
-        else:
-            out = np.empty(stack_shape, dtype=np.float32)
+        out = None
         if batch_size is None:
+            if stack_is_tensor:
+                # Allocated before the free-memory reading the automatic choice
+                # makes, so that a result living on the sweep device is counted
+                # in it; released again below when the stack turns out to be
+                # one batch, which needs no output array.
+                out = torch.empty(stack_shape, dtype=torch.float32, device=stack.device)
             batch_size = self.auto_batch_size()
         if batch_size is None or int(batch_size) > num_volumes:
             batch_size = num_volumes
         batch_size = int(batch_size)
         if batch_size < 1:
             raise ValueError(f'batch_size must be at least 1; got {batch_size}.')
+        # One batch returns the sweep's working image and allocates no output
+        # array.  Several batches write into one, on the input's device.
+        single = batch_size == num_volumes
+        if single:
+            out = None
+        elif out is None:
+            out = (torch.empty(stack_shape, dtype=torch.float32, device=stack.device)
+                   if stack_is_tensor else np.empty(stack_shape, dtype=np.float32))
 
         # The noise estimate strides all three axes of the stack merged into
         # one 3D array, as denoise strides a single image.
@@ -1061,17 +1091,20 @@ class QGGMRFDenoiser(TomographyModel):
 
         def flat_on_device(block):
             """A block of volumes as a float32 (B, num_pixels, num_slices)
-            tensor on the sweep device, and whether that tensor is a copy.
+            tensor on the sweep device, and whether the sweep may write it.
 
-            A block that crosses from the host, or changes device or dtype,
-            arrives as a copy the sweep may write into.  A caller's tensor
-            that already sits on the sweep device in float32 is returned as
-            it is, and must be cloned before the sweep writes it.
+            A block that crosses from the host, changes device or dtype, or
+            is copied by the reshape arrives as a copy the sweep owns.  A
+            caller's tensor that already sits on the sweep device in float32
+            and reshapes as a view stays the caller's, and is the sweep's to
+            write only under ``overwrite_input``; a numpy array never is.
             """
             tensor = block if torch.is_tensor(block) else torch.as_tensor(block)
             moved = tensor.to(device=device, dtype=torch.float32)
-            return (moved.reshape(moved.shape[0], num_pixels, num_slices),
-                    moved is not tensor)
+            flat = moved.reshape(moved.shape[0], num_pixels, num_slices)
+            owned = (moved is not tensor or flat.data_ptr() != moved.data_ptr()
+                     or (overwrite_input and torch.is_tensor(block)))
+            return flat, owned
 
         def padded(flat, pad):
             """The block with its last volume repeated pad more times."""
@@ -1085,26 +1118,31 @@ class QGGMRFDenoiser(TomographyModel):
             for b0 in range(0, num_volumes, batch_size):
                 b1 = min(b0 + batch_size, num_volumes)
                 pad = batch_size - (b1 - b0)
-                flat, _ = flat_on_device(stack[b0:b1])
-                flat = padded(flat, pad)
+                flat, owned = flat_on_device(stack[b0:b1])
+                if pad:
+                    flat, owned = padded(flat, pad), True
                 if init_stack is None:
-                    # The sweep writes its image in place, so it starts from a
-                    # copy of the input rather than from the input itself.
-                    flat_image = flat.clone()
+                    # The sweep writes its image in place, so the image is the
+                    # input when the input is the sweep's own and a copy of it
+                    # otherwise.  The residual, the input minus the image, is
+                    # then zero, and is allocated as zero rather than computed.
+                    flat_image = flat if owned else flat.clone()
+                    flat_error_image = torch.zeros_like(flat_image)
                 else:
-                    init_flat, owned = flat_on_device(init_stack[b0:b1])
+                    init_flat, init_owned = flat_on_device(init_stack[b0:b1])
                     if pad:
-                        init_flat, owned = padded(init_flat, pad), True
-                    # A copy made on the way to the device already belongs to
-                    # the sweep; a caller's tensor that was already here does
-                    # not, and is cloned so that the call never writes it.
-                    flat_image = init_flat if owned else init_flat.clone()
+                        init_flat, init_owned = padded(init_flat, pad), True
+                    flat_image = init_flat if init_owned else init_flat.clone()
+                    # The residual is formed in the input's own buffer when
+                    # that buffer is the sweep's, and in a new array otherwise.
+                    flat_error_image = (flat.sub_(flat_image) if owned
+                                        else flat - flat_image)
                 flat_image = flat_image.contiguous()
-                flat_error_image = (flat - flat_image).contiguous()
+                flat_error_image = flat_error_image.contiguous()
                 # The identity forward model carries the data term in the
-                # residual, so the input block is not read again.  Releasing
-                # it here leaves the sweep holding two arrays per volume
-                # whether or not an initial stack was given.
+                # residual, so the input is not read again.  The sweep holds
+                # two arrays per volume from here, and a caller's tensor it
+                # did not take over stays beside them.
                 del flat
                 counts, history = self._sweep_stack(
                     flat_image, flat_error_image, partition, fm_constant,
@@ -1112,7 +1150,9 @@ class QGGMRFDenoiser(TomographyModel):
                     subset_denoiser)
                 real = b1 - b0
                 result = flat_image[:real].reshape((real,) + image_shape)
-                if stack_is_tensor:
+                if single:
+                    out = result.to(stack.device) if stack_is_tensor else result.cpu().numpy()
+                elif stack_is_tensor:
                     out[b0:b1] = result.to(out.device)
                 else:
                     out[b0:b1] = result.cpu().numpy()
