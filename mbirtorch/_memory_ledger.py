@@ -117,18 +117,25 @@ DENOISE_APPLY_CYLINDERS = 3
 # from.  The two end devices hold one halo rather than two, and this charges
 # them four as well.
 DENOISE_HALO_COLUMNS = 4
-# The ell-1 statistics -- the denoiser's per pass, the reconstruction's per
-# iteration -- reduce a recon-shaped array a chunk at a time so that no whole
-# array of absolute values is allocated.  These two set the chunk.  They live
-# here, beside the charge that models them, because a second definition
-# elsewhere could drift from this one and quietly mis-price the phase; the
-# reduction itself is image_ell1 just below, for the same reason.
+# The sinogram and image reductions -- the ell-1 of an image, and the weighted
+# dot product and sum of squares of sinograms -- run a chunk at a time so that
+# no whole array of absolute values, products or weighted products is
+# allocated.  These two set the chunk for all of them.  They live here, beside
+# the charges that model them, because a second definition elsewhere could
+# drift from this one and quietly mis-price the phase; the reductions
+# themselves are image_ell1, weighted_dot and weighted_square_sum just below,
+# for the same reason.
 # The size is the measured knee on both backends; image_ell1 documents the
 # measurement and why the fused torch.linalg.vector_norm is not used instead.
 # The cap bounds the kernel launches for a very large array; past it the chunk
-# grows again, which the charge follows.
+# grows again, which the charges follow.
 ELL1_CHUNK_BYTES = 16 * 2 ** 20
 ELL1_MAX_CHUNKS = 1024
+
+
+def _chunk_count(n_bytes):
+    """How many chunks an array of ``n_bytes`` is reduced in."""
+    return min(ELL1_MAX_CHUNKS, max(1, round(int(n_bytes) / ELL1_CHUNK_BYTES)))
 
 
 def image_ell1(flat_image):
@@ -153,8 +160,7 @@ def image_ell1(flat_image):
     replaced, so small problems -- the goldens among them -- are unchanged bit
     for bit.
     """
-    n_bytes = flat_image.numel() * flat_image.element_size()
-    n_chunks = min(ELL1_MAX_CHUNKS, max(1, round(n_bytes / ELL1_CHUNK_BYTES)))
+    n_chunks = _chunk_count(flat_image.numel() * flat_image.element_size())
     if n_chunks == 1:
         return torch.sum(torch.abs(flat_image))
     return torch.stack([torch.sum(torch.abs(chunk)) for chunk
@@ -180,20 +186,92 @@ def stack_ell1(flat_stack):
                         in torch.chunk(flat_stack, n_chunks, dim=1)]).sum(dim=0)
 
 
-def ell1_chunk_bytes(image_bytes):
-    """What one chunk of image_ell1 holds, for an array of ``image_bytes``.
+def _block_dot(a_block, b_block, weights):
+    """One block's weighted dot product, in the operand order the unchunked
+    expression uses."""
+    if weights is None:
+        return torch.sum(a_block * b_block)
+    return torch.sum(a_block * b_block * weights)
+
+
+def _paired_blocks(operand, reference, n_chunks, n_blocks):
+    """The blocks of a second operand that pair with the reference's blocks.
+
+    An operand that carries the reference's view axis is split the same way,
+    so each block meets the values that belong to it.  Anything else -- None,
+    a scalar, or an array that broadcasts over the view axis rather than
+    spanning it -- is handed to every block whole, which is the broadcast the
+    unchunked expression does.
+    """
+    if (torch.is_tensor(operand) and operand.ndim == reference.ndim
+            and operand.shape[0] == reference.shape[0]):
+        return torch.chunk(operand, n_chunks, dim=0)
+    return [operand] * n_blocks
+
+
+def weighted_dot(a, b, weights=None):
+    """The weighted dot product of two sinograms, without a sinogram-shaped
+    temporary.
+
+    ``torch.sum(a * b * w)`` allocates a whole array of products and then a
+    whole array of weighted products before it reduces.  Reducing a block of
+    views at a time bounds both to one block, so they stop scaling with the
+    sinogram.
+
+    ``b`` is a sinogram of ``a``'s shape.  ``weights`` is None (the plain dot
+    product), a scalar, or an array of that shape.  Either one is split into
+    the same blocks as ``a`` when it spans the view axis, so each block meets
+    the values that belong to it.
+
+    Chunking keeps torch's pairwise summation inside each block and adds only
+    the block totals, so it tracks the unchunked value the way image_ell1
+    does.  A sinogram below one chunk is reduced whole, which is the
+    arithmetic this replaced, so small problems -- the goldens among them --
+    are unchanged bit for bit.
+    """
+    n_chunks = _chunk_count(a.numel() * a.element_size())
+    if n_chunks == 1:
+        return _block_dot(a, b, weights)
+    blocks = torch.chunk(a, n_chunks, dim=0)
+    b_blocks = _paired_blocks(b, a, n_chunks, len(blocks))
+    weight_blocks = _paired_blocks(weights, a, n_chunks, len(blocks))
+    totals = [_block_dot(block, b_block, block_weights)
+              for block, b_block, block_weights
+              in zip(blocks, b_blocks, weight_blocks)]
+    return torch.stack(totals).sum()
+
+
+def weighted_square_sum(error_sinogram, weights=None):
+    """The weighted sum of squares of a sinogram, without a sinogram-shaped
+    temporary.
+
+    The sum of squares is the dot product of a sinogram with itself, so this
+    is weighted_dot on one array; routing it through that one routine is what
+    keeps the two reductions on the same chunk rule and the same accumulation
+    pattern.  See weighted_dot for what chunking costs in accuracy and for
+    how weights are split.
+    """
+    return weighted_dot(error_sinogram, error_sinogram, weights)
+
+
+def reduction_chunk_bytes(array_bytes):
+    """What ONE chunk of a chunked reduction holds, for an array of
+    ``array_bytes``.
+
+    Shared by the ell-1 and the weighted dot products, which chunk by the
+    same rule.  A phase that holds more than one array per chunk -- a weighted
+    dot product holds the products and their weighted form -- multiplies this.
 
     An array small enough to want a single chunk is reduced whole, so the
     temporary is the array itself; that is the unchunked case and it is only
     reached below this module's chunk size, where one extra copy is small in
     absolute terms.
     """
-    image_bytes = int(image_bytes)
-    n_chunks = min(ELL1_MAX_CHUNKS,
-                   max(1, round(image_bytes / ELL1_CHUNK_BYTES)))
+    array_bytes = int(array_bytes)
+    n_chunks = _chunk_count(array_bytes)
     if n_chunks == 1:
-        return image_bytes, 1
-    return math.ceil(image_bytes / n_chunks), n_chunks
+        return array_bytes, 1
+    return math.ceil(array_bytes / n_chunks), n_chunks
 
 # Library workspace that torch allocates through its own caching allocator,
 # and that the ledger's array enumeration therefore cannot see.  Measured as
@@ -423,6 +501,27 @@ def estimate_peak_device_bytes(plan):
 
     def cyl(i, num_pixels):
         return int(num_pixels) * plan.slice_blocks[i] * _F32_BYTES
+
+    def sino_reduction_block(i):
+        """One block of a chunked sinogram reduction, at the size really
+        allocated.
+
+        The reduction splits the VIEW axis, so a block is a whole number of
+        views and cannot be finer than one view.  A sinogram with few views
+        and large detector planes therefore holds a block LARGER than the
+        byte rule alone would give, which is the direction the ledger may not
+        miss.
+
+        Every phase that reduces a sinogram a block at a time prices its
+        block here, so the initial dot products and the per-iteration
+        statistics cannot drift apart.
+        """
+        chunk, n_chunks = reduction_chunk_bytes(sino_dev(i))
+        views = int(plan.view_blocks[i])
+        if n_chunks == 1 or views <= 0:
+            return chunk
+        return (math.ceil(views / n_chunks) * num_rows_dev * num_channels
+                * _F32_BYTES)
 
     def back_block(i, num_pixels):
         """One live (pixels, band) back partial, at the size really allocated.
@@ -1032,7 +1131,7 @@ def estimate_peak_device_bytes(plan):
         # not charged -- the same treatment the line-search sums above get,
         # and far below the resolution of the workspace term.
         def ell1_chunk(i):
-            return ell1_chunk_bytes(recon_dev(i))[0]
+            return reduction_chunk_bytes(recon_dev(i))[0]
 
         phases.append(_phase(
             'denoise per-pass statistics',
@@ -1091,33 +1190,34 @@ def estimate_peak_device_bytes(plan):
         phases.append(_phase('initial forward projection', forward_terms,
                              n, base=constant_base,
                              base_terms=constant_terms))
-        # The error sinogram is formed while the sinogram and the projection
-        # are both live; the projection is then freed and the initial volume
-        # is briefly doubled by its scaling.
-        # The single-device branch binds `weighted_fwd = weights * fwd` for
-        # its two dot products and now releases it before the error sinogram
-        # is formed.  While it is alive it is co-live with the product
-        # temporary of `torch.sum(weighted_fwd * fwd)`, which is its own
-        # sub-peak and is modelled below.  The sharded branch has neither
-        # array: it fuses the weights into per-shard dot products whose
-        # locals die on worker return.
-        weighted_fwd = per_dev(
-            lambda i: sino_dev(i) if (n == 1 and plan.weights_supplied) else 0)
+        # The error sinogram is formed in the projection's own buffer, so the
+        # projection and the error are ONE array rather than two; the initial
+        # volume is then briefly doubled by its scaling.
+        # The two dot products that set the scale are reduced a block of views
+        # at a time on both branches, so neither builds a weighted projection
+        # nor a whole array of products.  A block of a weighted reduction holds
+        # the products and their weighted form, which is two blocks; that is
+        # charged on both branches, because the unweighted form's single block
+        # is smaller and the ledger may over-charge but never under-charge.
+        # The two reductions run one after the other, so only one pair of
+        # blocks is live.  This sub-phase used to hold a whole weighted
+        # projection beside a whole product temporary, and that made it the
+        # widest instant of a weighted initialization.
         dot_terms = [
             ('sinogram', per_dev(sino_dev)),
             ('weights', per_dev(supplied_weights_term)),
             ('forward projection', per_dev(sino_dev)),
-            ('weighted forward projection', weighted_fwd),
-            ('dot product temporary', per_dev(sino_dev)),
+            ('dot product blocks', per_dev(
+                lambda i: 2 * sino_reduction_block(i))),
             ('init recon', per_dev(recon_dev)),
         ]
         error_terms = [
             ('sinogram', per_dev(sino_dev)),
             ('weights', per_dev(supplied_weights_term)),
-            ('forward projection', per_dev(sino_dev)),
-            # `error = sinogram - alpha * fwd` allocates the scaled projection
-            # and then the difference, so both are live at the assignment.
-            ('alpha-scaled projection', per_dev(sino_dev)),
+            # The projection is scaled by -alpha in place and the sinogram is
+            # added into it, so the error sinogram IS the projection's buffer
+            # and the assignment allocates nothing.  One sinogram-shaped array
+            # is charged here for the pair.
             ('error sinogram', per_dev(sino_dev)),
             ('init recon', per_dev(recon_dev)),
         ]
@@ -1172,9 +1272,10 @@ def estimate_peak_device_bytes(plan):
 
     # ── the per-iteration statistics ─────────────────────────────────────────
     # This phase has to be charged rather than assumed small: on an unweighted
-    # run it is the peak.  Its transient measures EXACTLY two sinogram-shaped
-    # arrays at the largest sizes tested, which is the two squared-error
-    # products.
+    # run it used to be the peak, when its transient was two whole
+    # sinogram-shaped arrays -- the squares and their weighted form.
+    # weighted_square_sum reduces a block of views at a time, so what the
+    # phase holds is two blocks.
     #
     # The recon L1 is charged BESIDE those rather than folded into them,
     # because the two are consecutive and not co-live: the squared-error
@@ -1187,10 +1288,11 @@ def estimate_peak_device_bytes(plan):
     # second recon is the chunk instead.
     stats_sub_phases = (
         ('squared error',
-         ('squared-error products', per_dev(lambda i: 2 * sino_dev(i)))),
+         ('squared-error products',
+          per_dev(lambda i: 2 * sino_reduction_block(i)))),
         ('recon ell-1',
          ('recon ell-1 chunk',
-          per_dev(lambda i: ell1_chunk_bytes(recon_dev(i))[0]))),
+          per_dev(lambda i: reduction_chunk_bytes(recon_dev(i))[0]))),
     )
     stats_base_terms = constant_terms + list(persistent.items())
     for name, term in stats_sub_phases:
@@ -1224,6 +1326,12 @@ def estimate_peak_device_bytes(plan):
                 ('update direction', per_dev(
                     lambda i: (2 if plan.positivity else 1) * cyl(i, p_sub))),
                 ('delta sinogram', per_dev(sino_dev)),
+                # The second sinogram-shaped block of a multi-device forward,
+                # which is the same deliberate over-charge forward_fixed
+                # carries and describes: the driver accumulates its batches
+                # into ONE block, and the pair was calibrated against measured
+                # peaks at two.  A positivity pass also holds two for real,
+                # since it projects a second delta while the first is live.
                 ('forward assembly', per_dev(
                     lambda i: sino_dev(i) if n > 1 and is_view_owner(i) else 0)),
                 ('transferred cylinders', per_dev(

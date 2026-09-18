@@ -32,6 +32,8 @@ block of values.
 """
 
 import contextlib
+import math
+import os
 import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
@@ -165,6 +167,160 @@ class Placement:
                 for i, dev in enumerate(self.devices)]
 
 
+#: How many bytes of one shard the host gather moves at a time.  Each host
+#: thread of the gather stages its part of a shard through two pinned slots of
+#: this size, so a gather holds twice this much pinned memory per thread.
+GATHER_SLOT_BYTES = 16 * 2 ** 20
+
+#: The most host threads the gather uses per shard.  Writing a shard into its
+#: strided block of the host array runs at a few GB/s per thread and speeds up
+#: with more threads until the host memory bandwidth is reached.
+GATHER_THREADS_PER_SHARD = 16
+
+
+def _gather_threads_per_shard(n_shards):
+    """How many host threads each shard's block is written with.
+
+    The threads of all shards together are meant to occupy the CPUs this
+    process may run on, so the count is the CPUs divided by the shard count,
+    at most :data:`GATHER_THREADS_PER_SHARD` and at least one.  The write
+    itself is torch's copy, which already runs on torch's intra-op threads
+    where it has more than one, so those are divided out as well: a process
+    whose torch uses every core writes each shard from a single thread.
+    """
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        cpus = os.cpu_count() or 1
+    busy = max(1, n_shards) * max(1, torch.get_num_threads())
+    return max(1, min(GATHER_THREADS_PER_SHARD, cpus // busy))
+
+
+def _split_grid(rows, width, parts):
+    """Up to ``parts`` (row0, row1, col0, col1) sub-grids of a (rows, width)
+    grid, one per thread: ranges of whole rows, or ranges of the one row's
+    columns when the grid has a single row."""
+    if rows == 1 and parts > 1:
+        bounds = np.linspace(0, width, min(parts, width) + 1).astype(int)
+        return [(0, 1, int(a), int(b))
+                for a, b in zip(bounds[:-1], bounds[1:]) if b > a]
+    bounds = np.linspace(0, rows, min(parts, rows) + 1).astype(int)
+    return [(int(a), int(b), 0, width)
+            for a, b in zip(bounds[:-1], bounds[1:]) if b > a]
+
+
+def _slab_pieces(rows, width, slot_elems):
+    """The (row0, row1, col0, col1) pieces of a (rows, width) grid that each
+    fit in ``slot_elems`` elements: as many whole rows as fit while a row
+    fits, otherwise pieces of one row."""
+    rows_per_slab = slot_elems // width
+    if rows_per_slab >= 1:
+        for r0 in range(0, rows, rows_per_slab):
+            yield r0, min(r0 + rows_per_slab, rows), 0, width
+    else:
+        for r in range(rows):
+            for c0 in range(0, width, slot_elems):
+                yield r, r + 1, c0, min(c0 + slot_elems, width)
+
+
+def _copy_through_slots(source, dest, slots):
+    """Move part of a shard into its block of the host array, one slab at a
+    time through two staging slots.
+
+    ``source`` is a contiguous (rows, width) tensor on the shard's device,
+    ``dest`` the matching (rows, width) view of the host array, whose rows
+    are strided, and ``slots`` two host tensors of equal length.  Each slab
+    is copied into a slot and then written from the slot into place.  With
+    two slots the copy of the next slab is issued before the current slab is
+    written, so for a CUDA shard, whose copies into pinned slots return at
+    once, the two overlap; an event per slab says when that slab has landed.
+    On any other device the copy completes before it returns and no event is
+    needed.
+    """
+    rows, width = source.shape
+    if rows == 0 or width == 0:
+        return
+    pieces = list(_slab_pieces(rows, width, slots[0].numel()))
+    on_cuda = source.device.type == 'cuda'
+    stream = torch.cuda.current_stream(source.device) if on_cuda else None
+
+    def issue(k):
+        r0, r1, c0, c1 = pieces[k]
+        piece = source[r0:r1, c0:c1]
+        staged = slots[k % 2][:piece.numel()].view(r1 - r0, c1 - c0)
+        staged.copy_(piece, non_blocking=on_cuda)
+        landed = None
+        if on_cuda:
+            landed = torch.cuda.Event()
+            landed.record(stream)
+        return staged, landed
+
+    pending = issue(0)
+    for k in range(len(pieces)):
+        staged, landed = pending
+        if k + 1 < len(pieces):
+            # Into the other slot, whose last slab has already been written.
+            pending = issue(k + 1)
+        if landed is not None:
+            landed.synchronize()
+        r0, r1, c0, c1 = pieces[k]
+        dest[r0:r1, c0:c1].copy_(staged)
+
+
+def _fill_from_shards_in_slabs(sources, out, axis):
+    """Copy every shard into its block of ``out`` at once, several host
+    threads per shard, each thread moving its part in slabs of
+    :data:`GATHER_SLOT_BYTES`.
+
+    ``sources`` are the shards in axis order, ``out`` the contiguous host
+    array they fill, and ``axis`` the sharded axis as a non-negative index;
+    each shard's block is the next ``shape[axis]`` entries of that axis.
+    The array is handled as a grid with one row per combination of the
+    indices before the sharded axis and one column per combination of the
+    sharded index and the indices after it, so a shard's block is the same
+    range of columns in every row: contiguous within a row and strided
+    between rows.  Each thread takes a range of those rows (or of the
+    columns, when there is a single row).  Slots for a CUDA shard are
+    pinned, so its copies return at once; slots for a shard on any other
+    device are ordinary host memory.
+    """
+    shape = tuple(out.shape)
+    rows = math.prod(shape[:axis])
+    inner = math.prod(shape[axis + 1:])
+    grid = out.view(rows, shape[axis] * inner)
+    threads = _gather_threads_per_shard(len(sources))
+    tasks = []
+    start = 0
+    for source in sources:
+        length = int(source.shape[axis])
+        if source.numel():
+            source2d = source.reshape(rows, length * inner)
+            dest2d = grid[:, start * inner:(start + length) * inner]
+            for r0, r1, c0, c1 in _split_grid(rows, length * inner, threads):
+                tasks.append((source2d[r0:r1, c0:c1], dest2d[r0:r1, c0:c1]))
+        start += length
+
+    def run(task):
+        source2d, dest2d = task
+        slot_elems = max(1, min(GATHER_SLOT_BYTES // out.element_size(),
+                                source2d.numel()))
+        pinned = source2d.device.type == 'cuda'
+        try:
+            slots = [torch.empty(slot_elems, dtype=out.dtype, pin_memory=pinned)
+                     for _ in range(2)]
+        except RuntimeError:
+            # Pinned memory could not be had; ordinary host memory makes the
+            # copies wait, which is slower but gives the same values.
+            slots = [torch.empty(slot_elems, dtype=out.dtype) for _ in range(2)]
+        _copy_through_slots(source2d, dest2d, slots)
+
+    if len(tasks) == 1:
+        run(tasks[0])
+    elif tasks:
+        with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
+            list(pool.map(run, tasks))
+
+
 class Shards:
     """The device form of a sharded array: one tensor per device plus the
     placement that says which global block each covers.
@@ -209,14 +365,20 @@ class Shards:
         nothing in it aliases a shard.
 
         The host array is allocated ONCE, at full size, and each shard is
-        copied straight into its own slice of it.  The obvious alternative --
+        copied straight into its own block of it.  The obvious alternative --
         bring every shard over as its own host array and concatenate them --
         holds the whole volume twice on the host at the peak, once as the
         separate pieces and once as the joined result.  It is also slow in the
         layout that matters most: a recon shards on its LAST axis, and joining
         on the last axis means neither the reading nor the writing runs along
-        contiguous memory.  Copying each shard into place avoids the second
-        full-size array and lets each shard move as one large piece.
+        contiguous memory.
+
+        CUDA shards cross all at once, each in slabs through a small pinned
+        staging area (:func:`_fill_from_shards_in_slabs`).  A plain copy of
+        each shard into its strided block would instead stage the whole shard
+        in pageable host memory, one device after another, which moves a
+        large volume at a fraction of the transfer rate.  Shards on other
+        devices are copied into place directly.
 
         Returns:
             numpy.ndarray: the assembled array on the host.
@@ -242,11 +404,12 @@ class Shards:
         # numpy view at the end shares this same memory -- no copy, and no
         # translating torch dtypes into numpy dtypes by hand.
         out = torch.empty(shape, dtype=first.dtype, device='cpu')
+        # Each shard is paired with a VIEW of the finished array covering just
+        # the part it owns, so the copies below write the shard's values
+        # straight to their final position with nothing kept in between.
+        pairs = []
         start = 0
         for tensor, length in zip(self.tensors, lengths):
-            # `block` is a VIEW of the finished array, covering just the part
-            # this shard owns, so copying into it writes the shard's values
-            # straight to their final position with nothing staged in between.
             block = out.narrow(axis, start, length)
             start += length
             if tuple(tensor.shape) != tuple(block.shape):
@@ -256,21 +419,27 @@ class Shards:
                 raise ValueError(
                     f'A shard of shape {tuple(tensor.shape)} does not fill the '
                     f'{tuple(block.shape)} block of the whole array it covers.')
-            if length == 0:
-                continue                # this device holds nothing to copy
-            source = tensor.detach()
-            try:
-                block.copy_(source)
-            except RuntimeError:
-                # A block that is not at the very start of the array begins at
-                # some byte offset into it, and not every backend will write to
-                # an arbitrary offset: Metal copies only at 4-byte boundaries,
-                # which a 1- or 2-byte dtype can easily fall between.  Bring
-                # that shard to the host on its own and copy it into place
-                # here, where there is no such restriction.  This costs one
-                # shard-sized temporary and is taken only for shards that need
-                # it; the ordinary 4-byte-and-wider cases never reach it.
-                block.copy_(source.cpu())
+            pairs.append((tensor.detach(), block))
+        if all(source.device.type == 'cuda' for source, _ in pairs):
+            _fill_from_shards_in_slabs([source for source, _ in pairs], out,
+                                       axis)
+        else:
+            for source, block in pairs:
+                if block.numel() == 0:
+                    continue            # this device holds nothing to copy
+                try:
+                    block.copy_(source)
+                except RuntimeError:
+                    # A block that is not at the very start of the array
+                    # begins at some byte offset into it, and not every
+                    # backend will write to an arbitrary offset: Metal copies
+                    # only at 4-byte boundaries, which a 1- or 2-byte dtype
+                    # can easily fall between.  Bring that shard to the host
+                    # on its own and copy it into place here, where there is
+                    # no such restriction.  This costs one shard-sized
+                    # temporary and is taken only for shards that need it;
+                    # the ordinary 4-byte-and-wider cases never reach it.
+                    block.copy_(source.cpu())
         # Shares memory with `out` rather than copying it, and `out` is
         # contiguous, so this is a C-contiguous host array as promised.
         return out.numpy()
