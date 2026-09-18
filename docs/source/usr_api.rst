@@ -51,6 +51,7 @@ individual pages for more detail. See :ref:`DemosFAQs` for examples.
    usr_tomography_model
    usr_geometry_models
    usr_denoising
+   usr_mace4d
    usr_autograd
    usr_preprocess
    usr_utilities

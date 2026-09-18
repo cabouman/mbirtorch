@@ -376,13 +376,6 @@ class MACE4DModel(ParameterHandler):
             counted from the start of the scan.  Defaults to None, every
             frame.
 
-    Attributes:
-        model_list (list of TomographyModel): one model per frame.
-        view_slices (list of slice): the views of each frame.
-        num_frames (int): the number of frames.
-        recon_shape (tuple of int): the shape of one frame's volume.
-        sinogram_shape (tuple of int): the shape of the full sinogram.
-
     Example:
         >>> mace = mbirtorch.mace4d.MACE4DModel(ct_model, frames_per_rotation=6)
         >>> mace.set_params(mace_prior_weight=0.5, rho_mann=0.5)

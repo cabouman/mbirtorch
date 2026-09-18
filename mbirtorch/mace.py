@@ -64,7 +64,7 @@ def resolve_device_pool(devices=None):
         devices: one of the following.
 
             * None: every GPU, or the CPU when there is no GPU
-              (:func:`default_devices`).
+              (:func:`~mbirtorch.tomography_model.default_devices`).
             * ``'cpu'``: the CPU device.  torch presents one CPU device
               however many cores the machine has, so this pool has one entry.
             * ``'gpu'``: every GPU; raises when there is none.
@@ -79,7 +79,7 @@ def resolve_device_pool(devices=None):
     ``MBIRTORCH_NUM_DEVICES`` pins, because that variable pins the count for
     the whole process and the reconstruction policy already reads it as an
     explicit choice.  A list of devices or of indices is the caller's and is
-    not capped, and :func:`default_devices` and its siblings still report the
+    not capped, and :func:`~mbirtorch.tomography_model.default_devices` and its siblings still report the
     hardware.
 
     Returns:
