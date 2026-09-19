@@ -7,8 +7,10 @@ MBIRTorch: Model-Based Iterative Reconstruction (MBIR) for tomographic reconstru
 
 Features include:
 * Multiple geometries:  parallel beam, cone beam (including curved detector and helical), translation mode, and multi-axis parallel. 
-* Preprocessing routines for NSI and Zeiss scanners.
+* 4D reconstruction: a time sequence of volumes from a single continuous scan, using multi-agent consensus equilibrium (MACE).
+* Preprocessing routines for NSI and Zeiss scanners, plus geometry calibration.
 * Utilities for metal artifact reduction and stripe removal.  
+* Interactive slice and geometry viewers.
 * Informative demos and extensive documentation. 
 * Seamless operation on 1 or more GPUs, Mac MPS, or CPU. 
 * Compiled torch and Triton kernels for efficiency.

@@ -44,6 +44,16 @@ jobs:
           python ci/dependency_watch.py --act \
             --state .watch-state/last-divergence \
             --base-sha "$(git rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Dispatch CI on prerelease for a new torch release
+        # ci.yml installs the newest CPU-index torch, so this run validates the release the
+        # night it appears instead of at the next pull request.  The cluster nightly's canary
+        # validates the GPU and Triton paths the same night.
+        if: steps.watch.outputs.new_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref prerelease \
+            | tee -a "$GITHUB_STEP_SUMMARY"
       - name: Open the pull request
         if: steps.watch.outputs.act == 'true'
         env:

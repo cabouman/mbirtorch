@@ -6,3 +6,4 @@ from . import nsi
 from . import pymbir
 from . import zeiss_tct
 from . import zeiss
+from . import geometry_calibration

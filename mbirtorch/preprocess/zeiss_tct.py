@@ -14,7 +14,7 @@ pp = pprint.PrettyPrinter(indent=4)
 
 
 def get_sino_and_model(dataset_dir, *, crop_pixels_sides=0, crop_pixels_top=0, crop_pixels_bottom=0,
-                       alu_unit='mm', verbose=1):
+                       alu_unit='mm', det_rotation=0.0, verbose=1):
     """
     Load a Zeiss translation-CT (TCT) dataset, compute its sinogram, and return a ready-to-reconstruct
     model together with a data-specific weight mask.
@@ -35,6 +35,11 @@ def get_sino_and_model(dataset_dir, *, crop_pixels_sides=0, crop_pixels_top=0, c
         crop_pixels_top (int, optional): Pixels to crop from the top of the detector. Defaults to 0.
         crop_pixels_bottom (int, optional): Pixels to crop from the bottom of the detector. Defaults to 0.
         alu_unit (str, optional): Physical unit for 1 ALU (``'um'``, ``'mm'``, ``'cm'``, ``'m'``). Defaults to ``'mm'``.
+        det_rotation (float, optional): Detector rotation in radians, applied to every view as the
+            sinogram is computed. This is the same rotation that
+            :func:`mbirtorch.preprocess.correct_det_rotation` applies. The value to pass is the estimate
+            returned by :func:`mbirtorch.preprocess.geometry_calibration.estimate_det_rotation`.
+            Defaults to ``0.0``, which leaves the views unrotated.
         verbose (int, optional): Verbosity level. Defaults to 1.
 
     Returns:
@@ -53,12 +58,13 @@ def get_sino_and_model(dataset_dir, *, crop_pixels_sides=0, crop_pixels_top=0, c
     """
     sino, required_params, optional_params, weights = _compute_sino_and_params(
         dataset_dir, crop_pixels_sides=crop_pixels_sides, crop_pixels_top=crop_pixels_top,
-        crop_pixels_bottom=crop_pixels_bottom, alu_unit=alu_unit, verbose=verbose)
+        crop_pixels_bottom=crop_pixels_bottom, alu_unit=alu_unit, det_rotation=det_rotation,
+        verbose=verbose)
     sino, model = mtp.finalize_model(sino, required_params, optional_params)
     return sino, model, weights
 
 
-def _compute_sino_and_params(dataset_dir, crop_pixels_sides=0, crop_pixels_top=0, crop_pixels_bottom=0, alu_unit='mm', verbose=1):
+def _compute_sino_and_params(dataset_dir, crop_pixels_sides=0, crop_pixels_top=0, crop_pixels_bottom=0, alu_unit='mm', det_rotation=0.0, verbose=1):
     """
     Load Zeiss TCT scans and compute the sinogram, build_model-ready parameters, and a weight mask.
 
@@ -72,6 +78,8 @@ def _compute_sino_and_params(dataset_dir, crop_pixels_sides=0, crop_pixels_top=0
         crop_pixels_top (int, optional): Pixels to crop from the top of the detector. Defaults to 0.
         crop_pixels_bottom (int, optional): Pixels to crop from the bottom of the detector. Defaults to 0.
         alu_unit (str, optional): The physical unit used to define 1 ALU. Defaults to ``'mm'``.
+        det_rotation (float, optional): Detector rotation in radians, applied to every view as the
+            sinogram is computed. Defaults to ``0.0``.
         verbose (int, optional): Verbosity level. Defaults to 1.
 
     Returns:
@@ -103,12 +111,12 @@ def _compute_sino_and_params(dataset_dir, crop_pixels_sides=0, crop_pixels_top=0
 
     if verbose > 0:
         print("\n\n########## Computing sinogram from object, blank, and dark scans")
-    # Transmission via the shared, view-sharded core (no downsample or rotation for translation CT).
+    # Transmission via the shared, view-sharded core (no downsample for translation CT).
     sino = mtp.scan_to_sino(obj_scan, blank_scan, dark_scan, defective_pixel_array,
-                            downsample_factor=(1, 1), det_rotation=0.0)
+                            downsample_factor=(1, 1), det_rotation=det_rotation)
 
     if verbose > 0:
-        print("\n\n########## Correcting sinogram data to account for background offset and detector rotation")
+        print("\n\n########## Correcting sinogram data to account for background offset")
     sino = mtp.correct_background_offset(sino)
 
     if verbose > 0:

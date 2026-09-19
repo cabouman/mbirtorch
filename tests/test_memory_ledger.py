@@ -304,37 +304,92 @@ def test_unweighted_run_has_no_weights_array_before_the_hessian():
     assert dict(_named(ledger, 'subset prior').terms)['weights'][0] == sino_bytes
 
 
-def test_weighted_projection_is_released_before_the_error_assignment():
-    """`weighted_fwd` lives only across its two dot products.
+def test_the_initial_dot_products_charge_blocks_not_whole_sinograms():
+    """The two dot products that set the initial scale reduce in blocks.
 
-    It is charged in the dot-product sub-phase and NOT in the error sinogram
-    assignment, which is what the release in `_initial_error_state` buys.
+    Both branches used to bind the weights product `weights * fwd` -- the
+    single-device one as a whole array, the sharded one per shard -- and to
+    reduce `sum(wf * fwd)` through a whole product temporary beside it.  That
+    pair of sinogram-shaped arrays made this sub-phase the widest instant of
+    a weighted initialization.  The reductions now walk a block of views at a
+    time, so neither array exists and what is charged is two blocks: a
+    weighted block holds the products and their weighted form.
+
+    Two blocks are charged on the unweighted path as well, where only one is
+    really live.  A ledger may over-charge and may not under-charge, and the
+    single rule keeps the two paths from drifting apart.
+
+    These sinograms are below one chunk, so they are reduced whole and a
+    block is the whole shard -- the arithmetic and the cost the chunked form
+    replaced.
     """
-    one = estimate_peak_device_bytes(make_plan(n_devices=1, weights_supplied=True))
-    assert dict(_named(one, 'initial dot products').terms)[
-        'weighted forward projection'][0] > 0
-    assert 'weighted forward projection' not in dict(
-        _named(one, 'error sinogram formation').terms)
-    # The sharded branch never had the array, because it fuses the weights
-    # into per-shard dots whose locals die on worker return.
-    two = estimate_peak_device_bytes(make_plan(n_devices=2, weights_supplied=True))
-    assert dict(_named(two, 'initial dot products').terms)[
-        'weighted forward projection'][0] == 0
-    # Constant weights materialize no product at all.
-    plain = estimate_peak_device_bytes(make_plan(n_devices=1))
-    assert dict(_named(plain, 'initial dot products').terms)[
-        'weighted forward projection'][0] == 0
+    sino_bytes = 64 * 32 * 32 * 4
+    assert sino_bytes < _memory_ledger.ELL1_CHUNK_BYTES
+    for n_devices, weights_supplied in ((1, True), (2, True), (1, False)):
+        ledger = estimate_peak_device_bytes(
+            make_plan(n_devices=n_devices, weights_supplied=weights_supplied))
+        terms = dict(_named(ledger, 'initial dot products').terms)
+        assert 'weighted forward projection' not in terms
+        assert 'dot product temporary' not in terms
+        assert terms['dot product blocks'][0] == 2 * sino_bytes // n_devices
 
 
-def test_error_formation_holds_the_scaled_projection_and_its_result():
-    """`error = sinogram - alpha * fwd` allocates the scaled projection and
-    then the difference, so both are live at the assignment."""
+def test_the_initial_error_sub_peaks_hold_one_sinogram_beside_the_state():
+    """Both sub-peaks of the initial error state sit at the state itself.
+
+    Neither phase holds a second sinogram-shaped array any more: the dot
+    products reduce a block of views at a time, and the error sinogram is
+    formed in the projection's own buffer.  What a device holds is the
+    sinogram, the weights, the one array that is the projection and then the
+    error, and the initial volume -- plus, in the dot products, two reduction
+    blocks that do not scale with the sinogram.
+
+    Written as a relation between the two phases and their own terms rather
+    than as byte counts, so it holds at every size and device count.
+    """
+    for n_devices in (1, 2):
+        ledger = estimate_peak_device_bytes(
+            make_plan(n_devices=n_devices, weights_supplied=True))
+        dots = _named(ledger, 'initial dot products')
+        error = _named(ledger, 'error sinogram formation')
+        dot_terms, err_terms = dict(dots.terms), dict(error.terms)
+        for i in range(n_devices):
+            state = (dot_terms['sinogram'][i] + dot_terms['weights'][i]
+                     + dot_terms['forward projection'][i]
+                     + dot_terms['init recon'][i])
+            overhead = (dot_terms['library workspace'][i]
+                        + dot_terms['partitions (lead device)'][i])
+            blocks = dot_terms['dot product blocks'][i]
+            assert dots.per_device[i] == state + blocks + overhead
+            # The projection's buffer IS the error sinogram, so the same
+            # state carries into the next phase under a different name.
+            assert (err_terms['error sinogram'][i]
+                    == dot_terms['forward projection'][i])
+            assert error.per_device[i] == state + overhead
+            assert dots.per_device[i] == error.per_device[i] + blocks
+
+
+def test_error_formation_charges_one_array_for_the_projection_and_the_error():
+    """The error sinogram is formed in the projection's own buffer.
+
+    `_initial_error_state` scales the projection by -alpha in place and adds
+    the sinogram into it, so the projection and the error sinogram are one
+    array and the scaled copy has no existence.  The phase used to charge
+    three sinogram-shaped arrays here -- the projection, the scaled copy that
+    `sinogram - alpha * fwd` allocated, and the difference -- and now charges
+    the one that is really live, which is what makes this phase cheaper than
+    the dot products that precede it.
+    """
     ledger = estimate_peak_device_bytes(make_plan())
     terms = dict(_named(ledger, 'error sinogram formation').terms)
     sino_bytes = 64 * 32 * 32 * 4
-    assert terms['alpha-scaled projection'][0] == sino_bytes
+    assert 'alpha-scaled projection' not in terms
+    assert 'forward projection' not in terms
     assert terms['error sinogram'][0] == sino_bytes
-    assert terms['forward projection'][0] == sino_bytes
+    # The dot products before it hold the same state plus their reduction
+    # blocks, so they stay the wider of the two sub-peaks.
+    dots = _named(ledger, 'initial dot products').per_device[0]
+    assert dots > _named(ledger, 'error sinogram formation').per_device[0]
 
 
 def test_recon_direct_loop_and_scatter_are_not_co_live():
@@ -370,9 +425,13 @@ def test_per_iteration_statistics_are_charged():
     """Charged as zero by the first ledger, and measured as the peak of an
     unweighted run once the residency fixes shrank the other phases.
 
-    The squared-error transient is two sinogram-shaped products.
+    The squared-error transient is two blocks: the squares and their weighted
+    form.  This sinogram is below one chunk, so it is reduced whole and a
+    block is the whole sinogram -- the arithmetic and the cost the chunked
+    form replaced.
     """
     sino_bytes = 64 * 32 * 32 * 4
+    assert sino_bytes < _memory_ledger.ELL1_CHUNK_BYTES
     ledger = estimate_peak_device_bytes(make_plan())
     stats = _named(ledger, 'per-iteration statistics (squared error)')
     assert dict(stats.terms)['squared-error products'][0] == 2 * sino_bytes
@@ -424,6 +483,68 @@ def test_the_recon_ell_1_chunk_stops_following_the_recon():
     # And the chunk does not follow the recon.
     assert chunk <= recon_bytes / 16
     assert 0.5 * target <= chunk <= 2 * target
+
+
+def test_the_squared_error_chunk_stops_following_the_sinogram():
+    """A production-sized sinogram is what the two whole products cost.
+
+    weighted_square_sum reduces a block of views at a time, so the phase
+    holds two blocks however large the sinogram is.  The charge is two chunks
+    rather than two sinograms, which is what takes this phase off the peak of
+    a large run.
+    """
+    target = _memory_ledger.ELL1_CHUNK_BYTES
+    plan = make_plan(num_views=2048, num_rows=256, num_channels=256)
+    sino_bytes = 2048 * 256 * 256 * 4
+    ledger = estimate_peak_device_bytes(plan)
+    charged = dict(_named(ledger, 'per-iteration statistics (squared error)')
+                   .terms)['squared-error products'][0]
+    assert charged == 2 * target
+    assert charged < sino_bytes / 8
+
+
+def test_the_squared_error_block_is_a_whole_number_of_views():
+    """The reduction splits the view axis, so a block cannot be finer than
+    one view.
+
+    A sinogram with few views and large detector planes holds a block larger
+    than the byte rule alone gives, and the charge has to follow the block
+    that is really allocated rather than the byte rule -- a ledger may
+    over-charge but never under-charge.
+
+    Every phase that reduces a sinogram in blocks prices its block by the
+    same rule, so the initial dot products are checked here beside the
+    per-iteration statistics.
+    """
+    plan = make_plan(num_views=4, num_rows=2048, num_channels=3000)
+    view_bytes = 2048 * 3000 * 4
+    assert view_bytes > _memory_ledger.ELL1_CHUNK_BYTES
+    ledger = estimate_peak_device_bytes(plan)
+    charged = dict(_named(ledger, 'per-iteration statistics (squared error)')
+                   .terms)['squared-error products'][0]
+    # Four views over a chunk count far above four: one view per block.
+    assert charged == 2 * view_bytes
+    assert dict(_named(ledger, 'initial dot products').terms)[
+        'dot product blocks'][0] == 2 * view_bytes
+
+
+def test_the_initial_dot_blocks_stop_following_the_sinogram():
+    """A production-sized sinogram is what the weighted projection and the
+    product temporary used to cost.
+
+    The dot products reduce a block of views at a time, so the phase holds
+    two blocks however large the sinogram is.  That is what takes the initial
+    error state off the peak of a large weighted run.
+    """
+    target = _memory_ledger.ELL1_CHUNK_BYTES
+    plan = make_plan(num_views=2048, num_rows=256, num_channels=256,
+                     weights_supplied=True)
+    sino_bytes = 2048 * 256 * 256 * 4
+    ledger = estimate_peak_device_bytes(plan)
+    charged = dict(_named(ledger, 'initial dot products')
+                   .terms)['dot product blocks'][0]
+    assert charged == 2 * target
+    assert charged < sino_bytes / 8
 
 
 # ── the back projection's two sub-steps ──────────────────────────────────────
@@ -1208,16 +1329,18 @@ def test_the_denoise_statistics_reduce_a_small_image_whole():
 def test_the_ledger_chunk_matches_what_the_reduction_really_allocates():
     """The anti-drift gate on the two constants.
 
-    ``image_ell1`` and ``ell1_chunk_bytes`` share ELL1_CHUNK_BYTES, but they
-    are still two pieces of arithmetic that could disagree.  This runs the
-    real reduction and reads the largest array it actually allocates, so the
-    charge is checked against the allocation rather than against a restatement
-    of the same formula.  Both the denoise and the recon branches price their
-    ell-1 with ell1_chunk_bytes, so this covers both.
+    The reductions and ``reduction_chunk_bytes`` share ELL1_CHUNK_BYTES, but
+    they are still two pieces of arithmetic that could disagree.  This runs
+    the real reductions and reads the largest array each one actually
+    allocates, so the charges are checked against the allocation rather than
+    against a restatement of the same formula.  Every ell-1, dot-product and
+    squared-error charge in the module prices its block with
+    reduction_chunk_bytes, so this covers them all.
     """
     from torch.utils._python_dispatch import TorchDispatchMode
 
-    from mbirtorch._memory_ledger import image_ell1
+    from mbirtorch._memory_ledger import (image_ell1, weighted_dot,
+                                          weighted_square_sum)
 
     class Biggest(TorchDispatchMode):
         def __init__(self):
@@ -1237,8 +1360,120 @@ def test_the_ledger_chunk_matches_what_the_reduction_really_allocates():
         image_bytes = image.numel() * image.element_size()
         with Biggest() as seen:
             image_ell1(image)
-        predicted, _n_chunks = _memory_ledger.ell1_chunk_bytes(image_bytes)
+        predicted, _n_chunks = _memory_ledger.reduction_chunk_bytes(image_bytes)
         assert seen.nbytes == predicted, (image_bytes, seen.nbytes, predicted)
+
+    # The same gate on the sinogram reductions, whose phases charge two of
+    # these blocks: the products and their weighted form.  The dot product of
+    # two different sinograms is checked beside the sum of squares, because
+    # the initial error state reduces both.
+    for num_views, num_rows in ((256, 256), (8, 32)):
+        error = torch.zeros(num_views, num_rows, 64, dtype=torch.float32)
+        other = torch.zeros_like(error)
+        weights = torch.ones_like(error)
+        sino_bytes = error.numel() * error.element_size()
+        predicted, _n_chunks = _memory_ledger.reduction_chunk_bytes(sino_bytes)
+        for weight_arg in (None, weights):
+            for call in (lambda w: weighted_square_sum(error, w),
+                         lambda w: weighted_dot(error, other, w)):
+                with Biggest() as seen:
+                    call(weight_arg)
+                assert seen.nbytes == predicted, (sino_bytes, seen.nbytes,
+                                                  predicted)
+
+
+def test_weighted_square_sum_is_accurate_at_a_size_that_chunks():
+    """The reduction behind the reported forward-model loss, checked where
+    the goldens cannot check it.
+
+    The golden sinograms are far below one chunk, so they only ever exercise
+    the unchunked branch.  This runs a sinogram large enough to chunk and
+    scores the result against a float64 reference over the same float32
+    values, so it measures the reduction's own arithmetic rather than the
+    loss's.  Both the weighted and the plain forms are checked, because the
+    loss uses one and the error-sinogram RMSE the other.
+    """
+    from mbirtorch._memory_ledger import weighted_square_sum
+    torch.manual_seed(13)
+    error = torch.randn(256, 128, 256)
+    weights = torch.rand(256, 128, 256) + 0.5
+    assert (error.numel() * error.element_size()
+            > _memory_ledger.ELL1_CHUNK_BYTES)
+    for w, reference in (
+            (None, float((error.double() ** 2).sum())),
+            (weights, float((error.double() ** 2 * weights.double()).sum()))):
+        value = float(weighted_square_sum(error, w))
+        rel = abs(value - reference) / abs(reference)
+        assert rel < 1e-6, rel
+
+
+def test_weighted_square_sum_leaves_a_small_sinogram_bit_for_bit():
+    """Below one chunk the reduction is the sum(e * e * w) it replaced, so
+    small problems -- every golden among them -- cannot move at all."""
+    torch.manual_seed(5)
+    error = torch.randn(16, 8, 8)
+    weights = torch.rand(16, 8, 8) + 0.5
+    assert (error.numel() * error.element_size()
+            < _memory_ledger.ELL1_CHUNK_BYTES)
+    assert (float(_memory_ledger.weighted_square_sum(error, weights))
+            == float(torch.sum(error * error * weights)))
+    assert (float(_memory_ledger.weighted_square_sum(error))
+            == float(torch.sum(error * error)))
+    # A scalar weight broadcasts, which is the form the loss passes when the
+    # caller supplies no weights array.
+    assert (float(_memory_ledger.weighted_square_sum(error, 1))
+            == float(torch.sum(error * error * 1)))
+
+
+def test_weighted_dot_leaves_a_small_sinogram_bit_for_bit():
+    """Below one chunk the dot product is the sum(a * b * w) it replaced.
+
+    This is the reduction the initial scale is built from, so the unchunked
+    branch is what keeps a small reconstruction on its old trajectory.
+    """
+    torch.manual_seed(7)
+    a = torch.randn(16, 8, 8)
+    b = torch.randn(16, 8, 8)
+    weights = torch.rand(16, 8, 8) + 0.5
+    assert (a.numel() * a.element_size() < _memory_ledger.ELL1_CHUNK_BYTES)
+    assert (float(_memory_ledger.weighted_dot(a, b, weights))
+            == float(torch.sum(a * b * weights)))
+    assert (float(_memory_ledger.weighted_dot(a, b))
+            == float(torch.sum(a * b)))
+    # The sum of squares is this reduction on one array, and routing it
+    # through here must not have moved it.
+    assert (float(_memory_ledger.weighted_dot(a, a, weights))
+            == float(_memory_ledger.weighted_square_sum(a, weights)))
+
+
+def test_weighted_dot_is_accurate_at_a_size_that_chunks():
+    """The reduction behind the initial scale, checked where the goldens
+    cannot check it.
+
+    The golden sinograms are far below one chunk, so they only ever exercise
+    the unchunked branch.  This runs a sinogram large enough to chunk and
+    scores the result against a float64 reference over the same float32
+    values, so it measures the reduction's own arithmetic.  Both the weighted
+    and the plain forms are checked, because a weighted reconstruction uses
+    one and an unweighted one the other.
+
+    The two arrays are non-negative, as a projection and a sinogram are.  A
+    relative gate on a sum whose terms cancel would measure the cancellation
+    rather than the reduction.
+    """
+    from mbirtorch._memory_ledger import weighted_dot
+    torch.manual_seed(17)
+    a = torch.rand(256, 128, 256)
+    b = torch.rand(256, 128, 256)
+    weights = torch.rand(256, 128, 256) + 0.5
+    assert (a.numel() * a.element_size() > _memory_ledger.ELL1_CHUNK_BYTES)
+    for w, reference in (
+            (None, float((a.double() * b.double()).sum())),
+            (weights, float((a.double() * b.double()
+                             * weights.double()).sum()))):
+        value = float(weighted_dot(a, b, w))
+        rel = abs(value - reference) / abs(reference)
+        assert rel < 1e-6, rel
 
 
 def test_a_denoise_check_covers_nothing_but_another_denoise():

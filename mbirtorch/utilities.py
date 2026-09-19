@@ -608,14 +608,37 @@ def _resolve_geometry_class(geometry_type):
     raise ValueError(f"Cannot resolve a model class for geometry_type {geometry_type!r}.")
 
 
+# The reconstruction geometry the automatic pass sets.  build_model applies supplied values of these after
+# the pass, and copy_ct_model decides axis by axis which of the parent's to keep.
+_RECON_GEOMETRY_NAMES = ('recon_shape', 'delta_voxel', 'recon_slice_offset')
+
+
+def _is_parallel_beam(model):
+    return type(model).__name__ == 'ParallelBeamModel'
+
+
+def _recon_shape_at_pitch(recon_shape, automatic_pitch, pitch, slices_are_rows=False):
+    """The automatic ``recon_shape``, which was sized at ``automatic_pitch``, rescaled to cover the same
+    extent at ``pitch``.  With ``slices_are_rows`` the slice count is left alone: in parallel beam one
+    slice per detector row is structural."""
+    if np.isclose(pitch, automatic_pitch):
+        return tuple(int(n) for n in recon_shape)
+    scaled = [int(np.ceil(n * automatic_pitch / pitch)) for n in recon_shape]
+    if slices_are_rows:
+        scaled[2] = int(recon_shape[2])
+    return tuple(scaled)
+
+
 def build_model(required_params, optional_params=None, regularization=None):
     """
     Construct a model from the parameter dicts returned by
     :meth:`~mbirtorch.TomographyModel.get_all_params`.
 
     The model class is taken from the ``geometry_type`` entry of ``required_params``.  The model is
-    constructed, the optional parameters and regularization are applied, and the reconstruction
-    geometry is set with ``auto_set_recon_geometry``.
+    constructed, the optional parameters and regularization are applied, and ``auto_set_recon_geometry``
+    sets the reconstruction geometry the dicts do not carry.  A ``recon_shape``, ``delta_voxel``, or
+    ``recon_slice_offset`` the dicts do carry, from a reader or from a model whose values were set by
+    hand, is kept; when a pitch is supplied without a shape, the automatic shape is sized at that pitch.
 
     Args:
         required_params (dict): The model constructor's arguments, including ``geometry_type`` (as
@@ -633,10 +656,10 @@ def build_model(required_params, optional_params=None, regularization=None):
     model = model_class(**required_params)
 
     optional_params = dict(optional_params) if optional_params else {}
-    # A pinned recon_shape must be applied AFTER auto_set_recon_geometry, or the automatic pass would
-    # overwrite it (the translation reader pins recon_shape; a faithful save/load round-trip relies
-    # on this ordering).
-    pinned_recon_shape = optional_params.pop('recon_shape', None)
+    # The automatic pass fills in the reconstruction geometry the dicts do not carry.  Whatever they do
+    # carry is applied AFTER the pass, or the pass would overwrite it; a faithful save/load round trip
+    # relies on this ordering.
+    supplied = {name: optional_params.pop(name) for name in _RECON_GEOMETRY_NAMES if name in optional_params}
     # Apply the structural/optional params WITH name validation, so a typo'd key still raises; then
     # apply the regularization knobs with no_warning to suppress the "directly setting regularization"
     # advisory (this is a faithful rebuild, not a user hand-setting sigma_x).
@@ -645,8 +668,14 @@ def build_model(required_params, optional_params=None, regularization=None):
     if regularization:
         model.set_params(no_warning=True, **regularization)
     model.auto_set_recon_geometry()
-    if pinned_recon_shape is not None:
-        model.set_params(no_warning=True, recon_shape=pinned_recon_shape)
+    # A supplied pitch with no supplied shape: the automatic shape was sized at the automatic pitch, so
+    # it is rescaled to cover the same extent at the supplied one.
+    if 'delta_voxel' in supplied and 'recon_shape' not in supplied:
+        supplied['recon_shape'] = _recon_shape_at_pitch(
+            model.get_params('recon_shape'), float(model.get_params('delta_voxel')),
+            float(supplied['delta_voxel']), slices_are_rows=_is_parallel_beam(model))
+    if supplied:
+        model.set_params(no_warning=True, **supplied)
     return model
 
 
@@ -853,6 +882,176 @@ def get_top_level_tar_dir(tar_path, max_entries=1):
     return dir_name
 
 
+def save_volume_as_gif(volume, filename, frame_axis=None, slice_axis=None, slice_index=None,
+                       vmin=None, vmax=None, fps=5):
+    """
+    Save a 3D or 4D volume as an animated GIF by looping over one axis.
+
+    ``frame_axis`` is the looping axis, and the GIF gets one frame per index along it.
+    For a 3D volume, each frame shows the two remaining axes.  A 4D volume must first be
+    reduced to 3D, so ``slice_axis`` is held fixed at ``slice_index``.  With the defaults,
+    a 4D volume of shape (num_times, nx, ny, nz) plays over time at the middle x slice,
+    and a 3D volume of shape (nx, ny, nz) plays over x.
+
+    Choosing both axes selects the displayed plane.  For a 4D volume, the four useful
+    combinations give a movie of a YZ, XZ or XY plane playing over time, or a movie that
+    steps through the slices of a single time frame (``slice_axis=0``).
+
+    A frame shows its two axes in increasing order, with the lower-numbered axis
+    vertical.  This is the layout that :func:`mbirtorch.view_utils.slice_viewer` uses
+    for the same plane.  The axes are selected by indexing and reordering only, so the volume is not
+    copied.
+
+    The frames are drawn with matplotlib and written with Pillow, which matplotlib
+    already requires.  A GIF stores its frame durations in hundredths of a second and
+    holds at most 256 colors, so an ``fps`` that does not divide 100 is rounded and the
+    frames are quantized; both are properties of the format.
+
+    Args:
+        volume (numpy): 3D array (nx, ny, nz) or 4D array (num_times, nx, ny, nz).
+        filename (str): Output path for the GIF file.
+        frame_axis (int, optional): The looping axis, numbered as in ``volume``.  Negative
+            values count from the end.  Defaults to None, which means axis 0, or axis 1
+            when axis 0 is held fixed by ``slice_axis``.
+        slice_axis (int, optional): The axis held fixed to reduce a 4D volume to 3D.
+            Negative values count from the end.  Must differ from ``frame_axis``.
+            Defaults to None, which means axis 1 (x).  Passing this for a 3D volume is an
+            error, since it would leave a single image rather than a movie.
+        slice_index (int, optional): Index along ``slice_axis``.  Defaults to None, the
+            middle of that axis.
+        vmin (float, optional): Min pixel value for display normalization.  Defaults to
+            None, the minimum over the frames shown.  The window is computed once for the
+            whole movie, not per frame, so intensity changes from frame to frame remain
+            visible.
+        vmax (float, optional): Max pixel value for display normalization.  Defaults to
+            None, the maximum over the frames shown.
+        fps (float, optional): Frames per second in the saved GIF.  Defaults to 5.
+
+    Raises:
+        ValueError: If ``volume`` is not 3D or 4D, ``frame_axis`` and ``slice_axis`` are
+            the same axis, ``slice_axis`` or ``slice_index`` is given for a 3D volume, or
+            ``fps`` is not positive.
+        IndexError: If an axis or index is out of range for ``volume``.  These come from
+            numpy when the volume is indexed, not from a check here.
+
+    Example:
+        >>> # A 3D reconstruction, scaled to its own data range.
+        >>> mbirtorch.save_volume_as_gif(recon, 'recon.gif')
+        >>> # A 4D reconstruction: the middle x slice, playing over time.
+        >>> mbirtorch.save_volume_as_gif(recon_4d, 'recon_4d.gif', vmax=0.06)
+        >>> # A 4D reconstruction: an XY plane at the middle z, playing over time.
+        >>> mbirtorch.save_volume_as_gif(recon_4d, 'recon_4d_xy.gif', slice_axis=3)
+        >>> # A single time frame, stepping through z.
+        >>> mbirtorch.save_volume_as_gif(recon_4d, 'frame0_z.gif', frame_axis=3, slice_axis=0,
+        ...                              slice_index=0)
+    """
+
+    def _save_frames_as_gif(frames, filename, titles, vmin, vmax, fps):
+        """Write a stack of 2D frames, indexed along axis 0, as an animated GIF.
+
+        frames may be a strided view.  Each frame is rendered one at a time, so the stack
+        is never copied as a whole.  titles gives one label per frame.
+        """
+        if vmin is None or vmax is None:
+            # Scale to the frames actually shown, so a slice that is never displayed
+            # cannot consume the dynamic range.
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore', RuntimeWarning)  # An all-NaN frame warns.
+                data_min, data_max = float(np.nanmin(frames)), float(np.nanmax(frames))
+            if not (np.isfinite(data_min) and np.isfinite(data_max)):
+                data_min, data_max = 0.0, 1.0   # Nothing finite to scale to.
+            vmin = data_min if vmin is None else vmin
+            vmax = data_max if vmax is None else vmax
+        if vmin == vmax:
+            # A constant volume gives imshow a zero-width window.  Widen it as
+            # slice_viewer does.
+            scale = max(1e-6 * abs(vmax), 1e-6)
+            vmin, vmax = vmin - scale, vmax + scale
+
+        import matplotlib.pyplot as plt
+        from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+        from PIL import Image
+
+        # One figure is used for the whole movie.  This is cheaper than rebuilding it per
+        # frame, and it guarantees that every frame has the same size, which a GIF
+        # requires.
+        fig, ax = plt.subplots()
+        canvas = FigureCanvas(fig)
+        image_artist = ax.imshow(frames[0], cmap='gray', vmin=vmin, vmax=vmax)
+        ax.axis('off')
+        title_artist = ax.set_title('')
+        images = []
+        for i, frame in enumerate(frames):
+            image_artist.set_data(frame)
+            title_artist.set_text(titles[i])
+            canvas.draw()
+            # The RGBA buffer is reused on the next draw, so each frame is copied out
+            # rather than viewed, and the alpha channel is dropped.
+            buf = canvas.get_renderer().buffer_rgba()
+            image = np.frombuffer(buf, dtype=np.uint8).reshape(
+                canvas.get_width_height()[::-1] + (4,))
+            images.append(Image.fromarray(image[..., :3].copy(), mode='RGB'))
+        plt.close(fig)
+
+        makedirs(filename)
+        images[0].save(filename, save_all=True, append_images=images[1:],
+                       duration=round(1000 / fps), loop=0)
+
+    volume = np.asarray(volume)
+    if volume.ndim not in (3, 4):
+        raise ValueError('volume must be 3D (nx, ny, nz) or 4D (num_times, nx, ny, nz); '
+                         'got shape {}.'.format(volume.shape))
+    if fps <= 0:
+        raise ValueError('fps must be positive; got {}.'.format(fps))
+
+    # Negative axes count from the end, as they do throughout numpy.  Only an in-range
+    # negative is wrapped, so an out-of-range value stays out of range for numpy to
+    # reject.  Everything below then works in one numbering.
+    if frame_axis is not None and -volume.ndim <= frame_axis < 0:
+        frame_axis += volume.ndim
+    if slice_axis is not None and -volume.ndim <= slice_axis < 0:
+        slice_axis += volume.ndim
+
+    # Axis names are fixed by the mbirtorch layout, so frame titles can name the axes
+    # rather than print bare numbers.
+    axis_names = ('x', 'y', 'z') if volume.ndim == 3 else ('t', 'x', 'y', 'z')
+
+    if volume.ndim == 3:
+        if slice_axis is not None or slice_index is not None:
+            raise ValueError('slice_axis and slice_index apply only to a 4D volume; fixing '
+                             'an axis of a 3D volume would leave a single image, not a movie.')
+        if frame_axis is None:
+            frame_axis = 0
+        frames = np.moveaxis(volume, frame_axis, 0)
+        titles = ['{} = {}'.format(axis_names[frame_axis], i) for i in range(len(frames))]
+    else:
+        if slice_axis is None:
+            slice_axis = 1
+        # Default to axis 0, except when axis 0 is held fixed.  That case produces a movie
+        # that steps through the slices of a single time frame.
+        if frame_axis is None:
+            frame_axis = 0 if slice_axis != 0 else 1
+        if frame_axis == slice_axis:
+            raise ValueError('frame_axis and slice_axis must differ; both are {} ({}).'
+                             .format(frame_axis, axis_names[frame_axis]))
+        num_slices = volume.shape[slice_axis]
+        if slice_index is None:
+            slice_index = num_slices // 2
+
+        # Basic indexing and moveaxis both return views, so a large 4D volume is never
+        # copied.  Removing slice_axis renumbers every axis above it, so frame_axis shifts
+        # down by one when it was above.  Dropping one axis and moving another to the front
+        # leaves the remaining two in ascending order, the layout slice_viewer uses.
+        index = [slice(None)] * 4
+        index[slice_axis] = slice_index
+        frames = np.moveaxis(volume[tuple(index)], frame_axis - (frame_axis > slice_axis), 0)
+        titles = ['{} slice = {}, {} = {}'.format(axis_names[slice_axis], slice_index,
+                                                  axis_names[frame_axis], i)
+                  for i in range(len(frames))]
+
+    _save_frames_as_gif(frames, filename, titles, vmin, vmax, fps)
+
+
 def stitch_arrays(array_list, overlap, axis=2, ramp_overlap=None):
     """
     Concatenate arrays along one axis while linearly blending a fixed overlap
@@ -998,8 +1197,23 @@ def stitch_arrays(array_list, overlap, axis=2, ramp_overlap=None):
     return swap(stitched, 0, axis)
 
 
+def _automatic_recon_geometry(required, optional, regularization):
+    """The reconstruction geometry the automatic pass gives a model built from these parameter dicts, as
+    (recon_shape, recon_slice_offset), with the offset None for a geometry that has no such parameter.  A value
+    set by hand is recognized by differing from this."""
+    optional = {name: value for name, value in optional.items() if name not in _RECON_GEOMETRY_NAMES}
+    optional['verbose'] = 0
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        reference = build_model(dict(required), optional, regularization)
+    recon_shape = tuple(int(n) for n in reference.get_params('recon_shape'))
+    has_offset = 'recon_slice_offset' in reference.get_all_params()[1]
+    offset = float(reference.get_params('recon_slice_offset')) if has_offset else None
+    return recon_shape, offset
+
+
 def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_det_rows=None, new_num_det_cols=None,
-                  new_translation_vectors=None):
+                  new_translation_vectors=None, no_warning=False):
     """
     Create a TomographyModel with the same type and parameters as the given ct_model except with the new per-view
     parameters and a corresponding sinogram shape.  Supports the ParallelBeam, ConeBeam, MultiAxisParallel and
@@ -1015,6 +1229,15 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
     If the user explicitly set the devices on ct_model with configure_devices, the copy
     gets the same devices.  Otherwise the copy chooses its own devices when it is used.
 
+    The copy keeps the parent's reconstruction geometry: the voxel pitch (``delta_voxel``) and aspect ratios
+    always, and ``recon_shape`` and ``recon_slice_offset`` along every axis whose inputs did not change.  Only the
+    axes fed by a changed input are re-derived by ``auto_set_recon_geometry``: the slice count and slice offset
+    when the detector row count or the helical travel changes, the in-plane shape when the channel count changes,
+    and, for a TranslationModel, the whole shape when either changes.  A re-derived count is sized at the parent's
+    voxel pitch.  Changing only the per-view parameters keeps the parent's geometry, which is right for a subset of
+    the views; a copy over views the parent never had may need a larger volume, which the caller sets.  When a
+    re-derived value replaces one the parent had set by hand, a warning names it unless ``no_warning`` is True.
+
     Args:
         ct_model (TomographyModel): The model to copy.
         new_angles (ndarray of float, optional): Projection angles in radians -- a 1D vector for ParallelBeamModel and
@@ -1028,12 +1251,15 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
             If None, then use the num_det_cols in ct_model. Defaults to None.
         new_translation_vectors (ndarray of float, optional): (num_views, 3) array of object translations (x, y, z) in
             ALU for TranslationModel.  If None, then use the translation_vectors in ct_model. Defaults to None.
+        no_warning (bool, optional): Suppress the warning about hand-set reconstruction geometry that the copy
+            re-derived.  Defaults to False.
 
     Returns:
         An instance of the same model class as ct_model
     """
     model_name = str(type(ct_model))
     is_cone = model_name.find('ConeBeamModel') > 0
+    is_parallel = model_name.find('ParallelBeamModel') > 0
     is_translation = model_name.find('TranslationModel') > 0
     # MultiAxisParallelModel is matched on its own name rather than through 'ParallelBeamModel', which is not a
     # substring of it.
@@ -1046,6 +1272,7 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
     # constructor args with the view components already unpacked (angles + helical_z_shifts for cone)
     # and geometry_type in required, so build_model can reconstruct the class.
     required, optional, regularization = ct_model.get_all_params()
+    parent_required = dict(required)   # the parent's own constructor arguments, for the hand-set check below
 
     # The key the per-view parameters arrive under is the one the constructor declares, so the copy reads and writes
     # that key rather than assuming every geometry has angles.  Translation carries translation_vectors and no angles
@@ -1063,6 +1290,7 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
 
     old_view_params = required[view_key]
     new_shape = list(required['sinogram_shape'])
+    old_num_det_rows, old_num_det_cols = new_shape[1], new_shape[2]
 
     if is_cone:
         old_helical_z_shifts = required['helical_z_shifts']
@@ -1080,6 +1308,12 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
                 raise ValueError('copy_ct_model: new_helical_z_shifts must have the same length as the existing angles.')
         required['helical_z_shifts'] = new_helical_z_shifts
 
+    # The automatic pass reads the helical shifts only through their range, so that is what counts as a change.
+    travel_changed = False
+    if is_cone:
+        old_z, new_z = np.asarray(old_helical_z_shifts, dtype=float), np.asarray(new_helical_z_shifts, dtype=float)
+        travel_changed = not np.allclose([old_z.min(), old_z.max()], [new_z.min(), new_z.max()])
+
     if new_view_params is None:
         new_view_params = old_view_params
     # len() is the view count for every form here: one entry per view, whether that entry is a scalar angle or a row
@@ -1092,13 +1326,150 @@ def copy_ct_model(ct_model, new_angles=None, new_helical_z_shifts=None, new_num_
     required[view_key] = new_view_params
     required['sinogram_shape'] = tuple(new_shape)
 
-    # The sinogram shape changed, so drop recon_shape and let build_model's auto pass recompute it.
-    optional.pop('recon_shape', None)
+    # Hold back the parent's recon geometry so build_model's automatic pass sizes the copy for the new
+    # sinogram; the parent's values are applied below, axis by axis.
+    parent_geometry = {name: optional.pop(name) for name in _RECON_GEOMETRY_NAMES if name in optional}
     new_model = build_model(required, optional, regularization)
+
+    # That pass sized the whole volume for the new sinogram and replaced the voxel pitch with the detector-derived
+    # value.  The copy keeps the parent's geometry instead, except along the axes whose inputs changed: the slices
+    # when the row count or the helical travel changed, the in-plane shape when the channel count changed, and for
+    # a translation model the whole shape, since its heuristic mixes both detector axes into every recon axis.  The
+    # pitch always stays the parent's, so a re-derived count is rescaled from the automatic pitch to the parent's to
+    # cover the same extent; parallel beam is the exception, where one slice per detector row is structural.
+    rows_changed = new_shape[1] != old_num_det_rows
+    cols_changed = new_shape[2] != old_num_det_cols
+    if is_translation:
+        redo_in_plane = redo_slices = rows_changed or cols_changed
+    else:
+        redo_in_plane = cols_changed
+        redo_slices = rows_changed or travel_changed
+    automatic_pitch = float(new_model.get_params('delta_voxel'))
+    parent_pitch = (automatic_pitch if parent_geometry.get('delta_voxel') is None
+                    else float(parent_geometry['delta_voxel']))
+    automatic_shape = tuple(int(n) for n in new_model.get_params('recon_shape'))
+    parent_shape = tuple(int(n) for n in ct_model.get_params('recon_shape'))
+
+    def at_parent_pitch(count):
+        if np.isclose(parent_pitch, automatic_pitch):
+            return count
+        return int(np.ceil(count * automatic_pitch / parent_pitch))
+
+    in_plane = tuple(at_parent_pitch(n) for n in automatic_shape[:2]) if redo_in_plane else parent_shape[:2]
+    if not redo_slices:
+        slices = parent_shape[2]
+    elif is_parallel:
+        slices = automatic_shape[2]
+    else:
+        slices = at_parent_pitch(automatic_shape[2])
+    recon_shape = tuple(in_plane) + (slices,)
+    has_offset = 'recon_slice_offset' in parent_geometry
+    geometry = dict(delta_voxel=parent_pitch, recon_shape=recon_shape)
+    if has_offset and not redo_slices:
+        geometry['recon_slice_offset'] = parent_geometry['recon_slice_offset']
+    new_model.set_params(no_warning=True, **geometry)
+
+    if not no_warning and (redo_in_plane or redo_slices):
+        # A re-derived value replaces the parent's silently only when the parent's was automatic too.  Anything the
+        # parent had set by hand is named, so the caller can set it on the copy.
+        automatic_parent_shape, automatic_parent_offset = _automatic_recon_geometry(
+            parent_required, optional, regularization)
+        lost = []
+        if redo_in_plane and parent_shape[:2] != automatic_parent_shape[:2] and recon_shape[:2] != parent_shape[:2]:
+            lost.append('the in-plane recon shape')
+        if redo_slices and parent_shape[2] != automatic_parent_shape[2] and recon_shape[2] != parent_shape[2]:
+            lost.append('the slice count')
+        if redo_slices and has_offset:
+            parent_offset = float(parent_geometry['recon_slice_offset'])
+            if not np.isclose(parent_offset, automatic_parent_offset) \
+                    and not np.isclose(float(new_model.get_params('recon_slice_offset')), parent_offset):
+                lost.append('recon_slice_offset')
+        if lost:
+            changed = [name for flag, name in ((rows_changed, 'detector row count'),
+                                               (cols_changed, 'detector channel count'),
+                                               (travel_changed, 'helical travel')) if flag]
+            warnings.warn(f"copy_ct_model: the {' and '.join(changed)} changed, so the automatic pass re-derived "
+                          f"{' and '.join(lost)}, which the parent had set by hand.  Set them on the copy to keep "
+                          "the parent's values, or pass no_warning=True.")
     # If the user explicitly set the devices, the copy inherits them.
     if not ct_model.device_layout_is_automatic:
         new_model.configure_devices(devices=list(ct_model.sino_placement.devices))
     return new_model
+
+
+def construct_time_frame_models(model, frames_per_rotation=6, frame_overlap_factor=2.0):
+    """
+    Split a scan into overlapping time frames and build one model per frame.
+
+    The views are taken to be recorded in time order at a uniform angular rate, and each
+    frame is a window of consecutive views.  ``frames_per_rotation`` sets the angular step
+    between the starts of consecutive frames, one full rotation divided by that count.
+    ``frame_overlap_factor`` sets the span of a frame in units of that step, and it is also
+    the number of frames that share a view.  With the defaults a frame spans 120 degrees and a
+    new frame starts every 60 degrees, so every view belongs to two frames.
+
+    The angular step per view is the median of the absolute differences between consecutive
+    angles.  A median is used so that the frame arithmetic is unchanged by view subsampling
+    and by angles stored modulo one rotation, where each wrap adds one large difference.  The
+    views per frame and the stride between frames are the frame span and the frame step
+    divided by that angular step, rounded to the nearest integer.  Trailing views that cannot
+    fill a whole frame are discarded.  Each frame model is a copy of ``model`` over the
+    frame's angles, made with :func:`copy_ct_model`, so it keeps the parent's reconstruction
+    geometry.  No sinogram is needed, so the frames can be built before any data is loaded.
+
+    Args:
+        model (TomographyModel): the model of the full scan, with one angle per view (a
+            ConeBeamModel or a ParallelBeamModel).
+        frames_per_rotation (int, optional): number of frames per full rotation.  Defaults to 6.
+        frame_overlap_factor (float, optional): span of a frame in units of the step between
+            frames.  Defaults to 2.0.
+
+    Returns:
+        (model_list, view_slices): one model and one slice per frame.
+            - model_list (list of TomographyModel): the per-frame models.
+            - view_slices (list of slice): the views of the full sinogram that belong to each
+              frame, so that ``sinogram[view_slices[k]]`` is the sinogram of frame ``k``.
+
+    Raises:
+        ValueError: if the model has no one-dimensional angle vector, if the angles have zero
+            spacing, if the frame span or the stride is smaller than one view, or if a frame
+            would be longer than the scan.
+
+    Example:
+        >>> frames, view_slices = mbirtorch.utilities.construct_time_frame_models(ct_model)
+        >>> sinogram_of_frame_1 = sinogram[view_slices[1]]
+    """
+    angle_stride = 2.0 * np.pi / frames_per_rotation
+    angle_span_per_frame = frame_overlap_factor * angle_stride
+
+    required_params, _, _ = model.get_all_params()
+    angles = required_params.get('angles')
+    if angles is None or np.asarray(angles).ndim != 1:
+        raise ValueError('construct_time_frame_models needs a model with one angle per view, such '
+                         f'as a ConeBeamModel or a ParallelBeamModel; got {type(model).__name__}.')
+    angles = np.asarray(angles)
+    num_views = len(angles)
+
+    angle_step = float(np.median(np.abs(np.diff(angles)))) if num_views > 1 else 0.0
+    if not angle_step > 0:
+        raise ValueError('The model angles must have nonzero spacing.')
+    views_per_frame = int(round(angle_span_per_frame / angle_step))
+    stride = int(round(angle_stride / angle_step))
+
+    if views_per_frame <= 0:
+        raise ValueError('frame_overlap_factor gives a frame span smaller than one view.')
+    if stride <= 0:
+        raise ValueError('frames_per_rotation gives a stride smaller than one view.')
+    if views_per_frame > num_views:
+        raise ValueError('The frame span cannot exceed the full scan.')
+
+    model_list = []
+    view_slices = []
+    for start in range(0, num_views - views_per_frame + 1, stride):
+        view_slice = slice(start, start + views_per_frame)
+        view_slices.append(view_slice)
+        model_list.append(copy_ct_model(model, new_angles=angles[view_slice]))
+    return model_list, view_slices
 
 
 def calc_tct_recon_params(source_det_dist, source_iso_dist, delta_det_row, delta_det_channel, sinogram_shape, translation_vectors, voxel_row_aspect=1.0, voxel_slice_aspect=1.0):

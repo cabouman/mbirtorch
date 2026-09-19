@@ -13,6 +13,11 @@ the sweep runs shard by shard, with the qGGMRF halos staged once per pass and
 the four line-search sums combined on the lead device into one step size.
 Both paths keep the line search on device, so neither forces a host
 synchronization per subset.
+
+A third form, :meth:`QGGMRFDenoiser.denoise_stack`, denoises a stack of
+same-shaped volumes with shared parameters on one device.  Its update carries
+a leading volume axis, so every volume has its own step size and its own
+stopping test, and the result equals denoising the volumes one at a time.
 """
 
 import datetime
@@ -20,16 +25,86 @@ import datetime
 import numpy as np
 import torch
 
-from . import _sharding
+from . import _memory_ledger, _sharding
 
 from . import qggmrf as _qggmrf
 from . import vcd_utils
-from ._memory_ledger import image_ell1
-from ._utils import recon_param_names
+from ._memory_ledger import image_ell1, stack_ell1
+from ._utils import _AUTO_REGULARIZATION_PARAM_NAMES, recon_param_names
 from .projectors import maybe_compile
 from .tomography_model import TomographyModel
 
 _F32_EPS = float(np.finfo(np.float32).eps)
+# The smallest sigma_x the stack statistics will set; see
+# QGGMRFDenoiser.auto_set_regularization_params_from_stack.
+_SIGMA_X_FLOOR = 1e-6
+# The most voxels the whole-volume statistics read.  It is the budget
+# estimate_image_noise_std already keeps for its own subsample.
+_STATISTICS_POINT_BUDGET = 5_000_000
+
+
+#: The tile grid the point budget is spent on, and the smallest tile edge
+#: worth reading.  A grid of small tiles samples the whole field of view;
+#: one block of the same area would sample only the middle of it.
+#: Two tiles per axis, four in all, measured best: over five positions of an
+#: object boundary its worst error against the whole-stack estimate was
+#: 2.9e-2, against 4.3e-2 for one block and 6.2e-2 for four or eight tiles
+#: per axis.
+_TILE_GRID = 2
+_MIN_TILE = 4
+
+
+def _sample_tiles(num_rows, num_cols, num_leading, point_budget):
+    """Tiles of two axes that together hold at most ``point_budget`` voxels,
+    counting ``num_leading`` entries of a third axis that is left whole.
+
+    The tiles are contiguous, so a neighbor difference inside one is between
+    adjacent voxels; a strided subsample would compare voxels a stride apart,
+    which measures something else.  They are spread evenly across both axes,
+    first tile at one edge and last at the other, because the estimate must
+    see the whole field of view.  One block of the same area would sample
+    only the middle: at 30 frames of 512 cubed the budget buys 18 voxels per
+    axis, so a single block reads a needle 3.5 percent as wide as the object,
+    and misses the boundaries, where the largest neighbor differences are.
+
+    Args:
+        num_rows (int): the extent of the first tiled axis.
+        num_cols (int): the extent of the second tiled axis.
+        num_leading (int): the number of entries of the axis left whole.
+        point_budget (int): the most voxels the tiles may hold together.
+
+    Returns:
+        (list of slice, list of slice): the rows and the columns of the tiles.
+        Their product is the tile grid.  Each list holds one whole-axis slice
+        when the budget is not reached.
+    """
+    num_rows, num_cols, num_leading = int(num_rows), int(num_cols), int(num_leading)
+    total = num_leading * num_rows * num_cols
+    if total <= point_budget or total <= 0:
+        return [slice(0, num_rows)], [slice(0, num_cols)]
+    # The extent each axis may keep, spent as a grid of equal tiles.
+    side = max(2, int((point_budget / num_leading) ** 0.5))
+    count = max(1, min(_TILE_GRID, side // _MIN_TILE))
+    edge = max(2, side // count)
+
+    def spread(extent):
+        """The tiles of one axis, centered on equal shares of it.
+
+        The shares are ``(index + 0.5) / count`` of the axis, so no tile sits
+        against an edge.  Tiles placed edge to edge instead would, at the
+        production budget, put four tiles nine voxels wide in the four
+        corners of a 512 by 512 field, where a reconstruction holds only air.
+        """
+        width = min(edge, extent)
+        if count == 1 or width >= extent:
+            start = (extent - width) // 2
+            return [slice(start, start + width)]
+        starts = sorted({min(max(0, round((index + 0.5) * extent / count) - width // 2),
+                             extent - width)
+                         for index in range(count)})
+        return [slice(start, start + width) for start in starts]
+
+    return spread(num_rows), spread(num_cols)
 
 
 def vcd_subset_denoiser(flat_image, flat_error_image, pixel_indices,
@@ -79,6 +154,63 @@ def vcd_subset_denoiser(flat_image, flat_error_image, pixel_indices,
     cur_error_image = cur_error_image - alpha * delta_sinogram
     flat_error_image.index_copy_(0, pixel_indices, cur_error_image)
     ell1_for_subset = torch.sum(torch.abs(delta_recon_at_indices))
+    return flat_image, flat_error_image, ell1_for_subset, alpha
+
+
+def vcd_subset_denoiser_batched(flat_image, flat_error_image, pixel_indices,
+                                fm_constant, qggmrf_params, image_shape, active):
+    """One VCD subset update for a stack of images under the identity forward
+    model: :func:`vcd_subset_denoiser` with a leading volume axis.
+
+    The formulas are those of the single-image function.  The four line-search
+    sums are reduced over the pixel and slice axes of each volume, so the step
+    size ``alpha`` has one entry per volume and the volumes do not interact.
+    ``active`` is a boolean tensor with one entry per volume; a volume whose
+    entry is False gets a step of zero, so its image and its residual do not
+    change.  Both state tensors, of shape (num_volumes, num_pixels,
+    num_slices), are mutated in place.
+
+    Returns:
+        (flat_image, flat_error_image, ell1, alpha): the two state tensors,
+        the ell-1 norm of each volume's step, shape (num_volumes,), and the
+        step size of each volume, shape (num_volumes,).
+    """
+    prior_grad, prior_hess = _qggmrf.qggmrf_gradient_and_hessian_batched(
+        flat_image, image_shape, pixel_indices, qggmrf_params)
+
+    # The forward Hessian is all 1s for the qggmrf proximal map.
+    cur_error_image = flat_error_image[:, pixel_indices]
+    forward_grad = -fm_constant * cur_error_image
+    forward_hess = 1
+
+    delta_recon_at_indices = -((forward_grad + prior_grad)
+                               / (forward_hess + prior_hess))
+
+    # The line-search sums, one per volume.
+    prior_linear = torch.sum(prior_grad * delta_recon_at_indices, dim=(1, 2))
+    prior_quadratic_approx = torch.sum(prior_hess * delta_recon_at_indices ** 2,
+                                       dim=(1, 2))
+
+    delta_sinogram = delta_recon_at_indices
+    forward_linear = fm_constant * torch.sum(cur_error_image * delta_sinogram,
+                                             dim=(1, 2))
+    forward_quadratic = fm_constant * torch.sum(delta_sinogram * delta_sinogram,
+                                                dim=(1, 2))
+
+    alpha_numerator = forward_linear - prior_linear
+    alpha_denominator = forward_quadratic + prior_quadratic_approx + _F32_EPS
+    alpha = alpha_numerator / alpha_denominator
+    max_alpha = 1.5
+    alpha = torch.clamp(alpha, _F32_EPS, max_alpha)
+    # A frozen volume takes no step.
+    alpha = torch.where(active, alpha, torch.zeros_like(alpha))
+
+    delta_scaled = alpha[:, None, None] * delta_recon_at_indices
+    flat_image.index_add_(1, pixel_indices, delta_scaled)
+
+    cur_error_image = cur_error_image - delta_scaled
+    flat_error_image.index_copy_(1, pixel_indices, cur_error_image)
+    ell1_for_subset = torch.sum(torch.abs(delta_scaled), dim=(1, 2))
     return flat_image, flat_error_image, ell1_for_subset, alpha
 
 
@@ -257,13 +389,42 @@ class QGGMRFDenoiser(TomographyModel):
 
     def _get_estimate_of_recon_std(self, noisy_image, support_indicator):
         """Neighbor-difference std over the support (the denoiser's own recon-std
-        estimate, replacing the projection-path-length formula)."""
-        inds = np.where(support_indicator)
-        vals = np.stack([noisy_image[inds[0], inds[1], inds[2]],
-                         noisy_image[inds[0] - 1, inds[1], inds[2]],
-                         noisy_image[inds[0], inds[1] - 1, inds[2]],
-                         noisy_image[inds[0], inds[1], inds[2] - 1]], axis=0)
-        return np.mean(np.std(vals, axis=0))
+        estimate, replacing the projection-path-length formula).
+
+        Each voxel of the support is compared with itself and with its three
+        backward neighbors, one per axis, and the mean of those per-voxel
+        standard deviations is returned.  A voxel on an edge takes its
+        neighbor from the far side, which is what indexing with -1 did.
+
+        The four values are read as shifted views of the image rather than
+        gathered through an index array.  The gather held about sixteen
+        arrays of the image's size, because ``np.where`` returns three int64
+        arrays and the stack of four gathered copies doubles again; the
+        shifted views hold about five at their peak, and the spread is taken
+        in two passes, which is stable.
+        """
+        def views():
+            """The voxel and its three backward neighbors, one array at a
+            time, so that only one shifted copy exists at once."""
+            yield noisy_image
+            for axis in range(3):
+                yield np.roll(noisy_image, 1, axis=axis)
+
+        count = 4
+        mean = np.array(noisy_image, dtype=noisy_image.dtype, copy=True)
+        for index, value in enumerate(views()):
+            if index:
+                mean += value
+        mean /= count
+        spread = np.zeros_like(mean)
+        deviation = np.empty_like(mean)
+        for value in views():
+            np.subtract(value, mean, out=deviation)
+            deviation *= deviation
+            spread += deviation
+        spread /= count
+        np.sqrt(spread, out=spread)
+        return np.mean(spread[support_indicator.astype(bool)])
 
     def _get_sino_indicator(self, noisy_image, sigma_noise=None, verbose=1):
         """Binary support indicator for the noisy image: threshold at a small
@@ -304,7 +465,9 @@ class QGGMRFDenoiser(TomographyModel):
                 :meth:`~mbirtorch.TomographyModel.configure_devices` and its
                 ``like=`` argument).
             sigma_noise (float, optional): estimated noise std in the image.
-                If None, estimated from the image.
+                If None, estimated from the image.  ``sigma_y`` is kept equal
+                to ``sigma_noise`` (for the identity forward model they are
+                the same parameter), whether or not auto-regularization is on.
             use_ror_mask: restrict denoising to a masked region (False default;
                 True for the inscribed ellipse, or a custom 2D mask).
             init_image (numpy or tensor or Shards, optional): initial image
@@ -351,7 +514,12 @@ class QGGMRFDenoiser(TomographyModel):
             # whatever form the caller supplied.  Handing it the row subsample
             # built below would change the estimate.
             sigma_noise = self.estimate_image_noise_std(image)
-        self.set_params(no_warning=True, sigma_noise=sigma_noise)
+        # For the identity forward model sigma_y IS sigma_noise, so the two
+        # are kept equal here rather than only in the flag-gated auto path:
+        # a pinned denoiser (auto_regularize_flag=False, the Plug-and-Play
+        # agent configuration) must still take its strength from sigma_noise.
+        self.set_params(no_warning=True, sigma_noise=sigma_noise,
+                        sigma_y=sigma_noise)
         self.logger.info('Initializing QGGMRFDenoiser')
 
         # Auto-regularization with the background-estimation warning suppressed.
@@ -423,8 +591,13 @@ class QGGMRFDenoiser(TomographyModel):
 
                     # Chunked rather than sum(abs) over the whole image: see
                     # image_ell1 for the temporary this avoids and for why the
-                    # fused norm is not used instead.
-                    nmae = float(ell1_accum) / float(image_ell1(flat_image))
+                    # fused norm is not used instead.  A zero image gives nan
+                    # rather than raising ZeroDivisionError, as in _vcd_recon's
+                    # iteration statistics (a Plug-and-Play loop initialized
+                    # at zero feeds one in).
+                    image_l1 = float(image_ell1(flat_image))
+                    nmae = (float(ell1_accum) / image_l1 if image_l1
+                            else float('nan'))
                     nmae_update[i] = nmae
                     alpha_values[i] = float(alpha_accum) / partition.shape[0]
                     num_iters += 1
@@ -577,9 +750,12 @@ class QGGMRFDenoiser(TomographyModel):
                     # Chunked per shard, for the reason image_ell1 gives: it
                     # spares each device an image-shaped array of absolute
                     # values at the pass's one synchronization point.
-                    image_l1 = combine_on_lead([image_ell1(t)
-                                                for t in flat_image.tensors])
-                    nmae = float(ell1_accum) / float(image_l1)
+                    image_l1 = float(combine_on_lead(
+                        [image_ell1(t) for t in flat_image.tensors]))
+                    # A zero image gives nan rather than raising, as on the
+                    # single-device path.
+                    nmae = (float(ell1_accum) / image_l1 if image_l1
+                            else float('nan'))
                     nmae_update[i] = nmae
                     alpha_values[i] = float(alpha_accum) / partition.shape[0]
                     num_iters += 1
@@ -593,6 +769,451 @@ class QGGMRFDenoiser(TomographyModel):
                 self._per_device_pool.shutdown(wait=True)
                 self._per_device_pool = None
         return flat_image, nmae_update, alpha_values, num_iters
+
+    # ── denoising a stack of volumes at once ──────────────────────────────────
+    def auto_set_regularization_params_from_stack(self, stack):
+        """
+        Set the regularization parameters (sigma_y, sigma_x, and sigma_prox)
+        from a subsample of whole volumes of a stack, and return them as a
+        dict.  The parameters change only when ``auto_regularize_flag`` is
+        True, as in :meth:`auto_set_regularization_params`.
+
+        About 20 volumes are chosen, evenly spaced along the volume axis:
+        every volume when the stack holds at most 39, and every
+        ``num_volumes // 20``-th volume otherwise, which is the rule
+        :meth:`subsample_views` applies to views.  Only the chosen volumes
+        cross to the host; a tensor is indexed on its own device first.  The
+        chosen volumes are merged into one 3D array of shape
+        ``(k * d0, d1, d2)`` and the statistics run on it with no further
+        subsampling, so the neighbor differences along the first axis are
+        between adjacent frames of one volume, except at the ``k - 1`` joins
+        where the last frame of one chosen volume meets the first frame of the
+        next.  :meth:`auto_set_regularization_params` reads a row subsample
+        instead, whose row neighbors lie a stride apart, which is not what a
+        stack of volumes needs.
+
+        Args:
+            stack (numpy or tensor): the volumes, with shape
+                ``(num_volumes,) + image_shape``, on any device.
+
+        Returns:
+            dict: the values of ``sigma_y``, ``sigma_x``, and ``sigma_prox``.
+
+        Raises:
+            TypeError: if ``stack`` is in the divided device form.
+        """
+        _sharding.reject_shards('auto_set_regularization_params_from_stack',
+                                stack=stack)
+        names = list(_AUTO_REGULARIZATION_PARAM_NAMES)
+        if self.get_params('auto_regularize_flag'):
+            if not torch.is_tensor(stack):
+                stack = np.asarray(stack)
+            num_volumes = int(stack.shape[0])
+            d0, d1, d2 = (int(n) for n in stack.shape[1:])
+            # The volumes chosen are the ones subsample_views keeps when it is
+            # handed the volume indices.  The same stride, applied to the stack
+            # viewed as (num_volumes, d0 * d1, d2), picks those volumes on the
+            # device that holds them and brings only them to the host.
+            chosen = self.subsample_views(np.arange(num_volumes))
+            step = int(chosen[1] - chosen[0]) if chosen.size > 1 else 1
+            # The chosen volumes are cropped to a point budget before they
+            # cross to the host.  The crop keeps the middle of the two
+            # trailing axes and the whole of the first, so every neighbor
+            # difference the estimate reads is still between adjacent voxels.
+            rows, cols = _sample_tiles(d1, d2, int(chosen.size) * d0,
+                                       _STATISTICS_POINT_BUDGET)
+            blocks = []
+            for row in rows:
+                for col in cols:
+                    tile = stack[:, :, row, col]
+                    height, width = row.stop - row.start, col.stop - col.start
+                    # Only this tile's chosen volumes cross to the host.
+                    piece = _subsample_to_host(
+                        tile.reshape(num_volumes, d0 * height, width), row_step=step)
+                    blocks.append(piece.reshape(-1, height, width))
+            # The tiles are stacked along the axis the volumes already join
+            # on, so the joins between them are of the same kind.
+            merged = blocks[0] if len(blocks) == 1 else np.concatenate(blocks, axis=0)
+            tiled = len(blocks) > 1 or merged.shape[1:] != (d1, d2)
+
+            sino_indicator = self._get_sino_indicator(merged)
+            if tiled:
+                # The estimate reads each neighbor with a wrap, so entry 0 of
+                # an axis is compared with the far end of that axis.  Over a
+                # whole volume that is one plane in hundreds.  Over a tile it
+                # is one column in the tile's width, which on a structured
+                # image moves the estimate by tens of percent, so those
+                # entries are dropped from the support.  The planes where one
+                # tile meets the next are dropped for the same reason.
+                sino_indicator[:, 0, :] = 0
+                sino_indicator[:, :, 0] = 0
+                sino_indicator[::merged.shape[0] // len(blocks)] = 0
+            self.auto_set_sigma_y(merged, sino_indicator)
+            recon_std = self._get_estimate_of_recon_std(merged, sino_indicator)
+            if not np.isfinite(recon_std):
+                recon_std = 0.0
+            self.auto_set_sigma_x(recon_std)
+            self.auto_set_sigma_prox(recon_std)
+            # A stack dominated by background gives a sigma_x near zero, and
+            # the sweep then divides by it and returns NaN for every volume.
+            # The floor keeps sigma_x positive.
+            sigma_x = self.get_params('sigma_x')
+            if not np.isfinite(sigma_x) or sigma_x < _SIGMA_X_FLOOR:
+                self.set_params(no_warning=True, sigma_x=_SIGMA_X_FLOOR)
+        values = [float(v) for v in self.get_params(names)]
+        return dict(zip(names, values))
+
+    def auto_batch_size(self, volume_shape=None):
+        """
+        Return the number of volumes :meth:`denoise_stack` sweeps at once when
+        its ``batch_size`` is None.
+
+        On a CUDA device this is the largest batch whose sweep fits the
+        device's free memory.  The sweep holds every image-shaped array of one
+        volume's denoise plan once per volume in the batch, so the plan is
+        priced for one volume by the memory ledger, scaled by the batch count,
+        and compared with the free memory under the same margin the
+        reconstruction preflight uses.  The free memory is read when this
+        method is called.  On other devices no memory budget can be read, and
+        the result is None, which :meth:`denoise_stack` takes to mean the
+        whole stack.  A budget can be read on a CUDA device and on no other,
+        so on the CPU and on an Apple GPU the whole stack is swept at once.
+
+        The count does not depend on whether an initial stack is given.  The
+        sweep holds two arrays per volume either way, the working image and
+        the residual.  The image starts from the initial stack when there is
+        one and from the input when there is not, each taken over when the
+        sweep owns it and copied otherwise, and the residual is formed in the
+        input's own buffer when the sweep owns that and in a new array when
+        it does not; see ``overwrite_input`` on :meth:`denoise_stack`.
+
+        Args:
+            volume_shape (tuple of int, optional): the shape of one volume.
+                Defaults to the denoiser's image shape, which is the only
+                shape this denoiser sweeps; any other shape raises.
+
+        Returns:
+            int or None: volumes per batch, or None when the device reports no
+            memory budget.
+
+        Raises:
+            ValueError: if ``volume_shape`` is not the denoiser's image shape.
+            MemoryPreflightError: if a batch of one volume does not fit.
+        """
+        image_shape = tuple(int(n) for n in self.get_params('recon_shape'))
+        if volume_shape is not None and \
+                tuple(int(n) for n in volume_shape) != image_shape:
+            raise ValueError(
+                'auto_batch_size prices the sweep this denoiser runs, which is '
+                f'over volumes of shape {image_shape}; got volume_shape '
+                f'{tuple(volume_shape)}.  Build a QGGMRFDenoiser at that shape.')
+        device = self.torch_device
+        budget = _memory_ledger.device_budget_bytes(device)
+        if budget is None:
+            return None
+        plan = _memory_ledger.plan_from_model(self, [device], workload='denoise')
+        ledger = _memory_ledger.estimate_peak_device_bytes(plan)
+        batch = _memory_ledger.largest_denoise_batch(
+            ledger, budget, margin=self.memory_preflight_margin)
+        if batch < 1:
+            need = _memory_ledger.denoise_batch_peak_bytes(ledger, 1)
+            raise _memory_ledger.MemoryPreflightError(
+                'a denoise sweep of one volume of shape {} is modeled at {:.2f} GB '
+                'against {:.2f} GB free on {} (with a {:.0%} margin), so no batch '
+                'fits.  Pass batch_size to denoise_stack to run anyway.'.format(
+                    image_shape, need / 2 ** 30, budget / 2 ** 30, device,
+                    self.memory_preflight_margin))
+        return int(batch)
+
+    def denoise_stack(self, stack, sigma_noise=None, init_stack=None,
+                      max_iterations=15, stop_threshold_change_pct=0.2,
+                      batch_size=None, overwrite_input=False):
+        """
+        Denoise a stack of same-shaped volumes with shared parameters, each
+        volume as :meth:`denoise` would denoise it alone.
+
+        The volumes are independent.  The sweep carries a leading volume axis,
+        each volume has its own line-search step size, and each volume has its
+        own stopping test: a volume whose change falls below the threshold is
+        frozen, its step is zero from then on, and the other volumes keep
+        iterating.  The result and the per-volume iteration counts therefore
+        equal those of calling :meth:`denoise` once per volume with the same
+        parameters and the same pixel partition.
+
+        The parameters are set once for the whole stack.  ``sigma_noise`` is
+        shared by every volume, and ``sigma_y`` is kept equal to it.  When
+        auto-regularization is on, the regularization parameters are set by
+        :meth:`auto_set_regularization_params_from_stack` from a subsample of
+        about 20 whole volumes, evenly spaced, with the neighbor differences
+        taken between adjacent frames.  This differs from :meth:`denoise`,
+        which reads a row subsample of a single image.  One pixel partition is
+        drawn from the global numpy random generator and used by every volume,
+        so a seeded call is reproducible.
+
+        The sweep runs on the denoiser's device, in batches of ``batch_size``
+        volumes.  The last batch is padded to the full size by repeating its
+        last volume, so one compiled shape serves every batch of a call, and
+        the padded results are discarded.  This method uses one device: a
+        denoiser configured with more than one device raises.  No log file is
+        written.
+
+        The sweep holds two arrays per volume, the working image and the
+        residual.  A stack swept as one batch is returned as that working
+        image, with no separate output array; several batches write into
+        one.  By default the caller's tensors are never written: a tensor
+        already on the sweep device in float32 is cloned into the working
+        image, so the call holds the input beside the two.  With
+        ``overwrite_input`` the sweep takes such a tensor over instead, which
+        saves one array per volume; the caller must not read it afterward.
+
+        Args:
+            stack (numpy or tensor): the volumes to denoise, with shape
+                (num_volumes,) + image_shape.
+            sigma_noise (float, optional): noise std shared by every volume.
+                None estimates it from the merged stack.
+            init_stack (numpy or tensor, optional): initial image for each
+                volume, with the shape of ``stack``.  Defaults to ``stack``.
+            max_iterations (int, optional): maximum VCD iterations per volume.
+            stop_threshold_change_pct (float, optional): a volume stops when
+                100 * ||delta||_1 / ||volume||_1 drops below this.  0 runs
+                every volume for exactly max_iterations.
+            batch_size (int, optional): volumes swept at once.  None chooses
+                the size with :meth:`auto_batch_size`, which is the whole stack
+                on a device without a readable memory budget.
+            overwrite_input (bool, optional): let the sweep write ``stack``
+                and ``init_stack`` in place when they are float32 tensors
+                already on the sweep device, rather than clone them.  A numpy
+                array is never written.  Defaults to False.
+
+        Returns:
+            (denoised_stack, info): the denoised volumes, numpy for numpy input
+            and a tensor on the input's device for tensor input, which shares
+            the input's storage when ``overwrite_input`` let the sweep write
+            it; and a dict
+            with 'num_iterations' (one count per volume), 'nmae_pct' (one list
+            per volume holding the percent change at each of its iterations),
+            'regularization_params', and 'batch_size'.
+
+        Raises:
+            ValueError: if ``stack`` or ``init_stack`` has the wrong shape, if
+                ``batch_size`` is below 1, or if the denoiser is configured
+                with more than one device.
+            TypeError: if ``stack`` or ``init_stack`` is in the divided device
+                form.
+
+        Example:
+            >>> denoiser = mbirtorch.QGGMRFDenoiser(stack.shape[1:])
+            >>> denoised, info = denoiser.denoise_stack(stack, sigma_noise=0.1)
+        """
+        _sharding.reject_shards('denoise_stack', stack=stack, init_stack=init_stack)
+        if self.recon_placement.n_devices > 1:
+            raise ValueError(
+                'denoise_stack runs on one device, and this denoiser is '
+                f'configured with {self.recon_placement.n_devices}.  Configure '
+                'it with one device, or call denoise for the sharded sweep.')
+        device = self.torch_device
+        image_shape = tuple(int(n) for n in self.get_params('recon_shape'))
+        stack_shape = tuple(int(n) for n in stack.shape)
+        if len(stack_shape) != 4 or stack_shape[1:] != image_shape:
+            raise ValueError(
+                f'stack must have shape (num_volumes,) + {image_shape}; got '
+                f'{stack_shape}.')
+        if init_stack is not None and tuple(int(n) for n in init_stack.shape) != stack_shape:
+            raise ValueError(
+                f'init_stack must have the shape of stack, {stack_shape}; got '
+                f'{tuple(init_stack.shape)}.')
+        if init_stack is stack:
+            # The default start is the input, so the input passed twice means
+            # the same thing, and reading it so keeps the in-place forms below
+            # from writing one buffer as both the image and the residual.
+            init_stack = None
+        num_volumes = stack_shape[0]
+        num_pixels = image_shape[0] * image_shape[1]
+        num_slices = image_shape[2]
+
+        stack_is_tensor = torch.is_tensor(stack)
+        out = None
+        if batch_size is None:
+            if stack_is_tensor:
+                # Allocated before the free-memory reading the automatic choice
+                # makes, so that a result living on the sweep device is counted
+                # in it; released again below when the stack turns out to be
+                # one batch, which needs no output array.
+                out = torch.empty(stack_shape, dtype=torch.float32, device=stack.device)
+            batch_size = self.auto_batch_size()
+        if batch_size is None or int(batch_size) > num_volumes:
+            batch_size = num_volumes
+        batch_size = int(batch_size)
+        if batch_size < 1:
+            raise ValueError(f'batch_size must be at least 1; got {batch_size}.')
+        # One batch returns the sweep's working image and allocates no output
+        # array.  Several batches write into one, on the input's device.
+        single = batch_size == num_volumes
+        if single:
+            out = None
+        elif out is None:
+            out = (torch.empty(stack_shape, dtype=torch.float32, device=stack.device)
+                   if stack_is_tensor else np.empty(stack_shape, dtype=np.float32))
+
+        # The noise estimate strides all three axes of the stack merged into
+        # one 3D array, as denoise strides a single image.
+        if sigma_noise is None:
+            sigma_noise = self.estimate_image_noise_std(
+                stack.reshape(-1, image_shape[1], image_shape[2]))
+        # For the identity forward model sigma_y IS sigma_noise; kept equal
+        # here for the pinned path too, as in denoise.
+        self.set_params(no_warning=True, sigma_noise=sigma_noise,
+                        sigma_y=sigma_noise)
+        # The regularization parameters come from whole volumes, so the
+        # neighbor differences they measure are between adjacent frames.
+        regularization_params = self.auto_set_regularization_params_from_stack(stack)
+        verbose = self.get_params('verbose')
+
+        # One fixed partition over one volume's pixel grid, shared by every
+        # volume.
+        granularity = self.get_params('granularity')
+        partition_sequence = self.get_params('partition_sequence')
+        use_ror_mask = self.get_params('use_ror_mask')
+        partition = vcd_utils.gen_set_of_pixel_partitions(
+            image_shape, [granularity[partition_sequence[0]]],
+            device=device, use_ror_mask=use_ror_mask)[0]
+
+        fm_constant = 1.0 / (self.get_params('sigma_y') ** 2.0)
+        qggmrf_nbr_wts, sigma_x, p, q, T = self.get_params(
+            ['qggmrf_nbr_wts', 'sigma_x', 'p', 'q', 'T'])
+        qggmrf_params = (_qggmrf.get_b_from_nbr_wts(qggmrf_nbr_wts), sigma_x, p, q, T)
+        stop_thresh = stop_threshold_change_pct / 100.0
+        # One compiled instance per denoiser object, so that two denoisers
+        # swept at the same time from different threads, on the same device or
+        # on different ones, share no compiled state.
+        subset_denoiser = maybe_compile(vcd_subset_denoiser_batched,
+                                        self.compile_enabled, instance_key=id(self))
+
+        def flat_on_device(block):
+            """A block of volumes as a float32 (B, num_pixels, num_slices)
+            tensor on the sweep device, and whether the sweep may write it.
+
+            A block that crosses from the host, changes device or dtype, or
+            is copied by the reshape arrives as a copy the sweep owns.  A
+            caller's tensor that already sits on the sweep device in float32
+            and reshapes as a view stays the caller's, and is the sweep's to
+            write only under ``overwrite_input``; a numpy array never is.
+            """
+            tensor = block if torch.is_tensor(block) else torch.as_tensor(block)
+            moved = tensor.to(device=device, dtype=torch.float32)
+            flat = moved.reshape(moved.shape[0], num_pixels, num_slices)
+            owned = (moved is not tensor or flat.data_ptr() != moved.data_ptr()
+                     or (overwrite_input and torch.is_tensor(block)))
+            return flat, owned
+
+        def padded(flat, pad):
+            """The block with its last volume repeated pad more times."""
+            if pad == 0:
+                return flat
+            return torch.cat([flat, flat[-1:].expand(pad, -1, -1)])
+
+        num_iterations = np.zeros(num_volumes, dtype=int)
+        nmae_pct = [[] for _ in range(num_volumes)]
+        with torch.no_grad():
+            for b0 in range(0, num_volumes, batch_size):
+                b1 = min(b0 + batch_size, num_volumes)
+                pad = batch_size - (b1 - b0)
+                flat, owned = flat_on_device(stack[b0:b1])
+                if pad:
+                    flat, owned = padded(flat, pad), True
+                if init_stack is None:
+                    # The sweep writes its image in place, so the image is the
+                    # input when the input is the sweep's own and a copy of it
+                    # otherwise.  The residual, the input minus the image, is
+                    # then zero, and is allocated as zero rather than computed.
+                    flat_image = flat if owned else flat.clone()
+                    flat_error_image = torch.zeros_like(flat_image)
+                else:
+                    init_flat, init_owned = flat_on_device(init_stack[b0:b1])
+                    if pad:
+                        init_flat, init_owned = padded(init_flat, pad), True
+                    flat_image = init_flat if init_owned else init_flat.clone()
+                    # The residual is formed in the input's own buffer when
+                    # that buffer is the sweep's, and in a new array otherwise.
+                    flat_error_image = (flat.sub_(flat_image) if owned
+                                        else flat - flat_image)
+                flat_image = flat_image.contiguous()
+                flat_error_image = flat_error_image.contiguous()
+                # The identity forward model carries the data term in the
+                # residual, so the input is not read again.  The sweep holds
+                # two arrays per volume from here, and a caller's tensor it
+                # did not take over stays beside them.
+                del flat
+                counts, history = self._sweep_stack(
+                    flat_image, flat_error_image, partition, fm_constant,
+                    qggmrf_params, image_shape, max_iterations, stop_thresh,
+                    subset_denoiser)
+                real = b1 - b0
+                result = flat_image[:real].reshape((real,) + image_shape)
+                if single:
+                    out = result.to(stack.device) if stack_is_tensor else result.cpu().numpy()
+                elif stack_is_tensor:
+                    out[b0:b1] = result.to(out.device)
+                else:
+                    out[b0:b1] = result.cpu().numpy()
+                num_iterations[b0:b1] = counts[:real]
+                nmae_pct[b0:b1] = history[:real]
+
+        if verbose >= 1:
+            self.logger.info(
+                'Denoised {} volumes in batches of {}: {} to {} iterations per '
+                'volume.'.format(num_volumes, batch_size,
+                                 int(num_iterations.min()), int(num_iterations.max())))
+        info = dict(num_iterations=num_iterations, nmae_pct=nmae_pct,
+                    regularization_params=regularization_params,
+                    batch_size=batch_size)
+        return out, info
+
+    @staticmethod
+    def _sweep_stack(flat_image, flat_error_image, partition, fm_constant,
+                     qggmrf_params, image_shape, max_iters, stop_thresh,
+                     subset_denoiser):
+        """Run the batched sweep in place on one batch of flat volumes.
+
+        Each volume runs until its own change falls below ``stop_thresh`` or
+        until ``max_iters``.  A volume that has stopped is frozen: it keeps
+        its place in the batch with a step of zero.  The loop ends when no
+        volume is active.
+
+        Returns:
+            (num_iterations, nmae_pct): the iteration count of each volume,
+            and one list per volume of the percent change at each of its
+            iterations.
+        """
+        num_vols = int(flat_image.shape[0])
+        device = flat_image.device
+        active_host = np.ones(num_vols, dtype=bool)
+        active = torch.ones(num_vols, dtype=torch.bool, device=device)
+        counts = np.zeros(num_vols, dtype=int)
+        history = [[] for _ in range(num_vols)]
+        for i in range(max_iters):
+            ell1_accum = torch.zeros(num_vols, dtype=flat_image.dtype, device=device)
+            for k in range(partition.shape[0]):
+                flat_image, flat_error_image, ell1_subset, _alpha = subset_denoiser(
+                    flat_image, flat_error_image, partition[k], fm_constant,
+                    qggmrf_params, tuple(image_shape), active)
+                ell1_accum = ell1_accum + ell1_subset
+            # One host read per iteration: the stopping test needs Python
+            # numbers.  The ratio is formed in float64 on the host, as
+            # denoise forms it, and a zero volume gives nan rather than
+            # raising, as there.
+            stats = torch.stack([ell1_accum, stack_ell1(flat_image)])
+            stats = stats.cpu().numpy().astype(np.float64)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                nmae = stats[0] / stats[1]
+            for j in np.flatnonzero(active_host):
+                history[j].append(100.0 * float(nmae[j]))
+                counts[j] = i + 1
+            active_host &= ~(nmae < stop_thresh)
+            if not active_host.any():
+                break
+            active = torch.tensor(active_host, device=device)
+        return counts, history
 
 
 def median_filter3d(x, max_block_gb=4.0, return_min_max=False):

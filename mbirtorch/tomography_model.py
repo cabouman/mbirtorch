@@ -82,7 +82,13 @@ def _apply_update(flat_recon, error_sinogram, pixel_indices, delta_scaled,
     # functionally rather than relying on the side effect.
     flat_recon.index_add_(0, pixel_indices, delta_scaled)
     delta_sumsq = torch.sum(delta_scaled * delta_scaled, dim=0)
-    error_sinogram.sub_(alpha * delta_sinogram)
+    # error -= alpha * delta, with no sinogram-sized temporary: the scaled
+    # subtraction reads the step straight out of the 0-d device tensor the
+    # line search produced, so nothing is materialized and nothing is copied
+    # back to the host.  (The sub_ form's alpha keyword takes a NUMBER, so a
+    # 0-d tensor there would be read with .item() -- a host synchronization
+    # per subset, which this loop is built to avoid.)
+    error_sinogram.addcmul_(delta_sinogram, alpha, value=-1)
     ell1 = torch.sum(torch.abs(delta_scaled))
     return flat_recon, error_sinogram, delta_sumsq, ell1
 
@@ -96,6 +102,64 @@ def _resolve_device(device):
     if torch.backends.mps.is_available():
         return torch.device('mps')
     return torch.device('cpu')
+
+
+def gpu_devices():
+    """The GPU devices torch can use, as a tuple.
+
+    Every CUDA device when CUDA is available, the MPS device alone when CUDA
+    is absent and MPS is present, and an empty tuple when there is no GPU.
+    The tuple reports the hardware and reads no environment variable.
+    """
+    if torch.cuda.is_available():
+        return tuple(torch.device('cuda', i) for i in range(torch.cuda.device_count()))
+    if torch.backends.mps.is_available():
+        return (torch.device('mps'),)
+    return ()
+
+
+def cpu_devices():
+    """The CPU device, as a one-element tuple.
+
+    torch presents one CPU device however many cores the machine has, so a
+    pool of CPU devices has one entry.
+    """
+    return (torch.device('cpu'),)
+
+
+def default_devices():
+    """The devices a run uses when none are named, as a list: the GPU devices
+    when there are any, and otherwise the CPU device."""
+    return list(gpu_devices()) or list(cpu_devices())
+
+
+def _array_extremes(array):
+    """``(minimum, maximum)`` of ``array``, read where the array already is.
+
+    The pair answers every question the input checks below ask.  A NaN
+    anywhere propagates into both, so an array holding one cannot report two
+    finite extremes; an infinity of either sign appears in the extreme on its
+    side; and whether an array has a negative value, or is entirely zero, is
+    the pair's to answer directly.  Asking each question separately costs one
+    full pass and one full-length temporary per question, which at a
+    1024-class sinogram was measured at about half a second per pass.
+
+    Both reductions run through torch on the array's own device, so a host
+    array is read across the process's threads rather than on one, and an
+    array already on a device is never pulled back to the host to be checked.
+    A numpy array is wrapped rather than copied.
+    """
+    if torch.is_tensor(array):
+        tensor = array
+    else:
+        with warnings.catch_warnings():
+            # This function only READS the array.  A read-only host array is
+            # an ordinary input -- a memory-mapped load makes one -- so
+            # torch's not-writable notice would be noise from a check the
+            # caller did not ask about.
+            warnings.filterwarnings('ignore', message='.*not writable.*')
+            tensor = torch.as_tensor(array)
+    return float(tensor.min()), float(tensor.max())
 
 
 class TomographyModel(ParameterHandler):
@@ -1672,11 +1736,14 @@ class TomographyModel(ParameterHandler):
         fwd = self.forward_project(init_recon, output_sharded=True)
         if isinstance(fwd, _sharding.Shards):
             def dots_worker(i, d):
+                # Both sums are reduced a block of views at a time, so the
+                # shard never holds a weighted projection or a whole array of
+                # products.  See _memory_ledger.weighted_dot.
                 f = fwd.tensors[i]
-                w = 1 if constant_weights else weights.tensors[i]
-                wf = f if constant_weights else w * f
-                return (float(torch.sum(wf * f)),
-                        float(torch.sum(wf * sinogram.tensors[i])))
+                w = None if constant_weights else weights.tensors[i]
+                return (float(_memory_ledger.weighted_square_sum(f, w)),
+                        float(_memory_ledger.weighted_dot(
+                            f, sinogram.tensors[i], w)))
             dots = _sharding.run_per_device(self.sino_placement.devices,
                                             dots_worker)
             wtd_err_sino_norm = sum(a for a, _ in dots)
@@ -1684,29 +1751,38 @@ class TomographyModel(ParameterHandler):
                 alpha = sum(b for _, b in dots) / wtd_err_sino_norm
             else:
                 alpha = 1
+            # The error is formed IN the projection's own shards: scaling a
+            # shard by -alpha and adding the sinogram into it gives exactly
+            # the values of sinogram - alpha * fwd, since a - b and a + (-b)
+            # round identically, and it allocates nothing.  Nothing else
+            # reads fwd, so the buffer is free to become the error sinogram.
             error_sinogram = _sharding.Shards(
                 _sharding.run_per_device(
                     self.sino_placement.devices,
-                    lambda i, d: sinogram.tensors[i] - alpha * fwd.tensors[i]),
+                    lambda i, d: fwd.tensors[i].mul_(-alpha).add_(
+                        sinogram.tensors[i])),
                 self.sino_placement)
-            # The init projection is folded into the error; free its
-            # sino-sized shards before the Hessian and the loop.
+            # The projection's shards ARE the error sinogram now, so dropping
+            # this name releases only the container.
             fwd = None
             init_recon = _sharding.Shards(
                 [alpha * t for t in init_recon.tensors], self.recon_placement)
         else:
-            weighted_fwd = fwd if constant_weights else weights * fwd
-            wtd_err_sino_norm = torch.sum(weighted_fwd * fwd)
+            # Reduced a block of views at a time, as in the sharded branch
+            # above: no weighted projection and no whole array of products is
+            # built, and holding those made this function the measured peak of
+            # a weighted reconstruction.
+            w = None if constant_weights else weights
+            wtd_err_sino_norm = _memory_ledger.weighted_square_sum(fwd, w)
             if wtd_err_sino_norm > 0 and scale_recon_to_sinogram:
-                alpha = (torch.sum(weighted_fwd * sinogram)
+                alpha = (_memory_ledger.weighted_dot(fwd, sinogram, w)
                          / wtd_err_sino_norm).item()
             else:
                 alpha = 1
-            # Drop the weights product before the two sinogram-sized
-            # allocations below: holding it made this function the measured
-            # peak of a weighted reconstruction.
-            weighted_fwd = None
-            error_sinogram = sinogram - alpha * fwd
+            # Formed in the projection's own buffer, as in the sharded branch
+            # above: scaling by -alpha and adding the sinogram is the same
+            # arithmetic as sinogram - alpha * fwd, with nothing allocated.
+            error_sinogram = fwd.mul_(-alpha).add_(sinogram)
             fwd = None
             init_recon = alpha * init_recon
         return error_sinogram, init_recon
@@ -1947,6 +2023,96 @@ class TomographyModel(ParameterHandler):
             recon[indices] = cylinders
             recon = recon.reshape(tuple(recon_shape[:2]) + (cylinders.shape[-1],))
         return recon if output_sharded else self._gather_recon(recon)
+
+    def project_points(self, points_xyz, view_index):
+        """Map object points to fractional detector indices, for one view or several.
+
+        This is the geometric map the projectors implement, stated for points
+        instead of voxels.  Each geometry class computes it from the same
+        functions its projection bodies use, so the answer here is the answer
+        the projector gives, up to the projector's float32 rounding and its
+        footprint weights.
+
+        The object frame is the right-handed (x, y, z) frame in which voxel
+        (i, j, k) of the reconstruction has its center at
+
+            x = delta_voxel * (j - (num_cols - 1) / 2)
+            y = voxel_row_aspect * delta_voxel * (i - (num_rows - 1) / 2)
+            z = voxel_slice_aspect * delta_voxel * (k - (num_slices - 1) / 2) + recon_slice_offset
+
+        so the column index runs along x, the row index along y, and the slice
+        index along z, the rotation axis.  ``recon_slice_offset`` is zero for a
+        geometry that has no such parameter.  Points are given in this frame,
+        before the view's own action on the object: a view rotates the object
+        about z by its angle (parallel, cone, and multiaxis), shifts it by its
+        helical z shift (cone), or translates it by minus its translation
+        vector (translation).  This method applies that action itself.
+
+        The result is a pair of fractional indices into a sinogram of shape
+        ``(num_views, num_det_rows, num_det_channels)``.  Integer index m is
+        the center of detector row m, and index -0.5 is the outer edge of row
+        0.  A point outside the detector gets an index outside
+        ``[-0.5, num - 0.5]``; nothing is clipped.
+
+        Args:
+            points_xyz (array_like): the points, (N, 3) as (x, y, z) in ALU,
+                or one point as (3,).
+            view_index (int or sequence of int): one view, or several.
+
+        Returns:
+            tuple of ndarray: ``(row, channel)`` as float64 arrays.  For one
+            view each has shape (N,); for a sequence of views each has shape
+            (num_selected_views, N).
+
+        Raises:
+            ValueError: if ``points_xyz`` is not (N, 3) or (3,), or if a view
+                index is not an integer.
+            IndexError: if a view index is outside ``[0, num_views)``.
+
+        Example:
+            >>> row, channel = model.project_points([[0.0, 0.0, 0.0]], 0)
+        """
+        points = np.asarray(points_xyz, dtype=np.float64)
+        if points.ndim == 1 and points.shape == (3,):
+            points = points[None, :]
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError('points_xyz must have shape (N, 3) or (3,); '
+                             f'got {points.shape}.')
+        single_view = np.ndim(view_index) == 0
+        indices = np.atleast_1d(np.asarray(view_index))
+        if indices.ndim != 1 or not np.issubdtype(indices.dtype, np.integer):
+            raise ValueError('view_index must be an integer or a sequence of '
+                             f'integers; got {view_index!r}.')
+        num_views = int(self.get_params('sinogram_shape')[0])
+        if indices.size and (indices.min() < 0 or indices.max() >= num_views):
+            raise IndexError(f'view_index {view_index!r} is outside '
+                             f'[0, {num_views}).')
+        view_params = np.asarray(self.get_params(self.get_params('view_params_name')))[indices]
+        # The computation is float64 on the host: it is a small geometric
+        # query, and a device transfer would cost more than the arithmetic.
+        row, channel = self._project_points_batch(
+            torch.as_tensor(points, dtype=torch.float64),
+            torch.as_tensor(view_params, dtype=torch.float64))
+        row = np.ascontiguousarray(row.numpy())
+        channel = np.ascontiguousarray(channel.numpy())
+        if single_view:
+            return row[0], channel[0]
+        return row, channel
+
+    def _project_points_batch(self, points, view_params):
+        """The geometry's own part of :meth:`project_points`.
+
+        Args:
+            points: (N, 3) float64 CPU tensor of object-frame points.
+            view_params: the selected rows of the model's per-view parameter
+                array, as a float64 CPU tensor: (V,) angles for parallel beam,
+                (V, 2) for cone and multiaxis, (V, 3) for translation.
+
+        Returns:
+            (row, channel): float64 CPU tensors, each (V, N).
+        """
+        raise NotImplementedError(
+            f'{type(self).__name__} does not implement project_points.')
 
     def compute_hessian_diagonal(self, weights=None, output_sharded=False,
                                  indices=None):
@@ -2356,13 +2522,16 @@ class TomographyModel(ParameterHandler):
             weights = torch.as_tensor(weights, dtype=torch.float32,
                                       device=error_sinogram.device)
             avg_weight = torch.mean(weights)
+        # Chunked: sum(error * error * weights) allocated two whole
+        # sinogram-shaped arrays here, the squares and their weighted form.
+        # See _memory_ledger.weighted_square_sum.
+        weighted_sq_sum = _memory_ledger.weighted_square_sum(error_sinogram,
+                                                             weights)
         if normalize:
-            weighted_sq_sum = torch.sum(error_sinogram * error_sinogram * weights)
             loss = torch.sqrt(weighted_sq_sum
                               / (avg_weight * float(error_sinogram.numel()))) / sigma_y
         else:
-            loss = (1.0 / (2 * sigma_y ** 2)) * torch.sum(
-                (error_sinogram * error_sinogram) * weights)
+            loss = (1.0 / (2 * sigma_y ** 2)) * weighted_sq_sum
         return loss
 
     @staticmethod
@@ -2388,7 +2557,9 @@ class TomographyModel(ParameterHandler):
         # not only a logging one.  No golden covers it: every recon test runs
         # with stop_threshold_change_pct=0.0, which disables early stopping.
         recon_l1 = _memory_ledger.image_ell1(flat_recon)
-        es_rmse = torch.sqrt(torch.sum(error_sinogram * error_sinogram)
+        # Chunked for the reason above: sum(error * error) allocated a whole
+        # second sinogram.
+        es_rmse = torch.sqrt(_memory_ledger.weighted_square_sum(error_sinogram)
                              / float(error_sinogram.numel()))
         return fm_loss, recon_l1, es_rmse
 
@@ -3053,7 +3224,8 @@ class TomographyModel(ParameterHandler):
                 if tensor.is_complex():
                     raise TypeError(
                         "sinogram must be real-valued; got complex dtype.")
-                if not bool(torch.isfinite(tensor).all()):
+                low, high = _array_extremes(tensor)
+                if not (math.isfinite(low) and math.isfinite(high)):
                     raise ValueError("sinogram contains NaN and/or Inf values.")
             # Passed on as it is: the statistics below reduce it to a small
             # view subsample before anything reaches the host.
@@ -3063,7 +3235,8 @@ class TomographyModel(ParameterHandler):
                 else sinogram.cpu().numpy()
             if np.iscomplexobj(sinogram_np):
                 raise TypeError("sinogram must be real-valued; got complex dtype.")
-            if not np.isfinite(sinogram_np).all():
+            low, high = _array_extremes(sinogram_np)
+            if not (math.isfinite(low) and math.isfinite(high)):
                 raise ValueError("sinogram contains NaN and/or Inf values.")
             sinogram_for_stats = sinogram_np
         if weights is not None:
@@ -3072,21 +3245,23 @@ class TomographyModel(ParameterHandler):
                 # only when every shard is entirely zero.
                 all_zero = True
                 for tensor in weights.tensors:
-                    if not bool(torch.isfinite(tensor).all()):
+                    low, high = _array_extremes(tensor)
+                    if not (math.isfinite(low) and math.isfinite(high)):
                         raise ValueError("weights contains NaN and/or Inf values.")
-                    if bool((tensor < 0).any()):
+                    if low < 0:
                         raise ValueError("weights contain negative values.")
-                    all_zero = all_zero and bool((tensor == 0).all())
+                    all_zero = all_zero and low == 0 and high == 0
                 if all_zero:
                     raise ValueError("all weights are zero.")
             else:
                 weights_np = np.asarray(weights) if not torch.is_tensor(weights) \
                     else weights.cpu().numpy()
-                if not np.isfinite(weights_np).all():
+                low, high = _array_extremes(weights_np)
+                if not (math.isfinite(low) and math.isfinite(high)):
                     raise ValueError("weights contains NaN and/or Inf values.")
-                if (weights_np < 0).any():
+                if low < 0:
                     raise ValueError("weights contain negative values.")
-                if (weights_np == 0).all():
+                if low == 0 and high == 0:
                     raise ValueError("all weights are zero.")
 
         regularization_params = self.auto_set_regularization_params(
@@ -3217,13 +3392,16 @@ class TomographyModel(ParameterHandler):
             weights_shards = None if constant_weights else weights
 
             def sino_worker(i, d):
+                # Chunked per shard, for the reason weighted_square_sum
+                # gives: the squares and their weighted form were two whole
+                # sinogram shards per device, once per iteration.
                 e = error_shards.tensors[i]
+                sq = float(_memory_ledger.weighted_square_sum(e))
                 if weights_shards is None:
-                    return (float(torch.sum(e * e)), 0.0,
-                            float(torch.sum(e * e)))
+                    return sq, 0.0, sq
                 w = weights_shards.tensors[i]
-                return (float(torch.sum(e * e * w)), float(torch.sum(w)),
-                        float(torch.sum(e * e)))
+                return (float(_memory_ledger.weighted_square_sum(e, w)),
+                        float(torch.sum(w)), sq)
             parts = _sharding.run_per_device(error_shards.placement.devices,
                                              sino_worker)
             weighted_sq = sum(a for a, _, _ in parts)
@@ -3288,9 +3466,16 @@ class TomographyModel(ParameterHandler):
                 prox_map call on this model already initialized this sinogram.
             stop_threshold_change_pct (float, optional): stop when the NMAE
                 percent change drops below this value.  Defaults to 0.2.
-            max_iterations (int, optional): maximum VCD iterations.  Defaults to 3.
-            first_iteration (int, optional): partition-sequence offset for
-                restarts.  Defaults to 0.
+            max_iterations (int, optional): maximum VCD iterations, counted
+                from iteration 0: a call resuming at ``first_iteration=k``
+                runs ``max_iterations - k`` iterations.  Defaults to 3.
+            first_iteration (int, optional): cumulative iteration count for
+                restarts.  The partition sequence is advanced by this amount
+                (on the cached ``do_initialization=False`` path too), so a
+                Plug-and-Play loop that passes the total number of prox
+                iterations completed so far walks the sequence coarse to fine
+                and, past its end, stays on its last (typically finest)
+                entry.  Defaults to 0.
             logfile_path (str, optional): Path to the output log file ('~' expands to the
                 user's home directory).  If None or empty, no log file is written.
                 Defaults to '~/.mbirtorch/logs/prox.log'.  A Plug-and-Play loop
@@ -3325,6 +3510,17 @@ class TomographyModel(ParameterHandler):
         else:
             (partitions, partition_sequence, granularity,
              regularization_params) = self.prox_data
+            # The cache holds the expensive pieces: the pixel partitions and
+            # the regularization estimates.  The partition SEQUENCE is cheap
+            # and is recomputed the way initialize_recon computes it, so that
+            # first_iteration keeps its documented meaning on this path too:
+            # a Plug-and-Play loop passing its cumulative iteration count
+            # advances through the model's partition_sequence and, past its
+            # end, stays on its last (typically finest) entry.
+            partition_sequence = vcd_utils.gen_partition_sequence(
+                self.get_params('partition_sequence'),
+                max_iterations=max_iterations)
+            partition_sequence = partition_sequence[first_iteration:]
             # This pass skips the initialization, and with it the run header
             # that reopens the log file the previous pass closed, so reopen it
             # here.  Without this the loop's later passes would be missing
@@ -3401,6 +3597,49 @@ class TomographyModel(ParameterHandler):
         new_slices = int(old_slices * slice_scale)
         self.set_params(recon_shape=(new_rows, new_cols, new_slices))
         return new_rows - old_rows, new_cols - old_cols, new_slices - old_slices
+
+    def recon_slice_z(self, slice_indices=None):
+        """The axial coordinate, in ALU, of the center of each recon slice.
+
+        Slices are spaced by the slice pitch ``voxel_slice_aspect * delta_voxel``
+        and centered on ``recon_slice_offset``, which is zero for a geometry
+        that has no such parameter.  This is the one host-side statement of
+        the map the projectors use: the compiled cone and multiaxis bodies
+        write the same expression in ``_cone_vertical_affine`` and
+        ``_multiaxis_vertical_terms``, where a Python call cannot be traced.
+
+        Args:
+            slice_indices (int, sequence of int, or None): the slices to map.
+                None (the default) maps every slice.
+
+        Returns:
+            float or ndarray: the coordinate of each requested slice.
+        """
+        recon_shape = self.get_params('recon_shape')
+        delta_voxel, voxel_slice_aspect = self.get_params(['delta_voxel', 'voxel_slice_aspect'])
+        offset = self.get_params('recon_slice_offset') if 'recon_slice_offset' in self.params else 0.0
+        num_slices = int(recon_shape[2])
+        k = np.arange(num_slices) if slice_indices is None else np.asarray(slice_indices)
+        return voxel_slice_aspect * delta_voxel * (k - (num_slices - 1) / 2.0) + offset
+
+    def _fractional_slice_index(self, z):
+        """The fractional recon slice index of axial coordinate ``z``, the
+        inverse of :meth:`recon_slice_z` without rounding.  ``z`` may be a
+        float, a numpy array, or a torch tensor; the result has the same
+        form."""
+        recon_shape = self.get_params('recon_shape')
+        delta_voxel, voxel_slice_aspect = self.get_params(['delta_voxel', 'voxel_slice_aspect'])
+        offset = self.get_params('recon_slice_offset') if 'recon_slice_offset' in self.params else 0.0
+        num_slices = int(recon_shape[2])
+        return (z - offset) / (voxel_slice_aspect * delta_voxel) + (num_slices - 1) / 2.0
+
+    def nearest_recon_slice(self, z):
+        """The index of the recon slice whose center is nearest the axial
+        coordinate ``z`` in ALU, clipped to the volume.  The inverse of
+        :meth:`recon_slice_z`."""
+        num_slices = int(self.get_params('recon_shape')[2])
+        index = int(round(float(self._fractional_slice_index(z))))
+        return min(max(index, 0), num_slices - 1)
 
     def reshape_recon(self, recon):
         """Reshape a recon-like array to the model's ``recon_shape``.

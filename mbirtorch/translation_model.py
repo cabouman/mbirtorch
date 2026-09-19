@@ -29,7 +29,9 @@ import warnings
 import numpy as np
 import torch
 
-from .cone_beam import ConeBeamModel
+from .cone_beam import (ConeBeamModel, _cone_channel_coordinate,
+                        _cone_row_coordinate)
+from .geometry_rules import channel_index, pixel_xy, row_index
 from .horizontal_fan import fan_back_batch, fan_forward_batch
 from .tomography_model import TomographyModel
 
@@ -43,14 +45,21 @@ def _translation_pixel_xy_mag(pixel_indices, t_x, t_y, num_rows, num_cols,
     """Translated in-plane coordinates and the per-pixel magnification.
 
     Returns x (Vb, P), y (Vb, P), pixel_mag (Vb, P).  No rotation: the object
-    shifts by (t_x, t_y) per view.
+    shifts by (-t_x, -t_y) per view.
     """
-    row_index = (pixel_indices // num_cols).to(_F32)
-    col_index = (pixel_indices % num_cols).to(_F32)
-    y = (delta_voxel_row * (row_index - (num_rows - 1) / 2.0))[None, :] \
-        - t_y[:, None]
-    x = (delta_voxel * (col_index - (num_cols - 1) / 2.0))[None, :] \
-        - t_x[:, None]
+    x_tilde, y_tilde = pixel_xy(pixel_indices, num_rows, num_cols, delta_voxel,
+                                delta_voxel_row)
+    return _translation_xy_mag(x_tilde, y_tilde, t_x, t_y, magnification,
+                               source_detector_dist)
+
+
+def _translation_xy_mag(x_tilde, y_tilde, t_x, t_y, magnification,
+                        source_detector_dist):
+    """Translated in-plane coordinates and the per-point magnification, for
+    positions rather than pixel indices.  Returns x, y, pixel_mag, each
+    (Vb, P).  No rotation: the object shifts by (-t_x, -t_y) per view."""
+    y = y_tilde[None, :] - t_y[:, None]
+    x = x_tilde[None, :] - t_x[:, None]
     pixel_mag = 1.0 / (1.0 / magnification - y / source_detector_dist)
     return x, y, pixel_mag
 
@@ -71,11 +80,11 @@ def _translation_horizontal_data(pixel_indices, view_params_batch, num_rows,
     x, y, pixel_mag = _translation_pixel_xy_mag(
         pixel_indices, t_x, t_y, num_rows, num_cols, delta_voxel,
         delta_voxel_row, magnification, source_detector_dist)
-    u = pixel_mag * x
+    u = _cone_channel_coordinate(x, y, pixel_mag, magnification,
+                                 source_detector_dist, False)
     theta = torch.atan2(u, torch.as_tensor(source_detector_dist, dtype=_F32,
                                            device=u.device))
-    det_center_channel = (num_channels - 1) / 2.0
-    n_p = (u + det_channel_offset) / delta_det_channel + det_center_channel
+    n_p = channel_index(u, delta_det_channel, det_channel_offset, num_channels)
     W_p_c = pixel_mag * (delta_voxel / delta_det_channel)
     weight_scale = delta_voxel_row / torch.cos(theta)
     centers = torch.round(n_p).to(torch.int32)
@@ -90,11 +99,10 @@ def _translation_vertical_affine(pixel_mag, t_z, num_slices, delta_voxel_slice,
     (m0 (Vb, P), W_p_r (Vb, P), z_offset (Vb,)).
     """
     z_offset = -t_z                                              # (Vb,)
-    det_center_row = (num_rows_r - 1) / 2.0
     W_p_r = pixel_mag * delta_voxel_slice / delta_det_row        # (Vb, P)
     z_at_slice_0 = z_offset[:, None] - delta_voxel_slice * (num_slices - 1) / 2.0
-    m0 = (pixel_mag * z_at_slice_0 + det_row_offset) / delta_det_row \
-        + det_center_row                                         # (Vb, P)
+    m0 = row_index(_cone_row_coordinate(pixel_mag, z_at_slice_0),
+                   delta_det_row, det_row_offset, num_rows_r)    # (Vb, P)
     return m0, W_p_r, z_offset
 
 
@@ -240,8 +248,14 @@ class TranslationModel(TomographyModel):
         sinogram_shape (tuple): (num_views, num_det_rows, num_det_channels),
             where num_views is the number of translation steps.
         translation_vectors (ndarray): (num_views, 3) array of object
-            translations (x, y, z) in ALU.  Positive x shifts the object left,
-            z shifts up, and y shifts away from the source.
+            translations (x, y, z) in ALU.  Each view moves the object by minus
+            its vector, in the object frame that
+            :meth:`~mbirtorch.TomographyModel.project_points` describes: a
+            positive t_x moves the object toward -x, so its image moves toward
+            lower channel index; a positive t_y moves it toward -y, away from
+            the source, so its image shrinks toward the point where the central
+            ray meets the detector; a positive t_z moves it toward -z, so its
+            image moves toward lower row index.
         source_detector_dist (float): Distance from source to detector in ALU.
         source_iso_dist (float): Distance from source to isocenter in ALU.
         view_batch_size, compile_mode: as in ParallelBeamModel.
@@ -283,6 +297,24 @@ class TranslationModel(TomographyModel):
         # No hand-written kernels for translation yet; the compiled torch
         # bodies are the only bodies.
         return _translation_forward_view_batch, _translation_back_view_batch
+
+    def _project_points_batch(self, points, view_params):
+        # points (N, 3) float64 on the CPU; view_params (V, 3) as
+        # (t_x, t_y, t_z).  Returns (row, channel), each (V, N).
+        ddr, ddc, dro, dco, sdd = self.get_params(
+            ['delta_det_row', 'delta_det_channel', 'det_row_offset',
+             'det_channel_offset', 'source_detector_dist'])
+        _, num_rows_r, num_channels = self.get_params('sinogram_shape')
+        magnification = self.get_magnification()
+        x, y, pixel_mag = _translation_xy_mag(
+            points[:, 0], points[:, 1], view_params[:, 0], view_params[:, 1],
+            magnification, sdd)
+        u = _cone_channel_coordinate(x, y, pixel_mag, magnification, sdd, False)
+        # Each view moves the object by minus its translation vector.
+        z = points[:, 2][None, :] - view_params[:, 2][:, None]
+        v = _cone_row_coordinate(pixel_mag, z)
+        return (row_index(v, ddr, dro, num_rows_r),
+                channel_index(u, ddc, dco, num_channels))
 
     def _view_batch_args(self):
         gp_names = ['delta_det_row', 'delta_det_channel', 'det_row_offset',

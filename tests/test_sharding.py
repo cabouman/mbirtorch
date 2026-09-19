@@ -5,10 +5,14 @@ transfers are no-ops but every range/pad/mask/assembly path executes), and
 real cross-device movement uses the cpu<->mps pair when MPS is available (the
 local analog of the 2-GPU platform)."""
 
+import math
+import os
+
 import numpy as np
 import pytest
 import torch
 
+from mbirtorch import _sharding
 from mbirtorch._sharding import (Placement, Shards, device_pool,
                                  is_dev2dev_safe, move_shard, run_per_device,
                                  sum_band_to_owner)
@@ -179,6 +183,137 @@ def test_the_gather_refuses_shards_that_do_not_describe_one_array():
     q = Placement(["cpu", "cpu"], axis=0, axis_len=5)
     with pytest.raises(ValueError, match="does not fill"):
         Shards([torch.zeros(3, 4), torch.zeros(2, 1)], q).gather()
+
+
+def test_the_slab_pieces_tile_the_block_exactly():
+    """The CUDA gather cuts each shard's block into pieces that fit a staging
+    slot (_slab_pieces).  Every element must be covered exactly once and no
+    piece may exceed the slot, for slots smaller than a row, equal to a row,
+    a few rows, and larger than the whole block."""
+    for rows, width, slot in [(10, 7, 3), (10, 7, 7), (10, 7, 15),
+                              (10, 7, 100), (1, 100, 7), (3, 1, 1), (4, 6, 13)]:
+        cover = np.zeros((rows, width), dtype=int)
+        for r0, r1, c0, c1 in _sharding._slab_pieces(rows, width, slot):
+            assert (r1 - r0) * (c1 - c0) <= slot, (rows, width, slot)
+            cover[r0:r1, c0:c1] += 1
+        assert (cover == 1).all(), (rows, width, slot)
+
+
+def test_the_grid_splits_cover_the_block_exactly():
+    """Each host thread of the CUDA gather takes one sub-grid of a shard's
+    block (_split_grid).  The sub-grids must cover the block exactly, be at
+    most as many as asked for, and split the columns instead of the rows
+    when the block has a single row."""
+    for rows, width, parts in [(10, 7, 1), (10, 7, 3), (10, 7, 10), (10, 7, 25),
+                               (1, 100, 4), (1, 3, 8), (2, 5, 8)]:
+        subs = _sharding._split_grid(rows, width, parts)
+        assert 1 <= len(subs) <= parts, (rows, width, parts)
+        cover = np.zeros((rows, width), dtype=int)
+        for r0, r1, c0, c1 in subs:
+            cover[r0:r1, c0:c1] += 1
+        assert (cover == 1).all(), (rows, width, parts)
+        if rows == 1 and parts > 1:
+            assert len(subs) == min(parts, width), (rows, width, parts)
+
+
+def test_the_slab_gather_rebuilds_the_array_exactly_at_every_slot_size(
+        monkeypatch):
+    """CUDA shards are gathered in slabs through staging slots, several host
+    threads per shard (_fill_from_shards_in_slabs).  That is arithmetic on
+    offsets, the same on any device, so it is exercised here on CPU tensors,
+    with the slots unpinned and every copy blocking, and the result must be
+    the original array element for element, as for the plain gather.  The
+    cases cover the two axes a sharded array is cut on and a middle axis,
+    splits that divide evenly and splits that do not, more devices than
+    entries (a shard of zero length), several element sizes, one to five
+    threads per shard, and slots from one element, which splits every row of
+    a block into pieces, to one that holds a whole shard."""
+    for shape, axis in [((6, 5, 7), -1), ((7, 5, 6), 0), ((5, 7, 6), 1),
+                        ((6, 5, 3), -1), ((6, 5, 0), -1)]:
+        for count in [1, 2, 3, 4]:
+            for dtype in [torch.float32, torch.float64, torch.uint8]:
+                full = torch.arange(math.prod(shape)).reshape(shape).to(dtype)
+                ref = full.numpy()
+                p = Placement(["cpu"] * count, axis=axis, axis_len=shape[axis])
+                index = [slice(None)] * 3
+                parts = []
+                for _dev, (start, end) in p.shard_ranges():
+                    index[axis] = slice(start, end)
+                    parts.append(full[tuple(index)].contiguous())
+                untouched = [t.clone() for t in parts]
+                size = full.element_size()
+                for threads in [1, 2, 5]:
+                    monkeypatch.setattr(_sharding, "_gather_threads_per_shard",
+                                        lambda n, threads=threads: threads)
+                    for slot_bytes in [1, 3 * size, 7 * size, 2 ** 20]:
+                        case = (shape, axis, count, dtype, threads, slot_bytes)
+                        monkeypatch.setattr(_sharding, "GATHER_SLOT_BYTES",
+                                            slot_bytes)
+                        out = torch.empty(shape, dtype=dtype)
+                        _sharding._fill_from_shards_in_slabs(parts, out,
+                                                             axis % 3)
+                        assert np.array_equal(out.numpy(), ref), case
+                        assert all(torch.equal(t, u)
+                                   for t, u in zip(parts, untouched)), case
+
+
+def test_the_gather_thread_count_follows_the_cpus_and_the_cap(monkeypatch):
+    """The threads per shard are the CPUs this process may run on divided
+    among the shards and torch's own intra-op threads, at most
+    GATHER_THREADS_PER_SHARD and at least one."""
+    monkeypatch.setattr(_sharding, "GATHER_THREADS_PER_SHARD", 6)
+    if hasattr(os, "sched_getaffinity"):
+        monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(16)))
+    else:
+        monkeypatch.setattr(os, "cpu_count", lambda: 16)
+    monkeypatch.setattr(torch, "get_num_threads", lambda: 1)
+    assert _sharding._gather_threads_per_shard(1) == 6
+    assert _sharding._gather_threads_per_shard(4) == 4
+    assert _sharding._gather_threads_per_shard(5) == 3
+    assert _sharding._gather_threads_per_shard(40) == 1
+    # torch's copy already spreads over torch's intra-op threads, so those
+    # count against the CPUs too.
+    monkeypatch.setattr(torch, "get_num_threads", lambda: 4)
+    assert _sharding._gather_threads_per_shard(1) == 4
+    assert _sharding._gather_threads_per_shard(2) == 2
+    assert _sharding._gather_threads_per_shard(4) == 1
+    monkeypatch.setattr(torch, "get_num_threads", lambda: 16)
+    assert _sharding._gather_threads_per_shard(1) == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(),
+                    reason="needs a CUDA device")
+def test_the_cuda_gather_rebuilds_the_array_exactly_in_slabs(monkeypatch):
+    """The gather of CUDA shards takes the slab path -- pinned slots, copies
+    that return at once, several threads per shard -- which the CPU cases
+    above cannot reach.  The shards are spread over the visible devices, one
+    device serving several shards when there are few, the threads per shard
+    are forced to three, and the slot is made small so that every shard moves
+    in many slabs and a row is split; the result must be the original array
+    element for element at every slot size."""
+    default_slot = _sharding.GATHER_SLOT_BYTES
+    monkeypatch.setattr(_sharding, "_gather_threads_per_shard", lambda n: 3)
+    n_cuda = torch.cuda.device_count()
+    for shape, axis in [((6, 5, 1001), -1), ((1001, 6, 5), 0),
+                        ((6, 5, 3), -1), ((6, 5, 0), -1)]:
+        for count in [1, 2, 4]:
+            devices = [torch.device("cuda", i % n_cuda) for i in range(count)]
+            for dtype in [torch.float32, torch.uint8]:
+                full = torch.arange(math.prod(shape)).reshape(shape).to(dtype)
+                ref = full.numpy()
+                p = Placement(devices, axis=axis, axis_len=shape[axis])
+                index = [slice(None)] * 3
+                parts = []
+                for dev, (start, end) in p.shard_ranges():
+                    index[axis] = slice(start, end)
+                    parts.append(full[tuple(index)].to(dev))
+                for slot_bytes in [64, 2 ** 20, default_slot]:
+                    case = (shape, axis, count, dtype, slot_bytes)
+                    monkeypatch.setattr(_sharding, "GATHER_SLOT_BYTES",
+                                        slot_bytes)
+                    gathered = Shards(parts, p).gather()
+                    assert gathered.flags["C_CONTIGUOUS"], case
+                    assert np.array_equal(gathered, ref), case
 
 
 def test_band_reduce_values():

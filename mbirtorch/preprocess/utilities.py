@@ -207,7 +207,7 @@ def interpolate_defective_pixels(sino, defective_pixel_array=(), num_passes=3):
     return _fill_nan_pixels(sino, num_passes).numpy()
 
 
-def _rotation_kernel(sino_batch, det_rotation):
+def _rotation_kernel(sino_batch, det_rotation, center=None):
     """Per-view-batch detector-rotation kernel (pure device-tensor op): rotate each view's
     (row, channel) plane by ``det_rotation`` radians with bilinear interpolation, zero outside.
 
@@ -220,14 +220,22 @@ def _rotation_kernel(sino_batch, det_rotation):
     Args:
         sino_batch (tensor): (num_views, num_det_rows, num_det_channels).
         det_rotation (float): rotation angle in radians.
+        center (tuple of float or None): the ``(row, channel)`` point the rotation turns about, in the
+            index coordinates of ``sino_batch``.  None (the default) is the center of the array.  A
+            caller that rotates a band of rows cut from a taller detector passes the full detector's
+            center, expressed in the band's row indices, so that the band rotates exactly as it would
+            inside the full detector.
     """
     num_views, num_rows, num_cols = sino_batch.shape
     device = sino_batch.device
     dtype = sino_batch.dtype
     cos_a = math.cos(det_rotation)
     sin_a = math.sin(det_rotation)
-    center_row = (num_rows - 1) / 2.0
-    center_col = (num_cols - 1) / 2.0
+    if center is None:
+        center_row = (num_rows - 1) / 2.0
+        center_col = (num_cols - 1) / 2.0
+    else:
+        center_row, center_col = (float(c) for c in center)
 
     # For each OUTPUT pixel (i, j), find the INPUT location it samples:
     # coord = R @ pixel + offset, with offset = center - R @ center (rotation about the center).
@@ -987,9 +995,10 @@ def _auto_crop_sino(sino, required_params, optional_params, safety_buffer=20):
 
     This packages :func:`detect_blank_margins` (find the blank margins), array slicing, and
     :func:`apply_detector_crop` (update ``sinogram_shape`` and the detector offsets) into the
-    automatic-crop step.  It is geometry-general and detector-plane only, so ``recon_slice_offset``
-    is (re)derived by the subsequent ``auto_set_recon_geometry``: run it before ``build_model``
-    (or before ``auto_set_recon_geometry`` when constructing a model by hand).
+    automatic-crop step.  It is geometry-general and detector-plane only.  A ``recon_slice_offset``
+    the dicts carry is moved by the change in the automatic center, which follows the detector
+    through the crop; run this before ``build_model`` (or before ``auto_set_recon_geometry`` when
+    constructing a model by hand).
 
     Args:
         sino (np.ndarray): Sinogram, shape ``(num_views, num_det_rows, num_det_channels)``.
@@ -1004,8 +1013,17 @@ def _auto_crop_sino(sino, required_params, optional_params, safety_buffer=20):
     """
     crop_top, crop_bottom, crop_left, crop_right = detect_blank_margins(sino, safety_buffer)
     sino = sino[:, crop_top:sino.shape[1] - crop_bottom, crop_left:sino.shape[2] - crop_right]
+    # A supplied recon_slice_offset keeps its place relative to the automatic center, which the crop
+    # moves along with the row offset.
+    supplied_offset = optional_params.get('recon_slice_offset')
+    if supplied_offset is not None:
+        _, automatic_before = mt.utilities._automatic_recon_geometry(required_params, optional_params, None)
     required_params, optional_params = apply_detector_crop(
         required_params, optional_params, crop_top, crop_bottom, crop_left, crop_right)
+    if supplied_offset is not None and automatic_before is not None:
+        _, automatic_after = mt.utilities._automatic_recon_geometry(required_params, optional_params, None)
+        optional_params = dict(optional_params)
+        optional_params['recon_slice_offset'] = float(supplied_offset) + (automatic_after - automatic_before)
     return sino, required_params, optional_params
 
 
@@ -1251,6 +1269,17 @@ def fit_beam_hardening_curve(linear_projection, target_projection, num_parameter
     """
     Fit a parametric beam-hardening function from paired samples.
 
+    The fitted model is
+
+        f(p) = -log( sum_{i=1..N} exp(theta_i - i * theta_0 * p) )
+
+    with ``N = num_parameters - 1``.  The returned parameters are
+    ``[theta_0, theta_1, ..., theta_N]``.  With
+    ``zero_offset_normalized`` the model is shifted so that ``f(0) = 0``.
+    Evaluate the fitted curve with :func:`apply_beam_hardening_curve`, and
+    build the correction curve that inverts it with
+    :func:`fit_inverse_beam_hardening_curve`.
+
     Args:
         linear_projection (np.ndarray): Ideal linear projection or path-length
             samples.
@@ -1408,11 +1437,14 @@ def fit_inverse_beam_hardening_curve(forward_params, vmin=0.0, vmax=5.0, degree=
         forward_params (np.ndarray): Forward beam-hardening parameters from
             :func:`fit_beam_hardening_curve`.
         vmin (float, optional): Minimum input projection value to correct.
+            Defaults to 0.0.
         vmax (float, optional): Maximum input projection value to correct.
+            Defaults to 5.0.
         degree (int, optional): Chebyshev polynomial degree. Defaults to 10.
-        num_samples (int, optional): Number of fitting samples.
+        num_samples (int, optional): Number of fitting samples. Defaults to
+            2000.
         zero_offset_normalized (bool, optional): Match the forward model
-            normalization used to fit ``forward_params``.
+            normalization used to fit ``forward_params``. Defaults to True.
 
     Returns:
         tuple: ``(cheb_coeffs, y_domain)`` where ``cheb_coeffs`` is an

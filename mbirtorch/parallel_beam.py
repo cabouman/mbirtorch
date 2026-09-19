@@ -13,6 +13,7 @@ import warnings
 import numpy as np
 import torch
 
+from .geometry_rules import channel_index, pixel_xy, rotate_about_z
 from .horizontal_fan import fan_back_batch, fan_forward_batch
 from .tomography_model import TomographyModel
 
@@ -26,22 +27,15 @@ def _parallel_hfan_math(pixel_indices, view_params_batch, num_rows, num_cols,
     horizontal_fan.py); the view parameters are the view angles here.  Pure,
     fused into the view-batch bodies below by torch.compile (the scalar
     parameters specialize as constants; they are fixed per model)."""
-    row_index = (pixel_indices // num_cols).to(_F32)
-    col_index = (pixel_indices % num_cols).to(_F32)
-    # Compute the un-rotated coordinates relative to iso.  Note the change in
-    # order from (i, j) to (y, x).
-    y_tilde = delta_voxel_row * (row_index - (num_rows - 1) / 2.0)
-    x_tilde = delta_voxel * (col_index - (num_cols - 1) / 2.0)
-
-    # Precompute cosine and sine of the view angles, then do the rotation; only
-    # the x coordinate is needed for the channel projection.
+    x_tilde, y_tilde = pixel_xy(pixel_indices, num_rows, num_cols, delta_voxel,
+                                delta_voxel_row)
+    # Precompute cosine and sine of the view angles, then do the rotation.
+    # Only the rotated x is needed: it is the channel coordinate of a
+    # parallel projection whose rays travel along -y.
     cosine = torch.cos(view_params_batch)[:, None]
     sine = torch.sin(view_params_batch)[:, None]
-    x = cosine * x_tilde[None, :] - sine * y_tilde[None, :]
-
-    # Calculate indices on the detector grid.
-    det_center_channel = (num_channels - 1) / 2.0
-    n_p = (x + det_channel_offset) / delta_det_channel + det_center_channel
+    x, _ = rotate_about_z(x_tilde, y_tilde, cosine, sine)
+    n_p = channel_index(x, delta_det_channel, det_channel_offset, num_channels)
 
     # Compute the footprint of a voxel projected onto the channels, the
     # projected voxel width in channel units, and the weight scale.
@@ -138,6 +132,24 @@ class ParallelBeamModel(TomographyModel):
                          compile_mode=compile_mode,
                          geometry_type='parallel', view_params_name='angles',
                          angles=angles)
+
+    def _project_points_batch(self, points, view_params):
+        # points (N, 3) float64 on the CPU; view_params (V,) view angles.
+        # Returns (row, channel), each (V, N).
+        ddc, dco = self.get_params(['delta_det_channel', 'det_channel_offset'])
+        num_channels = self.get_params('sinogram_shape')[2]
+        cosine = torch.cos(view_params)[:, None]
+        sine = torch.sin(view_params)[:, None]
+        x, _ = rotate_about_z(points[:, 0], points[:, 1], cosine, sine)
+        channel = channel_index(x, ddc, dco, num_channels)
+        # Detector row r receives recon slice r, with no spreading and no
+        # offset, so the row of a point is the fractional slice index of its
+        # z.  verify_valid_params holds the slice count equal to the row
+        # count and the slice aspect equal to one, which is what makes this
+        # rule the projector's.
+        row = self._fractional_slice_index(points[:, 2])[None, :].expand(
+            channel.shape[0], -1)
+        return row, channel
 
     def get_magnification(self):
         """
@@ -496,10 +508,10 @@ class ParallelBeamModel(TomographyModel):
         # -------- Model builders shared by the estimate and the reconstruction --------
         def _part_model(num_part_rows):
             """A copy of this model covering ``num_part_rows`` detector rows, and therefore that
-            many recon slices.  The recon rows and columns are set explicitly so a parent with a
-            custom in-plane recon shape keeps it; the copy's own automatic pass would recompute it
-            from the detector."""
-            model = copy_ct_model(self, new_num_det_rows=num_part_rows)
+            many recon slices.  copy_ct_model keeps the parent's in-plane recon shape and voxel
+            pitch and sizes the slices to the rows; the shape is set again here so the part's
+            slice count is explicit."""
+            model = copy_ct_model(self, new_num_det_rows=num_part_rows, no_warning=True)
             # The regularization values come from the parent, which derives them from the FULL
             # sinogram below, so a part must not re-derive them from its own partial data.
             model.set_params(no_warning=True, auto_regularize_flag=False)

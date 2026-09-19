@@ -16,9 +16,9 @@ matplotlib.use('Agg', force=True)
 import matplotlib.pyplot as plt
 from matplotlib.backend_bases import KeyEvent, MouseEvent
 
-from mbirtorch.viewer import (Mode, SliceViewer, VolumeStack, _save_data_hdf5,
-                              slice_viewer)
-import mbirtorch.viewer as viewer_module
+from mbirtorch.viewers.slice_figure import (Mode, SliceViewer, VolumeStack,
+                                            _save_data_hdf5, slice_viewer)
+import mbirtorch.viewers.slice_figure as viewer_module
 
 
 # ---------------------------------------------------------------------------
@@ -126,7 +126,7 @@ class TestConstruction:
         # The mbirjax viewer built tooltips twice (_draw_images and
         # _connect_events), orphaning the first set; here the annotation
         # exists exactly once per panel.
-        from mbirtorch.viewer import TOOLTIP_TEXT
+        from mbirtorch.viewers.slice_figure import TOOLTIP_TEXT
         viewer = make_viewer(make_volume((8, 8, 4)), make_volume((8, 8, 4)))
         assert len(viewer.tooltips) == 2
         for ax in viewer.axes:
@@ -951,7 +951,7 @@ class TestNativeFileDialogs:
     def test_agg_reports_native_unavailable(self, make_viewer, tmp_path):
         # Guarantees the test suite never opens a real OS dialog: on a
         # non-interactive backend the chain must bail out immediately.
-        from mbirtorch.viewer import _NATIVE_UNAVAILABLE
+        from mbirtorch.viewers.slice_figure import _NATIVE_UNAVAILABLE
         viewer = make_viewer(make_volume((8, 8, 4)))
         result = viewer._native_choose_file('load', str(tmp_path), 'v.h5')
         assert result is _NATIVE_UNAVAILABLE

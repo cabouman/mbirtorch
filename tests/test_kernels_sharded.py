@@ -19,6 +19,12 @@ is the bar the repaired launch path passed when the interim selection rule
 retired.  And the selection contract must hold on real hardware: the same
 bodies bind at one device and at two.
 
+The multiaxis pair arrives with no such history, so it is asserted as the
+composition a user runs rather than as an isolation matrix: a two-device
+reconstruction with both kernels bound, read against the single-device torch
+reference, plus the device pin and the selection contract every geometry
+takes.
+
 The forward's history is the reason this file exists.  Its kernels once read
 order one against the torch bodies here, because a Triton launch targets the
 launching thread's current device and the banded drivers launch from worker
@@ -38,12 +44,16 @@ import torch
 
 import mbirtorch
 from mbirtorch.cone_beam import _cone_back_view_batch, _cone_forward_view_batch
+from mbirtorch.multiaxis_parallel import (_multiaxis_back_view_batch,
+                                          _multiaxis_forward_view_batch)
 from mbirtorch.parallel_beam import (_parallel_back_view_batch,
                                      _parallel_forward_view_batch)
 # The kernel modules import without triton; only calling a wrapper needs it,
 # and every test below is CUDA-gated.
 from mbirtorch.triton_cone import (_cone_back_view_batch_triton,
                                    _cone_forward_view_batch_triton)
+from mbirtorch.triton_multiaxis import (_multiaxis_back_view_batch_triton,
+                                        _multiaxis_forward_view_batch_triton)
 from mbirtorch.triton_parallel import (_parallel_back_view_batch_triton,
                                        _parallel_forward_view_batch_triton)
 
@@ -65,10 +75,36 @@ FLOOR = 5e-3
 BACK_KERNEL_TOLERANCE = 1e-2
 
 
+# The (forward, back) bodies of each geometry, keyed by name so an arm that
+# names a geometry cannot silently get another one's bodies.
+TORCH_BODIES = {
+    "parallel": (_parallel_forward_view_batch, _parallel_back_view_batch),
+    "cone": (_cone_forward_view_batch, _cone_back_view_batch),
+    "multiaxis": (_multiaxis_forward_view_batch, _multiaxis_back_view_batch),
+}
+KERNEL_BODIES = {
+    "parallel": (_parallel_forward_view_batch_triton,
+                 _parallel_back_view_batch_triton),
+    "cone": (_cone_forward_view_batch_triton, _cone_back_view_batch_triton),
+    "multiaxis": (_multiaxis_forward_view_batch_triton,
+                  _multiaxis_back_view_batch_triton),
+}
+
+
 def _build(geometry):
     if geometry == "parallel":
         angles = np.linspace(0, np.pi, CELL[0], endpoint=False)
         model = mbirtorch.ParallelBeamModel(CELL, angles, compile_mode="off")
+    elif geometry == "multiaxis":
+        # Two angles per view: the azimuth over a half turn, and an elevation
+        # swept across +/- 0.5 radians, which is how this geometry is built
+        # everywhere else in the suite.  The cell's own slice count follows
+        # from that range (the recon height divides by the smallest
+        # |cos(elevation)|), and it still divides by two.
+        azimuth = np.linspace(0, np.pi, CELL[0], endpoint=False)
+        elevation = np.linspace(-0.5, 0.5, CELL[0])
+        model = mbirtorch.MultiAxisParallelModel(
+            CELL, np.stack([azimuth, elevation], axis=1), compile_mode="off")
     else:
         angles = np.linspace(0, 2 * np.pi, CELL[0], endpoint=False)
         sdd = 4 * CELL[2]
@@ -84,9 +120,7 @@ def _force_torch_bodies(model, geometry):
     Setting compile_mode='off' does not do this: the kernels are chosen by
     their availability gates, not by the compile setting.
     """
-    bodies = ((_parallel_forward_view_batch, _parallel_back_view_batch)
-              if geometry == "parallel"
-              else (_cone_forward_view_batch, _cone_back_view_batch))
+    bodies = TORCH_BODIES[geometry]
     model._view_batch_bodies = lambda: bodies
     model.create_projectors()
 
@@ -98,15 +132,10 @@ def _force_one_kernel(model, geometry, direction):
     matrix separated the forward from the back.  The default selection binds
     both kernels, so a single-direction arm must be forced.
     """
-    if geometry == "parallel":
-        pair = ((_parallel_forward_view_batch_triton, _parallel_back_view_batch)
-                if direction == "forward"
-                else (_parallel_forward_view_batch,
-                      _parallel_back_view_batch_triton))
-    else:
-        pair = ((_cone_forward_view_batch_triton, _cone_back_view_batch)
-                if direction == "forward"
-                else (_cone_forward_view_batch, _cone_back_view_batch_triton))
+    torch_forward, torch_back = TORCH_BODIES[geometry]
+    kernel_forward, kernel_back = KERNEL_BODIES[geometry]
+    pair = ((kernel_forward, torch_back) if direction == "forward"
+            else (torch_forward, kernel_back))
     model._view_batch_bodies = lambda: pair
     model.create_projectors()
 
@@ -128,7 +157,7 @@ def _rel(reference, other):
 def problem():
     """One phantom and sinogram per geometry, built on a single device."""
     data = {}
-    for geometry in ("parallel", "cone"):
+    for geometry in ("parallel", "cone", "multiaxis"):
         model = _build(geometry)
         model.configure_devices(1)
         recon_shape = tuple(model.get_params("recon_shape"))
@@ -251,7 +280,49 @@ def test_the_default_selection_matches_the_torch_bodies_under_sharding(
 
 
 @requires_two_cuda
-@pytest.mark.parametrize("geometry", ["parallel", "cone"])
+def test_multiaxis_kernels_match_the_single_device_reference(problem):
+    """The multiaxis pair's arm, composed the way a multi-GPU user runs it.
+
+    The other geometries' arms above isolate one effect at a time, because
+    their history needed that.  This one states the composition directly: a
+    two-device reconstruction with the default selection -- both multiaxis
+    kernels bound -- against the SINGLE-device torch-body reference.  The
+    torch bodies at two devices run beside it, so a failure says whether the
+    engine or the kernels moved.
+    """
+    sinogram, weights = problem["multiaxis"]
+
+    reference_model = _build("multiaxis")
+    reference_model.configure_devices(1)
+    _force_torch_bodies(reference_model, "multiaxis")
+    reference = _reconstruct(reference_model, sinogram, weights)
+
+    plain = _build("multiaxis")
+    plain.configure_devices(2)
+    _force_torch_bodies(plain, "multiaxis")
+    torch_arm = _reconstruct(plain, sinogram, weights)
+    torch_rel = _rel(reference, torch_arm)
+    assert torch_rel < FLOOR, f"multiaxis torch bodies at n=2: {torch_rel:.3e}"
+
+    shipped = _build("multiaxis")
+    shipped.configure_devices(2)
+    # The arm check: this arm exists to measure the KERNELS, so a silent
+    # availability decline must fail loudly rather than compare torch with
+    # torch and pass vacuously.
+    from mbirtorch.triton_cone import triton
+    if triton is not None:
+        fwd, back = shipped._view_batch_bodies()
+        assert "triton" in fwd.__name__ and "triton" in back.__name__, (
+            f"multiaxis kernels not bound with triton importable: "
+            f"{fwd.__name__}, {back.__name__}")
+    kernel_arm = _reconstruct(shipped, sinogram, weights)
+
+    rel = _rel(reference, kernel_arm)
+    assert rel < FLOOR, f"multiaxis default selection at n=2: {rel:.3e}"
+
+
+@requires_two_cuda
+@pytest.mark.parametrize("geometry", ["parallel", "cone", "multiaxis"])
 def test_kernels_hold_on_a_single_nonzero_device(geometry, problem):
     """The trivial-placement twin of the launch-context defect.
 
@@ -293,7 +364,7 @@ def test_kernels_hold_on_a_single_nonzero_device(geometry, problem):
 
 
 @requires_two_cuda
-@pytest.mark.parametrize("geometry", ["parallel", "cone"])
+@pytest.mark.parametrize("geometry", ["parallel", "cone", "multiaxis"])
 def test_kernel_selection_is_the_same_at_one_and_two_devices(geometry):
     """The selection contract, asserted on real hardware.
 

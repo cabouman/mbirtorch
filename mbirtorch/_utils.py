@@ -13,8 +13,13 @@ FILE_FORMAT_NUMBER = 1.0
 
 #: The multiple a hand-written kernel's width argument is rounded up to.
 #: Triton compiles a separate, faster kernel for each integer argument it can
-#: prove is a multiple of 16; the unspecialized compilation uses more
-#: registers and runs at roughly half the rate on the cone back kernel.
+#: prove is a multiple of 16.  Two kernels have been measured against their
+#: unspecialized compilation, and they cost different amounts and for
+#: different reasons.  The cone back kernel used more registers and ran at
+#: roughly half the rate.  The multiaxis forward kernel ran at about a third
+#: of the rate with the SAME 32 registers and no spills, and its unspecialized
+#: compilation was 4 percent more PTX and 7 percent more cubin; what the
+#: specialization buys there was not isolated further.
 KERNEL_WIDTH_MULTIPLE = 16
 
 
@@ -29,6 +34,14 @@ def padded_kernel_width(width):
     it to size the launch and the arrays they allocate, and the memory ledger
     calls it to charge those same arrays, so the code and the charge cannot
     disagree.
+
+    The rule covers every width-class argument a kernel receives, including
+    the bound it masks its vector axis against, not only the arrays it
+    allocates.  The multiaxis forward wrapper padded its allocation and its
+    stride but passed the real detector row count as that bound, and it cost a
+    factor of 3.1 at every row count that was not a multiple of 16 (measured
+    2026-08-24; the record is multigpu_findings.md section 1.51 in the plans
+    repository).
 
     Args:
         width (int): a non-negative length -- a slice band, a detector row

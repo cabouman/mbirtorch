@@ -7,10 +7,14 @@ host numbers from psutil.  Backends differ in what they can report, so the
 per-device dicts carry the keys their backend actually tracks (the printer
 iterates whatever is present):
 
-- CUDA: ``bytes_in_use`` (allocated), ``peak_bytes_in_use`` (resettable via
-  torch.cuda.reset_peak_memory_stats), ``reserved_bytes`` (the caching
-  allocator's pool, the analog of jax's pool-vs-in-use distinction), and
-  ``bytes_limit`` (the device's total memory).
+- CUDA: ``bytes_in_use`` (allocated), ``peak_bytes_in_use`` (its high-water
+  mark), ``reserved_bytes`` (the caching allocator's pool, the analog of
+  jax's pool-vs-in-use distinction), ``peak_reserved_bytes`` (the pool's
+  high-water mark; both peaks reset together via
+  torch.cuda.reset_peak_memory_stats), ``cache_bytes`` (the pool beyond the
+  arrays in use -- outside tools such as nvidia-smi see only the pool plus
+  the CUDA context, so this split is only visible from inside the process),
+  and ``bytes_limit`` (the device's total memory).
 - MPS: ``bytes_in_use`` (current allocated), ``driver_bytes_in_use`` (the
   Metal driver's total footprint), and ``bytes_limit`` (the recommended
   working-set maximum).  MPS does not track a peak.
@@ -51,6 +55,11 @@ def get_memory_stats(print_results=True, file=None):
             memory_stats['bytes_in_use'] = torch.cuda.memory_allocated(i)
             memory_stats['peak_bytes_in_use'] = torch.cuda.max_memory_allocated(i)
             memory_stats['reserved_bytes'] = torch.cuda.memory_reserved(i)
+            memory_stats['peak_reserved_bytes'] = torch.cuda.max_memory_reserved(i)
+            # The pool always covers the arrays in use, so this is never
+            # negative: it is the memory held for reuse but not in any array.
+            memory_stats['cache_bytes'] = (memory_stats['reserved_bytes']
+                                           - memory_stats['bytes_in_use'])
             memory_stats['bytes_limit'] = torch.cuda.get_device_properties(i).total_memory
             memory_stats_per_processor.append(memory_stats)
     elif torch.backends.mps.is_available():

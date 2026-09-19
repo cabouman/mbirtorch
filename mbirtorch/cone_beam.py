@@ -29,6 +29,7 @@ import numpy as np
 import torch
 import warnings
 
+from .geometry_rules import channel_index, pixel_xy, rotate_about_z, row_index
 from .horizontal_fan import fan_back_batch, fan_forward_batch
 from .projectors import maybe_compile
 from .tomography_model import TomographyModel
@@ -63,17 +64,42 @@ def _cone_pixel_xy_mag(pixel_indices, angles, num_rows, num_cols, delta_voxel,
     Returns x (Vb, P), y (Vb, P), pixel_mag (Vb, P).  The magnification
     expression 1 / (1/M - y/SDD) is valid even at SDD = inf.
     """
-    row_index = (pixel_indices // num_cols).to(_F32)
-    col_index = (pixel_indices % num_cols).to(_F32)
-    # Note the change in order from (i, j) to (y, x) (recon_ijk_to_xyz).
-    y_tilde = delta_voxel_row * (row_index - (num_rows - 1) / 2.0)
-    x_tilde = delta_voxel * (col_index - (num_cols - 1) / 2.0)
+    x_tilde, y_tilde = pixel_xy(pixel_indices, num_rows, num_cols, delta_voxel,
+                                delta_voxel_row)
+    return _cone_xy_mag(x_tilde, y_tilde, angles, magnification,
+                        source_detector_dist)
+
+
+def _cone_xy_mag(x_tilde, y_tilde, angles, magnification, source_detector_dist):
+    """Rotated in-plane coordinates and the per-point magnification, for
+    positions rather than pixel indices.  Returns x, y, pixel_mag, each
+    (Vb, P).  The magnification expression 1 / (1/M - y/SDD) is valid even at
+    SDD = inf."""
     cosine = torch.cos(angles)[:, None]
     sine = torch.sin(angles)[:, None]
-    x = cosine * x_tilde[None, :] - sine * y_tilde[None, :]
-    y = sine * x_tilde[None, :] + cosine * y_tilde[None, :]
+    x, y = rotate_about_z(x_tilde, y_tilde, cosine, sine)
     pixel_mag = 1.0 / (1.0 / magnification - y / source_detector_dist)
     return x, y, pixel_mag
+
+
+def _cone_channel_coordinate(x, y, pixel_mag, magnification,
+                             source_detector_dist, use_curved_detector):
+    """The detector coordinate u along the channels of rotated points.  A
+    flat panel scales x by the point's magnification.  A curved panel is a
+    cylinder of radius source_detector_dist about an axis through the source,
+    and u is arc length along it, positive toward +x."""
+    if not use_curved_detector:
+        return pixel_mag * x
+    source_iso_dist = source_detector_dist / magnification
+    return source_detector_dist * torch.atan2(x, source_iso_dist - y)
+
+
+def _cone_row_coordinate(pixel_mag, z):
+    """The detector coordinate v along the rows: the height z of a point in
+    the projector's frame, scaled by the point's magnification.  A curved
+    panel uses this too: its rows are spaced on the plane tangent to the
+    cylinder at the central ray, not at equal angles."""
+    return pixel_mag * z
 
 
 def _cone_horizontal_data(pixel_indices, angles, num_rows, num_cols, num_channels,
@@ -88,17 +114,15 @@ def _cone_horizontal_data(pixel_indices, angles, num_rows, num_cols, num_channel
     x, y, pixel_mag = _cone_pixel_xy_mag(pixel_indices, angles, num_rows, num_cols,
                                          delta_voxel, delta_voxel_row,
                                          magnification, source_detector_dist)
-    det_center_channel = (num_channels - 1) / 2.0
+    u = _cone_channel_coordinate(x, y, pixel_mag, magnification,
+                                 source_detector_dist, use_curved_detector)
     if not use_curved_detector:
-        u = pixel_mag * x
         theta = torch.atan2(u, torch.as_tensor(source_detector_dist, dtype=_F32,
                                                device=u.device))
     else:
-        source_iso_dist = source_detector_dist / magnification
-        u = source_detector_dist * torch.atan2(x, source_iso_dist - y)
         theta = u / source_detector_dist
 
-    n_p = (u + det_channel_offset) / delta_det_channel + det_center_channel
+    n_p = channel_index(u, delta_det_channel, det_channel_offset, num_channels)
     footprint_xy = torch.maximum((angles[:, None] - theta).cos().abs() * delta_voxel,
                                  (angles[:, None] - theta).sin().abs() * delta_voxel_row)
     if not use_curved_detector:
@@ -150,11 +174,10 @@ def _cone_vertical_affine(pixel_mag, z_shifts, num_slices, delta_voxel_slice,
         both bodies' cone-angle chains share.
     """
     z_offset = recon_slice_offset - z_shifts                     # (Vb,)
-    det_center_row = (num_rows_r - 1) / 2.0
     W_p_r = pixel_mag * delta_voxel_slice / delta_det_row        # (Vb, P)
     z_at_slice_0 = z_offset[:, None] - delta_voxel_slice * (num_slices - 1) / 2.0
-    m0 = (pixel_mag * z_at_slice_0 + det_row_offset) / delta_det_row \
-        + det_center_row                                         # (Vb, P)
+    m0 = row_index(_cone_row_coordinate(pixel_mag, z_at_slice_0),
+                   delta_det_row, det_row_offset, num_rows_r)    # (Vb, P)
     return m0, W_p_r, z_offset
 
 
@@ -454,7 +477,7 @@ class ConeBeamModel(TomographyModel):
         nz = recon_shape[2]
         L = recon_shape[0] * dv
         dz = slice_aspect * dv
-        z = (np.arange(nz) - (nz - 1) / 2.0) * dz + oz
+        z = self.recon_slice_z()
 
         def profile(t):
             return (c * t ** p + a * b ** p) / (t ** p + b ** p)
@@ -495,6 +518,24 @@ class ConeBeamModel(TomographyModel):
         return fns[dev_index](forward_grad, prior_grad, forward_hess,
                               prior_hess_t, profiles[dev_index])
 
+    def _project_points_batch(self, points, view_params):
+        # points (N, 3) float64 on the CPU; view_params (V, 2) as
+        # (angle, helical z shift).  Returns (row, channel), each (V, N).
+        (ddr, ddc, dro, dco, sdd, curved) = self.get_params(
+            ['delta_det_row', 'delta_det_channel', 'det_row_offset',
+             'det_channel_offset', 'source_detector_dist', 'use_curved_detector'])
+        _, num_rows_r, num_channels = self.get_params('sinogram_shape')
+        magnification = self.get_magnification()
+        angles = view_params[:, 0]
+        z_shifts = view_params[:, 1]
+        x, y, pixel_mag = _cone_xy_mag(points[:, 0], points[:, 1], angles,
+                                       magnification, sdd)
+        u = _cone_channel_coordinate(x, y, pixel_mag, magnification, sdd, curved)
+        # A helical view moves the object toward -z by its shift.
+        z = points[:, 2][None, :] - z_shifts[:, None]
+        v = _cone_row_coordinate(pixel_mag, z)
+        return (row_index(v, ddr, dro, num_rows_r),
+                channel_index(u, ddc, dco, num_channels))
 
     def get_magnification(self):
         """magnification = source_detector_dist / source_iso_dist (1 at inf)."""
@@ -569,6 +610,45 @@ class ConeBeamModel(TomographyModel):
         """Integer radius of the channel psf (see :meth:`get_psf_radii`)."""
         return self.get_psf_radii()[0]
 
+    def pixel_magnification_bounds(self, support_radius=None):
+        """The smallest and largest per-pixel magnification over the support.
+
+        A voxel at in-plane depth ``y`` toward the detector projects with
+        magnification ``sdd / (sid - y)`` (``_cone_pixel_xy_mag``).  Over the
+        support radius ``r`` of :func:`get_support_radius` that runs from
+        ``sdd / (sid + r)`` at the far side to ``sdd / (sid - r)`` at the near
+        side.  The reciprocal of the smallest magnification is the axial reach
+        per unit of detector height at the far side, which
+        :meth:`auto_set_recon_geometry` uses to pad the volume axially.  A
+        parallel source (infinite ``source_detector_dist``) gives 1 and 1.
+        :meth:`get_psf_radii` computes its own bounds over the half width of
+        the grid rather than the masked support, and is left as it is, because
+        those bounds set the integer tap radii of the compiled bodies.
+
+        Args:
+            support_radius (float, optional): the support radius in ALU.  None
+                (the default) computes it from the model's recon geometry.
+                ``auto_set_recon_geometry`` passes its own, because it calls
+                this before the recon geometry it is deriving has been set.
+
+        Returns:
+            tuple of float: ``(min_magnification, max_magnification)``.  The
+            largest is ``inf`` when the support reaches the source.
+        """
+        source_detector_dist, source_iso_dist = self.get_params(
+            ['source_detector_dist', 'source_iso_dist'])
+        if np.isinf(source_detector_dist):
+            return 1.0, 1.0
+        if support_radius is None:
+            recon_shape, delta_voxel, voxel_row_aspect, use_ror_mask = self.get_params(
+                ['recon_shape', 'delta_voxel', 'voxel_row_aspect', 'use_ror_mask'])
+            support_radius = get_support_radius(recon_shape, voxel_row_aspect * delta_voxel,
+                                                delta_voxel, use_ror_mask=use_ror_mask)
+        min_magnification = source_detector_dist / (source_iso_dist + support_radius)
+        if source_iso_dist - support_radius <= 0:
+            return float(min_magnification), float('inf')
+        return float(min_magnification), float(source_detector_dist / (source_iso_dist - support_radius))
+
     @staticmethod
     def detector_mn_to_uv(m, n, delta_det_channel, delta_det_row, det_channel_offset,
                           det_row_offset, num_det_rows, num_det_channels):
@@ -580,12 +660,15 @@ class ConeBeamModel(TomographyModel):
         return u, v
 
     def auto_set_recon_geometry(self, no_compile=False, no_warning=False):
-        """Compute the automatic recon shape for cone beam reconstruction.
+        """Compute the automatic recon geometry for cone beam reconstruction.
 
         The xy width is the detector field of view at iso; the axial height is
         the detector height at iso swept over any helical travel, plus per-end
         padding scaled by ``axial_pad_fraction`` (a fraction of 1 pads each end
-        to the deepest z reached by any measured ray).
+        to the deepest z reached by any measured ray).  The volume is centered
+        on the band the detector illuminates: the center of the helical travel,
+        shifted by ``-det_row_offset / magnification``, so a row offset moves
+        the volume with the detector.
         """
         delta_det_row, delta_det_channel = self.get_params(
             ['delta_det_row', 'delta_det_channel'])
@@ -609,14 +692,16 @@ class ConeBeamModel(TomographyModel):
         z_travel = z_max - z_min
         H_iso = num_det_rows * (delta_det_row / magnification)
         num_recon_slices = max(1, int(np.ceil((H_iso + z_travel) / delta_voxel_slice)))
-        recon_slice_offset = 0.5 * (z_min + z_max)
+        # The rows sit at v = (m - center) * delta_det_row - det_row_offset, so the band they
+        # illuminate at iso is centered at -det_row_offset / magnification.
+        det_row_offset = self.get_params('det_row_offset')
+        recon_slice_offset = 0.5 * (z_min + z_max) - det_row_offset / magnification
 
         # Per-end axial padding: an edge ray at height v diverges across the
         # support to |z| = |v| * (SID + R) / SDD; extend each end by its excess
-        # over H_iso / 2, scaled by axial_pad_fraction.
-        source_detector_dist, det_row_offset, det_channel_offset, use_ror_mask = \
-            self.get_params(['source_detector_dist', 'det_row_offset',
-                             'det_channel_offset', 'use_ror_mask'])
+        # over the band's own edge at iso, scaled by axial_pad_fraction.
+        source_detector_dist, det_channel_offset, use_ror_mask = \
+            self.get_params(['source_detector_dist', 'det_channel_offset', 'use_ror_mask'])
         support_radius = get_support_radius((num_recon_rows, num_recon_cols),
                                             delta_voxel_row, delta_voxel,
                                             use_ror_mask=use_ror_mask)
@@ -630,11 +715,13 @@ class ConeBeamModel(TomographyModel):
                                                num_det_rows, num_det_channels)
         v_bot = max(float(v_row_low), float(v_row_high))
         v_top = min(float(v_row_low), float(v_row_high))
-        z_per_v_far_side = 1.0 / float(magnification)
-        if not np.isinf(source_detector_dist):
-            z_per_v_far_side += support_radius / float(source_detector_dist)
-        excess_bot = max(0.0, v_bot * z_per_v_far_side - float(H_iso) / 2)
-        excess_top = max(0.0, -v_top * z_per_v_far_side - float(H_iso) / 2)
+        # The far-side reach per unit of detector height is the reciprocal of
+        # the smallest magnification over the support.
+        z_per_v_far_side = 1.0 / self.pixel_magnification_bounds(support_radius)[0]
+        # The excess is measured from the band's edge (v / magnification at iso), so the
+        # padding is a per-end extension wherever the row offset put the band.
+        excess_bot = max(0.0, v_bot * (z_per_v_far_side - 1.0 / magnification))
+        excess_top = max(0.0, -v_top * (z_per_v_far_side - 1.0 / magnification))
 
         axial_pad_fraction = self.get_params('axial_pad_fraction')
         if isinstance(axial_pad_fraction, (tuple, list)):
@@ -718,9 +805,7 @@ class ConeBeamModel(TomographyModel):
                 w = torch.as_tensor(w_full[s0:s1].astype(np.float32), device=dev)
                 tensors.append(recon.tensors[i] * w[None, None, :])
             return _sharding.Shards(tensors, rp)
-        num_slices = recon_shape[2]
-        k = np.arange(num_slices)
-        z_k = delta_voxel_slice * (k - (num_slices - 1) / 2.0) + recon_slice_offset
+        z_k = self.recon_slice_z()
         det_half_height_iso = 0.5 * num_rows * delta_det_row / M_0
         visible = np.abs(z_k[:, None] - helical_z_shifts[None, :]) <= det_half_height_iso
         coverage = np.sum(visible, axis=1)
@@ -740,10 +825,7 @@ class ConeBeamModel(TomographyModel):
              'recon_slice_offset', 'delta_det_row'])
         M_0 = self.get_magnification()
         delta_voxel_slice = voxel_slice_aspect * delta_voxel
-        num_slices = recon_shape[2]
-        k = np.arange(num_slices)
-        z_k = delta_voxel_slice * (k - (num_slices - 1) / 2.0) \
-            + recon_slice_offset
+        z_k = self.recon_slice_z()
         det_half_height_iso = 0.5 * num_rows * delta_det_row / M_0
         visible = np.abs(z_k[:, None] - helical_z_shifts[None, :]) \
             <= det_half_height_iso
@@ -1045,9 +1127,10 @@ class ConeBeamModel(TomographyModel):
             det_center = (num_rows - 1) / 2.0
             det_row_offset = full_det_row_offset + (full_det_center - (det_center + lo)) * delta_det_row
 
-            # Half model: copy the parent's parameters (including any explicit device
-            # choice; see copy_ct_model), then set this half's detector/recon geometry.
-            model = copy_ct_model(self, new_num_det_rows=num_rows)
+            # Half model: copy the parent's parameters (including its voxel pitch and any
+            # explicit device choice; see copy_ct_model), then set this half's detector/recon
+            # geometry.  no_warning: the half's shape and slice offset are set right here.
+            model = copy_ct_model(self, new_num_det_rows=num_rows, no_warning=True)
             model.set_params(det_row_offset=det_row_offset)
             model.set_params(no_warning=True, auto_regularize_flag=False)
             model.set_params(recon_shape=recon_shape)

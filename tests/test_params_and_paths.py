@@ -349,6 +349,13 @@ def test_get_memory_stats_structure():
     import io
     stats = mbirtorch.get_memory_stats(print_results=False)
     assert stats[-1]['id'] == 'CPU'
+    if stats[0]['id'].startswith('GPU'):
+        # CUDA entries separate the arrays in use from the allocator's pool
+        # and carry the pool's high-water mark beside the in-use peak.
+        assert 'peak_reserved_bytes' in stats[0]
+        assert 'cache_bytes' in stats[0]
+        assert stats[0]['cache_bytes'] == (stats[0]['reserved_bytes']
+                                           - stats[0]['bytes_in_use'])
     for entry in stats:
         for key, value in entry.items():
             if key != 'id':
@@ -432,3 +439,250 @@ def test_apply_update_functional_no_copy():
     assert abs(float(error_sinogram[0, 0, 0]) - 0.9) < 1e-6
     assert float(ell1) == 6.0
     assert delta_sumsq.shape == (3,) and float(delta_sumsq[0]) == 2.0
+
+
+class _LargestAllocation(torch.utils._python_dispatch.TorchDispatchMode):
+    """The largest NEW array allocated inside the block, in bytes.
+
+    An in-place op hands back the buffer it was given, so an output that
+    shares storage with an input is not an allocation and is not counted.
+    Used to hold a claim about what a piece of arithmetic does NOT allocate,
+    which is the claim the memory ledger's charges rest on.
+    """
+
+    def __init__(self):
+        self.nbytes = 0
+
+    @staticmethod
+    def _tensors(obj):
+        if isinstance(obj, torch.Tensor):
+            return [obj]
+        if isinstance(obj, (tuple, list)):
+            return [t for item in obj
+                    for t in _LargestAllocation._tensors(item)]
+        if isinstance(obj, dict):
+            return [t for item in obj.values()
+                    for t in _LargestAllocation._tensors(item)]
+        return []
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        held = {t.data_ptr() for t in self._tensors(args)}
+        held |= {t.data_ptr() for t in self._tensors(kwargs or {})}
+        out = func(*args, **(kwargs or {}))
+        for t in self._tensors(out):
+            if t.data_ptr() not in held:
+                self.nbytes = max(self.nbytes, t.numel() * t.element_size())
+        return out
+
+
+def test_apply_update_matches_the_scaled_subtraction():
+    """The error sinogram update forms no sinogram-sized temporary.
+
+    `error.sub_(alpha * delta)` built a whole scaled sinogram before
+    subtracting it; the scaled subtraction reads the step out of the 0-d
+    device tensor the line search produced and writes through the error
+    sinogram in one pass.  torch may fuse the multiply and the subtraction
+    into a single rounding, so the values are gated at a relative tolerance
+    rather than bit for bit.
+    """
+    from mbirtorch.tomography_model import _apply_update
+    torch.manual_seed(4)
+    flat_recon = torch.zeros(6, 3)
+    error_sinogram = torch.randn(4, 5, 7)
+    delta_sinogram = torch.randn(4, 5, 7)
+    delta_scaled = torch.randn(2, 3)
+    alpha = torch.tensor(0.37)
+    reference = error_sinogram - alpha * delta_sinogram
+
+    with _LargestAllocation() as seen:
+        _apply_update(flat_recon, error_sinogram, torch.tensor([0, 2]),
+                      delta_scaled, alpha, delta_sinogram)
+    rel = float(torch.max(torch.abs(error_sinogram - reference))
+                / torch.max(torch.abs(reference)))
+    assert rel < 1e-6, rel
+    # Nothing sinogram-sized was allocated: the largest array the update
+    # makes is the per-slice sum of squares, which is one row.
+    sino_bytes = delta_sinogram.numel() * delta_sinogram.element_size()
+    assert seen.nbytes < sino_bytes
+
+
+def _state_tensors(state):
+    """The per-device tensors of a state that may be whole or divided."""
+    return (list(state.tensors)
+            if isinstance(state, mbirtorch._sharding.Shards) else [state])
+
+
+def _clone_state(state):
+    if isinstance(state, mbirtorch._sharding.Shards):
+        return mbirtorch._sharding.Shards([t.clone() for t in state.tensors],
+                                          state.placement)
+    return state.clone()
+
+
+@pytest.mark.parametrize("n_devices", (1, 2))
+@pytest.mark.parametrize("weighted", (False, True),
+                         ids=("unweighted", "weighted"))
+def test_initial_error_state_forms_the_error_in_the_projection_buffer(
+        monkeypatch, n_devices, weighted):
+    """The initial error sinogram is the projection's own buffer.
+
+    `_initial_error_state` scales the projection by -alpha in place and adds
+    the sinogram into it.  That is the same arithmetic as the
+    `sinogram - alpha * fwd` it replaced -- a - b and a + (-b) round
+    identically -- so the values must agree BIT FOR BIT, and one fewer
+    sinogram-sized array is allocated: the result shares storage with the
+    projection it was handed.
+
+    The volume handed in is all ones, so the scaled volume the call returns
+    reads back the alpha the call chose.  The reference below therefore uses
+    the code's own step rather than a second implementation of the line that
+    computes it.
+    """
+    model = _small_model()
+    if n_devices > 1:
+        model.configure_devices(devices=["cpu"] * n_devices)
+    sino_shape = tuple(model.get_params("sinogram_shape"))
+    recon_shape = tuple(model.get_params("recon_shape"))
+    rng = np.random.RandomState(3)
+    sinogram = model._shard_sinogram(
+        rng.rand(*sino_shape).astype(np.float32))
+    weights = model._shard_sinogram(
+        (rng.rand(*sino_shape) + 0.5).astype(np.float32)) if weighted else 1
+    init_recon = model._shard_recon(np.ones(recon_shape, dtype=np.float32))
+
+    projection = model.forward_project(init_recon, output_sharded=True)
+    handed = []
+
+    def fake_forward(recon, output_sharded=False):
+        # A fresh copy per call: the call consumes the buffer it is given,
+        # and the reference below needs the projection intact.
+        copy = _clone_state(projection)
+        handed.append(copy)
+        return copy
+
+    monkeypatch.setattr(model, "forward_project", fake_forward)
+    error, scaled_init = model._initial_error_state(
+        sinogram, init_recon, weights, not weighted, True)
+
+    alpha = float(_state_tensors(scaled_init)[0].reshape(-1)[0])
+    assert alpha != 1.0
+    for err, sino, fwd, given in zip(_state_tensors(error),
+                                     _state_tensors(sinogram),
+                                     _state_tensors(projection),
+                                     _state_tensors(handed[0])):
+        assert torch.equal(err, sino - alpha * fwd)
+        assert err.data_ptr() == given.data_ptr()
+
+
+@pytest.mark.parametrize("n_devices", (1, 2))
+@pytest.mark.parametrize("weighted", (False, True),
+                         ids=("unweighted", "weighted"))
+def test_initial_scale_matches_the_unchunked_dot_products(
+        monkeypatch, n_devices, weighted):
+    """The initial scale is built from two chunked reductions.
+
+    Both branches used to bind the weighted projection `weights * fwd` and
+    reduce `sum(wf * fwd)` and `sum(wf * sinogram)` through whole
+    sinogram-shaped products, which is what made the initialization the
+    measured peak of a weighted run.  The reductions now walk a block of
+    views at a time and multiply the weights inside the block.
+
+    That reassociates both sums and drops the rounding the weighted
+    projection used to introduce, so the scale is gated at a relative
+    tolerance against the old expression rather than bit for bit.  Every
+    later iterate follows the scale, so nothing downstream can be gated bit
+    for bit against the old code either; the goldens' relative gates are what
+    carries the trajectory.
+
+    The chunk size is lowered so the chunked branch really runs: this
+    sinogram is far below one chunk and would otherwise take the unchunked
+    path, where the arithmetic is unchanged.
+    """
+    from mbirtorch import _memory_ledger
+    model = _small_model()
+    if n_devices > 1:
+        model.configure_devices(devices=["cpu"] * n_devices)
+    sino_shape = tuple(model.get_params("sinogram_shape"))
+    recon_shape = tuple(model.get_params("recon_shape"))
+    rng = np.random.RandomState(11)
+    sinogram = model._shard_sinogram(rng.rand(*sino_shape).astype(np.float32))
+    weights = model._shard_sinogram(
+        (rng.rand(*sino_shape) + 0.5).astype(np.float32)) if weighted else 1
+    init_recon = model._shard_recon(np.ones(recon_shape, dtype=np.float32))
+
+    projection = model.forward_project(init_recon, output_sharded=True)
+    # The old expression, per shard, on the projection the call will be
+    # handed: bind the weighted projection and reduce whole products.
+    norm, cross = 0.0, 0.0
+    for i, fwd in enumerate(_state_tensors(projection)):
+        w = 1 if not weighted else _state_tensors(weights)[i]
+        wf = fwd if not weighted else w * fwd
+        norm += float(torch.sum(wf * fwd))
+        cross += float(torch.sum(wf * _state_tensors(sinogram)[i]))
+    reference = cross / norm
+
+    # Cloned OUTSIDE the measured block: the call consumes the buffer it is
+    # given, and the copy is the harness's cost rather than the call's.
+    handed = _clone_state(projection)
+    monkeypatch.setattr(model, "forward_project",
+                        lambda recon, output_sharded=False: handed)
+    monkeypatch.setattr(_memory_ledger, "ELL1_CHUNK_BYTES", 2048)
+    with _LargestAllocation() as seen:
+        _error, scaled_init = model._initial_error_state(
+            sinogram, init_recon, weights, not weighted, True)
+
+    alpha = float(_state_tensors(scaled_init)[0].reshape(-1)[0])
+    assert abs(alpha - reference) <= 1e-6 * abs(reference), (alpha, reference)
+    # No weighted projection and no whole array of products: the largest new
+    # array is a reduction block, well under one shard of the sinogram.  The
+    # sharded branch runs its reductions in worker threads, where a dispatch
+    # mode does not reach, so this bites on the single-device layout; the
+    # scale above is what covers both.
+    shard_bytes = max(t.numel() * t.element_size()
+                      for t in _state_tensors(projection))
+    assert seen.nbytes < shard_bytes
+
+
+def test_forward_model_loss_and_stats_match_the_unchunked_products(monkeypatch):
+    """The per-iteration statistics reduce a block of views at a time.
+
+    `sum(error * error * weights)` allocated two whole sinogram-shaped
+    arrays, once per iteration.  Below one chunk the reduction is unchunked,
+    so it is bit for bit what it replaced; above it the block totals are
+    summed instead, which moves the value only in its last digits.
+    """
+    from mbirtorch import _memory_ledger
+    from mbirtorch.tomography_model import TomographyModel
+    torch.manual_seed(1)
+    error = torch.randn(24, 16, 16)
+    weights = torch.rand(24, 16, 16) + 0.5
+    flat_recon = torch.rand(64, 8)
+    sigma_y = 2.0
+
+    def stats():
+        return (float(TomographyModel.get_forward_model_loss(
+                    error, sigma_y, weights)),
+                float(TomographyModel.get_forward_model_loss(
+                    error, sigma_y, weights, normalize=False)),
+                float(TomographyModel.get_forward_model_loss(error, sigma_y)),
+                float(TomographyModel._vcd_iteration_stats(
+                    error, flat_recon, sigma_y, weights)[2]))
+
+    weighted_sq = torch.sum(error * error * weights)
+    reference = (
+        float(torch.sqrt(weighted_sq
+                         / (torch.mean(weights) * error.numel())) / sigma_y),
+        float((1.0 / (2 * sigma_y ** 2)) * weighted_sq),
+        float(torch.sqrt(torch.sum(error * error * 1)
+                         / (1 * error.numel())) / sigma_y),
+        float(torch.sqrt(torch.sum(error * error) / error.numel())),
+    )
+    assert (error.numel() * error.element_size()
+            < _memory_ledger.ELL1_CHUNK_BYTES)
+    assert stats() == reference
+
+    # The same values through the chunked branch, which this sinogram is far
+    # too small to reach on its own.
+    monkeypatch.setattr(_memory_ledger, "ELL1_CHUNK_BYTES", 2048)
+    for value, ref in zip(stats(), reference):
+        assert abs(value - ref) <= 1e-6 * abs(ref), (value, ref)

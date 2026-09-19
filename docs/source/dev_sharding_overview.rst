@@ -81,6 +81,10 @@ for the index-heavy kernels in MBIRTorch, so there is no global array here.  ``S
 plain container instead: it holds the tensors, checks on construction that each
 shard really lives on its placement's device, and exposes ``gather()`` as the host
 exit.  The drivers and the VCD loop operate on the per-device tensors directly.
+The gather of CUDA shards moves every shard at once, each in slabs through pinned
+host memory and with several host threads per shard: a recon is cut on its last
+axis, so each shard lands in a strided block of the host array, and one host
+thread writes such a block at a small fraction of the transfer rate.
 
 One layout is refused: a device holding no data on **either** axis, since it
 would do no work.  That happens exactly when the device count exceeds both the

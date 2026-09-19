@@ -17,7 +17,9 @@ that then runs on each band or shard.  There are two layers.  The **torch bodies
 are written in ordinary PyTorch, compiled with ``torch.compile``, and run everywhere
 -- CPU, MPS, any GPU, every geometry; they are the baseline, the permanent fallback,
 and the value reference.  On top of them, on CUDA, sits a layer of hand-written
-**Triton kernels** that replace the bodies where they have been measured to win.
+**Triton kernels** that replace the bodies wherever they reproduce them on the
+device at hand: parallel beam, cone beam and multi-axis parallel beam each have a
+forward and a back kernel today, and translation has none.
 The design notes and every measured number are in the plans repo under
 ``plans/torch_port/``.
 
@@ -94,7 +96,7 @@ The Triton kernels
 The hand-written kernels are written in `Triton <https://triton-lang.org>`__, which
 compiles GPU kernels from plain Python at import time -- no separate CUDA build
 step, and the code ships in the package like any other module (``triton_cone.py``,
-``triton_parallel.py``).
+``triton_parallel.py``, ``triton_multiaxis.py``).
 
 **A kernel is an alternative body, never a new driver.**  Each kernel wrapper has
 the same signature as the torch body it replaces, so the driver's view loop, the
@@ -155,6 +157,19 @@ to float summation order alone.  The parallel geometry is also cheaper in a way 
 kernels exploit: its footprint terms depend on the view angle alone, so they are
 passed as per-view scalars rather than per-pixel planes.
 
+**Multi-axis parallel beam adds a second angle.**  Each view carries an azimuth and
+an elevation, so a detector row sees ``z*cos(elevation) + y*sin(elevation)``.  Two
+consequences shape its kernels.  The slope of the slice-to-row map is per *view*
+rather than per (view, pixel), which leaves only three per-pixel arrays to hand the
+kernel; and the vertical footprint that sets the trapezoid weight is a *separate*
+quantity from that slope -- the largest of the voxel's three projected edges -- where
+in cone the two coincide.  The forward kernel also inverts the map that its torch
+body scatters through, so it must enumerate the recon slices reaching each detector
+row; at a tilted view more of them reach one row than the tap radius counts, so the
+wrapper computes its own slice-tap radius per call and hands the work back to the
+torch body when a near-vanishing slope pushes that radius past the cap the unrolled
+loop can hold.
+
 **The cone rounding carve-out.**  The cone kernels form the cone-angle divisor as
 ``sqrt(1 + (v/SDD)^2)`` where the torch bodies compute ``cos(atan2(v, SDD))`` -- the
 forms are algebraically identical and differ by a couple of float rounding steps --
@@ -174,11 +189,15 @@ Whether a kernel may replace its torch body is decided by two gates, both automa
    fails closed: no CUDA platform, no ``triton`` import, a compile error, or a wrong
    result all mean the torch bodies are used, with the reason recorded in the
    returned ``(usable, reason)`` pair.
-2. **The per-kernel, per-device value self-check.**  On first use, each of the four
-   kernel slots (cone back, cone forward, parallel back, parallel forward) is run
-   against its torch body on a tiny problem *on the actual device that will run it*,
-   and falls back if the results differ by more than the 1e-4 contract.  The answer
-   is cached per device for the process.  The parallel forward slot holds two
+2. **The per-kernel, per-device value self-check.**  On first use, each of the six
+   kernel slots (cone back, cone forward, parallel back, parallel forward,
+   multi-axis back, multi-axis forward) is run against its torch body on a tiny
+   problem *on the actual device that will run it*, and falls back if the results
+   differ by more than the 1e-4 contract.  The answer is cached per device for the
+   process.  Each check's problem is shaped to reach the terms its geometry adds:
+   the multi-axis cell carries a spread of real elevations, because at zero
+   elevation that geometry is parallel beam, and it runs a banded call beside the
+   unbanded one in both directions.  The parallel forward slot holds two
    kernels behind one wrapper -- sorted and per-tap -- and the check exercises the
    one its switch selects at that moment (see below).
 
@@ -190,10 +209,15 @@ measured on H100 (the composed gates in the plans repo), so on a very different 
 the kernels are still safe to use but their speed is unmeasured.
 
 Selection happens in each geometry's ``_view_batch_bodies``: if a kernel can't be used, then
-the torch body is.  Every kernel is on by default,
-each having passed a composed performance gate -- a full reconstruction comparison
-against the kill-switch variant -- before earning that default; the sorted parallel
-forward passed its own such gate against the per-tap route.
+the torch body is.  Every kernel is on by default, and the two directions are asked
+separately, so a machine can bind one kernel and keep the other direction's torch
+body.  The cone and parallel kernels earned that default at a composed performance
+gate -- a full reconstruction comparison against the kill-switch variant -- and the
+sorted parallel forward passed its own such gate against the per-tap route.  The
+multi-axis pair is selected on the availability gates alone: it reproduces its torch
+bodies, but its tile constants were adopted from the cone kernels rather than swept
+and no composed measurement has been made for that geometry yet, so its *speed* is
+unmeasured where the others' is recorded.
 
 **One multi-GPU subtlety, fixed and guarded.**  A Triton launch targets the
 launching thread's current device, and the per-device worker threads launch from

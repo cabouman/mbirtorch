@@ -48,6 +48,9 @@ print(f'Detector rows: {num_det_rows}; reconstruction slices: {recon.shape[2]}')
 nrmse = np.linalg.norm(recon - phantom) / np.linalg.norm(phantom)
 print(f'Normalized RMS error between reconstruction and phantom: {nrmse:.3f}')
 
+# Display the geometry, phantom, recon, and sinogram
+mbirtorch.geometry_viewer(ct_model, show_trajectory=True, sinogram=sinogram, recon=recon,
+                          title='Helical model', block=False)
 mbirtorch.slice_viewer(phantom, recon, data_dicts=[None, recon_dict], vmin=0.0,
                        title='Phantom (left) and helical reconstruction (right)', block=False)
 mbirtorch.slice_viewer(sinogram, title='Sinogram', slice_axis=0)
