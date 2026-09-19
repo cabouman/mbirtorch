@@ -42,7 +42,9 @@ git checkout -q prerelease
 git pull -q origin prerelease
 sed -i '' "s/^__version__ = \".*\"/__version__ = \"$VERSION\"/" $INIT
 grep -q "__version__ = \"$VERSION\"" $INIT
-git add $INIT
+# Stamp the version and date into CITATION.cff and the BibTeX entries.
+python3 dev_scripts/update_citation.py
+git add $INIT CITATION.cff README.md docs/source/credits.rst docs/source/refs.bib
 git commit -q -m "Set version to $VERSION"
 git push -q origin prerelease
 

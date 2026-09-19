@@ -27,3 +27,23 @@ recon, recon_dict = mbirtorch.recon_simple_parallel(sinogram, angles)
 ```
 
 Full documentation at [https://mbirtorch.readthedocs.io/](https://mbirtorch.readthedocs.io/)
+
+## Citation
+
+Please use the following BibTeX citation when referencing this software.
+
+```bibtex
+@misc{mbirtorch,
+  title = {{MBIRTorch}: {H}igh-performance tomographic reconstruction using {PyTorch}},
+  author = {Gregery T. Buzzard and Charles A. Bouman and Jingsong Lin and Ziyun Li},
+  howpublished = {Software library available from \url{https://github.com/cabouman/mbirtorch}},
+  note = {Version 0.1.0},
+  year = 2026
+}
+```
+
+GitHub's "Cite this repository" button on the repository page generates this
+citation from `CITATION.cff`.
+
+mbirtorch is a PyTorch port of [MBIRJAX](https://github.com/cabouman/mbirjax);
+please also cite it when referencing the underlying methods.

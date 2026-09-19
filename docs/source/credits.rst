@@ -3,9 +3,9 @@ Credits
 
 **MBIRTorch Development Team**
 
-The MBIR Development Team is listed below in alphabetical order:
+The MBIR Development Team is listed below:
 
-    Charles A. Bouman, Gregery T. Buzzard.
+    Gregery T. Buzzard, Charles A. Bouman, Jingsong Lin, Ziyun Li.
 
 **MBIRTorch Sponsors**
 
@@ -20,10 +20,11 @@ We would like to thank the following sponsors for their financial support in the
 Please use the following Bibtex citation when referencing this software.
 ::
 
-    @misc{mbirtorch-2026,
+    @misc{mbirtorch,
     title = {{MBIRTorch}: {H}igh-performance tomographic reconstruction using {PyTorch}},
-    author = {Gregery T. Buzzard and Charles A. Bouman},
+    author = {Gregery T. Buzzard and Charles A. Bouman and Jingsong Lin and Ziyun Li},
     howpublished = {Software library available from \url{https://github.com/cabouman/mbirtorch}},
+    note = {Version 0.1.0},
     year = 2026
     }
 
