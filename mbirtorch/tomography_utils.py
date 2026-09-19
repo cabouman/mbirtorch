@@ -9,9 +9,8 @@ row batches.
 import numpy as np
 import torch
 
-# Detector rows convolved per batch; bounds the FFT work area.  The value comes
-# from an H100 sweep in an earlier implementation and is kept as a starting
-# point; re-sweep as part of the torch tuning.
+# Each batch filters this many detector rows.  The value bounds the size of
+# the FFT work area.
 ROW_FILTER_BATCH = 1024
 
 
@@ -52,26 +51,21 @@ def apply_row_filter(block, filter_arr, row_weight=None):
     rows = block.reshape(-1, n_channels)
     total_rows = rows.shape[0]
 
-    # FFT of the filter once; each row batch shares it.
     filt_f = torch.fft.rfft(filter_arr, n=full_len)
-    # Compute the indices to match the 'valid' output of a scipy convolution.
-    # A length-C (C = num_channels) signal convolved with a length-(2C-1) filter
-    # is the C samples of the full linear convolution starting at index C - 1, so
-    # the valid slice is filtered[C-1 : C-1+C].
+    # The valid part of a length C signal convolved with a length 2C-1 filter
+    # is filtered[C-1 : C-1+C].
     start = n_channels - 1
     out = torch.empty_like(rows)
-    # Never zero: a view-shard that owns no views has no rows to filter, and
-    # a loop step of zero is an error even where the range it walks is empty.
+    # The batch size must be at least one.  A range step of zero is an error
+    # even when the range is empty.
     batch = max(1, min(ROW_FILTER_BATCH, total_rows))
     for r0 in range(0, total_rows, batch):
         window = rows[r0:r0 + batch]
         if row_weight is not None:
-            # Flattened row k is detector row k % n_rows: gather the window's
-            # weights (a (batch, channels) transient, bounded by the batch).
+            # Flattened row k is detector row k % n_rows.
             det_rows = torch.arange(r0, r0 + window.shape[0],
                                     device=block.device) % n_rows
             window = window * row_weight[det_rows]
-        # Do the convolution in frequency space, then convert back and place the result.
         win_f = torch.fft.rfft(window, n=full_len, dim=1)
         filtered = torch.fft.irfft(win_f * filt_f, n=full_len, dim=1)
         out[r0:r0 + window.shape[0]] = filtered[:, start:start + n_channels]

@@ -13,24 +13,19 @@ def _normalize_by_norm(x, eps):
 
 
 def _normalize_and_project(x, ref, eps):
-    """Normalized ``x`` and its full contraction with ``ref``."""
+    """Return the normalized ``x`` and its full contraction with ``ref``."""
     x_normalized = x / (np.linalg.norm(x) + eps)
     return x_normalized, np.tensordot(x_normalized, ref, axes=x_normalized.ndim)
 
 
 def _make_single_view_sibling(ct_model):
-    """A SINGLE-view sibling of ``ct_model``: same class, same geometry and recon
-    parameters, but ``sinogram_shape`` with one view.
+    """Return a one-view copy of ``ct_model``.  It has the same class and the
+    same geometry and recon parameters, but its ``sinogram_shape`` holds one
+    view.
 
-    Per-view back projection is then expressed as the natural operation "back project
-    one view at these view parameters" -- a per-view view-parameter update (see
-    :func:`_set_sibling_view_params`) + ``sparse_back_project`` of the one view.
-    Working one view at a time at its own parameters avoids selecting a SUBSET of the
-    full model's views.
-
-    Construction: read the full model's description with ``get_all_params``, shrink
-    every view-length constructor argument to its first view, rebuild through
-    ``build_model``, and re-pin the recon shape to the full model's.
+    The caller points the copy at one view's parameters with
+    :func:`_set_sibling_view_params` and then back projects that view.  This
+    avoids selecting a subset of the full model's views.
     """
     required, optional, regularization = ct_model.get_all_params()
     required = dict(required)
@@ -43,16 +38,14 @@ def _make_single_view_sibling(ct_model):
     optional = dict(optional)
     optional['recon_shape'] = tuple(ct_model.get_params('recon_shape'))
     sibling = mt.build_model(required, optional, regularization)
-    # The sibling must live where its parent lives, and the constructors take
-    # no device argument, so the layout is set explicitly.  The parent's LEAD
-    # device is the right target: the sibling projects one view at a time and
-    # is never sharded.
+    # The copy must live where its parent lives, and the constructors take no device
+    # argument, so the layout is set here.  The parent's lead device is the target.
     sibling.configure_devices(devices=[ct_model.torch_device])
     return sibling
 
 
 def _set_sibling_view_params(sibling, view_params_row):
-    """Point the single-view sibling at one view's parameters."""
+    """Point the one-view copy at one view's parameters."""
     view_params_name = sibling.get_params('view_params_name')
     sibling.set_params(no_warning=True, **{view_params_name: np.asarray(view_params_row)})
 
@@ -81,8 +74,8 @@ def max_abs_neighbor_diff(arr):
     center = arr
     max_diff = np.zeros_like(arr)
 
-    # Define the directional offsets: (di, dj)
-    directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]  # up, down, left, right
+    # The offsets are (di, dj) for up, down, left, and right.
+    directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
 
     for di, dj in directions:
         neighbor = padded[1 + di : 1 + di + arr.shape[0],
@@ -143,9 +136,9 @@ def get_opt_views(ct_model, reference_object, num_selected_views, r_1=0.002, r_2
         roi = roi.astype(bool)
 
     num_views = ct_model.get_params('sinogram_shape')[0]
-    # Geometry-general: look the view-parameter array up by the model's own name for it
-    # ('angles' for parallel beam, 'view_params_array' for cone, ...); the candidate
-    # angle per view is the first component.
+    # The view-parameter array is looked up by the model's own name for it, which is
+    # 'angles' for parallel beam and 'view_params_array' for cone.  The candidate
+    # angle of a view is its first component.
     view_params_name = ct_model.get_params('view_params_name')
     view_params = np.asarray(ct_model.get_params(view_params_name))
     angle_candidates = view_params.reshape(view_params.shape[0], -1)[:, 0]
@@ -161,17 +154,13 @@ def get_opt_views(ct_model, reference_object, num_selected_views, r_1=0.002, r_2
             raise ValueError("prev_selected_view_inds must contain integers in the range [0, {}).".format(num_views))
 
     with tempfile.TemporaryDirectory() as data_store_dir:
-        # Compute recon bases
         gamma = compute_view_basis_functions(
             ct_model, reference_object, r_1=r_1,
             data_store_dir=data_store_dir, seed=seed, roi=roi
         )
-
-        # Compute inner product between recon bases
         R = compute_cov_matrix(num_views, data_store_dir)
 
     if verbose > 0:
-        # plot the the covariance matrix and gamma
         import matplotlib.pyplot as plt
         fig, axes = plt.subplots(1, 3, figsize=(12, 4))
         axes[0].imshow(R)
@@ -184,10 +173,8 @@ def get_opt_views(ct_model, reference_object, num_selected_views, r_1=0.002, r_2
         plt.tight_layout()
         plt.show()
 
-    # Compute optimal view angles
     optimal_angle_inds, vcl_value = compute_opt_angle_subset(R, gamma, angle_candidates, num_selected_views, r_2, prev_selected_view_inds, seed=seed)
 
-    # Reorder optimal_angle_inds by importance if requested
     if priority_order:
         optimal_angle_inds = reorder_by_priority(optimal_angle_inds, prev_selected_view_inds, R, gamma)
 
@@ -218,7 +205,6 @@ def compute_view_basis_functions(ct_model, ref_object, r_1, data_store_dir, seed
     """
     eps = 1e-12
 
-    # Forward project the reference object
     print('Creating sinogram for reference object of shape {}'.format(ref_object.shape))
     ref_sino = ct_model.forward_project(ref_object)
 
@@ -239,24 +225,18 @@ def compute_view_basis_functions(ct_model, ref_object, r_1, data_store_dir, seed
             np.asarray(sampled_ref_object[sampled_roi_mask]).reshape(-1, 1), eps
         )
 
-    # Get number of views and angles
     num_views = ct_model.get_params('sinogram_shape')[0]
 
-    # The sibling below is pinned to the PARENT's lead device, so the layout it
-    # runs on is the caller's only when the caller placed the parent by hand.
-    # Name which, for the same reason generate_demo_data does: this is a device
-    # set decided outside the reconstruction device policy, and without the word
-    # a library fallback and a caller's choice read alike in the run log.
+    # The one-view copy runs on the parent's lead device.  The message says
+    # whether that device was chosen by the caller or by the library.
     print('Creating recon bases on the {} device'.format(
         'default' if ct_model.device_layout_is_automatic else 'requested'))
 
-    # Filter the sinogram in a single call
     filtered_sinogram = np.asarray(ct_model.direct_filter(ref_sino))
-    del ref_sino  # Free up space in case the sino is large
+    del ref_sino
 
-    # Compute recon bases individually for each view, on a ONE-view sibling model:
-    # "back project this view at its own view parameters" via a per-view
-    # view-parameter update, rather than selecting a subset of the full model's views.
+    # The basis of each view is computed on a one-view copy of the model,
+    # pointed at that view's own parameters.
     single_view_model = _make_single_view_sibling(ct_model)
     view_params_name = ct_model.get_params('view_params_name')
     full_view_params = np.asarray(ct_model.get_params(view_params_name))
@@ -270,10 +250,8 @@ def compute_view_basis_functions(ct_model, ref_object, r_1, data_store_dir, seed
         if roi is not None:
             recon_i = recon_i[sampled_roi_mask].reshape(-1, 1)
 
-        # One normalize + contraction per view.
         recon_i, gamma_i = _normalize_and_project(recon_i, sparse_ref_object, eps)
 
-        # Save view basis function
         with open(os.path.join(data_store_dir, f'view_basis_function{i}.npy'), 'wb') as f:
             np.save(f, recon_i)
 
@@ -310,26 +288,22 @@ def compute_cov_matrix(num_views, data_store_dir, batch_size=100):
 
     for batch_index, batch in enumerate(tqdm.tqdm(batches, desc='Computing covariance matrix')):
         recons_batch = np.zeros((len(batch), recon_size))
-        # Load the recons for the current batch
         for i in batch:
             recons_batch[i - batch[0]] = np.load(os.path.join(data_store_dir, f'view_basis_function{i}.npy')).flatten()
-        # Find the inner products for the block diagonal for this batch
+        # This batch fills one diagonal block of the matrix.
         batch_start, batch_stop = batch[0], batch[0] + len(batch)
         dot_products = recons_batch @ recons_batch.T
         cov_matrix[batch_start:batch_stop, batch_start:batch_stop] = dot_products
 
-        # Loop over the higher index batches
         for batch2_index, batch2 in enumerate(batches[batch_index+1:]):
-            # Load a batch
             recons_batch2 = np.zeros((len(batch2), recon_size))
             for j in batch2:
                 recons_batch2[j - batch2[0]] = np.load(
                     os.path.join(data_store_dir, f'view_basis_function{j}.npy')).flatten()
-            # Compute the inner product with the outer loop batch
             batch2_start, batch2_stop = batch2[0], batch2[0] + len(batch2)
             dot_products = recons_batch @ recons_batch2.T
 
-            # Store the inner product in the two symmetric blocks
+            # The matrix is symmetric, so this block is written twice.
             cov_matrix[batch_start:batch_stop, batch2_start:batch2_stop] = dot_products
             cov_matrix[batch2_start:batch2_stop, batch_start:batch_stop] = dot_products.T
 
@@ -394,35 +368,29 @@ def compute_opt_angle_subset(R, gamma, candidate_angles, K, r_2, prev_selected_v
         random.seed(seed)
         np.random.seed(seed)
 
-    # Determine available angle candidates
     candidate_angles_inds = np.arange(len(candidate_angles))
     avail_angle_inds = np.setdiff1d(candidate_angles_inds, prev_selected_view_inds, assume_unique=False)
 
-    # Determine the number of candidate views for the stochastic search
     num_avail_angle_inds = len(avail_angle_inds)
     num_unselected_angles = num_avail_angle_inds - K
 
     if K <= 0:
         raise ValueError("K must be positive. Received K={}".format(K))
 
-    # If there are no available angles, just return the full set of angle candidates
+    # With no angles left over, every candidate is returned.
     if num_unselected_angles <= 0:
         warnings.warn(f"Requested {K} views, but only {num_avail_angle_inds} available. Returning all candidates.")
         sorted_angle_inds = avail_angle_inds
         return sorted_angle_inds, float(compute_vcl(*subsample_R_gamma(R, gamma, sorted_angle_inds)))
 
-    # Compute the number of candidates to search
     num_search_candidates = np.minimum(np.maximum(int(r_2 * num_unselected_angles), search_min), num_unselected_angles)
 
-    # Initialize with uniformly spaced angles across candidate list.
+    # The search starts from uniformly spaced angles.
     pos = np.linspace(0, len(avail_angle_inds), K, endpoint=False).astype(int)
     selected_angle_inds = avail_angle_inds[pos].astype(int)
 
-    # Subsample R and gamma to form smaller submatrix and subvector
     combined_selected_angle_inds = np.concatenate((prev_selected_view_inds, selected_angle_inds))
     R_chosen, gamma_chosen = subsample_R_gamma(R, gamma, combined_selected_angle_inds)
-
-    # Compute the vcl loss
     vcl_current_best = compute_vcl(R_chosen, gamma_chosen)
 
     for i in range(max_iterations):
@@ -443,12 +411,11 @@ def compute_opt_angle_subset(R, gamma, candidate_angles, K, r_2, prev_selected_v
                     vcl_current_best = np.copy(vcl_temp)
                     selected_angle_inds = np.copy(selected_angle_inds_tmp)
 
-        # Early stopping: exit if no change in selected angles during this iteration.
+        # The search stops once an iteration changes no angle.
         if np.array_equal(selected_angle_inds, prev_selected_angle_inds):
             print(f'Early stopping at iteration {i}, no change in indices')
             break
 
-    # Read-out and sort set of best angles
     best_view_angle_inds = np.sort(selected_angle_inds)
     return best_view_angle_inds, float(vcl_current_best)
 
@@ -474,46 +441,37 @@ def get_2d_subsampling_indices(mask, r_1, seed=None, blue_noise=False):
             (row_inds, col_inds) (Tuple[ndarray, ndarray]): Arrays of row and column indices
                 corresponding to the selected voxels.
     """
-    # Math is needed for ceiling operations used in tiling the blue noise pattern.
     import math
 
-    # Validate that r_1 is a valid fraction.
     if r_1 <= 0 or r_1 > 1:
         raise ValueError("r_1 must be in the range (0, 1].")
 
-    # Extract dimensions of the mask and compute number of samples to select.
     num_rows, num_cols = mask.shape
     mask_flat = mask.ravel()
     num_total = np.sum(mask_flat)
     num_samples = min(int(num_total * r_1), int(num_total))
 
-    # Blue noise-based voxel sampling.
     if not blue_noise:
-        # Uniform random voxel sampling.
         if seed is not None:
             np.random.seed(seed)
-        # Identify eligible voxel indices from the flattened mask.
         eligible_indices = np.where(mask_flat > 0)[0]
         flat_indices = np.random.choice(eligible_indices, size=num_samples, replace=False)
     else:
-        # Load the precomputed blue noise pattern.
+        # The stored blue noise pattern is tiled to cover the mask.
         bn_pattern = mt.bn256
-        # Determine how many times to tile the blue noise pattern to cover the mask.
         tile_rows = math.ceil(num_rows / bn_pattern.shape[0])
         tile_cols = math.ceil(num_cols / bn_pattern.shape[1])
         tiled_pattern = np.tile(bn_pattern, (tile_rows, tile_cols))
         tiled_pattern = tiled_pattern[:num_rows, :num_cols]
 
-        # Mask out non-ROI regions with infinity to exclude them from sampling.
+        # Setting the values outside the mask to infinity excludes them, and
+        # the lowest remaining values are the sampled points.
         masked_values = np.where(mask, tiled_pattern, np.inf)
-        # Select the lowest blue noise values within the mask.
         flat_indices = np.argsort(masked_values.ravel())[:num_samples]
 
-    # Convert flat indices back to 2D row/column indices and linear indices.
     row_inds, col_inds = np.unravel_index(flat_indices, (num_rows, num_cols))
     random_indices_2d = row_inds * num_cols + col_inds
 
-    # Return the flattened and row/column indices.
     return random_indices_2d, (row_inds, col_inds)
 
 
@@ -552,19 +510,18 @@ def show_image_with_projection_rays(
     if rotation_angles_rad is None:
         rotation_angles_rad = np.deg2rad(rotation_angles_deg)
 
-    # Convert from projection angles to angles in the standard representation
+    # The projection angles are converted to the standard representation.
     rotation_angles_rad = np.pi / 2 + rotation_angles_rad
 
     rows, cols = image.shape
     center_x, center_y = cols / 2, rows / 2
-    radius = min(rows, cols) / 2  # Use shortest dimension to ensure arrows fit within the image
+    # The shortest dimension keeps the arrows inside the image.
+    radius = min(rows, cols) / 2
 
-    # Plot the image
     import matplotlib.pyplot as plt
     plt.imshow(image, cmap='gray', origin='upper', extent=[0, cols, rows, 0])
     plt.gca().set_aspect('equal')
 
-    # Overlay arrows for each angle
     colors = plt.cm.tab10(np.arange(len(rotation_angles_rad)) % 10)
 
     for i, theta in enumerate(rotation_angles_rad):
@@ -596,7 +553,6 @@ def reorder_by_priority(optimal_angle_inds, prev_selected_view_inds, R, gamma):
     while len(optimal_angle_inds) > 1:
         vcl_list = []
         for i in range(len(optimal_angle_inds)):
-            # Create a temporary array of angles with the i-th element removed.
             temp_inds = np.delete(optimal_angle_inds, i)
             combined_selected_inds = np.concatenate((prev_selected_view_inds, temp_inds))
             R_temp, gamma_temp = subsample_R_gamma(R, gamma, combined_selected_inds)
@@ -608,7 +564,7 @@ def reorder_by_priority(optimal_angle_inds, prev_selected_view_inds, R, gamma):
         optimal_angle_inds = np.delete(optimal_angle_inds, idx_to_drop)
 
     drop_inds_list.append(optimal_angle_inds[0])
-    # Reverse the list to rank elements from most to least important
+    # Reversing the list ranks the angles from most to least important.
     optimal_angle_inds = np.array(drop_inds_list)[::-1]
 
     return optimal_angle_inds

@@ -30,8 +30,8 @@ def _to_numpy(dataset):
     if dataset is None:
         return None
     if hasattr(dataset, 'detach'):
-        # A torch tensor, possibly on a CUDA or MPS device; np.asarray alone
-        # cannot convert device tensors, and this avoids importing torch.
+        # This is a torch tensor.  np.asarray cannot convert a device tensor,
+        # and this path avoids importing torch.
         return dataset.detach().cpu().numpy()
     return np.asarray(dataset)
 

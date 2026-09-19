@@ -30,14 +30,14 @@ from .tomography_model import TomographyModel
 _F32 = torch.float32
 
 
-# ── geometry chains (pure, compiled) ─────────────────────────────────────────
 def _multiaxis_horizontal_data(pixel_indices, azimuth, num_rows, num_cols,
                                num_channels, delta_voxel, delta_voxel_row,
                                delta_det_channel, det_channel_offset):
-    """The horizontal fan's inputs for a view batch.  n_p and centers (int32)
-    are (Vb, P); W_p_c and weight_scale are per-VIEW (Vb, 1) -- the footprint
-    depends only on the azimuth (parallel beam, no magnification).  Also
-    returns the rotated in-plane depth y (Vb, P) for the vertical fan.
+    """The horizontal fan inputs for one view batch.
+
+    n_p and centers (int32) are (Vb, P).  W_p_c and weight_scale are (Vb, 1),
+    because in parallel beam the footprint depends only on the azimuth.  The
+    rotated in-plane depth y (Vb, P) is returned for the vertical fan.
     """
     x_tilde, y_tilde = pixel_xy(pixel_indices, num_rows, num_cols, delta_voxel,
                                 delta_voxel_row)
@@ -54,9 +54,9 @@ def _multiaxis_horizontal_data(pixel_indices, azimuth, num_rows, num_cols,
 
 
 def _multiaxis_row_coordinate(y, z, cos_el, sin_el):
-    """The detector coordinate v along the rows: the height z of a point
-    turned by the elevation, which picks up the in-plane depth y as well.
-    ``cos_el`` and ``sin_el`` are per view, (Vb, 1)."""
+    """The detector coordinate v along the rows, z*cos(el) + y*sin(el).
+
+    ``cos_el`` and ``sin_el`` are per view, each (Vb, 1)."""
     return z * cos_el + y * sin_el
 
 
@@ -64,19 +64,16 @@ def _multiaxis_vertical_terms(y, azimuth, elevation, num_slices,
                               delta_voxel, delta_voxel_row, delta_voxel_slice,
                               delta_det_row, det_row_offset, recon_slice_offset,
                               num_rows_r):
-    """The vertical fan's terms: the affine slice-to-row map m(k) = m0 + slope*k
-    (k the GLOBAL slice index; v = z*cos(el) + y*sin(el)), plus the per-view
-    footprint, clip bound, and mass-conserving amplitude.
+    """The vertical fan terms for one view batch.
 
-    The footprint is the LARGEST of the voxel's three projected edges on the
-    detector v-axis (max, not sum -- the trapezoid's effective width is about
-    the largest edge), so it never collapses to zero and the amplitude never
-    divides by zero.  The amplitude makes the total vertical weight
-    delta_voxel_slice/delta_det_row, independent of elevation.
+    The affine map from global slice index k to detector row is
+    m(k) = m0 + slope*k.  The footprint is the largest of the voxel's three
+    projected edges on the detector v axis, so it never reaches zero and the
+    amplitude never divides by zero.  The amplitude makes the total vertical
+    weight delta_voxel_slice/delta_det_row at any elevation.
 
     Returns:
-        (m0 (Vb, P), slope (Vb, 1), W_p_r (Vb, 1), L_max (Vb, 1),
-        scaling (Vb, 1)).
+        m0 (Vb, P), slope (Vb, 1), W_p_r (Vb, 1), L_max (Vb, 1), scaling (Vb, 1).
     """
     cos_el = torch.cos(elevation)[:, None]                           # (Vb, 1)
     sin_el = torch.sin(elevation)[:, None]
@@ -102,17 +99,13 @@ def _multiaxis_forward_view_batch(values, pixel_indices, view_params_batch,
                                   det_channel_offset, det_row_offset,
                                   recon_slice_offset, psf_radius,
                                   slice_start=0, plan=None):
-    """Multiaxis forward for one view batch: the slice-scatter vertical fan,
-    then the per-pixel horizontal fan scatter.  Returns (Vb, R, C).
+    """Multiaxis forward projection for one view batch.  Returns (Vb, R, C).
 
-    ``slice_start`` supports a slice-BANDED call exactly as in cone:
-    ``values`` may be a band (P, L) with global indices [slice_start,
-    slice_start + L); the slice-to-row map is anchored on the full num_slices
-    center, so summing per-band outputs over a tiling of the slice axis
-    reproduces the unbanded projection.
-
-    ``plan`` is the memoization slot for a future sorted/CSR stream variant;
-    unused today."""
+    ``values`` may be a slice band (P, L) with global indices starting at
+    ``slice_start``.  The slice to row map stays anchored on the full
+    num_slices center, so summing the band outputs over a tiling of the slice
+    axis reproduces the unbanded projection.  ``plan`` is ignored.
+    """
     azimuth = view_params_batch[:, 0]
     elevation = view_params_batch[:, 1]
     n_p, centers, W_p_c, weight_scale, y = _multiaxis_horizontal_data(
@@ -121,7 +114,7 @@ def _multiaxis_forward_view_batch(values, pixel_indices, view_params_batch,
     vb, num_pixels = n_p.shape
     dev = values.device
 
-    # ── vertical fan (scatter input slices onto detector rows) ───────────────
+    # The vertical fan scatters the input slices onto detector rows.
     m0, slope, W_p_r, L_max, scaling = _multiaxis_vertical_terms(
         y, azimuth, elevation, num_slices, delta_voxel, delta_voxel_row,
         delta_voxel_slice, delta_det_row, det_row_offset, recon_slice_offset,
@@ -132,8 +125,8 @@ def _multiaxis_forward_view_batch(values, pixel_indices, view_params_batch,
     m_p = m0.unsqueeze(-1) + slope.unsqueeze(-1) * k[None, None, :]  # (Vb, P, L)
     m_center = torch.round(m_p).to(torch.int64)
 
-    # Mass-conserving amplitude folded into the values; slices past the real
-    # count are masked (the global validity test).
+    # The amplitude is folded into the values.  Slices past the real count
+    # are masked out.
     valid_k = (k < num_slices).to(_F32)                              # (L,)
     scaled_values = values[None, :, :] * scaling.unsqueeze(-1) \
         * valid_k[None, None, :]                                     # (Vb, P, L)
@@ -148,7 +141,6 @@ def _multiaxis_forward_view_batch(values, pixel_indices, view_params_batch,
         A = A * ((m >= 0) & (m < num_rows_r)).to(_F32)
         det_col.scatter_add_(2, m.clamp(0, num_rows_r - 1), scaled_values * A)
 
-    # ── horizontal fan scatter (the shared kernel; per-view values) ──────────
     acc = fan_forward_batch((n_p, centers, W_p_c, weight_scale), det_col,
                             num_channels, psf_radius)
     return acc.permute(0, 2, 1)
@@ -162,17 +154,12 @@ def _multiaxis_back_view_batch(sino_batch, pixel_indices, view_params_batch,
                                det_channel_offset, det_row_offset,
                                recon_slice_offset, psf_radius, coeff_power=1,
                                slice_start=0, band_slices=None, plan=None):
-    """Multiaxis back projection for one view batch, summed over the batch's
-    views: horizontal fan gather -> per-pixel detector columns -> vertical fan
-    gather onto the slices.  Returns (P, S), or (P, band_slices) for a slice
-    band, exactly as in cone.
+    """Multiaxis back projection for one view batch, summed over its views.
 
-    The vertical weight is a pure interpolation weight raised to coeff_power,
-    with the per-view amplitude applied at the same power (the adjoint of the
-    forward folding the amplitude into the values).
-
-    ``plan`` is the memoization slot for a future sorted/CSR stream variant;
-    unused today."""
+    Returns (P, S), or (P, band_slices) for a slice band.  The vertical weight
+    is an interpolation weight raised to coeff_power, with the per-view
+    amplitude applied at the same power.  ``plan`` is ignored.
+    """
     azimuth = view_params_batch[:, 0]
     elevation = view_params_batch[:, 1]
     n_p, centers, W_p_c, weight_scale, y = _multiaxis_horizontal_data(
@@ -181,13 +168,13 @@ def _multiaxis_back_view_batch(sino_batch, pixel_indices, view_params_batch,
     vb, num_pixels = n_p.shape
     dev = sino_batch.device
 
-    # ── horizontal fan gather (the shared kernel, view axis kept) ────────────
+    # Horizontal fan gather, with the view axis kept.
     sino_T = sino_batch.permute(0, 2, 1).contiguous()                # (Vb, C, R)
     det_col = fan_back_batch(sino_T, (n_p, centers, W_p_c, weight_scale),
                              num_channels, psf_radius,
                              coeff_power=coeff_power, reduce_views=False)
 
-    # ── vertical fan gather ──────────────────────────────────────────────────
+    # Vertical fan gather.
     m0, slope, W_p_r, L_max, scaling = _multiaxis_vertical_terms(
         y, azimuth, elevation, num_slices, delta_voxel, delta_voxel_row,
         delta_voxel_slice, delta_det_row, det_row_offset, recon_slice_offset,
@@ -212,7 +199,7 @@ def _multiaxis_back_view_batch(sino_batch, pixel_indices, view_params_batch,
         A = A * scale_pow
         g = torch.gather(det_col, 2, mm.clamp(0, num_rows_r - 1))
         out = out + torch.einsum("vps,vps->ps", A, g)
-    # Slices past the real count are inert (a no-op for an interior band).
+    # Slices past the real count are zeroed.
     out = out * (k < num_slices).to(_F32)[None, :]
     return out
 
@@ -256,45 +243,22 @@ class MultiAxisParallelModel(TomographyModel):
         if np.any(np.abs(angles[:, 1]) > np.pi / 4):
             warnings.warn("One or more elevation angles exceed 45 degrees. "
                           "This may degrade approximation quality.")
-        # geometry_type is the class-identity string, so save/load resolves
-        # the class by name.
+        # geometry_type is the class name, so save and load resolve the class.
         super().__init__(sinogram_shape,
                          view_batch_size=view_batch_size, compile_mode=compile_mode,
                          geometry_type=str(type(self)),
                          view_params_name='angles', angles=angles,
                          recon_slice_offset=0.0)
 
-    # Multiaxis has its own floor family rather than borrowing parallel's,
-    # because its crossover was measured separately.  The thresholds
-    # themselves, the runs behind them, and their dates are the multiaxis
-    # rows of _widening_floors.FLOORS; they are not restated here, because a
-    # refresh moves them and a copy would go stale.  Historical note: the
-    # 2026-08-17 reading that first justified a separate family (394 s at two
-    # devices against 951 s at four, 1024-class) was torch's per-function
-    # recompile budget filling, which projectors._raise_recompile_budget has
-    # since fixed.
+    # The thresholds for this family are the multiaxis rows of
+    # _widening_floors.FLOORS.
     _floor_family = 'multiaxis'
 
     def _view_batch_bodies(self):
-        # The hand-written kernels are alternative BODIES: same signatures, so
-        # nothing downstream of this hook changes.  Each is available wherever
-        # BOTH availability gates pass -- the triton probe and the first-use
-        # value self-check on the actual device (the probe-the-hardware
-        # protocol; MBIRTORCH_DISABLE_TRITON=1 is the kill switch inside the
-        # probe) -- and the two directions are asked separately, so a machine
-        # may bind one kernel and keep the other direction's torch body.
-        #
-        # What the gates say here is that the kernels REPRODUCE the torch
-        # bodies on the device that will run them.  No composed performance
-        # measurement has been made for this geometry: the tile constants were
-        # adopted from the cone kernels rather than swept, and nothing has yet
-        # timed a multiaxis reconstruction with them bound.  The speed sweep
-        # and the composed gate the cone and parallel kernels passed are still
-        # owed here; the kill switch above is the handle until they run.
-        #
-        # The kernel module is imported INSIDE the method because it imports
-        # this one (for the two eager geometry builders and the torch bodies);
-        # a module-level import would close that cycle.
+        # Each direction is checked separately, so a machine may bind one kernel and
+        # keep the torch body for the other.  Set MBIRTORCH_DISABLE_TRITON=1 to turn
+        # the kernels off.  The kernel module is imported here rather than at module
+        # level, because it imports this module.
         from .kernel_availability import (multiaxis_back_kernel_usable,
                                           multiaxis_forward_kernel_usable)
         if multiaxis_back_kernel_usable(self)[0]:
@@ -302,10 +266,8 @@ class MultiAxisParallelModel(TomographyModel):
             back_body = _multiaxis_back_view_batch_triton
         else:
             back_body = _multiaxis_back_view_batch
-        # Selection is layout-independent, as in the other geometries: the
-        # wrappers bracket every launch on the tensors' own device, so a
-        # sharded model binds exactly what a single device binds (the launch
-        # discipline that tests/test_kernels_sharded.py holds).
+        # The wrappers launch on the tensors' own device, so a sharded model
+        # binds the same bodies a single device model binds.
         if multiaxis_forward_kernel_usable(self)[0]:
             from .triton_multiaxis import _multiaxis_forward_view_batch_triton
             fwd_body = _multiaxis_forward_view_batch_triton
@@ -314,7 +276,7 @@ class MultiAxisParallelModel(TomographyModel):
         return fwd_body, back_body
 
     def _project_points_batch(self, points, view_params):
-        # points (N, 3) float64 on the CPU; view_params (V, 2) as
+        # points is (N, 3) float64 on the CPU.  view_params is (V, 2) holding
         # (azimuth, elevation).  Returns (row, channel), each (V, N).
         ddr, ddc, dro, dco = self.get_params(
             ['delta_det_row', 'delta_det_channel', 'det_row_offset',
@@ -348,8 +310,8 @@ class MultiAxisParallelModel(TomographyModel):
                     psf_radius=self.get_psf_radius())
 
     def _transient_cols(self, band_cols):
-        # The bodies hold (Vb, P, S) and (Vb, P, R) transients whatever the
-        # requested band, so the budget width is params-derived (as in cone).
+        # The bodies hold (Vb, P, S) and (Vb, P, R) temporaries whatever band is
+        # requested, so the budget width comes from the parameters.
         sinogram_shape, recon_shape = self.get_params(['sinogram_shape',
                                                        'recon_shape'])
         return max(int(recon_shape[2]), int(sinogram_shape[1]))
@@ -384,9 +346,8 @@ class MultiAxisParallelModel(TomographyModel):
         max_in_plane_pitch = max(delta_voxel, delta_voxel_row)
         psf_radius_u = int(np.ceil(np.ceil(max_in_plane_pitch / delta_det_channel) / 2))
 
-        # Vertical: one radius serves every view, so take each footprint
-        # edge's max over the actual elevations (the z edge peaks at the
-        # smallest tilt, the in-plane edge at the largest).
+        # One vertical radius serves every view, so each footprint edge is
+        # maximized over the actual elevations.
         angles = self.get_params('angles')
         if angles is not None:
             elevations = np.asarray(angles)[:, 1]
@@ -417,15 +378,11 @@ class MultiAxisParallelModel(TomographyModel):
         angles = np.asarray(self.get_params('angles'))
         elevations = angles[:, 1]
 
-        # XY radius from the channel coverage; z height from the row coverage
-        # (v = z*cos(el) - t*sin(el); the cos is clamped so a top-down view
-        # does not imply infinite z).
+        # The xy radius comes from the channel coverage.
         max_R_xy = max_u
-        # The z band each view illuminates on the rotation axis: its rows span v
-        # in [-max_v, max_v] shifted by the row offset, and v = z * cos(el)
-        # there.  The volume covers the union of the bands over the views and is
-        # centered on it.  With no row offset this is the height
-        # 2 * max_v / min |cos(el)| about z = 0.
+        # Each view illuminates a band of z on the rotation axis, and the volume covers
+        # the union of those bands.  The cosine is clamped below, so a view from
+        # straight above does not imply infinite z.
         det_row_offset = self.get_params('det_row_offset')
         cos_el = np.maximum(np.abs(np.cos(elevations)), 0.1)
         z_low = float(np.min((-max_v - det_row_offset) / cos_el))
@@ -445,7 +402,6 @@ class MultiAxisParallelModel(TomographyModel):
                         delta_voxel=delta_voxel, recon_slice_offset=recon_slice_offset,
                         no_compile=no_compile, no_warning=no_warning)
 
-    # ── direct recon (stacked 2-D FBP) ────────────────────────────────────────
     def fbp_filter(self, sinogram, filter_name="ramp", output_sharded=False):
         """FBP filtering with the standard 1-D channel ramp (the shared row
         filter, as in ParallelBeamModel).
@@ -491,12 +447,8 @@ class MultiAxisParallelModel(TomographyModel):
             geometry, so this direct reconstruction is only approximate; it is
             intended as an initializer for the iterative ``recon()``.
         """
-        # Settle the device layout before the first large allocation, as
-        # recon() does: a no-op when the user already chose devices;
-        # otherwise the automatic selection runs here, so a bare FBP call
-        # spreads across the GPUs instead of landing whole on one.  The
-        # workload tells the memory check to price this reconstruction rather
-        # than the full recon the device count is chosen for.
+        # The device layout is settled before the first large allocation, so a
+        # bare FBP call spreads across the GPUs instead of landing on one.
         self._apply_device_policy(workload='direct')
         filtered_sinogram = self.fbp_filter(sinogram, filter_name=filter_name,
                                             output_sharded=True)
@@ -517,5 +469,5 @@ class MultiAxisParallelModel(TomographyModel):
                                output_sharded=output_sharded)
 
 
-# Backward-compatible public API name used throughout docs/examples.
+# The docs and examples also use this name for the model.
 MultiAxisParallelBeamModel = MultiAxisParallelModel

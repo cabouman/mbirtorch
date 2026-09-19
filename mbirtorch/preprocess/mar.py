@@ -9,12 +9,8 @@ from mbirtorch import _sharding
 from . import pipeline
 
 
-# ── device-form helpers ──────────────────────────────────────────────────────
-# The beam-hardening arithmetic below runs on sinograms in either form: one
-# tensor, or a Shards container (one piece per device).  Each helper applies
-# an operation in whichever form it is given; aligned arguments share one
-# placement.  Elementwise work stays on each piece's device; reductions
-# combine tiny per-piece results on the host.
+# These helpers apply an operation to a sinogram held either as one tensor or as a Shards
+# container with one piece per device.  Reductions combine the per piece results on the host.
 
 def _ps_map(fn, *xs):
     """Elementwise: fn over aligned inputs, returned in the same form."""
@@ -34,10 +30,8 @@ def _ps_sum(fn, *xs):
 
 
 def _ps_max(fn, x):
-    """float: fn (a scalar reduction) maximized across the pieces.
-
-    A piece with no elements is skipped: a device may own no views, and a
-    reduction has no value to return there."""
+    """float: fn (a scalar reduction) maximized across the pieces.  A piece with no elements is
+    skipped, since a device may own no views."""
     if isinstance(x, _sharding.Shards):
         return max(float(fn(t)) for t in x.tensors if t.numel() > 0)
     return float(fn(x))
@@ -62,16 +56,14 @@ def _ps_item(x, idx):
 
 
 def _ps_argmin3d(x):
-    """Global (view, row, col) of the minimum, plus the value.  Pieces are
-    visited in view order with a strict comparison, so ties resolve to the
-    first view, matching the single-tensor argmin."""
+    """Global (view, row, col) of the minimum, plus the value.  A tie resolves to the first view,
+    which matches the single tensor argmin."""
     if not isinstance(x, _sharding.Shards):
         return _argmin_3d(x)
     pl = x.placement
     best_idx, best_val = None, None
     for t, (_d, (v0, _v1)) in zip(x.tensors, pl.shard_ranges()):
         if t.numel() == 0:
-            # A device may own no views, and an argmin has no answer there.
             continue
         (v, r, c), val = _argmin_3d(t)
         if best_val is None or float(val) < best_val:
@@ -126,16 +118,13 @@ def gen_huber_weights(weights, sino_error, T=1.0, delta=1.0, epsilon=1e-6):
     if not isinstance(sino_error, torch.Tensor):
         sino_error = torch.as_tensor(np.asarray(sino_error), device=weights_t.device)
 
-    # Compute std and global alpha
     std = 1.0 / torch.clamp(torch.sqrt(weights_t), min=epsilon)
     alpha = torch.linalg.norm(sino_error) / (torch.linalg.norm(std) + epsilon)
     std_norm = alpha * std
 
-    # Compute normalized error
     normalized_error = sino_error / std_norm
     abs_norm_error = torch.abs(normalized_error)
 
-    # Apply generalized Huber function
     huber_weights = torch.where(abs_norm_error <= T,
                                 torch.ones_like(abs_norm_error),
                                 (delta * T) / (abs_norm_error + epsilon))
@@ -191,8 +180,6 @@ def BH_correction(sino, alpha, batch_size=64, devices=None):
 
     alpha = np.asarray(alpha)
 
-    # Per-view-batch polynomial evaluation, driven through the shared pipeline driver.  The
-    # correction is per-pixel, so batching is exact.
     def kernel(sino_batch):
         corrected = torch.zeros_like(sino_batch)
         for k in range(len(alpha)):
@@ -230,7 +217,6 @@ def _generate_metal_exponent_list(num_metal, max_order):
 
     generate_recursive([], num_metal)
 
-    # Sort by total degree (sum of powers)
     combinations.sort(key=lambda x: sum(x))
     return combinations
 
@@ -252,26 +238,15 @@ def _est_plastic_metal_sinos_from_recon(recon, num_metal, ct_model,
         plastic_sino_est (tensor): Unnormalized plastic sino estimation.
         metal_sino_est (list of tensor): List of unnormalized metal sino estimation.
     """
-    # Put the recon in the model's device form once at entry; the segmentation and the
-    # 1+num_metal forward projections below consume the SAME device recon.
     recon = ct_model._shard_recon(recon)
 
-    # --- Segment plastic and metal regions in the reconstruction ---
-    # plastic_mask: Mask for plastic regions.
-    # metal_masks: List of masks for each metal.
-    # plastic_scale: Scaling factor for the plastic region.
-    # metal_scales: List of scaling factors for each metal region.
     plastic_mask, metal_masks, plastic_scale, metal_scales = mtp.segment_plastic_metal(
         recon, num_metal=num_metal, radial_margin=radial_margin, top_margin=top_margin,
         bottom_margin=bottom_margin)
 
-    # --- Forward project and scale plastic ---
-    # Keep the OUTPUT on-device (output_sharded=True): the whole correction below runs on these
-    # device sinograms.
     plastic_sino_est = _ps_map(lambda t: plastic_scale * t,
                                ct_model.forward_project(plastic_mask, output_sharded=True))
 
-    # --- Forward project the masked out metal regions ---
     metal_sino_est = []
     for mask in metal_masks:
         masked = (_sharding.Shards([mk * t for mk, t in zip(mask.tensors, recon.tensors)],
@@ -304,9 +279,7 @@ def _get_column_H(col_index, plastic_sino_est, metal_sino_est, H_exponent_list):
     exponents = H_exponent_list[col_index]
     assert len(exponents) == 1 + len(metal_sino_est), "Mismatch between exponent tuple and number of sinograms."
 
-    # Most exponents are 0 or 1 (the exponent tuples are sparse), so skip the no-op factors instead of
-    # materializing full-sinogram-sized ones/copies: x**0 == 1 exactly (skip the factor) and x**1 == x
-    # exactly (use the array directly, no power op).  Byte-identical to the dense product.
+    # An exponent of 0 contributes nothing, and an exponent of 1 needs no power operation.  Both are skipped.
     col = None
     for arr, exp in zip([plastic_sino_est] + list(metal_sino_est), exponents):
         if exp == 0:
@@ -314,8 +287,7 @@ def _get_column_H(col_index, plastic_sino_est, metal_sino_est, H_exponent_list):
         term = arr if exp == 1 else arr ** exp
         col = term if col is None else col * term
     if col is None:
-        # All-zero exponent tuple (the constant column) -- excluded by construction from H, but handle
-        # it correctly if a caller ever asks.
+        # An all zero exponent tuple gives the constant column.
         col = torch.ones_like(plastic_sino_est)
     return col
 
@@ -323,9 +295,8 @@ def _get_row_H(pixel_index, plastic_sino_est, metal_sino_est, H_exponent_list):
     """
     Compute the row of the matrix H for one sinogram pixel.
 
-    H is conceptually (num_pixels x num_cols) -- one row per sinogram pixel -- so ``pixel_index``
-    specifies a ROW of H.  It is named for the pixel rather than the matrix row because it is a
-    (view, row, col) tuple whose middle entry is the DETECTOR row, a different axis.
+    H has one row per sinogram pixel, so ``pixel_index`` selects a row of H.  The middle entry of
+    ``pixel_index`` is the detector row, which is a different axis from the row of H.
 
     Args:
         pixel_index (tuple of int): (view, row, col) of the pixel, identifying the row of H to compute.
@@ -348,12 +319,8 @@ def _get_row_H(pixel_index, plastic_sino_est, metal_sino_est, H_exponent_list):
 
 
 def _argmin_3d(x):
-    """Index of the minimum of a 3-D sinogram-shaped array as PER-AXIS Python ints (view, row, col),
-    plus the minimum value.
-
-    Equivalent to unraveling a flat argmin, staged per axis so every index stays within its own small
-    axis length.  Tie-breaking matches the flat row-major argmin: the first view attaining the
-    minimum, and the first plane position within it.
+    """Index of the minimum of a 3D sinogram shaped array as Python ints (view, row, col), plus the
+    minimum value.  A tie resolves to the first view and the first position within it.
     """
     num_views, num_rows, num_channels = x.shape
     per_view = x.reshape(num_views, -1)              # (V, R*C)
@@ -363,9 +330,8 @@ def _argmin_3d(x):
     return (view, row, col), per_view_min[view]
 
 
-# Minimum NORMALIZED metal-sinogram value for a pixel to be eligible for a residual-positivity
-# constraint (the metal estimates are normalized to max 1 before the fit, so this is relative).
-# See _find_most_violated_constraints for why near-zero-support pixels must be excluded.
+# A pixel is eligible for a residual positivity constraint when some metal estimate exceeds this
+# value.  The metal estimates are normalized to a maximum of 1 before the fit.
 _METAL_SUPPORT_FLOOR = 1e-3
 
 
@@ -380,14 +346,10 @@ def _find_most_violated_constraints(measured_sino, plastic_sino_est, metal_sino_
     This function evaluates the indices and values of the entries that most violate
     the constraints.
 
-    The residual argmin is further restricted to pixels where some metal estimate exceeds
-    ``_METAL_SUPPORT_FLOOR``: where every metal estimate is (near) zero the row H_m[i,:] is (near)
-    zero, so no θ can move that residual and the constraint is unactionable -- vacuous when
-    y[i] ≥ 0, and STRUCTURALLY INFEASIBLE when y[i] < 0 (which noisy measured sinograms routinely
-    contain on air rays from log-domain noise).  One such selected pixel makes OSQP declare the
-    whole QP primal infeasible, and its sentinel "solution" used to silently poison theta and
-    collapse the corrected plastic to ~0.  Near-zero rows are almost as bad: the constraint then
-    demands metal-polynomial coefficients of order y/m.
+    The residual search is restricted to pixels where some metal estimate exceeds
+    ``_METAL_SUPPORT_FLOOR``.  Where every metal estimate is near zero the row H_m[i,:] is near
+    zero, so no θ can move that residual.  Such a pixel makes OSQP declare the whole problem
+    infeasible when y[i] is negative, which noisy sinograms contain on air rays.
 
     Returns:
         idx_min_Sp (tuple of int): (view, row, col) of the smallest Sp entry.
@@ -396,9 +358,7 @@ def _find_most_violated_constraints(measured_sino, plastic_sino_est, metal_sino_
         v_min_residual (scalar): Value of (y − Sm) at that entry.
     """
     num_cols = len(H_exponent_list)
-    # The coefficient of p in column i is the column with its p factor removed, so zero the p exponent
-    # (the sparse _get_column_H then SKIPS that factor) rather than passing a dummy full-sinogram ones
-    # array.
+    # Zeroing the p exponent gives the coefficient of p in each column.
     p_coeff_exponents = [(0,) + exps[1:] for exps in H_exponent_list]
 
     def build_sp(p, *ms):
@@ -416,8 +376,7 @@ def _find_most_violated_constraints(measured_sino, plastic_sino_est, metal_sino_
     Sp = _ps_map(build_sp, plastic_sino_est, *metal_sino_est)
     y_minus_Sm = _ps_map(build_y_minus_sm, measured_sino, plastic_sino_est, *metal_sino_est)
 
-    # Residual argmin restricted to the metal support (see the docstring): pixels where every metal
-    # estimate is <= the floor cannot be moved by theta, so they must never become constraints.
+    # A pixel with no metal support cannot be moved by theta, so it must never become a constraint.
     def mask_residual(ym, *ms):
         support = torch.zeros_like(ym, dtype=torch.bool)
         for metal in ms:
@@ -457,15 +416,11 @@ def _estimate_BH_model_params_using_OSQP(P, q, A, u):
     q_numpy = np.asarray(q, dtype=np.float64)
 
     if A is None or u is None:
-        # No constraints - solve unconstrained QP directly on the host (the system is tiny,
-        # num_cols x num_cols).
+        # There are no constraints, so solve the small unconstrained system directly.
         theta = np.linalg.solve(P_numpy, -q_numpy)
         return np.asarray(theta, dtype=np.float32)
 
-    # Convert arrays as required by OSQP. These matrices are small.
-    # osqp (which pulls scipy.sparse) is imported here, at its one use site, so that
-    # importing the preprocess package stays fast for the many callers that never fit
-    # a beam-hardening model.
+    # osqp and scipy.sparse are imported here because most callers never fit a beam hardening model.
     from scipy.sparse import csc_matrix
     import osqp
     A_numpy = np.asarray(A, dtype=np.float64)
@@ -478,10 +433,8 @@ def _estimate_BH_model_params_using_OSQP(P, q, A, u):
     solver.setup(P=P_sparse, q=q_numpy, A=A_sparse, l=None, u=u_numpy, alpha=1.0, verbose=0)
     result = solver.solve()
 
-    # OSQP reports failure through the status field, NOT by raising: on an infeasible or unsolved
-    # QP it fills result.x with a no-solution sentinel (2143289344.0 -- the float32-NaN bit pattern
-    # as a value), which is FINITE and would silently poison every downstream use of theta.
-    # Accept only a solved status ('solved' / 'solved inaccurate') with finite values.
+    # OSQP reports failure in result.info.status rather than by raising.  On failure it fills
+    # result.x with the finite sentinel 2143289344.0, so accept only a solved status with finite values.
     status = str(result.info.status).strip().lower()
     theta = np.asarray(result.x, dtype=np.float64)
     if not status.startswith('solved') or not np.all(np.isfinite(theta)):
@@ -496,8 +449,7 @@ def _compute_entry_for_OSQP(plastic_sino_est, metal_sino_est, measured_sino, H_e
     HtH = np.zeros((num_cols, num_cols), dtype=np.float64)
     Hty = np.zeros(num_cols, dtype=np.float64)
 
-    # Compute the upper triangle of HtH and mirror it.  Each column is built
-    # in the sinogram's own form and the inner products sum per piece.
+    # Compute the upper triangle of HtH and mirror it.
     def column(i):
         return _ps_map(lambda p, *ms: _get_column_H(i, p, list(ms), H_exponent_list),
                        plastic_sino_est, *metal_sino_est)
@@ -512,17 +464,13 @@ def _compute_entry_for_OSQP(plastic_sino_est, metal_sino_est, measured_sino, H_e
             if i != j:
                 HtH[j, i] = dot_ij
 
-    # Compute total degree for each cross term and metal term
     cross_degree = [sum(exponent) for exponent in H_exponent_list[0:1+num_cross_terms]]
     metal_degree = [sum(exponent) for exponent in H_exponent_list[1+num_cross_terms:]]
 
-    # Construct diagonal regularization weights: higher-degree terms are penalized more.
-    # This applies stronger regularization to higher-order terms when alpha > 0.
-    # Add 1 to the beginning to represent the weight for the linear plastic term (p^1).
+    # Diagonal regularization weights.  A higher degree term is penalized more when alpha > 0.
     weights = np.asarray(cross_degree + metal_degree, dtype=np.float64)
     weight_matrix = np.diag(1 + weights ** alpha)
 
-    # --- Solve for theta ---
     scaling_const = np.trace(HtH) / np.trace(weight_matrix)
     lambda_reg = beta * scaling_const
 
@@ -570,29 +518,24 @@ def _estimate_BH_model_params(plastic_sino_est, metal_sino_est, measured_sino, H
     num_cols = len(H_exponent_list)
     dp = 1 + num_cross_terms
 
-    # Lists that store the indices of the points that most violate the constraints
     C_p = []
     C_m = []
 
-    # Construct the entries P, q, A and u of OSQP for solving the constraint optimization
     P, q = _compute_entry_for_OSQP(plastic_sino_est, metal_sino_est, measured_sino, H_exponent_list, num_cross_terms, alpha, beta)
     A = np.zeros((0, num_cols))  # no active constraints yet
     u = np.zeros((0,))
 
-    # Initial θ solved without constraint
     theta = _estimate_BH_model_params_using_OSQP(P, q, A=None, u=None)
 
     for iter in range(num_constraint_update_iter):
-        # Find the (view, row, col) indices and values of the points that most violate each constraint
         idx_min_Sp, v_min_Sp, idx_min_residual, v_min_residual = _find_most_violated_constraints(measured_sino, plastic_sino_est, metal_sino_est, theta, H_exponent_list, num_cross_terms)
 
         # (1) Hp θp ≥ 0  ->  (-Hp) θ ≤ 0
         if v_min_Sp < tolerance and (idx_min_Sp not in C_p):
-            # Coefficient-of-p row: zero the p exponent (pi**0 == 1 exactly) instead of allocating a
-            # full-sinogram dummy ones array just to read its one pixel.
+            # Zeroing the p exponent gives the coefficient of p in the row.
             p_coeff_exponents = [(0,) + exps[1:] for exps in H_exponent_list]
             row_p = _get_row_H(idx_min_Sp, plastic_sino_est, metal_sino_est, p_coeff_exponents)
-            # Negative row_p[:dp] to ensure Hpθp >= 0
+            # The sign of row_p[:dp] is negated so that Hp θp >= 0.
             A_p = np.concatenate([-row_p[:dp], np.zeros((num_cols - dp,))])
             u_p = np.array([0.0])
             A = np.vstack([A, A_p[None, :]])
@@ -602,26 +545,20 @@ def _estimate_BH_model_params(plastic_sino_est, metal_sino_est, measured_sino, H
         # (2) y − Hm θm ≥ 0  ->  (Hm) θ ≤ y
         if v_min_residual < tolerance and (idx_min_residual not in C_m):
             row_m = _get_row_H(idx_min_residual, plastic_sino_est, metal_sino_est, H_exponent_list)
-            # Positive row_m[dp:] to ensure y-Hmθm >= 0
+            # row_m[dp:] is kept positive so that y - Hm θm >= 0.
             A_m = np.concatenate([np.zeros(dp), row_m[dp:]])
-            # RHS clamped at 0: the metal-only contribution H_m θ_m is a physical (nonnegative)
-            # attenuation, so its tightest meaningful upper bound is max(y, 0).  A raw negative
-            # measurement (log-domain noise) would force the metal polynomial NEGATIVE at this
-            # pixel's metal values -- for small values that means huge negative coefficients.
+            # The right side is clamped at 0.  The metal contribution is a nonnegative attenuation,
+            # and a negative measurement would force large negative metal coefficients.
             u_m = np.array([max(_ps_item(measured_sino, idx_min_residual), 0.0)])
             A = np.vstack([A, A_m[None, :]])
             u = np.concatenate([u, u_m])
             C_m.append(idx_min_residual)
 
-        # Early exit if both constraints are satisfied (within tolerances)
         if (v_min_Sp >= tolerance) and (v_min_residual >= tolerance):
             break
         theta_new = _estimate_BH_model_params_using_OSQP(P, q, A, u)
         if theta_new is None:
-            # Defensive: with the support-restricted constraint selection the QP is feasible by
-            # construction (the two constraint families act on disjoint theta blocks, each
-            # satisfiable), so a solver failure signals numerical trouble.  Keep the last good
-            # theta rather than propagating OSQP's failure sentinel into the correction.
+            # Keep the last good theta rather than passing the OSQP failure sentinel downstream.
             warnings.warn("OSQP failed to solve the constrained beam-hardening fit; keeping the "
                           "parameters from the previous constraint iteration.", RuntimeWarning)
             break
@@ -663,9 +600,8 @@ def _correct_plastic_sinogram(measured_sino, plastic_sino_est, metal_sino_est, t
         corrected_plastic_sino (tensor): Beam-hardening-corrected plastic sinogram.
     """
 
-    # Compute the denominator (linear plastic + cross terms) from the first (1 + num_cross_terms) columns
-    # of H.  The coefficient of p in column i is the column with its p factor removed, so zero the p
-    # exponent (the sparse _get_column_H then SKIPS that factor).
+    # The denominator uses the first 1 + num_cross_terms columns of H.  Zeroing the p exponent
+    # gives the coefficient of p in each column.
     p_coeff_exponents = [(0,) + exps[1:] for exps in H_exponent_list]
 
     def build_sp(p, *ms):
@@ -678,40 +614,24 @@ def _correct_plastic_sinogram(measured_sino, plastic_sino_est, metal_sino_est, t
         out = y
         for j in range(1 + num_cross_terms, 1 + num_cross_terms + num_metal_terms):
             out = out - float(theta[j]) * _get_column_H(j, p, list(ms), H_exponent_list)
-        # Enforce non-negativity on the residual sinogram (plastic + cross terms)
         return torch.clamp(out, min=0)
 
     Sp = _ps_map(build_sp, plastic_sino_est, *metal_sino_est)
     y_minus_Sm = _ps_map(build_y_minus_sm, measured_sino, plastic_sino_est, *metal_sino_est)
 
-    # Central plastic coefficient, used to define a stabilization floor.  The MEAN (rather than the
-    # median) is a cheap reduction; over the sinogram support the two are close, and this only sets a
-    # floor.
-    #
-    # The two forms below are NOT interchangeable, so the branch is on the form
-    # of Sp rather than on convenience.  One tensor keeps the pre-sharding
-    # reduction exactly: torch.mean, a 0-d float32 Sp_floor, and torch.maximum
-    # against it.  The float32-sum / float64-divide form exists only to combine
-    # per-piece partials that cannot be reduced in one kernel, so it is
-    # reserved for the sharded branch; using it on one device would move the
-    # divide to float64 and silently change a single-device result that this
-    # port promises to leave alone.
+    # The central plastic coefficient sets a stabilization floor.  A sharded input is summed per
+    # piece and divided on the host.
     if not isinstance(Sp, _sharding.Shards):
         mean_plastic_coef = torch.mean(Sp)
     else:
         mean_plastic_coef = _ps_sum(torch.sum, Sp) / _ps_numel(Sp)
     Sp_floor = gamma * mean_plastic_coef
 
-    # A negative mean would be non-physical and may indicate instability in the algorithm
-    # In that case, issue a runtime warning to flag the potential problem
+    # A negative mean is not physical and may indicate instability.
     if float(mean_plastic_coef) <= 0:
         warnings.warn("Mean of Sp is negative", RuntimeWarning)
 
     # Clamp Sp at Sp_floor to prevent division by very small or negative values.
-    # torch.maximum against a 0-d tensor of the piece's own dtype and device is
-    # the unsharded expression verbatim; the sharded branch's Python-float floor
-    # is materialized per piece rather than clamped as a weak scalar, so both
-    # branches run the same kernel.
     def clamp_and_divide(sp, ym):
         floor = (Sp_floor if torch.is_tensor(Sp_floor)
                  else torch.as_tensor(Sp_floor, dtype=sp.dtype, device=sp.device))
@@ -722,10 +642,8 @@ def _correct_plastic_sinogram(measured_sino, plastic_sino_est, metal_sino_est, t
     return corrected_plastic_sino
 
 def _estimate_plastic_scaling(plastic_sino_est, metal_sino_est, measured_sino, plastic_sino_corrected):
-    # Compute a scaling factor by performing least-squares fitting between the corrected plastic sinogram
-    # and the measured sinogram at plastic-only locations (i.e., where plastic is present and all metals are absent)
-    # Plastic-only locations.  Zero out the other locations and let compute_scaling_factor's inner
-    # products (sum(a*b)/sum(b*b)) do the reduction -- no data-dependent-shape selection needed.
+    # The scaling is a least squares fit between the corrected plastic sinogram and the measured
+    # sinogram.  Only the locations where plastic is present and every metal is absent are used.
     def keep_plastic_only(x, p, *ms):
         condition = (p != 0)
         for metal in ms:
@@ -761,35 +679,27 @@ def correct_sino_plastic_metal(ct_model, measured_sino, recon, num_metal=1, orde
     Returns:
         ndarray: Beam-hardening corrected sinogram of the same shape as `measured_sino`.
     """
-    # Construct the exponent list of the metal sinograms.
     metal_exponent_list = _generate_metal_exponent_list(num_metal, order)
     cross_exponent_list = _generate_metal_exponent_list(num_metal, order - 1)
     num_metal_terms = len(metal_exponent_list)
     num_cross_terms = len(cross_exponent_list)
 
-    # Construct the exponent list for each column of the matrix H.
-    # Each entry in H_exponent_list is a tuple representing the exponents of (p, m_0, m_1, ..., m_{num_metal-1}).
-    # - Linear plastic term: (1, 0, 0, ...)
-    # - Cross terms: The leading 1 indicates the presence of a linear p term.
-    # - Metal-only terms: The leading 0 indicates there is no p in the term.
-    # - Total number of columns: 1 + num_cross_terms + num_metal_terms.
+    # Each entry of H_exponent_list holds the exponents of (p, m_0, ..., m_{num_metal-1}).  The
+    # first entry is the linear plastic term, then come the cross terms, then the metal only terms.
     H_exponent_list = (
             [(1,) + (0,) * num_metal] +
             [(1, *t) for t in cross_exponent_list] +
             [(0, *t) for t in metal_exponent_list])
 
-    # Put the measured sinogram in the model's device form.
     measured_sino = ct_model.prepare_sino_for_devices(measured_sino)
 
-    # Get normalized sinogram p and [m_0, m_1, ...].
     plastic_sino_est, metal_sino_est = _est_plastic_metal_sinos_from_recon(
         recon, num_metal, ct_model, radial_margin=radial_margin, top_margin=top_margin,
         bottom_margin=bottom_margin)
     plastic_sino_scale = _ps_max(lambda t: torch.max(torch.abs(t)), plastic_sino_est)
     metal_sino_scale = [_ps_max(lambda t: torch.max(torch.abs(t)), arr) for arr in metal_sino_est]
-    # An empty (all-zero) plastic or metal estimate would silently fill the normalized sinogram with
-    # NaNs and fail far downstream.  Check the scales explicitly and fail fast with an actionable
-    # message.  ``not > 0`` also catches a NaN scale (e.g. a NaN in the recon).
+    # An empty plastic or metal estimate would fill the normalized sinogram with NaNs, so check the
+    # scales here.  ``not > 0`` also catches a NaN scale.
     if not float(plastic_sino_scale) > 0:
         raise ValueError(
             "The estimated plastic sinogram is empty (the plastic segmentation class contains no "
@@ -803,18 +713,14 @@ def correct_sino_plastic_metal(ct_model, measured_sino, recon, num_metal=1, orde
     metal_sino_est = [_ps_map(lambda t, n=norm: t / n, arr)
                       for arr, norm in zip(metal_sino_est, metal_sino_scale)]
 
-    # Estimate beam hardening model parameters theta
     theta = _estimate_BH_model_params(plastic_sino_est, metal_sino_est, measured_sino, H_exponent_list, num_cross_terms, alpha, beta, num_constraint_update_iter)
 
-    # Compute the corrected plastic sinogram
     plastic_sino_corrected = _correct_plastic_sinogram(measured_sino, plastic_sino_est, metal_sino_est, theta, H_exponent_list,
                                                        num_cross_terms, num_metal_terms, float(plastic_sino_scale), gamma)
 
-    # Compute and apply the scaling of the corrected plastic sino
     plastic_sino_corrected_scale = _estimate_plastic_scaling(plastic_sino_est, metal_sino_est, measured_sino, plastic_sino_corrected)
 
-    # Combine the scaled corrected plastic sino and the metal sinos, then gather to a host sinogram
-    # for the downstream recon.
+    # Combine the corrected plastic sinogram with the metal sinograms and gather to the host.
     def combine(corrected, *ms):
         out = plastic_sino_corrected_scale * corrected
         for arr, norm in zip(ms, metal_sino_scale):

@@ -6,11 +6,6 @@ from sklearn.decomposition import non_negative_factorization as nmf
 from sklearn.utils.extmath import randomized_svd
 
 
-# -----------------------------------------------------------------------
-# Hyperspectral Neutron Radiographic/Tomographic Data Denoising Functions
-# -----------------------------------------------------------------------
-
-
 def hyper_denoise(data, dataset_type='attenuation', num_materials=None, safety_factor=2, beta_loss='frobenius',
                   max_iter=300, tolerance=1e-10, batch_size=2 ** 27, subspace_basis=None, random_state=None,
                   verbose=1):
@@ -47,7 +42,6 @@ def hyper_denoise(data, dataset_type='attenuation', num_materials=None, safety_f
         ((N_x, N_y, N_z, ..., N_k), (N_x, N_y, N_z, ..., N_k))
 
     """
-    # --------------------- Dehydrate ----------------------
     dehydrated_data = dehydrate(data,
                                 dataset_type=dataset_type,
                                 num_materials=num_materials,
@@ -60,7 +54,6 @@ def hyper_denoise(data, dataset_type='attenuation', num_materials=None, safety_f
                                 random_state=random_state,
                                 verbose=verbose)
 
-    # --------------------- Rehydrate ----------------------
     denoised_data = rehydrate(dehydrated_data)
 
     return denoised_data
@@ -105,20 +98,20 @@ def dehydrate(data, dataset_type='attenuation', num_materials=None, safety_facto
         >>> data.shape, subspace_data.shape, subspace_basis.shape
         ((N_x, N_y, N_z, ..., N_k), (N_x, N_y, N_z, ..., 10), (10, N_k))
     """
-    epsilon = 1e-3  # Define epsilon
+    epsilon = 1e-3
 
-    # --------------- Dataset type validation --------------
     if dataset_type not in ('attenuation', 'transmission'):
         raise ValueError("'dataset_type' must be either 'attenuation' or 'transmission'.")
 
-    # ------------------ Data preparation ------------------
     data_shape = data.shape
     num_bands = data_shape[-1]
     num_points = data.size // num_bands
-    data = data.reshape(num_points, num_bands).astype(np.float64)  # Reshape to 2D and cast to float64 for stability
+    # float64 is used for numerical stability.
+    data = data.reshape(num_points, num_bands).astype(np.float64)
 
     if dataset_type == 'transmission':
-        # Initial cleanup in the transmission domain to get rid of defective measurements
+        # This first pass in the transmission domain removes defective
+        # measurements.
         data = hyper_denoise(data,
                              dataset_type='attenuation',
                              num_materials=num_materials,
@@ -130,28 +123,25 @@ def dehydrate(data, dataset_type='attenuation', num_materials=None, safety_facto
                              random_state=random_state,
                              verbose=0)
         data[data < epsilon] = epsilon
-        data = - np.log(data)  # Convert to attenuation
+        data = - np.log(data)
 
-    data[data < 0] = 0  # Enforce non-negativity
+    data[data < 0] = 0
 
     if subspace_basis is not None:
-        subspace_basis = np.asarray(subspace_basis, dtype=np.float64)  # Cast to float64 for stability
+        subspace_basis = np.asarray(subspace_basis, dtype=np.float64)
 
-    # --------------------- Batch setup ---------------------
-    num_points_batch = max(1, batch_size // num_bands)  # Number of hyperspectral points per batch
-    num_batches = int(np.ceil(num_points / num_points_batch))  # Number of batches
+    num_points_batch = max(1, batch_size // num_bands)
+    num_batches = int(np.ceil(num_points / num_points_batch))
 
-    # ------------------- NMF solver setup ------------------
     if beta_loss == 'frobenius':
-        solver = 'cd'  # Coordinate Descent
+        solver = 'cd'   # coordinate descent
     elif beta_loss == 'kullback-leibler':
-        solver = 'mu'  # Multiplicative Update
+        solver = 'mu'   # multiplicative update
     else:
         warnings.warn(f"Invalid beta_loss '{beta_loss}' specified: falling back to 'frobenius'.")
         beta_loss = 'frobenius'
         solver = 'cd'
 
-    # ------------- Subspace dimension setup -----------------
     if subspace_basis is not None:
         subspace_dimension = subspace_basis.shape[0]
     elif num_materials is not None:
@@ -160,12 +150,10 @@ def dehydrate(data, dataset_type='attenuation', num_materials=None, safety_facto
         subspace_dimension = _estimate_subspace_dimension(data, safety_factor=safety_factor,
                                                           random_state=random_state, verbose=verbose)
 
-    # ------- Subspace basis estimation for multi-batch ------
     if subspace_basis is None and num_batches > 1:
         row_idx = np.random.default_rng(random_state).permutation(num_points)
         subspace_basis_batch = [None] * num_batches
 
-        # Estimate subspace basis for each batch using NMF
         for batch in range(num_batches):
             b_start = batch * num_points_batch
             b_stop = min((batch + 1) * num_points_batch, num_points)
@@ -183,7 +171,7 @@ def dehydrate(data, dataset_type='attenuation', num_materials=None, safety_facto
                                                         random_state=random_state,
                                                         update_H=True)
                 
-        # Estimate final subspace basis from batch estimations using NMF
+        # The per-batch bases are factored together to give the final basis.
         subspace_basis_batch = np.reshape(np.array(subspace_basis_batch), (-1, num_bands))
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -196,13 +184,11 @@ def dehydrate(data, dataset_type='attenuation', num_materials=None, safety_facto
                                        max_iter=max_iter,
                                        random_state=random_state)
 
-    # --------------- Subspace data estimation ---------------
     if num_batches == 1:
         nmf_init, update_basis = 'nndsvd', True
     else:
         nmf_init, update_basis = 'custom', False
 
-    # Estimate subspace data in batches using NMF
     subspace_data = np.zeros((num_points, subspace_dimension))
     for batch in range(num_batches):
         b_start = batch * num_points_batch
@@ -221,13 +207,12 @@ def dehydrate(data, dataset_type='attenuation', num_materials=None, safety_facto
                                                                     random_state=random_state,
                                                                     update_H=update_basis)
 
-    # ------------------ Final formatting -------------------
-    subspace_data = subspace_data.reshape(*data_shape[:-1], -1)  # Reshape to original dimensions (except last axis)
-    subspace_data = np.asarray(subspace_data, dtype=np.float32)  # Cast to float32 to reduce memory footprint
-    subspace_basis = np.asarray(subspace_basis, dtype=np.float32)  # Cast to float32 to reduce memory footprint
-    dehydrated_data = [subspace_data, subspace_basis, dataset_type]  # Package outputs for return
+    subspace_data = subspace_data.reshape(*data_shape[:-1], -1)
+    # float32 is used to reduce the memory the outputs occupy.
+    subspace_data = np.asarray(subspace_data, dtype=np.float32)
+    subspace_basis = np.asarray(subspace_basis, dtype=np.float32)
+    dehydrated_data = [subspace_data, subspace_basis, dataset_type]
 
-    # --------------- Print details if required -------------
     if verbose >= 1:
         print("dehydrate(): ")
         print("   -Number of data batches: ", num_batches)
@@ -261,16 +246,15 @@ def rehydrate(dehydrated_data, hyperspectral_idx=None):
         >>> subspace_data.shape, subspace_basis.shape, hyper_data.shape
         ((N_x, N_y, N_z, ..., N_s), (N_s, N_k), (N_x, N_y, N_z, ..., 3))
     """
-    [subspace_data, subspace_basis, dataset_type] = dehydrated_data  # Unpack data
+    [subspace_data, subspace_basis, dataset_type] = dehydrated_data
 
-    # Retrieve original data dimensions
     if hyperspectral_idx is None:
         rehydrated_data = subspace_data @ subspace_basis
     else:
         rehydrated_data = subspace_data @ subspace_basis[:, hyperspectral_idx]
 
     if dataset_type == 'transmission':
-        rehydrated_data = np.exp(-rehydrated_data)  # Convert to transmission
+        rehydrated_data = np.exp(-rehydrated_data)
 
     return rehydrated_data
 
@@ -297,46 +281,35 @@ def _estimate_subspace_dimension(data, safety_factor=2, noise_fit_window=[25.0, 
         raise ValueError("`data` must be a 2D array shaped (samples, N_k).")
 
     n_points, n_bands = data.shape
-
-    # Decide how many rows to sample for speed/robustness
     sample_size = min(n_points, n_bands)
 
-    # Sample rows without replacement
     rng = np.random.default_rng(random_state)
     row_idx = rng.choice(n_points, size=sample_size, replace=False)
 
-    # Cast to float64 for numerical stability in svd
+    # float64 is used for numerical stability in the SVD.
     Y = np.asarray(data[row_idx, :], dtype=np.float64)
 
-    # Compute singular values via randomized SVD
     _, s, _ = randomized_svd(Y, n_components=sample_size, random_state=random_state)
 
-    # Guard against degenerate cases
     s = np.asarray(s, dtype=float)
     if s.size == 0:
         return 0
 
-    # Extract start and stop percent from noise_fit_window
     start_percent, stop_percent = noise_fit_window
-    # Fit window around percentile: [percentile-10, percentile+10], in s-index space
     start_idx = int(np.floor((start_percent / 100.0) * s.size))
     stop_idx = int(np.ceil((stop_percent / 100.0) * s.size))
 
-    # Clip and ensure at least 2 points
+    # The fit window is clipped to the array and holds at least 2 points.
     start_idx = max(0, min(start_idx, s.size - 2))
     stop_idx = max(start_idx + 2, min(stop_idx, s.size))
 
-    # Fit log(s) ≈ a*n + b on [start_idx:stop_idx]
+    # The noise model is a straight line fit to log(s) over the window.
     n = np.arange(s.size)
     a, b = np.polyfit(n[start_idx:stop_idx], np.log(s[start_idx:stop_idx] + 1e-12), 1)
-
-    # Predicted singular values for all indices
     s_pred = np.exp(a * n + b)
-
-    # Compute tau by scaling the predicted singular values with the threshold
     tau = threshold * s_pred
 
-    # Consider singular values > the corresponding tau values to be associated with signals
+    # A singular value above its tau is taken to carry signal.
     signal_flag = s > tau
     num_materials = int(np.sum(signal_flag[:start_idx]))
 
@@ -351,18 +324,12 @@ def _estimate_subspace_dimension(data, safety_factor=2, noise_fit_window=[25.0, 
         plt.ylabel("singular value")
         plt.legend()
 
-    # Multiply by safety factor
     subspace_dimension = int(np.ceil(safety_factor * num_materials))
 
     return max(1, subspace_dimension)
 
 
-# -----------------------------------------------------------------------
-# HDF5 Import/Export Utilities for Hyperspectral Neutron Data/Metadata
-# -----------------------------------------------------------------------
-
-
-# Description of the allowed keys
+# The allowed metadata keys and what each one holds.
 KEY_DESCRIPTIONS = {
     "dataset_name": "Character string with the name of the dataset.",
     "dataset_type": "'attenuation' or 'transmission'.",
@@ -379,26 +346,27 @@ KEY_DESCRIPTIONS = {
     "source_iso_dist": "Distance from source to iso in ALU."
 }
 
-# Acceptable input options for certain keys
+# The values each of these keys accepts.
 VALIDATION_RULES = {
     "dataset_type": (None, "attenuation", "transmission"),
     "dataset_modality": (None, "hyperspectral neutron"),
     "dataset_geometry": (None, "parallel", "cone"),
 }
 
-# Allowed keys derived from the KEY_DESCRIPTIONS
 ALLOWED_KEYS = list(KEY_DESCRIPTIONS.keys())
 
 
 def _validate_key(key, value):
-    """Validate categorical keys according to VALIDATION_RULES."""
+    """Warn when a key listed in VALIDATION_RULES has a value that is not
+    allowed."""
     if key in VALIDATION_RULES and value not in VALIDATION_RULES[key]:
         valid_options = [v for v in VALIDATION_RULES[key] if v is not None]
         warnings.warn(f"Invalid '{key}': should be one of {valid_options}.")
 
 
 def _with_key_docstring(style):
-    """Function to insert key descriptions into docstrings."""
+    """Return a decorator that replaces ``{_KEY_DOCS}`` in a docstring with
+    the key descriptions."""
     indent = "\t- " if style == "dict" else "\t"
     text = "\n".join(f"{indent}{k}: {v}" for k, v in KEY_DESCRIPTIONS.items())
 
@@ -433,10 +401,8 @@ def import_hsnt_data_hdf5(filename):
         with h5py.File(filename, "r") as f:
             group = f
 
-            # Check if data is dehydrated/compressed
             dehydrated = all(k in group for k in ["subspace_data", "subspace_basis", "dataset_type"])
 
-            # Importing data
             if dehydrated:
                 dataset_type = group["dataset_type"][()]
                 if isinstance(dataset_type, (bytes, np.bytes_)):
@@ -449,7 +415,6 @@ def import_hsnt_data_hdf5(filename):
             else:
                 warnings.warn(f"No HSNT data found in HDF5 file '{filename}'. Returning data=None.")
 
-            # Importing metadata
             for key in ALLOWED_KEYS:
                 if key in group:
                     value = group[key][()]
@@ -462,7 +427,6 @@ def import_hsnt_data_hdf5(filename):
         warnings.warn(f"Could not import HSNT data from HDF5 file '{filename}': {error}. Returning data=None.")
         data = None
 
-    # Validate categorical keys
     for key, value in metadata.items():
         _validate_key(key, value)
 
@@ -494,14 +458,12 @@ def create_hsnt_metadata(**kwargs):
         >>> print(metadata["dataset_name"])
         sample1
     """
-    # Warn for unexpected keyword arguments
     for key in kwargs.keys():
         if key not in ALLOWED_KEYS:
             warnings.warn(f"Ignoring invalid key '{key}' in arguments.")
 
     metadata = {k: kwargs.get(k, None) for k in ALLOWED_KEYS}
 
-    # Validation
     for key, value in metadata.items():
         _validate_key(key, value)
 
@@ -527,20 +489,17 @@ def export_hsnt_data_hdf5(filename, data, metadata=None):
     if metadata is None:
         metadata = {}
 
-    # Check if data is dehydrated/compressed
     dehydrated = (isinstance(data, list)
                   and len(data) == 3
                   and isinstance(data[2], str)
                   and data[2] in VALIDATION_RULES["dataset_type"][1:])
 
-    # Validate categorical keys before writing
     for key, value in metadata.items():
         _validate_key(key, value)
 
     with h5py.File(filename, "w") as f:
         group = f
 
-        # Exporting data
         if dehydrated:
             group.create_dataset("subspace_data", data=data[0])
             group.create_dataset("subspace_basis", data=data[1])
@@ -548,7 +507,6 @@ def export_hsnt_data_hdf5(filename, data, metadata=None):
         else:
             group.create_dataset("data", data=data)
 
-        # Exporting metadata
         for key, value in metadata.items():
             if key not in ALLOWED_KEYS:
                 warnings.warn(f"Ignoring invalid key '{key}' in metadata.")
@@ -559,11 +517,6 @@ def export_hsnt_data_hdf5(filename, data, metadata=None):
                 group.create_dataset(key, data=np.bytes_(value))
             else:
                 group.create_dataset(key, data=value)
-
-
-# -----------------------------------------------------------------------
-# Noisy Hyperspectral Neutron Data Simulation Function (Ni, Cu, and Al)
-# -----------------------------------------------------------------------
 
 
 def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector_columns=64, dosage_rate=300, 
@@ -587,17 +540,14 @@ def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector
             - gt_hyper_projection: Ground truth noiseless hyperspectral data of same shape.
 
     """
-    # Ensure material_basis has exactly 3 rows
     if material_basis.shape[0] != 3:
         raise ValueError("material_basis must have exactly 3 rows (Ni, Cu, Al).")
 
-    # Validate geometry and inputs
     if detector_rows < 3 or detector_columns < 2:
         raise ValueError("detector_rows must be ≥3 and detector_columns ≥2.")
     if dosage_rate <= 0:
         raise ValueError("dosage_rate must be positive.")
 
-    # Handle default material_density and verify required keys
     if material_density is None:
         material_density = {"Ni": 0.2, "Cu": 0.2, "Al": 1.0}
     required = {"Ni", "Cu", "Al"}
@@ -605,19 +555,16 @@ def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector
     if missing:
         raise KeyError(f"material_density missing keys: {sorted(missing)}")
 
-    # Basic sanity on basis values
     if np.any(material_basis < 0):
         raise ValueError("material_basis should be non-negative attenuation coefficients.")
 
-    # Set variable values
     epsilon = 1e-8
     number_of_materials = material_basis.shape[0]
     number_of_wavelengths = material_basis.shape[1]
-    
-    # Generate view angles
+
     angles = np.linspace(0, np.pi, num_angles)
 
-    # Generate simulated projection data for 3 materials (Ni, Cu, and Al)
+    # The phantom is three stacked bars, one of each material.
     height = detector_rows // 3
     width = detector_columns // 2
     thickness = 20 * np.sqrt((width//2)**2 - np.linspace(-width // 2, width // 2, width)**2)/ width
@@ -626,22 +573,18 @@ def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector
     material_projection[:, 2 * height:, width // 2:width + width // 2, 1] = material_density["Cu"] * thickness
     material_projection[:, height:2 * height, width // 2:width + width // 2, 2] = material_density["Al"] * thickness
 
-    # Generate noiseless hyperspectral projection data using rehydrate function
     gt_hyper_projection = rehydrate([material_projection, material_basis, 'attenuation'])
 
-    # Generate noiseless hyperspectral open beam data using the given dosage rate
     noiseless_open_beam = dosage_rate * np.ones((detector_rows, detector_columns, number_of_wavelengths)).astype(
         np.float32)
 
-    # Generate noiseless raw hyperspectral neutron counts
     noiseless_object_scan = np.exp(-gt_hyper_projection) * noiseless_open_beam
     noiseless_object_scan = np.nan_to_num(noiseless_object_scan, nan=0, posinf=0, neginf=0)
 
-    # Generate noisy neutron counts from Poisson distribution
+    # The measured counts are Poisson distributed.
     noisy_open_beam = np.random.poisson(noiseless_open_beam).astype(np.float32)
     noisy_object_scan = np.random.poisson(noiseless_object_scan).astype(np.float32)
 
-    # Generate noisy hyperspectral projection data
     ratio = noisy_object_scan / noisy_open_beam
     ratio[ratio < epsilon] = epsilon
     noisy_hyper_projection = -np.log(ratio)
@@ -655,7 +598,7 @@ def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector
     if verbose > 1:
         import matplotlib.pyplot as plt
         plt.figure()
-        plt.plot(material_basis.T)  # each column is a basis function
+        plt.plot(material_basis.T)
         plt.xlabel("wavelength index")
         plt.ylabel("linear attenuation ($cm^{-1}$)")
         plt.title("Material basis functions (Ni, Cu, Al)")

@@ -113,10 +113,8 @@ def qggmrf_gradient_and_hessian_at_indices(flat_recon, recon_shape, pixel_indice
     Raises:
         TypeError: If ``flat_recon`` or either halo is in the divided device form.
     """
-    # This works on ONE shard's tensors, with the halos supplying the values
-    # just outside it, so a whole divided array is refused.  Left alone it
-    # would fail on the indexing below with a message that says only that a
-    # Shards cannot be subscripted.
+    # This works on one shard's tensors, with the halos supplying the values
+    # just outside it, so a whole divided array is refused here.
     _sharding.reject_shards('qggmrf_gradient_and_hessian_at_indices',
                             flat_recon=flat_recon, left_halo=left_halo,
                             right_halo=right_halo)
@@ -125,13 +123,8 @@ def qggmrf_gradient_and_hessian_at_indices(flat_recon, recon_shape, pixel_indice
     b, sigma_x, p, q, T = qggmrf_params
     num_rows, num_cols = recon_shape[0], recon_shape[1]
 
-    # ── cylinder (slice-axis) term ────────────────────────────────────────────
-    # Build delta[j] = v[j] - v[j-1] for interior positions, with explicit
-    # boundary deltas at each end derived from the neighbor values.  With no
-    # halo the boundary value is the local edge slice itself, so the boundary
-    # delta is exactly zero -- the reflected boundary condition (bit-identical
-    # to the previous literal zero edge); a halo (a shard-interior boundary)
-    # gives the true cross-boundary delta instead.
+    # Cylinder (slice-axis) term.  With no halo the boundary value is the local
+    # edge slice, so the boundary delta is zero.  That is a reflected boundary.
     cylinders = flat_recon[pixel_indices]                     # (N, S)
     left_val = (left_halo[pixel_indices][:, None] if left_halo is not None
                 else cylinders[:, :1])
@@ -141,32 +134,24 @@ def qggmrf_gradient_and_hessian_at_indices(flat_recon, recon_shape, pixel_indice
                        cylinders[:, 1:] - cylinders[:, :-1],
                        right_val - cylinders[:, -1:]), dim=1)  # (N, S+1)
 
-    # Compute the primary quantity used for the gradient and Hessian.
-    # Use b_for_delta = 1 here and scale by the slice-direction b below.
+    # b_for_delta is 1 here, and the slice-direction b is applied below.
     b_tilde_2 = get_2_b_tilde(delta, 1.0, qggmrf_params)
     b_tilde_2_delta = b_tilde_2 * delta
 
-    # The gradient gets a term from each neighbor, slice+1 and slice-1.
-    # For slice+1, delta[1:] holds v[1]-v[0], v[2]-v[1], ..., so we need -delta
-    # since delta is supposed to be xs - xr with xs the current point of
-    # interest.  For slice-1, delta[:-1] holds v[0]-v[-1], v[1]-v[0], ... and
-    # hence has the correct sign already.
+    # A delta is xs - xr, with xs the pixel being updated.  The slice+1 neighbor
+    # therefore needs the sign of delta[1:] reversed.
     b_slice_plus, b_slice_minus = b[4], b[5]
     gradient = -b_slice_plus * b_tilde_2_delta[:, 1:] + b_slice_minus * b_tilde_2_delta[:, :-1]
     hessian = b_slice_plus * b_tilde_2[:, 1:] + b_slice_minus * b_tilde_2[:, :-1]
 
-    # ── in-slice (row/col) term ──────────────────────────────────────────────
-    # Add the contributions from the 4 in-plane neighbors.  Neighbor indices
-    # clamp at the grid border (jax's ravel_multi_index mode='clip'): an edge
-    # pixel's out-of-grid neighbor clips to itself, giving delta = 0 there --
-    # the same reflected boundary condition as the cylinder term.
+    # In-slice (row/col) term.  A neighbor index clamps at the grid border, so
+    # an edge pixel's out-of-grid neighbor is the pixel itself and its delta is zero.
     row_index = pixel_indices // num_cols
     col_index = pixel_indices % num_cols
 
-    # Access the central voxels' values at the given pixel_indices.
     xs0 = cylinders                                            # (N, S)
 
-    # Relative positions and their b weights: row+1, row-1, col+1, col-1.
+    # The offsets are row+1, row-1, col+1, col-1, with their b weights.
     offsets_and_b = [((1, 0), b[0]), ((-1, 0), b[1]),
                      ((0, 1), b[2]), ((0, -1), b[3])]
     for (dr, dc), b_value in offsets_and_b:
@@ -175,7 +160,6 @@ def qggmrf_gradient_and_hessian_at_indices(flat_recon, recon_shape, pixel_indice
         neighbor = flat_recon[r * num_cols + c]                # (N, S)
         delta = xs0 - neighbor
 
-        # Compute the primary quantity, then update the gradient and Hessian.
         b_tilde_2 = get_2_b_tilde(delta, b_value, qggmrf_params)
         gradient = gradient + b_tilde_2 * delta
         hessian = hessian + b_tilde_2
@@ -224,11 +208,8 @@ def qggmrf_gradient_and_hessian_batched(flat_stack, recon_shape, pixel_indices,
     b, sigma_x, p, q, T = qggmrf_params
     num_rows, num_cols = recon_shape[0], recon_shape[1]
 
-    # ── cylinder (slice-axis) term ────────────────────────────────────────────
-    # delta[j] = v[j] - v[j-1] for interior positions.  The boundary value at
-    # each end is the edge slice itself, so the boundary delta is exactly zero:
-    # the reflected boundary condition of the single-image function with no
-    # halo.
+    # Cylinder (slice-axis) term.  The boundary value at each end is the edge
+    # slice itself, so the boundary delta is zero.  That is a reflected boundary.
     cylinders = flat_stack[:, pixel_indices]                   # (B, N, S)
     left_val = cylinders[..., :1]
     right_val = cylinders[..., -1:]
@@ -236,22 +217,20 @@ def qggmrf_gradient_and_hessian_batched(flat_stack, recon_shape, pixel_indices,
                        cylinders[..., 1:] - cylinders[..., :-1],
                        right_val - cylinders[..., -1:]), dim=-1)  # (B, N, S+1)
 
-    # Compute the primary quantity used for the gradient and Hessian.
-    # Use b_for_delta = 1 here and scale by the slice-direction b below.
+    # b_for_delta is 1 here, and the slice-direction b is applied below.
     b_tilde_2 = get_2_b_tilde(delta, 1.0, qggmrf_params)
     b_tilde_2_delta = b_tilde_2 * delta
 
-    # slice+1 uses -delta[1:] and slice-1 uses delta[:-1], for the reason the
-    # single-image function gives.
+    # The slice+1 neighbor uses -delta[1:] and the slice-1 neighbor uses
+    # delta[:-1], for the reason the single-image function gives.
     b_slice_plus, b_slice_minus = b[4], b[5]
     gradient = (-b_slice_plus * b_tilde_2_delta[..., 1:]
                 + b_slice_minus * b_tilde_2_delta[..., :-1])
     hessian = (b_slice_plus * b_tilde_2[..., 1:]
                + b_slice_minus * b_tilde_2[..., :-1])
 
-    # ── in-slice (row/col) term ──────────────────────────────────────────────
-    # The 4 in-plane neighbors, with the neighbor index clamped at the grid
-    # border so that an edge pixel's out-of-grid neighbor is itself.
+    # In-slice (row/col) term.  A neighbor index clamps at the grid border, so
+    # an edge pixel's out-of-grid neighbor is the pixel itself.
     row_index = pixel_indices // num_cols
     col_index = pixel_indices % num_cols
     xs0 = cylinders                                            # (B, N, S)
@@ -289,7 +268,6 @@ def prox_gradient_at_indices(recon, prox_input, pixel_indices, sigma_prox):
         tensor of shape (N_indices, num_recon_slices): the gradient of the prox
         term at the specified indices.
     """
-    # Compute the prior model gradient at all voxels
     cur_diff = recon[pixel_indices] - prox_input[pixel_indices]
     return (1.0 / (sigma_prox ** 2.0)) * cur_diff
 
@@ -312,8 +290,7 @@ def qggmrf_loss(full_recon, qggmrf_params):
         TypeError: If ``full_recon`` is in the divided device form.
     """
     # np.asarray turns a divided array into a 0-d object array without
-    # complaint, and the failure then surfaces much further down as a numpy
-    # message about dimensionality, so it is refused here instead.
+    # complaint, so a divided array is refused here instead.
     _sharding.reject_shards('qggmrf_loss', full_recon=full_recon)
     b, sigma_x, p, q, T = qggmrf_params
     full_recon = np.asarray(full_recon)
@@ -322,7 +299,7 @@ def qggmrf_loss(full_recon, qggmrf_params):
     b_per_axis = [(b[j] + b[j + 1]) / (2 * sum(b)) for j in [0, 2, 4]]
 
     def rho_ref(delta):
-        # Compute rho from Table 8.1 in FCI
+        # This is rho from Table 8.1 in FCI.
         a_min = T * sigma_x * np.finfo(np.float32).eps
         abs_delta = np.clip(np.abs(delta), a_min, None)
         delta_scale = abs_delta / (T * sigma_x)  # delta_scale has a min of eps
@@ -331,7 +308,6 @@ def qggmrf_loss(full_recon, qggmrf_params):
         numerator *= ds_q_minus_p
         return numerator / (1 + ds_q_minus_p)
 
-    # Add rho over all the neighbor differences
     loss = 0.0
     for axis in [0, 1, 2]:
         cur_delta = np.diff(full_recon, axis=axis)

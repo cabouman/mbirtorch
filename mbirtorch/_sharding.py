@@ -167,26 +167,21 @@ class Placement:
                 for i, dev in enumerate(self.devices)]
 
 
-#: How many bytes of one shard the host gather moves at a time.  Each host
-#: thread of the gather stages its part of a shard through two pinned slots of
-#: this size, so a gather holds twice this much pinned memory per thread.
+#: How many bytes of one shard the host gather moves at a time.  Each host thread
+#: stages its part through two pinned slots, so a gather holds twice this much
+#: pinned memory per thread.
 GATHER_SLOT_BYTES = 16 * 2 ** 20
 
-#: The most host threads the gather uses per shard.  Writing a shard into its
-#: strided block of the host array runs at a few GB/s per thread and speeds up
-#: with more threads until the host memory bandwidth is reached.
+#: The most host threads the gather uses per shard.
 GATHER_THREADS_PER_SHARD = 16
 
 
 def _gather_threads_per_shard(n_shards):
-    """How many host threads each shard's block is written with.
+    """Return the number of host threads each shard's block is written with.
 
     The threads of all shards together are meant to occupy the CPUs this
-    process may run on, so the count is the CPUs divided by the shard count,
-    at most :data:`GATHER_THREADS_PER_SHARD` and at least one.  The write
-    itself is torch's copy, which already runs on torch's intra-op threads
-    where it has more than one, so those are divided out as well: a process
-    whose torch uses every core writes each shard from a single thread.
+    process may run on, so the count is the CPUs divided by the shard count
+    and by torch's own intra-op thread count.
     """
     try:
         cpus = len(os.sched_getaffinity(0))
@@ -197,9 +192,9 @@ def _gather_threads_per_shard(n_shards):
 
 
 def _split_grid(rows, width, parts):
-    """Up to ``parts`` (row0, row1, col0, col1) sub-grids of a (rows, width)
-    grid, one per thread: ranges of whole rows, or ranges of the one row's
-    columns when the grid has a single row."""
+    """Return up to ``parts`` (row0, row1, col0, col1) sub-grids of a
+    (rows, width) grid, one per thread.  Each sub-grid is a range of whole
+    rows, or a range of columns when the grid has a single row."""
     if rows == 1 and parts > 1:
         bounds = np.linspace(0, width, min(parts, width) + 1).astype(int)
         return [(0, 1, int(a), int(b))
@@ -210,9 +205,9 @@ def _split_grid(rows, width, parts):
 
 
 def _slab_pieces(rows, width, slot_elems):
-    """The (row0, row1, col0, col1) pieces of a (rows, width) grid that each
-    fit in ``slot_elems`` elements: as many whole rows as fit while a row
-    fits, otherwise pieces of one row."""
+    """Yield the (row0, row1, col0, col1) pieces of a (rows, width) grid that
+    each fit in ``slot_elems`` elements.  A piece is as many whole rows as
+    fit, or part of one row when a whole row does not fit."""
     rows_per_slab = slot_elems // width
     if rows_per_slab >= 1:
         for r0 in range(0, rows, rows_per_slab):
@@ -228,14 +223,11 @@ def _copy_through_slots(source, dest, slots):
     time through two staging slots.
 
     ``source`` is a contiguous (rows, width) tensor on the shard's device,
-    ``dest`` the matching (rows, width) view of the host array, whose rows
-    are strided, and ``slots`` two host tensors of equal length.  Each slab
-    is copied into a slot and then written from the slot into place.  With
-    two slots the copy of the next slab is issued before the current slab is
-    written, so for a CUDA shard, whose copies into pinned slots return at
-    once, the two overlap; an event per slab says when that slab has landed.
-    On any other device the copy completes before it returns and no event is
-    needed.
+    ``dest`` is the matching view of the host array, and ``slots`` is two
+    host tensors of equal length.  Each slab is copied into a slot and then
+    written from the slot into place.  With two slots the copy of the next
+    slab is issued before the current slab is written, so a CUDA shard's
+    copies overlap the writes.  An event per slab says when it has landed.
     """
     rows, width = source.shape
     if rows == 0 or width == 0:
@@ -272,17 +264,12 @@ def _fill_from_shards_in_slabs(sources, out, axis):
     threads per shard, each thread moving its part in slabs of
     :data:`GATHER_SLOT_BYTES`.
 
-    ``sources`` are the shards in axis order, ``out`` the contiguous host
-    array they fill, and ``axis`` the sharded axis as a non-negative index;
-    each shard's block is the next ``shape[axis]`` entries of that axis.
-    The array is handled as a grid with one row per combination of the
-    indices before the sharded axis and one column per combination of the
-    sharded index and the indices after it, so a shard's block is the same
-    range of columns in every row: contiguous within a row and strided
-    between rows.  Each thread takes a range of those rows (or of the
-    columns, when there is a single row).  Slots for a CUDA shard are
-    pinned, so its copies return at once; slots for a shard on any other
-    device are ordinary host memory.
+    ``sources`` are the shards in axis order, ``out`` is the contiguous host
+    array they fill, and ``axis`` is the sharded axis as a non-negative
+    index.  The array is handled as a grid whose rows are the indices before
+    the sharded axis, so a shard's block is the same range of columns in
+    every row.  Each thread takes a range of those rows, or of the columns
+    when there is a single row.  Slots for a CUDA shard are pinned.
     """
     shape = tuple(out.shape)
     rows = math.prod(shape[:axis])
@@ -309,8 +296,8 @@ def _fill_from_shards_in_slabs(sources, out, axis):
             slots = [torch.empty(slot_elems, dtype=out.dtype, pin_memory=pinned)
                      for _ in range(2)]
         except RuntimeError:
-            # Pinned memory could not be had; ordinary host memory makes the
-            # copies wait, which is slower but gives the same values.
+            # Pinned memory is unavailable.  Ordinary host memory makes the
+            # copies wait, which is slower and gives the same values.
             slots = [torch.empty(slot_elems, dtype=out.dtype) for _ in range(2)]
         _copy_through_slots(source2d, dest2d, slots)
 
@@ -338,11 +325,8 @@ class Shards:
                 f"{len(tensors)} shard tensors for {placement.n_devices} devices.")
         self.tensors = list(tensors)
         self.placement = placement
-        # Identity check: each shard must live on its placement's device (a
-        # cheap catch for a shard built or moved onto the wrong device, which
-        # would otherwise surface as a distant cross-device RuntimeError or a
-        # silent host-side slowdown).  Unindexed device forms ('cuda') match
-        # any index of their type; both-indexed forms must agree.
+        # Each shard must live on its placement's device.  An unindexed form such
+        # as 'cuda' matches any index of its type, and two indexed forms must agree.
         for t, d in zip(self.tensors, placement.devices):
             if t.device.type != d.type or (
                     t.device.index is not None and d.index is not None
@@ -384,13 +368,10 @@ class Shards:
             numpy.ndarray: the assembled array on the host.
         """
         first = self.tensors[0]
-        # The sharded axis may be given as a negative number, so resolve it
-        # against the rank before it is used as an index into the shape.
+        # The sharded axis may be negative, so it is resolved against the rank.
         axis = self.placement.axis % first.ndim
-        # The whole array has one shard's shape with the sharded axis grown to
-        # the total the shards cover between them.  Shards may differ in
-        # length on that axis, and a device that owns nothing contributes a
-        # length of zero.
+        # The whole array has one shard's shape with the sharded axis grown to the
+        # total the shards cover.  A device that owns nothing contributes length zero.
         lengths = [int(t.shape[axis]) for t in self.tensors]
         shape = [int(n) for n in first.shape]
         shape[axis] = sum(lengths)
@@ -399,23 +380,19 @@ class Shards:
             raise ValueError(
                 f'The shards cover {shape[axis]} entries of axis {axis}, but '
                 f'their placement says that axis is {axis_len} long.')
-        # The destination is made as a host TENSOR so that each shard can be
-        # copied into it with torch's own copy, which is the fast one.  Its
-        # numpy view at the end shares this same memory -- no copy, and no
-        # translating torch dtypes into numpy dtypes by hand.
+        # The destination is a host tensor, and the numpy view at the end shares
+        # this same memory.
         out = torch.empty(shape, dtype=first.dtype, device='cpu')
-        # Each shard is paired with a VIEW of the finished array covering just
-        # the part it owns, so the copies below write the shard's values
-        # straight to their final position with nothing kept in between.
+        # Each shard is paired with a view of the part of the finished array it
+        # owns, so the copies below write straight to their final position.
         pairs = []
         start = 0
         for tensor, length in zip(self.tensors, lengths):
             block = out.narrow(axis, start, length)
             start += length
             if tuple(tensor.shape) != tuple(block.shape):
-                # Shards that disagree on their other axes do not describe one
-                # array.  Say so, rather than letting the copy below quietly
-                # stretch a too-small shard to fill the block.
+                # Shards that disagree on their other axes do not describe one array,
+                # and without this check the copy below would stretch a small shard.
                 raise ValueError(
                     f'A shard of shape {tuple(tensor.shape)} does not fill the '
                     f'{tuple(block.shape)} block of the whole array it covers.')
@@ -430,18 +407,13 @@ class Shards:
                 try:
                     block.copy_(source)
                 except RuntimeError:
-                    # A block that is not at the very start of the array
-                    # begins at some byte offset into it, and not every
-                    # backend will write to an arbitrary offset: Metal copies
-                    # only at 4-byte boundaries, which a 1- or 2-byte dtype
-                    # can easily fall between.  Bring that shard to the host
-                    # on its own and copy it into place here, where there is
-                    # no such restriction.  This costs one shard-sized
-                    # temporary and is taken only for shards that need it;
-                    # the ordinary 4-byte-and-wider cases never reach it.
+                    # Not every backend writes at an arbitrary byte offset.  Metal
+                    # copies only at 4-byte boundaries, which a 1-byte or 2-byte
+                    # dtype can fall between.  Such a shard comes to the host on its
+                    # own, at the price of one shard-sized temporary.
                     block.copy_(source.cpu())
-        # Shares memory with `out` rather than copying it, and `out` is
-        # contiguous, so this is a C-contiguous host array as promised.
+        # This shares memory with `out` rather than copying it, and `out` is
+        # contiguous, so the result is a C-contiguous host array.
         return out.numpy()
 
 
@@ -474,12 +446,9 @@ def reject_shards(function_name, **arrays):
             'pass the host array.'.format(function_name, ', '.join(divided)))
 
 
-# ── safe transfer ─────────────────────────────────────────────────────────────
-# jax's device_put silently corrupted device-resident transfers on some GPUs
-# (L40S); torch's tensor.to() has no known analog, but the empirical probe is
-# kept as near-free paranoia: we test the actual hardware once per device set
-# instead of assuming, and route through host memory if a copy ever fails to
-# round-trip.
+# A direct device-to-device copy is probed once per device set, and transfers
+# route through host memory when the probe fails.  The probe exists because jax's
+# device_put corrupted device-resident transfers on some GPUs, such as the L40S.
 _warned_host_bounce = False
 
 
@@ -524,15 +493,8 @@ def move_shard(x, target, dev2dev_safe=True):
     return torch.as_tensor(x.detach().cpu().numpy()).to(target)
 
 
-#: How many bytes of one arriving partial the reduce moves at a time.
-#: MEASURED (2026-08-17, 2048-class cone on four H100s): sweeping the slab
-#: from 16 to 256 MiB moved the back projection by 0.8 percent in all, with
-#: 256 MiB best by a small, repeatable margin, so the measured best ships.
-#: The bounds the original reasoning set still hold: the slab stays large
-#: enough that one step's launch and dispatch are negligible beside its copy
-#: and add, and small enough to be a fraction of a production band, which is
-#: gigabytes.  A band smaller than one slab moves in a single piece, which
-#: is exactly what the reduce always did, so nothing changes at small sizes.
+#: How many bytes of one arriving partial the reduce moves at a time.  A band
+#: smaller than one slab moves in a single piece.
 REDUCE_SLAB_BYTES = 256 * 2 ** 20
 
 
@@ -544,8 +506,7 @@ def reduce_slab_rows(num_rows, row_bytes):
     the size the code moves and the size the model charges must not be able
     to drift apart.
     """
-    # Never zero: the answer is a loop step, and a step of zero is an error
-    # even where the range it walks is empty.
+    # The answer is a loop step, so it is never zero.
     if row_bytes <= 0:
         return max(1, int(num_rows))
     return max(1, min(int(num_rows), int(REDUCE_SLAB_BYTES) // int(row_bytes)))
@@ -589,30 +550,24 @@ def sum_band_to_owner(partials, owner, dev2dev_safe=True):
         return move_shard(partials[0], owner, dev2dev_safe=dev2dev_safe)
     total = move_shard(partials[0], owner, dev2dev_safe=dev2dev_safe)
     if total is partials[0]:
-        # The first partial already lives on the owner, so move_shard handed
-        # back the caller's own tensor.  Accumulate into a copy of it rather
-        # than writing through to an array the caller still holds.
+        # move_shard handed back the caller's own tensor, so accumulate into a
+        # copy rather than writing through to an array the caller still holds.
         total = total.clone()
     num_rows = int(total.shape[0])
     row_bytes = (total.numel() // max(1, num_rows)) * total.element_size()
     step = reduce_slab_rows(num_rows, row_bytes)
     for start in range(0, num_rows, step):
         stop = min(start + step, num_rows)
-        # Rows, not slices: a partial is (pixels, slices) with the slices
-        # contiguous, so a block of ROWS is a contiguous piece and each
-        # transfer stays a single flat copy.  Every source's transfer for
-        # this slab is issued BEFORE any of them is consumed, so copies from
-        # different devices still overlap each other the way they did when
-        # whole bands were moved up front.
+        # A partial is (pixels, slices) with the slices contiguous, so a slab of
+        # rows is one contiguous piece and each transfer is a single flat copy.
         slabs = [move_shard(p[start:stop], owner, dev2dev_safe=dev2dev_safe)
                  for p in partials[1:]]
         rows = total[start:stop]
         for slab in slabs:
             rows.add_(slab)
-        # Released here: the next iteration's list comprehension is evaluated
-        # BEFORE `slabs` is rebound, so without this the previous slabs stay
-        # live on the owner through the next slab's transfers, doubling the
-        # very transient this loop exists to bound.
+        # The slabs are released here.  The next iteration's list comprehension is
+        # evaluated before `slabs` is rebound, so without this release the previous
+        # slabs stay live through the next transfers and double the memory in use.
         slabs = None
     return total
 
@@ -662,21 +617,10 @@ def transfer_cylinder_batch(shard_tensors, p0, p1, target, dev2dev_safe=True):
     return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=1)
 
 
-# ── copy streams for the cylinder transfer (CUDA only) ───────────────────────
-# One extra CUDA stream per device, used for nothing but the cylinder
-# transfer's cross-device copies.  A stream runs its work in the order it was
-# given, one item at a time, so copies left on the stream a device projects on
-# can only take turns with those projections however early they are issued --
-# torch issues a cross-device copy on the SOURCE device's current stream and
-# orders the DESTINATION device's current stream behind it, and for the
-# transfer's worker threads both of those are the default stream the device
-# projects on.  A stream of their own is what lets a copy and a projection run
-# at once.
-#
-# Cached per device index and created once, the way projectors.py caches its
-# compiled bodies: the lock is taken only to CREATE a stream, so the worker
-# threads that ask for one every batch find it already there and stay
-# lock-free.
+# One extra CUDA stream per device, used only for the cylinder transfer's
+# cross-device copies.  A stream runs its work one item at a time, so a stream of
+# its own lets a copy and a projection run at the same time.  The streams are
+# created once and cached per device index, and the lock guards only creation.
 _COPY_STREAMS = {}
 _COPY_STREAM_LOCK = threading.Lock()
 
@@ -705,9 +649,9 @@ def copy_stream(device):
 
 
 def _transfer_stream_devices(shard_tensors, target):
-    """The distinct CUDA devices one transfer touches: every shard's device
-    and the target it assembles on.  Ordered by device index so that the
-    nested stream contexts are always entered in the same order."""
+    """Return the distinct CUDA devices one transfer touches, which are every
+    shard's device and the target it assembles on.  They are ordered by device
+    index, so the nested stream contexts are entered in the same order."""
     seen = {}
     for dev in [t.device for t in shard_tensors] + [torch.device(target)]:
         if dev.type == 'cuda':
@@ -765,10 +709,10 @@ def transfer_cylinder_batch_async(shard_tensors, p0, p1, target,
     if stream is None:
         return transfer_cylinder_batch(shard_tensors, p0, p1, target,
                                        dev2dev_safe), None
-    # BOTH ends of every copy have to be on a copy stream: torch issues the
-    # copy on the source's current stream and orders the destination's current
-    # stream behind it, so leaving either end on its default stream would put
-    # the copy straight back in the queue the projections run in.
+    # Both ends of every copy have to be on a copy stream.  Torch issues the copy
+    # on the source's current stream and orders the destination's current stream
+    # behind it, so leaving either end on its default stream puts the copy back in
+    # the queue the projections run in.
     with contextlib.ExitStack() as stack:
         for dev in _transfer_stream_devices(shard_tensors, target):
             stack.enter_context(torch.cuda.stream(copy_stream(dev)))
@@ -776,13 +720,9 @@ def transfer_cylinder_batch_async(shard_tensors, p0, p1, target,
                                            dev2dev_safe)
         ready = torch.cuda.Event()
         ready.record(stream)
-    # The cylinder batch was allocated on the copy stream and is read on the
-    # compute stream.  Without this the caching allocator would be free to hand
-    # its block to the next transfer the moment python drops the name, while
-    # the projection was still reading it.  This covers the arriving pieces
-    # too: they are allocated and concatenated on the one copy stream, and the
-    # only one that ever escapes is the single-shard case, where the piece IS
-    # the cylinder batch returned here.
+    # The cylinder batch is allocated on the copy stream and read on the compute
+    # stream.  Without this the caching allocator could hand its block to the next
+    # transfer while the projection is still reading it.
     cylinder.record_stream(torch.cuda.current_stream(torch.device(target)))
     return cylinder, ready
 
@@ -880,11 +820,10 @@ def exchange_qggmrf_halos(recon_shards, dev2dev_safe=True):
     tensors = recon_shards.tensors
     devs = recon_shards.placement.devices
     n = len(tensors)
-    # A boundary carries a halo only when the shards on both of its sides
-    # hold slices.  A shard with no slices comes last, because the slice axis
-    # is split with the longer blocks first, so no halo ever has to come
-    # from beyond one.
-    joined = [t.shape[1] > 0 and u.shape[1] > 0
+    # A boundary carries a halo only when the shards on both sides hold slices.
+    # A shard with no slices comes last, because the slice axis is split with the
+    # longer blocks first, so no halo comes from beyond such a shard.
+    joined =[t.shape[1] > 0 and u.shape[1] > 0
               for t, u in zip(tensors[:-1], tensors[1:])]
     left = [None] + [move_shard(tensors[i][:, -1].contiguous(), devs[i + 1],
                                 dev2dev_safe) if joined[i] else None

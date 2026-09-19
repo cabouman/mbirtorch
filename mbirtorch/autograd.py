@@ -75,9 +75,7 @@ def forward_project_differentiable(model, volume):
         the projector pair supplies the operator's gradient).
     """
     _require_single_device(model)
-    # The model check above does not cover a divided array built by SOME OTHER
-    # model, which would otherwise reach the move below and fail on a missing
-    # attribute.
+    # The check above does not cover a sharded array built by another model.
     _sharding.reject_shards('forward_project_differentiable', volume=volume)
     volume = volume.to(device=model.torch_device, dtype=torch.float32)
     indices = model.full_indices_device()
@@ -89,7 +87,6 @@ def back_project_differentiable(model, sinogram):
     """Differentiable full-volume back projection (adjoint of the above; the
     same device/dtype normalization and index caching apply)."""
     _require_single_device(model)
-    # As above: a divided array from another model would reach the move below.
     _sharding.reject_shards('back_project_differentiable', sinogram=sinogram)
     recon_shape = model.get_params('recon_shape')
     sinogram = sinogram.to(device=model.torch_device, dtype=torch.float32)

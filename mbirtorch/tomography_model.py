@@ -34,26 +34,14 @@ from .projectors import Projectors, maybe_compile
 
 _F32_EPS = float(np.finfo(np.float32).eps)
 
-# ── the multi-device forward's cylinder transfer ─────────────────────────────
-# Pixels per transferred cylinder batch in the multi-device forward; bounds
-# the cross-device transient.  Set forward_project_pixel_batch on the model to
-# override.
-#
-# 32768 is the measured knee.  The production-scale sweep (2026-08-17, four
-# H100s, 2048-class cone and parallel) read forward busy time falling 11
-# percent from batch 8192 to 16384, 5 more to 32768, and 2 to 3 more to
-# 65536, with the transferred cylinders under 1.5 GiB at the largest batch.
-# The 1024-class sweep read the same direction, so one default serves both.
+# This is the number of pixels in one transferred cylinder batch in the multi-device forward
+# projection.  Setting forward_project_pixel_batch on the model overrides it.
 FORWARD_PIXEL_BATCH = 32768
 
 
-# ── compiled updater glue (module level, one compile per process) ─────────────
-# Fused forms of the per-subset arithmetic.  _apply_update mutates its two
-# state tensors in place but returns them; call sites rebind through the
-# returns.
+# These module level functions hold the fused per-subset arithmetic, so that
+# each one is compiled once per process.
 def _diagonal_update_direction(forward_grad, prior_grad, forward_hess, prior_hess):
-    # The base preconditioned direction, fused so the sums and the divide are
-    # one kernel.
     return -((forward_grad + prior_grad) / (forward_hess + prior_hess))
 
 
@@ -68,26 +56,20 @@ def _forward_lin_quad_const(weighted_error_sinogram, delta_sinogram, fm_constant
 
 
 def _forward_lin_quad_weighted(error_sinogram, delta_sinogram, weights, fm_constant):
-    # weighted_error = weights * error is fused into the reductions here, so no
-    # sinogram-sized weighted-product transient is materialized per subset.
+    # The product of the weights and the error is fused into the reductions, so
+    # no array of sinogram size is created for each subset.
     return (fm_constant * torch.sum(weights * error_sinogram * delta_sinogram),
             fm_constant * torch.sum(delta_sinogram * delta_sinogram * weights))
 
 
 def _apply_update(flat_recon, error_sinogram, pixel_indices, delta_scaled,
                   alpha, delta_sinogram):
-    # In-place state application: recon scatter-add, per-slice sumsq, the error
-    # sinogram FMA, and the ell1 reduction, in one compiled region.  The state
-    # tensors are returned (same storage, no copy) so callers rebind
-    # functionally rather than relying on the side effect.
+    # This updates the reconstruction and the error sinogram in place, in one compiled region.
+    # The state tensors are returned so that callers rebind them rather than use the side effect.
     flat_recon.index_add_(0, pixel_indices, delta_scaled)
     delta_sumsq = torch.sum(delta_scaled * delta_scaled, dim=0)
-    # error -= alpha * delta, with no sinogram-sized temporary: the scaled
-    # subtraction reads the step straight out of the 0-d device tensor the
-    # line search produced, so nothing is materialized and nothing is copied
-    # back to the host.  (The sub_ form's alpha keyword takes a NUMBER, so a
-    # 0-d tensor there would be read with .item() -- a host synchronization
-    # per subset, which this loop is built to avoid.)
+    # This subtracts alpha times delta from the error sinogram.  The addcmul_ form reads alpha from
+    # a zero dimensional device tensor.  The sub_ form would force a host synchronization.
     error_sinogram.addcmul_(delta_sinogram, alpha, value=-1)
     ell1 = torch.sum(torch.abs(delta_scaled))
     return flat_recon, error_sinogram, delta_sumsq, ell1
@@ -134,29 +116,20 @@ def default_devices():
 
 
 def _array_extremes(array):
-    """``(minimum, maximum)`` of ``array``, read where the array already is.
+    """Return the minimum and maximum of ``array``, computed where the array
+    already is.
 
-    The pair answers every question the input checks below ask.  A NaN
-    anywhere propagates into both, so an array holding one cannot report two
-    finite extremes; an infinity of either sign appears in the extreme on its
-    side; and whether an array has a negative value, or is entirely zero, is
-    the pair's to answer directly.  Asking each question separately costs one
-    full pass and one full-length temporary per question, which at a
-    1024-class sinogram was measured at about half a second per pass.
-
-    Both reductions run through torch on the array's own device, so a host
-    array is read across the process's threads rather than on one, and an
-    array already on a device is never pulled back to the host to be checked.
-    A numpy array is wrapped rather than copied.
+    One pass answers every input check below.  A NaN anywhere propagates into
+    both values, and an infinity appears in the extreme on its own side.  Both
+    reductions run through torch, so a numpy array is wrapped rather than
+    copied, and a device array is never brought back to the host.
     """
     if torch.is_tensor(array):
         tensor = array
     else:
         with warnings.catch_warnings():
-            # This function only READS the array.  A read-only host array is
-            # an ordinary input -- a memory-mapped load makes one -- so
-            # torch's not-writable notice would be noise from a check the
-            # caller did not ask about.
+            # This function only reads the array, so torch's warning about a
+            # host array that is not writable does not apply.
             warnings.filterwarnings('ignore', message='.*not writable.*')
             tensor = torch.as_tensor(array)
     return float(tensor.min()), float(tensor.max())
@@ -184,76 +157,61 @@ class TomographyModel(ParameterHandler):
 
     def __init__(self, sinogram_shape, view_batch_size=None,
                  compile_mode='auto', **kwargs):
-        # super().__init__ gives this model a logger of its own, with a console
-        # handler for the messages that happen before a run starts.  The runs
-        # log to that same logger, so everything this model says goes to one
-        # place and one setup governs it.
         super().__init__()
-        # Device state resolves lazily on first use, so inspecting a model or
-        # calling configure_devices first never touches an unchosen device.
+        # The device state resolves on first use, so that inspecting a model or
+        # calling configure_devices never touches a device that was not chosen.
         self._torch_device = None
         self._sino_placement = None
         self._recon_placement = None
         self._projector_functions = None
-        # Views per body call in the batched drivers.  None means the
-        # per-body default, and the driver's transient budget may cap the
-        # realized batch below either.
+        # This is the number of views per call in the batched drivers.  None means the body's
+        # default, and the driver may reduce the batch to stay within its memory budget.
         self.view_batch_size = view_batch_size
-        # torch.compile of the hot chains: 'auto' compiles, 'off' is pure eager.
+        # A compile_mode of 'auto' compiles the main chains with torch.compile,
+        # and 'off' runs them eagerly.
         self.compile_mode = compile_mode
-        # Cached prox initialization, so a Plug-and-Play loop pays
-        # initialize_recon once.
+        # This caches the prox initialization, so that a Plug and Play loop
+        # calls initialize_recon only once.
         self.prox_data = None
-        # Device-layout caches (see _invalidate_device_caches).
         self._dc_damping_cache = None
-        self.dev2dev_safe = True     # probed for real in configure_devices
-        # False once configure_devices is called: an explicit layout is the
-        # caller's, permanently.
+        self.dev2dev_safe = True     # configure_devices probes this.
+        # This becomes False once configure_devices is called.  An explicit
+        # layout belongs to the caller permanently.
         self.device_layout_is_automatic = True
-        # The (sinogram_shape, recon_shape) pair the current automatic layout
-        # was decided from, or None while no automatic decision is in force.
-        # _apply_device_policy compares it against the current shapes on
-        # every call: equal shapes reuse the settled layout without a new
-        # search, and different shapes clear this record and re-decide.
-        # configure_devices clears it too, so a pinned model carries no
-        # settled record.
+        # This records the (sinogram_shape, recon_shape) pair that the current automatic layout
+        # was decided from.  _apply_device_policy decides again when the shapes do not match.
         self._settled_shapes = None
-        # The workload the settled layout's capacity check was made against
-        # ('recon' or 'direct').  A call that allocates more than that check
-        # priced re-runs the check on the settled layout, so a reconstruction
-        # can never reach the allocator with no preflight behind it.
+        # This is the workload, either 'recon' or 'direct', that the settled layout's capacity
+        # check was made against.  A call that allocates more than that check priced runs it again.
         self._settled_workload = None
-        # Device counts the automatic choice turned down, for the run log.
+        # These are the device counts the automatic choice rejected, for the
+        # run log.
         self.device_choice_rejections = []
-        # Speed-floor bookkeeping for the run log (see
-        # _speed_ordered_candidates).
         self._speed_floor_fallback = None
         self._speed_floor_held = None
-        # Memory-preflight knobs; the margin covers what the ledger cannot
-        # see (fragmentation, non-torch CUDA workspaces).  The preflight
-        # runs when the automatic layout is decided, so setting
-        # skip_memory_preflight after that changes nothing until a shape
-        # change re-decides the layout.
+        # The preflight margin covers memory the ledger cannot see, such as fragmentation and
+        # CUDA workspaces outside torch.  The preflight runs when the automatic layout is decided,
+        # so setting skip_memory_preflight later has no effect until the shapes change.
         self.skip_memory_preflight = False
         self.memory_preflight_margin = 0.15
-        # These two exist for a harness to read.  Nothing in the library
-        # reads them back.
+        # These two exist for a test harness to read.  Nothing in the library
+        # reads them.
         self.last_memory_ledger = None
         self.last_memory_calibration = None
-        # The per-device thread pool is owned by _vcd_recon and is None
-        # outside a recon.
+        # _vcd_recon owns the per-device thread pool.  It is None outside a
+        # reconstruction.
         self._per_device_pool = None
 
-        # Insert the geometry's own parameters (e.g. angles, view_params_name)
-        # as new Param entries, then record the sinogram shape.
+        # The geometry's own parameters, such as angles, are added as new Param
+        # entries.
         from ._utils import Param
         for key, val in kwargs.items():
             self.params[key] = Param(val, True)
         self.set_params(no_compile=True, no_warning=True,
                         sinogram_shape=tuple(int(s) for s in sinogram_shape))
 
-        # Construct in this order: geometry-derived defaults (recon_shape,
-        # delta_voxel), then the projectors, then a validity check.
+        # The order matters.  The geometry defaults come first, then the
+        # projectors, then the validity check.
         self.auto_set_recon_geometry(no_compile=True, no_warning=True)
         self.verify_valid_params()
 
@@ -261,9 +219,8 @@ class TomographyModel(ParameterHandler):
     def compile_enabled(self):
         return self.compile_mode != 'off'
 
-    # ── lazily resolved device state ──────────────────────────────────────────
-    # Each of these resolves on first read and is plain-assignable, so
-    # configure_devices and the automatic widening keep setting them directly.
+    # Each device property below resolves on first read and can also be
+    # assigned directly by configure_devices and by the automatic widening.
     @property
     def torch_device(self):
         """The model's lead device, resolved on first use.
@@ -281,8 +238,8 @@ class TomographyModel(ParameterHandler):
     def torch_device(self, value):
         self._torch_device = torch.device(value)
 
-    # Placement source of truth: sino-like arrays shard by VIEW (axis 0),
-    # recon-like arrays by SLICE (the last axis).
+    # Sinogram arrays are sharded by view, which is axis 0.  Reconstruction
+    # arrays are sharded by slice, which is the last axis.
     @property
     def sino_placement(self):
         if self._sino_placement is None:
@@ -348,30 +305,31 @@ class TomographyModel(ParameterHandler):
         raise NotImplementedError
 
     def _view_batch_bodies(self):
-        """The geometry's per-view-batch projection bodies, (forward, back):
-        MODULE-LEVEL pure functions taking parameter VALUES (built by
-        :meth:`_view_batch_args`), never bound methods -- bound methods would
-        pin the model in the module-level compile cache, and parameter reads
-        inside the compiled region would make dynamo trace the parameter
-        machinery.  The driver compiles one instance per device."""
+        """Return the geometry's projection bodies for one view batch, as
+        (forward, back).
+
+        These must be module level functions that take parameter values built
+        by :meth:`_view_batch_args`.  A bound method would hold the model in the
+        module level compile cache, and a parameter read inside the compiled
+        region would make dynamo trace the parameter machinery."""
         raise NotImplementedError(
             f'{type(self).__name__} defines no per-view-batch projection '
             'bodies.')
 
     def _view_batch_args(self):
-        """The eager argument dict for this geometry's bodies: every
-        parameter read happens HERE, outside the traced region, per call --
-        never frozen at build time (the stale-bind lesson)."""
+        """Return the argument dictionary for this geometry's projection
+        bodies.  Every parameter read happens here, outside the traced region,
+        on every call.  The values must not be frozen at build time."""
         raise NotImplementedError
 
     def _transient_cols(self, band_cols):
-        """The column count of this geometry's dominant per-view transient,
-        for the driver's view-batch budget.  The base tracks the runtime
-        band length (single-fan geometries); a two-fan geometry -- one
-        whose slice band projects onto many detector rows, like cone --
-        overrides with its params-derived width.  Geometry-owned because the value is
-        calibrated: changing it silently changes batch sizes, float
-        summation order, and measured peaks."""
+        """Return the column count of this geometry's largest temporary array
+        for one view, which sets the driver's view batch budget.
+
+        The base class returns the band length.  A geometry whose slice band
+        projects onto many detector rows, such as cone beam, overrides this
+        with a width derived from its parameters.  Changing the value changes
+        batch sizes, the order of floating point summation, and peak memory."""
         return band_cols
 
     def recon_direct(self, sinogram, filter_name=None, output_sharded=False):
@@ -517,16 +475,11 @@ class TomographyModel(ParameterHandler):
         from .utilities import merge_log_files
         from .view_utils import slice_viewer
 
-        # Check for nonnegative num_metals
         if num_metal < 0:
             raise ValueError("num_metal must be >= 0")
 
-        # Host input only (API specification).  A tensor is converted at entry,
-        # and an input already placed on the devices is refused.  This driver
-        # works on the host throughout, so a gather here would only leave the
-        # caller's placed copy on the devices for the whole call.  The check
-        # comes before np.asarray, which would build an object array from the
-        # device form rather than fail.
+        # This driver accepts host input only.  The check comes before np.asarray, which would
+        # build an object array from a sharded input rather than fail.
         if (isinstance(sino, _sharding.Shards)
                 or isinstance(weights, _sharding.Shards)):
             raise ValueError(
@@ -541,33 +494,31 @@ class TomographyModel(ParameterHandler):
                 weights = weights.detach().cpu().numpy()
             weights = np.asarray(weights)
 
-        # Use split sino recon for cone beam when the model provides it (it splits on the host so the
-        # full sinogram is never device-resident); otherwise use the standard recon with a device-form
-        # output so the next correction consumes it with no gather/re-upload.
+        # Cone beam uses the split sinogram recon when the model provides it, because that form
+        # splits on the host and never places the full sinogram on the devices.  Other geometries
+        # use the standard recon with a device form output.
         if ('cone' in self.get_params('geometry_type')
                 and type(self).recon_split_sino is not TomographyModel.recon_split_sino):
             recon_function = self.recon_split_sino
         else:
             recon_function = functools.partial(self.recon, output_sharded=True)
 
-        # The output is always a host numpy array (API specification).
+        # The output is always a host numpy array.
         def to_output_form(r):
             return r if isinstance(r, np.ndarray) else self._gather_recon(r)
 
-        # Do a regular recon if num_metal == 0
         if num_metal == 0:
             recon, recon_dict = recon_function(sino, weights=weights, max_iterations=max_iterations,
                                                stop_threshold_change_pct=stop_threshold_change_pct,
                                                logfile_path=logfile_path)
             return to_output_form(recon), recon_dict
 
-        # Continue with beam hardening and segmentation
         if verbose >= 1:
             print("\n************ Perform initial FDK reconstruction  **************")
         recon = self.recon_direct(sino, output_sharded=True)
 
-        # Each BH pass logs to its own temp file; merged into logfile_path afterward
-        # (in finally, so any pass logs written before a failure are preserved).
+        # Each beam hardening pass logs to its own temporary file.  The files are merged in the
+        # finally block, so the logs of the passes that ran before a failure are kept.
         if logfile_path:
             log_path = os.path.expanduser(logfile_path)
             pass_log_paths = [log_path + '.pass{}'.format(i + 1) for i in range(num_BH_iterations)]
@@ -575,18 +526,15 @@ class TomographyModel(ParameterHandler):
             log_path, pass_log_paths = None, [None] * num_BH_iterations
         try:
             for i in range(num_BH_iterations):
-                # Estimate Corrected Sinogram
                 if verbose >= 1:
                     print(f"\n************ Correct sino plastic metal {i + 1}  **************")
                 corrected_sinogram = correct_sino_plastic_metal(self, sino, recon, num_metal=num_metal, order=order, alpha=alpha, beta=beta, gamma=gamma, num_constraint_update_iter=num_constraint_update_iter,
                                                                 radial_margin=radial_margin, top_margin=top_margin, bottom_margin=bottom_margin)
 
-                # Reconstruct Corrected Sinogram
                 if verbose >= 1:
                     print(f"\n************ Perform MBIR reconstruction {i + 1} **************")
-                # The recon entry points validate a user-supplied init_recon as a
-                # host/tensor array, so a sharded recon is gathered first (one
-                # gather per BH pass; the engine builds its own device-form init).
+                # The recon entry points require init_recon to be a host array
+                # or a tensor, so a sharded reconstruction is gathered first.
                 init = (self._gather_recon(recon)
                         if isinstance(recon, _sharding.Shards) else recon)
                 recon, recon_dict = recon_function(corrected_sinogram, weights=weights, init_recon=init,
@@ -605,16 +553,15 @@ class TomographyModel(ParameterHandler):
                                     title=f'Iteration {i + 1}: Comparison of Plastic and Metal Masks')
         finally:
             if log_path:
-                # Each pass closes its own log file when it finishes, but a
-                # pass that failed partway may have left one open, and the
-                # merge below deletes the files it merges.
+                # A pass that failed partway may have left its log file open,
+                # and the merge below deletes the files it merges.
                 self.close_log_file()
                 labels = ['recon_plastic_metal: BH pass {}'.format(i + 1) for i in range(num_BH_iterations)]
                 merge_log_files(log_path, zip(labels, pass_log_paths))
 
         return to_output_form(recon), recon_dict
 
-    # ── projection wrappers (numpy at the public boundary) ────────────────────
+    # ── projection wrappers ───────────────────────────────────────────────────
     def sparse_forward_project(self, voxel_values, pixel_indices):
         """Cylinders at ``pixel_indices`` -> full sinogram.  This is the ONE
         funnel for sparse forward projection: the recon engine, the dense
@@ -641,49 +588,44 @@ class TomographyModel(ParameterHandler):
             sinogram, pixel_indices, coeff_power=coeff_power)
 
     def _band_pool(self, n):
-        """The thread pool for a sharded projection's per-device fan-outs:
-        reuse the recon-loop pool when one is active (_vcd_recon creates it
-        once for the whole loop), else a private pool for this call."""
+        """Return the thread pool for a sharded projection.  This reuses the
+        reconstruction loop's pool when one is active, and otherwise creates a
+        pool for this call alone."""
         if self._per_device_pool is not None:
             return contextlib.nullcontext(self._per_device_pool)
         return _sharding.device_pool(n)
 
     @staticmethod
     def _slice_band_length(slices_per_dev, n_dev, num_pixels, fixed_band=None):
-        """Band length B for streaming the slice axis in the banded back
-        projection.
+        """Return the band length for streaming the slice axis in the banded
+        back projection.
 
-        The default is one band per slice-owner (the whole shard): sub-bands
-        were measured to be slower, and a single device never runs the banded
-        driver.  A smaller B reduces per-band memory; set
-        ``back_project_slice_band`` on the model to opt in.  The result is
-        capped at slices_per_dev so a band never crosses a slice-owner
-        boundary."""
+        The default is one band per device, which holds the whole shard.
+        Smaller bands were measured to be slower, but they use less memory.
+        Setting ``back_project_slice_band`` on the model selects a smaller
+        band.  The result never exceeds slices_per_dev, so a band never crosses
+        a device boundary."""
         b = fixed_band if fixed_band else slices_per_dev
         return min(int(b), slices_per_dev)
 
     def _forward_pixel_batch(self):
-        """How many pixels one transferred cylinder batch covers.
-
-        :data:`FORWARD_PIXEL_BATCH` carries the value and its provenance.
-        ``forward_project_pixel_batch`` on the model overrides it.  The
-        memory ledger calls THIS method rather than re-deriving the number,
-        so a changed default cannot leave the charge behind."""
+        """Return the number of pixels in one transferred cylinder batch.  The
+        default is :data:`FORWARD_PIXEL_BATCH`, and
+        ``forward_project_pixel_batch`` on the model overrides it.  The memory
+        ledger calls this method rather than compute the number itself."""
         fixed = getattr(self, 'forward_project_pixel_batch', None)
         return max(1, int(fixed)) if fixed else FORWARD_PIXEL_BATCH
 
     @staticmethod
     def _balanced_slice_bounds(extent, band_len):
-        """Tile ``[0, extent)`` into balanced bands no longer than
-        ``band_len``: the fewest bands, lengths as equal as possible
-        (differing by at most 1), non-overlapping -- no slice is ever
-        recomputed.  An extent that is not positive gives no bands at all,
-        so a caller's loop over the result runs zero times."""
+        """Split ``[0, extent)`` into the fewest bands no longer than
+        ``band_len``.  The bands do not overlap, and their lengths differ by at
+        most one.  An extent that is not positive gives no bands."""
         if extent <= 0:
-            # A shard with no slices arrives here with a band length of 0 as
-            # well, so the ceil division below would divide by zero.
+            # A shard with no slices also has a band length of 0, so the
+            # division below would divide by zero.
             return []
-        num_bands = -(-extent // band_len)            # ceil division
+        num_bands = -(-extent // band_len)            # Ceiling division.
         base, rem = divmod(extent, num_bands)
         bounds, start = [], 0
         for k in range(num_bands):
@@ -700,11 +642,8 @@ class TomographyModel(ParameterHandler):
             raise NotImplementedError(
                 f'{type(self).__name__} has no per-view-batch projection '
                 'bodies, so the multi-device drivers cannot run.')
-        # Half-open (start, end) view spans and slice-band ranges, in device
-        # order.  A span can be empty: with more devices than views, or more
-        # devices than slices, the trailing devices own nothing on that axis
-        # (the sparse-view and thin-volume extensions), and the drivers below
-        # check for that.
+        # These are half open view spans and slice band ranges, in device order.  A span can be
+        # empty, because with more devices than views or slices the trailing devices own nothing.
         view_spans = [span for _d, span in sp.shard_ranges()]
         band_ranges = rp.shard_ranges()
         idx_per_dev = [torch.as_tensor(pixel_indices, dtype=torch.int64).to(d)
@@ -712,11 +651,9 @@ class TomographyModel(ParameterHandler):
         return sp, rp, view_spans, band_ranges, idx_per_dev
 
     def _sparse_forward_project_sharded(self, voxel_shards, pixel_indices):
-        """The sharded forward.  A trivial placement is the plain driver,
-        wrapped; a multi-device placement is the cylinder transfer in
-        :meth:`_sparse_forward_project_cylinders`.  This method stays the one
-        entry point to the multi-device forward, so a caller and the speed
-        guard both have a single name to refer to."""
+        """Run the sharded forward projection.  A single device placement calls
+        the plain driver.  A multi-device placement calls
+        :meth:`_sparse_forward_project_cylinders`."""
         if voxel_shards.placement.is_trivial:
             return _sharding.Shards(
                 [self.projector_functions._sparse_forward_project_single_device(
@@ -726,28 +663,24 @@ class TomographyModel(ParameterHandler):
                                                       pixel_indices)
 
     def _sparse_forward_project_cylinders(self, voxel_shards, pixel_indices):
-        """The multi-device forward as a pixel-batched cylinder transfer: each
-        view-owner walks the pixel axis in batches, collects each batch's
-        full-height cylinders from every slice-owner, and makes ONE projector
-        call per batch over its own views and the whole slice range.  This is
-        the multi-device forward on all four projection geometries; it was
-        measured faster than the slice-banded walk it replaced on each of them
-        in turn (H100, 2026-08-10 through 2026-08-17, records in the plans
-        repository).  The operator is unchanged, so the forward stays the
-        adjoint of the sharded back, and the back driver is untouched.  The
-        pixel batch bounds the cross-device transfer, and the memory ledger
-        charges it (CYLINDER_TRANSFER_RESIDENTS)."""
+        """Run the multi-device forward projection as a cylinder transfer in
+        pixel batches.
+
+        Each device that owns views walks the pixel axis in batches.  For each
+        batch it collects the full height cylinders from every device that owns
+        slices, then makes one projector call over its own views and the whole
+        slice range.  The pixel batch size bounds the transfer between devices,
+        and the memory ledger charges for it."""
         sp, rp, view_spans, _band_ranges, idx_per = self._banded_setup(
             pixel_indices)
         pf = self.projector_functions
         num_channels = int(self.get_params('sinogram_shape')[2])
-        # Block height per call.  A row-aligned body sizes its output by the
-        # transferred cylinders, which span the whole slice axis; a two-fan
-        # body returns the detector rows.
+        # This is the block height per call.  A row aligned body sizes its output by the
+        # transferred cylinders, which span the whole slice axis.  A two fan body returns rows.
         num_rows = (int(rp.axis_len) if self.rows_track_slices
                     else int(self.get_params('sinogram_shape')[1]))
         num_pixels = int(idx_per[0].shape[0])
-        shards = voxel_shards.tensors        # in device = global slice order
+        shards = voxel_shards.tensors        # Device order is global slice order.
         pixel_batch = self._forward_pixel_batch()
         batch_bounds = [(p0, min(p0 + pixel_batch, num_pixels))
                         for p0 in range(0, num_pixels, pixel_batch)]
@@ -755,8 +688,7 @@ class TomographyModel(ParameterHandler):
         def worker(i, dev):
             v0, v1 = view_spans[i]
             if v1 <= v0:
-                # A view-owner with no views (the sparse-view extension)
-                # produces an empty block, which assembles as pure zeros.
+                # A device that owns no views produces an empty block.
                 return torch.zeros((0, num_rows, num_channels),
                                    dtype=voxel_shards.dtype, device=dev)
             local_idx = idx_per[i]
@@ -767,25 +699,17 @@ class TomographyModel(ParameterHandler):
                 return _sharding.transfer_cylinder_batch_async(
                     shards, p0, p1, dev, self.dev2dev_safe)
 
-            # The batch after the one being projected, transferred ahead of
-            # it.  A pass of one batch has nothing to transfer ahead, and no
-            # pixels at all leaves this empty.
+            # This holds the batch transferred ahead of the one being
+            # projected.
             ahead = transfer(0) if batch_bounds else None
             for k, (p0, p1) in enumerate(batch_bounds):
                 full_cyl, ready = ahead
-                # The next batch's transfer is issued before this batch is
-                # projected.  The copies run on separate per-device streams,
-                # so they move while this projection runs.  Each batch
-                # carries an event, and the wait below keeps a projection
-                # from starting before its batch's copies finish.  Off CUDA
-                # the transfer is synchronous and the wait does nothing.
+                # The next batch's transfer is issued before this batch is projected, on separate
+                # streams.  The wait below keeps a projection from starting before its copies land.
                 ahead = transfer(k + 1) if k + 1 < len(batch_bounds) else None
                 _sharding.wait_for_cylinder_batch(dev, ready)
-                # The first batch's projection allocates the owner's block.
-                # Later batches add into that block inside the projector's
-                # view loop, which saves a full-block allocation and pass per
-                # batch.  The summands and their order are unchanged, so the
-                # result is bit for bit the same.
+                # The first batch allocates the block.  Later batches add into that block
+                # inside the projector's view loop, which saves one allocation per batch.
                 if owned is None:
                     owned = pf.sparse_forward_project_view_range(
                         full_cyl, local_idx[p0:p1], (v0, v1), slice_start=0,
@@ -794,20 +718,17 @@ class TomographyModel(ParameterHandler):
                     pf.sparse_forward_project_view_range(
                         full_cyl, local_idx[p0:p1], (v0, v1), slice_start=0,
                         dev_index=i, accumulate_into=owned)
-                # The cylinder batch is released once its projection is
-                # issued.  The next batch is already resident, which is the
-                # third set of cylinders the memory ledger charges.
+                # The cylinder batch is released once its projection is issued.
                 full_cyl = None
             if owned is None:
-                # No pixels at all: the owner still owes its views' block, and
-                # a block with no voxels behind it is zero everywhere.
+                # With no pixels the device still owes a block for its views,
+                # and that block is zero everywhere.
                 owned = torch.zeros((v1 - v0, num_rows, num_channels),
                                     dtype=voxel_shards.dtype, device=dev)
             return owned
 
-        # One fan-out covers the whole call: the pixel loop inside the worker
-        # issues each device's transfers from the thread that consumes them.
-        # Both slice-owners and view-owners get their copy streams ordered.
+        # One fan out covers the whole call, so the pixel loop inside the worker issues each
+        # device's transfers from the thread that consumes them.
         transfer_devices = (list(voxel_shards.placement.devices)
                             + list(sp.devices))
         _sharding.open_copy_streams(transfer_devices)
@@ -816,18 +737,18 @@ class TomographyModel(ParameterHandler):
                 tensors = _sharding.run_per_device(sp.devices, worker,
                                                    executor=pool)
         finally:
-            # Closed even if a worker raised: copies that were already issued
-            # are still in flight, and the shards they read must not be
-            # overwritten under them.
+            # The streams are closed even when a worker raises, because copies
+            # already issued are still running and read the shards.
             _sharding.close_copy_streams(transfer_devices)
         return _sharding.Shards(tensors, sp)
 
     def _sparse_back_project_sharded(self, sino_shards, pixel_indices,
                                      coeff_power=1):
-        """The banded sharded back (the forward's adjoint): every view-owner
-        back-projects its views onto each slice band (a PARTIAL (P, L) each),
-        and the partials sum onto the band's slice-owner.  A trivial
-        placement is the plain driver, wrapped."""
+        """Run the banded sharded back projection, which is the adjoint of the
+        forward projection.  Every device that owns views back projects them
+        onto each slice band, and the partial results are summed onto the
+        device that owns that band.  A single device placement calls the plain
+        driver."""
         if sino_shards.placement.is_trivial:
             return _sharding.Shards(
                 [self.projector_functions._sparse_back_project_single_device(
@@ -842,16 +763,14 @@ class TomographyModel(ParameterHandler):
         fixed_band = getattr(self, 'back_project_slice_band', None)
         with self._band_pool(sp.n_devices) as pool:
             for oi, (odev, (s0, s1)) in enumerate(band_ranges):
-                # Stream the owner's band in sub-bands: each view-owner
-                # partial and the owner's reduce gather are band-sized.  An
-                # owner with no slices yields no sub-bands at all.
+                # The band is streamed in sub-bands, so each partial result and
+                # each gather is the size of a sub-band.
                 band_len = self._slice_band_length(
                     s1 - s0, sp.n_devices, num_pixels, fixed_band)
                 owner_parts = []
                 for (l0, l1) in self._balanced_slice_bounds(s1 - s0, band_len):
-                    # A view-owner with no views (sparse-view extension)
-                    # contributes nothing: skip its projector call and drop
-                    # it from the band reduce.
+                    # A device that owns no views contributes nothing, so its
+                    # projector call is skipped and it is dropped from the sum.
                     if aligned:
                         partials = _sharding.run_per_device(
                             sp.devices,
@@ -879,14 +798,12 @@ class TomographyModel(ParameterHandler):
                     owner_parts.append(_sharding.sum_band_to_owner(
                         [p for p in partials if p is not None], odev,
                         self.dev2dev_safe))
-                    # This release must come before the next band's
-                    # run_per_device call.  Without it, this band's partial
-                    # stays live on every device through the next projection.
+                    # This release must come before the next band's run_per_device call.
+                    # Without it, this band's partial result stays on every device.
                     partials = None
                 if not owner_parts:
-                    # An owner with no slices produced no bands, so there is
-                    # nothing to concatenate.  No part exists to take a dtype
-                    # and a device from, so both are named here.
+                    # A device that owns no slices produced no bands, so the
+                    # dtype and the device are named explicitly here.
                     recon_tensors.append(torch.zeros(
                         (num_pixels, 0), dtype=sino_shards.dtype, device=odev))
                 else:
@@ -953,14 +870,13 @@ class TomographyModel(ParameterHandler):
             self.create_projectors()
 
     def _check_no_empty_shard(self):
-        """Refuse a device layout that would leave a device idle on BOTH
-        axes.  A device with views but no slices, or slices but no views, is
-        legal: sparse views and thin volumes still give it work.  A device
-        with neither would do nothing, so that layout is refused.
+        """Raise an error for a device layout that would leave a device with no
+        views and no slices.
 
-        A device owns nothing on an axis only when the device count exceeds
-        that axis length, so the rule is exactly a device count above both
-        the view count and the slice count."""
+        A device with views but no slices, or slices but no views, still has
+        work to do and is allowed.  A device owns nothing on an axis only when
+        the device count exceeds that axis length, so the rule is a device
+        count above both the view count and the slice count."""
         sp, rp = self.sino_placement, self.recon_placement
         if sp.axis_len is None or rp.axis_len is None:
             return
@@ -973,8 +889,8 @@ class TomographyModel(ParameterHandler):
                 f'geometry.')
 
     def _invalidate_device_caches(self):
-        """Drop every cache keyed to the device layout or geometry, so no
-        consumer can bind stale device-resident state."""
+        """Drop every cache that depends on the device layout or the geometry,
+        so that no consumer reads out of date device state."""
         self.prox_data = None
         self._dc_damping_cache = None
 
@@ -1049,13 +965,9 @@ class TomographyModel(ParameterHandler):
                 "copies another model's device list, and devices= names one "
                 'directly.  Pass whichever one expresses the intent.')
         self.device_layout_is_automatic = False
-        # An earlier automatic settle may have left rejected counts behind.
-        # They explain a search this layout did not come from, so the run log
-        # must not carry them into a run the caller placed by hand.
+        # The rejected counts and the settled record belong to the automatic search.  An
+        # explicit layout did not come from that search, so they are cleared here.
         self.device_choice_rejections = []
-        # The settled record is likewise the automatic path's; a pinned model
-        # must not carry one.  The explicit branch never reads it, so this
-        # keeps the two states consistent rather than changing behavior.
         self._settled_shapes = None
         self._settled_workload = None
         if like is not None:
@@ -1074,17 +986,12 @@ class TomographyModel(ParameterHandler):
         self._install_device_layout(devices)
 
     def _devices_like(self, other):
-        """The device list of ``other``, checked as a model this model's
-        recon-like arrays can be exchanged with: the body of
-        ``configure_devices(like=...)``.
+        """Return the device list of ``other``, after checking that this model
+        can exchange reconstruction arrays with it.
 
-        The check is the point of the method.  Copying a device list is easy;
-        what is easy to get wrong is building the second model at the wrong
-        shape -- typically a denoiser built at a CT model's SINOGRAM shape
-        instead of its recon shape -- and then discovering it only once an
-        array fails to place, or worse, places into blocks that do not line
-        up.  The slice count is what the recon-like arrays are divided by, so
-        that is what has to agree.
+        The check catches a second model built at the wrong shape, such as a
+        denoiser built at a CT model's sinogram shape instead of its
+        reconstruction shape.
         """
         placement = getattr(other, 'recon_placement', None)
         other_get_params = getattr(other, 'get_params', None)
@@ -1116,9 +1023,9 @@ class TomographyModel(ParameterHandler):
         return list(placement.devices)
 
     def _install_device_layout(self, devices):
-        """Rebuild the placements over ``devices``: the shared body of
-        :meth:`configure_devices` and the automatic choice.  Carries no
-        policy; does not touch ``device_layout_is_automatic``."""
+        """Rebuild the placements over ``devices``.  Both
+        :meth:`configure_devices` and the automatic choice call this.  It does
+        not change ``device_layout_is_automatic``."""
         devices = [torch.device(d) for d in devices]
         self.torch_device = devices[0]
         sinogram_shape, recon_shape = self.get_params(['sinogram_shape', 'recon_shape'])
@@ -1127,8 +1034,8 @@ class TomographyModel(ParameterHandler):
         self.recon_placement = _sharding.Placement(
             devices, axis=-1, axis_len=int(recon_shape[2]))
         self._check_no_empty_shard()
-        # One empirical probe per configuration (the L40S device_put lesson):
-        # route transfers through host memory if a direct copy ever corrupts.
+        # This probes whether a direct copy between devices is correct on this
+        # hardware.  When it is not, transfers go through host memory.
         self.dev2dev_safe = _sharding.is_dev2dev_safe(devices)
         self._invalidate_device_caches()
         if self._projector_functions is not None:
@@ -1137,9 +1044,9 @@ class TomographyModel(ParameterHandler):
     # ── the memory ledger and the automatic device count ──────────────────────
     def _build_memory_ledger(self, devices=None, workload='recon',
                              **call_arrays):
-        """The modeled per-device peak for one candidate device list; None
-        means the current placement.  Device-agnostic, so the rule can be
-        tested on CPU.  ``workload`` can be used to specify the function: `recon_direct` vs `recon`.
+        """Return the modeled peak memory per device for one candidate device
+        list.  A value of None for ``devices`` means the current placement.
+        The argument ``workload`` names the call, either 'recon' or 'direct'.
         """
 
         devices = list(self.sino_placement.devices if devices is None
@@ -1152,10 +1059,9 @@ class TomographyModel(ParameterHandler):
         return [torch.device(f'cuda:{i}') for i in range(num_devices)]
 
     def _shape_pair(self):
-        """The (sinogram_shape, recon_shape) tuple pair the automatic policy
-        records at settle time and compares on every later call.  These two
-        shapes are what the memory ledger's plan is built from, so a change
-        in either invalidates a settled decision."""
+        """Return the (sinogram_shape, recon_shape) pair.  The automatic policy
+        records this pair when it settles and compares it on every later call.
+        The memory ledger's plan is built from these two shapes."""
         sinogram_shape, recon_shape = self.get_params(['sinogram_shape',
                                                        'recon_shape'])
         return tuple(sinogram_shape), tuple(recon_shape)
@@ -1164,36 +1070,25 @@ class TomographyModel(ParameterHandler):
         """Settle the device layout for the reconstruction about to run, and
         return the ledger for the layout settled on.
 
-        ``workload`` names the call in progress: ``'recon'`` (the default) for
-        a full reconstruction, ``'direct'`` for a direct reconstruction, and
+        ``workload`` names the call in progress.  It is ``'recon'`` for a full
+        reconstruction, ``'direct'`` for a direct reconstruction, and
         ``'denoise'`` for one QGGMRFDenoiser sweep.  It tells the ledger what
-        is about to be allocated; it is not a way for a caller to overrule the
-        policy.
+        is about to be allocated.
 
-        This is the one site where the automatic device count is chosen.
-        The choice happens at recon time, not construction, because the
-        free-memory reading is only current here.  The choice is made once
-        per model: later calls return the same layout, and the search runs
-        again only when the model's sinogram or reconstruction shape
-        changes.  On the unpinned branch
-        the candidate ORDER comes from the widening speed floors
-        (:meth:`_speed_ordered_candidates`), and capacity still wins when
-        nothing admitted fits.  Explicit layouts and process-wide pins skip
-        the floors.  recon_split_sino's halves arrive here and choose for
-        themselves at their own sinogram size.
+        This is the only place where the automatic device count is chosen.  The
+        choice happens when a reconstruction starts, because the free memory
+        reading is current only then.  The choice is made once per model, and
+        the search runs again only when the sinogram or reconstruction shape
+        changes.  The widening speed floors set the order in which candidate
+        counts are tried, and capacity wins when no admitted count fits.
         """
         calibrating = _memory_ledger.calibration_enabled()
-        # The workload a candidate layout is SIZED for is the largest one this
-        # model may ever run, not the call in progress: the count chosen here
-        # is kept for the model's whole life.  For every projection model that
-        # is a full reconstruction.  A QGGMRFDenoiser can never run one -- its
-        # recon raises NotImplementedError -- so the denoise sweep itself is
-        # its largest workload, and pricing a recon plan on it would raise as
-        # well, since it has no projection bodies to price.
+        # A candidate layout is sized for the largest workload this model may ever run.  That is a
+        # full reconstruction, except on a QGGMRFDenoiser, which can only denoise.
         sizing = 'denoise' if workload == 'denoise' else 'recon'
         if not self.device_layout_is_automatic:
-            # An explicit layout is the caller's; the ledger runs only when
-            # the calibration mode asks for it.
+            # The ledger runs on an explicit layout only when calibration asks
+            # for it.
             ledger = self._build_memory_ledger(workload=sizing,
                                                **call_arrays) \
                 if calibrating else None
@@ -1203,57 +1098,45 @@ class TomographyModel(ParameterHandler):
             if self._settled_shapes == self._shape_pair():
                 if _memory_ledger.workload_covers(self._settled_workload,
                                                   workload):
-                    # The automatic choice for these shapes is settled and the
-                    # settled check already covers this call: reuse the layout
-                    # without a search, as the pinned branch above reuses an
-                    # explicit one.  The ledger runs only for the calibration
-                    # mode, and it prices the sizing workload -- a full
-                    # reconstruction for a projection model, the denoise sweep
-                    # for a denoiser -- because that is the scope the measured
-                    # peak covers.
+                    # The settled check already covers this call, so the layout
+                    # is reused without a search.
                     ledger = self._build_memory_ledger(workload=sizing,
                                                        **call_arrays) \
                         if calibrating else None
                     return self._arm_calibration(ledger, sizing)
-                # This call allocates more than the settled check priced, so
-                # the check runs again -- on the settled layout, which does
-                # not move.
+                # This call allocates more than the settled check priced, so the check runs
+                # again on the settled layout, which does not move.
                 ledger = self._check_settled_capacity(workload, call_arrays)
-                # It passed, so the record now names the workload the layout
-                # is known to hold, and a later call of the same kind repeats
-                # no check: the preflight stays a once-per-model cost.
+                # The check passed, so the record now names the workload the layout is known
+                # to hold, and a later call of the same kind repeats no check.
                 self._settled_workload = workload
                 return self._arm_calibration(ledger, sizing)
-            # The shapes changed, so the settled decision's inputs are gone:
-            # drop the record and re-decide below.
+            # The shapes changed, so the settled decision is dropped and the
+            # layout is decided again below.
             self._settled_shapes = None
             self._settled_workload = None
 
         pinned = _memory_ledger.pinned_device_count()
         visible = torch.cuda.device_count() if torch.cuda.is_available() else 0
         if visible < 2:
-            # No layout to choose; the allocator's own error covers a
-            # single-device overflow, and the n=1 path stays free of new cost.
+            # There is no layout to choose.  The allocator's own error covers
+            # an overflow on a single device.
             return self._arm_calibration(None, sizing)
 
         if pinned is not None:
-            # A process-wide pin is as explicit as a configure_devices call.
-            # The pinned count is not searched, not reduced, and not subject
-            # to the speed floors.
+            # A pin that applies to the whole process is as explicit as a
+            # configure_devices call, so the count is used as given.
             candidates, held = [min(pinned, visible)], {}
         else:
             candidates, held = self._speed_ordered_candidates(visible)
 
         rejected, best = [], None
         self._speed_floor_fallback = None
-        # _settle names every wider held count in the run log once the
-        # chosen count is known.
         self._speed_floor_held = held
         for count in candidates:
             if count in held:
                 # Admitted counts come first, so reaching a held count means
-                # capacity is about to override the speed rule.  If the loop
-                # settles on this count, _settle rewrites the note.
+                # capacity is about to override the speed rule.
                 held_note, taken_note = held[count]
                 rejected.append((count, held_note))
                 self._speed_floor_fallback = (count, taken_note)
@@ -1262,14 +1145,13 @@ class TomographyModel(ParameterHandler):
             if not self._layout_is_valid(devices):
                 rejected.append((count, 'a device would own no real data'))
                 continue
-            # Priced at the sizing workload whatever this call is: the count
-            # chosen here has to suit the largest workload the model may later
-            # run, which is a full recon for a projection model and the
-            # denoise sweep for a denoiser.
+            # The price is taken at the sizing workload, whatever this call is, because the
+            # count chosen here has to suit the largest workload the model may later run.
             ledger = self._build_memory_ledger(devices=devices,
                                                workload=sizing, **call_arrays)
             if ledger is None or self.skip_memory_preflight:
-                # Nothing to check against, or the caller has forced the run.
+                # There is nothing to check against, or the caller has forced
+                # the run.
                 return self._settle(devices, ledger, rejected, sizing)
             fits, rows = self._layout_capacity(devices, ledger, call_arrays)
             if fits:
@@ -1280,15 +1162,8 @@ class TomographyModel(ParameterHandler):
                 best = (shortfall, ledger, rows, count)
 
         if workload != sizing and best is not None:
-            # No count fits the sizing workload, and this call is not running
-            # one.  The check that can refuse is made against the work in
-            # progress, in the same candidate order, so the count is still the
-            # one the floors and capacity prefer.  Only what it is checked
-            # against changes.  The shortfall reported below then describes the
-            # check that actually refused, so the search starts its record
-            # over.  When the call in progress IS the sizing plan -- a denoise
-            # -- the first pass already checked the work in progress, so there
-            # is nothing narrower to retry and a refusal is final.
+            # No count fits the sizing workload, and this call is not running one.  The candidates
+            # are tried again in the same order, priced against the call in progress instead.
             best = None
             for count in candidates:
                 devices = (self._candidate_devices(count) if count > 1
@@ -1300,12 +1175,8 @@ class TomographyModel(ParameterHandler):
                 fits, rows = self._layout_capacity(devices, ledger,
                                                    call_arrays)
                 if fits:
-                    # The first pass recorded this count as refused, priced
-                    # for a recon this call is not running, and the device
-                    # line must not call the count in use rejected.  A
-                    # speed-floor note pending for the same count goes with
-                    # it: both explain this choice, and the note below names
-                    # the rule that admitted the count.
+                    # The first pass recorded this count as refused, priced for a
+                    # reconstruction this call is not running.  That record is removed.
                     self._speed_floor_fallback = None
                     rejected = [(c, why) for c, why in rejected
                                 if c != count]
@@ -1318,9 +1189,8 @@ class TomographyModel(ParameterHandler):
                 if best is None or shortfall < best[0]:
                     best = (shortfall, ledger, rows, count)
 
-        # Nothing fits, including a single device.  The answer to "which
-        # count" is "none", so fail here with the dominant phase named rather
-        # than launch a reconstruction that is known not to fit.
+        # No device count fits, including a single device.  The call fails here
+        # rather than start a reconstruction that is known not to fit.
         if best is None:
             raise _memory_ledger.MemoryPreflightError(
                 'no device layout is valid for this geometry: '
@@ -1332,13 +1202,12 @@ class TomographyModel(ParameterHandler):
                 closest_count=count, remedies=self._memory_remedies()))
 
     def _speed_ordered_candidates(self, visible):
-        """The unpinned automatic branch's candidate order, and the notes for
-        the counts the widening speed floors hold back.
+        """Return the order in which to try candidate device counts, along with
+        the notes for the counts the widening speed floors hold back.
 
-        The floors REORDER, never remove: admitted counts largest-first,
-        then held counts largest-first.  Capacity therefore always wins, and
-        ``skip_memory_preflight`` (which settles on the first candidate)
-        leaves the floors in force.
+        The floors reorder the counts and never remove one.  Admitted counts
+        come first, largest first, then the held counts, also largest first.
+        Capacity therefore always wins.
 
         Returns:
             (list, dict): candidate counts in the order to try them, and
@@ -1350,8 +1219,6 @@ class TomographyModel(ParameterHandler):
         elements = _widening_floors.sinogram_elements(
             self.get_params('sinogram_shape'))
         family = self._floor_family
-        # Debt and substitution are both said out loud rather than inferred
-        # from a count that came out smaller than expected.
         note = _widening_floors.stale_note()
         if note is not None:
             self.logger.info('Note: ' + note + '.')
@@ -1368,8 +1235,7 @@ class TomographyModel(ParameterHandler):
             else:
                 held[count] = (why, _widening_floors.fallback_reason(
                     family, count, elements))
-        # A count of 1 is always admitted, so `admitted` is never empty and a
-        # held count always has something ahead of it.
+        # A count of 1 is always admitted, so the admitted list is never empty.
         return admitted + list(held), held
 
     def _memory_remedies(self):
@@ -1382,18 +1248,16 @@ class TomographyModel(ParameterHandler):
         return []
 
     def _layout_is_valid(self, devices):
-        """Whether ``devices`` passes the empty-shard rule, without mutating
-        anything: the same rule :meth:`_check_no_empty_shard` applies,
-        evaluated on a candidate device count."""
+        """Return True when ``devices`` passes the rule that
+        :meth:`_check_no_empty_shard` applies.  Nothing is changed."""
         sinogram_shape, recon_shape = self.get_params(['sinogram_shape',
                                                        'recon_shape'])
         return len(devices) <= max(int(sinogram_shape[0]), int(recon_shape[2]))
 
     def _layout_capacity(self, devices, ledger, call_arrays):
-        """Whether ``ledger``'s modeled peak fits ``devices``, and the rows to
-        report it with.  The one place a budget reading is compared with a
-        modeled demand, so the search, the narrower second pass and the
-        settled re-check all ask the question the same way."""
+        """Return whether the modeled peak in ``ledger`` fits ``devices``,
+        along with the rows used to report it.  This is the only place where a
+        memory budget is compared with a modeled demand."""
         budgets = [_memory_ledger.device_budget_bytes(d) for d in devices]
         credits = _memory_ledger.resident_credits(
             devices, list(call_arrays.values()))
@@ -1401,22 +1265,15 @@ class TomographyModel(ParameterHandler):
             ledger, budgets, credits, margin=self.memory_preflight_margin)
 
     def _fits_available_devices(self, workload='recon', **call_arrays):
-        """Whether the modeled peak for ``workload`` fits any device layout
-        this model could run on, answered without changing anything.
+        """Return whether the modeled peak for ``workload`` fits any device
+        layout this model could run on.  Nothing is changed and no memory is
+        allocated, so a caller can price a model it is about to discard.
 
-        This asks the capacity question :meth:`_apply_device_policy` asks,
-        priced from the same plan and compared the same way, but it settles no
-        layout, records nothing on the model, and allocates no reconstruction.
-        A caller can therefore price a model it is about to throw away -- a
-        candidate whose shape it is still choosing -- and discard it.
-
-        The candidate device lists are the ones the policy would try: the
-        configured devices when the caller fixed them, otherwise the pinned
-        count, otherwise every count up to the number of visible devices.
-        Order does not matter to a yes-or-no answer, so the widening speed
-        floors, which only reorder, are not consulted.  A device with no
-        readable budget (anything other than CUDA) holds whatever it is asked
-        to hold, which is how the policy treats it too.
+        The candidate device lists are the ones the policy would try.  The
+        order does not matter to a yes or no answer, so the widening speed
+        floors are not consulted.  A device with no readable memory budget,
+        meaning anything other than CUDA, is treated as holding whatever it is
+        asked to hold.
 
         Returns:
             bool: True when some candidate layout holds the modeled peak.
@@ -1451,18 +1308,16 @@ class TomographyModel(ParameterHandler):
         return False
 
     def _check_settled_capacity(self, workload, call_arrays):
-        """Run the capacity check for ``workload`` on the layout already
-        settled, and return the ledger it priced.
+        """Run the capacity check for ``workload`` on the settled layout, and
+        return the ledger it priced.
 
-        The layout does not move here: the model has settled and a caller may
-        be holding shards of it.  What this can do is refuse, which is the
-        point.  A model that settled under a direct reconstruction was checked
-        against what that reconstruction allocates, so without this a later
-        ``recon`` would reach the allocator with none of the preflight's
-        message and remedies behind it.
+        The layout does not change, because a caller may be holding shards of
+        it.  This check can refuse the call.  Without it, a model that settled
+        under a direct reconstruction would reach the allocator on a later full
+        reconstruction with no preflight message or remedies.
         """
         if self.skip_memory_preflight:
-            # The caller has forced the run, here as in the search.
+            # The caller has forced the run.
             return None
         devices = list(self.sino_placement.devices)
         ledger = self._build_memory_ledger(devices=devices, workload=workload,
@@ -1483,16 +1338,14 @@ class TomographyModel(ParameterHandler):
         ``workload`` is the plan ``ledger`` was priced with, which is the
         workload the settled layout has been checked for."""
         chosen, current = len(devices), self.sino_placement.n_devices
-        # A note recorded when the search reached a held count is replaced
-        # if that count was settled on: capacity went past the floor.
+        # When the search settled on a held count, capacity overrode the speed
+        # floor, so the note recorded for that count is replaced.
         fallback = getattr(self, '_speed_floor_fallback', None)
         if fallback is not None and fallback[0] == chosen:
             rejected = [fallback if count == chosen else (count, why)
                         for count, why in rejected]
-        # Every wider count the floors held back is named here, because the
-        # loop usually never reaches them and idle GPUs need explaining.  A
-        # held count smaller than the chosen one was outranked, not
-        # excluded, so it carries no entry.
+        # Every larger count the floors held back is named in the log, so that
+        # idle GPUs are explained.
         held = getattr(self, '_speed_floor_held', None) or {}
         rejected = list(rejected)
         already = {count for count, _why in rejected}
@@ -1501,44 +1354,27 @@ class TomographyModel(ParameterHandler):
                 rejected.append((count, held[count][0]))
         self._speed_floor_fallback = None
         self._speed_floor_held = None
-        # Kept for the run log's device line, which explains any GPUs the
-        # automatic choice left idle (see ParameterHandler._device_report).
+        # The run log's device line reads this to explain any idle GPUs.
         self.device_choice_rejections = list(rejected)
         if chosen != current:
             self.logger.info(
                 f'Using {chosen} CUDA device(s) for this reconstruction '
                 f'(was {current}).  configure_devices(num_devices=n) pins it.')
             self._install_device_layout(devices)
-            # The ledger priced the layout we just installed, but the view
-            # batch it charged came from the same candidate count, so it
-            # stays valid.
         if rejected and self.get_params('verbose') >= 2:
             for count, why in rejected:
                 self.logger.debug(f'  device count {count} rejected: {why}')
-        # Record the shapes this decision came from.  While they hold, later
-        # policy calls reuse the layout instead of re-deciding; a shape
-        # change clears the record (see _apply_device_policy).  The workload
-        # beside them is the one the capacity check was made against, so a
-        # later call that allocates more re-runs that check.
+        # These are the shapes this decision came from.  While they hold, later policy calls
+        # reuse the layout.  The workload recorded beside them is what the capacity check used.
         self._settled_shapes = self._shape_pair()
         self._settled_workload = workload
         return self._arm_calibration(ledger, workload)
 
     def _arm_calibration(self, ledger, workload='recon'):
-        """Record the ledger for a harness to read; under the calibration
-        mode, build one when the caller had none, so a policy return always
-        carries a ledger to compare against.
-
-        ``workload`` is the plan to build that missing ledger with: a
-        denoiser has no projection bodies, so a recon plan on one would raise
-        rather than price anything.
-
-        The peak-counter reset the calibration mode compares against lives in
-        :meth:`_vcd_recon`, beside the report that reads the counters.  A
-        reset here would run on every policy return, and the nested return
-        inside a reconstruction (_vcd_recon -> recon_direct -> policy) would
-        clear the peak after the sinogram and weights were already placed,
-        under-measuring the run."""
+        """Record the ledger for a test harness to read.  Under the calibration
+        mode, build one when the caller had none, so that a policy return
+        always carries a ledger.  The argument ``workload`` names the plan to
+        build that missing ledger with."""
         if ledger is not None:
             self.last_memory_ledger = ledger
         if _memory_ledger.calibration_enabled() and ledger is None:
@@ -1546,15 +1382,12 @@ class TomographyModel(ParameterHandler):
             self.last_memory_ledger = ledger
         return ledger
 
-    # ── array placement (entry) and gathering (exit) ──────────────────────────
-    # Every sinogram-like placement routes through _shard_sinogram, every
-    # recon-like one through _shard_recon; the exits route through the
-    # matching gathers.  Multi-device support changes these four functions
-    # alone.
+    # Every sinogram array is placed by _shard_sinogram and every reconstruction array by
+    # _shard_recon.  The matching gather functions bring them back to the host.
     def _shard_sinogram(self, sinogram):
-        """Place a sinogram-like array (sinogram or weights) in its device
-        form: float32 on the model device, view axis checked, and
-        view-sharded on a multi-device placement."""
+        """Place a sinogram or a weights array in its device form.  The result
+        is float32, its view axis is checked, and on a multi-device placement
+        it is sharded by view."""
         num_views = self.get_params('sinogram_shape')[0]
         if isinstance(sinogram, _sharding.Shards):
             if sinogram.placement != self.sino_placement:
@@ -1575,18 +1408,16 @@ class TomographyModel(ParameterHandler):
         return self._split_to_shards(sinogram, self.sino_placement, num_views,
                                      what='sinogram (view axis)')
 
-    # Whether detector row r ties to recon slice r 1:1 (parallel beam:
-    # True).  False is the base so a geometry that forgets to declare
-    # itself is never mis-assembled by the row-aligned fast path.
+    # This is True when detector row r corresponds to reconstruction slice r, as it does in
+    # parallel beam.  The base value is False, so a geometry must declare the row aligned path.
     rows_track_slices = False
 
-    # The fewest pixels this geometry's COMPILED bodies may be called with;
-    # narrower calls are padded up outside the compiled region (see
-    # projectors.forward_at_min_pixel_width).
+    # This is the fewest pixels the compiled projection bodies may be called
+    # with.  Narrower calls are padded outside the compiled region.
     min_compiled_pixel_width = 1
 
-    # Which measured widening-floor set governs the automatic device count
-    # (see _widening_floors).  None means the parallel floors.
+    # This names the set of measured widening floors that governs the automatic
+    # device count.  None means the parallel beam floors.
     _floor_family = None
 
     def prepare_sino_for_devices(self, sinogram, weights=None):
@@ -1626,11 +1457,8 @@ class TomographyModel(ParameterHandler):
             The prepared sinogram, or a (sinogram, weights) tuple when weights
             were given.
         """
-        # Settle before the sinogram is placed.  Placing first would put the
-        # whole sinogram on the lead device and then need it moved again.
-        # The layout is still sized for a full reconstruction; naming the
-        # workload here only changes what the check that can refuse is made
-        # against when no device count fits a full reconstruction.
+        # The layout is settled before the sinogram is placed.  Placing first would put the
+        # whole sinogram on the lead device and then move it again.
         self._apply_device_policy(workload='direct')
         sino = self._shard_sinogram(sinogram)
         if weights is None:
@@ -1638,24 +1466,15 @@ class TomographyModel(ParameterHandler):
         return sino, self._shard_sinogram(weights)
 
     def _shard_recon(self, recon):
-        """Place a recon-like array (3-D, or flat (num_pixels, num_slices))
-        in its device form: float32 on the model device, slice axis (the
-        LAST axis) checked, slice-sharded on a multi-device placement."""
+        """Place a reconstruction array in its device form.  The array is
+        either three dimensional or flat with shape (num_pixels, num_slices).
+        The result is float32, its slice axis is checked, and on a
+        multi-device placement it is sharded by slice."""
         num_slices = self.get_params('recon_shape')[2]
         if isinstance(recon, _sharding.Shards):
-            # Placements compare by value, so shards produced by ANOTHER model
-            # on the same devices with the same slice count are accepted here.
-            # That is the handoff a Plug-and-Play loop makes between a
-            # reconstruction model and a denoiser (see
-            # :meth:`configure_devices` and its ``like=`` argument).
-            #
-            # No whole-volume shape check belongs here: sparse_forward_project
-            # sends pixel SUBSETS through this method, whose shards are
-            # (subset_pixels, local_slices), so a check demanding the full
-            # rows * cols would refuse a legitimate call.  The whole-volume
-            # contract is checked where it actually holds -- on the prox input
-            # in :meth:`_vcd_recon`, and on the two recon shapes in
-            # :meth:`configure_devices`.
+            # Placements compare by value, so shards made by another model on the same
+            # devices with the same slice count are accepted.  No check of the whole volume shape
+            # belongs here, because sparse_forward_project sends subsets of the pixels through it.
             if recon.placement != self.recon_placement:
                 raise ValueError(
                     'Recon shards belong to a different device '
@@ -1675,10 +1494,9 @@ class TomographyModel(ParameterHandler):
                                      what='reconstruction (slice axis)')
 
     def _split_to_shards(self, x, placement, axis_len, what='array'):
-        """Split an array into per-device shard tensors (the n>1 body of
-        _shard_sinogram / _shard_recon): each device gets its contiguous
-        block of the sharded axis.  The blocks differ in length by at most
-        one, and a device count above the axis length leaves the trailing
+        """Split an array into one shard tensor per device.  Each device gets a
+        contiguous block of the sharded axis.  The blocks differ in length by
+        at most one.  A device count above the axis length leaves the trailing
         devices with empty blocks."""
         x = torch.as_tensor(x, dtype=torch.float32)
         axis = placement.axis % x.ndim
@@ -1712,9 +1530,8 @@ class TomographyModel(ParameterHandler):
         return out
 
     def _constant_recon(self, value):
-        """A constant-valued recon in the device form, for either
-        state layout (built per shard so no full volume lands on one
-        device)."""
+        """Return a reconstruction of constant value in the device form.  It is
+        built one shard at a time, so no full volume lands on one device."""
         recon_shape = self.get_params('recon_shape')
         if self.recon_placement.is_trivial:
             recon = torch.full(tuple(recon_shape), float(value),
@@ -1729,16 +1546,15 @@ class TomographyModel(ParameterHandler):
 
     def _initial_error_state(self, sinogram, init_recon, weights,
                              constant_weights, scale_recon_to_sinogram):
-        """The initial (error_sinogram, init_recon) pair: forward-project the
-        init, find the optimal scale alpha (applied only to the default
-        direct-recon init), and scale both -- for either state layout."""
+        """Return the initial (error_sinogram, init_recon) pair.  The initial
+        reconstruction is forward projected, the optimal scale alpha is found,
+        and both arrays are scaled by it."""
         self.logger.info('Initializing error sinogram')
         fwd = self.forward_project(init_recon, output_sharded=True)
         if isinstance(fwd, _sharding.Shards):
             def dots_worker(i, d):
-                # Both sums are reduced a block of views at a time, so the
-                # shard never holds a weighted projection or a whole array of
-                # products.  See _memory_ledger.weighted_dot.
+                # Both sums are reduced one block of views at a time, so the shard never
+                # holds a weighted projection or a full array of products.
                 f = fwd.tensors[i]
                 w = None if constant_weights else weights.tensors[i]
                 return (float(_memory_ledger.weighted_square_sum(f, w)),
@@ -1751,27 +1567,22 @@ class TomographyModel(ParameterHandler):
                 alpha = sum(b for _, b in dots) / wtd_err_sino_norm
             else:
                 alpha = 1
-            # The error is formed IN the projection's own shards: scaling a
-            # shard by -alpha and adding the sinogram into it gives exactly
-            # the values of sinogram - alpha * fwd, since a - b and a + (-b)
-            # round identically, and it allocates nothing.  Nothing else
-            # reads fwd, so the buffer is free to become the error sinogram.
+            # The error is formed in the projection's own shards.  Scaling a shard by minus alpha
+            # and adding the sinogram gives sinogram - alpha * fwd, and allocates nothing.
             error_sinogram = _sharding.Shards(
                 _sharding.run_per_device(
                     self.sino_placement.devices,
                     lambda i, d: fwd.tensors[i].mul_(-alpha).add_(
                         sinogram.tensors[i])),
                 self.sino_placement)
-            # The projection's shards ARE the error sinogram now, so dropping
+            # The projection's shards now hold the error sinogram, so dropping
             # this name releases only the container.
             fwd = None
             init_recon = _sharding.Shards(
                 [alpha * t for t in init_recon.tensors], self.recon_placement)
         else:
-            # Reduced a block of views at a time, as in the sharded branch
-            # above: no weighted projection and no whole array of products is
-            # built, and holding those made this function the measured peak of
-            # a weighted reconstruction.
+            # The reduction runs one block of views at a time, as in the
+            # sharded branch above.
             w = None if constant_weights else weights
             wtd_err_sino_norm = _memory_ledger.weighted_square_sum(fwd, w)
             if wtd_err_sino_norm > 0 and scale_recon_to_sinogram:
@@ -1779,22 +1590,20 @@ class TomographyModel(ParameterHandler):
                          / wtd_err_sino_norm).item()
             else:
                 alpha = 1
-            # Formed in the projection's own buffer, as in the sharded branch
-            # above: scaling by -alpha and adding the sinogram is the same
-            # arithmetic as sinogram - alpha * fwd, with nothing allocated.
+            # The error is formed in the projection's own buffer, as in the
+            # sharded branch above.
             error_sinogram = fwd.mul_(-alpha).add_(sinogram)
             fwd = None
             init_recon = alpha * init_recon
         return error_sinogram, init_recon
 
     def _flatten_recon(self, recon):
-        """The VCD loop's flat (num_pixels, slices) recon layout, placed via
-        _shard_recon and made contiguous for the in-place row updates --
-        for either state layout."""
+        """Return the reconstruction in the VCD loop's flat
+        (num_pixels, slices) layout, made contiguous for the in place row
+        updates."""
         if isinstance(recon, _sharding.Shards):
-            # The row count is named rather than inferred: a shard that owns
-            # no slices has no elements, and reshape cannot infer a row count
-            # from an empty tensor whose column count is also zero.
+            # The row count is named rather than inferred, because reshape
+            # cannot infer it from a shard that owns no slices.
             flat = _sharding.Shards(
                 [t.reshape((math.prod(t.shape[:-1]), t.shape[-1])).contiguous()
                  for t in recon.tensors], recon.placement)
@@ -1804,23 +1613,14 @@ class TomographyModel(ParameterHandler):
         return flat
 
     def _flatten_prox_shards(self, prox_input, recon_shape):
-        """A prox input that is ALREADY in the device form, brought into the
-        VCD loop's flat (num_pixels, local_slices) layout.
+        """Bring a prox input that is already in the device form into the VCD
+        loop's flat (num_pixels, local_slices) layout, without going through
+        host memory.
 
-        This is the return leg of a Plug-and-Play loop: ``denoise(...,
-        output_sharded=True)`` hands back one 3-D tensor per device, and this
-        turns them into the loop's flat shards with no trip through host
-        memory.  Each SHARD is reshaped rather than the container, which has
-        no shape of its own, and the pixel count is named rather than inferred
-        because a shard that owns no slices has no elements to infer it from.
-
-        The whole-volume contract is checked here, where it holds: the shards
-        together have to cover the full pixel grid and the full slice axis.
-        (``_shard_recon`` cannot check that, because pixel SUBSETS route
-        through it as well.)  Both per-shard forms are accepted: the 3-D
-        ``(rows, cols, local_slices)`` one a denoise returns, and the
-        already-flat ``(num_pixels, local_slices)`` one.  A shard that owns no
-        slices is legal and contributes zero to the slice total.
+        The shards together must cover the full pixel grid and the full slice
+        axis, and that is checked here.  Each shard is either three dimensional
+        with shape (rows, cols, local_slices) or already flat with shape
+        (num_pixels, local_slices).  A shard that owns no slices is allowed.
         """
         rows, cols, num_slices = (int(recon_shape[0]), int(recon_shape[1]),
                                   int(recon_shape[2]))
@@ -1846,29 +1646,20 @@ class TomographyModel(ParameterHandler):
                 'local_slices), with the local slice counts summing to '
                 f'{num_slices}.  Got shapes '
                 f'{[tuple(t.shape) for t in tensors]} for prox_input.')
-        # Re-placed through _shard_recon so the placement check runs: shards
-        # from a model on a different device layout are refused here rather
-        # than surfacing later as a cross-device error.
+        # The result goes through _shard_recon so that the placement check runs, and shards from
+        # a model on a different device layout are refused here rather than later.
         return self._shard_recon(_sharding.Shards(
             [t.reshape(num_pixels, t.shape[-1]) for t in tensors],
             prox_input.placement))
 
     def _check_sinogram_shards(self, sinogram, sinogram_shape):
-        """Check that a sinogram ALREADY in the device form describes the
-        model's whole sinogram.
+        """Check that a sinogram already in the device form covers the model's
+        whole sinogram.
 
-        This is the sinogram counterpart of :meth:`_flatten_prox_shards`'s
-        whole-volume check, for a sinogram that came from
-        :meth:`prepare_sino_for_devices` and can therefore be handed straight
-        to a reconstruction.  The container has no shape of its own, so the
-        per-shard tensors are checked instead: the view axis is the sharded
-        one, so each shard holds a block of views together with every detector
-        row and channel, and the blocks' view counts add up to the sinogram's.
-        A shard that owns no views is legal and contributes zero to the total.
-
-        Only the shapes are checked here.  Which devices the shards are on is
-        checked in :meth:`_shard_sinogram`, where every sinogram-like array
-        enters, so it is not repeated.
+        Each shard must hold a block of views together with every detector row
+        and channel, and the view counts must add up to the model's view count.
+        A shard that owns no views is allowed.  Only the shapes are checked
+        here, because :meth:`_shard_sinogram` checks the devices.
         """
         views, rows, channels = (int(sinogram_shape[0]), int(sinogram_shape[1]),
                                  int(sinogram_shape[2]))
@@ -1889,8 +1680,8 @@ class TomographyModel(ParameterHandler):
                 f'{[tuple(t.shape) for t in tensors]}.')
 
     def _flatten_hessian(self, fm_hessian):
-        """The Hessian diagonal in the VCD loop's flat layout, for either
-        state layout (read-only in the loop, so no contiguity forcing)."""
+        """Return the Hessian diagonal in the VCD loop's flat layout.  The loop
+        only reads it, so it is not made contiguous."""
         if isinstance(fm_hessian, _sharding.Shards):
             flat = _sharding.Shards(
                 [t.reshape((math.prod(t.shape[:-1]), t.shape[-1]))
@@ -1900,8 +1691,8 @@ class TomographyModel(ParameterHandler):
         return flat
 
     def _recon_from_flat(self, flat_recon, recon_shape):
-        """The 3-D recon from the VCD loop's flat layout, keeping each
-        array's OWN slice count, for either state layout."""
+        """Return the three dimensional reconstruction from the VCD loop's flat
+        layout.  Each array keeps its own slice count."""
         if isinstance(flat_recon, _sharding.Shards):
             recon = _sharding.Shards(
                 [t.reshape(tuple(recon_shape[:2]) + (t.shape[-1],))
@@ -1915,10 +1706,10 @@ class TomographyModel(ParameterHandler):
         return shards.gather()
 
     def _as_shards(self, x, placement):
-        """The uniform per-device container view of a device-form array: a
-        plain tensor wraps as a one-shard container ALIASING it (in-place
-        updates reach the caller's array); Shards pass through.
-        Representation only -- the placement functions own validation."""
+        """Return a device form array as a Shards container.  A plain tensor is
+        wrapped in a one shard container that aliases it, so in place updates
+        reach the caller's array.  A Shards container passes through.  Nothing
+        is validated here."""
         if isinstance(x, _sharding.Shards):
             shards = x
         else:
@@ -1926,9 +1717,9 @@ class TomographyModel(ParameterHandler):
         return shards
 
     def _as_device_form(self, x):
-        """The inverse of :meth:`_as_shards`: a trivial one-shard container
-        unwraps to its (aliased) tensor; a genuinely per-device state stays
-        Shards (collapsing it would take a gather)."""
+        """Invert :meth:`_as_shards`.  A one shard container unwraps to the
+        tensor it aliases.  A container that really spans devices is returned
+        unchanged, because collapsing it would require a gather."""
         if isinstance(x, _sharding.Shards) and x.placement.is_trivial:
             out = x.tensors[0]
         else:
@@ -1936,7 +1727,7 @@ class TomographyModel(ParameterHandler):
         return out
 
     def _sino_ones_device_form(self, sino_like=None):
-        """All-ones sinogram in the device form, one block of ones per
+        """Return a sinogram of all ones in the device form, with one block per
         device.  ``sino_like`` supplies only the dtype."""
         dtype = torch.float32 if sino_like is None else sino_like.dtype
         if self.sino_placement.is_trivial:
@@ -1971,9 +1762,8 @@ class TomographyModel(ParameterHandler):
         recon = self._shard_recon(recon)
         indices = self.full_indices_device()
         if isinstance(recon, _sharding.Shards):
-            # The row count is named rather than inferred: a shard that owns
-            # no slices has no elements, and reshape cannot infer a row count
-            # from an empty tensor whose column count is also zero.
+            # The row count is named rather than inferred, because reshape
+            # cannot infer it from a shard that owns no slices.
             num_pixels = int(recon_shape[0]) * int(recon_shape[1])
             flat = _sharding.Shards(
                 [t.reshape(num_pixels, t.shape[-1])[indices.to(t.device)]
@@ -2088,8 +1878,8 @@ class TomographyModel(ParameterHandler):
             raise IndexError(f'view_index {view_index!r} is outside '
                              f'[0, {num_views}).')
         view_params = np.asarray(self.get_params(self.get_params('view_params_name')))[indices]
-        # The computation is float64 on the host: it is a small geometric
-        # query, and a device transfer would cost more than the arithmetic.
+        # The computation runs in float64 on the host, because a device
+        # transfer would cost more than this small amount of arithmetic.
         row, channel = self._project_points_batch(
             torch.as_tensor(points, dtype=torch.float64),
             torch.as_tensor(view_params, dtype=torch.float64))
@@ -2144,17 +1934,11 @@ class TomographyModel(ParameterHandler):
             memory check again and raises ``MemoryPreflightError``, rather
             than reusing a layout that was never checked for it.
         """
-        # Settle before the full sinogram of weights and the full volume are
-        # built.  Both are sized by the model, so on an unsettled model they
-        # would land whole on the lead device.  The layout is still sized for
-        # a full reconstruction; naming the workload here only changes what
-        # the check that can refuse is made against when no device count fits
-        # a full reconstruction.
+        # The layout is settled before the full array of weights and the full volume are built.
+        # Otherwise they would land whole on the lead device.
         self._apply_device_policy(workload='direct')
         sinogram_shape, recon_shape = self.get_params(['sinogram_shape', 'recon_shape'])
         if weights is None:
-            # Unit weights built through the device-form seam, for either
-            # layout.
             weights = self._sino_ones_device_form()
         elif (not isinstance(weights, _sharding.Shards)
               and tuple(weights.shape) != tuple(sinogram_shape)):
@@ -2173,11 +1957,9 @@ class TomographyModel(ParameterHandler):
                                       device=self.torch_device)
         hessian = self.sparse_back_project(weights, indices, coeff_power=2)
 
-        # The dense back projection IS the flat volume, so it reshapes.  A
-        # masked one returns only its own rows, so it scatters into a
-        # zero-filled volume first.  An explicit index set always scatters,
-        # even at full length: assuming a given set is the identity
-        # permutation would silently mis-place a reordered one.
+        # A dense back projection is already the flat volume, so it is reshaped.  A masked one
+        # returns only its own rows, so it is scattered into a volume of zeros.  An explicit
+        # index set is always scattered, because a reordered set is not the identity permutation.
         def to_volume(cylinders, device):
             if dense:
                 return cylinders.reshape((recon_shape[0], recon_shape[1],
@@ -2209,9 +1991,8 @@ class TomographyModel(ParameterHandler):
         """
         if isinstance(recon, _sharding.Shards):
             recon_shape = self.get_params('recon_shape')
-            # The row count is named rather than inferred: a shard that owns no
-            # slices has no elements, and reshape cannot infer a row count from
-            # an empty tensor whose column count is also zero.
+            # The row count is named rather than inferred, because reshape
+            # cannot infer it from a shard that owns no slices.
             num_pixels = int(recon_shape[0]) * int(recon_shape[1])
             indices = torch.as_tensor(indices, dtype=torch.int64)
             return _sharding.Shards(
@@ -2219,7 +2000,7 @@ class TomographyModel(ParameterHandler):
                  for t in recon.tensors], recon.placement)
         return recon.reshape((-1, recon.shape[-1]))[indices]
 
-    # ── auto-regularization (verbatim-math numpy ports) ───────────────────────
+    # ── auto-regularization ───────────────────────────────────────────────────
     def auto_set_regularization_params(self, sinogram, weights=None):
         """
         Automatically set the regularization parameters (sigma_y, sigma_x,
@@ -2228,14 +2009,15 @@ class TomographyModel(ParameterHandler):
         ``auto_regularize_flag`` is True.  The statistics run on the host,
         on a view subsample.
         """
-        # Host-side statistics: accept tensors (any device) or numpy.
+        # The statistics run on the host, so a tensor on any device is copied
+        # there first.
         if torch.is_tensor(sinogram):
             sinogram = sinogram.cpu().numpy()
         if torch.is_tensor(weights):
             weights = weights.cpu().numpy()
         if self.get_params('auto_regularize_flag'):
-            # Estimate the regularization stats from a view subsample (see
-            # subsample_views) -- both cheap and independent of sinogram size.
+            # The statistics are estimated from a subsample of the views, which
+            # costs the same at any sinogram size.
             small_sinogram = self.subsample_views(sinogram)
             small_weights = 1 if weights is None else self.subsample_views(weights)
 
@@ -2255,10 +2037,8 @@ class TomographyModel(ParameterHandler):
         """Warn if the sinogram support (the indicator from
         :meth:`_get_sino_indicator`) reaches the detector's edge channels."""
         if np.all(sino_indicator):
-            # An all-ones indicator is either the undeterminable-background
-            # fallback (which has already warned on its own) or support
-            # genuinely everywhere -- indistinguishable here, so skip rather
-            # than risk a spurious warning on the fallback.
+            # An indicator of all ones means either that the background could not be determined,
+            # which has already warned, or that the support really covers everything.
             return
         edge_frac = float(np.mean(np.logical_or(sino_indicator[:, :, 0],
                                                 sino_indicator[:, :, -1])))
@@ -2283,22 +2063,17 @@ class TomographyModel(ParameterHandler):
         magnification = self.get_magnification()
         delta_voxel, delta_det_channel = self.get_params(['delta_voxel', 'delta_det_channel'])
 
-        # Compute RMS value of sinogram excluding empty space
+        # This is the root mean square of the sinogram over its support.
         signal_rms = float(np.average(weights * np.asarray(sinogram) ** 2, None,
                                       sino_indicator) ** 0.5)
 
-        # Convert snr to relative noise standard deviation
         rel_noise_std = 10 ** (-snr_db / 20)
 
-        # This section adjusts the regularization when the reconstruction
-        # resolution is greater or less than normal.  For normal resolution,
-        # pixel_pitch_relative_to_default = 1.0; low resolution >> 1.0; high
-        # resolution << 1.0.  The default pixel pitch is the detector pixel
-        # pitch in the recon plane given the magnification.
+        # The regularization is adjusted when the reconstruction resolution differs from the
+        # default.  The default pixel pitch is the detector pitch scaled by the magnification.
         default_pixel_pitch = delta_det_channel / magnification
         pixel_pitch_relative_to_default = delta_voxel / default_pixel_pitch
 
-        # Compute sigma_y and scale by relative pixel pitch
         sigma_y = np.float32(rel_noise_std * signal_rms *
                              (pixel_pitch_relative_to_default ** 0.5))
         self.set_params(no_warning=True, sigma_y=float(sigma_y), auto_regularize_flag=True)
@@ -2307,8 +2082,8 @@ class TomographyModel(ParameterHandler):
         """Set sigma_x (the qGGMRF prior scale) from the estimated recon
         standard deviation."""
         sharpness = self.get_params('sharpness')
-        # Compute sigma_x as a fraction of the typical recon value.
-        # 0.2 is an empirically determined constant.
+        # This is a fraction of the typical reconstruction value.  The constant
+        # 0.2 was determined empirically.
         sigma_x = np.float32(0.2 * (2 ** sharpness) * recon_std)
         self.set_params(no_warning=True, sigma_x=float(sigma_x), auto_regularize_flag=True)
 
@@ -2316,8 +2091,8 @@ class TomographyModel(ParameterHandler):
         """Set sigma_prox (the proximal map prior scale) from the estimated
         recon standard deviation."""
         sharpness = self.get_params('sharpness')
-        # Compute sigma_prox as a fraction of the typical recon value.
-        # 0.2 is an empirically determined constant.
+        # This is a fraction of the typical reconstruction value.  The constant
+        # 0.2 was determined empirically.
         sigma_prox = np.float32(0.2 * (2 ** sharpness) * recon_std)
         self.set_params(no_warning=True, sigma_prox=float(sigma_prox),
                         auto_regularize_flag=True)
@@ -2366,8 +2141,8 @@ class TomographyModel(ParameterHandler):
             for tensor, (_dev, (start, _end)) in zip(
                     array.tensors, placement.shard_ranges(num_views)):
                 block = tensor[(-start) % step_size::step_size]
-                # Made dense on the shard's own device so that the copy
-                # crossing to the host carries only the sampled views.
+                # The block is made contiguous on the shard's own device, so
+                # that the copy to the host carries only the sampled views.
                 blocks.append(block.detach().contiguous().cpu().numpy())
             return np.concatenate(blocks, axis=0)
         num_views = array.shape[0]
@@ -2377,20 +2152,19 @@ class TomographyModel(ParameterHandler):
 
     @staticmethod
     def _get_sino_indicator(sinogram, verbose=1):
-        """Compute an int8 mask marking the region of sinogram support, the
-        same shape as the input.  This runs several host-side reductions, so
-        it is typically called on a view subsample."""
-        # Sometimes users accidentally create complex sinograms when they take
-        # the -log.  So we check for complex numbers or NaNs and raise an error.
+        """Return an int8 mask of the sinogram support, with the same shape as
+        the input.  This runs several reductions on the host, so it is usually
+        called on a subsample of the views."""
+        # Taking the negative logarithm of a sinogram can produce complex
+        # values, so the input is checked for complex values and for NaN.
         sinogram = np.asarray(sinogram)
         if np.iscomplexobj(sinogram):
             raise TypeError("sinogram must be real-valued; got complex dtype.")
         if not np.isfinite(sinogram).all():
             raise ValueError("sinogram contains NaN and/or Inf values.")
 
-        # Compute an initial threshold that results in a non-empty region that
-        # contains no background: the background cluster's right boundary plus
-        # one cluster width of safety.
+        # The initial threshold is the right boundary of the background cluster
+        # plus one cluster width.
         left, right = vcd_utils.estimate_background_cluster_boundaries(sinogram)
         threshold = right + (right - left)
 
@@ -2406,8 +2180,8 @@ class TomographyModel(ParameterHandler):
                               'regularization.\n')
             return np.ones_like(sinogram, dtype=np.int8)
 
-        # Compute a final threshold that is a fraction of the median of the
-        # object region.
+        # The final threshold is a fraction of the median over the object
+        # region.
         object_level = 0.25
         object_median = np.median(sinogram[sinogram >= threshold])
         object_threshold = object_level * object_median
@@ -2415,43 +2189,41 @@ class TomographyModel(ParameterHandler):
 
     def _get_estimate_of_recon_std(self, sinogram, sino_indicator):
         """Estimate the standard deviation of the reconstruction from the
-        (typically view-subsampled) sinogram and its support indicator.  The
-        estimate scales sigma_x and sigma_prox."""
+        sinogram and its support indicator.  The result scales sigma_x and
+        sigma_prox."""
         delta_det_channel = self.get_params('delta_det_channel')
         delta_voxel = self.get_params('delta_voxel')
         recon_shape = self.get_params('recon_shape')
         magnification = self.get_magnification()
         num_det_channels = sinogram.shape[-1]
 
-        # Compute the typical magnitude of a sinogram value
+        # This is the typical magnitude of a sinogram value.
         typical_sinogram_value = np.average(np.abs(sinogram), weights=sino_indicator)
 
-        # Compute a typical projection path length based on the soft minimum of
-        # the recon width and height
+        # This path length estimate comes from the reconstruction width and
+        # height.
         typical_path_length_space = (2 * recon_shape[0] * recon_shape[1]) / (
                 recon_shape[0] + recon_shape[1]) * delta_voxel
 
-        # Compute a typical projection path length based on the detector column width
+        # This path length estimate comes from the detector width.
         typical_path_length_sino = num_det_channels * delta_det_channel / magnification
 
-        # Compute a typical projection path as the minimum of the two estimates
         typical_path_length = np.minimum(typical_path_length_space, typical_path_length_sino)
 
-        # Compute a typical recon value by dividing the average sinogram value by
-        # a typical projection path length
+        # The typical reconstruction value is the typical sinogram value
+        # divided by the typical path length.
         return typical_sinogram_value / typical_path_length
 
     # ── direct recon (FBP) machinery ──────────────────────────────────────────
     def _apply_direct_recon_filter(self, sinogram, filter_name, filter_scale,
                                    output_sharded=False, row_weight=None):
-        """Shared FBP row-filter for direct reconstruction.
+        """Apply the filtered backprojection row filter for a direct
+        reconstruction.
 
-        The filter is scaled by ``filter_scale * pi / num_views``, folded into
-        the (tiny) filter array rather than applied as a full-sinogram
-        multiply (which would promote f32 -> f64 and about double peak
-        memory).  The pi / num_views factor assumes equally spaced views over
-        the full angular range; for nonuniform, limited-angle, or short scans
-        a standalone direct recon is only approximate -- prefer ``recon()``.
+        The scale factor ``filter_scale * pi / num_views`` is folded into the
+        small filter array rather than multiplied into the whole sinogram.  The
+        factor pi divided by num_views assumes views equally spaced over the
+        full angular range.
 
         Args:
             sinogram: (num_views, num_rows, num_channels); numpy or tensor.
@@ -2470,8 +2242,8 @@ class TomographyModel(ParameterHandler):
             num_channels, filter_name=filter_name)
         recon_filter = recon_filter * np.float32(filter_scale * (np.pi / num_views))
         if isinstance(sinogram, _sharding.Shards):
-            # The row filter is per detector row, so each view-shard filters
-            # locally (one thread per device; no cross-device data).
+            # The filter acts on each detector row on its own, so each shard
+            # filters its own views with no data from other devices.
             def filter_worker(i, d):
                 ft = torch.as_tensor(recon_filter, device=d)
                 rw = None if row_weight is None else row_weight.to(d)
@@ -2486,7 +2258,7 @@ class TomographyModel(ParameterHandler):
                                                          row_weight=row_weight)
         return filtered if output_sharded else self._gather_sinogram(filtered)
 
-    # ── loss / stats (mirrors get_forward_model_loss + _vcd_iteration_stats) ──
+    # ── loss and per-iteration statistics ─────────────────────────────────────
     @staticmethod
     def get_forward_model_loss(error_sinogram, sigma_y, weights=None, normalize=True):
         """
@@ -2504,27 +2276,23 @@ class TomographyModel(ParameterHandler):
         Returns:
             The loss as a device scalar tensor.
         """
-        # The sums below run on one array on one device.  Summing a divided
-        # array would take a cross-device reduction and a choice of where the
-        # scalar lands, so the divided form is refused here instead.
+        # The sums below run on one array on one device, so a sharded array is
+        # refused here.
         _sharding.reject_shards('get_forward_model_loss',
                                 error_sinogram=error_sinogram, weights=weights)
         if weights is None:
             weights = 1
             avg_weight = 1
         elif np.ndim(weights) == 0:
-            # A true scalar (python or 0-d): the average weight is itself.
+            # For a scalar the average weight is the scalar itself.
             avg_weight = weights
         else:
-            # Array-likes (numpy included -- a numpy array is not a torch
-            # tensor, and a tensor-only test would route it to the scalar
-            # branch, returning a sinogram-shaped 'loss').
+            # This branch takes any array, including a numpy array, which is
+            # not a torch tensor.
             weights = torch.as_tensor(weights, dtype=torch.float32,
                                       device=error_sinogram.device)
             avg_weight = torch.mean(weights)
-        # Chunked: sum(error * error * weights) allocated two whole
-        # sinogram-shaped arrays here, the squares and their weighted form.
-        # See _memory_ledger.weighted_square_sum.
+        # The sum runs in chunks, so no array of sinogram size is allocated.
         weighted_sq_sum = _memory_ledger.weighted_square_sum(error_sinogram,
                                                              weights)
         if normalize:
@@ -2536,29 +2304,14 @@ class TomographyModel(ParameterHandler):
 
     @staticmethod
     def _vcd_iteration_stats(error_sinogram, flat_recon, sigma_y, weights=None):
-        """Per-iteration VCD logging stats: (fm_loss, recon_l1, es_rmse).
-
-        Both statistics normalize by the error sinogram's own element count,
-        which is the whole sinogram: this form runs on a single device, where
-        one array holds every element."""
+        """Return the per-iteration VCD statistics (fm_loss, recon_l1,
+        es_rmse).  Both statistics are normalized by the number of elements in
+        the error sinogram."""
         fm_loss = TomographyModel.get_forward_model_loss(
             error_sinogram, sigma_y, weights)
-        # Chunked: sum(abs) over the whole recon allocated a second
-        # recon-shaped array here.  See _memory_ledger.image_ell1.
-        #
-        # This value NORMALIZES the NMAE, and the NMAE percent change is the
-        # early-stopping rule, so the chunked summation order can move the
-        # stopping statistic in its last digits.  At a knife edge against the
-        # default 0.2% threshold that is one iteration more or fewer.  The
-        # movement is within the iterated-comparison tolerance class the
-        # project already accepts (measured ~1e-7 relative against a float64
-        # reference, where the run-to-run floor of a recon is ~2e-7), so it is
-        # accepted rather than avoided -- but it is a stopping-rule effect and
-        # not only a logging one.  No golden covers it: every recon test runs
-        # with stop_threshold_change_pct=0.0, which disables early stopping.
+        # The sums below run in chunks, so no second array of reconstruction or sinogram size is
+        # allocated.  The chunked order can change the last digits of the NMAE stopping test.
         recon_l1 = _memory_ledger.image_ell1(flat_recon)
-        # Chunked for the reason above: sum(error * error) allocated a whole
-        # second sinogram.
         es_rmse = torch.sqrt(_memory_ledger.weighted_square_sum(error_sinogram)
                              / float(error_sinogram.numel()))
         return fm_loss, recon_l1, es_rmse
@@ -2594,11 +2347,10 @@ class TomographyModel(ParameterHandler):
 
         The base implementation is the preconditioned gradient
         -(forward_grad + prior_grad) / (forward_hess + prior_hess).
-        Overrides must return -M (forward_grad + prior_grad) with M positive
-        definite, which preserves the cost's minimizers.  Arguments are one
-        shard's (num_subset_pixels, local_slices) arrays; ``dev_index``
-        selects a slice-profile override's shard (cone DC damping) and is
-        ignored here."""
+        An override must return -M (forward_grad + prior_grad) with M positive
+        definite, which preserves the minimizers of the cost.  The arguments
+        are one shard's arrays, of shape (num_subset_pixels, local_slices).
+        The base implementation ignores ``dev_index``."""
         fn = maybe_compile(_diagonal_update_direction, self.compile_enabled)
         return fn(forward_grad, prior_grad, forward_hess, prior_hess)
 
@@ -2644,9 +2396,8 @@ class TomographyModel(ParameterHandler):
         recon_shape = self.get_params('recon_shape')
         max_alpha = self.get_params('max_alpha')
 
-        # Bind the compiled forms once for all subsets, one instance per
-        # device thread: compiled artifacts carry launcher state that must
-        # not be shared across threads (see maybe_compile).
+        # The compiled functions are bound once for all subsets, with one instance per device
+        # thread.  A compiled function carries launcher state that must not be shared.
         def per_dev(fn):
             return [maybe_compile(fn, self.compile_enabled, instance_key=i)
                     for i in range(num_devices)]
@@ -2659,17 +2410,16 @@ class TomographyModel(ParameterHandler):
         dev0 = devices[0]
 
         def combine_on_lead(parts):
-            """Sum per-shard 0-d tensor partials on the lead device: the
-            identity on one device, scalar-sized device moves otherwise."""
+            """Sum the zero dimensional partial results of each shard on the
+            lead device."""
             total = parts[0]
             for part in parts[1:]:
                 total = total + _sharding.move_shard(part, dev0,
                                                      self.dev2dev_safe)
             return total
 
-        # The qGGMRF boundary halos are staged once per PARTITION pass.  A
-        # None halo means the reflected boundary at a true volume edge,
-        # which is every entry on a single device.
+        # The qGGMRF boundary halos are staged once for each pass over a partition.  A halo of
+        # None means a reflected boundary at a true edge of the volume.
         halos = {'left': [None] * num_devices, 'right': [None] * num_devices}
 
         def stage_halos(flat_shards):
@@ -2677,10 +2427,10 @@ class TomographyModel(ParameterHandler):
                 flat_shards, self.dev2dev_safe)
 
         def vcd_subset_updater(flat_recon, error_sinogram, pixel_indices):
-            """One VCD iteration on a single subset of the partition, under
-            the invariant error_sinogram = measured_sinogram -
-            forward_proj(recon).  flat_recon and error_sinogram are
-            per-device shards, updated IN PLACE.
+            """Run one VCD update on a single subset of the partition.  The
+            invariant is error_sinogram = measured_sinogram -
+            forward_proj(recon).  The arguments flat_recon and error_sinogram
+            are shards and are updated in place.
 
             Returns:
                 flat_recon, error_sinogram, ell1_for_subset,
@@ -2689,18 +2439,17 @@ class TomographyModel(ParameterHandler):
             pixel_indices_per_device = [torch.as_tensor(pixel_indices, dtype=torch.int64).to(dev)
                        for dev in devices]
 
-            # Compute the prior model gradient and Hessian (i.e., second
-            # derivative) terms at each pixel in the index set, per slice-shard
-            # (halos carry the cross-boundary term; a true edge is reflected).
+            # This computes the prior gradient and Hessian at each pixel of the index set, one
+            # shard at a time.  The halos carry the term that crosses a shard boundary.
             def prior_worker(i, dev):
                 if prox_input is None:
-                    # qGGMRF prior.
                     grad, hess = qggmrf_grad_hess[i](
                         flat_recon.tensors[i], recon_shape, pixel_indices_per_device[i],
                         qggmrf_params, left_halo=halos['left'][i],
                         right_halo=halos['right'][i])
                 else:
-                    # Proximal map prior: pointwise, so the Hessian is a scalar.
+                    # The proximal map prior acts pointwise, so its Hessian is
+                    # a scalar.
                     grad = _qggmrf.prox_gradient_at_indices(
                         flat_recon.tensors[i], prox_input.tensors[i],
                         pixel_indices_per_device[i], sigma_prox)
@@ -2710,8 +2459,7 @@ class TomographyModel(ParameterHandler):
             prior_terms = _sharding.run_per_device(devices, prior_worker,
                                              executor=self._per_device_pool)
 
-            # Compute the forward model gradient and Hessian at each pixel in
-            # the index set.  Assumes Loss(delta) =
+            # The forward model loss is
             # 1/(2 sigma_y^2) || error_sinogram - A delta ||_weights^2.
             if const_weights:
                 weighted_error_sinogram = error_sinogram
@@ -2722,16 +2470,16 @@ class TomographyModel(ParameterHandler):
                         * error_sinogram.tensors[i],
                         executor=self._per_device_pool), sino_placement)
 
-            # Back project to get the gradient; note fm_constant = 1/sigma_y^2.
+            # The back projection gives the gradient.  The value fm_constant is
+            # 1/sigma_y^2.
             back_projected_error = self.sparse_back_project(weighted_error_sinogram, pixel_indices)
             if not const_weights:
-                # The weighted product is dead here, because the line-search
-                # terms fuse the weights into their reductions.  Freeing it
-                # now drops a full sinogram before the delta projection.
+                # The weighted product is no longer needed, because the line
+                # search terms fuse the weights into their own reductions.
                 weighted_error_sinogram = None
 
-            # Each shard computes its update direction and its prior
-            # line-search partials in one worker.
+            # Each shard computes its update direction and its prior line
+            # search terms in one worker.
             def direction_worker(i, dev):
                 prior_grad, prior_hess = prior_terms[i]
                 forward_grad = -fm_constant * back_projected_error.tensors[i]
@@ -2754,23 +2502,21 @@ class TomographyModel(ParameterHandler):
             prior_quadratic_approx = combine_on_lead(
                 [quadratic for _, _, quadratic in direction_results])
 
-            # This frees the dead gradient and Hessian buffers before the
-            # memory-heavy delta projection.  The stream-aware allocator
-            # needs no synchronization.
+            # These buffers are freed before the delta projection, which uses
+            # much more memory.
             del prior_terms, back_projected_error, direction_results
 
-            # Compute the update direction in the sinogram domain.
+            # This is the update direction in the sinogram domain.
             delta_sinogram = self.sparse_forward_project(
                 _sharding.Shards(delta_recon_per_device, recon_placement), pixel_indices)
 
-            # Forward line-search reductions per view-shard.
             def lin_quad_worker(i, dev):
                 local_delta_sinogram = delta_sinogram.tensors[i]
                 if const_weights:
                     return lin_quad_const[i](error_sinogram.tensors[i], local_delta_sinogram,
                                              fm_constant)
-                # Fusing the weights product into the reductions avoids the
-                # per-subset sinogram-sized weighted transient.
+                # Fusing the weights into the reductions avoids an array of
+                # sinogram size for each subset.
                 return lin_quad_weighted[i](error_sinogram.tensors[i], local_delta_sinogram,
                                             weights.tensors[i], fm_constant)
             forward_line_terms = _sharding.run_per_device(devices, lin_quad_worker,
@@ -2780,8 +2526,8 @@ class TomographyModel(ParameterHandler):
             forward_quadratic = combine_on_lead(
                 [quadratic for _, quadratic in forward_line_terms])
 
-            # Compute the optimal update step.  The line search stays ON DEVICE
-            # (alpha is a scalar tensor; no host synchronization per subset).
+            # The line search runs on the device.  The step alpha stays a
+            # scalar tensor, so no subset costs a host synchronization.
             alpha_numerator = forward_linear - prior_linear
             alpha_denominator = forward_quadratic + prior_quadratic_approx + _F32_EPS
             alpha = alpha_numerator / alpha_denominator
@@ -2790,8 +2536,8 @@ class TomographyModel(ParameterHandler):
                          [_sharding.move_shard(alpha, dev, self.dev2dev_safe)
                           for dev in devices])
 
-            # Enforce the positivity constraint if desired: clip updates so that
-            # recon + alpha * delta >= 0, then recompute the sinogram projection.
+            # The positivity constraint clips the update so that recon + alpha * delta is at
+            # least zero, and the sinogram projection is then computed again.
             if positivity_flag is True:
                 def positivity_worker(i, dev):
                     recon_at_indices = flat_recon.tensors[i][pixel_indices_per_device[i]]
@@ -2803,9 +2549,8 @@ class TomographyModel(ParameterHandler):
                 delta_sinogram = self.sparse_forward_project(
                     _sharding.Shards(delta_recon_per_device, recon_placement), pixel_indices)
 
-            # The sparse updates are applied IN PLACE, each shard locally.
-            # The per-slice sum of squared updates is the convergence
-            # diagnostic.
+            # The updates are applied in place on each shard.  The sum of
+            # squared updates per slice is the convergence diagnostic.
             def apply_worker(i, dev):
                 delta_scaled = alpha_per_device[i] * delta_recon_per_device[i]
                 _, _, delta_sumsq_local, ell1_local = apply_update[i](
@@ -2815,9 +2560,8 @@ class TomographyModel(ParameterHandler):
                 return delta_sumsq_local, ell1_local
             apply_results = _sharding.run_per_device(devices, apply_worker,
                                                executor=self._per_device_pool)
-            # Per-slice sums concatenate in global slice order on the lead
-            # device (the identity on one device; (local_slices,)-sized moves
-            # otherwise); the L1 partials combine like the line-search terms.
+            # The per-slice sums are concatenated in global slice order on the
+            # lead device.
             delta_sumsq_subset = (apply_results[0][0] if num_devices == 1
                                   else torch.cat(
                 [_sharding.move_shard(sumsq, dev0, self.dev2dev_safe)
@@ -2843,14 +2587,12 @@ class TomographyModel(ParameterHandler):
             change, alpha averaged over the subsets, and the per-slice sum
             of squared update values over the partition.
         """
-        # The qGGMRF boundary halos are staged once for this whole partition
-        # pass.  A single device has no shard boundaries, so this costs it
-        # nothing.
+        # The qGGMRF boundary halos are staged once for this whole pass over
+        # the partition.
         if hasattr(vcd_subset_updater, 'stage_halos'):
             vcd_subset_updater.stage_halos(flat_recon)
-        # Loop over the subsets of the partition, using random subset_indices to
-        # order them.  Keep this np.random call as written: any change to the
-        # random sequence changes the iteration trace the tests compare against.
+        # The subsets are visited in a random order.  Do not change this np.random call, because
+        # a different random sequence changes the iteration trace that the tests compare against.
         ell1_for_partition = 0
         alpha_sum = 0
         delta_sumsq_partition = 0
@@ -2936,35 +2678,27 @@ class TomographyModel(ParameterHandler):
         recon_shape = self.get_params('recon_shape')
         sinogram_shape = self.get_params('sinogram_shape')
         if isinstance(sinogram, _sharding.Shards):
-            # Already in the device form -- what prepare_sino_for_devices
-            # returns.  The container has no shape of its own, so the
-            # per-shard tensors are checked instead.
+            # The container has no shape of its own, so the shard tensors are
+            # checked instead.
             self._check_sinogram_shards(sinogram, sinogram_shape)
         elif tuple(sinogram.shape) != tuple(sinogram_shape):
             raise ValueError('sinogram does not have the shape in sinogram_shape. \n'
                              f'Expected {tuple(sinogram_shape)}, got '
                              f'{tuple(sinogram.shape)}.')
 
-        # Settle the device layout BEFORE the first large allocation; the
-        # returned ledger is what the calibration mode compares against.
+        # The device layout is settled before the first large allocation.
         memory_ledger = self._apply_device_policy(
             partition_sequence=partition_sequence, weights=weights,
             init_recon=init_recon, fm_hessian=fm_hessian,
             prox_input=prox_input, init_error_sinogram=init_error_sinogram)
         if _memory_ledger.calibration_enabled():
-            # The measured run begins here, so this is where the peak
-            # counters reset -- one reset per reconstruction, owned by the
-            # same function that reads the counters at the end.  A reset
-            # inside the policy would also run on the nested recon_direct
-            # call below and clear the peak mid-run.
+            # The measured run begins here, so the peak memory counters are
+            # reset here, once per reconstruction.
             _memory_ledger.calibration_start(self.sino_placement.devices)
-        # The layout is final here, so this is where the log can name the
-        # devices the run will actually use.
+        # The layout is final here, so the log can now name the devices the run
+        # will use.
         self._log_device_report()
 
-        # Placement: recon-like arrays route through _shard_recon and
-        # sino-like arrays through _shard_sinogram (a single device is the trivial
-        # 1-shard case), keeping the rest of the loop placement-agnostic.
         constant_weights = weights is None
         if constant_weights:
             weights = 1
@@ -2975,8 +2709,8 @@ class TomographyModel(ParameterHandler):
             raise ValueError('init_error_sinogram requires init_recon (the pair must be a '
                              'consistent resume state; see the docstring).')
 
-        # On the resume path the error sinogram replaces the sinogram's only
-        # use, so no device copy is made.
+        # When resuming, the error sinogram replaces the only use of the
+        # sinogram, so the sinogram is not placed on the devices.
         if init_error_sinogram is None:
             sinogram = self._shard_sinogram(sinogram)
 
@@ -2993,9 +2727,8 @@ class TomographyModel(ParameterHandler):
             init_recon = self._shard_recon(init_recon)
 
         if init_error_sinogram is not None:
-            # Resume fast path: trust the pair and skip the initializing
-            # forward projection.  No defensive copies -- the caller's arrays
-            # become the loop's working buffers (see the docstring).
+            # The pair is trusted, so the initializing forward projection is
+            # skipped.  The caller's arrays become the loop's working buffers.
             self.logger.info('Resuming from init_error_sinogram')
             error_sinogram = self._shard_sinogram(init_error_sinogram)
         else:
@@ -3003,52 +2736,42 @@ class TomographyModel(ParameterHandler):
                 sinogram, init_recon, weights, constant_weights,
                 scale_recon_to_sinogram)
 
-        # The sinogram is fully folded into error_sinogram.  Dropping the
-        # reference frees any device copy made here before the loop.
+        # The sinogram is now folded into the error sinogram, so dropping this
+        # reference frees any device copy made above.
         sinogram = None
-        # Placement invariant at the loop boundary: the error sinogram is in
-        # the sino device form -- a no-op re-placement on a single device.
         error_sinogram = self._shard_sinogram(error_sinogram)
 
         if prox_input is not None:
             if isinstance(prox_input, _sharding.Shards):
-                # Already in the device form -- what a Plug-and-Play loop gets
-                # back from denoise(output_sharded=True).  The container has
-                # no shape of its own, so the per-shard tensors are flattened
-                # and checked instead.
+                # The container has no shape of its own, so the shard tensors
+                # are flattened and checked instead.
                 prox_input = self._flatten_prox_shards(prox_input, recon_shape)
             else:
-                # Validate the prox input's shape before flattening: a
-                # size-compatible but mis-shaped input (e.g. a transposed volume)
-                # must fail loudly rather than silently reshape.
+                # The shape is checked before flattening, so that an input with the right
+                # number of elements but the wrong shape raises rather than being reshaped.
                 if tuple(prox_input.shape) != tuple(recon_shape):
                     raise ValueError('prox_input does not have the correct size. \n'
                                      f'Expected {tuple(recon_shape)}, got shape '
                                      f'{tuple(prox_input.shape)} for prox_input shape.')
-                # Flatten first, then place: the flat form is the slice-sharded
-                # device form.
                 prox_input = self._shard_recon(
                     prox_input.reshape((-1, prox_input.shape[-1])))
 
         verbose, sigma_y = self.get_params(['verbose', 'sigma_y'])
 
-        # math.prod uses exact Python integers; np.prod would silently wrap
-        # past 2^31 elements.
+        # math.prod uses exact Python integers.  np.prod would wrap past
+        # 2^31 elements.
         total_sino_size = math.prod(sinogram_shape)
 
-        # Initialize the diagonal of the Hessian of the forward model: the back
-        # projection of the weights with squared coefficients (constant weights
-        # use an all-ones sinogram).  A precomputed fm_hessian (the checkpoint
-        # fast path) skips the back projection; it is read-only in the loop.
+        # The Hessian diagonal of the forward model is the back projection of the weights with
+        # squared coefficients.  A Hessian supplied by the caller skips that back projection.
         if fm_hessian is None:
             if constant_weights:
                 hess_weights = self._sino_ones_device_form(error_sinogram)
             else:
                 hess_weights = weights
             self.logger.info('Computing Hessian diagonal')
-            # Back-project only at the ROR-masked pixels: the loop reads the
-            # Hessian only at partition indices from the same mask, so the
-            # values are unchanged while the transients shrink.
+            # The back projection covers only the masked pixels.  The loop reads the Hessian only
+            # at partition indices from the same mask, so the values are unchanged.
             hess_indices = (None if self.get_params('use_ror_mask') is False
                             else self.full_indices_device())
             fm_hessian = self.compute_hessian_diagonal(weights=hess_weights,
@@ -3061,9 +2784,8 @@ class TomographyModel(ParameterHandler):
 
         flat_recon = self._flatten_recon(init_recon)
 
-        # From here the loop runs one code path for any device count.  On a
-        # single device the one-shard container aliases its tensor, so the
-        # in-place updates still reach the caller-visible array.
+        # From here the loop runs one code path for any device count.  On a single device the
+        # one shard container aliases its tensor, so in place updates reach the caller's array.
         flat_recon = self._as_shards(flat_recon, self.recon_placement)
         error_sinogram = self._as_shards(error_sinogram,
                                              self.sino_placement)
@@ -3090,8 +2812,8 @@ class TomographyModel(ParameterHandler):
         delta_norm_per_slice = np.zeros((max_iters, recon_shape[2]))
         num_iters = 0
         if not self.sino_placement.is_trivial:
-            # One per-device thread pool serves the whole loop.  A single
-            # device never creates it.
+            # One thread pool serves the whole loop.  A single device model
+            # never creates one.
             self._per_device_pool = _sharding.device_pool(
                 self.sino_placement.n_devices)
         try:
@@ -3101,15 +2823,15 @@ class TomographyModel(ParameterHandler):
                  delta_sumsq_partition) = self.vcd_partition_iterator(
                     vcd_subset_updater, flat_recon, error_sinogram, partition)
 
-                # The element count is passed rather than read off the array:
-                # a sharded error sinogram is a list of per-device tensors, and
-                # the statistics normalize by the total.
+                # The element count is passed in, because a sharded error sinogram is a list
+                # of tensors and the statistics normalize by the total element count.
                 fm_loss_i, recon_l1, es_rmse = self._iteration_stats(
                     error_sinogram, flat_recon, sigma_y, weights,
                     constant_weights, float(total_sino_size))
                 fm_rmse[i] = float(fm_loss_i)
                 recon_l1_f = float(recon_l1)
-                # A zero recon gives nan rather than raising ZeroDivisionError.
+                # A reconstruction of all zeros gives nan rather than raising
+                # ZeroDivisionError.
                 nmae_update[i] = (float(ell1_for_partition) / recon_l1_f
                                   if recon_l1_f else float('nan'))
                 alpha_values[i] = float(alpha)
@@ -3127,17 +2849,15 @@ class TomographyModel(ParameterHandler):
                             ['qggmrf_nbr_wts', 'sigma_x', 'p', 'q', 'T'])
                         b = _qggmrf.get_b_from_nbr_wts(qggmrf_nbr_wts)
                         qggmrf_params = (b, sigma_x, p, q, T)
-                        # Evaluate the prior loss on the assembled volume, so
-                        # the inter-slice terms cross the shard boundaries.
+                        # The prior loss is evaluated on the assembled volume,
+                        # so that terms between slices cross shard boundaries.
                         total_recon_size = math.prod(recon_shape)
                         loss_recon = self._gather_recon(flat_recon).reshape(
                             tuple(recon_shape))
                         pm_loss[i] = _qggmrf.qggmrf_loss(loss_recon, qggmrf_params)
                         pm_loss[i] /= total_recon_size
-                        # Each loss is scaled by its element count, but the
-                        # optimization uses unscaled values.  Remove the
-                        # scaling, add, then scale by the average element
-                        # count of the two.
+                        # Each loss arrives scaled by its own element count.  Both are
+                        # unscaled, added, and rescaled by the average element count.
                         total_loss = ((fm_rmse[i] * total_sino_size
                                        + pm_loss[i] * total_recon_size)
                                       / (0.5 * (total_sino_size + total_recon_size)))
@@ -3161,8 +2881,8 @@ class TomographyModel(ParameterHandler):
                 self._per_device_pool.shutdown(wait=True)
                 self._per_device_pool = None
 
-        # The calibration comparison, before the loop's state is released, so
-        # the measured high-water mark still reflects the reconstruction.
+        # The calibration comparison runs before the loop's state is released,
+        # so that the measured peak still reflects the reconstruction.
         if memory_ledger is not None and _memory_ledger.calibration_enabled():
             rows = _memory_ledger.calibration_report(
                 memory_ledger, self.sino_placement.devices)
@@ -3170,9 +2890,8 @@ class TomographyModel(ParameterHandler):
             if rows:
                 self.logger.warning(_memory_ledger.format_calibration(rows))
 
-        # Loop exit: back to the public/device forms -- plain tensors on a
-        # single device (the same objects the loop mutated, so the checkpoint
-        # aliasing contract is unchanged), per-device shards otherwise.
+        # The state returns to the device form here.  On a single device that
+        # is a plain tensor, and it is the same object the loop updated.
         flat_recon = self._as_device_form(flat_recon)
         error_sinogram = self._as_device_form(error_sinogram)
         recon_3d = self._recon_from_flat(flat_recon, recon_shape)
@@ -3199,9 +2918,8 @@ class TomographyModel(ParameterHandler):
             sinogram, weights, init_recon, partitions, partition_sequence,
             granularity, regularization_params
         """
-        # The run logger is set up exactly when a run is initialized.  A
-        # Plug-and-Play loop passing do_initialization=False skips this
-        # method, so the whole loop writes to one log.
+        # The run logger is set up when a run is initialized.  A Plug and Play loop that passes
+        # do_initialization=False skips this method, so the whole loop writes to one log.
         self._log_run_header(first_iteration, logfile_path, print_logs)
         recon_shape, granularity, use_ror_mask = self.get_params(
             ['recon_shape', 'granularity', 'use_ror_mask'])
@@ -3214,11 +2932,8 @@ class TomographyModel(ParameterHandler):
             partition_sequence, max_iterations=max_iterations)
         partition_sequence = partition_sequence[first_iteration:]
 
-        # The input checks run where the data already is.  A host array or a
-        # single tensor is checked as a whole, as before.  A sinogram already
-        # divided across devices is checked one shard at a time, on the device
-        # that holds it, so a prepared sinogram is never pulled back to the
-        # host just to be validated.
+        # The input checks run where the data already is.  A sharded sinogram is checked one
+        # shard at a time on the device that holds it, and never brought back to the host.
         if isinstance(sinogram, _sharding.Shards):
             for tensor in sinogram.tensors:
                 if tensor.is_complex():
@@ -3227,8 +2942,8 @@ class TomographyModel(ParameterHandler):
                 low, high = _array_extremes(tensor)
                 if not (math.isfinite(low) and math.isfinite(high)):
                     raise ValueError("sinogram contains NaN and/or Inf values.")
-            # Passed on as it is: the statistics below reduce it to a small
-            # view subsample before anything reaches the host.
+            # The statistics below reduce this to a small subsample of the
+            # views before anything reaches the host.
             sinogram_for_stats = sinogram
         else:
             sinogram_np = np.asarray(sinogram) if not torch.is_tensor(sinogram) \
@@ -3241,8 +2956,7 @@ class TomographyModel(ParameterHandler):
             sinogram_for_stats = sinogram_np
         if weights is not None:
             if isinstance(weights, _sharding.Shards):
-                # "All zero" is a statement about the whole array, so it holds
-                # only when every shard is entirely zero.
+                # The weights are all zero only when every shard is all zero.
                 all_zero = True
                 for tensor in weights.tensors:
                     low, high = _array_extremes(tensor)
@@ -3333,17 +3047,16 @@ class TomographyModel(ParameterHandler):
             'recon_log' (the run's log text), 'notes', and
             'model_params' (a snapshot of the model parameters).
         """
-        # The sinogram and the weights may arrive already divided across the
-        # devices, but the initial reconstruction is checked against the whole
-        # volume's shape, which a divided array does not have.
+        # The initial reconstruction is checked against the shape of the whole volume, which a
+        # sharded array does not have, so a sharded init_recon is refused.
         _sharding.reject_shards('recon', init_recon=init_recon)
         (sinogram, weights, init_recon, partitions, partition_sequence, granularity,
          regularization_params) = self.initialize_recon(
             sinogram, weights, init_recon, max_iterations, first_iteration,
             logfile_path=logfile_path, print_logs=print_logs)
 
-        # no_grad, not inference_mode: torch.compile's guards crash on
-        # compiled calls inside inference_mode with in-place updates.
+        # This uses no_grad rather than inference_mode, because torch.compile guards fail on
+        # compiled calls with in place updates inside inference_mode.
         with torch.no_grad():
             recon, loss_vectors = self._vcd_recon(
                 sinogram, partitions, partition_sequence,
@@ -3365,36 +3078,33 @@ class TomographyModel(ParameterHandler):
         if logfile_path:
             self.logger.info('Logs written to {}'.format(
                 os.path.abspath(os.path.expanduser(logfile_path))))
-        for h in list(self.logger.handlers):  # Make sure the log files are up to date
+        for h in list(self.logger.handlers):
             h.flush()
-        # This call has written its last line, so finish the file rather than
-        # holding it open: the caller may want to read, move, or delete it, and
-        # a run made of parts merges and deletes each part's log.  A call that
-        # continues this run reopens it.
+        # This call has written its last line, so the log file is closed.  A call that continues
+        # this run reopens it.
         self.close_log_file()
 
         notes = 'Reconstruction completed: {}\n\n'.format(datetime.datetime.now())
         recon_dict = self.get_recon_dict(recon_params, notes=notes)
-        # output_sharded=True keeps the device form (no numpy exit).
         return (recon if output_sharded else self._gather_recon(recon)), recon_dict
 
     def _iteration_stats(self, error_sinogram, flat_recon, sigma_y, weights,
                          constant_weights, total_sino_size):
-        """Per-iteration logging stats (fm loss, recon L1, error-sino RMSE).
-        A single-device state delegates to the fused _vcd_iteration_stats
-        with bit-identical results.  A per-device state combines per-shard
-        sums on the host, which is the loop's one host synchronization point
-        per iteration.  ``total_sino_size`` is the whole sinogram's element
-        count, which no single shard can supply."""
+        """Return the per-iteration statistics (forward model loss, the L1 norm
+        of the reconstruction, and the error sinogram RMSE).
+
+        A single device state calls _vcd_iteration_stats.  A state spread over
+        devices combines the shard sums on the host, which is the loop's one
+        host synchronization per iteration.  ``total_sino_size`` is the element
+        count of the whole sinogram, which no single shard knows."""
         if (isinstance(error_sinogram, _sharding.Shards)
                 and not error_sinogram.placement.is_trivial):
             error_shards, flat_shards = error_sinogram, flat_recon
             weights_shards = None if constant_weights else weights
 
             def sino_worker(i, d):
-                # Chunked per shard, for the reason weighted_square_sum
-                # gives: the squares and their weighted form were two whole
-                # sinogram shards per device, once per iteration.
+                # The sums run in chunks on each shard, so no array the size of
+                # a shard is allocated.
                 e = error_shards.tensors[i]
                 sq = float(_memory_ledger.weighted_square_sum(e))
                 if weights_shards is None:
@@ -3418,8 +3128,7 @@ class TomographyModel(ParameterHandler):
             es_rmse = (sq / total_sino_size) ** 0.5
         else:
             if isinstance(error_sinogram, _sharding.Shards):
-                # The trivial one-shard container unwraps (aliasing) to the
-                # fused single-tensor kernel below, bit-identically.
+                # A one shard container unwraps to the tensor it aliases.
                 error_sinogram = error_sinogram.tensors[0]
                 flat_recon = flat_recon.tensors[0]
             fm_loss, recon_l1, es_rmse = TomographyModel._vcd_iteration_stats(
@@ -3494,10 +3203,8 @@ class TomographyModel(ParameterHandler):
             'recon_log' (the run's log text), 'notes', and
             'model_params' (a snapshot of the model parameters).
         """
-        # The proximal input, the sinogram, and the weights may all arrive
-        # already divided across the devices, but the initial reconstruction is
-        # checked against the whole volume's shape, which a divided array does
-        # not have.
+        # The initial reconstruction is checked against the shape of the whole volume, which a
+        # sharded array does not have, so a sharded init_recon is refused.
         _sharding.reject_shards('prox_map', init_recon=init_recon)
         prior_loss = [0]
         if do_initialization or self.prox_data is None:
@@ -3510,24 +3217,18 @@ class TomographyModel(ParameterHandler):
         else:
             (partitions, partition_sequence, granularity,
              regularization_params) = self.prox_data
-            # The cache holds the expensive pieces: the pixel partitions and
-            # the regularization estimates.  The partition SEQUENCE is cheap
-            # and is recomputed the way initialize_recon computes it, so that
-            # first_iteration keeps its documented meaning on this path too:
-            # a Plug-and-Play loop passing its cumulative iteration count
-            # advances through the model's partition_sequence and, past its
-            # end, stays on its last (typically finest) entry.
+            # The cache holds the pixel partitions and the regularization estimates, which are
+            # expensive.  The partition sequence is cheap and is recomputed here the same way.
             partition_sequence = vcd_utils.gen_partition_sequence(
                 self.get_params('partition_sequence'),
                 max_iterations=max_iterations)
             partition_sequence = partition_sequence[first_iteration:]
-            # This pass skips the initialization, and with it the run header
-            # that reopens the log file the previous pass closed, so reopen it
-            # here.  Without this the loop's later passes would be missing
-            # from the file.
+            # This pass skips the initialization, and with it the run header that reopens
+            # the log file the previous pass closed, so the file is reopened here.
             self._reopen_log_file()
 
-        # Override the auto sigma_prox if requested, restoring it afterward.
+        # A supplied sigma_prox overrides the automatic value, and the
+        # automatic value is restored at the end of the call.
         self_sigma_prox = self.get_params('sigma_prox')
         if sigma_prox is not None:
             regularization_params = dict(regularization_params,
@@ -3557,14 +3258,13 @@ class TomographyModel(ParameterHandler):
         if logfile_path:
             self.logger.info('Logs written to {}'.format(
                 os.path.abspath(os.path.expanduser(logfile_path))))
-        for h in list(self.logger.handlers):  # Make sure the log files are up to date
+        for h in list(self.logger.handlers):
             h.flush()
-        # As in recon: the file is finished here and reopened by the next pass.
+        # The log file is closed here and reopened by the next pass.
         self.close_log_file()
 
         notes = 'Proximal map completed: {}\n\n'.format(datetime.datetime.now())
         recon_dict = self.get_recon_dict(recon_params, notes=notes)
-        # output_sharded=True keeps the device form (no numpy exit).
         return (recon if output_sharded else self._gather_recon(recon)), recon_dict
 
     @staticmethod
@@ -3623,10 +3323,10 @@ class TomographyModel(ParameterHandler):
         return voxel_slice_aspect * delta_voxel * (k - (num_slices - 1) / 2.0) + offset
 
     def _fractional_slice_index(self, z):
-        """The fractional recon slice index of axial coordinate ``z``, the
-        inverse of :meth:`recon_slice_z` without rounding.  ``z`` may be a
-        float, a numpy array, or a torch tensor; the result has the same
-        form."""
+        """Return the fractional reconstruction slice index of the axial
+        coordinate ``z``.  This inverts :meth:`recon_slice_z` without rounding.
+        The argument may be a float, a numpy array, or a torch tensor, and the
+        result has the same form."""
         recon_shape = self.get_params('recon_shape')
         delta_voxel, voxel_slice_aspect = self.get_params(['delta_voxel', 'voxel_slice_aspect'])
         offset = self.get_params('recon_slice_offset') if 'recon_slice_offset' in self.params else 0.0
@@ -3680,10 +3380,11 @@ class TomographyModel(ParameterHandler):
 
         regularization_names = _AUTO_REGULARIZATION_PARAM_NAMES + (
             'snr_db', 'sharpness', 'auto_regularize_flag')
-        # Bookkeeping params re-derived at construction.
+        # These parameters are derived again when a model is constructed.
         construction_derived_names = ('geometry_type', 'view_params_name', 'file_format',
                                       'version', 'use_gpu')
-        # Execution-environment constructor arguments; not model parameters.
+        # These constructor arguments describe the execution environment rather
+        # than the model.
         environment_args = ('self', 'view_batch_size', 'compile_mode')
 
         ctor_names = [n for n in inspect.signature(type(self).__init__).parameters
@@ -3794,7 +3495,6 @@ class TomographyModel(ParameterHandler):
         arr = _to_host(recon)
         save_data_hdf5(filepath, arr, 'recon', recon_dict)
 
-        # Log the save
         if self.logger:
             self.logger.info(f"Saved reconstruction and params to '{filepath}'")
 

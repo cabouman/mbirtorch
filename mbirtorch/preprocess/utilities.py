@@ -24,27 +24,22 @@ def _transmission_kernel(obj_batch, blank_minus_dark, dark_scan_mean, flat_indic
     blank_minus_dark = torch.as_tensor(np.asarray(blank_minus_dark, dtype=np.float32), device=device)
     dark_scan_mean = torch.as_tensor(np.asarray(dark_scan_mean, dtype=np.float32), device=device)
     obj_batch = torch.abs(obj_batch - dark_scan_mean)
-    # NaN for non-positive ratios so the neighborhood fill later removes them along with defective pixels.
+    # A non-positive ratio becomes NaN, so the fill below removes it along with the defective pixels.
     ratio = obj_batch / blank_minus_dark
     nan = torch.tensor(float('nan'), dtype=ratio.dtype, device=device)
     sino_batch = torch.where(ratio > 0, -torch.log(torch.where(ratio > 0, ratio, torch.ones_like(ratio))), nan)
     if flat_indices is not None:
-        # Shared defective pixels (same in every view) -> NaN for the neighborhood fill.
         sino_batch = put_in_slice(sino_batch, flat_indices, float('nan'))
-    # Any remaining non-finite value (e.g. an infinite ratio from a zero blank
-    # pixel) also becomes NaN, so the fill removes it too.
+    # Any remaining non-finite value also becomes NaN, so the fill removes it too.
     sino_batch = torch.where(torch.isfinite(sino_batch), sino_batch, nan)
     return _fill_nan_pixels(sino_batch)
 
 
 def _reference_scan_to_host(scan):
-    """Bring a blank or dark scan to host numpy if it is a torch tensor.
+    """Bring a blank or dark scan to a host numpy array.  A numpy input is returned unchanged.
 
-    The reference scans are small and are reduced on the host with numpy
-    functions, and numpy's functions cannot be trusted on a torch tensor:
-    np.mean, for one, forwards keyword names torch's mean does not take.
-    Converting once at entry keeps every downstream host computation on a
-    plain numpy array.  A numpy input passes through untouched."""
+    The reference scans are reduced on the host with numpy functions, and those functions do not
+    work correctly on a torch tensor."""
     return scan.detach().cpu().numpy() if torch.is_tensor(scan) else scan
 
 
@@ -100,7 +95,6 @@ def compute_sino_transmission(obj_scan, blank_scan, dark_scan, defective_pixel_a
     blank_scan = _reference_scan_to_host(blank_scan)
     dark_scan = _reference_scan_to_host(dark_scan)
 
-    # Blank/dark means (host); blank_minus_dark does not vary across batches, so precompute it once.
     blank_scan_mean = np.mean(blank_scan, axis=0, keepdims=True)
     dark_scan_mean = np.mean(dark_scan, axis=0, keepdims=True)
     blank_minus_dark = np.abs(blank_scan_mean - dark_scan_mean)
@@ -122,21 +116,19 @@ def compute_sino_transmission(obj_scan, blank_scan, dark_scan, defective_pixel_a
 
 
 def _box3x3_sum(x):
-    """Sum over each 3x3 (row, channel) window, per view, zero-padded at the detector edges.
+    """Sum over each 3x3 (row, channel) window of every view, zero padded at the detector edges.
 
-    ``x`` has shape (num_views, num_det_rows, num_det_channels); the window spans only the trailing two
-    (detector) axes.  Uses a strided pooling op -- a fused sliding-window sum -- so it does NOT
-    materialize nine shifted copies of the array (O(N) memory, unlike stack-the-9-neighbors-and-reduce)."""
+    ``x`` has shape (num_views, num_det_rows, num_det_channels).  The window spans the two detector
+    axes."""
     return F.avg_pool2d(x.unsqueeze(1), kernel_size=3, stride=1, padding=1,
                         count_include_pad=True).squeeze(1) * 9.0
 
 
 def _interpolate_fill_pass(sino):
-    """One dense pass: replace each NaN pixel with the MEAN of its finite 3x3 in-view neighbors.
+    """Replace each NaN pixel with the mean of its finite 3x3 neighbors within the same view.
 
-    Finite pixels are unchanged.  A NaN with no finite neighbor stays NaN (it gets filled on a later
-    pass, as the surrounding NaN region shrinks inward).  Computed densely with two box sums (values and
-    a validity mask), so it is memory-light -- no per-NaN gather, no neighbor stack."""
+    Finite pixels are unchanged.  A NaN with no finite neighbor stays NaN and is filled on a later
+    pass."""
     is_nan = torch.isnan(sino)
     valid = (~is_nan).to(sino.dtype)
     filled = torch.where(is_nan, torch.zeros((), dtype=sino.dtype, device=sino.device), sino)
@@ -147,11 +139,10 @@ def _interpolate_fill_pass(sino):
 
 
 def _fill_nan_pixels(sino, num_passes=3):
-    """Fill every NaN pixel with the mean of its finite 3x3 in-view neighbors, in ``num_passes`` dense
-    passes (each fills the NaN frontier inward by one pixel), then warn about and zero any pixel still
-    NaN (a defective/zinger cluster wider than the fill reach).  Shared by
-    ``interpolate_defective_pixels`` and the zinger correction -- they differ only in HOW pixels are
-    flagged NaN before calling this."""
+    """Fill every NaN pixel with the mean of its finite 3x3 neighbors within the same view.
+
+    Each of the ``num_passes`` passes fills the NaN region inward by one pixel.  A pixel that is
+    still NaN after the last pass is set to 0, and the function warns."""
     for _ in range(num_passes):
         sino = _interpolate_fill_pass(sino)
     num_residual = int(torch.sum(torch.isnan(sino)).item())
@@ -194,28 +185,22 @@ def interpolate_defective_pixels(sino, defective_pixel_array=(), num_passes=3):
     sino = torch.as_tensor(np.asarray(sino, dtype=np.float32))
     num_views, num_rows, num_channels = sino.shape
 
-    # Mark every invalid pixel NaN: non-finite values, plus the known shared defective pixels.
     nan = torch.tensor(float('nan'), dtype=sino.dtype, device=sino.device)
     sino = torch.where(torch.isfinite(sino), sino, nan)
     if len(defective_pixel_array) > 0:
-        # mode='clip' guards the host-side ravel against out-of-range coords.
+        # mode='clip' guards the ravel on the host against an out of range coordinate.
         defective_flat = np.ravel_multi_index(np.asarray(defective_pixel_array).T,
                                               (num_rows, num_channels), mode='clip').astype(np.int64)
         sino = put_in_slice(sino, defective_flat, float('nan'))
 
-    # Dense neighborhood-mean fill, a fixed number of passes (shared with the zinger correction).
     return _fill_nan_pixels(sino, num_passes).numpy()
 
 
 def _rotation_kernel(sino_batch, det_rotation, center=None):
-    """Per-view-batch detector-rotation kernel (pure device-tensor op): rotate each view's
-    (row, channel) plane by ``det_rotation`` radians with bilinear interpolation, zero outside.
+    """Rotate the (row, channel) plane of each view in a batch by ``det_rotation`` radians.
 
-    This is a direct 2-D bilinear rotation: the rotated sampling grid is computed ONCE for the
-    (row, channel) plane and reused across all views.  Because the view axis is an identity dimension
-    (each output view samples only its own input view), the per-view result is plain 4-corner 2-D
-    bilinear interpolation, computed directly: gather the 4 neighbors for every view in one shot with
-    shared 2-D weights.
+    The interpolation is bilinear, and a sample from outside the view is zero.  The rotated sampling
+    grid is computed once for the (row, channel) plane and used for every view in the batch.
 
     Args:
         sino_batch (tensor): (num_views, num_det_rows, num_det_channels).
@@ -237,8 +222,7 @@ def _rotation_kernel(sino_batch, det_rotation, center=None):
     else:
         center_row, center_col = (float(c) for c in center)
 
-    # For each OUTPUT pixel (i, j), find the INPUT location it samples:
-    # coord = R @ pixel + offset, with offset = center - R @ center (rotation about the center).
+    # Each output pixel (i, j) samples the input at R @ pixel + offset, where offset = center - R @ center.
     grid_i, grid_j = torch.meshgrid(torch.arange(num_rows, dtype=dtype, device=device),
                                     torch.arange(num_cols, dtype=dtype, device=device), indexing='ij')
     offset_row = center_row - (cos_a * center_row + sin_a * center_col)
@@ -246,8 +230,7 @@ def _rotation_kernel(sino_batch, det_rotation, center=None):
     src_row = cos_a * grid_i + sin_a * grid_j + offset_row   # (num_rows, num_cols)
     src_col = -sin_a * grid_i + cos_a * grid_j + offset_col
 
-    # Bilinear neighbors: lower = floor, upper = ceil, weight = coord - floor; the gather indices are
-    # clipped into range and out-of-image samples are zeroed afterwards via the mask.
+    # The four bilinear neighbors are gathered below.  An out of range index is clipped here and zeroed by the mask.
     lower_row = torch.floor(src_row)
     lower_col = torch.floor(src_col)
     frac_row = src_row - lower_row     # (num_rows, num_cols)
@@ -257,8 +240,6 @@ def _rotation_kernel(sino_batch, det_rotation, center=None):
     c0 = torch.clamp(lower_col.to(torch.int64), 0, num_cols - 1)
     c1 = torch.clamp(torch.ceil(src_col).to(torch.int64), 0, num_cols - 1)
 
-    # Gather the 4 neighbors for EVERY view at once; the (num_rows, num_cols) weights broadcast over the
-    # leading view axis.  sino_batch[:, r, c] has shape (num_views, num_rows, num_cols).
     rotated = (((1.0 - frac_row) * (1.0 - frac_col)) * sino_batch[:, r0, c0]
                + ((1.0 - frac_row) * frac_col) * sino_batch[:, r0, c1]
                + (frac_row * (1.0 - frac_col)) * sino_batch[:, r1, c0]
@@ -317,7 +298,6 @@ def correct_background_offset(sino, edge_width=9, option='global'):
         sino_corrected (numpy.ndarray)
     """
 
-    # No-op option: return the original sinogram without modification.
     if option is None:
         return sino
 
@@ -339,7 +319,6 @@ def correct_background_offset(sino, edge_width=9, option='global'):
     offset = np.median(edge_medians, axis=1)   # (num_views,)
 
     if option == "global":
-        # Estimate one scalar offset from edge regions across all views
         percentile = 10
         offset = np.percentile(offset, percentile)
         sino_corrected = sino - offset
@@ -365,18 +344,18 @@ def _downsample_obj_kernel(obj_batch, flat_indices, new_size1, new_size2, block_
 
 
 def _downsample_blank_dark(blank_scan, dark_scan, downsample_factor, defective_pixel_array=()):
-    """Host-side part of view-data downsampling: NaN-mask defective pixels, crop to a block-divisible
-    size, and block-average the blank and dark scans.  Returns the downsampled blank/dark, the NEW
-    (downsampled-grid) defective array, and the parameters :func:`_downsample_obj_kernel` needs for the
-    object scan.  (blank/dark share the object scan's detector dimensions, so its block params are
-    computed here.)
+    """Downsample the blank and dark scans on the host.
+
+    Defective pixels are set to NaN, the scans are cropped to a size divisible by the downsample
+    factor, and each block is averaged.  The blank and dark scans have the detector dimensions of
+    the object scan, so the block parameters that :func:`_downsample_obj_kernel` needs are computed
+    here as well.
 
     Returns:
         (blank_scan, dark_scan, defective_pixel_array, obj_flat_indices, new_size1, new_size2, block_shape)
     """
-    # Set defective pixels to NaN for use with nanmean.  blank_scan and dark_scan may have different
-    # numbers of views, so loop each over its OWN leading dimension (a single shared loop over
-    # blank_scan.shape[0] would index out of bounds on a singleton dark_scan, or vice versa).
+    # Set defective pixels to NaN for use with nanmean.  The blank and dark scans may have
+    # different numbers of views, so each is looped over its own leading dimension.
     if len(defective_pixel_array) > 0:
         flat_indices = np.ravel_multi_index(defective_pixel_array.T, blank_scan.shape[1:]).astype(np.int64)
         for i in range(blank_scan.shape[0]):
@@ -386,19 +365,17 @@ def _downsample_blank_dark(blank_scan, dark_scan, downsample_factor, defective_p
     else:
         flat_indices = None
 
-    # Crop the scan if the size is not divisible by downsample_factor (blank/dark share the object
-    # scan's detector dimensions).
+    # Crop the scan if the size is not divisible by downsample_factor.
     new_size1 = downsample_factor[0] * (blank_scan.shape[1] // downsample_factor[0])
     new_size2 = downsample_factor[1] * (blank_scan.shape[2] // downsample_factor[1])
 
     blank_scan = blank_scan[:, 0:new_size1, 0:new_size2]
     dark_scan = dark_scan[:, 0:new_size1, 0:new_size2]
 
-    # Reshape into blocks specified by the downsampling factor and then use nanmean to average over the blocks.
     block_shape = (blank_scan.shape[1] // downsample_factor[0], downsample_factor[0],
                    blank_scan.shape[2] // downsample_factor[1], downsample_factor[1])
 
-    # Take the mean over blocks, ignoring nans.  Any blocks with all nans will yield a nan.
+    # A block of all NaNs gives NaN.
     blank_scan = np.stack([
         np.nanmean(scan.reshape(block_shape), axis=(1, 3))
         for scan in blank_scan
@@ -409,14 +386,13 @@ def _downsample_blank_dark(blank_scan, dark_scan, downsample_factor, defective_p
         for scan in dark_scan
     ], axis=0)
 
-    # new defective pixel list = {indices of pixels where the downsampling block contains all bad pixels}
+    # A downsampled pixel is defective when every pixel in its block was bad.
     nan_mask = np.isnan(blank_scan).any(axis=0)  # Combine across all views
     defective_pixel_array = np.argwhere(nan_mask)
     if len(defective_pixel_array) == 0:
         defective_pixel_array = ()
 
-    # flat_indices stays a HOST array so the per-view object-scan kernel is device-agnostic (it is
-    # moved to each batch's device inside the kernel).
+    # flat_indices stays on the host.  The kernel moves it to the device of each batch.
     return blank_scan, dark_scan, defective_pixel_array, flat_indices, new_size1, new_size2, block_shape
 
 
@@ -469,7 +445,6 @@ def downsample_view_data(obj_scan, blank_scan, dark_scan, downsample_factor, def
     blank_scan, dark_scan, defective_pixel_array, obj_flat_indices, new_size1, new_size2, block_shape = \
         _downsample_blank_dark(blank_scan, dark_scan, downsample_factor, defective_pixel_array)
 
-    # Object scan: batch over views through the shared driver, block-averaging each view-batch.
     obj_scan = pipeline.map_view_batches(
         obj_scan,
         lambda b: _downsample_obj_kernel(b, obj_flat_indices, new_size1, new_size2, block_shape),
@@ -523,13 +498,11 @@ def scan_to_sino(obj_scan, blank_scan, dark_scan, defective_pixel_array=(),
         blank_scan, dark_scan, defective_pixel_array, obj_flat_indices, new_size1, new_size2, block_shape = \
             _downsample_blank_dark(blank_scan, dark_scan, downsample_factor, defective_pixel_array)
 
-    # Keep the transmission constants as host NumPy so the kernel is device-agnostic (each value is
-    # moved to its batch's device inside the kernel).
     blank_scan_mean = np.mean(blank_scan, axis=0, keepdims=True)
     dark_scan_mean = np.mean(dark_scan, axis=0, keepdims=True)
     blank_minus_dark = np.abs(blank_scan_mean - dark_scan_mean)
 
-    # Ravel defective-pixel indices against the detector grid the kernel sees (downsampled if downsampling).
+    # The defective pixel indices are raveled against the detector grid the kernel sees.
     trans_det_shape = blank_scan.shape[1:]
     if len(defective_pixel_array) > 0:
         defective_pixel_array = np.asarray(defective_pixel_array)
@@ -540,7 +513,7 @@ def scan_to_sino(obj_scan, blank_scan, dark_scan, defective_pixel_array=(),
 
     do_rotation = det_rotation != 0.0
 
-    # One fused kernel per view batch: (downsample) -> transmission -> (rotation).
+    # Each view batch runs one fused kernel that downsamples, converts to transmission, and rotates.
     def fused_kernel(obj_batch):
         if do_downsample:
             obj_batch = _downsample_obj_kernel(obj_batch, obj_flat_indices, new_size1, new_size2, block_shape)
@@ -617,7 +590,6 @@ def crop_view_data(obj_scan, blank_scan, dark_scan, crop_pixels_sides=0, crop_pi
     blank_scan = blank_scan[:, Nr_lo:Nr_hi, Nc_lo:Nc_hi]
     dark_scan = dark_scan[:, Nr_lo:Nr_hi, Nc_lo:Nc_hi]
 
-    # Remove any defective pixels that are outside the new cropped region
     if len(defective_pixel_array) > 0:
         in_bounds = (defective_pixel_array[:, 0] >= Nr_lo) & (defective_pixel_array[:, 0] < Nr_hi) & \
                     (defective_pixel_array[:, 1] >= Nc_lo) & (defective_pixel_array[:, 1] < Nc_hi)
@@ -678,16 +650,13 @@ def read_tif_stack_dir(scan_dir, view_ids=None):
     """
 
     import tifffile
-    # Get the files that are views and check that we have as many as we need
     img_path_list = sorted(glob.glob(os.path.join(scan_dir, '*[0-9].tif')))
     if len(img_path_list) == 0:
         img_path_list = sorted(glob.glob(os.path.join(scan_dir, '*[0-9].tiff')))  # Assume files are '.tif' but check '.tiff' if not
 
-    # if no views are found, raise an error
     if len(img_path_list) == 0:
         raise FileNotFoundError('No scan images found in directory: {}'.format(scan_dir))
 
-    # Set view_idx to be an array corresponding to the views that should be read.
     # This assumes that all the views are labeled sequentially.
     if view_ids is None:
         view_ids = np.arange(len(img_path_list))
@@ -700,7 +669,6 @@ def read_tif_stack_dir(scan_dir, view_ids=None):
     output_views = tifffile.imread(img_path_list, ioworkers=48, maxworkers=8)
     output_views = _normalize_to_float32(output_views)
 
-    # return shape = num_views x num_det_rows x num_det_channels
     return output_views
 
 
@@ -725,8 +693,7 @@ def compute_scaling_factor(target_vect, vect_to_scale) -> float:
         >>> u = np.array([0.5, 1.0, 1.5])
         >>> alpha = compute_scaling_factor(v,u)
     """
-    # Sharded inputs: the two sums decompose over the shards, so sum each
-    # shard on its own device and combine on the host.
+    # A sharded input is summed on each shard's own device, and the sums are combined on the host.
     if isinstance(target_vect, _sharding.Shards):
         numerator = 0.0
         denominator = 0.0
@@ -751,9 +718,8 @@ def compute_scaling_factor(target_vect, vect_to_scale) -> float:
 
 
 def _dot_sums(target_vect, vect_to_scale):
-    """The two inner products <v,t> and <v,v>, chunked along the leading axis:
-    a whole-array elementwise product would allocate a full-size temporary
-    (tens of GB for a production recon on one device)."""
+    """The two inner products <v,t> and <v,v>, computed in chunks along the leading axis.  A whole
+    array product would allocate a temporary as large as the input."""
     numerator = 0.0
     denominator = 0.0
     per_row = max(1, int(np.prod(target_vect.shape[1:], dtype=np.int64)))
@@ -784,7 +750,7 @@ def put_in_slice(array, flat_indices, value):
     """
     array_shape = array.shape
     flat_indices = torch.as_tensor(np.asarray(flat_indices), dtype=torch.int64, device=array.device)
-    # Clip out-of-range indices; the clipped positions receive the same value as the in-range write.
+    # Clip out of range indices.  A clipped position receives the same value as an in-range write.
     flat_indices = torch.clamp(flat_indices, 0, int(np.prod(array_shape[1:])) - 1)
     array = array.reshape(array_shape[0], -1).clone()
     array[:, flat_indices] = value
@@ -834,9 +800,7 @@ def apply_cylindrical_mask(recon, radial_margin=0, top_margin=0, bottom_margin=0
         >>> masked_vol.shape
         (128, 128, 64)
     """
-    # A sharded volume is masked shard by shard on its own devices.  The
-    # circular mask is the same for every slice; the top/bottom margins are
-    # global slice ranges, so each shard zeroes its own overlap with them.
+    # The top and bottom margins are global slice ranges, so each shard zeroes its own overlap with them.
     if isinstance(recon, _sharding.Shards):
         pl = recon.placement
         num_slices = pl.axis_len
@@ -863,7 +827,6 @@ def apply_cylindrical_mask(recon, radial_margin=0, top_margin=0, bottom_margin=0
     base_radius = max(row_center, col_center)
     radius = base_radius - radial_margin
 
-    # Create circular mask in (row, col) plane (small; built on recon's array module and device).
     if is_torch:
         row_coords, col_coords = torch.meshgrid(
             torch.arange(num_recon_rows, device=recon.device),
@@ -875,10 +838,10 @@ def apply_cylindrical_mask(recon, radial_margin=0, top_margin=0, bottom_margin=0
         dist_sq = (row_coords - row_center) ** 2 + (col_coords - col_center) ** 2
         circular_mask = (dist_sq <= radius ** 2).astype(recon.dtype)
 
-    # Circular mask: this multiply allocates the one new array we return; input is untouched.
+    # This multiply allocates the array that is returned.  The input is not modified.
     recon = recon * circular_mask[:, :, None]
 
-    # Zero top/bottom margins in place on that new array (no second full-volume copy -> 2x not 3x).
+    # Zero the top and bottom margins in place on that new array.
     if top_margin > 0:
         recon[:, :, :top_margin] = 0
     if bottom_margin > 0:
@@ -906,10 +869,7 @@ def detect_blank_margins(sino, safety_buffer=20, max_views_to_use=20):
         tuple: ``(crop_top, crop_bottom, crop_left, crop_right)`` -- detector rows to crop from the
         top and bottom, and detector channels to crop from the left and right.
     """
-    # The crop boundaries need full detector row/column resolution, but support detection is
-    # statistical across views -- so subsample VIEWS (axis 0) to keep this fast on large sinograms.
-    # The safety_buffer absorbs the small approximation from sampling fewer views (the object's
-    # row/column extent is stable across the rotation).
+    # Detection is statistical across views, so a subsample of views keeps it fast on a large sinogram.
     sino = mt.TomographyModel.subsample_views(sino, max_views_to_use)
 
     sino_indicator_mask = mt.TomographyModel._get_sino_indicator(sino)
@@ -919,13 +879,12 @@ def detect_blank_margins(sino, safety_buffer=20, max_views_to_use=20):
     rows = np.any(union_mask, axis=1)
     cols = np.any(union_mask, axis=0)
 
-    # argmax of the binary returns the first 1's index
+    # argmax on a binary array returns the index of the first 1.
     top_width = np.argmax(rows)
     bottom_width = np.argmax(rows[::-1])
     left_width = np.argmax(cols)
     right_width = np.argmax(cols[::-1])
 
-    # Include a margin to save some empty region on each boundary
     crop_pixels_top = max(top_width - safety_buffer, 0)
     crop_pixels_bottom = max(bottom_width - safety_buffer, 0)
     crop_pixels_left = max(left_width - safety_buffer, 0)
@@ -962,23 +921,21 @@ def apply_detector_crop(required_params, optional_params, crop_top, crop_bottom,
             or if ``crop_left + crop_right >= num_det_channels``.
     """
     num_views, num_det_rows, num_det_channels = required_params['sinogram_shape']
-    # Guard the geometry path independently of the array path (crop_view_data has the matching assert):
-    # a crop >= the detector dimension would otherwise silently produce a negative sinogram_shape.
+    # A crop as large as the detector dimension would give a negative sinogram_shape.
     assert (crop_top >= 0 and crop_bottom >= 0 and crop_left >= 0 and crop_right >= 0 and
             crop_top + crop_bottom < num_det_rows and crop_left + crop_right < num_det_channels), \
         ('apply_detector_crop: crop amounts must be nonnegative with crop_top + crop_bottom < num_det_rows'
          ' and crop_left + crop_right < num_det_channels (got top={}, bottom={}, left={}, right={} for a'
          ' {}x{} detector).'.format(crop_top, crop_bottom, crop_left, crop_right, num_det_rows, num_det_channels))
-    # Work on copies and return them, so the crop is an explicit data flow with no silent mutation of
-    # the caller's dicts.
+    # Work on copies so that the caller's dicts are not modified.
     required_params = dict(required_params)
     optional_params = dict(optional_params)
     required_params['sinogram_shape'] = (int(num_views),
                                          int(num_det_rows - crop_top - crop_bottom),
                                          int(num_det_channels - crop_left - crop_right))
 
-    # Shift each detector offset by the crop-induced move of the detector center.  Only geometries
-    # that carry the offset get it compensated (parallel beam, for instance, has no det_row_offset).
+    # Shift each detector offset by the move of the detector center.  Only a geometry that carries
+    # the offset gets it compensated.
     if 'det_row_offset' in optional_params:
         delta_det_row = optional_params.get('delta_det_row', 1.0)
         optional_params['det_row_offset'] += (crop_bottom - crop_top) / 2 * delta_det_row
@@ -993,12 +950,9 @@ def _auto_crop_sino(sino, required_params, optional_params, safety_buffer=20):
     """
     Detect and remove blank sinogram margins, updating the detector-plane geometry to match.
 
-    This packages :func:`detect_blank_margins` (find the blank margins), array slicing, and
-    :func:`apply_detector_crop` (update ``sinogram_shape`` and the detector offsets) into the
-    automatic-crop step.  It is geometry-general and detector-plane only.  A ``recon_slice_offset``
-    the dicts carry is moved by the change in the automatic center, which follows the detector
-    through the crop; run this before ``build_model`` (or before ``auto_set_recon_geometry`` when
-    constructing a model by hand).
+    This combines :func:`detect_blank_margins`, slicing of the sinogram, and
+    :func:`apply_detector_crop`.  A ``recon_slice_offset`` in the dicts is moved by the change in
+    the automatic center.  Run this before ``build_model``.
 
     Args:
         sino (np.ndarray): Sinogram, shape ``(num_views, num_det_rows, num_det_channels)``.
@@ -1013,8 +967,7 @@ def _auto_crop_sino(sino, required_params, optional_params, safety_buffer=20):
     """
     crop_top, crop_bottom, crop_left, crop_right = detect_blank_margins(sino, safety_buffer)
     sino = sino[:, crop_top:sino.shape[1] - crop_bottom, crop_left:sino.shape[2] - crop_right]
-    # A supplied recon_slice_offset keeps its place relative to the automatic center, which the crop
-    # moves along with the row offset.
+    # A supplied recon_slice_offset keeps its place relative to the automatic center.
     supplied_offset = optional_params.get('recon_slice_offset')
     if supplied_offset is not None:
         _, automatic_before = mt.utilities._automatic_recon_geometry(required_params, optional_params, None)
@@ -1110,19 +1063,15 @@ def estimate_sino_view_offset(ct_model, sino, recon_direct):
     """
     import cv2
 
-    # Verify the input recon shape
     recon_shape = ct_model.get_params('recon_shape')
     if tuple(recon_direct.shape) != tuple(recon_shape):
         raise ValueError("Input recon shape does not match ct_model's recon shape.")
 
-    # Forward project the reconstruction
     sino_from_recon = ct_model.forward_project(recon_direct)
 
-    # Apply a high-pass filter to sinogram and forward projection of the reconstruction
     filtered_sino = sino_high_pass_filtering(sino)
     filtered_sino_from_recon = sino_high_pass_filtering(sino_from_recon)
 
-    # Estimate the shift between original sinogram and forward projected recon
     num_slices, num_rows, num_channels = sino.shape
     estimated_shifts = np.zeros((num_slices, 2))
 
@@ -1166,11 +1115,9 @@ def sino_high_pass_filtering(sino, sigma_row=3.0, sigma_col=15.0, subtract_view_
     for view in range(num_views):
         single_view = sino_np[view]
 
-        # Subtract per-view mean
         if subtract_view_mean:
             single_view = single_view - single_view.mean()
 
-        # Estimate low frequency component for each view
         loss_pass_estimate = cv2.GaussianBlur(
             single_view,
             ksize=(0, 0),
@@ -1239,14 +1186,12 @@ def align_sino_views(ct_model, sino, recon_direct):
     Returns:
         numpy array: Aligned sinogram with the same shape as the input sinogram (num_views, num_det_rows, num_det_channels).
     """
-    # Estimate per-view shift of the sinogram
     estimated_shifts = estimate_sino_view_offset(ct_model, sino, recon_direct)
 
-    # Align each view of the sinogram using estimated shifts
     return _translate_views_bilinear(sino, estimated_shifts).cpu().numpy()
 
 
-# Conversion of a length unit to micrometers; 1 ALU is defined as 1 unit of the caller's alu_unit.
+# Conversion of a length unit to micrometers.  One ALU is one unit of the caller's alu_unit.
 _ALU_UNIT_CONVERSION = {'um': 1.0, 'mm': 1000.0, 'cm': 1e4, 'm': 1e6}
 
 
@@ -1480,7 +1425,7 @@ def fit_inverse_beam_hardening_curve(forward_params, vmin=0.0, vmax=5.0, degree=
             'fit_inverse_beam_hardening_curve: num_samples must be at least '
             'degree + 1.')
 
-    # estimate effective attenuation (h'(0))
+    # Estimate the effective attenuation h'(0).
     epsilon = 1e-6
     forward_at_zero = apply_beam_hardening_curve(
         0.0, forward_params,
@@ -1495,7 +1440,7 @@ def fit_inverse_beam_hardening_curve(forward_params, vmin=0.0, vmax=5.0, degree=
 
     path_min = 0.0
     path_max = max(path_min + 1.0, abs(vmax) + 1.0)
-    # Each pass doubles path_max; this guard prevents an infinite expansion loop.
+    # Each pass doubles path_max.  This guard prevents an infinite expansion loop.
     max_expand_iterations = 64
     for _ in range(max_expand_iterations):
         y_at_path_max = apply_beam_hardening_curve(
@@ -1648,19 +1593,17 @@ def correct_zinger_pixels(sino, zinger_pixel_ratio=0.1, num_passes=3, batch_size
     """
     pipeline.reject_shards('correct_zinger_pixels', sino=sino)
 
-    # The threshold is computed once, on the whole sinogram, BEFORE the views are split across
-    # devices.  A per-shard threshold would be estimated from a different subsample on each device,
-    # so the result would depend on the device count.
+    # The threshold is computed once on the whole sinogram, so the result does not depend on the
+    # number of devices.
     zinger_threshold = _zinger_threshold(sino, zinger_pixel_ratio, max_views_to_use)
     kernel = lambda b: _zinger_fill(b, zinger_threshold, num_passes)
     return pipeline.map_view_batches(sino, kernel, batch_size,
                                      devices=pipeline.permitted_devices(devices))
 
 
-# Value written into the 'format' attribute of new files.
+# This value is written into the 'format' attribute of new files.
 _CONE_PREPROCESSING_FORMAT = 'mbirtorch_preprocessing_v1'
-# Tags the loader accepts.  The mbirjax tag is the name this format was written under before the
-# package was renamed; files carrying it have the same layout, so they keep loading.
+# The loader accepts these tags.  The mbirjax tag names the same file layout.
 _ACCEPTED_CONE_PREPROCESSING_FORMATS = ('mbirtorch_preprocessing_v1', 'mbirjax_preprocessing_v1')
 
 
@@ -1700,7 +1643,7 @@ def save_cone_preprocessing(file_path, sinogram, cone_beam_params, optional_para
         return v.detach().cpu().numpy() if isinstance(v, torch.Tensor) else np.asarray(v)
 
     def _is_array(v):
-        # numpy/torch arrays (and other ndim>0 array-likes) -> datasets; scalars/tuples/str -> JSON.
+        # An array becomes a dataset.  A scalar, tuple, or string is stored as JSON.
         return hasattr(v, 'ndim') and getattr(v, 'ndim', 0) > 0
 
     scalar_params = {'cone_beam_params': {}, 'optional_params': {}}
@@ -1714,7 +1657,7 @@ def save_cone_preprocessing(file_path, sinogram, cone_beam_params, optional_para
                     f.create_dataset('{}__{}'.format(dname, key), data=_to_host(value))
                 else:
                     scalar_params[dname][key] = value
-        # numpy scalars -> Python via .item(); tuples -> JSON lists (sinogram_shape restored on load).
+        # A numpy scalar becomes a Python value through .item().  A tuple becomes a JSON list.
         f.attrs['params'] = json.dumps(scalar_params, default=lambda o: o.item())
         f.attrs['format'] = _CONE_PREPROCESSING_FORMAT
 
@@ -1752,7 +1695,7 @@ def load_cone_preprocessing(file_path):
     import json
     params = {'cone_beam_params': {}, 'optional_params': {}}
     with h5py.File(file_path, 'r') as f:
-        # A missing 'format' attribute is allowed; a present one must name a layout we can read.
+        # A missing 'format' attribute is allowed.  A present one must name a layout we can read.
         file_format = f.attrs.get('format')
         if file_format is not None:
             if isinstance(file_format, bytes):
@@ -1772,7 +1715,7 @@ def load_cone_preprocessing(file_path):
                 if ds_name.startswith(prefix):
                     params[dname][ds_name[len(prefix):]] = f[ds_name][()]
     cone_beam_params, optional_params = params['cone_beam_params'], params['optional_params']
-    # JSON turns the sinogram_shape tuple into a list; restore the tuple the constructor expects.
+    # JSON turns the sinogram_shape tuple into a list.  Restore the tuple that the constructor expects.
     if 'sinogram_shape' in cone_beam_params:
         cone_beam_params['sinogram_shape'] = tuple(int(x) for x in cone_beam_params['sinogram_shape'])
     return sinogram, cone_beam_params, optional_params, weights

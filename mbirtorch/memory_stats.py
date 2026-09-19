@@ -56,8 +56,7 @@ def get_memory_stats(print_results=True, file=None):
             memory_stats['peak_bytes_in_use'] = torch.cuda.max_memory_allocated(i)
             memory_stats['reserved_bytes'] = torch.cuda.memory_reserved(i)
             memory_stats['peak_reserved_bytes'] = torch.cuda.max_memory_reserved(i)
-            # The pool always covers the arrays in use, so this is never
-            # negative: it is the memory held for reuse but not in any array.
+            # This is the memory held for reuse but not in any array.
             memory_stats['cache_bytes'] = (memory_stats['reserved_bytes']
                                            - memory_stats['bytes_in_use'])
             memory_stats['bytes_limit'] = torch.cuda.get_device_properties(i).total_memory
@@ -70,17 +69,14 @@ def get_memory_stats(print_results=True, file=None):
         memory_stats['bytes_limit'] = torch.mps.recommended_max_memory()
         memory_stats_per_processor.append(memory_stats)
 
-    # Then add info for the CPU
     memory_stats = dict()
     current_process = psutil.Process(os.getpid())
     memory_info = current_process.memory_full_info()
     memory_stats['id'] = 'CPU'
-    # memory_info.rss is the Resident Set Size (the non-swapped physical
-    # memory the process has used); uss is the Unique Set Size.  The
-    # peak<-rss / in_use<-uss assignment is intentional.
+    # For the CPU, bytes_in_use is the unique set size and peak_bytes_in_use
+    # is the resident set size.  This assignment is intentional.
     memory_stats['bytes_in_use'] = memory_info.uss
     memory_stats['peak_bytes_in_use'] = memory_info.rss
-    # Available physical memory (excluding swap)
     memory_stats['bytes_limit'] = psutil.virtual_memory().available
     memory_stats_per_processor.append(memory_stats)
 

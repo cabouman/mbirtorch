@@ -52,22 +52,19 @@ DIALOG_PAGE_LINES = 30
 
 ROI_STATS_THROTTLE_S = 0.3
 
-# Backends with no interactive window; show() warns and returns under these.
+# These backends have no interactive window.  show() warns and returns.
 NONINTERACTIVE_BACKENDS = {'agg', 'pdf', 'ps', 'svg', 'template', 'cairo'}
 
-# Backends where the partial-redraw (blit) fast path is verified: Agg for
-# headless tests, TkAgg for the remote-X11 sessions the fast path exists for.
-# Everywhere else the viewer uses plain full redraws.  macosx in particular
-# reports blit support but repaints the whole window per blit, and its
-# Retina buffers are larger than the logical canvas size.
+# The partial redraw path is verified on these backends only.  The macosx backend
+# reports blit support but repaints the whole window on each blit.
 BLIT_BACKENDS = {'agg', 'tkagg'}
 
 # Extensions offered by the file-load browser (save always writes .h5).
 FILE_EXTENSIONS = ('.npy', '.npz', '.h5', '.hdf5')
 FILE_DIALOG_ROWS = 11
 
-# Returned by the native-dialog chain when no native file dialog can run;
-# the caller then falls back to the in-figure browser.
+# The native-dialog chain returns this when no native file dialog can run.
+# The caller then falls back to the in-figure browser.
 _NATIVE_UNAVAILABLE = object()
 
 
@@ -166,8 +163,8 @@ class VolumeStack:
         self.labels = self._normalize_labels(slice_label)
         self.data_dicts = self._normalize_data_dicts(data_dicts)
 
-        # original_data holds each volume in its as-passed axis order; data
-        # holds the permuted view actually displayed (slice axis last).
+        # original_data holds each volume in the axis order it was passed in.  data
+        # holds the permuted view that is displayed, with the slice axis last.
         self.original_data = []
         self.data = []
         for i, dataset in enumerate(datasets):
@@ -185,17 +182,14 @@ class VolumeStack:
         # 'comparison_index', 'use_abs', 'prev_label'.
         self._difference_info = [None] * self.n_volumes
 
-        # Each volume opens at its own midpoint; the master index (the shared
-        # slider position) starts at volume 0's midpoint.  The first
-        # set_master_index call snaps all volumes onto the proportional map.
+        # Each volume opens at its own midpoint, and the shared slider starts at
+        # volume 0's midpoint.
         self.cur_slices = [d.shape[2] // 2 for d in self.data]
         self.master_index = self.cur_slices[0]
 
         self.vmin, self.vmax = self.resolve_range(vmin, vmax)
 
-    # ------------------------------------------------------------------
-    # Input normalization
-    # ------------------------------------------------------------------
+    # --- Input normalization ---
 
     @staticmethod
     def perm_from_slice_axis(slice_axis):
@@ -244,9 +238,7 @@ class VolumeStack:
                 "same length as the number of datasets")
         return data_dicts
 
-    # ------------------------------------------------------------------
-    # Slice position: master index with proportional per-volume mapping
-    # ------------------------------------------------------------------
+    # --- Slice position: master index with proportional per-volume mapping ---
 
     @property
     def max_slices(self):
@@ -305,9 +297,7 @@ class VolumeStack:
         """Return the 2D array currently displayed for volume ``i``."""
         return self.data[i][:, :, self.cur_slices[i]]
 
-    # ------------------------------------------------------------------
-    # Axis permutations
-    # ------------------------------------------------------------------
+    # --- Axis permutations ---
 
     def set_perm(self, i, new_perm):
         """Re-orient volume ``i``; return True if the permutation changed.
@@ -338,9 +328,7 @@ class VolumeStack:
         perm[0], perm[1] = perm[1], perm[0]
         self.set_perm(i, perm)
 
-    # ------------------------------------------------------------------
-    # Intensity range
-    # ------------------------------------------------------------------
+    # --- Intensity range ---
 
     def data_range(self):
         """Return (min, max) over all volumes' current data."""
@@ -373,9 +361,7 @@ class VolumeStack:
         self.vmin, self.vmax = self.resolve_range(vmin, vmax)
         return self.vmin, self.vmax
 
-    # ------------------------------------------------------------------
-    # Difference images
-    # ------------------------------------------------------------------
+    # --- Difference images ---
 
     def is_difference(self, i):
         """Return True if volume ``i`` currently shows a difference image."""
@@ -430,9 +416,7 @@ class VolumeStack:
             self.labels[i] = info['prev_label']
         self._difference_info[i] = None
 
-    # ------------------------------------------------------------------
-    # ROI statistics
-    # ------------------------------------------------------------------
+    # --- ROI statistics ---
 
     def roi_stats(self, i, x, y, radius):
         """Statistics of the current slice of volume ``i`` inside a circle.
@@ -451,9 +435,7 @@ class VolumeStack:
         return {'mean': float(np.mean(values)), 'std': float(np.std(values)),
                 'min': float(np.min(values)), 'max': float(np.max(values))}
 
-    # ------------------------------------------------------------------
-    # File load
-    # ------------------------------------------------------------------
+    # --- File load ---
 
     @staticmethod
     def list_file_arrays(file_path):
@@ -537,8 +519,8 @@ class VolumeStack:
             raise ValueError("Loaded array must be 2D, 3D, or 4D")
 
         self.data_dicts[image_index] = data_dict
-        # The primary volume returns to the canonical display order for its
-        # slice axis; other replaced volumes keep their permutations.
+        # The primary volume returns to the standard display order for its
+        # slice axis.  Other replaced volumes keep their permutations.
         self.axes_perms[image_index] = self.perm_from_slice_axis(
             self.axes_perms[image_index][-1])
         for j in replaced:
@@ -570,14 +552,8 @@ def _save_data_hdf5(file_path, array, array_name='volume', attributes_dict=None)
             dataset.attrs[str(key)] = str(value)
 
 
-# ---------------------------------------------------------------------------
-# Native (Tk) dialogs
-# ---------------------------------------------------------------------------
-# Module-level so they can be exercised standalone.  Each creates a hidden Tk
-# root at call time, runs a short modal loop, and destroys the root before
-# returning -- the same lazy pattern as the native file dialogs, so importing
-# this module never touches a GUI toolkit.  Callers catch exceptions and fall
-# back to the in-figure dialogs.
+# Native Tk dialogs.  Each creates a hidden Tk root at call time and destroys it
+# before returning, so importing this module never touches a GUI toolkit.
 
 def _tk_menu(labels):
     """Show a menu-like popup at the mouse pointer; return the chosen label.
@@ -618,8 +594,8 @@ def _tk_menu(labels):
         top.attributes('-topmost', True)
         top.lift()
         listbox.focus_force()
-        # Dismiss on click-away (focus loss); bound after focus has settled
-        # so the binding cannot fire during the popup's own creation.
+        # The popup closes when it loses focus.  The binding is made after the
+        # focus has settled, so it cannot fire while the popup is being created.
         top.after(200, lambda: top.winfo_exists() and top.bind(
             '<FocusOut>', lambda _event: top.destroy()))
         root.wait_window(top)
@@ -815,41 +791,37 @@ class SliceViewer:
         self.show_instructions = show_instructions
         self.save_fn = save_fn if save_fn is not None else _save_data_hdf5
 
-        # Every piece of interaction state is initialized before any widget
-        # or callback is created, so no callback can ever observe a
-        # partially constructed viewer.
+        # All interaction state is initialized before any widget or callback
+        # is created, so no callback sees a partly built viewer.
         self._init_interaction_state()
         self._build_figure()
         self._connect_events()
 
-    # ------------------------------------------------------------------
-    # Construction
-    # ------------------------------------------------------------------
+    # --- Construction ---
 
     def _init_interaction_state(self):
         n = self.stack.n_volumes
         self.mode = Mode.IDLE
         self._mode_data = {}
-        # User-facing sync settings, separated from the reentrancy latch.
+        # These two are the user's sync settings.  _in_sync_callback below
+        # is the reentrancy latch and is not a setting.
         self.sync_limits = True
         self.sync_axes = len(set(self.stack.slice_axes)) == 1
         self._in_sync_callback = False
-        # ROI graphics: one circle and one stats text per volume, or None.
+        # The ROI graphics are one circle and one stats text per volume.
         self.circles = [None] * n
         self.stats_texts = [None] * n
         self.tooltips = []
-        # Trailing-edge throttle state for ROI statistics.
+        # These two throttle the ROI statistics updates.
         self._last_stats_time = 0.0
         self._stats_timer = None
-        # Overlays.
         self._dialog = None
         self._message_artist = None
-        # Blitting support; flips on once the first full draw has happened.
+        # Blitting turns on once the first full draw has happened.
         self.enable_blit = True
         self._renderer_ready = False
         self._clear_rect = None
         self._last_blit_regions = {}
-        # File dialog memory.
         self._last_dir = os.getcwd()
 
     def _build_figure(self):
@@ -869,8 +841,8 @@ class SliceViewer:
         self._create_slice_slider()
         self._create_intensity_slider()
 
-        # The opaque rectangle drawn under partial redraws; animated=True
-        # keeps it out of ordinary full draws.
+        # This opaque rectangle is drawn under partial redraws.  Marking it
+        # animated keeps it out of ordinary full draws.
         self._clear_rect = Rectangle((0, 0), 1, 1,
                                      facecolor=self.fig.get_facecolor(),
                                      edgecolor='none', animated=True,
@@ -894,9 +866,8 @@ class SliceViewer:
             ax = self.fig.add_subplot(self.gs[0, i])
             img = ax.imshow(stack.slice_image(i), cmap=self.cmap,
                             aspect='equal', vmin=stack.vmin, vmax=stack.vmax)
-            # Limits are managed explicitly (_reset_view); autoscale must not
-            # re-derive them from set_extent during refresh, which would leak
-            # one volume's extent onto the others through the zoom sync.
+            # _reset_view manages the limits.  Autoscale must not rederive them
+            # from set_extent, which would carry one volume's extent onto others.
             ax.set_autoscale_on(False)
             ax.set_title(self._title_text(i), fontsize=10)
             divider = make_axes_locatable(ax)
@@ -909,7 +880,7 @@ class SliceViewer:
             self.images[i] = img
 
     def _create_tooltips(self):
-        # Single owner: the tooltips are created exactly once, here.
+        # The tooltips are created exactly once, and only here.
         self.tooltips = [
             ax.annotate(TOOLTIP_TEXT, xy=(0, 0), xytext=TOOLTIP_OFFSET,
                         textcoords='offset points', ha='left',
@@ -920,13 +891,12 @@ class SliceViewer:
             for ax in self.axes
         ]
 
-    # --- slice-axis radios and range button -------------------------------
+    # --- slice-axis radios and range button ---
 
     def _create_axis_row(self):
         n = self.stack.n_volumes
-        # Each cell splits into [radio | spare]; the last spare cell holds
-        # the Set-range button.  Global toggles (couple axes/zoom) live in
-        # the right-click context menu.
+        # Each cell splits into a radio part and a spare part.  The last spare cell
+        # holds the Set-range button.
         self._radio_slots = []
         spare_slots = []
         for i in range(n):
@@ -974,7 +944,7 @@ class SliceViewer:
                 radio.on_clicked(
                     lambda label, i=i: self._on_axis_selected(i, int(label)))
 
-    # --- sliders ---------------------------------------------------------
+    # --- sliders ---
 
     def _slider_slot(self, row):
         # Inset the slider inside its row so the left label and right value
@@ -1017,9 +987,7 @@ class SliceViewer:
         self.intensity_slider.drawon = False
         self.intensity_slider.on_changed(self._on_intensity_slider)
 
-    # ------------------------------------------------------------------
-    # Event wiring
-    # ------------------------------------------------------------------
+    # --- Event wiring ---
 
     def _connect_events(self):
         canvas = self.fig.canvas
@@ -1069,9 +1037,8 @@ class SliceViewer:
 
         toolbar._update_view = types.MethodType(_update_view, toolbar)
 
-        # Home with an empty navigation stack is a silent no-op in stock
-        # matplotlib; in this viewer "home" is unambiguous, so fall back to
-        # the explicit full-extent reset.
+        # In stock matplotlib, Home with an empty navigation stack does
+        # nothing.  This viewer falls back to the full-extent reset.
         stock_home = type(toolbar).home
 
         def home(tb, *args):
@@ -1101,8 +1068,8 @@ class SliceViewer:
         return bool(getattr(toolbar, 'mode', ''))
 
     def _sync_limits_from(self, src_ax, which):
-        # One implementation for both directions; sync_limits is the user
-        # setting, _in_sync_callback the reentrancy latch.
+        # This runs for both directions.  sync_limits is the user setting,
+        # and _in_sync_callback is the reentrancy latch.
         if not self.sync_limits or self._in_sync_callback:
             return
         if src_ax not in self.axes:
@@ -1117,9 +1084,7 @@ class SliceViewer:
             self._in_sync_callback = False
         self.fig.canvas.draw_idle()
 
-    # ------------------------------------------------------------------
-    # The one button-press dispatcher
-    # ------------------------------------------------------------------
+    # --- The one button-press dispatcher ---
 
     def _volume_index_of(self, ax):
         try:
@@ -1129,15 +1094,15 @@ class SliceViewer:
 
     def _on_button_press(self, event):
         if self._dialog is not None:
-            # A click outside an open context menu dismisses it; all other
-            # dialogs' widgets handle their own events.
+            # A click outside an open context menu closes it.  Every other
+            # dialog's widgets handle their own events.
             if (self._dialog['kind'] == 'menu'
                     and event.inaxes not in self._dialog.get('menu_axes', ())):
                 self._close_dialog()
             return
         if event.button == 3:
-            # Right-click works even while the toolbar's pan/zoom tool is
-            # active, as in the reference viewer.
+            # Right-click works even while the toolbar's pan or zoom tool
+            # is active.
             if event.inaxes is self.intensity_slider.ax:
                 self._open_range_dialog()
                 return
@@ -1147,9 +1112,8 @@ class SliceViewer:
             return
         if event.button != 1:
             return
-        # Comparison selection outranks the toolbar tools: while the
-        # instruction overlay is up, a left-click on an image always means
-        # "this one", even if a pan/zoom mode is somehow armed.
+        # Comparison selection outranks the toolbar tools.  While the instruction
+        # overlay is up, a left-click selects an image even with pan or zoom armed.
         if self.mode is Mode.SELECT_COMPARISON:
             i = self._volume_index_of(event.inaxes)
             if i is not None:
@@ -1162,8 +1126,8 @@ class SliceViewer:
             return
         if event.xdata is None or event.ydata is None:
             return
-        # Hit-test the ROI circles: edge -> resize, interior -> move,
-        # anywhere else -> start a new ROI.
+        # A click on a circle's edge resizes it, and a click inside it moves
+        # it.  A click anywhere else starts a new ROI.
         for circle in self.circles:
             if circle is None:
                 continue
@@ -1245,9 +1209,7 @@ class SliceViewer:
         self._remove_roi_graphics()
         self.fig.canvas.draw_idle()
 
-    # ------------------------------------------------------------------
-    # ROI graphics, tooltips, and statistics
-    # ------------------------------------------------------------------
+    # --- ROI graphics, tooltips, and statistics ---
 
     def _remove_roi_graphics(self):
         for artist in self.circles + self.stats_texts:
@@ -1284,7 +1246,7 @@ class SliceViewer:
             return
         now = time.monotonic()
         if not force and now - self._last_stats_time < ROI_STATS_THROTTLE_S:
-            # Trailing edge: guarantee one final update after the burst.
+            # This guarantees one final update after a burst of moves.
             self._schedule_trailing_stats()
             return
         self._last_stats_time = now
@@ -1321,9 +1283,7 @@ class SliceViewer:
         self._display_roi_stats(force=True)
         self._partial_redraw()
 
-    # ------------------------------------------------------------------
-    # Messages
-    # ------------------------------------------------------------------
+    # --- Messages ---
 
     def _show_message(self, show, message_type=None, message=None):
         if self._message_artist is not None:
@@ -1349,9 +1309,7 @@ class SliceViewer:
                 bbox=dict(facecolor='white', alpha=0.9), zorder=20)
         self.fig.canvas.draw_idle()
 
-    # ------------------------------------------------------------------
-    # In-place refresh (there is no teardown/rebuild path)
-    # ------------------------------------------------------------------
+    # --- In-place refresh (there is no teardown/rebuild path) ---
 
     def refresh(self, volume_index=None):
         """Push model state into the panels in place: data, extent, title."""
@@ -1365,10 +1323,8 @@ class SliceViewer:
             self.axes[i].set_title(self._title_text(i), fontsize=10)
 
     def _reset_view(self, volume_index=None):
-        # Hold the sync latch: a programmatic reset gives each volume its
-        # own full extent, and must not propagate one volume's extent onto
-        # panels with different displayed shapes (e.g. after decoupled axis
-        # changes).
+        # The sync latch is held here.  A reset gives each volume its own full
+        # extent and must not carry it onto panels with a different shape.
         indices = (range(self.stack.n_volumes) if volume_index is None
                    else [volume_index])
         already_syncing = self._in_sync_callback
@@ -1396,9 +1352,7 @@ class SliceViewer:
         self.slice_slider.ax.set_xlim(0, max_slices - 1)
         self.slice_slider.set_val(self.stack.master_index)
 
-    # ------------------------------------------------------------------
-    # Slider callbacks
-    # ------------------------------------------------------------------
+    # --- Slider callbacks ---
 
     def _on_slice_slider(self, value):
         changed = self.stack.set_master_index(value)
@@ -1413,9 +1367,7 @@ class SliceViewer:
             img.set_clim(value[0], value[1])
         self._partial_redraw(widgets=('intensity',))
 
-    # ------------------------------------------------------------------
-    # Slice-axis selection and coupling
-    # ------------------------------------------------------------------
+    # --- Slice-axis selection and coupling ---
 
     def _reset_navigation(self):
         """Clear the toolbar's saved views; they are stale after structural
@@ -1454,9 +1406,7 @@ class SliceViewer:
     def _toggle_couple_zoom(self):
         self.sync_limits = not self.sync_limits
 
-    # ------------------------------------------------------------------
-    # The context menu
-    # ------------------------------------------------------------------
+    # --- The context menu ---
 
     def _in_process_tk_ok(self):
         """True when opening an in-process Tk window is safe.
@@ -1557,16 +1507,11 @@ class SliceViewer:
         else:
             self.fig.canvas.draw_idle()
 
-    # ------------------------------------------------------------------
-    # Strip actions
-    # ------------------------------------------------------------------
+    # --- Strip actions ---
 
     def _on_difference_button(self, i, use_abs=False):
-        # NOTE: no toolbar state is touched here.  Toggling pan/zoom
-        # programmatically desynchronizes the macosx backend's NATIVE
-        # buttons from matplotlib's internal mode (the visual inverts);
-        # selection clicks work with a tool armed because the dispatcher
-        # checks SELECT_COMPARISON before the toolbar guard.
+        # No toolbar state is touched here.  Toggling pan or zoom in code leaves
+        # the macosx backend's native buttons out of step with matplotlib's mode.
         if self.stack.is_difference(i):
             self._on_restore(i)
             return
@@ -1613,20 +1558,16 @@ class SliceViewer:
         self.fig.canvas.draw_idle()
 
     def _on_reset_button(self, i):
-        # View-level reset: zoom, ROI, overlays, and any pending selection.
+        # This resets the zoom, the ROI, the overlays, and any pending
+        # selection.
         self._reset_view(None if self.sync_limits else i)
         self._remove_roi_graphics()
         self._set_mode(Mode.IDLE)
         self._show_message(False)
         self.fig.canvas.draw_idle()
 
-    # ------------------------------------------------------------------
-    # Dialog infrastructure: modal in-figure panels
-    # ------------------------------------------------------------------
-    # A dialog is a set of high-zorder axes: a translucent full-figure
-    # backdrop plus a white panel holding widgets.  The backdrop's zorder
-    # makes event.inaxes resolve to dialog axes only, so the widgets and
-    # dispatcher underneath are inert while a dialog is open.
+    # A modal in-figure dialog is a set of high-zorder axes.  Its backdrop makes
+    # event.inaxes resolve to dialog axes only, so the widgets underneath do nothing.
 
     def _main_widgets(self):
         widgets = list(self.axis_radios)
@@ -1645,11 +1586,9 @@ class SliceViewer:
         backdrop.set_yticks([])
         self._dialog = {'kind': kind, 'axes': [backdrop], 'widgets': {},
                         'texts': {}, 'state': {}}
-        # Matplotlib widgets hit-test geometrically (Axes.contains), not by
-        # stacking order, so widgets underneath the dialog must be disabled
-        # explicitly.  (.active is the flag every widget's ignore() checks;
-        # set_active cannot be used because RadioButtons/CheckButtons
-        # repurpose that name for option selection.)
+        # Matplotlib widgets hit-test by position and not by stacking order, so the
+        # widgets under the dialog are disabled through the .active flag that every
+        # widget's ignore() checks.  RadioButtons give set_active another meaning.
         for widget in self._main_widgets():
             widget.active = False
         return self._dialog
@@ -1700,9 +1639,8 @@ class SliceViewer:
         return textbox
 
     def _dialog_text(self, name, xy, text, **kwargs):
-        # Texts are children of the panel axes so they draw above the panel's
-        # opaque face; the transform keeps their coordinates in figure
-        # fractions, and panel removal removes them.
+        # The texts are children of the panel axes, so they draw above the panel's
+        # opaque face and are removed with the panel.
         kwargs.setdefault('fontsize', DIALOG_FONT_SIZE)
         panel = self._dialog['panel_ax']
         artist = panel.text(xy[0], xy[1], text,
@@ -1710,7 +1648,7 @@ class SliceViewer:
         self._dialog['texts'][name] = artist
         return artist
 
-    # --- intensity-range dialog ------------------------------------------
+    # --- intensity-range dialog ---
 
     def _open_range_dialog(self):
         if self._in_process_tk_ok():
@@ -1765,8 +1703,8 @@ class SliceViewer:
         x0, y0, w, h = self._dialog_panel(4.6, 2.6)
         self._dialog_text('title', (x0 + 0.02 * w, y0 + h - 0.06),
                           'Set intensity range', fontweight='bold')
-        # Fields start empty so new bounds can be typed without fighting the
-        # cursor; a blank field keeps its current bound.
+        # The fields start empty, so a new bound can be typed directly.  A
+        # blank field keeps its current bound.
         self._dialog_text('hint', (x0 + 0.02 * w, y0 + h - 0.11),
                           f'Blank keeps the current bound '
                           f'({stack.vmin:.6g}, {stack.vmax:.6g}).')
@@ -1819,7 +1757,7 @@ class SliceViewer:
         slider.ax.set_xlim(stack.vmin, stack.vmax)
         slider.set_val((stack.vmin, stack.vmax))
 
-    # --- data-dict dialogs -------------------------------------------------
+    # --- data-dict dialogs ---
 
     def _on_dict_button(self, i):
         data_dict = self.stack.data_dicts[i]
@@ -1915,13 +1853,8 @@ class SliceViewer:
         self._render_text_page()
         self.fig.canvas.draw_idle()
 
-    # --- file load/save dialogs --------------------------------------------
-    # File selection tries the platform's native dialog first -- Qt's on Qt
-    # backends, the macOS panel via osascript (a separate process, so it
-    # cannot conflict with the GUI event loop), then tkinter's -- and falls
-    # back to the in-figure browser when none is available.  Everything is
-    # resolved lazily at click time; nothing here adds an import-time
-    # dependency.
+    # File selection tries native dialogs first, in the order Qt, the macOS panel
+    # through osascript, then tkinter, and falls back to the in-figure browser.
 
     def _native_choose_file(self, mode, directory, initial_file):
         """Return a chosen path, None if cancelled, or _NATIVE_UNAVAILABLE."""
@@ -1939,9 +1872,8 @@ class SliceViewer:
                                                    initial_file)
             except Exception:
                 pass
-        # In-process Tk is safe only under TkAgg; under other toolkits'
-        # event loops it can crash the process outright, so fall back to
-        # the in-figure browser instead of risking it.
+        # In-process Tk is safe only under TkAgg.  Under another toolkit's event
+        # loop it can crash the process, so the in-figure browser is used instead.
         if not self._in_process_tk_ok():
             return _NATIVE_UNAVAILABLE
         try:
@@ -2026,8 +1958,8 @@ class SliceViewer:
                 self._finish_save(i, chosen)
 
         if matplotlib.get_backend().lower() == 'tkagg':
-            # Launch from Tk's scheduler rather than from inside this
-            # callback; launching a second Tk root re-entrantly misbehaves.
+            # This launches from Tk's scheduler rather than from inside this
+            # callback.  A second Tk root started inside a callback misbehaves.
             try:
                 self.fig.canvas.manager.window.after(10, run)
                 return
@@ -2081,8 +2013,8 @@ class SliceViewer:
             if os.path.isfile(full) and \
                     name.lower().endswith(FILE_EXTENSIONS):
                 entries.append((name, full, False))
-        # Navigating up re-selects the directory we came from: land on the
-        # page that contains it rather than restarting at page one.
+        # Navigating up reselects the directory the listing came from, so the
+        # browser lands on the page that contains it rather than on the first page.
         if select_name is not None:
             for index, (label, _full, _is_dir) in enumerate(entries):
                 if label.rstrip(os.sep) == select_name:
@@ -2227,9 +2159,8 @@ class SliceViewer:
     def _finish_save(self, i, path):
         if not path.lower().endswith('.h5'):
             path += '.h5'
-        # Under TkAgg, offer the data dict for editing before it is written
-        # (the reference's easygui flow, as one editor window).  Elsewhere
-        # the dict is saved as-is.
+        # Under TkAgg the data dict is offered for editing before it is
+        # written.  On every other backend it is saved as it is.
         if self._in_process_tk_ok():
             try:
                 result = _tk_dict_editor(self.stack.data_dicts[i])
@@ -2250,14 +2181,9 @@ class SliceViewer:
         self._show_message(True,
                            message=f"Saved to {path}. Press Esc to dismiss.")
 
-    # ------------------------------------------------------------------
-    # Partial redraws (blitting)
-    # ------------------------------------------------------------------
-    # A partial redraw repaints only the affected panels or slider rows:
-    # paint an opaque rectangle over the region, redraw those axes into the
-    # canvas buffer, and blit the region.  No artist is marked animated, so
-    # full draws and savefig need no special casing, and backends without
-    # blit support (e.g. macosx) simply fall back to draw_idle.
+    # A partial redraw repaints only the affected panels or slider rows.  No artist
+    # is marked animated, so full draws and savefig need no special case.  A backend
+    # without blit support falls back to draw_idle.
 
     def _partial_redraw(self, volume_indices=None, widgets=()):
         canvas = self.fig.canvas
@@ -2270,8 +2196,8 @@ class SliceViewer:
             canvas.draw_idle()
             return
         renderer = canvas.get_renderer()
-        # Clip to the renderer buffer, not the logical canvas size: on HiDPI
-        # displays the two differ by the device pixel ratio.
+        # The clip is against the renderer buffer rather than the logical canvas
+        # size.  On a HiDPI display the two differ by the device pixel ratio.
         buffer_w = getattr(renderer, 'width', 0) or canvas.get_width_height()[0]
         buffer_h = getattr(renderer, 'height', 0) or canvas.get_width_height()[1]
         canvas_box = Bbox([[0, 0], [buffer_w, buffer_h]])
@@ -2314,9 +2240,7 @@ class SliceViewer:
         except NotImplementedError:
             pass
 
-    # ------------------------------------------------------------------
-    # Showing
-    # ------------------------------------------------------------------
+    # --- Showing ---
 
     def show(self, block=True):
         """Display the viewer window.
@@ -2345,8 +2269,8 @@ class SliceViewer:
             self.fig.canvas.draw_idle()
 
 
-# Keeps block=False viewers (and their toolkit widgets) alive for callers
-# who drop the returned viewer; the next blocking call adopts and closes them.
+# This keeps nonblocking viewers alive for callers who drop the returned
+# viewer.  The next blocking call adopts and closes them.
 _NONBLOCKING_VIEWERS = []
 
 
@@ -2401,11 +2325,8 @@ def slice_viewer(*datasets, data_dicts=None, title='', vmin=None, vmax=None,
     if not block:
         _NONBLOCKING_VIEWERS.append(viewer)
         return viewer
-    # The blocking show returned, so every open window has been closed.
-    # Close any earlier nonblocking viewers and, under TkAgg, collect now on
-    # the main thread: matplotlib's TkAgg backend leaves orphaned tkinter
-    # objects that a later background-thread GC would finalize with no Tk
-    # mainloop running ("main thread is not in main loop").
+    # The blocking show returned, so earlier nonblocking viewers are closed here.
+    # Under TkAgg the garbage collection also runs here, on the main thread.
     for nonblocking_viewer in _NONBLOCKING_VIEWERS:
         plt.close(nonblocking_viewer.fig)
     _NONBLOCKING_VIEWERS.clear()
