@@ -81,6 +81,7 @@ docs = [
 addopts = "-m 'not goldens'"
 markers = [
     "goldens: opt-in cross-framework parity tests; need tests/goldens artifacts generated from the mbirjax env",
+    "performance: timing-gate tests; exclude with -m 'not performance' on loaded machines",
 ]
 
 [tool.setuptools.dynamic]

@@ -985,6 +985,7 @@ def ball_phantom(scene, radius=8.0):
     return np.where(inside, 1.0, 0.0).astype(np.float32)
 
 
+@pytest.mark.performance
 def test_a_slider_step_with_a_sinogram_stays_under_the_gate():
     """A slider step on the 1800-view scan stays under the gate with a sinogram.
 
