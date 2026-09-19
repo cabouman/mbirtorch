@@ -62,14 +62,33 @@ def test_nsi_symmetric_crop_is_byte_identical():
         assert op[key] == pytest.approx(base[key]), key   # crop changes nothing but the shape
 
 
-def test_nsi_asymmetric_crop_shifts_row_offset():
-    conv = mtp.nsi.convert_nsi_to_mbirtorch_params
+def test_asymmetric_crop_shifts_row_offset_for_every_vendor():
+    # crop_top=10, crop_bottom=0, sides=0: the row offset moves by half the
+    # difference of the two row crops times the row pitch, and the channel
+    # offset does not move, in all three vendor conversions.
+    nsi_conv = mtp.nsi.convert_nsi_to_mbirtorch_params
     p = _nsi_params()
-    _, base = conv(p, (1, 1), 0, 0, 0)
-    cb, op = conv(p, (1, 1), 0, 10, 0)                   # crop_top=10, crop_bottom=0
+    _, base = nsi_conv(p, (1, 1), 0, 0, 0)
+    cb, op = nsi_conv(p, (1, 1), 0, 10, 0)
     assert cb['sinogram_shape'] == (20, 54, 80)
     assert op['det_row_offset'] == pytest.approx(base['det_row_offset'] + (0 - 10) / 2 * base['delta_det_row'])
     assert op['det_channel_offset'] == pytest.approx(base['det_channel_offset'])   # sides symmetric
+
+    zeiss_conv = mtp.zeiss.convert_zeiss_to_mbirtorch_params
+    p = _zeiss_params()
+    _, base, _ = zeiss_conv(p, (1, 1), 0, 0, 0)
+    gp, op, _ = zeiss_conv(p, (1, 1), 0, 10, 0)
+    assert gp['sinogram_shape'] == (20, 54, 80)
+    assert op['det_row_offset'] == pytest.approx(base['det_row_offset'] + (0 - 10) / 2 * base['delta_det_row'])
+    assert op['det_channel_offset'] == pytest.approx(base['det_channel_offset'])
+
+    tct_conv = mtp.zeiss_tct.convert_zeiss_to_mbirtorch_params
+    p = _tct_params()
+    _, base = tct_conv(p, 0, 0, 0)
+    tp, op = tct_conv(p, 0, 10, 0)
+    assert tp['sinogram_shape'] == (20, 54, 80)
+    assert op['det_row_offset'] == pytest.approx(base['det_row_offset'] + (0 - 10) / 2 * base['delta_det_row'])
+    assert op['det_channel_offset'] == pytest.approx(base['det_channel_offset'])
 
 
 def test_nsi_offset_shift_uses_raw_pitch_independent_of_downsample():
@@ -84,46 +103,6 @@ def test_nsi_offset_shift_uses_raw_pitch_independent_of_downsample():
     cb2, op2 = conv(p, (2, 2), 0, 10, 0)
     assert op2['delta_det_row'] == pytest.approx(raw_pitch * 2)    # downsample still scales the pitch
     assert cb2['sinogram_shape'] == (20, 54 // 2, 80 // 2)
-
-
-def test_zeiss_symmetric_crop_is_byte_identical():
-    conv = mtp.zeiss.convert_zeiss_to_mbirtorch_params
-    p = _zeiss_params()
-    _, base, _ = conv(p, (1, 1), 0, 0, 0)
-    gp, op, _ = conv(p, (1, 1), 3, 5, 5)
-    assert gp['sinogram_shape'] == (20, 54, 74)
-    assert op['det_row_offset'] == pytest.approx(base['det_row_offset'])
-    assert op['det_channel_offset'] == pytest.approx(base['det_channel_offset'])
-
-
-def test_zeiss_asymmetric_crop_shifts_row_offset():
-    conv = mtp.zeiss.convert_zeiss_to_mbirtorch_params
-    p = _zeiss_params()
-    _, base, _ = conv(p, (1, 1), 0, 0, 0)
-    gp, op, _ = conv(p, (1, 1), 0, 10, 0)
-    assert gp['sinogram_shape'] == (20, 54, 80)
-    assert op['det_row_offset'] == pytest.approx(base['det_row_offset'] + (0 - 10) / 2 * base['delta_det_row'])
-    assert op['det_channel_offset'] == pytest.approx(base['det_channel_offset'])
-
-
-def test_zeiss_tct_symmetric_crop_is_byte_identical():
-    conv = mtp.zeiss_tct.convert_zeiss_to_mbirtorch_params
-    p = _tct_params()
-    _, base = conv(p, 0, 0, 0)
-    tp, op = conv(p, 3, 5, 5)                                # sides=3, top=bottom=5 (symmetric)
-    assert tp['sinogram_shape'] == (20, 54, 74)
-    assert op['det_row_offset'] == pytest.approx(base['det_row_offset'])
-    assert op['det_channel_offset'] == pytest.approx(base['det_channel_offset'])
-
-
-def test_zeiss_tct_asymmetric_crop_shifts_row_offset():
-    conv = mtp.zeiss_tct.convert_zeiss_to_mbirtorch_params
-    p = _tct_params()
-    _, base = conv(p, 0, 0, 0)
-    tp, op = conv(p, 0, 10, 0)                               # sides=0, top=10, bottom=0 (asymmetric)
-    assert tp['sinogram_shape'] == (20, 54, 80)
-    assert op['det_row_offset'] == pytest.approx(base['det_row_offset'] + (0 - 10) / 2 * base['delta_det_row'])
-    assert op['det_channel_offset'] == pytest.approx(base['det_channel_offset'])
 
 
 def test_auto_crop_sino_consistent_and_survives_build_model():

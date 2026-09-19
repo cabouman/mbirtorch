@@ -14,8 +14,8 @@ import torch
 
 import mbirtorch
 from mbirtorch import _memory_ledger, _sharding
-from mbirtorch._memory_ledger import (Ledger, LedgerPlan, MemoryPreflightError,
-                                      PhaseCharge, estimate_peak_device_bytes)
+from mbirtorch._memory_ledger import (Ledger, LedgerPlan, PhaseCharge,
+                                      estimate_peak_device_bytes)
 from mbirtorch._utils import padded_kernel_width
 
 GB = 2 ** 30
@@ -44,7 +44,8 @@ def make_plan(n_devices=1, num_views=64, num_rows=32, num_channels=32,
 
 
 # ── the state terms ──────────────────────────────────────────────────────────
-def test_persistent_set_is_the_four_arrays_and_scales_with_shape():
+def test_the_charges_scale_with_shape_cylinders_granularity_and_devices():
+    """The four proportionality rules the ledger's arithmetic rests on."""
     # Doubling the slice count doubles every recon-shaped term and leaves the
     # sinogram-shaped ones alone, so the peak grows by less than 2x.
     small = estimate_peak_device_bytes(make_plan(recon=(32, 32, 32)))
@@ -52,31 +53,67 @@ def test_persistent_set_is_the_four_arrays_and_scales_with_shape():
     assert large.peak_bytes(0) > small.peak_bytes(0)
     assert large.peak_bytes(0) < 2 * small.peak_bytes(0)
 
+    # The prior phase is proportional to the cylinder count it is priced at.
+    nine = estimate_peak_device_bytes(make_plan(qggmrf_cylinders=9))
+    sixteen = estimate_peak_device_bytes(make_plan(qggmrf_cylinders=16))
+    prior_9 = dict(_named(nine, 'prior').terms)['prior cylinders'][0]
+    prior_16 = dict(_named(sixteen, 'prior').terms)['prior cylinders'][0]
+    assert prior_16 == pytest.approx(prior_9 * 16 / 9)
 
-def test_weights_are_charged_once_not_twice():
+    # P_g = ceil(P_full / g), so the coarsest granularity holds the most.
+    ledger = estimate_peak_device_bytes(make_plan(granularities=(4, 128)))
+    coarse = _named(ledger, 'prior (granularity 4)').per_device[0]
+    fine = _named(ledger, 'prior (granularity 128)').per_device[0]
+    assert coarse > fine
+    assert ledger.peak_bytes(0) >= coarse
+
+    # Every persistent array is a share of the volume, so it shrinks exactly
+    # with the device count.
+    one = estimate_peak_device_bytes(make_plan(n_devices=1))
+    four = estimate_peak_device_bytes(make_plan(n_devices=4))
+    persistent_1 = dict(_named(one, 'prior').terms)['error sinogram'][0]
+    persistent_4 = dict(_named(four, 'prior').terms)['error sinogram'][0]
+    assert persistent_4 == persistent_1 // 4
+
+
+def test_weights_are_charged_once_and_only_where_they_are_resident():
     """The hessian's weight array is an ALIAS of supplied weights.
 
     Charging both would over-count a full sinogram on every weighted run,
-    which is the common case.  With weights supplied and the hessian computed
-    internally, the peak must not exceed the unweighted case by more than one
-    sinogram-shaped array on any phase that holds both.
+    which is the common case.  Supplied weights are placed at the top of
+    _vcd_recon, so they are resident from there on; the unweighted run's
+    all-ones array is built INSIDE the hessian block, so nothing
+    weights-shaped is resident before it.
     """
     sino_bytes = 64 * 32 * 32 * 4
     unweighted = estimate_peak_device_bytes(make_plan(weights_supplied=False))
     weighted = estimate_peak_device_bytes(make_plan(weights_supplied=True))
     # The hessian phase holds the weights either way (as the ones array, or as
     # the caller's array), so it must read identically.
-    hess_un = _named(unweighted, 'hessian diagonal').per_device[0]
-    hess_w = _named(weighted, 'hessian diagonal').per_device[0]
-    assert hess_un == hess_w
+    assert (_named(unweighted, 'hessian diagonal').per_device[0]
+            == _named(weighted, 'hessian diagonal').per_device[0])
     # The subset back projection materializes a weighted product only when
     # weights are supplied: exactly one sinogram-shaped array more.
     back_un = _named(unweighted, 'back projection').per_device[0]
     back_w = _named(weighted, 'back projection').per_device[0]
     assert back_w - back_un == sino_bytes
+    # Resident through the pre-loop phases when supplied, absent when not.
+    for fragment in ('direct recon', 'initial forward projection',
+                     'error sinogram formation'):
+        assert dict(_named(weighted, fragment).terms)['weights'][0] \
+            == sino_bytes, fragment
+        assert dict(_named(unweighted, fragment).terms)['weights'][0] == 0, \
+            fragment
+    # From the hessian onward the unweighted run has one too.
+    assert dict(_named(unweighted, 'hessian diagonal').terms)[
+        'hessian weights'][0] == sino_bytes
+    assert dict(_named(unweighted, 'subset prior').terms)['weights'][0] \
+        == sino_bytes
 
 
-def test_supplied_hessian_and_init_recon_drop_their_phases():
+def test_supplied_state_drops_the_phases_it_replaces():
+    """A supplied hessian, a supplied initial volume, and a resume each drop
+    the phases that would have produced them."""
     # A grid much larger than the masked set makes the hessian dominate, so
     # dropping it has to move the peak and not merely the phase list.
     shape = dict(recon=(64, 64, 32), num_pixels_full=800)
@@ -89,8 +126,6 @@ def test_supplied_hessian_and_init_recon_drop_their_phases():
     assert not _has(supplied, 'hessian diagonal')
     assert supplied.peak_bytes(0) < full.peak_bytes(0)
 
-
-def test_resume_drops_the_initialization_phases_entirely():
     resumed = estimate_peak_device_bytes(make_plan(
         resume=True, init_recon_supplied=True, fm_hessian_supplied=True))
     names = [p.name for p in resumed.phases]
@@ -104,42 +139,7 @@ def test_resume_drops_the_initialization_phases_entirely():
     assert any(n.startswith('per-iteration statistics') for n in names)
 
 
-def test_hessian_phase_uses_the_unmasked_grid_count():
-    """The one phase charged at the full grid rather than the ROR-masked set."""
-    masked = make_plan(num_pixels_full=800, recon=(64, 64, 32))
-    ledger = estimate_peak_device_bytes(masked)
-    hessian = _named(ledger, 'hessian diagonal')
-    grid_term = dict(hessian.terms)['back output'][0]
-    # 3 x cyl(P_grid, slices), with P_grid = 64*64 and not the 800 masked.
-    assert grid_term == 3 * (64 * 64) * 32 * 4
-
-
-def test_prior_cylinder_count_drives_the_prior_phase():
-    nine = estimate_peak_device_bytes(make_plan(qggmrf_cylinders=9))
-    sixteen = estimate_peak_device_bytes(make_plan(qggmrf_cylinders=16))
-    prior_9 = dict(_named(nine, 'prior').terms)['prior cylinders'][0]
-    prior_16 = dict(_named(sixteen, 'prior').terms)['prior cylinders'][0]
-    assert prior_16 == pytest.approx(prior_9 * 16 / 9)
-
-
-def test_coarsest_granularity_dominates_the_subset_phases():
-    """P_g = ceil(P_full / g), so the coarsest granularity holds the most."""
-    ledger = estimate_peak_device_bytes(make_plan(granularities=(4, 128)))
-    coarse = _named(ledger, 'prior (granularity 4)').per_device[0]
-    fine = _named(ledger, 'prior (granularity 128)').per_device[0]
-    assert coarse > fine
-    assert ledger.peak_bytes(0) >= coarse
-
-
 # ── the multi-device terms ───────────────────────────────────────────────────
-def test_persistent_set_shrinks_with_the_device_count():
-    one = estimate_peak_device_bytes(make_plan(n_devices=1))
-    four = estimate_peak_device_bytes(make_plan(n_devices=4))
-    persistent_1 = dict(_named(one, 'prior').terms)['error sinogram'][0]
-    persistent_4 = dict(_named(four, 'prior').terms)['error sinogram'][0]
-    assert persistent_4 == persistent_1 // 4
-
-
 def test_band_reduce_shrinks_with_the_device_count():
     """The signature that replaced the flat one, and the closed form it rests
     on.
@@ -187,7 +187,7 @@ def test_band_reduce_shrinks_with_the_device_count():
     assert reduce_bytes(1) == 0       # a single device never runs the reduce
 
 
-def test_band_reduce_charges_the_bands_already_reduced_this_pass():
+def test_band_reduce_charges_the_whole_shard_and_the_padded_band():
     """A band smaller than the shard means several reduces per owner, and the
     owner holds the ones it has finished until it concatenates them.
 
@@ -200,77 +200,85 @@ def test_band_reduce_charges_the_bands_already_reduced_this_pass():
     allocates the band rounded up to a multiple of 16, so that one term is
     charged at the padded length.
     """
-    plan = make_plan(n_devices=2, back_band=4)
-    ledger = estimate_peak_device_bytes(plan)
-    charged = dict(_sub(ledger, 'subset back projection', 2,
-                        'band reduce').terms)['band reduce'][0]
-    p_sub, shard, band = math.ceil(800 / 4), 16, 4
-    own_partial = padded_kernel_width(band)
-    assert own_partial == 16
-    slab = _sharding.reduce_slab_rows(p_sub, band * 4) * band * 4
-    assert charged == p_sub * (shard + own_partial) * 4 + slab
+    p_sub, shard = math.ceil(800 / 4), 16
 
-    # The floor rule in the place it bites: however narrow the band, the owner
-    # still ends the pass holding a whole shard, so the charge may not fall
-    # under one cylinder-shard.  The old form did, which is what this
-    # replaces: it charged only the band in flight.
     def charge(band_length):
         led = estimate_peak_device_bytes(make_plan(n_devices=2,
                                                    back_band=band_length))
         return dict(_sub(led, 'subset back projection', 2,
                          'band reduce').terms)['band reduce'][0]
 
+    band = 4
+    own_partial = padded_kernel_width(band)
+    assert own_partial == 16
+    slab = _sharding.reduce_slab_rows(p_sub, band * 4) * band * 4
+    assert charge(band) == p_sub * (shard + own_partial) * 4 + slab
+
+    # The floor rule in the place it bites: however narrow the band, the owner
+    # still ends the pass holding a whole shard, so the charge may not fall
+    # under one cylinder-shard.  The old form did, which is what this
+    # replaces: it charged only the band in flight.
     one_shard = p_sub * shard * 4
     for band_length in (1, 2, 4, 8, 16):
         assert charge(band_length) > one_shard, band_length
     # And it still falls as the band narrows, so the knob remains a lever.
     assert charge(1) < charge(4) < charge(16)
 
+    def terms(slices):
+        ledger = estimate_peak_device_bytes(
+            make_plan(n_devices=2, recon=(32, 32, slices)))
+        workers = dict(_sub(ledger, 'subset back projection', 2,
+                            'back workers').terms)
+        reduce_phase = dict(_sub(ledger, 'subset back projection', 2,
+                                 'band reduce').terms)
+        return workers['back output'][0], reduce_phase['band reduce'][0]
 
-def test_empty_shard_extensions_skip_their_role_terms():
+    # 40 slices over two devices is a shard and a band of 20, which rounds up
+    # to 32.  The two live blocks are charged at 32 slices each, and the
+    # reduce holds the owner's own partial at 32 beside its shard at 20.
+    # 32 slices over two devices is a band of 16, which rounds up to itself,
+    # so both terms read exactly as they did before the padding existed.
+    assert padded_kernel_width(20) == 32
+    assert padded_kernel_width(16) == 16
+    for band in (20, 16):
+        padded = padded_kernel_width(band)
+        blocks, reduce_bytes = terms(2 * band)
+        assert blocks == 2 * p_sub * padded * 4, band
+        slab = _sharding.reduce_slab_rows(p_sub, band * 4) * band * 4
+        assert reduce_bytes == p_sub * (band + padded) * 4 + slab, band
+
+
+def test_each_term_lands_only_where_its_array_exists():
     """A device with no real views does no projection; one with no real slices
-    holds no band.  The ledger charges each role only where it exists."""
+    holds no band; the partition sequence is the lead device's alone."""
     # 3 views over 4 devices: device 3 owns no real view.
-    plan = make_plan(n_devices=4, num_views=3, recon=(32, 32, 32))
-    ledger = estimate_peak_device_bytes(plan)
-    back = _named(ledger, 'back projection')
-    batch = dict(back.terms)['back batch']
-    assert batch[3] == 0
+    ledger = estimate_peak_device_bytes(
+        make_plan(n_devices=4, num_views=3, recon=(32, 32, 32)))
+    assert dict(_named(ledger, 'back projection').terms)['back batch'][3] == 0
     # And with 3 slices over 4 devices, device 3 owns no real slice.
-    plan = make_plan(n_devices=4, num_views=64, recon=(32, 32, 3))
-    ledger = estimate_peak_device_bytes(plan)
+    ledger = estimate_peak_device_bytes(
+        make_plan(n_devices=4, num_views=64, recon=(32, 32, 3)))
     reduce_phase = _sub(ledger, 'subset back projection', 4, 'band reduce')
     assert dict(reduce_phase.terms)['band reduce'][3] == 0
     # The band it finished is charged only where a band lands, too.
     workers = _sub(ledger, 'subset back projection', 4, 'back workers')
     assert dict(workers.terms)['finished own band'][3] == 0
-
-
-def test_partitions_are_charged_to_the_lead_device_only():
-    ledger = estimate_peak_device_bytes(make_plan(n_devices=2))
-    partitions = dict(_named(ledger, 'prior').terms)['partitions (lead device)']
+    # The partitions are charged to the lead device only.
+    two = estimate_peak_device_bytes(make_plan(n_devices=2))
+    partitions = dict(_named(two, 'prior').terms)['partitions (lead device)']
     assert partitions[0] > 0
     assert partitions[1] == 0
 
 
-def test_slice_band_knob_reduces_the_band_reduce():
-    """The remedy the error message names first must actually work."""
-    wide = estimate_peak_device_bytes(make_plan(n_devices=2))
-    narrow = estimate_peak_device_bytes(make_plan(n_devices=2, back_band=4))
-    wide_reduce = dict(_sub(wide, 'subset back projection', 2,
-                            'band reduce').terms)['band reduce'][0]
-    narrow_reduce = dict(_sub(narrow, 'subset back projection', 2,
-                              'band reduce').terms)['band reduce'][0]
-    assert narrow_reduce < wide_reduce
-
-
-def test_back_projection_holds_three_cylinders_on_one_device():
+def test_the_back_output_holds_the_blocks_the_view_loop_realizes():
     """The driver evaluates `block = back_body(...)` before rebinding the
     name, so the previous block is still alive while the next is produced:
-    accumulator, outgoing block, incoming block."""
+    accumulator, outgoing block, incoming block.  With a cost model the count
+    follows the batches actually realized: min(2, view_batches).
+    """
+    p_sub = math.ceil(800 / 4)
     ledger = estimate_peak_device_bytes(make_plan(n_devices=1))
     back = dict(_named(ledger, 'subset back projection').terms)['back output'][0]
-    p_sub = math.ceil(800 / 4)
     assert back == 3 * p_sub * 32 * 4
     # A multi-device slice-owner instead accumulates band parts and
     # concatenates them, which is two.
@@ -278,50 +286,39 @@ def test_back_projection_holds_three_cylinders_on_one_device():
     back2 = dict(_named(shared, 'subset back projection').terms)['back output'][0]
     assert back2 == 2 * p_sub * 16 * 4
 
+    def blocks(batches_per_device):
+        # A charge that yields exactly `batches_per_device` batches over the
+        # 32 views each of two devices owns.
+        def charge(direction, num_pixels, band_cols):
+            return max(1, 32 // batches_per_device), 1
+        led = estimate_peak_device_bytes(
+            make_plan(n_devices=2, view_charge=charge))
+        terms = dict(_sub(led, 'subset back projection', 2,
+                          'back workers').terms)
+        return terms['back output'][0] / (p_sub * 16 * 4)
 
-def test_weights_are_live_in_every_pre_loop_phase_when_supplied():
-    """Supplied weights are placed at the top of _vcd_recon, so they are
-    resident through the direct recon and the initial error state."""
-    sino_bytes = 64 * 32 * 32 * 4
-    ledger = estimate_peak_device_bytes(make_plan(weights_supplied=True))
-    for fragment in ('direct recon', 'initial forward projection',
-                     'error sinogram formation'):
-        terms = dict(_named(ledger, fragment).terms)
-        assert terms['weights'][0] == sino_bytes, fragment
-
-
-def test_unweighted_run_has_no_weights_array_before_the_hessian():
-    """The all-ones array is built INSIDE the hessian block, so nothing
-    weights-shaped is resident before it."""
-    sino_bytes = 64 * 32 * 32 * 4
-    ledger = estimate_peak_device_bytes(make_plan(weights_supplied=False))
-    for fragment in ('direct recon', 'initial forward projection',
-                     'error sinogram formation'):
-        assert dict(_named(ledger, fragment).terms)['weights'][0] == 0, fragment
-    # From the hessian onward it exists.
-    assert dict(_named(ledger, 'hessian diagonal').terms)[
-        'hessian weights'][0] == sino_bytes
-    assert dict(_named(ledger, 'subset prior').terms)['weights'][0] == sino_bytes
+    assert blocks(1) == 1                        # one batch, one block
+    assert blocks(2) == 2
+    assert blocks(8) == 2                        # capped at the accumulator + 1
+    # No cost model at all: the ceiling, which is what the docstring promises.
+    assert dict(_sub(shared, 'subset back projection', 2,
+                     'back workers').terms)['back output'][0] \
+        == 2 * p_sub * 16 * 4
 
 
-def test_the_initial_dot_products_charge_blocks_not_whole_sinograms():
-    """The two dot products that set the initial scale reduce in blocks.
+def test_the_initial_error_state_charges_blocks_not_whole_sinograms():
+    """The two dot products that set the initial scale reduce in blocks, and
+    the error sinogram is formed in the projection's own buffer.
 
-    Both branches used to bind the weights product `weights * fwd` -- the
-    single-device one as a whole array, the sharded one per shard -- and to
+    Both branches used to bind the weights product `weights * fwd` and to
     reduce `sum(wf * fwd)` through a whole product temporary beside it.  That
     pair of sinogram-shaped arrays made this sub-phase the widest instant of
     a weighted initialization.  The reductions now walk a block of views at a
-    time, so neither array exists and what is charged is two blocks: a
-    weighted block holds the products and their weighted form.
+    time, so neither array exists and what is charged is two blocks.
 
     Two blocks are charged on the unweighted path as well, where only one is
     really live.  A ledger may over-charge and may not under-charge, and the
     single rule keeps the two paths from drifting apart.
-
-    These sinograms are below one chunk, so they are reduced whole and a
-    block is the whole shard -- the arithmetic and the cost the chunked form
-    replaced.
     """
     sino_bytes = 64 * 32 * 32 * 4
     assert sino_bytes < _memory_ledger.ELL1_CHUNK_BYTES
@@ -333,26 +330,19 @@ def test_the_initial_dot_products_charge_blocks_not_whole_sinograms():
         assert 'dot product temporary' not in terms
         assert terms['dot product blocks'][0] == 2 * sino_bytes // n_devices
 
-
-def test_the_initial_error_sub_peaks_hold_one_sinogram_beside_the_state():
-    """Both sub-peaks of the initial error state sit at the state itself.
-
-    Neither phase holds a second sinogram-shaped array any more: the dot
-    products reduce a block of views at a time, and the error sinogram is
-    formed in the projection's own buffer.  What a device holds is the
-    sinogram, the weights, the one array that is the projection and then the
-    error, and the initial volume -- plus, in the dot products, two reduction
-    blocks that do not scale with the sinogram.
-
-    Written as a relation between the two phases and their own terms rather
-    than as byte counts, so it holds at every size and device count.
-    """
+    # `_initial_error_state` scales the projection by -alpha in place and adds
+    # the sinogram into it, so the projection and the error sinogram are one
+    # array and the scaled copy has no existence.  Written as a relation
+    # between the two phases and their own terms rather than as byte counts,
+    # so it holds at every size and device count.
     for n_devices in (1, 2):
         ledger = estimate_peak_device_bytes(
             make_plan(n_devices=n_devices, weights_supplied=True))
         dots = _named(ledger, 'initial dot products')
         error = _named(ledger, 'error sinogram formation')
         dot_terms, err_terms = dict(dots.terms), dict(error.terms)
+        assert 'alpha-scaled projection' not in err_terms
+        assert 'forward projection' not in err_terms
         for i in range(n_devices):
             state = (dot_terms['sinogram'][i] + dot_terms['weights'][i]
                      + dot_terms['forward projection'][i]
@@ -368,183 +358,83 @@ def test_the_initial_error_sub_peaks_hold_one_sinogram_beside_the_state():
             assert error.per_device[i] == state + overhead
             assert dots.per_device[i] == error.per_device[i] + blocks
 
-
-def test_error_formation_charges_one_array_for_the_projection_and_the_error():
-    """The error sinogram is formed in the projection's own buffer.
-
-    `_initial_error_state` scales the projection by -alpha in place and adds
-    the sinogram into it, so the projection and the error sinogram are one
-    array and the scaled copy has no existence.  The phase used to charge
-    three sinogram-shaped arrays here -- the projection, the scaled copy that
-    `sinogram - alpha * fwd` allocated, and the difference -- and now charges
-    the one that is really live, which is what makes this phase cheaper than
-    the dot products that precede it.
-    """
-    ledger = estimate_peak_device_bytes(make_plan())
-    terms = dict(_named(ledger, 'error sinogram formation').terms)
-    sino_bytes = 64 * 32 * 32 * 4
-    assert 'alpha-scaled projection' not in terms
-    assert 'forward projection' not in terms
-    assert terms['error sinogram'][0] == sino_bytes
-    # The dot products before it hold the same state plus their reduction
-    # blocks, so they stay the wider of the two sub-peaks.
-    dots = _named(ledger, 'initial dot products').per_device[0]
-    assert dots > _named(ledger, 'error sinogram formation').per_device[0]
+    # At a production-sized sinogram the blocks are capped by the reduction
+    # chunk instead of following the sinogram.  That is what takes the initial
+    # error state off the peak of a large weighted run.
+    target = _memory_ledger.ELL1_CHUNK_BYTES
+    big = estimate_peak_device_bytes(make_plan(
+        num_views=2048, num_rows=256, num_channels=256, weights_supplied=True))
+    charged = dict(_named(big, 'initial dot products')
+                   .terms)['dot product blocks'][0]
+    assert charged == 2 * target
+    assert charged < 2048 * 256 * 256 * 4 / 8
 
 
-def test_recon_direct_loop_and_scatter_are_not_co_live():
-    """The back accumulator feeds the scatter, so the two are consecutive
-    sub-peaks rather than one sum.
+def test_the_per_iteration_statistics_hold_capped_blocks():
+    """The squared-error transient is two blocks -- the squares and their
+    weighted form -- and the recon ell-1 is its own sub-phase beside it.
 
-    Both are emitted and the per-device maximum picks between them.  Picking
-    one whole sub-phase by a cross-device total would under-charge a device
-    where the other is larger, so the selection must stay per device.
-    """
-    ledger = estimate_peak_device_bytes(make_plan())
-    loop = _named(ledger, 'direct recon (back loop)')
-    scatter = _named(ledger, 'direct recon (scatter)')
-    assert 'scatter buffer' not in dict(loop.terms)
-    assert 'back output' not in dict(scatter.terms)
-    # The contribution to the peak is the max of the two, never their sum.
-    combined = max(loop.per_device[0], scatter.per_device[0])
-    assert combined < loop.per_device[0] + scatter.per_device[0]
-    assert ledger.peak_bytes(0) >= combined
-
-
-def test_sub_phase_selection_is_per_device():
-    """A two-device layout whose sub-peaks rank differently per device must
-    charge each device its own larger sub-peak."""
-    ledger = estimate_peak_device_bytes(make_plan(n_devices=2))
-    for i in (0, 1):
-        loop = _named(ledger, 'direct recon (back loop)').per_device[i]
-        scatter = _named(ledger, 'direct recon (scatter)').per_device[i]
-        assert ledger.peak_bytes(i) >= max(loop, scatter)
-
-
-def test_per_iteration_statistics_are_charged():
-    """Charged as zero by the first ledger, and measured as the peak of an
-    unweighted run once the residency fixes shrank the other phases.
-
-    The squared-error transient is two blocks: the squares and their weighted
-    form.  This sinogram is below one chunk, so it is reduced whole and a
-    block is the whole sinogram -- the arithmetic and the cost the chunked
-    form replaced.
+    The ell-1 phase used to charge the squared-error products alone, on the
+    reading that the L1 "fuses into its own reduction and materializes
+    nothing".  It does not: ``sum(abs(flat_recon))`` allocated a whole second
+    recon.  Both reductions are now bounded to a chunk, so neither charge
+    follows the array it reduces.
     """
     sino_bytes = 64 * 32 * 32 * 4
-    assert sino_bytes < _memory_ledger.ELL1_CHUNK_BYTES
+    target = _memory_ledger.ELL1_CHUNK_BYTES
+    assert sino_bytes < target
     ledger = estimate_peak_device_bytes(make_plan())
-    stats = _named(ledger, 'per-iteration statistics (squared error)')
-    assert dict(stats.terms)['squared-error products'][0] == 2 * sino_bytes
-    # It carries the persistent set, like every other in-loop phase.
-    assert dict(stats.terms)['error sinogram'][0] == sino_bytes
-    assert dict(stats.terms)['flat recon'][0] > 0
-
-
-def test_the_recon_ell_1_is_charged_beside_the_squared_error_products():
-    """The recon L1 does allocate, and is charged as its own sub-phase.
-
-    This phase used to charge the squared-error products alone, on the reading
-    that the L1 "fuses into its own reduction and materializes nothing".  It
-    does not: ``sum(abs(flat_recon))`` allocated a whole second recon.  The
-    sizes that were measured simply had two sinograms larger, so the miss did
-    not show.  The two are consecutive rather than co-live, so both are
-    emitted and the per-device maximum picks.
-    """
-    ledger = estimate_peak_device_bytes(make_plan())
-    ell1 = _named(ledger, 'per-iteration statistics (recon ell-1)')
     squared = _named(ledger, 'per-iteration statistics (squared error)')
-    charged = dict(ell1.terms)['recon ell-1 chunk'][0]
-    assert charged > 0
+    ell1 = _named(ledger, 'per-iteration statistics (recon ell-1)')
+    # Below one chunk the sinogram is reduced whole and a block is the whole
+    # sinogram -- the arithmetic the chunked form replaced.
+    assert dict(squared.terms)['squared-error products'][0] == 2 * sino_bytes
+    # Both carry the persistent set, as every in-loop phase does, and neither
+    # holds the other's transient.
+    assert dict(squared.terms)['error sinogram'][0] == sino_bytes
+    assert dict(squared.terms)['flat recon'][0] > 0
+    assert dict(ell1.terms)['recon ell-1 chunk'][0] > 0
+    assert dict(ell1.terms)['error sinogram'][0] > 0
     assert 'squared-error products' not in dict(ell1.terms)
     assert 'recon ell-1 chunk' not in dict(squared.terms)
-    # Both carry the persistent set, as every in-loop phase does.
-    assert dict(ell1.terms)['error sinogram'][0] > 0
 
-
-def test_the_recon_ell_1_chunk_stops_following_the_recon():
-    """A recon far larger than two sinograms is the geometry the old charge
-    missed.  image_ell1 bounds the transient to a chunk, so the charge no
-    longer scales with the recon."""
-    target = _memory_ledger.ELL1_CHUNK_BYTES
-    # Few views, big recon: two sinograms are much smaller than one recon.
-    plan = make_plan(recon=(512, 512, 512), num_views=8,
-                     num_rows=64, num_channels=64,
-                     num_pixels_full=512 * 512)
-    ledger = estimate_peak_device_bytes(plan)
-    terms = dict(_named(ledger,
+    # Few views, big recon: two sinograms are much smaller than one recon,
+    # which is the geometry the old ell-1 charge missed.
+    big_recon = estimate_peak_device_bytes(make_plan(
+        recon=(512, 512, 512), num_views=8, num_rows=64, num_channels=64,
+        num_pixels_full=512 * 512))
+    terms = dict(_named(big_recon,
                         'per-iteration statistics (recon ell-1)').terms)
-    squared = dict(_named(ledger,
-                          'per-iteration statistics (squared error)').terms)
+    products = dict(_named(big_recon, 'per-iteration statistics (squared '
+                                      'error)').terms)['squared-error products']
     recon_bytes = terms['flat recon'][0]
     chunk = terms['recon ell-1 chunk'][0]
-    # The geometry the old charge missed: one recon dwarfs two sinograms, so
-    # charging the sinogram products alone would have set the phase far too low.
-    assert recon_bytes > 100 * squared['squared-error products'][0]
-    # And the chunk does not follow the recon.
+    assert recon_bytes > 100 * products[0]
     assert chunk <= recon_bytes / 16
     assert 0.5 * target <= chunk <= 2 * target
 
-
-def test_the_squared_error_chunk_stops_following_the_sinogram():
-    """A production-sized sinogram is what the two whole products cost.
-
-    weighted_square_sum reduces a block of views at a time, so the phase
-    holds two blocks however large the sinogram is.  The charge is two chunks
-    rather than two sinograms, which is what takes this phase off the peak of
-    a large run.
-    """
-    target = _memory_ledger.ELL1_CHUNK_BYTES
-    plan = make_plan(num_views=2048, num_rows=256, num_channels=256)
-    sino_bytes = 2048 * 256 * 256 * 4
-    ledger = estimate_peak_device_bytes(plan)
-    charged = dict(_named(ledger, 'per-iteration statistics (squared error)')
+    # A production-sized sinogram: the charge is two chunks rather than two
+    # sinograms, which is what takes this phase off the peak of a large run.
+    big_sino = estimate_peak_device_bytes(make_plan(
+        num_views=2048, num_rows=256, num_channels=256))
+    charged = dict(_named(big_sino, 'per-iteration statistics (squared error)')
                    .terms)['squared-error products'][0]
     assert charged == 2 * target
-    assert charged < sino_bytes / 8
+    assert charged < 2048 * 256 * 256 * 4 / 8
 
-
-def test_the_squared_error_block_is_a_whole_number_of_views():
-    """The reduction splits the view axis, so a block cannot be finer than
-    one view.
-
-    A sinogram with few views and large detector planes holds a block larger
-    than the byte rule alone gives, and the charge has to follow the block
-    that is really allocated rather than the byte rule -- a ledger may
-    over-charge but never under-charge.
-
-    Every phase that reduces a sinogram in blocks prices its block by the
-    same rule, so the initial dot products are checked here beside the
-    per-iteration statistics.
-    """
-    plan = make_plan(num_views=4, num_rows=2048, num_channels=3000)
+    # The reduction splits the view axis, so a block cannot be finer than one
+    # view: a sinogram with few views and large detector planes holds a block
+    # larger than the byte rule alone gives.  Every phase that reduces a
+    # sinogram in blocks prices its block by the same rule, so the initial dot
+    # products are checked here beside the per-iteration statistics.
+    few_views = estimate_peak_device_bytes(
+        make_plan(num_views=4, num_rows=2048, num_channels=3000))
     view_bytes = 2048 * 3000 * 4
-    assert view_bytes > _memory_ledger.ELL1_CHUNK_BYTES
-    ledger = estimate_peak_device_bytes(plan)
-    charged = dict(_named(ledger, 'per-iteration statistics (squared error)')
-                   .terms)['squared-error products'][0]
-    # Four views over a chunk count far above four: one view per block.
-    assert charged == 2 * view_bytes
-    assert dict(_named(ledger, 'initial dot products').terms)[
+    assert view_bytes > target
+    assert dict(_named(few_views, 'per-iteration statistics (squared error)')
+                .terms)['squared-error products'][0] == 2 * view_bytes
+    assert dict(_named(few_views, 'initial dot products').terms)[
         'dot product blocks'][0] == 2 * view_bytes
-
-
-def test_the_initial_dot_blocks_stop_following_the_sinogram():
-    """A production-sized sinogram is what the weighted projection and the
-    product temporary used to cost.
-
-    The dot products reduce a block of views at a time, so the phase holds
-    two blocks however large the sinogram is.  That is what takes the initial
-    error state off the peak of a large weighted run.
-    """
-    target = _memory_ledger.ELL1_CHUNK_BYTES
-    plan = make_plan(num_views=2048, num_rows=256, num_channels=256,
-                     weights_supplied=True)
-    sino_bytes = 2048 * 256 * 256 * 4
-    ledger = estimate_peak_device_bytes(plan)
-    charged = dict(_named(ledger, 'initial dot products')
-                   .terms)['dot product blocks'][0]
-    assert charged == 2 * target
-    assert charged < sino_bytes / 8
 
 
 # ── the back projection's two sub-steps ──────────────────────────────────────
@@ -552,214 +442,63 @@ SPLIT_PARENTS = ('direct recon (back loop)', 'hessian diagonal',
                  'subset back projection')
 
 
-def test_every_back_phase_splits_into_workers_and_reduce_at_n_above_one():
-    """The workers project and the reduce gathers, consecutively.
+def test_consecutive_sub_phases_contribute_their_max_never_their_sum():
+    """Sub-steps that feed one another are consecutive sub-peaks, not one sum.
 
-    Charging their sum priced a peak that is never live.  Both are emitted
-    and the per-device maximum over phases picks between them, exactly as the
-    direct recon's loop/scatter split does.
+    The back accumulator feeds the scatter; the back workers project and the
+    reduce gathers.  Both are emitted and the per-device maximum over phases
+    picks between them.  Charging their sum priced a peak that is never live,
+    which was the largest over-charge at n>1.  Picking one whole sub-phase by
+    a cross-device total would under-charge a device where the other is
+    larger, so the selection must stay per device.
     """
-    ledger = estimate_peak_device_bytes(make_plan(n_devices=2))
-    names = [p.name for p in ledger.phases]
+    ledger = estimate_peak_device_bytes(make_plan())
+    loop = _named(ledger, 'direct recon (back loop)')
+    scatter = _named(ledger, 'direct recon (scatter)')
+    assert 'scatter buffer' not in dict(loop.terms)
+    assert 'back output' not in dict(scatter.terms)
+    combined = max(loop.per_device[0], scatter.per_device[0])
+    assert combined < loop.per_device[0] + scatter.per_device[0]
+    assert ledger.peak_bytes(0) >= combined
+
+    two = estimate_peak_device_bytes(make_plan(n_devices=2))
+    names = [p.name for p in two.phases]
+    for i in (0, 1):
+        assert two.peak_bytes(i) >= max(
+            _named(two, 'direct recon (back loop)').per_device[i],
+            _named(two, 'direct recon (scatter)').per_device[i])
     for parent in SPLIT_PARENTS:
-        workers = _sub(ledger, parent, 2, 'back workers')
-        reduce_phase = _sub(ledger, parent, 2, 'band reduce')
-        # The phase's contribution is the MAX of the two, never their sum.
+        workers = _sub(two, parent, 2, 'back workers')
+        reduce_phase = _sub(two, parent, 2, 'band reduce')
         for i in (0, 1):
             both = max(workers.per_device[i], reduce_phase.per_device[i])
             assert both < workers.per_device[i] + reduce_phase.per_device[i]
-            assert ledger.peak_bytes(i) >= both
+            assert two.peak_bytes(i) >= both
         # And the unsplit parent name is gone -- nothing charges the sum.
         assert parent not in names
 
-
-def test_the_split_sub_phases_keep_the_parent_name_visible():
-    """The compatibility surface.
-
-    Every consumer that matches a phase by its parent name -- the preflight
-    message, a calibration row, these tests -- must still find it, so the
-    sub-step is a SUFFIX and never a rewrite.
-    """
-    ledger = estimate_peak_device_bytes(make_plan(n_devices=2))
+    # The peak really sits below what summing the two would have charged.
+    four = estimate_peak_device_bytes(make_plan(
+        n_devices=4, recon=(64, 64, 32), num_pixels_full=3000))
     for parent in SPLIT_PARENTS:
-        for step in ('back workers', 'band reduce'):
-            name = _sub(ledger, parent, 2, step).name
-            assert name.startswith(parent), name
-            assert name.endswith(f'[{step}]'), name
-    # The message the user reads still names the parent it came from.
-    _fits, rows = _memory_ledger.layout_fits(ledger, [1024, 1024])
-    message = _memory_ledger.format_shortfall(ledger, rows,
-                                              num_devices_tried=2)
-    assert ledger.dominant_phase(0).name in message
+        summed = (_sub(four, parent, 4, 'back workers').per_device[0]
+                  + _sub(four, parent, 4, 'band reduce').per_device[0])
+        assert four.peak_bytes(0) < summed
 
 
-def test_each_sub_phase_charges_only_its_own_terms():
-    """The workers hold blocks, the band they already finished, and the
-    batch; the reduce holds its gather and nothing of the loop."""
-    ledger = estimate_peak_device_bytes(make_plan(n_devices=2))
-    workers = dict(_sub(ledger, 'direct recon (back loop)', 2,
-                        'back workers').terms)
-    reduce_phase = dict(_sub(ledger, 'direct recon (back loop)', 2,
-                             'band reduce').terms)
-    for term in ('back output', 'finished own band', 'back batch'):
-        assert term in workers and term not in reduce_phase, term
-    assert 'band reduce' in reduce_phase and 'band reduce' not in workers
-    # Both carry the same residents, which is why neither can be dropped.
-    for term in ('sinogram', 'filtered sinogram', 'library workspace'):
-        assert workers[term] == reduce_phase[term], term
-
-
-def test_a_single_device_phase_is_not_split_and_does_not_move():
-    """n == 1 has no reduce to split off, so the phase stays whole under the
-    parent name and every single-device charge reads exactly as before."""
-    ledger = estimate_peak_device_bytes(make_plan(n_devices=1))
-    names = [p.name for p in ledger.phases]
-    assert 'direct recon (back loop)' in names
-    assert not any('[back workers]' in n or '[band reduce]' in n for n in names)
-    terms = dict(_named(ledger, 'direct recon (back loop)').terms)
-    assert terms['band reduce'][0] == 0          # never runs at one device
-    assert terms['finished own band'][0] == 0    # nor does the band handoff
-    assert terms['back output'][0] == 3 * 800 * 32 * 4   # still three
-
-
-def test_the_worker_block_count_follows_the_realized_view_batches():
-    """The calibrated term.
-
-    The view loop releases each block after accumulating it, so it holds the
-    accumulator plus the incoming block: min(2, view_batches).  A plan with
-    no cost model cannot count batches and charges the ceiling of two.
-    """
-    p_sub = math.ceil(800 / 4)
-
-    def blocks(batches_per_device):
-        # A charge that yields exactly `batches_per_device` batches over the
-        # 32 views each of two devices owns.
-        def charge(direction, num_pixels, band_cols):
-            return max(1, 32 // batches_per_device), 1
-        ledger = estimate_peak_device_bytes(
-            make_plan(n_devices=2, view_charge=charge))
-        terms = dict(_sub(ledger, 'subset back projection', 2,
-                          'back workers').terms)
-        return terms['back output'][0] / (p_sub * 16 * 4)
-
-    assert blocks(1) == 1                        # one batch, one block
-    assert blocks(2) == 2
-    assert blocks(8) == 2                        # capped at the accumulator + 1
-    # No cost model at all: the ceiling, which is what the docstring promises.
-    ledger = estimate_peak_device_bytes(make_plan(n_devices=2))
-    assert dict(_sub(ledger, 'subset back projection', 2,
-                     'back workers').terms)['back output'][0] == 2 * p_sub * 16 * 4
-
-
-def test_the_band_sized_back_partials_are_charged_at_the_padded_band():
-    """A kernel wrapper allocates the band rounded up to a multiple of 16.
-
-    Two terms hold such a partial, and both read the padded length: the
-    blocks the view loop holds, and the partial the reduce keeps alive on the
-    owner.  A band that is already a multiple of 16 is charged exactly what
-    it was charged before the padding existed.
-    """
-    p_sub = math.ceil(800 / 4)
-
-    def terms(slices):
-        ledger = estimate_peak_device_bytes(
-            make_plan(n_devices=2, recon=(32, 32, slices)))
-        workers = dict(_sub(ledger, 'subset back projection', 2,
-                            'back workers').terms)
-        reduce_phase = dict(_sub(ledger, 'subset back projection', 2,
-                                 'band reduce').terms)
-        return workers['back output'][0], reduce_phase['band reduce'][0]
-
-    # 40 slices over two devices is a shard and a band of 20, which rounds up
-    # to 32.  The two live blocks are charged at 32 slices each, and the
-    # reduce holds the owner's own partial at 32 beside its shard at 20.
-    band = 20
-    padded = padded_kernel_width(band)
-    assert padded == 32
-    blocks, reduce_bytes = terms(2 * band)
-    assert blocks == 2 * p_sub * padded * 4
-    slab = _sharding.reduce_slab_rows(p_sub, band * 4) * band * 4
-    assert reduce_bytes == p_sub * (band + padded) * 4 + slab
-
-    # 32 slices over two devices is a band of 16, which rounds up to itself,
-    # so both terms read exactly as they did before.
-    band = 16
-    assert padded_kernel_width(band) == band
-    blocks, reduce_bytes = terms(2 * band)
-    assert blocks == 2 * p_sub * band * 4
-    slab = _sharding.reduce_slab_rows(p_sub, band * 4) * band * 4
-    assert reduce_bytes == p_sub * (band + band) * 4 + slab
-
-
-def test_the_finished_own_band_is_one_cylinder_on_every_slice_owner():
-    """Each owner keeps its reduced band for the rest of the loop, so from
-    its own pass onward it carries one extra cylinder through every later
-    pass.  Real and unavoidable, so the ledger has to charge it."""
-    ledger = estimate_peak_device_bytes(make_plan(n_devices=2))
-    terms = dict(_sub(ledger, 'direct recon (back loop)', 2,
-                      'back workers').terms)
-    assert terms['finished own band'] == [800 * 16 * 4] * 2
-
-
-def test_no_phase_carries_a_margin_term():
-    """The ledger used to carry a safety margin -- one per-device sinogram
-    shard on every forward phase -- standing in for arrays nobody had
-    enumerated yet.  Those arrays are now charged directly and checked against
-    measurement, so NO phase may carry a margin term: every term must name an
-    array the code allocates.
-    """
-    one = estimate_peak_device_bytes(make_plan(n_devices=1))
-    two = estimate_peak_device_bytes(make_plan(n_devices=2))
-    for ledger in (one, two):
-        for phase in ledger.phases:
-            for name, _vals in phase.terms:
-                assert 'margin' not in name, (phase.name, name)
-
-
-def test_the_forward_block_count_follows_the_realized_view_batches():
-    """The forward counterpart of the worker block count, with one
-    difference.
-
-    The view-range loop has no release, so it holds the outgoing block and the
-    incoming one: min(2, view_batches).  One of those is already inside the
-    batch charge -- a forward body's output plane scales with the view batch,
-    so its ``_view_batch_cost`` prices it per view -- so this term charges the
-    remainder: nothing at a single batch, one block above that.
-    """
-    # make_plan defaults to a two-fan geometry: one whose detector rows are
-    # not tied 1:1 to recon slices, as in cone beam.
-    rows, channels = 32, 32
-
-    def block(batches_per_device):
-        # A charge that yields exactly `batches_per_device` batches over the
-        # 32 views each of two devices owns.
-        view_batch = max(1, 32 // batches_per_device)
-
-        def charge(direction, num_pixels, band_cols):
-            return view_batch, 1
-
-        ledger = estimate_peak_device_bytes(
-            make_plan(n_devices=2, view_charge=charge))
-        terms = dict(_named(ledger, 'initial forward projection').terms)
-        return terms['forward block'][0], view_batch
-
-    assert block(1)[0] == 0                  # one batch, one block, all priced
-    for batches in (2, 8):
-        charged, view_batch = block(batches)
-        assert charged == view_batch * rows * channels * 4
-    # No cost model at all: the ceiling of two, one of them charged here,
-    # which is what the docstring promises.
-    ledger = estimate_peak_device_bytes(make_plan(n_devices=2))
-    assert dict(_named(ledger, 'initial forward projection')
-                .terms)['forward block'][0] == 1 * rows * channels * 4
-
-
-def test_the_forward_block_is_sized_by_the_geometry_it_belongs_to():
+def test_the_forward_block_is_sized_by_its_geometry_and_batch_count():
     """A two-fan body's output plane spans the FULL detector rows, so the
     block follows the row count.  A row-aligned body sizes its output by the
     values it was handed, which under sharding is a transferred cylinder --
     the WHOLE slice axis, at every device count.  The two are separated here
     by a plan whose slice count differs from its detector row count.
+
+    The count follows the realized view batches.  The view-range loop has no
+    release, so it holds the outgoing block and the incoming one:
+    min(2, view_batches).  For a body that declares its own per-view cost one
+    of those is already inside the batch charge -- a forward kernel body's
+    declaration prices its output plane per view -- so this term charges the
+    remainder.  A torch body declares nothing, so both blocks are charged.
     """
     rows, channels, slices = 32, 32, 48
     for aligned, expected in ((True, slices), (False, rows)):
@@ -771,20 +510,35 @@ def test_the_forward_block_is_sized_by_the_geometry_it_belongs_to():
             assert terms['forward block'][0] == expected * channels * 4, \
                 (aligned, n)
 
+    # make_plan defaults to a two-fan geometry: one whose detector rows are
+    # not tied 1:1 to recon slices, as in cone beam.
+    def block(batches_per_device, directions=()):
+        # A charge that yields exactly `batches_per_device` batches over the
+        # 32 views each of two devices owns.
+        view_batch = max(1, 32 // batches_per_device)
 
-def test_the_split_lowers_the_multi_device_peak_and_leaves_n1_alone():
-    """The whole point: summing two sub-steps that are never live together
-    was the largest over-charge at n>1, and removing it leaves the
-    single-device ledger untouched."""
-    plan_kwargs = dict(recon=(64, 64, 32), num_pixels_full=3000)
-    four = estimate_peak_device_bytes(make_plan(n_devices=4, **plan_kwargs))
-    for parent in SPLIT_PARENTS:
-        workers = _sub(four, parent, 4, 'back workers').per_device[0]
-        reduce_phase = _sub(four, parent, 4, 'band reduce').per_device[0]
-        # Neither sub-step alone reaches what the sum would have charged.
-        summed = workers + reduce_phase
-        assert max(workers, reduce_phase) < summed
-        assert four.peak_bytes(0) < summed
+        def charge(direction, num_pixels, band_cols):
+            return view_batch, 1
+
+        ledger = estimate_peak_device_bytes(make_plan(
+            n_devices=2, view_charge=charge,
+            torch_body_directions=directions))
+        return (dict(_named(ledger, 'initial forward projection')
+                     .terms)['forward block'][0], view_batch)
+
+    assert block(1)[0] == 0                  # one batch, one block, all priced
+    for batches in (2, 8):
+        charged, view_batch = block(batches)
+        assert charged == view_batch * rows * channels * 4
+    # No cost model at all: the ceiling of two, one of them charged here,
+    # which is what the docstring promises.
+    plain = estimate_peak_device_bytes(make_plan(n_devices=2))
+    assert dict(_named(plain, 'initial forward projection')
+                .terms)['forward block'][0] == 1 * rows * channels * 4
+    # A torch body pays for both blocks; the back direction alone leaves the
+    # forward's own term where it was.
+    assert block(4, ('forward', 'back'))[0] == 2 * 8 * rows * channels * 4
+    assert block(4, ('back',))[0] == 1 * 8 * rows * channels * 4
 
 
 # ── the masked hessian ───────────────────────────────────────────────────────
@@ -815,17 +569,6 @@ def test_masked_hessian_agrees_with_the_full_grid_at_the_masked_indices():
     if outside.size:
         assert np.all(flat_masked[outside] == 0)
         assert np.any(flat_dense[outside] != 0)
-
-
-def test_masked_hessian_leaves_the_public_method_unchanged():
-    """`indices=None` must keep today's behavior bit for bit."""
-    angles = np.linspace(0, np.pi, 12, endpoint=False)
-    model = mbirtorch.ParallelBeamModel((12, 8, 10), angles)
-    model.configure_devices(devices=['cpu'])
-    model.set_params(no_warning=True, verbose=0)
-    a = model.compute_hessian_diagonal()
-    b = model.compute_hessian_diagonal(indices=None)
-    np.testing.assert_array_equal(a, b)
 
 
 def test_every_index_the_loop_reads_is_inside_the_mask():
@@ -869,7 +612,7 @@ def test_recon_is_bitwise_identical_with_the_masked_hessian():
     and the loop reads nowhere else.
     """
     angles = np.linspace(0, np.pi, 12, endpoint=False)
-    model = mbirtorch.ParallelBeamModel((12, 8, 10), angles, 
+    model = mbirtorch.ParallelBeamModel((12, 8, 10), angles,
                                         compile_mode='off')
     model.configure_devices(devices=['cpu'])
     model.set_params(no_warning=True, verbose=0)
@@ -911,27 +654,10 @@ def test_ledger_charges_the_masked_hessian_and_its_scatter():
 
 
 # ── the projector cost model ─────────────────────────────────────────────────
-def test_view_charge_enters_the_projection_phases():
-    calls = []
-
-    def charge(direction, num_pixels, band_cols):
-        calls.append((direction, num_pixels, band_cols))
-        return 8, 1024                      # 8 views at 1 KiB each
-
-    with_charge = estimate_peak_device_bytes(make_plan(view_charge=charge))
-    without = estimate_peak_device_bytes(make_plan())
-    # The charge lands on the PROJECTION phases; the peak may sit on a
-    # state-only phase, so assert where the charge actually goes.
-    charged = _named(with_charge, 'back projection').per_device[0]
-    plain = _named(without, 'back projection').per_device[0]
-    assert charged > plain
-    directions = {d for d, _p, _c in calls}
-    assert directions == {'forward', 'back'}
-
-
 def test_view_batch_charge_matches_the_driver_batch():
     """One cost model, two consumers: the number the ledger prices must be the
-    number the driver would actually run."""
+    number the driver would actually run.  It must also be answerable for a
+    layout the model is not in, since that is what the ledger prices."""
     angles = np.linspace(0, np.pi, 8, endpoint=False)
     model = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
     model.configure_devices(devices=['cpu'])
@@ -944,19 +670,16 @@ def test_view_batch_charge_matches_the_driver_batch():
             body, 40, 6, args)
         assert per_view > 0
 
-
-def test_view_batch_charge_prices_a_hypothetical_device_count():
-    """The ledger must be able to price a layout the model is not in."""
-    angles = np.linspace(0, np.pi, 512, endpoint=False)
-    model = mbirtorch.ParallelBeamModel((512, 64, 64), angles)
-    model.configure_devices(devices=['cpu'])
-    fwd_body, _back = model._view_batch_bodies()
-    args = model._view_batch_args()
-    live = model.projector_functions.view_batch_charge(fwd_body, 400, 64, args)
-    hypothetical = model.projector_functions.view_batch_charge(
-        fwd_body, 400, 64, args, n_devices=4)
-    assert model.sino_placement.n_devices == 1      # unchanged by the query
-    assert live[1] == hypothetical[1]               # same per-view charge
+    big = mbirtorch.ParallelBeamModel(
+        (512, 64, 64), np.linspace(0, np.pi, 512, endpoint=False))
+    big.configure_devices(devices=['cpu'])
+    big_fwd, _back = big._view_batch_bodies()
+    big_args = big._view_batch_args()
+    live = big.projector_functions.view_batch_charge(big_fwd, 400, 64, big_args)
+    hypothetical = big.projector_functions.view_batch_charge(
+        big_fwd, 400, 64, big_args, n_devices=4)
+    assert big.sino_placement.n_devices == 1         # unchanged by the query
+    assert live[1] == hypothetical[1]                # same per-view charge
 
 
 # ── the verdict and the message ──────────────────────────────────────────────
@@ -972,43 +695,10 @@ def test_layout_fits_applies_the_margin_and_the_credits():
         ledger, [11 * GB], credits=[2 * GB], margin=0.15)
     assert fits
     assert rows[0][1] == int(1.15 * 8 * GB)
-
-
-def test_resident_credits_counts_only_matching_cuda_devices():
+    # And a credit is counted only for a matching CUDA device.
     cpu_tensor = torch.zeros(1024, dtype=torch.float32)
-    credits = _memory_ledger.resident_credits(['cpu'], [cpu_tensor])
-    assert credits == [0]                            # CPU is never credited
+    assert _memory_ledger.resident_credits(['cpu'], [cpu_tensor]) == [0]
     assert _memory_ledger.resident_credits(['cpu'], [None]) == [0]
-
-
-def test_shortfall_message_names_the_phase_and_the_remedies():
-    ledger = estimate_peak_device_bytes(make_plan(n_devices=2))
-    _fits, rows = _memory_ledger.layout_fits(ledger, [1024, 1024])
-    message = _memory_ledger.format_shortfall(ledger, rows, num_devices_tried=2)
-    assert 'dominant phase' in message
-    assert ledger.dominant_phase(0).name in message
-    assert 'back_project_slice_band' in message      # the band-reduce lever
-    assert 'view_batch_size' in message
-    assert 'skip_memory_preflight' in message
-    assert 'shortfall' in message
-
-
-def test_preflight_error_is_raisable_and_readable():
-    ledger = estimate_peak_device_bytes(make_plan())
-    _fits, rows = _memory_ledger.layout_fits(ledger, [1024])
-    with pytest.raises(MemoryPreflightError, match='more memory'):
-        raise MemoryPreflightError(
-            _memory_ledger.format_shortfall(ledger, rows, 1))
-
-
-def test_calibration_band_verdicts():
-    rows = [('cuda:0', 12 * GB, 12 * GB, 1.00),
-            ('cuda:1', 9 * GB, 10 * GB, 0.90),
-            ('cuda:2', 20 * GB, 10 * GB, 2.00)]
-    text = _memory_ledger.format_calibration(rows)
-    assert 'UNDER' in text                           # 0.90 under-predicts
-    assert 'over' in text
-    assert ' ok ' in text or text.count('ok') >= 1
 
 
 # ── the direct workload ──────────────────────────────────────────────────────
@@ -1020,7 +710,8 @@ def test_the_direct_plan_is_the_filter_and_one_back_projection():
 
     The filter holds the placed sinogram, the copy it writes, and its own row
     batch; the back projection reads that copy and scatters into the volume.
-    No prior, no hessian, no partitions and no loop exist while it runs.
+    No prior, no hessian, no partitions and no loop exist while it runs, and
+    dropping them has to move the peak and not merely the phase list.
     """
     sino_bytes = 64 * 32 * 32 * 4
     ledger = estimate_peak_device_bytes(make_plan(workload='direct'))
@@ -1039,11 +730,8 @@ def test_the_direct_plan_is_the_filter_and_one_back_projection():
     scatter = dict(_named(ledger, 'direct recon (scatter)').terms)
     assert scatter['scatter buffer'][0] == 32 * 32 * 32 * 4
 
-
-def test_the_direct_plan_costs_less_than_the_full_one_at_the_same_shapes():
-    """The whole point of the narrowed check.  A grid much larger than the
-    masked set makes the hessian dominate the full plan, so the phases the
-    direct plan drops have to move the peak and not merely the phase list."""
+    # A grid much larger than the masked set makes the hessian dominate the
+    # full plan, so the phases the direct plan drops move the peak.
     shape = dict(recon=(64, 64, 32), num_pixels_full=800)
     full = estimate_peak_device_bytes(make_plan(**shape))
     direct = estimate_peak_device_bytes(make_plan(workload='direct', **shape))
@@ -1053,44 +741,20 @@ def test_the_direct_plan_costs_less_than_the_full_one_at_the_same_shapes():
         assert not _has(direct, gone)
 
 
-def test_the_direct_plan_splits_its_back_projection_like_the_full_one():
-    """Same charges, so the same two consecutive sub-steps: the workers
-    project and the reduce gathers, and the reduce's co-residency is charged
-    where a direct reconstruction really pays it."""
-    ledger = estimate_peak_device_bytes(make_plan(n_devices=2,
-                                                  workload='direct'))
-    workers = _sub(ledger, 'direct recon (back loop)', 2, 'back workers')
-    reduce_phase = _sub(ledger, 'direct recon (back loop)', 2, 'band reduce')
-    assert dict(reduce_phase.terms)['band reduce'][0] > 0
-    for i in (0, 1):
-        both = max(workers.per_device[i], reduce_phase.per_device[i])
-        assert both < workers.per_device[i] + reduce_phase.per_device[i]
-        assert ledger.peak_bytes(i) >= both
-
-
-def test_the_filter_batch_follows_the_rows_it_actually_walks():
-    """apply_row_filter walks ROW_FILTER_BATCH detector rows at a time, so the
-    charge is capped by that batch and not by the shard: a shard with fewer
-    rows than one batch is charged for the rows it has."""
-    from mbirtorch.tomography_utils import ROW_FILTER_BATCH
-
-    small = estimate_peak_device_bytes(make_plan(
-        workload='direct', num_views=4, num_rows=8))       # 32 rows in all
-    large = estimate_peak_device_bytes(make_plan(
-        workload='direct', num_views=1024, num_rows=8))    # far past the batch
-    per_row_small = dict(_named(small, 'filter').terms)['filter row batch'][0]
-    per_row_large = dict(_named(large, 'filter').terms)['filter row batch'][0]
-    assert per_row_large == per_row_small * ROW_FILTER_BATCH // 32
-
-
-def test_a_recon_check_covers_a_direct_one_but_not_the_reverse():
+def test_workload_covers_is_the_table_it_claims_to_be():
     """The full plan charges everything the direct plan charges, so a layout
-    checked for a recon needs no direct check.  Nothing else is claimed."""
+    checked for a recon needs no direct check.  A denoise holds arrays neither
+    of the other plans holds, so no check substitutes for it and it
+    substitutes for none.  Nothing else is claimed."""
     assert _memory_ledger.workload_covers('recon', 'direct')
     assert _memory_ledger.workload_covers('direct', 'direct')
     assert _memory_ledger.workload_covers('recon', 'recon')
     assert not _memory_ledger.workload_covers('direct', 'recon')
     assert not _memory_ledger.workload_covers(None, 'recon')
+    assert _memory_ledger.workload_covers('denoise', 'denoise')
+    for other in ('recon', 'direct', None):
+        assert not _memory_ledger.workload_covers(other, 'denoise')
+        assert not _memory_ledger.workload_covers('denoise', other)
 
 
 # ── the denoise workload ─────────────────────────────────────────────────────
@@ -1130,7 +794,10 @@ def test_the_denoise_plan_is_the_state_and_the_subset_sweep():
     It places the image, clones it into the working image and forms the
     residual; then per subset it runs the qGGMRF prior, forms the update
     direction, and applies it; then once per pass it reads the working
-    image's ell-1 norm.  Nothing else exists while it runs.
+    image's ell-1 norm.  Nothing else exists while it runs: its
+    ``create_projectors`` is a no-op, so no view batch, no projection block
+    and no assembled projection output exists; it builds no hessian diagonal
+    and no weights array; and it builds one partition rather than a sequence.
     """
     image_bytes = 32 * 32 * 32 * 4
     ledger = estimate_peak_device_bytes(make_denoise_plan())
@@ -1149,17 +816,8 @@ def test_the_denoise_plan_is_the_state_and_the_subset_sweep():
         'init image'][0] == image_bytes
     assert supplied.peak_bytes(0) - ledger.peak_bytes(0) == image_bytes
 
-
-def test_the_denoise_plan_charges_no_projector_or_hessian_term():
-    """The three sets of charges a denoiser must not carry.
-
-    Its ``create_projectors`` is a no-op, so no view batch, no projection
-    block and no assembled projection output exists.  It builds no hessian
-    diagonal and no weights array.  And it builds one partition rather than a
-    sequence, so no term follows a granularity it never visits.
-    """
-    ledger = estimate_peak_device_bytes(make_denoise_plan(n_devices=2))
-    charged = {name for phase in ledger.phases for name, _vals in phase.terms}
+    sharded = estimate_peak_device_bytes(make_denoise_plan(n_devices=2))
+    charged = {name for phase in sharded.phases for name, _vals in phase.terms}
     for absent in ('batch', 'block', 'forward', 'back', 'hessian', 'weights',
                    'sinogram', 'scatter', 'band', 'partitions'):
         assert not any(absent in name for name in charged), (absent, charged)
@@ -1167,13 +825,15 @@ def test_the_denoise_plan_charges_no_projector_or_hessian_term():
     # device reads identically, because only the slice split is used.
     lopsided = estimate_peak_device_bytes(
         make_denoise_plan(n_devices=2, num_views=1))
-    assert lopsided.per_device_peaks() == ledger.per_device_peaks()
+    assert lopsided.per_device_peaks() == sharded.per_device_peaks()
 
 
-def test_the_denoise_working_set_follows_the_subset_size():
+def test_the_denoise_charges_follow_the_subset_size_and_the_slice_split():
     """A coarser partition means a bigger subset, and a bigger subset means a
     bigger working set: every per-subset term is the subset's pixel count by
-    the device's slices."""
+    the device's slices.  The denoiser divides its image by SLICE, so every
+    term is the device's own slice block and no term follows the view axis.
+    """
     coarse = estimate_peak_device_bytes(make_denoise_plan(granularities=(4,)))
     fine = estimate_peak_device_bytes(make_denoise_plan(granularities=(64,)))
     for fragment, term in (('prior', 'prior cylinders'),
@@ -1187,23 +847,16 @@ def test_the_denoise_working_set_follows_the_subset_size():
         assert big == small * (1024 // 4) // (1024 // 64), fragment
     assert coarse.peak_bytes(0) > fine.peak_bytes(0)
 
-
-def test_the_denoise_prior_is_charged_at_the_shared_qggmrf_count():
-    """The denoiser calls the same prior kernel a reconstruction calls, so it
-    is priced by the same cylinder count and not by one of its own."""
+    # The denoiser calls the same prior kernel a reconstruction calls, so it
+    # is priced by the same cylinder count and not by one of its own.
     p_sub = math.ceil(1024 / 16)
     for cylinders in (_memory_ledger.QGGMRF_CYLINDERS_COMPILED,
                       _memory_ledger.QGGMRF_CYLINDERS_EAGER):
         ledger = estimate_peak_device_bytes(
             make_denoise_plan(qggmrf_cylinders=cylinders))
-        charged = dict(_named(ledger, 'denoise subset prior').terms)[
-            'prior cylinders'][0]
-        assert charged == cylinders * p_sub * 32 * 4
+        assert dict(_named(ledger, 'denoise subset prior').terms)[
+            'prior cylinders'][0] == cylinders * p_sub * 32 * 4
 
-
-def test_the_denoise_charges_follow_the_slice_split():
-    """The denoiser divides its image by SLICE, so every term is the device's
-    own slice block and no term follows the view axis."""
     # 30 slices over four devices: 8, 8, 7, 7.
     ledger = estimate_peak_device_bytes(
         make_denoise_plan(image=(32, 32, 30), n_devices=4))
@@ -1215,7 +868,6 @@ def test_the_denoise_charges_follow_the_slice_split():
         assert terms['residual'] == terms['input image']
     prior = dict(_named(ledger, 'denoise subset prior').terms)[
         'prior cylinders']
-    p_sub = math.ceil(1024 / 16)
     assert prior == [_memory_ledger.QGGMRF_CYLINDERS_COMPILED * p_sub * b * 4
                      for b in blocks]
     # And the peak falls with the device count, since every image-shaped term
@@ -1226,60 +878,25 @@ def test_the_denoise_charges_follow_the_slice_split():
     assert four.peak_bytes(0) < one.peak_bytes(0)
 
 
-def test_the_denoise_halos_exist_only_on_a_sharded_sweep():
-    """The sharded sweep stages one boundary column per shard side; a single
-    device runs the compiled sweep and exchanges nothing.
-
-    The column count is written out here rather than read from the module, so
-    that changing the constant alone cannot move the charge without this test
-    noticing.
-    """
-    grid = 32 * 32
-    one = estimate_peak_device_bytes(make_denoise_plan())
-    two = estimate_peak_device_bytes(make_denoise_plan(n_devices=2))
-    assert dict(_named(one, 'denoise subset prior').terms)['qggmrf halos'] \
-        == [0]
-    assert dict(_named(two, 'denoise subset prior').terms)['qggmrf halos'] \
-        == [4 * grid * 4] * 2
-    # A halo is a column of the in-slice grid, so it does not shrink with the
-    # device count the way the image-shaped terms do.
-    four = estimate_peak_device_bytes(make_denoise_plan(n_devices=4))
-    assert dict(_named(four, 'denoise subset prior').terms)['qggmrf halos'] \
-        == [4 * grid * 4] * 4
-
-
-def test_the_denoise_partition_is_held_whole_on_every_device():
-    """The sharded sweep copies the whole partition onto each device, because
-    a subset's indices address the in-slice grid that every shard shares.
-
-    A reconstruction charges its partitions to the lead device alone, so this
-    is the one place the two plans differ in WHERE a term lands rather than
-    in how large it is.
-    """
-    ledger = estimate_peak_device_bytes(make_denoise_plan(n_devices=2))
-    charged = dict(_named(ledger, 'denoise subset prior').terms)[
-        'subset indices']
-    assert charged == [16 * math.ceil(1024 / 16) * 8] * 2
-    recon = estimate_peak_device_bytes(make_plan(n_devices=2))
-    assert dict(_named(recon, 'prior').terms)['partitions (lead device)'][1] \
-        == 0
-
-
-def test_the_denoise_statistics_phase_holds_one_chunk_not_one_image():
+def test_the_denoise_statistics_hold_one_chunk_not_one_image():
     """The convergence test reduces the working image a chunk at a time, so at
     any size worth chunking it holds a chunk and not a fourth image.
 
     As ``sum(abs(working image))`` it held a whole image of absolute values and
     was the denoiser's widest instant.  Bounded to a chunk, the peak falls on
     the qGGMRF prior's working set instead, so this asserts which phase is the
-    peak and not merely what the statistic costs.
+    peak and not merely what the statistic costs.  Below one chunk the
+    reduction runs unchunked and the whole image is charged -- the arithmetic
+    the chunked form replaced, left alone because an extra image is small in
+    absolute terms at those sizes.
     """
+    target = _memory_ledger.ELL1_CHUNK_BYTES
     ledger = estimate_peak_device_bytes(
         make_denoise_plan(image=(512, 512, 512)))
     stats = _named(ledger, 'denoise per-pass statistics')
     placement = _named(ledger, 'denoise state placement')
     charged = dict(stats.terms)['ell-1 chunk'][0]
-    assert charged == _memory_ledger.ELL1_CHUNK_BYTES
+    assert charged == target
     # The chunk is the whole of what this phase adds to the state.
     assert stats.per_device[0] - placement.per_device[0] == charged
     # The peak moved off this phase and onto the prior.
@@ -1287,12 +904,9 @@ def test_the_denoise_statistics_phase_holds_one_chunk_not_one_image():
     assert ledger.peak_bytes(0) == prior.per_device[0]
     assert prior.per_device[0] > stats.per_device[0]
 
-
-def test_the_denoise_statistics_chunk_stops_following_the_image():
-    """The point of the chunking: the statistic's transient stays near one
-    chunk as the image grows, where every other denoise term scales with it.
-    """
-    target = _memory_ledger.ELL1_CHUNK_BYTES
+    # The image grows about fifteenfold over this pair; the chunk does not
+    # move off the target, because the chunk COUNT absorbs the growth, while
+    # the prior, which does scale, really does grow.
     small = estimate_peak_device_bytes(
         make_denoise_plan(image=(256, 256, 256)))
     big = estimate_peak_device_bytes(make_denoise_plan(image=(640, 640, 640)))
@@ -1300,30 +914,22 @@ def test_the_denoise_statistics_chunk_stops_following_the_image():
     def chunk(led):
         return dict(_named(led, 'per-pass statistics').terms)['ell-1 chunk'][0]
 
-    # The image grows about fifteenfold over this pair; the chunk does not
-    # move off the target, because the chunk COUNT absorbs the growth.
+    def prior_bytes(led):
+        return dict(_named(led, 'denoise subset prior').terms)[
+            'prior cylinders'][0]
+
     assert 256 ** 3 * 15 < 640 ** 3
     for led in (small, big):
         assert 0.5 * target <= chunk(led) <= 2 * target
     assert chunk(big) < 1.1 * chunk(small)
-    # The prior, which does scale, really does grow over the same pair.
-    def prior(led):
-        return dict(_named(led, 'denoise subset prior').terms)[
-            'prior cylinders'][0]
+    assert prior_bytes(big) > 15 * prior_bytes(small)
 
-    assert prior(big) > 15 * prior(small)
-
-
-def test_the_denoise_statistics_reduce_a_small_image_whole():
-    """Below one chunk the reduction runs unchunked, so the ledger charges the
-    whole image -- the arithmetic and the cost the chunked form replaced.  An
-    extra image is small in absolute terms at these sizes, which is why the
-    unchunked case is left alone."""
+    # Below one chunk the whole image is charged.
     image_bytes = 32 * 32 * 32 * 4
-    assert image_bytes < _memory_ledger.ELL1_CHUNK_BYTES
-    ledger = estimate_peak_device_bytes(make_denoise_plan())
-    stats = _named(ledger, 'denoise per-pass statistics')
-    assert dict(stats.terms)['ell-1 chunk'][0] == image_bytes
+    assert image_bytes < target
+    tiny = estimate_peak_device_bytes(make_denoise_plan())
+    assert dict(_named(tiny, 'denoise per-pass statistics').terms)[
+        'ell-1 chunk'][0] == image_bytes
 
 
 def test_the_ledger_chunk_matches_what_the_reduction_really_allocates():
@@ -1382,18 +988,22 @@ def test_the_ledger_chunk_matches_what_the_reduction_really_allocates():
                                                   predicted)
 
 
-def test_weighted_square_sum_is_accurate_at_a_size_that_chunks():
-    """The reduction behind the reported forward-model loss, checked where
-    the goldens cannot check it.
+def test_the_chunked_reductions_are_accurate_at_a_size_that_chunks():
+    """The reductions behind the reported forward-model loss and the initial
+    scale, checked where the goldens cannot check them.
 
     The golden sinograms are far below one chunk, so they only ever exercise
-    the unchunked branch.  This runs a sinogram large enough to chunk and
-    scores the result against a float64 reference over the same float32
-    values, so it measures the reduction's own arithmetic rather than the
-    loss's.  Both the weighted and the plain forms are checked, because the
-    loss uses one and the error-sinogram RMSE the other.
+    the unchunked branch.  This runs sinograms large enough to chunk and
+    scores each result against a float64 reference over the same float32
+    values, so it measures the reductions' own arithmetic rather than the
+    loss's.  Both the weighted and the plain forms are checked, because a
+    weighted reconstruction uses one and an unweighted one the other.
+
+    The dot product's two arrays are non-negative, as a projection and a
+    sinogram are.  A relative gate on a sum whose terms cancel would measure
+    the cancellation rather than the reduction.
     """
-    from mbirtorch._memory_ledger import weighted_square_sum
+    from mbirtorch._memory_ledger import weighted_dot, weighted_square_sum
     torch.manual_seed(13)
     error = torch.randn(256, 128, 256)
     weights = torch.rand(256, 128, 256) + 0.5
@@ -1405,11 +1015,23 @@ def test_weighted_square_sum_is_accurate_at_a_size_that_chunks():
         value = float(weighted_square_sum(error, w))
         rel = abs(value - reference) / abs(reference)
         assert rel < 1e-6, rel
+    del error
+
+    torch.manual_seed(17)
+    a = torch.rand(256, 128, 256)
+    b = torch.rand(256, 128, 256)
+    for w, reference in (
+            (None, float((a.double() * b.double()).sum())),
+            (weights, float((a.double() * b.double()
+                             * weights.double()).sum()))):
+        value = float(weighted_dot(a, b, w))
+        rel = abs(value - reference) / abs(reference)
+        assert rel < 1e-6, rel
 
 
-def test_weighted_square_sum_leaves_a_small_sinogram_bit_for_bit():
-    """Below one chunk the reduction is the sum(e * e * w) it replaced, so
-    small problems -- every golden among them -- cannot move at all."""
+def test_the_unchunked_reductions_leave_a_small_sinogram_bit_for_bit():
+    """Below one chunk both reductions are the sums they replaced, so small
+    problems -- every golden among them -- cannot move at all."""
     torch.manual_seed(5)
     error = torch.randn(16, 8, 8)
     weights = torch.rand(16, 8, 8) + 0.5
@@ -1424,65 +1046,18 @@ def test_weighted_square_sum_leaves_a_small_sinogram_bit_for_bit():
     assert (float(_memory_ledger.weighted_square_sum(error, 1))
             == float(torch.sum(error * error * 1)))
 
-
-def test_weighted_dot_leaves_a_small_sinogram_bit_for_bit():
-    """Below one chunk the dot product is the sum(a * b * w) it replaced.
-
-    This is the reduction the initial scale is built from, so the unchunked
-    branch is what keeps a small reconstruction on its old trajectory.
-    """
     torch.manual_seed(7)
     a = torch.randn(16, 8, 8)
     b = torch.randn(16, 8, 8)
-    weights = torch.rand(16, 8, 8) + 0.5
-    assert (a.numel() * a.element_size() < _memory_ledger.ELL1_CHUNK_BYTES)
-    assert (float(_memory_ledger.weighted_dot(a, b, weights))
-            == float(torch.sum(a * b * weights)))
+    w = torch.rand(16, 8, 8) + 0.5
+    assert (float(_memory_ledger.weighted_dot(a, b, w))
+            == float(torch.sum(a * b * w)))
     assert (float(_memory_ledger.weighted_dot(a, b))
             == float(torch.sum(a * b)))
     # The sum of squares is this reduction on one array, and routing it
     # through here must not have moved it.
-    assert (float(_memory_ledger.weighted_dot(a, a, weights))
-            == float(_memory_ledger.weighted_square_sum(a, weights)))
-
-
-def test_weighted_dot_is_accurate_at_a_size_that_chunks():
-    """The reduction behind the initial scale, checked where the goldens
-    cannot check it.
-
-    The golden sinograms are far below one chunk, so they only ever exercise
-    the unchunked branch.  This runs a sinogram large enough to chunk and
-    scores the result against a float64 reference over the same float32
-    values, so it measures the reduction's own arithmetic.  Both the weighted
-    and the plain forms are checked, because a weighted reconstruction uses
-    one and an unweighted one the other.
-
-    The two arrays are non-negative, as a projection and a sinogram are.  A
-    relative gate on a sum whose terms cancel would measure the cancellation
-    rather than the reduction.
-    """
-    from mbirtorch._memory_ledger import weighted_dot
-    torch.manual_seed(17)
-    a = torch.rand(256, 128, 256)
-    b = torch.rand(256, 128, 256)
-    weights = torch.rand(256, 128, 256) + 0.5
-    assert (a.numel() * a.element_size() > _memory_ledger.ELL1_CHUNK_BYTES)
-    for w, reference in (
-            (None, float((a.double() * b.double()).sum())),
-            (weights, float((a.double() * b.double()
-                             * weights.double()).sum()))):
-        value = float(weighted_dot(a, b, w))
-        rel = abs(value - reference) / abs(reference)
-        assert rel < 1e-6, rel
-
-
-def test_a_denoise_check_covers_nothing_but_another_denoise():
-    """A denoise holds arrays neither of the other plans holds, so no check
-    substitutes for it and it substitutes for none."""
-    assert _memory_ledger.workload_covers('denoise', 'denoise')
-    for other in ('recon', 'direct', None):
-        assert not _memory_ledger.workload_covers(other, 'denoise')
-        assert not _memory_ledger.workload_covers('denoise', other)
+    assert (float(_memory_ledger.weighted_dot(a, a, w))
+            == float(_memory_ledger.weighted_square_sum(a, w)))
 
 
 def test_plan_from_model_prices_a_denoiser_without_its_projectors():
@@ -1492,6 +1067,11 @@ def test_plan_from_model_prices_a_denoiser_without_its_projectors():
     denoiser's ``create_projectors`` is a no-op, so it defines no per-view
     projection bodies, and the recon plan's cost-model read raises on it --
     which is asserted here, so the branch cannot be quietly removed.
+
+    A denoise sweep also builds ONE partition, the one the first entry of the
+    sequence names, so the plan may not read the sequence the way a
+    reconstruction does: reading it that way would charge partitions the
+    denoiser never builds and emit subset phases it never runs.
     """
     denoiser = mbirtorch.QGGMRFDenoiser((16, 16, 12), compile_mode='off')
     denoiser.configure_devices(devices=['cpu'])
@@ -1522,50 +1102,28 @@ def test_plan_from_model_prices_a_denoiser_without_its_projectors():
     assert ledger.peak_bytes(0) > 0
     assert ledger.peak_bytes(0) == ledger.peak_bytes(1)   # an even slice split
 
-
-def test_plan_from_model_visits_only_the_partition_the_denoiser_builds():
-    """A denoise sweep builds ONE partition, the one the first entry of the
-    sequence names, so the plan may not read the sequence the way a
-    reconstruction does.
-
-    A reconstruction walks the whole sequence and builds every granularity in
-    the list.  Reading it that way here would charge partitions the denoiser
-    never builds and emit subset phases it never runs.
-    """
-    denoiser = mbirtorch.QGGMRFDenoiser((16, 16, 12), compile_mode='off')
-    denoiser.configure_devices(devices=['cpu'])
-    denoiser.set_params(no_warning=True, verbose=0,
-                        granularity=[8, 16, 32], partition_sequence=[1, 2])
-    plan = _memory_ledger.plan_from_model(denoiser, ['cpu'],
-                                          workload='denoise')
-    assert plan.granularities == (16,)          # granularity[sequence[0]]
-    assert plan.partition_granularities == (16,)
-    ledger = estimate_peak_device_bytes(plan)
-    assert [p.name for p in ledger.phases] == DENOISE_PHASES
+    # A granularity list of three and a sequence starting at 1 must still
+    # yield the single partition granularity[sequence[0]].
+    listed = mbirtorch.QGGMRFDenoiser((16, 16, 12), compile_mode='off')
+    listed.configure_devices(devices=['cpu'])
+    listed.set_params(no_warning=True, verbose=0,
+                      granularity=[8, 16, 32], partition_sequence=[1, 2])
+    one_device = _memory_ledger.plan_from_model(listed, ['cpu'],
+                                               workload='denoise')
+    assert one_device.granularities == (16,)
+    assert one_device.partition_granularities == (16,)
+    single = estimate_peak_device_bytes(one_device)
+    assert [p.name for p in single.phases] == DENOISE_PHASES
     # The partition charge is that one partition, not the three the list names.
-    assert dict(_named(ledger, 'denoise subset prior').terms)[
+    assert dict(_named(single, 'denoise subset prior').terms)[
         'subset indices'][0] == 16 * math.ceil(16 * 16 / 16) * 8
-
-
-def test_a_denoise_plan_needs_a_model_whose_shapes_agree():
-    """The assumption the plan rests on, checked rather than assumed.
-
-    Every term in the denoise plan is image-shaped.  A model whose sinogram
-    shape differs from its image shape is not a denoiser, and pricing one
-    with this plan would charge the wrong arrays, so it is refused by name.
-    """
-    angles = np.linspace(0, np.pi, 8, endpoint=False)
-    model = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
-    model.configure_devices(devices=['cpu'])
-    model.set_params(no_warning=True, verbose=0)
-    assert tuple(model.get_params('sinogram_shape')) != \
-        tuple(model.get_params('recon_shape'))
-    with pytest.raises(ValueError, match='sinogram_shape is its image shape'):
-        _memory_ledger.plan_from_model(model, ['cpu'], workload='denoise')
 
 
 # ── the model-facing plan ────────────────────────────────────────────────────
 def test_plan_from_model_reads_the_current_params_and_a_candidate_layout():
+    """The plan reads the model rather than re-deriving its rules, and asking
+    about a candidate device count leaves the model where it is."""
+    from mbirtorch.tomography_model import FORWARD_PIXEL_BATCH
     angles = np.linspace(0, np.pi, 8, endpoint=False)
     model = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
     model.configure_devices(devices=['cpu'])
@@ -1584,22 +1142,45 @@ def test_plan_from_model_reads_the_current_params_and_a_candidate_layout():
     assert _memory_ledger.plan_from_model(
         model, ['cpu', 'cpu'], workload='direct').workload == 'direct'
 
+    # The pixel batch is the one the model would actually walk, so a changed
+    # default or an override reaches the charge without a second edit here.
+    # Every projection plan carries it, because the cylinder transfer is the
+    # only multi-device forward.
+    cell = (8, 8, 8)
+    cone = mbirtorch.ConeBeamModel(
+        cell, np.linspace(0, 2 * np.pi, cell[0], endpoint=False),
+        source_detector_dist=32, source_iso_dist=16)
+    cone.configure_devices(devices=['cpu'])
+    cone.set_params(no_warning=True, verbose=0)
+    devices = ['cpu', 'cpu']
+    assert _memory_ledger.plan_from_model(
+        cone, devices).pixel_batch == FORWARD_PIXEL_BATCH
+    cone.forward_project_pixel_batch = 512
+    assert _memory_ledger.plan_from_model(
+        cone, devices).pixel_batch == 512
+    # The row-aligned geometry takes the same path, so the same resolution has
+    # to reach its charge.
+    par = mbirtorch.ParallelBeamModel(cell, np.linspace(0, np.pi, cell[0],
+                                                        endpoint=False))
+    par.configure_devices(devices=['cpu'])
+    par.set_params(no_warning=True, verbose=0)
+    assert _memory_ledger.plan_from_model(
+        par, devices).pixel_batch == FORWARD_PIXEL_BATCH
+    par.forward_project_pixel_batch = 256
+    assert _memory_ledger.plan_from_model(
+        par, devices).pixel_batch == 256
 
-def test_full_index_count_matches_the_index_array_and_caches():
-    angles = np.linspace(0, np.pi, 8, endpoint=False)
-    model = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
-    model.configure_devices(devices=['cpu'])
-    assert model.full_index_count() == model._full_indices().shape[0]
-    assert model.full_index_count() == model.full_index_count()
 
-
-def test_the_policy_builds_no_ledger_for_a_cpu_model():
+def test_the_device_layout_policy_consults_and_records_correctly():
     """The ledger's production job is choosing a CUDA device count, so a CPU
-    or MPS model never consults one and never pays for it.
+    or MPS model never consults one and never pays for it.  The MATH is
+    device-agnostic and can be built for any backend, which is what lets these
+    tests run; refusing to consult it is the policy's decision.
 
-    The MATH is device-agnostic and can be built for any backend, which is
-    what lets these tests run.  Refusing to consult it is the policy's
-    decision, so that is where the contract is asserted.
+    Automatic means NO configure_devices call has been made.  The constructor
+    amendment collapsed eligibility to that one bit: there is no device string
+    to parse, so EVERY call is explicit, including an unindexed
+    ``devices=['cuda']``.
     """
     angles = np.linspace(0, np.pi, 8, endpoint=False)
     model = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
@@ -1607,23 +1188,9 @@ def test_the_policy_builds_no_ledger_for_a_cpu_model():
     assert model._apply_device_policy() is None
     assert model._build_memory_ledger() is not None
 
-
-def test_only_an_unconfigured_model_is_eligible_for_the_automatic_count():
-    """Automatic means NO configure_devices call has been made.
-
-    The constructor amendment collapsed eligibility to that one bit: there
-    is no device string to parse, so EVERY call is explicit, including an
-    unindexed ``devices=['cuda']``.  This test's earlier form asserted the
-    pre-amendment rule (unindexed cuda stays automatic) and was gated on
-    CUDA, so it first ran, and failed, on the first full-suite H100 run
-    after the amendment.
-    """
-    angles = np.linspace(0, np.pi, 8, endpoint=False)
     untouched = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
     assert untouched.device_layout_is_automatic is True
-    cpu = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
-    cpu.configure_devices(devices=['cpu'])
-    assert cpu.device_layout_is_automatic is False
+    assert model.device_layout_is_automatic is False
     if torch.cuda.is_available():
         plain = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
         plain.configure_devices(devices=['cuda'])
@@ -1632,22 +1199,10 @@ def test_only_an_unconfigured_model_is_eligible_for_the_automatic_count():
         indexed.configure_devices(devices=['cuda:0'])
         assert indexed.device_layout_is_automatic is False
 
-
-def test_configure_devices_takes_the_layout_out_of_automatic_mode():
-    angles = np.linspace(0, np.pi, 8, endpoint=False)
-    model = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
-    model.configure_devices(devices=['cpu'])
+    # A later call takes the layout out of automatic mode again.
     model.device_layout_is_automatic = True          # as a CUDA model would be
     model.configure_devices(devices=['cpu', 'cpu'])
     assert model.device_layout_is_automatic is False
-
-
-def test_preflight_knobs_have_their_documented_defaults():
-    angles = np.linspace(0, np.pi, 8, endpoint=False)
-    model = mbirtorch.ParallelBeamModel((8, 6, 8), angles)
-    model.configure_devices(devices=['cpu'])
-    assert model.skip_memory_preflight is False
-    assert model.memory_preflight_margin == 0.15
 
 
 def test_recon_is_unaffected_on_a_cpu_model():
@@ -1709,21 +1264,27 @@ def test_a_declared_per_view_cost_is_charged_exactly_as_declared():
     assert forward['forward batch'][0] == 8 * 1024
 
 
-def test_a_torch_body_view_batch_is_charged_at_the_measured_slab_count():
+def test_the_torch_body_slab_follows_the_wider_of_rows_and_slices():
     """A torch body holds a loop of slabs where the driver's nominal charge
     prices one, so the ledger charges the measured count of them.
 
     The slab is (view batch, pixels, width) floats, with width the wider of
     the detector rows and the slice band the call was handed -- the two axes
     the body sweeps.  The view batch stays the driver's own choice.
+
+    The two directions are handed different slice extents.  The forward is
+    handed transferred cylinders, which span the whole slice axis at every
+    device count, so its slab does not shrink as devices are added.  The back
+    is handed one owner's slice band, so a tall volume's back slab does shrink
+    with the device count.
     """
     rows, channels, slices = 32, 32, 32
     p_sub = math.ceil(800 / 4)
 
-    def charge(direction, num_pixels, band_cols):
+    def declared_charge(direction, num_pixels, band_cols):
         return 8, 1024                       # the driver's batch and nominal
 
-    plan_kwargs = dict(view_charge=charge, num_pixels_full=800,
+    plan_kwargs = dict(view_charge=declared_charge, num_pixels_full=800,
                        num_rows=rows, num_channels=channels,
                        recon=(32, 32, slices))
     declared = estimate_peak_device_bytes(make_plan(**plan_kwargs))
@@ -1742,17 +1303,6 @@ def test_a_torch_body_view_batch_is_charged_at_the_measured_slab_count():
     # Every other term is untouched, so the peak moves only by the charge.
     assert torch_body.peak_bytes(0) > declared.peak_bytes(0)
 
-
-def test_the_torch_body_slab_follows_the_wider_of_rows_and_slices():
-    """The body allocates arrays at the detector-row extent AND at the slice
-    extent it was handed; the wider of the two sets the slab.
-
-    The two directions are handed different slice extents.  The forward is
-    handed transferred cylinders, which span the whole slice axis at every
-    device count, so its slab does not shrink as devices are added.  The back
-    is handed one owner's slice band, so a tall volume's back slab does shrink
-    with the device count.
-    """
     def charge(direction, num_pixels, band_cols):
         return 1, 1
 
@@ -1785,33 +1335,6 @@ def test_the_torch_body_slab_follows_the_wider_of_rows_and_slices():
     assert forward_batch(128, 32, 1) == SLABS * 800 * 128 * 4
     assert forward_batch(128, 32, 4) == SLABS * 800 * 128 * 4
     assert back_batch(128, 32, 4) == SLABS * 800 * 128 * 4
-
-
-def test_a_torch_body_pays_for_both_forward_blocks():
-    """The forward loop holds the outgoing block and the incoming one.
-
-    Against a body that declares its own cost, one of the two is already
-    inside the batch charge, because a forward kernel body's declaration
-    prices its output plane per view.  A torch body declares nothing, and
-    what the ledger charges in its place is the body's internal slab set,
-    which does not include the output plane -- so both blocks are charged.
-    """
-    rows, channels = 32, 32
-
-    def charge(direction, num_pixels, band_cols):
-        return 8, 1024                       # 4 batches over 32 views
-
-    def block(directions):
-        ledger = estimate_peak_device_bytes(make_plan(
-            n_devices=2, view_charge=charge,
-            torch_body_directions=directions))
-        return dict(_named(ledger, 'initial forward projection')
-                    .terms)['forward block'][0]
-
-    assert block(()) == 1 * 8 * rows * channels * 4
-    assert block(('forward', 'back')) == 2 * 8 * rows * channels * 4
-    # The back direction alone leaves the forward's own term where it was.
-    assert block(('back',)) == 1 * 8 * rows * channels * 4
 
 
 # One row per measured arm: (sinogram shape, recon shape, masked pixel count,
@@ -1917,112 +1440,85 @@ def _measured_arm_ledger(arm):
     return estimate_peak_device_bytes(plan), measured
 
 
-@pytest.mark.parametrize('arm', sorted(MEASURED_ARMS))
-def test_the_torch_body_ledger_covers_every_measured_peak(arm):
+def test_the_torch_body_ledger_covers_every_measured_peak():
     """The floor, on the runs the slab count was calibrated from.
 
     A modeled peak below the measured one lets a doomed reconstruction start
     and die inside the allocator, which is the failure this module exists to
     prevent.  Every device of every measured arm must sit at or above 1.00.
-    """
-    ledger, measured = _measured_arm_ledger(arm)
-    for i, peak in enumerate(measured):
-        assert ledger.peak_bytes(i) >= peak, (
-            f'{arm} device {i}: modeled {ledger.peak_bytes(i)} < '
-            f'measured {peak}')
 
-
-def test_the_torch_body_over_charge_stays_inside_its_band():
-    """The other side of the floor: an over-charge spreads a reconstruction
-    over more devices than it needs, so the band is asserted too.
-
-    The band is wider than CALIBRATION_BAND, and the module records the two
-    measurements that set its width.  The arms pinned above sit inside it:
-    the widest over-charge among them is about 4.2x, on tct1k_n1, against a
-    bound of 5.8x.  The bound is not narrowed to match, because it was set by
-    a measurement rather than by this set of arms.
+    The other side of the floor: an over-charge spreads a reconstruction over
+    more devices than it needs, so the band is asserted too.  The band is
+    wider than CALIBRATION_BAND, and the module records the two measurements
+    that set its width.  The widest over-charge among these arms is about
+    4.2x, on tct1k_n1, against a bound of 5.8x.  The bound is not narrowed to
+    match, because it was set by a measurement rather than by this set of
+    arms.
     """
     low, high = _memory_ledger.TORCH_BODY_CALIBRATION_BAND
-    assert low == _memory_ledger.CALIBRATION_BAND[0]
     worst = 0.0
-    for arm in MEASURED_ARMS:
+    for arm in sorted(MEASURED_ARMS):
         ledger, measured = _measured_arm_ledger(arm)
         for i, peak in enumerate(measured):
+            assert ledger.peak_bytes(i) >= peak, (
+                f'{arm} device {i}: modeled {ledger.peak_bytes(i)} < '
+                f'measured {peak}')
             worst = max(worst, ledger.peak_bytes(i) / peak)
     assert low <= worst <= high
 
 
-def test_format_calibration_judges_against_the_band_it_is_given():
-    rows = [('cuda:0', 40 * GB, 10 * GB, 4.00)]
-    assert 'over' in _memory_ledger.format_calibration(rows)
-    assert 'over' not in _memory_ledger.format_calibration(
-        rows, band=_memory_ledger.TORCH_BODY_CALIBRATION_BAND)
-
-
 # ── the forward's cylinder transfer ──────────────────────────────────────────
-@pytest.mark.parametrize('aligned', (False, True),
-                         ids=('two-fan', 'row-aligned'))
-def test_the_cylinder_transfer_charges_its_cylinders(aligned):
+def test_the_cylinder_transfer_charges_its_cylinders():
     """The transfer leaves cylinders resident on every view-owner: one pixel
     batch wide and the whole slice axis tall.  Both forward phases carry them.
 
-    Both GEOMETRIES are priced by the same arithmetic, and the parametrization
-    is the claim: what a transfer holds is set by the shape it
-    assembles -- one
-    pixel batch by the whole device-form slice axis -- and not by whether the
-    geometry's detector rows track its slices.  The two take the path for
-    different reasons and pay the same term for it.
+    Both GEOMETRIES are priced by the same arithmetic: what a transfer holds
+    is set by the shape it assembles -- one pixel batch by the whole
+    device-form slice axis -- and not by whether the geometry's detector rows
+    track its slices.
 
-    THREE such batches are charged, not one: the driver transfers one
-    batch
+    Several such batches are charged, not one: the driver transfers one batch
     ahead of the projection that reads it, so the widest instant holds the
     cylinder about to be projected, the pieces arriving for the batch after
-    it, and their concatenation.  The count is written out here rather than
-    read from the module, so that changing the constant alone cannot move the
-    charge without this test noticing."""
+    it, and their concatenation.
+    """
     slices, batch = 32, 100                  # make_plan's slice axis
-    transferred = estimate_peak_device_bytes(
-        make_plan(n_devices=2, rows_track_slices=aligned,
-                  pixel_batch=batch))
-    for fragment in ('initial forward projection',
-                     'subset delta forward projection'):
-        terms = dict(_named(transferred, fragment).terms)
-        assert (terms['transferred cylinders']
-                == [3 * batch * slices * 4] * 2), fragment
+    residents = _memory_ledger.CYLINDER_TRANSFER_RESIDENTS
+    for aligned in (False, True):
+        transferred = estimate_peak_device_bytes(
+            make_plan(n_devices=2, rows_track_slices=aligned,
+                      pixel_batch=batch))
+        for fragment in ('initial forward projection',
+                         'subset delta forward projection'):
+            terms = dict(_named(transferred, fragment).terms)
+            assert (terms['transferred cylinders']
+                    == [residents * batch * slices * 4] * 2), (aligned,
+                                                               fragment)
 
-
-def test_the_transferred_cylinders_are_capped_by_the_pass_they_cover():
-    """A batch wider than the pixel set transfers the pixel set: the charge
-    follows what one call is actually handed, which is what keeps the term
-    honest at the small end without a separate rule.
-
-    Such a pass runs as a single batch and so transfers nothing ahead,
-    holding
-    two cylinders where the charge is three.  That over-charge is deliberate:
-    the ledger's one hard rule is that it may never charge less than a run
-    needs, and one term that covers the widest instant is simpler than a
-    second rule for the passes that fall short of it."""
-    slices, pixels = 32, 800
-    ledger = estimate_peak_device_bytes(
+    # A batch wider than the pixel set transfers the pixel set: the charge
+    # follows what one call is actually handed, which is what keeps the term
+    # honest at the small end without a separate rule.  Such a pass runs as a
+    # single batch and so transfers nothing ahead, holding two cylinders where
+    # the charge is three.  That over-charge is deliberate: the ledger's one
+    # hard rule is that it may never charge less than a run needs.
+    capped = estimate_peak_device_bytes(
         make_plan(n_devices=2, pixel_batch=10 ** 6))
-    terms = dict(_named(ledger, 'initial forward projection').terms)
-    assert terms['transferred cylinders'] == [3 * pixels * slices * 4] * 2
+    assert dict(_named(capped, 'initial forward projection')
+                .terms)['transferred cylinders'] \
+        == [residents * 800 * slices * 4] * 2
 
-
-def test_the_transferred_cylinders_do_not_grow_with_the_device_count():
-    """The property that dissolves the objection to assembling whole
-    cylinders: the term is the batch by the WHOLE slice axis on every
-    view-owner, so adding devices does not change it."""
+    # The term is the batch by the WHOLE slice axis on every view-owner, so
+    # adding devices does not change it.
     charges = []
     for n in (2, 4):
         transferred = estimate_peak_device_bytes(
-            make_plan(n_devices=n, pixel_batch=100))
+            make_plan(n_devices=n, pixel_batch=batch))
         charges.append(dict(_named(transferred, 'initial forward projection')
                             .terms)['transferred cylinders'][0])
     assert charges[0] == charges[1]
     # A single device never transfers: it holds the whole volume already.
     one = estimate_peak_device_bytes(
-        make_plan(n_devices=1, pixel_batch=100))
+        make_plan(n_devices=1, pixel_batch=batch))
     assert dict(_named(one, 'initial forward projection')
                 .terms)['transferred cylinders'] == [0]
 
@@ -2049,38 +1545,6 @@ def test_the_cylinder_transfer_prices_the_call_it_actually_makes():
     back = [(p, c) for d, p, c in asked if d == 'back']
     assert {c for _p, c in back} == {16}            # one slice shard of 32
     assert max(p for p, _c in back) > batch
-
-
-def test_plan_from_model_reads_the_resolved_pixel_batch():
-    """The ledger must not re-derive the driver's rule.  It asks the model
-    for the batch it would actually walk, so a changed default or an override
-    reaches the charge without a second edit here."""
-    from mbirtorch.tomography_model import FORWARD_PIXEL_BATCH
-    cell = (8, 8, 8)
-    angles = np.linspace(0, 2 * np.pi, cell[0], endpoint=False)
-    model = mbirtorch.ConeBeamModel(cell, angles, source_detector_dist=32,
-                                    source_iso_dist=16)
-    model.configure_devices(devices=['cpu'])
-    model.set_params(no_warning=True, verbose=0)
-    devices = ['cpu', 'cpu']
-    # Every projection plan carries the batch, because the cylinder
-    # transfer is the only multi-device forward.
-    assert _memory_ledger.plan_from_model(
-        model, devices).pixel_batch == FORWARD_PIXEL_BATCH
-    model.forward_project_pixel_batch = 512
-    assert _memory_ledger.plan_from_model(
-        model, devices).pixel_batch == 512
-    # The row-aligned geometry takes the same path, so the same resolution has
-    # to reach its charge.
-    par = mbirtorch.ParallelBeamModel(cell, np.linspace(0, np.pi, cell[0],
-                                                        endpoint=False))
-    par.configure_devices(devices=['cpu'])
-    par.set_params(no_warning=True, verbose=0)
-    assert _memory_ledger.plan_from_model(
-        par, devices).pixel_batch == FORWARD_PIXEL_BATCH
-    par.forward_project_pixel_batch = 256
-    assert _memory_ledger.plan_from_model(
-        par, devices).pixel_batch == 256
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────

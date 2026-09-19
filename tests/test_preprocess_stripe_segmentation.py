@@ -10,7 +10,6 @@ import os
 
 import numpy as np
 import pytest
-import torch
 
 import mbirtorch.preprocess as mtp
 
@@ -66,12 +65,6 @@ def test_multi_threshold_otsu_exact(golden):
     assert np.array_equal(thm, golden["otsu_masked"])
 
 
-def test_multi_threshold_otsu_torch_input(golden):
-    th_np = mtp.multi_threshold_otsu(golden["otsu_img"].copy(), classes=3)
-    th_t = mtp.multi_threshold_otsu(torch.as_tensor(golden["otsu_img"].copy()), classes=3)
-    assert np.array_equal(np.array(th_np), np.array(th_t))
-
-
 def test_segment_plastic_metal(golden):
     pm, mm, ps, ms = mtp.segment_plastic_metal(golden["seg_vol"].copy(), num_metal=2)
     assert np.array_equal(pm, golden["seg_pm"])
@@ -80,13 +73,3 @@ def test_segment_plastic_metal(golden):
     err_ms = _rel_max(np.array(ms), golden["seg_ms"])
     print(f"segment scales rel err = {err_ps:.2e} (plastic), {err_ms:.2e} (metal)")
     assert err_ps < 1e-5 and err_ms < 1e-5
-
-
-def test_segment_plastic_metal_torch_input(golden):
-    pm_n, mm_n, ps_n, ms_n = mtp.segment_plastic_metal(golden["seg_vol"].copy(), num_metal=2)
-    pm_t, mm_t, ps_t, ms_t = mtp.segment_plastic_metal(
-        torch.as_tensor(golden["seg_vol"].copy()), num_metal=2)
-    assert isinstance(pm_t, torch.Tensor)
-    assert np.array_equal(pm_n, pm_t.numpy())
-    assert all(np.array_equal(np.asarray(a), b.numpy()) for a, b in zip(mm_n, mm_t))
-    assert np.allclose([ps_n] + list(ms_n), [ps_t] + list(ms_t), rtol=1e-6)

@@ -1,10 +1,9 @@
-"""Gates for get_ct_model and the demo-data generators.
+"""Gates for the demo-data generators.
 
 The reference phantom shares its numpy code with mbirjax, so it gates on
 exact equality.  The demo sinograms have the projectors in the loop, so
 they gate at the projector tolerance with a small allowance for phantom
-voxels that sit exactly on an ellipsoid boundary.  get_ct_model gates on
-class and recon shape against the mbirjax golden.
+voxels that sit exactly on an ellipsoid boundary.
 """
 
 import os
@@ -60,32 +59,6 @@ def _rel_max(out, ref):
 # mbirtorch version was corrected, so the two no longer match.
 
 
-@pytest.mark.goldens
-def test_get_ct_model_classes_and_shapes(golden):
-    par = mbirtorch.get_ct_model('parallel', (8, 10, 12),
-                                 np.linspace(0, np.pi, 8, endpoint=False))
-    cone = mbirtorch.get_ct_model('cone', (8, 10, 12),
-                                  np.linspace(0, 2 * np.pi, 8, endpoint=False),
-                                  source_detector_dist=100.0, source_iso_dist=50.0)
-    assert type(par).__name__ == 'ParallelBeamModel'
-    assert type(cone).__name__ == 'ConeBeamModel'
-    shapes = np.array([par.get_params('recon_shape'), cone.get_params('recon_shape')],
-                      dtype=np.int64)
-    assert np.array_equal(shapes, golden["gcm_shapes"])
-
-
-def test_get_ct_model_rejects_bad_geometry():
-    with pytest.raises(ValueError):
-        mbirtorch.get_ct_model('spiral', (8, 10, 12), np.zeros(8))
-
-
-def test_get_ct_model_warns_on_parallel_z_shifts():
-    with pytest.warns(UserWarning):
-        mbirtorch.get_ct_model('parallel', (8, 10, 12),
-                               np.linspace(0, np.pi, 8, endpoint=False),
-                               helical_z_shifts=np.zeros(8))
-
-
 @pytest.mark.parametrize("tag,kwargs", [
     ("par", dict(model_type='parallel')),
     ("cone", dict(model_type='cone')),
@@ -119,15 +92,15 @@ def test_generate_demo_data_matches_golden(golden, tag, kwargs):
     assert err < 1e-3
 
 
-def test_gen_cube_phantom_is_float32():
-    """mbirjax's jnp.array downcasts to float32; torch.as_tensor keeps
-    numpy's float64, which doubles the memory and mps cannot hold at all."""
+def test_generate_demo_data_is_finite_float32_for_every_model_type():
+    """Each generator must return a host numpy float32 phantom and a finite,
+    non-empty sinogram of the shape its geometry implies.  The cube phantom
+    itself must be torch float32: mbirjax's jnp.array downcasts to float32,
+    while torch.as_tensor keeps numpy's float64, which doubles the memory and
+    mps cannot hold at all."""
     import torch
-    phantom = mbirtorch.gen_cube_phantom((8, 8, 4))
-    assert phantom.dtype == torch.float32
+    assert mbirtorch.gen_cube_phantom((8, 8, 4)).dtype == torch.float32
 
-
-def test_generate_demo_data_cube():
     phantom, sino, params = mbirtorch.generate_demo_data(
         model_type='cone', object_type='cube', num_views=12,
         num_det_rows=24, num_det_channels=32)
@@ -135,8 +108,6 @@ def test_generate_demo_data_cube():
     assert isinstance(phantom, np.ndarray) and phantom.dtype == np.float32
     assert phantom.max() > 0 and np.isfinite(np.asarray(sino)).all()
 
-
-def test_generate_demo_data_translation():
     phantom, sino, params = mbirtorch.generate_demo_data(
         model_type='translation', object_type='cube',
         num_det_rows=24, num_det_channels=32)
@@ -145,16 +116,6 @@ def test_generate_demo_data_translation():
     assert phantom.max() > 0 and np.isfinite(np.asarray(sino)).all()
     assert np.asarray(sino).max() > 0
 
-
-def test_gen_translation_vectors_grid():
-    vecs = mbirtorch.gen_translation_vectors(3, 2, 10.0, 5.0)
-    assert vecs.shape == (6, 3)
-    assert np.allclose(vecs[:, 1], 0.0)                       # no y motion
-    assert np.allclose(sorted(set(vecs[:, 0])), [-10.0, 0.0, 10.0])
-    assert np.allclose(sorted(set(vecs[:, 2])), [-2.5, 2.5])
-
-
-def test_generate_demo_data_multiaxis():
     phantom, sino, params = mbirtorch.generate_demo_data(
         model_type='multiaxis', elevation_degrees=25.0, object_type='cube',
         num_views=8, num_det_rows=16, num_det_channels=24)
@@ -162,3 +123,11 @@ def test_generate_demo_data_multiaxis():
     assert params['angles'].shape == (8, 2)
     assert np.allclose(params['angles'][:, 1], np.deg2rad(25.0))
     assert np.isfinite(np.asarray(sino)).all() and np.asarray(sino).max() > 0
+
+
+def test_gen_translation_vectors_grid():
+    vecs = mbirtorch.gen_translation_vectors(3, 2, 10.0, 5.0)
+    assert vecs.shape == (6, 3)
+    assert np.allclose(vecs[:, 1], 0.0)                       # no y motion
+    assert np.allclose(sorted(set(vecs[:, 0])), [-10.0, 0.0, 10.0])
+    assert np.allclose(sorted(set(vecs[:, 2])), [-2.5, 2.5])

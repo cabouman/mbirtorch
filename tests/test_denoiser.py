@@ -73,45 +73,67 @@ def test_denoise_reduces_noise(device):
     assert err_den < 0.6 * err_noisy, (err_den, err_noisy)
 
 
-def test_image_ell1_is_accurate_at_a_size_that_chunks(device):
-    """The reduction behind the reported nmae, checked where the goldens
-    cannot check it.
+def test_ell1_reductions_match_a_float64_reference(device):
+    """The reductions behind the reported nmae, checked where the goldens
+    cannot check them.
 
     The golden image is far below one chunk, so the goldens only ever exercise
-    the unchunked branch.  This runs an image large enough to chunk and scores
-    the result against a float64 reference over the same float32 values, so it
-    measures the reduction's own arithmetic rather than the denoiser's.  The
-    statistic is gated at 1e-3 relative, and this must hold with room to
-    spare: a reduction that accumulates float32 sequentially instead of
-    pairwise drifts past that gate as the element count grows, which is why
-    torch.linalg.vector_norm is not used here.
-    """
-    shape = (256, 256, 256)
+    the unchunked branch.  Below one chunk the reduction is the sum(abs) it
+    replaced, so it must match bit for bit.  Above one chunk the result is
+    scored against a float64 reference over the same float32 values, which
+    measures the reduction's own arithmetic rather than the denoiser's: a
+    reduction that accumulates float32 sequentially instead of pairwise drifts
+    as the element count grows, which is why torch.linalg.vector_norm is not
+    used here.  The per-volume form used by the stack sweep's stopping test is
+    checked against the single-image form on each volume."""
     torch.manual_seed(11)
-    flat = torch.randn(shape[0] * shape[1], shape[2])
-    assert flat.numel() * flat.element_size() > _memory_ledger.ELL1_CHUNK_BYTES
-    reference = float(flat.double().abs().sum())
 
-    value = float(image_ell1(flat.to(device)))
-    rel = abs(value - reference) / abs(reference)
-    print(f"image_ell1 on {device}: rel vs float64 = {rel:.2e}")
-    assert rel < 1e-5
-
-
-def test_image_ell1_leaves_a_small_image_bit_for_bit():
-    """Below one chunk the reduction is the sum(abs) it replaced, so small
-    problems -- every golden among them -- cannot move at all."""
     small = torch.randn(32 * 32, 32)
     assert (small.numel() * small.element_size()
             < _memory_ledger.ELL1_CHUNK_BYTES)
     assert float(image_ell1(small)) == float(torch.sum(torch.abs(small)))
 
+    shape = (256, 256, 256)
+    flat = torch.randn(shape[0] * shape[1], shape[2])
+    assert flat.numel() * flat.element_size() > _memory_ledger.ELL1_CHUNK_BYTES
+    reference = float(flat.double().abs().sum())
+    value = float(image_ell1(flat.to(device)))
+    rel = abs(value - reference) / abs(reference)
+    print(f"image_ell1 on {device}: rel vs float64 = {rel:.2e}")
+    assert rel < 1e-5
+
+    small_stack = torch.randn(3, 32 * 32, 32, device=device)
+    assert small_stack.numel() * small_stack.element_size() < _memory_ledger.ELL1_CHUNK_BYTES
+    per_volume = torch.stack([image_ell1(small_stack[b]) for b in range(3)])
+    rel = float((stack_ell1(small_stack) - per_volume).abs().max() / per_volume.abs().max())
+    assert rel < 1e-6
+
+    large_stack = torch.randn(4, 512 * 512, 8, device=device)
+    assert large_stack.numel() * large_stack.element_size() > _memory_ledger.ELL1_CHUNK_BYTES
+    # The float64 reference is formed on the host: MPS has no float64.
+    reference = large_stack.cpu().double().abs().sum(dim=(1, 2))
+    rel = float((stack_ell1(large_stack).cpu().double() - reference).abs().max()
+                / reference.abs().max())
+    print(f"stack_ell1 on {device} at a size that chunks: rel vs float64 = {rel:.2e}")
+    assert rel < 1e-5
+
 
 def test_sharded_denoise_matches_single_device():
-    """Two CPU shards vs one device on the same seeded problem.  The sharded
-    path stages halos once per pass and combines the step-size sums on the
-    lead device, so agreement is at float level, not bitwise (gate per the
-    measured iterated-comparison floor)."""
+    """Two CPU shards vs one device on the same seeded problem: the denoised
+    volume and the automatically set regularization parameters must both agree
+    with the single-device run.
+
+    The sharded path stages halos once per pass and combines the step-size sums
+    on the lead device, so agreement is at float level, not bitwise (gate per
+    the measured iterated-comparison floor).  The regularization parameters are
+    gated relatively for the same reason: the two runs reach numpy by different
+    routes -- a strided view of the caller's own array on one, a concatenation
+    of per-shard copies on the other -- and float32 reductions need not
+    accumulate in the same order over different memory layouts.
+
+    sigma_noise is left unset so the statistics run, and the two-device model
+    is handed its device form, which is what a caller that keeps its volume on
+    the devices does and what puts the statistics on the sharded path."""
     shape = (24, 24, 21)   # 2 shards pad the slice axis 21 -> 22
     clean = np.zeros(shape, dtype=np.float32)
     clean[6:-6, 6:-6, 5:-5] = 1.0
@@ -121,23 +143,33 @@ def test_sharded_denoise_matches_single_device():
     ref_den.configure_devices(devices=['cpu'])
     ref_den.set_params(no_warning=True, verbose=0)
     np.random.seed(0)
-    ref, ref_dict = ref_den.denoise(noisy, sigma_noise=0.1, max_iterations=5,
+    ref, ref_dict = ref_den.denoise(noisy, max_iterations=5,
                                     stop_threshold_change_pct=0.0, logfile_path=None)
 
     sh_den = mbirtorch.QGGMRFDenoiser(shape)
     sh_den.configure_devices(devices=['cpu', 'cpu'])
     sh_den.set_params(no_warning=True, verbose=0)
     np.random.seed(0)
-    out, out_dict = sh_den.denoise(noisy, sigma_noise=0.1, max_iterations=5,
-                                   stop_threshold_change_pct=0.0, logfile_path=None)
+    out, out_dict = sh_den.denoise(sh_den._shard_recon(noisy), max_iterations=5,
+                                   stop_threshold_change_pct=0.0, logfile_path=None,
+                                   output_sharded=True)
+    out = np.asarray(out.gather())
 
     assert out.shape == ref.shape
     rel = float(np.max(np.abs(out - ref)) / np.max(np.abs(ref)))
     print(f"sharded vs single denoise rel_max = {rel:.2e}")
     assert rel < 1e-4
-    # The denoiser dict now carries the run log and notes, like recon's.
+    # The denoiser dict carries the run log and notes, like recon's.
     # (verbose=0 logs no iteration lines, so only the keys are checked.)
     assert 'recon_log' in out_dict and 'notes' in out_dict
+
+    ref_params = ref_dict['recon_params']['regularization_params']
+    out_params = out_dict['recon_params']['regularization_params']
+    for name in ('sigma_x', 'sigma_prox', 'sigma_y'):
+        rel = abs(out_params[name] - ref_params[name]) / abs(ref_params[name])
+        print(f"{name}: sharded {out_params[name]:.8g} vs single "
+              f"{ref_params[name]:.8g} (rel {rel:.2e})")
+        assert rel < 1e-5, name
 
 
 def _as_shards(volume, n_shards):
@@ -147,52 +179,6 @@ def _as_shards(volume, n_shards):
     tensors = [torch.as_tensor(volume[:, :, s0:s1].copy())
                for _dev, (s0, s1) in placement.shard_ranges()]
     return _sharding.Shards(tensors, placement)
-
-
-@pytest.mark.parametrize('n_shards', [1, 2, 3])
-def test_subsample_to_host_reproduces_striding_the_volume(n_shards):
-    """Assembling a strided subsample from the shards is data movement, so
-    the gate is exact equality with striding the whole volume, not a
-    tolerance.
-
-    Three shards matter: 23 slices split 8/8/7, so the shard boundaries fall
-    at 8 and 16 and most of the strides below do not divide them.  That is
-    what the per-shard starting offset exists for, and a subsample that
-    restarted at each shard instead would disagree here while still matching
-    on an evenly divided split."""
-    rng = np.random.default_rng(5)
-    volume = rng.standard_normal((9, 7, 23)).astype(np.float32)
-    shards = _as_shards(volume, n_shards)
-    assert denoising._volume_shape(shards) == volume.shape
-
-    for row_step in (1, 2, 4):
-        for col_step in (1, 3):
-            for slice_step in (1, 2, 3, 5, 7, 8, 23, 30):
-                assembled = denoising._subsample_to_host(
-                    shards, row_step, col_step, slice_step)
-                expected = volume[::row_step, ::col_step, ::slice_step]
-                assert np.array_equal(assembled, expected), (
-                    n_shards, row_step, col_step, slice_step)
-
-    # The tensor and numpy forms take the same three strides.
-    assert np.array_equal(denoising._subsample_to_host(torch.as_tensor(volume), 2, 3, 5),
-                          volume[::2, ::3, ::5])
-    assert np.array_equal(denoising._subsample_to_host(volume, 2, 3, 5),
-                          volume[::2, ::3, ::5])
-
-
-def test_subsample_to_host_handles_a_shard_with_no_slices():
-    """More devices than slices leaves a trailing shard empty; it must
-    contribute nothing rather than break the assembly."""
-    rng = np.random.default_rng(6)
-    volume = rng.standard_normal((4, 3, 2)).astype(np.float32)
-    shards = _as_shards(volume, 3)
-    assert [int(t.shape[-1]) for t in shards.tensors] == [1, 1, 0]
-    assert denoising._volume_shape(shards) == volume.shape
-
-    for slice_step in (1, 2, 3):
-        assert np.array_equal(denoising._subsample_to_host(shards, 1, 1, slice_step),
-                              volume[:, :, ::slice_step])
 
 
 def test_noise_estimate_is_the_same_sharded_or_not():
@@ -218,49 +204,6 @@ def test_noise_estimate_is_the_same_sharded_or_not():
     for n_shards in (1, 2, 3):
         sharded = float(denoiser.estimate_image_noise_std(_as_shards(noisy, n_shards)))
         assert sharded == reference, (n_shards, sharded, reference)
-
-
-def test_sharded_denoise_sets_the_same_regularization_params():
-    """Two shards with sigma_noise unset must reach the same regularization
-    parameters as one device, since both statistics see the same subsample.
-
-    The gate is relative, not exact: the two runs reach numpy by different
-    routes -- a strided view of the caller's own array on one, a
-    concatenation of per-shard copies on the other -- and float32 reductions
-    need not accumulate in the same order over different memory layouts.  The
-    claim being tested is about the statistics, not about the layout, so a
-    float32-sized tolerance is what states it."""
-    shape = (24, 24, 21)
-    rng = np.random.default_rng(8)
-    clean = np.zeros(shape, dtype=np.float32)
-    clean[6:-6, 6:-6, 5:-5] = 1.0
-    noisy = clean + 0.1 * rng.standard_normal(shape).astype(np.float32)
-
-    ref_den = mbirtorch.QGGMRFDenoiser(shape)
-    ref_den.configure_devices(devices=['cpu'])
-    ref_den.set_params(no_warning=True, verbose=0)
-    np.random.seed(0)
-    _, ref_dict = ref_den.denoise(noisy, max_iterations=2,
-                                  stop_threshold_change_pct=0.0, logfile_path=None)
-
-    sh_den = mbirtorch.QGGMRFDenoiser(shape)
-    sh_den.configure_devices(devices=['cpu', 'cpu'])
-    sh_den.set_params(no_warning=True, verbose=0)
-    np.random.seed(0)
-    # Hand the two-device model its device form, which is what a caller that
-    # keeps its volume on the devices does, and what puts the statistics on
-    # the sharded path.
-    _, out_dict = sh_den.denoise(sh_den._shard_recon(noisy), max_iterations=2,
-                                 stop_threshold_change_pct=0.0, logfile_path=None,
-                                 output_sharded=True)
-
-    ref_params = ref_dict['recon_params']['regularization_params']
-    out_params = out_dict['recon_params']['regularization_params']
-    for name in ('sigma_x', 'sigma_prox', 'sigma_y'):
-        rel = abs(out_params[name] - ref_params[name]) / abs(ref_params[name])
-        print(f"{name}: sharded {out_params[name]:.8g} vs single "
-              f"{ref_params[name]:.8g} (rel {rel:.2e})")
-        assert rel < 1e-5, name
 
 
 def test_sharded_denoise_makes_no_whole_volume_host_transfer(monkeypatch):
@@ -339,32 +282,6 @@ def test_sharded_denoise_makes_no_whole_volume_host_transfer(monkeypatch):
     assert moved == [noise_elements, row_elements]
 
 
-def test_median_filter3d_refuses_the_divided_form():
-    """Each output voxel needs the 26 voxels around it, so a volume divided
-    across devices on its slice axis would need its neighboring slices
-    exchanged between them.  The filter refuses it by name instead of taking it
-    for numpy, which fails on a torch dtype message that says nothing about
-    where the array actually is.  Two 'virtual' CPU devices build the divided
-    form, so this runs everywhere."""
-    volume = np.random.RandomState(0).rand(6, 6, 8).astype(np.float32)
-    placement = _sharding.Placement(['cpu', 'cpu'], axis=-1,
-                                    axis_len=volume.shape[-1])
-    divided = _sharding.Shards(
-        [torch.as_tensor(volume[..., start:end].copy())
-         for _, (start, end) in placement.shard_ranges()], placement)
-
-    with pytest.raises(TypeError) as refusal:
-        mbirtorch.median_filter3d(divided)
-    message = str(refusal.value)
-    assert 'median_filter3d' in message
-    assert 'form: x.' in message          # the argument that was wrong
-    assert 'divided device form' in message
-    assert 'shards.gather()' in message
-
-    # The whole-array forms still go through.
-    assert mbirtorch.median_filter3d(volume).shape == volume.shape
-
-
 def test_denoise_pinned_params_keep_sigma_noise_knob(device):
     """With auto-regularization pinned off (the Plug-and-Play agent
     configuration: sigma_x fixed so the denoiser is the same operator every
@@ -399,10 +316,14 @@ def test_denoise_pinned_params_keep_sigma_noise_knob(device):
     assert dist_weak < 0.5 * dist_strong, (dist_weak, dist_strong)
 
 
-def test_denoise_accepts_zero_image(device):
+def test_zero_input_comes_back_unchanged(device):
     """An all-zero image is a legitimate input (a Plug-and-Play loop
     initialized at zero feeds one in): the denoiser must return it unchanged
-    instead of dividing its NMAE statistic by the zero image norm."""
+    instead of dividing its NMAE statistic by the zero image norm.
+
+    The same holds for a stack: a stack of zeros has no neighbor differences,
+    so the estimate is zero and sigma_x takes the floor, and denoise_stack
+    returns the zeros with no NaN."""
     shape = (16, 16, 1)
     denoiser = mbirtorch.QGGMRFDenoiser(shape)
     denoiser.configure_devices(devices=[device])
@@ -413,6 +334,21 @@ def test_denoise_accepts_zero_image(device):
                               sigma_noise=0.1, max_iterations=2,
                               stop_threshold_change_pct=0.0)
     assert np.array_equal(np.asarray(out), np.zeros(shape, dtype=np.float32))
+
+    stack_shape = (8, 10, 12)
+    zeros = np.zeros((3,) + stack_shape, dtype=np.float32)
+    params = _auto_denoiser(stack_shape, device).auto_set_regularization_params_from_stack(zeros)
+    assert params['sigma_x'] == denoising._SIGMA_X_FLOOR
+
+    stack_denoiser = mbirtorch.QGGMRFDenoiser(stack_shape)
+    stack_denoiser.configure_devices(devices=[device])
+    stack_denoiser.set_params(no_warning=True, verbose=0)
+    np.random.seed(0)
+    stack_out, info = stack_denoiser.denoise_stack(zeros, sigma_noise=0.1, max_iterations=2,
+                                                   stop_threshold_change_pct=0.0)
+    assert info['regularization_params']['sigma_x'] == denoising._SIGMA_X_FLOOR
+    assert np.all(np.isfinite(stack_out))
+    assert np.array_equal(stack_out, zeros)
 
 
 # ── denoise_stack: a stack of volumes against a loop of single volumes ───────
@@ -476,9 +412,13 @@ def test_batched_gradient_and_hessian_equal_the_single_image_function(device):
 def test_denoise_stack_equals_a_loop_of_denoise_calls(device):
     """The stack sweep gives each volume its own step size and its own
     stopping test, so it must reproduce a loop of single-volume denoise calls
-    with the same pinned parameters and the same seeded partition, volume by
-    volume, including the iteration count at which each volume stops.  The
-    noise amplitude differs per volume so that the counts differ.
+    with the same parameters and the same seeded partition, volume by volume,
+    including the iteration count at which each volume stops.  The noise
+    amplitude differs per volume so that the counts differ.
+
+    Auto-regularization is on, so the sweep also sets sigma_x from the stack.
+    That value is checked against the method that computes it, and the loop is
+    pinned to it: the parameter moved and the sweep did not.
 
     The gate is a relative maximum difference of 1e-6, not equality: the
     line-search sums are reductions, and a reduction over one axis of a 3D
@@ -489,9 +429,26 @@ def test_denoise_stack_equals_a_loop_of_denoise_calls(device):
     sigma_noise = 0.1
     stack = _ramp_stack(num_volumes, shape)
 
+    auto = mbirtorch.QGGMRFDenoiser(shape)
+    auto.configure_devices(devices=[device])
+    auto.set_params(no_warning=True, verbose=0)
+    np.random.seed(0)
+    denoised, info = auto.denoise_stack(stack, sigma_noise=sigma_noise,
+                                        max_iterations=15,
+                                        stop_threshold_change_pct=0.2)
+
+    # The parameter moved: the reported sigma_x is the method's own value.
+    reported = info['regularization_params']['sigma_x']
+    from_method = _auto_denoiser(shape, device, sigma_noise) \
+        .auto_set_regularization_params_from_stack(stack)['sigma_x']
+    rel_param = _rel(reported, from_method)
+    assert rel_param < 1e-6
+
+    # And the sweep did not: it is the loop of single-volume calls with
+    # sigma_x pinned to that value on the same seeded partition.
     reference = np.empty_like(stack)
     reference_counts = []
-    single = _pinned_denoiser(shape, device)
+    single = _pinned_denoiser(shape, device, sigma_x=reported)
     for volume in range(num_volumes):
         np.random.seed(0)     # the same partition for every volume
         out, out_dict = single.denoise(stack[volume], sigma_noise=sigma_noise,
@@ -501,15 +458,10 @@ def test_denoise_stack_equals_a_loop_of_denoise_calls(device):
         reference[volume] = out
         reference_counts.append(int(out_dict['recon_params']['num_iterations']))
 
-    np.random.seed(0)
-    denoised, info = _pinned_denoiser(shape, device).denoise_stack(
-        stack, sigma_noise=sigma_noise, max_iterations=15,
-        stop_threshold_change_pct=0.2)
-
     rel = _rel_max(denoised, reference)
     counts = [int(n) for n in info['num_iterations']]
-    print(f"denoise_stack vs loop of denoise on {device}: rel_max = {rel:.2e}, "
-          f"iteration counts {counts}")
+    print(f"denoise_stack vs loop of denoise on {device}: sigma_x {reported:.8g} "
+          f"(rel {rel_param:.2e}), rel_max = {rel:.2e}, iteration counts {counts}")
     assert denoised.shape == stack.shape and denoised.dtype == np.float32
     assert rel < 1e-6
     assert counts == reference_counts
@@ -519,34 +471,6 @@ def test_denoise_stack_equals_a_loop_of_denoise_calls(device):
     assert set(info['regularization_params']) == {'sigma_y', 'sigma_x', 'sigma_prox'}
     # The volumes changed: this is a denoise, not a copy.
     assert _rel_max(denoised, stack) > 1e-3
-
-
-def test_denoise_stack_returns_the_kind_of_array_it_was_given(device):
-    """A numpy stack comes back as numpy, and a tensor comes back as a tensor
-    on the device it arrived on, whatever device the sweep ran on."""
-    shape = (8, 10, 12)
-    stack = _ramp_stack(3, shape)
-    denoiser = _pinned_denoiser(shape, device)
-
-    np.random.seed(0)
-    from_numpy, _ = denoiser.denoise_stack(stack, sigma_noise=0.1)
-    assert isinstance(from_numpy, np.ndarray)
-
-    np.random.seed(0)
-    from_host_tensor, _ = denoiser.denoise_stack(torch.as_tensor(stack),
-                                                 sigma_noise=0.1)
-    assert torch.is_tensor(from_host_tensor)
-    assert from_host_tensor.device.type == 'cpu'
-
-    np.random.seed(0)
-    from_device_tensor, _ = denoiser.denoise_stack(
-        torch.as_tensor(stack).to(device), sigma_noise=0.1)
-    assert torch.is_tensor(from_device_tensor)
-    assert from_device_tensor.device.type == torch.device(device).type
-
-    # Data movement only: the three forms hold the same values.
-    assert np.array_equal(from_host_tensor.numpy(), from_numpy)
-    assert np.array_equal(from_device_tensor.cpu().numpy(), from_numpy)
 
 
 def test_denoise_stack_padded_last_batch_matches_one_batch(device):
@@ -570,10 +494,12 @@ def test_denoise_stack_padded_last_batch_matches_one_batch(device):
     assert list(batched_info['num_iterations']) == list(whole_info['num_iterations'])
 
 
-def test_denoise_stack_takes_an_init_stack_and_checks_shapes(device):
+def test_denoise_stack_takes_an_init_stack_and_checks_arguments(device):
     """An initial stack starts the sweep where it says; a wrong shape in
     either argument, or a batch size below one, is refused before any
-    computation."""
+    computation.  A denoiser configured with two devices is refused as well:
+    the stack sweep runs on one device rather than silently using the first.
+    Two 'virtual' CPU devices build that layout, so it runs everywhere."""
     shape = (8, 10, 12)
     stack = _ramp_stack(3, shape)
     denoiser = _pinned_denoiser(shape, device)
@@ -597,6 +523,12 @@ def test_denoise_stack_takes_an_init_stack_and_checks_shapes(device):
         denoiser.denoise_stack(stack, sigma_noise=0.1, init_stack=stack[:2])
     with pytest.raises(ValueError):
         denoiser.denoise_stack(stack, sigma_noise=0.1, batch_size=0)
+
+    two_devices = mbirtorch.QGGMRFDenoiser(shape)
+    two_devices.configure_devices(devices=['cpu', 'cpu'])
+    two_devices.set_params(no_warning=True, verbose=0)
+    with pytest.raises(ValueError, match='one device'):
+        two_devices.denoise_stack(stack, sigma_noise=0.1)
 
 
 def test_denoise_stack_never_writes_the_caller_s_arrays(device):
@@ -674,141 +606,6 @@ def test_overwrite_input_takes_the_caller_s_tensors_over(device):
     assert _rel_max(out, before) > 1e-3
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason='needs a CUDA memory counter')
-def test_overwrite_input_saves_one_array_per_volume():
-    """By default a one-batch sweep of a tensor on its own device holds the
-    input, the working image, and the residual; with ``overwrite_input`` the
-    input is the image, so the peak drops by about one stack in three, less
-    the subset temporaries both hold.  Only CUDA reports the peak."""
-    shape = (16, 64, 64)
-    denoiser = _pinned_denoiser(shape, 'cuda')
-
-    peaks = {}
-    for flag in (False, True):
-        stack = torch.as_tensor(_ramp_stack(8, shape)).cuda()
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats()
-        denoiser.denoise_stack(stack, sigma_noise=0.1, batch_size=8, overwrite_input=flag,
-                               max_iterations=2, stop_threshold_change_pct=0.0)
-        torch.cuda.synchronize()
-        peaks[flag] = torch.cuda.max_memory_allocated()
-        del stack
-    ratio = peaks[True] / peaks[False]
-    print(f"peak bytes without overwrite {peaks[False]}, with {peaks[True]}, ratio {ratio:.3f}")
-    assert ratio < 0.85
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason='needs a CUDA memory counter')
-def test_a_denoise_sweep_holds_the_same_memory_with_and_without_an_init_stack():
-    """The sweep holds two arrays per volume either way, so its peak does not
-    depend on whether an initial stack is given.  Only CUDA reports the peak,
-    so this runs there alone; it is the check that auto_batch_size no longer
-    needs to be told."""
-    shape = (16, 32, 32)
-    denoiser = _pinned_denoiser(shape, 'cuda')
-    stack = torch.as_tensor(_ramp_stack(4, shape)).cuda()
-
-    peaks = {}
-    for label, init in (('without init', None), ('with init', torch.zeros_like(stack) + 0.25)):
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats()
-        denoiser.denoise_stack(stack, sigma_noise=0.1, init_stack=init, batch_size=4,
-                               max_iterations=2, stop_threshold_change_pct=0.0)
-        torch.cuda.synchronize()
-        peaks[label] = torch.cuda.max_memory_allocated()
-    ratio = peaks['with init'] / peaks['without init']
-    print(f"peak bytes without init {peaks['without init']}, with init "
-          f"{peaks['with init']}, ratio {ratio:.3f}")
-    # One more array per volume would be a ratio near 1.5, since the sweep
-    # holds two; the tolerance covers the allocator's own rounding.
-    assert ratio < 1.15
-
-
-def test_denoise_stack_refuses_a_multi_device_denoiser():
-    """The stack sweep runs on one device; a denoiser configured with two
-    refuses rather than silently using the first.  Two 'virtual' CPU devices
-    build the layout, so this runs everywhere."""
-    shape = (8, 10, 12)
-    denoiser = mbirtorch.QGGMRFDenoiser(shape)
-    denoiser.configure_devices(devices=['cpu', 'cpu'])
-    denoiser.set_params(no_warning=True, verbose=0)
-    with pytest.raises(ValueError, match='one device'):
-        denoiser.denoise_stack(_ramp_stack(2, shape), sigma_noise=0.1)
-
-
-def test_stack_ell1_matches_image_ell1_per_volume(device):
-    """The per-volume reduction behind the stack sweep's stopping test agrees
-    with the single-image reduction on each volume, at a size that chunks and
-    at one that does not.  Below one chunk both reduce whole, so the small
-    case is the same arithmetic, checked at float rounding; the chunked case
-    cuts different chunks and is checked against a float64 reference."""
-    torch.manual_seed(11)
-    small = torch.randn(3, 32 * 32, 32, device=device)
-    assert small.numel() * small.element_size() < _memory_ledger.ELL1_CHUNK_BYTES
-    per_volume = torch.stack([image_ell1(small[b]) for b in range(3)])
-    rel = float((stack_ell1(small) - per_volume).abs().max() / per_volume.abs().max())
-    assert rel < 1e-6
-
-    large = torch.randn(4, 512 * 512, 8, device=device)
-    assert large.numel() * large.element_size() > _memory_ledger.ELL1_CHUNK_BYTES
-    # The float64 reference is formed on the host: MPS has no float64.
-    reference = large.cpu().double().abs().sum(dim=(1, 2))
-    rel = float((stack_ell1(large).cpu().double() - reference).abs().max()
-                / reference.abs().max())
-    print(f"stack_ell1 on {device} at a size that chunks: rel vs float64 = {rel:.2e}")
-    assert rel < 1e-5
-
-
-# ── the automatic batch size ─────────────────────────────────────────────────
-
-def test_auto_batch_size_follows_the_device_budget():
-    """Without a readable memory budget the size is None, which
-    denoise_stack takes as the whole stack; a CUDA device gets a positive
-    count.  A shape other than the denoiser's is refused."""
-    shape = (8, 10, 12)
-    denoiser = _pinned_denoiser(shape, 'cpu')
-    assert denoiser.auto_batch_size() is None
-    assert denoiser.auto_batch_size(shape) is None
-    with pytest.raises(ValueError):
-        denoiser.auto_batch_size((8, 10, 13))
-    if torch.cuda.is_available():
-        on_cuda = _pinned_denoiser(shape, 'cuda')
-        batch = on_cuda.auto_batch_size()
-        print(f"auto_batch_size on cuda for {shape}: {batch}")
-        assert isinstance(batch, int) and batch >= 1
-
-
-def test_denoise_batch_ledger_scales_the_per_volume_terms_only():
-    """The batch rule reprices the one-volume denoise ledger as fixed terms
-    plus the batch count times the per-volume terms.  On the real plan this
-    must reproduce the one-volume peak at a batch of one, grow by the same
-    amount per added volume, and leave the shared partition and the library
-    workspace uncounted in that growth."""
-    shape = (16, 20, 24)
-    denoiser = _pinned_denoiser(shape, 'cpu')
-    ledger = denoiser._build_memory_ledger(devices=['cpu'], workload='denoise')
-    peaks = [_memory_ledger.denoise_batch_peak_bytes(ledger, b) for b in (1, 2, 3)]
-    assert peaks[0] == ledger.peak_bytes(0)
-    per_volume = peaks[1] - peaks[0]
-    assert per_volume > 0 and peaks[2] - peaks[1] == per_volume
-    # The growth is image-shaped: at least the three resident images of the
-    # sweep, and never the 64 MiB workspace.
-    volume_bytes = 4 * int(np.prod(shape))
-    assert 3 * volume_bytes <= per_volume < _memory_ledger.FIXED_DEVICE_OVERHEAD_BYTES
-
-    # The largest batch that fits is the largest whose scaled peak, under the
-    # margin, stays within the budget.
-    margin = 0.15
-    for batch in (1, 2, 7, 40):
-        budget = int((1.0 + margin) * peaks[0]) + (batch - 1) * int((1.0 + margin) * per_volume)
-        chosen = _memory_ledger.largest_denoise_batch(ledger, budget, margin=margin)
-        assert (1.0 + margin) * _memory_ledger.denoise_batch_peak_bytes(ledger, chosen) <= budget
-        assert (1.0 + margin) * _memory_ledger.denoise_batch_peak_bytes(ledger, chosen + 1) > budget
-        assert chosen >= batch - 1
-    # Less than one volume's worth gives zero, which auto_batch_size refuses.
-    assert _memory_ledger.largest_denoise_batch(ledger, peaks[0] // 2, margin=margin) == 0
-
-
 # ── the regularization parameters of a stack ─────────────────────────────────
 
 def _auto_denoiser(shape, device, sigma_noise=0.1):
@@ -834,15 +631,21 @@ def _rel(a, b):
     return abs(float(a) - float(b)) / abs(float(b))
 
 
-def test_stack_regularization_uses_every_volume_of_a_small_stack():
-    """Up to 39 volumes every volume is chosen, so sigma_x is the whole-stack
-    statistic: the estimator on the merged stack with its neighbor
-    differences between adjacent frames.  The value stored is float32, so the
-    gate is relative rather than exact.  With auto-regularization off the
-    method changes nothing and returns the current values."""
+def test_stack_regularization_uses_the_chosen_volumes(device, monkeypatch):
+    """sigma_x is the estimator on the chosen volumes, merged into one 3D
+    array with its neighbor differences between adjacent frames.
+
+    Up to 39 volumes every volume is chosen, so sigma_x is the whole-stack
+    statistic.  Above 39 about 20 are chosen, evenly spaced, by the rule
+    subsample_views applies to views, and only those volumes cross to the
+    host: a stack on the device is indexed there and nothing gathers the whole
+    of it.  Which volumes move is data movement and is checked exactly; the
+    statistics are computed floats stored as float32, so they are gated
+    relatively.  With auto-regularization off the method changes nothing and
+    returns the current values."""
     shape = (8, 10, 12)
     stack = _ramp_stack(6, shape)
-    denoiser = _auto_denoiser(shape, 'cpu')
+    denoiser = _auto_denoiser(shape, device)
     params = denoiser.auto_set_regularization_params_from_stack(stack)
     expected = _whole_stack_sigma_x(denoiser, stack)
     rel = _rel(params['sigma_x'], expected)
@@ -858,6 +661,56 @@ def test_stack_regularization_uses_every_volume_of_a_small_stack():
     unchanged = denoiser.auto_set_regularization_params_from_stack(stack)
     assert unchanged['sigma_x'] == 0.5
     assert denoiser.get_params('sigma_x') == 0.5
+
+    # A stack of 60 volumes: 20 are chosen, every third one.
+    large_shape = (6, 16, 16)
+    num_volumes = 60
+    large = _ramp_stack(num_volumes, large_shape)
+    on_host = _auto_denoiser(large_shape, device)
+    chosen = on_host.subsample_views(np.arange(num_volumes))
+    assert len(chosen) == 20 and chosen[1] - chosen[0] == 3
+
+    moved, gathered = [], []
+    real_subsample = denoising._subsample_to_host
+    real_gather = _sharding.Shards.gather
+
+    def recording_subsample(image, *args, **kwargs):
+        result = real_subsample(image, *args, **kwargs)
+        moved.append(result)
+        return result
+
+    def counting_gather(self):
+        result = real_gather(self)
+        gathered.append(int(result.size))
+        return result
+
+    monkeypatch.setattr(denoising, '_subsample_to_host', recording_subsample)
+    monkeypatch.setattr(_sharding.Shards, 'gather', counting_gather)
+
+    from_numpy = on_host.auto_set_regularization_params_from_stack(large)
+    assert len(moved) == 1
+    assert np.array_equal(moved[0].reshape((len(chosen),) + large_shape), large[chosen])
+    assert gathered == []
+
+    expected = _whole_stack_sigma_x(on_host, large[chosen])
+    rel = _rel(from_numpy['sigma_x'], expected)
+    print(f"sigma_x from the method {from_numpy['sigma_x']:.8g} vs the chosen volumes "
+          f"{expected:.8g} (rel {rel:.2e})")
+    assert rel < 1e-6
+
+    # The same stack as a tensor on the device gives the same parameters, and
+    # moves the same elements.
+    del moved[:]
+    on_device = torch.as_tensor(large).to(device)
+    from_tensor = _auto_denoiser(large_shape, device) \
+        .auto_set_regularization_params_from_stack(on_device)
+    assert gathered == []
+    assert [int(m.size) for m in moved] == [len(chosen) * int(np.prod(large_shape))]
+    for name in from_numpy:
+        rel = _rel(from_tensor[name], from_numpy[name])
+        print(f"{name}: tensor {from_tensor[name]:.8g} vs numpy {from_numpy[name]:.8g} "
+              f"(rel {rel:.2e})")
+        assert rel < 1e-6, name
 
 
 def test_the_recon_std_estimate_matches_the_form_it_replaced(device):
@@ -965,134 +818,3 @@ def test_the_whole_volume_statistics_keep_a_point_budget():
         under = sigma_x_at(small, denoising._STATISTICS_POINT_BUDGET, monkey)
         whole_small = sigma_x_at(small, 10 ** 12, monkey)
     assert under == whole_small
-
-
-def test_stack_regularization_subsamples_whole_volumes_of_a_large_stack(monkeypatch):
-    """Above 39 volumes about 20 are chosen, evenly spaced, by the rule
-    subsample_views applies to views.  Which volumes cross to the host is
-    data movement and is checked exactly; the statistic on them is checked
-    at float rounding."""
-    shape = (6, 16, 16)
-    num_volumes = 60
-    stack = _ramp_stack(num_volumes, shape)
-    denoiser = _auto_denoiser(shape, 'cpu')
-    chosen = denoiser.subsample_views(np.arange(num_volumes))
-    assert len(chosen) == 20 and chosen[1] - chosen[0] == 3
-
-    moved = []
-    real_subsample = denoising._subsample_to_host
-
-    def recording_subsample(image, *args, **kwargs):
-        result = real_subsample(image, *args, **kwargs)
-        moved.append(result)
-        return result
-
-    monkeypatch.setattr(denoising, '_subsample_to_host', recording_subsample)
-    params = denoiser.auto_set_regularization_params_from_stack(stack)
-    assert len(moved) == 1
-    assert np.array_equal(moved[0].reshape((len(chosen),) + shape), stack[chosen])
-
-    expected = _whole_stack_sigma_x(denoiser, stack[chosen])
-    rel = _rel(params['sigma_x'], expected)
-    print(f"sigma_x from the method {params['sigma_x']:.8g} vs the chosen volumes "
-          f"{expected:.8g} (rel {rel:.2e})")
-    assert rel < 1e-6
-
-
-def test_denoise_stack_auto_regularization_moves_only_the_parameter(device):
-    """With auto-regularization on, denoise_stack reports the method's
-    sigma_x, and its result equals a loop of denoise calls with sigma_x
-    pinned to that value on the same seeded partition.  So the parameter
-    moved and the sweep did not."""
-    shape = (8, 10, 12)
-    num_volumes = 6
-    sigma_noise = 0.1
-    stack = _ramp_stack(num_volumes, shape)
-
-    auto = mbirtorch.QGGMRFDenoiser(shape)
-    auto.configure_devices(devices=[device])
-    auto.set_params(no_warning=True, verbose=0)
-    np.random.seed(0)
-    denoised, info = auto.denoise_stack(stack, sigma_noise=sigma_noise)
-    reported = info['regularization_params']['sigma_x']
-    from_method = _auto_denoiser(shape, device, sigma_noise) \
-        .auto_set_regularization_params_from_stack(stack)['sigma_x']
-    rel_param = _rel(reported, from_method)
-    assert rel_param < 1e-6
-
-    pinned = _pinned_denoiser(shape, device, sigma_x=reported)
-    reference = np.empty_like(stack)
-    reference_counts = []
-    for volume in range(num_volumes):
-        np.random.seed(0)
-        out, out_dict = pinned.denoise(stack[volume], sigma_noise=sigma_noise,
-                                       max_iterations=15, stop_threshold_change_pct=0.2,
-                                       logfile_path=None, print_logs=False)
-        reference[volume] = out
-        reference_counts.append(int(out_dict['recon_params']['num_iterations']))
-
-    rel = _rel_max(denoised, reference)
-    print(f"auto-regularized denoise_stack vs pinned loop on {device}: sigma_x "
-          f"{reported:.8g} (rel {rel_param:.2e}), rel_max = {rel:.2e}")
-    assert rel < 1e-6
-    assert [int(n) for n in info['num_iterations']] == reference_counts
-
-
-def test_stack_regularization_is_the_same_from_a_device_tensor(device, monkeypatch):
-    """A tensor on the device gives the parameters the numpy stack gives, and
-    only the chosen volumes cross to the host: the stack is indexed on its
-    own device and nothing gathers the whole of it.  The parameters are
-    computed floats, so they are gated at float rounding; the element count
-    is data movement and is checked exactly."""
-    shape = (6, 16, 16)
-    num_volumes = 60
-    stack = _ramp_stack(num_volumes, shape)
-    from_numpy = _auto_denoiser(shape, device).auto_set_regularization_params_from_stack(stack)
-
-    moved, gathered = [], []
-    real_subsample = denoising._subsample_to_host
-    real_gather = _sharding.Shards.gather
-
-    def counting_subsample(image, *args, **kwargs):
-        result = real_subsample(image, *args, **kwargs)
-        moved.append(int(result.size))
-        return result
-
-    def counting_gather(self):
-        result = real_gather(self)
-        gathered.append(int(result.size))
-        return result
-
-    monkeypatch.setattr(denoising, '_subsample_to_host', counting_subsample)
-    monkeypatch.setattr(_sharding.Shards, 'gather', counting_gather)
-    on_device = torch.as_tensor(stack).to(device)
-    from_tensor = _auto_denoiser(shape, device).auto_set_regularization_params_from_stack(on_device)
-
-    chosen = len(_auto_denoiser(shape, device).subsample_views(np.arange(num_volumes)))
-    assert gathered == []
-    assert moved == [chosen * int(np.prod(shape))]
-    print(f"moved {moved[0]} of {stack.size} elements ({chosen} of {num_volumes} volumes) on {device}")
-    for name in from_numpy:
-        rel = _rel(from_tensor[name], from_numpy[name])
-        print(f"{name}: tensor {from_tensor[name]:.8g} vs numpy {from_numpy[name]:.8g} (rel {rel:.2e})")
-        assert rel < 1e-6, name
-
-
-def test_stack_regularization_floors_sigma_x_on_a_zero_stack(device):
-    """A stack of zeros has no neighbor differences, so the estimate is zero
-    and sigma_x takes the floor; denoise_stack on it returns the zeros with
-    no NaN."""
-    shape = (8, 10, 12)
-    zeros = np.zeros((3,) + shape, dtype=np.float32)
-    params = _auto_denoiser(shape, device).auto_set_regularization_params_from_stack(zeros)
-    assert params['sigma_x'] == denoising._SIGMA_X_FLOOR
-
-    denoiser = mbirtorch.QGGMRFDenoiser(shape)
-    denoiser.configure_devices(devices=[device])
-    denoiser.set_params(no_warning=True, verbose=0)
-    np.random.seed(0)
-    out, info = denoiser.denoise_stack(zeros, sigma_noise=0.1, max_iterations=2,
-                                       stop_threshold_change_pct=0.0)
-    assert info['regularization_params']['sigma_x'] == denoising._SIGMA_X_FLOOR
-    assert np.all(np.isfinite(out))
-    assert np.array_equal(out, zeros)

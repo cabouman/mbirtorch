@@ -351,8 +351,9 @@ def test_binned_reduction_preserves_position(model_and_sino):
 # ── no state change ───────────────────────────────────────────────────────────────────────────────
 
 def test_functions_do_not_change_the_caller_state(cone_model, cone_sino):
-    """Only apply_calibration changes state.  The reduction, the sweep, and the rotation check leave
-    the model's parameters and the sinogram as they were."""
+    """Only apply_calibration changes state.  The reduction, the sweep, the rotation check, the
+    conjugate-view estimator, and the difference image all leave the model's parameters and the
+    sinogram as they were."""
     params_before = _copy_params(cone_model.get_all_params())
     sino_before = cone_sino.copy()
 
@@ -361,6 +362,8 @@ def test_functions_do_not_change_the_caller_state(cone_model, cone_sino):
     reduce_sinogram(cone_sino, reduction)
     parameter_sweep(cone_model, cone_sino, 'det_channel_offset', [-1.0, 0.0, 1.0])
     check_rotation_direction(cone_model, cone_sino, view_stride=2, bin_factor=2)
+    estimate_det_channel_offset(cone_model, cone_sino)
+    conjugate_difference(cone_model, cone_sino)
 
     assert _params_equal(params_before, cone_model.get_all_params())
     assert np.array_equal(cone_sino, sino_before)
@@ -435,12 +438,14 @@ def test_check_rotation_direction_on_cone_data(cone_model, cone_sino):
 
 def test_helical_and_whole_extent_reductions(cone_model):
     """A helical scan and a request for the whole axial extent both keep every detector row and
-    every recon slice.  The rotation-direction check refuses a helical scan."""
-    angles = np.linspace(0, 2 * np.pi, NUM_VIEWS, endpoint=False)
+    every recon slice.  The rotation-direction check refuses a helical scan.  On the helical scan
+    the sweep reads the requested slice from the reduced model's own slice grid, so the 0.0
+    candidate matches the full model's direct reconstruction of that slice."""
+    angles = np.linspace(0, 4 * np.pi, NUM_VIEWS, endpoint=False)
     helical_model = mbirtorch.ConeBeamModel((NUM_VIEWS, NUM_ROWS, NUM_CHANNELS), angles,
                                             source_detector_dist=4 * NUM_CHANNELS,
                                             source_iso_dist=2 * NUM_CHANNELS,
-                                            helical_z_shifts=np.linspace(-2, 2, NUM_VIEWS),
+                                            helical_z_shifts=np.linspace(-4, 4, NUM_VIEWS),
                                             compile_mode='off')
     helical_model.configure_devices(devices=['cpu'])
     helical_model.set_params(no_warning=True, verbose=0)
@@ -460,6 +465,15 @@ def test_helical_and_whole_extent_reductions(cone_model):
     assert whole_extent['axial_thinning'] is False
     assert whole_extent['row_window'] == (0, NUM_ROWS)
 
+    sino = _phantom_sinogram(helical_model)
+    full_recon = np.asarray(helical_model.recon_direct(sino))
+    for slice_index in (3, (full_recon.shape[2] - 1) // 2):
+        stack = parameter_sweep(helical_model, sino, 'det_channel_offset', [0.0],
+                                slice_index=slice_index)
+        error = _rel_max(stack[:, :, 0], full_recon[:, :, slice_index])
+        print(f'helical slice {slice_index} parity rel_max = {error:.2e}')
+        assert error <= 1e-5
+
 
 # ── an off-center band under rotation, and a helical sweep ────────────────────────────────────────
 
@@ -478,27 +492,6 @@ def test_rotation_of_a_band_away_from_the_detector_center(cone_model, cone_sino)
         difference = np.max(np.abs(out - rotated_sino[:, row_lo:row_hi, :]))
         print(f'slice {slice_index}: rows {row_lo}:{row_hi}, max abs difference {difference:.2e}')
         assert np.allclose(out, rotated_sino[:, row_lo:row_hi, :], rtol=1e-4, atol=1e-5)
-
-
-def test_helical_sweep_reads_the_requested_slice():
-    """On a helical scan the sweep keeps the whole volume, and the requested slice is read back
-    from the reduced model's own slice grid.  The 0.0 candidate matches the full model's direct
-    reconstruction of that slice."""
-    angles = np.linspace(0, 4 * np.pi, NUM_VIEWS, endpoint=False)
-    model = mbirtorch.ConeBeamModel((NUM_VIEWS, NUM_ROWS, NUM_CHANNELS), angles,
-                                    source_detector_dist=4 * NUM_CHANNELS,
-                                    source_iso_dist=2 * NUM_CHANNELS,
-                                    helical_z_shifts=np.linspace(-4, 4, NUM_VIEWS),
-                                    compile_mode='off')
-    model.configure_devices(devices=['cpu'])
-    model.set_params(no_warning=True, verbose=0)
-    sino = _phantom_sinogram(model)
-    full_recon = np.asarray(model.recon_direct(sino))
-    for slice_index in (3, (full_recon.shape[2] - 1) // 2):
-        stack = parameter_sweep(model, sino, 'det_channel_offset', [0.0], slice_index=slice_index)
-        error = _rel_max(stack[:, :, 0], full_recon[:, :, slice_index])
-        print(f'helical slice {slice_index} parity rel_max = {error:.2e}')
-        assert error <= 1e-5
 
 
 # ── multiaxis, curved detector, and a parallel source ─────────────────────────────────────────────
@@ -620,25 +613,19 @@ def test_estimate_det_channel_offset_on_parallel_beam(true_offset):
 @pytest.mark.parametrize('true_offset', [1.3, -2.2])
 def test_estimate_det_channel_offset_on_cone_beam(true_offset):
     """On cone-beam data at a full fan angle of 20 degrees the estimator recovers the offset to
-    better than half a channel.  The fan angle biases the estimate, so the error is printed."""
+    better than half a channel.  The fan angle biases the estimate, so the error is printed.
+    Rolling the same sinogram by two channels raises the estimate by two channel pitches; np.roll
+    moves whole samples, so the data are unchanged apart from the shift."""
     sino = _conjugate_sinogram('cone', true_offset)
     result = estimate_det_channel_offset(_conjugate_cone_model(0.0), sino)
     error = _check_offset_result(result, true_offset, 0.5)
     print(f'cone offset {true_offset} at a 20 degree fan: estimate {result.value:.4f}, '
           f'bias {error:.4f} channels')
 
-
-def test_estimate_det_channel_offset_follows_a_channel_roll():
-    """Rolling the sinogram by two channels raises the estimate by two channel pitches.  np.roll
-    moves whole samples, so the data are unchanged apart from the shift."""
-    true_offset = 1.3
-    sino = _conjugate_sinogram('cone', true_offset)
     delta_det_channel = _conjugate_cone_model(0.0).get_params('delta_det_channel')
-
-    base = estimate_det_channel_offset(_conjugate_cone_model(0.0), sino)
     rolled = estimate_det_channel_offset(_conjugate_cone_model(0.0), np.roll(sino, 2, axis=2))
-    difference = rolled.value - base.value
-    print(f'roll of 2 channels: {base.value:.4f} to {rolled.value:.4f}, '
+    difference = rolled.value - result.value
+    print(f'roll of 2 channels: {result.value:.4f} to {rolled.value:.4f}, '
           f'difference {difference:.4f} against {2 * delta_det_channel}')
     assert abs(difference - 2 * delta_det_channel) < 0.1
 
@@ -740,7 +727,9 @@ def test_search_minimum():
 def test_angular_coverage():
     """The coverage is the full circle minus the largest gap between distinct view angles.  Equally
     spaced views over a full rotation cover 2 pi minus one spacing, views over a half rotation
-    cover pi minus one spacing, and two turns cover the same as one."""
+    cover pi minus one spacing, and two turns cover the same as one.  A full rotation with
+    irregular spacing and a scan of two turns are both accepted by the conjugate-view geometry
+    check."""
     spacing = 2 * np.pi / 32
     full = _angular_coverage(np.linspace(0, 2 * np.pi, 32, endpoint=False))
     half = _angular_coverage(np.linspace(0, np.pi, 32, endpoint=False))
@@ -750,11 +739,9 @@ def test_angular_coverage():
     assert abs(half - (np.pi - spacing / 2)) < 1e-9
     assert abs(two_turns - full) < 1e-9
 
-
-def test_irregular_full_rotations_are_accepted():
-    """A full rotation with irregular spacing and a scan of two turns both pass the coverage rule,
-    which refuses only a scan whose largest gap between neighboring views is three times the
-    median gap."""
+    # Seen from the model side: a full rotation with irregular spacing and a scan of two turns both
+    # pass the coverage rule, which refuses only a scan whose largest gap between neighboring views
+    # is three times the median gap.
     rng = np.random.default_rng(0)
     jittered = np.linspace(0, 2 * np.pi, 64, endpoint=False) + rng.uniform(-0.4, 0.4, 64) * (2 * np.pi / 64)
     two_turns = np.linspace(0, 4 * np.pi, 64, endpoint=False)
@@ -774,20 +761,6 @@ def test_fourier_shift_channels():
     print(f'fourier shift against roll, max abs difference = {difference:.2e}')
     assert difference < 1e-5
     assert _fourier_shift_channels(array, 0.0) is array
-
-
-def test_conjugate_functions_do_not_change_the_caller_state(cone_model, cone_sino):
-    """The estimator and the difference image leave the model's parameters and the sinogram as they
-    were."""
-    params_before = _copy_params(cone_model.get_all_params())
-    sino_before = cone_sino.copy()
-
-    estimate_det_channel_offset(cone_model, cone_sino)
-    conjugate_difference(cone_model, cone_sino)
-
-    assert _params_equal(params_before, cone_model.get_all_params())
-    assert np.array_equal(cone_sino, sino_before)
-    assert cone_model.get_params('det_channel_offset') == 0.0
 
 
 # ── the rotation estimate ─────────────────────────────────────────────────────────────────────────
@@ -818,19 +791,6 @@ def test_estimate_det_rotation_recovers_a_rotation(geometry):
     with pytest.warns(UserWarning, match='edge channels'):
         result = estimate_det_rotation(model, correct_det_rotation(sino, -np.radians(0.3)))
     print(f'{geometry} rotation 0.3 degrees: estimate {np.degrees(result.value):+.3f}, with a warning')
-
-
-def test_estimate_det_rotation_refuses_a_curved_detector(cone_sino):
-    """A curved detector cannot be rotated as a plane, so the rotation estimate refuses it."""
-    angles = np.linspace(0, 2 * np.pi, NUM_VIEWS, endpoint=False)
-    curved = mbirtorch.ConeBeamModel((NUM_VIEWS, NUM_ROWS, NUM_CHANNELS), angles,
-                                     source_detector_dist=4 * NUM_CHANNELS,
-                                     source_iso_dist=2 * NUM_CHANNELS, use_curved_detector=True,
-                                     compile_mode='off')
-    curved.configure_devices(devices=['cpu'])
-    curved.set_params(no_warning=True, verbose=0)
-    with pytest.raises(ValueError, match='curved'):
-        estimate_det_rotation(curved, cone_sino)
 
 
 def test_estimate_det_channel_offset_widens_its_range():

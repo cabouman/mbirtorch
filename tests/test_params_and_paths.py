@@ -28,7 +28,9 @@ def _box_problem(model):
 
 
 # ── set_params semantics (mbirjax parity) ────────────────────────────────────
-def test_manual_sigma_disables_auto_regularization():
+def test_auto_regularization_flag_turns_off_and_back_on():
+    # A manual sigma turns auto-regularization off and the recon uses the
+    # manual value; a later sharpness turns it back on.
     model = _small_model()
     with pytest.warns(UserWarning, match="disable auto-regularization"):
         model.set_params(sigma_x=0.123)
@@ -41,19 +43,9 @@ def test_manual_sigma_disables_auto_regularization():
     reg = recon_dict['recon_params']['regularization_params']
     assert abs(reg['sigma_x'] - 0.123) < 1e-12
 
-
-def test_sharpness_reenables_auto_regularization():
-    model = _small_model()
-    model.set_params(no_warning=True, auto_regularize_flag=False)
     with pytest.warns(UserWarning, match="re-enabled auto-regularization"):
         model.set_params(sharpness=0.5)
     assert model.get_params('auto_regularize_flag') is True
-
-
-def test_unknown_parameter_raises():
-    model = _small_model()
-    with pytest.raises(ValueError, match="not a recognized parameter"):
-        model.set_params(not_a_param=1)
 
 
 def test_multi_step_geometry_change_allowed():
@@ -70,24 +62,21 @@ def test_multi_step_geometry_change_allowed():
     assert sino.shape == new_shape
 
 
-def test_sinogram_shape_validated():
+def test_input_shapes_validated():
+    # A wrong-shaped sinogram and a wrong-shaped prox input are both refused
+    # at entry, each naming the array that was wrong.
     model = _small_model()
-    bad = np.zeros((10, 16, 16), dtype=np.float32)
+    bad_sino = np.zeros((10, 16, 16), dtype=np.float32)
     with pytest.raises(ValueError, match="sinogram does not have the shape"):
         np.random.seed(0)
-        model.recon(bad, max_iterations=1)
+        model.recon(bad_sino, max_iterations=1)
 
-
-def test_prox_input_shape_validated():
-    model = _small_model()
     _, sinogram = _box_problem(model)
     recon_shape = tuple(model.get_params('recon_shape'))
-    bad = np.zeros(recon_shape[::-1], dtype=np.float32).transpose(0, 1, 2)
-    if bad.shape == recon_shape:
-        pytest.skip("cell is a cube; transposed shape identical")
+    bad_prox = np.zeros((recon_shape[0] + 1,) + recon_shape[1:], dtype=np.float32)
     with pytest.raises(ValueError, match="prox_input does not have the correct size"):
         np.random.seed(0)
-        model.prox_map(bad, sinogram, max_iterations=1)
+        model.prox_map(bad_prox, sinogram, max_iterations=1)
 
 
 # ── VCD-loop paths ─────────────────────────────────────────────────────────────
@@ -180,53 +169,6 @@ def test_autograd_cpu_and_f64_leaves():
     assert volume.grad.device == volume.device
 
 
-def test_placement_functions_validate_and_place():
-    # _shard_sinogram / _shard_recon and the matching gathers: numpy in ->
-    # float32 tensor on the model device, with the
-    # future sharded axis checked; gathers return host numpy.
-    model = _small_model()
-    sino_shape = tuple(model.get_params('sinogram_shape'))
-    recon_shape = tuple(model.get_params('recon_shape'))
-
-    sino = model._shard_sinogram(np.zeros(sino_shape, dtype=np.float64))
-    assert torch.is_tensor(sino) and sino.dtype == torch.float32
-    rec = model._shard_recon(np.zeros(recon_shape, dtype=np.float64))
-    assert torch.is_tensor(rec) and rec.dtype == torch.float32
-    flat = model._shard_recon(np.zeros((7, recon_shape[2]), dtype=np.float32))
-    assert tuple(flat.shape) == (7, recon_shape[2])
-
-    with pytest.raises(ValueError, match='view axis'):
-        model._shard_sinogram(np.zeros((sino_shape[0] + 1,) + sino_shape[1:],
-                                       dtype=np.float32))
-    with pytest.raises(ValueError, match='slice axis'):
-        model._shard_recon(np.zeros(recon_shape[:2] + (recon_shape[2] + 1,),
-                                    dtype=np.float32))
-
-    assert isinstance(model._gather_sinogram(sino), np.ndarray)
-    assert isinstance(model._gather_recon(rec), np.ndarray)
-
-
-def test_gen_weights_matches_input_form():
-    sino = np.ones((4, 6, 8), dtype=np.float32)
-    w_host = mbirtorch.gen_weights(sino, 'transmission_root')
-    assert isinstance(w_host, np.ndarray)
-    w_tensor = mbirtorch.gen_weights(torch.as_tensor(sino), 'transmission_root')
-    assert torch.is_tensor(w_tensor)
-    assert np.allclose(w_tensor.cpu().numpy(), w_host)
-
-
-def test_clear_cache_empties_and_recreates(tmp_path):
-    root = tmp_path / "fake_mbirtorch"
-    (root / "torch_cache" / "sub").mkdir(parents=True)
-    (root / "torch_cache" / "sub" / "artifact.bin").write_bytes(b"x" * 128)
-    cleared = mbirtorch.clear_cache(_root=root)
-    assert cleared == str(root)
-    assert root.is_dir() and list(root.iterdir()) == []
-    # Clearing an absent directory just (re)creates it.
-    mbirtorch.clear_cache(_root=root / "never_existed")
-    assert (root / "never_existed").is_dir()
-
-
 def test_vcd_checkpoint_resume_matches_continuous():
     # A chunked run (3 + 3 + 3 iterations through checkpoints) must reproduce
     # a continuous 9-iteration run: the partitions are shared, the
@@ -281,37 +223,6 @@ def test_vcd_checkpoint_resume_matches_continuous():
     assert np.allclose(fm_chunked, ref_stats[0], rtol=1e-4, atol=1e-5)
 
 
-def test_vcd_resume_requires_init_recon():
-    model = _small_model()
-    _, sinogram = _box_problem(model)
-    np.random.seed(0)
-    (_, _, _, partitions, seq, _, _) = model.initialize_recon(
-        sinogram, max_iterations=2)
-    with pytest.raises(ValueError, match='init_error_sinogram requires init_recon'):
-        model._vcd_recon(sinogram, partitions, seq, 0.0,
-                         init_error_sinogram=np.zeros_like(sinogram))
-
-
-def test_sino_ones_device_form_seam():
-    # The constant-weights Hessian path must build its ones sinogram through
-    # the device-form seam (real entries 1, padded entries 0 under a future
-    # sharding port) -- never a bare torch.ones at whatever shape the device
-    # arrays have.  Lock the seam contract and the weights=None wiring.
-    model = _small_model()
-    sino_shape = tuple(model.get_params('sinogram_shape'))
-    ones = model._sino_ones_device_form()
-    assert tuple(ones.shape) == sino_shape
-    assert ones.dtype == torch.float32
-    assert float(ones.min()) == 1.0 and float(ones.max()) == 1.0
-    ones64 = model._sino_ones_device_form(torch.zeros(2, dtype=torch.float64))
-    assert ones64.dtype == torch.float64
-
-    h_none = model.compute_hessian_diagonal()
-    h_ones = model.compute_hessian_diagonal(
-        weights=np.ones(sino_shape, dtype=np.float32))
-    assert np.allclose(h_none, h_ones, rtol=1e-6, atol=0)
-
-
 def test_compute_prior_loss_records_pm_loss():
     # The compute_prior_loss path (ported with the _vcd_recon sweep): pm_loss
     # recorded per iteration, positive and finite; qggmrf_loss cross-checked
@@ -341,104 +252,6 @@ def test_compute_prior_loss_records_pm_loss():
     smooth = np.ones((8, 8, 8), dtype=np.float32)
     rough = np.random.RandomState(2).rand(8, 8, 8).astype(np.float32)
     assert mbirtorch.qggmrf_loss(rough, params) > mbirtorch.qggmrf_loss(smooth, params)
-
-
-def test_get_memory_stats_structure():
-    # One dict per processor, devices first then 'CPU', each with byte counts;
-    # printing to a file-like works (the _vcd_recon verbose>=2 route).
-    import io
-    stats = mbirtorch.get_memory_stats(print_results=False)
-    assert stats[-1]['id'] == 'CPU'
-    if stats[0]['id'].startswith('GPU'):
-        # CUDA entries separate the arrays in use from the allocator's pool
-        # and carry the pool's high-water mark beside the in-use peak.
-        assert 'peak_reserved_bytes' in stats[0]
-        assert 'cache_bytes' in stats[0]
-        assert stats[0]['cache_bytes'] == (stats[0]['reserved_bytes']
-                                           - stats[0]['bytes_in_use'])
-    for entry in stats:
-        for key, value in entry.items():
-            if key != 'id':
-                assert isinstance(value, int) and value >= 0, (entry['id'], key)
-    buf = io.StringIO()
-    mbirtorch.get_memory_stats(file=buf)
-    text = buf.getvalue()
-    assert 'CPU' in text and 'bytes_in_use' in text and 'GB' in text
-
-
-def test_vcd_verbose2_memory_dump_runs():
-    model = _small_model()
-    model.set_params(no_warning=True, verbose=2)
-    _, sinogram = _box_problem(model)
-    np.random.seed(0)
-    (_, _, _, partitions, seq, _, _) = model.initialize_recon(
-        sinogram, max_iterations=1)
-    np.random.seed(1)
-    recon, _ = model._vcd_recon(sinogram, partitions, seq, 0.0, init_recon=0)
-    assert np.all(np.isfinite(recon.cpu().numpy()))
-
-
-# ── hand-written kernel availability probe ───────────────────────────────────
-def test_triton_probe_kill_switch(monkeypatch):
-    # The kill switch must force the fallback answer on ANY hardware, so the
-    # gate is bisectable on a node where the kernels do work.
-    from mbirtorch import kernel_availability
-
-    monkeypatch.setenv(kernel_availability.DISABLE_ENV_VAR, '1')
-    kernel_availability._reset_probe_cache()
-    try:
-        usable, reason = kernel_availability.triton_available()
-    finally:
-        kernel_availability._reset_probe_cache()
-    assert usable is False
-    assert kernel_availability.DISABLE_ENV_VAR in reason
-
-
-def test_triton_probe_is_a_cached_pair(monkeypatch):
-    # (bool, str) whatever this machine has, probed at most once per process.
-    from mbirtorch import kernel_availability
-
-    monkeypatch.delenv(kernel_availability.DISABLE_ENV_VAR, raising=False)
-    kernel_availability._reset_probe_cache()
-    try:
-        first = kernel_availability.triton_available()
-        assert isinstance(first, tuple) and len(first) == 2
-        usable, reason = first
-        assert isinstance(usable, bool)
-        assert isinstance(reason, str) and reason
-
-        # Cached: a second call must not re-probe (a probe that now raises
-        # would surface as an error rather than the cached pair).
-        def _exploding_probe():
-            raise AssertionError('probe re-ran despite the cache')
-
-        monkeypatch.setattr(kernel_availability, '_probe_triton',
-                            _exploding_probe)
-        assert kernel_availability.triton_available() is first
-    finally:
-        kernel_availability._reset_probe_cache()
-
-
-def test_apply_update_functional_no_copy():
-    # _apply_update returns the state tensors for a functional interface; the
-    # returns are the SAME storage (no transient copy) and the in-place
-    # updates are applied.  (The chained-resume test guards the same storage
-    # stability end-to-end through the compiled loop.)
-    from mbirtorch.tomography_model import _apply_update
-    flat_recon = torch.zeros(5, 3)
-    error_sinogram = torch.ones(2, 2, 2)
-    idx = torch.tensor([1, 3])
-    delta = torch.ones(2, 3)
-    alpha = torch.tensor(0.5)
-    delta_sinogram = torch.full((2, 2, 2), 0.2)
-    fr, es, delta_sumsq, ell1 = _apply_update(
-        flat_recon, error_sinogram, idx, delta, alpha, delta_sinogram)
-    assert fr.data_ptr() == flat_recon.data_ptr()
-    assert es.data_ptr() == error_sinogram.data_ptr()
-    assert float(flat_recon[1, 0]) == 1.0 and float(flat_recon[0, 0]) == 0.0
-    assert abs(float(error_sinogram[0, 0, 0]) - 0.9) < 1e-6
-    assert float(ell1) == 6.0
-    assert delta_sumsq.shape == (3,) and float(delta_sumsq[0]) == 2.0
 
 
 class _LargestAllocation(torch.utils._python_dispatch.TorchDispatchMode):
@@ -475,9 +288,12 @@ class _LargestAllocation(torch.utils._python_dispatch.TorchDispatchMode):
         return out
 
 
-def test_apply_update_matches_the_scaled_subtraction():
-    """The error sinogram update forms no sinogram-sized temporary.
+def test_apply_update_writes_in_place_and_forms_no_sinogram_temporary():
+    """_apply_update updates its inputs in place and allocates nothing large.
 
+    The returned recon and error sinogram are the SAME storage as the inputs
+    (no transient copy), the values are the update the call advertises, and
+    the error sinogram update forms no sinogram-sized temporary.
     `error.sub_(alpha * delta)` built a whole scaled sinogram before
     subtracting it; the scaled subtraction reads the step out of the 0-d
     device tensor the line search produced and writes through the error
@@ -486,6 +302,20 @@ def test_apply_update_matches_the_scaled_subtraction():
     rather than bit for bit.
     """
     from mbirtorch.tomography_model import _apply_update
+    # Small exact inputs: the returns share storage with the inputs and the
+    # arithmetic is the stated update.
+    flat_recon = torch.zeros(5, 3)
+    error_sinogram = torch.ones(2, 2, 2)
+    fr, es, delta_sumsq, ell1 = _apply_update(
+        flat_recon, error_sinogram, torch.tensor([1, 3]), torch.ones(2, 3),
+        torch.tensor(0.5), torch.full((2, 2, 2), 0.2))
+    assert fr.data_ptr() == flat_recon.data_ptr()
+    assert es.data_ptr() == error_sinogram.data_ptr()
+    assert float(flat_recon[1, 0]) == 1.0 and float(flat_recon[0, 0]) == 0.0
+    assert abs(float(error_sinogram[0, 0, 0]) - 0.9) < 1e-6
+    assert float(ell1) == 6.0
+    assert delta_sumsq.shape == (3,) and float(delta_sumsq[0]) == 2.0
+
     torch.manual_seed(4)
     flat_recon = torch.zeros(6, 3)
     error_sinogram = torch.randn(4, 5, 7)

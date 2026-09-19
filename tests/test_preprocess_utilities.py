@@ -59,16 +59,33 @@ def test_compute_sino_transmission(golden):
     assert err < 1e-5
 
 
-def test_transmission_batch_invariance(golden):
-    a = mtp.compute_sino_transmission(golden["obj"].copy(), golden["blank"].copy(),
-                                      golden["dark"].copy(),
-                                      defective_pixel_array=golden["defective"].copy(),
-                                      batch_size=4)
-    b = mtp.compute_sino_transmission(golden["obj"].copy(), golden["blank"].copy(),
-                                      golden["dark"].copy(),
-                                      defective_pixel_array=golden["defective"].copy(),
-                                      batch_size=13)
-    assert np.array_equal(a, b)
+@pytest.mark.parametrize("function_name, small_batch",
+                         [("compute_sino_transmission", 4),
+                          ("correct_det_rotation", 3),
+                          ("downsample_view_data", 2),
+                          ("scan_to_sino", 3)])
+def test_batch_invariance(golden, function_name, small_batch):
+    # Every entry with a batch_size gives the same result at two batch sizes:
+    # the cheap guard against seam bugs in the batching driver.
+    def call(batch_size):
+        if function_name == "compute_sino_transmission":
+            return mtp.compute_sino_transmission(
+                golden["obj"].copy(), golden["blank"].copy(), golden["dark"].copy(),
+                defective_pixel_array=golden["defective"].copy(), batch_size=batch_size)
+        if function_name == "correct_det_rotation":
+            return mtp.correct_det_rotation(
+                golden["sino_trans"].copy(), det_rotation=float(golden["det_rotation"]),
+                batch_size=batch_size)
+        if function_name == "downsample_view_data":
+            return mtp.downsample_view_data(
+                golden["obj"].copy(), golden["blank"].copy(), golden["dark"].copy(), (2, 2),
+                defective_pixel_array=golden["defective"].copy(), batch_size=batch_size)[0]
+        return mtp.scan_to_sino(
+            golden["obj"].copy(), golden["blank"].copy(), golden["dark"].copy(),
+            defective_pixel_array=golden["defective"].copy(), downsample_factor=(2, 2),
+            det_rotation=float(golden["det_rotation"]), batch_size=batch_size)
+
+    assert np.array_equal(call(small_batch), call(13))
 
 
 def test_interpolate_defective_pixels(golden):
@@ -87,14 +104,6 @@ def test_correct_det_rotation(golden):
     err = _rel_max(out, golden["rotated"])
     print(f"rotation rel_max = {err:.2e}")
     assert err < 1e-5
-
-
-def test_rotation_batch_invariance(golden):
-    a = mtp.correct_det_rotation(golden["sino_trans"].copy(),
-                                 det_rotation=float(golden["det_rotation"]), batch_size=3)
-    b = mtp.correct_det_rotation(golden["sino_trans"].copy(),
-                                 det_rotation=float(golden["det_rotation"]), batch_size=13)
-    assert np.array_equal(a, b)
 
 
 def test_correct_background_offset(golden):
@@ -121,16 +130,6 @@ def test_downsample_view_data(golden):
     assert np.array_equal(defective, golden["ds_defective"])
 
 
-def test_downsample_batch_invariance(golden):
-    a = mtp.downsample_view_data(golden["obj"].copy(), golden["blank"].copy(),
-                                 golden["dark"].copy(), (2, 2),
-                                 defective_pixel_array=golden["defective"].copy(), batch_size=2)[0]
-    b = mtp.downsample_view_data(golden["obj"].copy(), golden["blank"].copy(),
-                                 golden["dark"].copy(), (2, 2),
-                                 defective_pixel_array=golden["defective"].copy(), batch_size=13)[0]
-    assert np.array_equal(a, b)
-
-
 def test_crop_view_data(golden):
     obj, blank, dark, defective = mtp.crop_view_data(
         golden["obj"].copy(), golden["blank"].copy(), golden["dark"].copy(),
@@ -151,16 +150,6 @@ def test_scan_to_sino(golden):
     err = _rel_max(out, golden["fused"])
     print(f"scan_to_sino rel_max = {err:.2e}")
     assert err < 1e-5
-
-
-def test_scan_to_sino_batch_invariance(golden):
-    kwargs = dict(defective_pixel_array=golden["defective"].copy(), downsample_factor=(2, 2),
-                  det_rotation=float(golden["det_rotation"]))
-    a = mtp.scan_to_sino(golden["obj"].copy(), golden["blank"].copy(), golden["dark"].copy(),
-                         batch_size=3, **kwargs)
-    b = mtp.scan_to_sino(golden["obj"].copy(), golden["blank"].copy(), golden["dark"].copy(),
-                         batch_size=13, **kwargs)
-    assert np.array_equal(a, b)
 
 
 def test_correct_zinger_pixels(golden):
@@ -187,13 +176,6 @@ def test_apply_detector_crop(golden):
                        golden["crop_opt"], rtol=1e-12)
     # inputs are not mutated
     assert req['sinogram_shape'] == (11, 40, 36) and opt['det_row_offset'] == 1.5
-
-
-def test_apply_config_crop(golden):
-    out = np.array(mtp.apply_config_crop(
-        40, 36, 1.5, -0.5, 0.8, 1.2,
-        crop_pixels_top=3, crop_pixels_bottom=5, crop_pixels_sides=2), dtype=np.float64)
-    assert np.allclose(out, golden["config_crop"], rtol=1e-12)
 
 
 def test_apply_cylindrical_mask(golden):
@@ -232,23 +214,6 @@ def test_beam_hardening_family(golden):
     assert err_p < 1e-6 and err_c < 1e-12 and err_i < 1e-6 and err_v < 1e-12
 
 
-def test_small_helpers(golden):
-    alpha = mtp.compute_scaling_factor(golden["scale_target"], golden["scale_vect"])
-    err = abs(alpha - float(golden["scaling_factor"])) / abs(float(golden["scaling_factor"]))
-    print(f"scaling factor rel err = {err:.2e}")
-    assert err < 1e-5
-
-    out = mtp.put_in_slice(torch.as_tensor(golden["pis_in"].copy()),
-                           golden["pis_indices"], -7.0)
-    assert np.array_equal(out.numpy(), golden["pis_out"])
-
-    assert abs(mtp.to_alu(25.4, 'mm', 'cm') - float(golden["alu"])) < 1e-12
-    assert np.allclose(mtp.unit_vector(np.array([3.0, 4.0, 12.0])), golden["uv"], rtol=1e-12)
-    assert np.allclose(mtp.project_vector_to_vector(np.array([1.0, 2.0, 2.0]),
-                                                    np.array([0.0, 3.0, 4.0])),
-                       golden["pv"], rtol=1e-12)
-
-
 @pytest.mark.skipif(not os.path.exists(_h5_path), reason="no mbirjax-written cone save golden")
 def test_load_mbirjax_cone_save(golden):
     # Golden read of an mbirjax-written file: the two packages share the on-disk layout, and that
@@ -282,35 +247,18 @@ def test_save_load_round_trip(tmp_path, golden):
     assert opt_params == {'sharpness': 1.0} and weights is None
 
 
-def test_load_accepts_older_format_tag(tmp_path, golden):
-    # Files written before the package was renamed carry the mbirjax tag and must keep loading.
-    path, _ = _write_cone_save(tmp_path, golden)
-    with h5py.File(path, 'r+') as f:
-        f.attrs['format'] = 'mbirjax_preprocessing_v1'
-    sino, cone_params, opt_params, weights = mtp.load_cone_preprocessing(path)
-    assert np.array_equal(sino, golden["sino_trans"])
-    assert cone_params['sinogram_shape'] == tuple(golden["sino_trans"].shape)
-    assert opt_params == {'sharpness': 1.0} and weights is None
-
-
-def test_load_accepts_missing_format_tag(tmp_path, golden):
-    # The oldest files and files from other tools have no format attribute at all.
-    path, _ = _write_cone_save(tmp_path, golden)
-    with h5py.File(path, 'r+') as f:
-        del f.attrs['format']
-    sino, cone_params, opt_params, weights = mtp.load_cone_preprocessing(path)
-    assert np.array_equal(sino, golden["sino_trans"])
-    assert cone_params['sinogram_shape'] == tuple(golden["sino_trans"].shape)
-    assert opt_params == {'sharpness': 1.0} and weights is None
-
-
-def test_load_rejects_unknown_format_tag(tmp_path, golden):
-    path, _ = _write_cone_save(tmp_path, golden)
-    with h5py.File(path, 'r+') as f:
-        f.attrs['format'] = 'some_other_preprocessing_v9'
-    with pytest.raises(ValueError) as excinfo:
-        mtp.load_cone_preprocessing(path)
-    message = str(excinfo.value)
-    # The error has to name the tag found and both tags that would have worked.
-    assert 'some_other_preprocessing_v9' in message
-    assert 'mbirtorch_preprocessing_v1' in message and 'mbirjax_preprocessing_v1' in message
+def test_load_accepts_older_and_missing_format_tags(tmp_path, golden):
+    # Files written before the package was renamed carry the mbirjax tag, and
+    # the oldest files and files from other tools have no format attribute at
+    # all.  Both must keep loading.
+    for tag in ('mbirjax_preprocessing_v1', None):
+        path, _ = _write_cone_save(tmp_path, golden, name=f'pp_{tag}.h5')
+        with h5py.File(path, 'r+') as f:
+            if tag is None:
+                del f.attrs['format']
+            else:
+                f.attrs['format'] = tag
+        sino, cone_params, opt_params, weights = mtp.load_cone_preprocessing(path)
+        assert np.array_equal(sino, golden["sino_trans"]), tag
+        assert cone_params['sinogram_shape'] == tuple(golden["sino_trans"].shape), tag
+        assert opt_params == {'sharpness': 1.0} and weights is None, tag

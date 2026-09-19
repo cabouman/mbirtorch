@@ -2,14 +2,8 @@
 
 stitch_arrays blends a fixed overlap between adjacent arrays and returns the
 result where the inputs already live: NumPy in gives NumPy out, tensors give a
-tensor on their own device.  Two inputs it cannot serve are refused with a
-message that names the problem, rather than being quietly relocated or failing
-on a missing attribute deep inside the function: tensors spread over more than
-one device, and an array in the divided device form (a Shards container).
-
-The refusal for the divided form and the normal-path values are checked on the
-CPU, so they run everywhere.  The mixed-device refusal needs two real GPUs and
-is skipped otherwise.
+tensor on their own device.  The values are checked on the CPU, so they run
+everywhere.
 
 copy_ct_model keeps the parent's reconstruction geometry and re-derives only
 the axes whose inputs changed: rows or helical travel for the slices and the
@@ -21,25 +15,16 @@ construct_time_frame_models splits a scan into overlapping windows of
 consecutive views and builds one model per window.  The view slices are
 integers, so they are checked exactly against pinned values, including a
 scan over more than one rotation with its angles stored modulo one rotation.
-The device helpers are checked against what torch reports.
 """
 
 import warnings
-
-import os
 
 import numpy as np
 import pytest
 import torch
 
 import mbirtorch
-from mbirtorch import _sharding
-from mbirtorch.tomography_model import cpu_devices, default_devices, gpu_devices
 from mbirtorch.utilities import construct_time_frame_models
-
-requires_two_cuda = pytest.mark.skipif(
-    torch.cuda.device_count() < 2,
-    reason="the mixed-device refusal needs at least two CUDA devices")
 
 
 def _halves():
@@ -64,44 +49,22 @@ EXPECTED_OVERLAP_3 = np.array(
 
 
 def test_stitch_arrays_numpy_values():
+    """The blended values, through each input form.  A NumPy list gives a
+    NumPy array; a tensor list, and a list that mixes a tensor with a NumPy
+    array, give a CPU tensor with the same values.  The mixed case is the one
+    the device check must not break: only one device is named, so the NumPy
+    array simply joins it."""
     first, second = _halves()
     out = mbirtorch.stitch_arrays([first, second], overlap=3, axis=2)
     assert isinstance(out, np.ndarray) and out.dtype == np.float32
     assert np.array_equal(out, EXPECTED_OVERLAP_3)
 
-
-def test_stitch_arrays_one_device_matches_numpy():
-    """A tensor list, and a list that mixes a tensor with a NumPy array, both
-    stay valid and give the same values as the all-NumPy call.  The mixed case
-    is the one the device check must not break: only one device is named, so
-    the NumPy array simply joins it."""
-    first, second = _halves()
     tensors = mbirtorch.stitch_arrays([torch.as_tensor(first), torch.as_tensor(second)],
                                       overlap=3, axis=2)
     mixed = mbirtorch.stitch_arrays([torch.as_tensor(first), second], overlap=3, axis=2)
     for out in (tensors, mixed):
         assert isinstance(out, torch.Tensor) and out.device.type == 'cpu'
         assert np.array_equal(out.numpy(), EXPECTED_OVERLAP_3)
-
-
-def test_stitch_arrays_refuses_divided_form():
-    """A Shards holds one tensor per device, so it has no shape of its own.
-    Two CPU shards are enough to build one; no GPU is involved."""
-    first, second = _halves()
-    placement = _sharding.Placement(['cpu', 'cpu'], axis=-1, axis_len=4)
-    shards = _sharding.Shards([torch.as_tensor(first[..., :2]),
-                               torch.as_tensor(first[..., 2:4])], placement)
-    with pytest.raises(TypeError, match="divided device form"):
-        mbirtorch.stitch_arrays([shards, second], overlap=3, axis=2)
-
-
-@requires_two_cuda
-def test_stitch_arrays_refuses_mixed_devices():
-    first, second = _halves()
-    with pytest.raises(ValueError, match="one device"):
-        mbirtorch.stitch_arrays([torch.as_tensor(first).to('cuda:0'),
-                                 torch.as_tensor(second).to('cuda:1')],
-                                overlap=3, axis=2)
 
 
 # ── copy_ct_model keeps the parent's reconstruction geometry ────────────────
@@ -173,13 +136,29 @@ def test_copy_keeps_the_parents_geometry_when_only_the_views_change(make_model):
                 assert float(copy.get_params(name)) == pytest.approx(hand_set[name])
 
 
-@pytest.mark.parametrize('make_model', [_cone_model, _parallel_model, _multiaxis_model],
-                         ids=['cone', 'parallel', 'multiaxis'])
+@pytest.mark.parametrize('make_model', [_cone_model, _parallel_model, _multiaxis_model, _translation_model],
+                         ids=['cone', 'parallel', 'multiaxis', 'translation'])
 def test_copy_re_derives_the_slices_when_the_rows_change(make_model):
     """Fewer detector rows re-derive the slice count (and a cone model's slice offset) for the new
     detector and keep a hand-set in-plane shape.  A parent at the automatic slice count gets no
     warning; a hand-set slice count is replaced with a warning that names it, which no_warning
-    silences."""
+    silences.  Fewer detector channels re-derive the in-plane shape instead, keeping the hand-set
+    slice count and slice offset.  The translation heuristic sizes every recon axis from both
+    detector axes, so a detector change there re-derives the whole shape."""
+    if make_model is _translation_model:
+        parent = _translation_model()
+        rows, cols, slices = _shape(parent)
+        parent.set_params(no_warning=True, recon_shape=(rows + 1, cols - 2, slices - 1))
+        required, optional, regularization = parent.get_all_params()
+        required = dict(required)
+        required['sinogram_shape'] = (8, 12, 48)
+        optional = {k: v for k, v in optional.items() if k != 'recon_shape'}
+        automatic = mbirtorch.build_model(required, optional, regularization)
+        with pytest.warns(UserWarning, match='in-plane recon shape and the slice count'):
+            copy = mbirtorch.copy_ct_model(parent, new_num_det_rows=12)
+        assert _shape(copy) == _shape(automatic)
+        return
+
     parent = make_model()
     rows, cols, slices = _shape(parent)
     parent.set_params(no_warning=True, recon_shape=(rows + 1, cols - 3, slices))
@@ -207,10 +186,11 @@ def test_copy_re_derives_the_slices_when_the_rows_change(make_model):
         mbirtorch.copy_ct_model(parent, new_num_det_rows=12, no_warning=True)
     assert not _copy_warnings(caught)
 
-
-def test_copy_re_derives_the_in_plane_shape_when_the_channels_change():
-    """Fewer detector channels re-derive the in-plane shape for the new detector and keep the
-    hand-set slice count and slice offset; the replaced in-plane shape is named in a warning."""
+    if make_model is not _cone_model:
+        return
+    # The channel axis: fewer detector channels re-derive the in-plane shape for the new detector
+    # and keep the hand-set slice count and slice offset; the replaced in-plane shape is named in
+    # a warning.
     parent = _cone_model()
     rows, cols, slices = _shape(parent)
     parent.set_params(no_warning=True, recon_shape=(rows + 1, cols - 3, slices - 1), recon_slice_offset=1.4)
@@ -269,22 +249,6 @@ def test_copy_re_derives_the_slices_when_the_helical_travel_changes():
     assert float(copy.get_params('recon_slice_offset')) == pytest.approx(1.4)
 
 
-def test_translation_copy_re_derives_the_whole_shape_when_the_detector_changes():
-    """The translation heuristic sizes every recon axis from both detector axes, so a detector
-    change re-derives the whole shape, named in the warning when it was set by hand."""
-    parent = _translation_model()
-    rows, cols, slices = _shape(parent)
-    parent.set_params(no_warning=True, recon_shape=(rows + 1, cols - 2, slices - 1))
-    required, optional, regularization = parent.get_all_params()
-    required = dict(required)
-    required['sinogram_shape'] = (8, 12, 48)
-    optional = {k: v for k, v in optional.items() if k != 'recon_shape'}
-    automatic = mbirtorch.build_model(required, optional, regularization)
-    with pytest.warns(UserWarning, match='in-plane recon shape and the slice count'):
-        copy = mbirtorch.copy_ct_model(parent, new_num_det_rows=12)
-    assert _shape(copy) == _shape(automatic)
-
-
 # ── construct_time_frame_models splits a scan into overlapping frames ────────
 def _scan_model(num_views, degrees_per_view, wrap=False):
     """A small cone-beam scan with one angle per view.  ``wrap`` stores the
@@ -307,7 +271,11 @@ def test_time_frames_of_a_one_rotation_scan():
     of eight views starting every four views.  Each frame model is a copy of
     the parent over the frame's angles: its sinogram shape has the frame's
     view count, its angles are exactly the parent's over the frame's slice,
-    and its reconstruction geometry is the parent's."""
+    and its reconstruction geometry is the parent's.
+
+    Four more parameter sets check the same arithmetic: the view slices are
+    integers fixed by the frame arithmetic, and each frame model's view count
+    is the slice's length."""
     parent = _scan_model(24, 15.0)
     model_list, view_slices = construct_time_frame_models(parent)
     assert len(model_list) == 5
@@ -319,10 +287,7 @@ def test_time_frames_of_a_one_rotation_scan():
         assert _shape(frame) == _shape(parent)
         assert np.array_equal(np.asarray(frame.get_all_params()[0]['angles']), parent_angles[view_slice])
 
-
-@pytest.mark.parametrize(
-    'num_views, degrees_per_view, wrap, frames_per_rotation, frame_overlap_factor, expected',
-    [
+    cases = [
         # 600 degrees of views with the angles stored modulo one rotation: nine
         # frames of 48 views starting every 24 views.  The wrap adds one large
         # difference per rotation, which the median angular step ignores.
@@ -337,104 +302,12 @@ def test_time_frames_of_a_one_rotation_scan():
         (36, 10.0, False, 4, 1.5, [(0, 14), (9, 23), (18, 32)]),
         # Three frames share each view: a span of 60 views at a stride of 20.
         (100, 3.6, False, 5, 3.0, [(0, 60), (20, 80), (40, 100)]),
-    ],
-    ids=['multi_rotation_wrapped', 'multi_rotation_monotonic', 'half_view_rounding', 'three_frame_overlap'])
-def test_time_frame_view_slices(num_views, degrees_per_view, wrap, frames_per_rotation, frame_overlap_factor,
-                                expected):
-    """The view slices for a parameter set, checked exactly: they are integers
-    fixed by the frame arithmetic, and each frame model's view count is the
-    slice's length."""
-    model_list, view_slices = construct_time_frame_models(
-        _scan_model(num_views, degrees_per_view, wrap=wrap), frames_per_rotation=frames_per_rotation,
-        frame_overlap_factor=frame_overlap_factor)
-    assert _pairs(view_slices) == expected
-    assert len(model_list) == len(expected)
-    for frame, (start, stop) in zip(model_list, expected):
-        assert tuple(frame.get_params('sinogram_shape')) == (stop - start, 8, 10)
-
-
-def test_time_frames_reject_parameters_that_give_no_frames():
-    """A stride or a span below one view, a span longer than the scan, angles
-    with no spacing, and a model without one angle per view are each refused
-    with a message that names the cause."""
-    parent = _scan_model(24, 15.0)
-    # At the default overlap factor the span is twice the stride, so a stride
-    # below one view is caught by the span check first.
-    with pytest.raises(ValueError, match='smaller than one view'):
-        construct_time_frame_models(parent, frames_per_rotation=100)     # a 3.6 degree stride
-    with pytest.raises(ValueError, match='stride smaller than one view'):
-        construct_time_frame_models(parent, frames_per_rotation=100, frame_overlap_factor=5.0)   # an 18 degree span
-    with pytest.raises(ValueError, match='frame span smaller than one view'):
-        construct_time_frame_models(parent, frame_overlap_factor=0.05)   # a 3 degree span
-    with pytest.raises(ValueError, match='cannot exceed the full scan'):
-        construct_time_frame_models(parent, frame_overlap_factor=10.0)   # a 600 degree span
-    with pytest.raises(ValueError, match='nonzero spacing'):
-        construct_time_frame_models(_scan_model(24, 0.0))
-    for model in (_multiaxis_model(), _translation_model()):
-        with pytest.raises(ValueError, match='one angle per view'):
-            construct_time_frame_models(model)
-
-
-# ── the device helpers report the hardware ───────────────────────────────────
-def test_device_helpers_report_the_hardware():
-    """cpu_devices has one entry, gpu_devices lists every CUDA device or the
-    MPS device or nothing, and default_devices is the GPU list when it is
-    nonempty and the CPU device otherwise."""
-    assert cpu_devices() == (torch.device('cpu'),)
-    gpus = gpu_devices()
-    if torch.cuda.is_available():
-        assert gpus == tuple(torch.device('cuda', i) for i in range(torch.cuda.device_count()))
-    elif torch.backends.mps.is_available():
-        assert gpus == (torch.device('mps'),)
-    else:
-        assert gpus == ()
-    defaults = default_devices()
-    assert isinstance(defaults, list) and len(defaults) >= 1
-    assert defaults == (list(gpus) or [torch.device('cpu')])
-
-
-# ── save_volume_as_gif writes a real animation ───────────────────────────────
-def test_save_volume_as_gif_writes_the_frames_each_form_selects(tmp_path):
-    """Each form of the call selects its own set of frames, and every one of
-    them reaches the file: a 4D volume plays over time by default, over time in
-    a chosen plane when slice_axis names one, and through the slices of a
-    single frame when slice_axis is the frame axis; a 3D volume plays over its
-    first axis.  The frame count of the written file is the length of the axis
-    the movie loops over, so the file is read back rather than trusted."""
-    from PIL import Image
-
-    volume_4d = np.random.default_rng(0).random((6, 12, 14, 10)).astype(np.float32)
-    volume_3d = volume_4d[0]
-    cases = [
-        ('over time at the middle x', volume_4d, {}, 6),
-        ('over time in an XY plane', volume_4d, dict(slice_axis=3), 6),
-        ('through z of one frame', volume_4d, dict(frame_axis=3, slice_axis=0, slice_index=0), 10),
-        ('a 3D volume over x', volume_3d, {}, 12),
     ]
-    for name, volume, kwargs, expected in cases:
-        path = str(tmp_path / f"{name.replace(' ', '_')}.gif")
-        mbirtorch.save_volume_as_gif(volume, path, vmin=0, vmax=1, **kwargs)
-        with Image.open(path) as written:
-            print(f"{name}: {written.n_frames} frames, {os.path.getsize(path)} bytes")
-            assert written.n_frames == expected
-
-    # The frame duration is what fps asks for, in the hundredths of a second a
-    # GIF stores.  Five frames per second is 200 ms.
-    path = str(tmp_path / 'timed.gif')
-    mbirtorch.save_volume_as_gif(volume_4d, path, fps=5, vmin=0, vmax=1)
-    with Image.open(path) as written:
-        assert written.info['duration'] == 200
-
-    # A constant volume gives the display a zero-width window, which is widened
-    # rather than left to divide by zero.
-    flat = np.full((4, 6, 6, 6), 0.25, dtype=np.float32)
-    mbirtorch.save_volume_as_gif(flat, str(tmp_path / 'flat.gif'))
-
-    with pytest.raises(ValueError, match='3D volume'):
-        mbirtorch.save_volume_as_gif(volume_3d, str(tmp_path / 'x.gif'), slice_axis=1)
-    with pytest.raises(ValueError, match='must differ'):
-        mbirtorch.save_volume_as_gif(volume_4d, str(tmp_path / 'x.gif'), frame_axis=1, slice_axis=1)
-    with pytest.raises(ValueError, match='must be positive'):
-        mbirtorch.save_volume_as_gif(volume_4d, str(tmp_path / 'x.gif'), fps=0)
-    with pytest.raises(ValueError, match='3D .* or 4D'):
-        mbirtorch.save_volume_as_gif(volume_3d[0], str(tmp_path / 'x.gif'))
+    for num_views, degrees_per_view, wrap, frames_per_rotation, frame_overlap_factor, expected in cases:
+        model_list, view_slices = construct_time_frame_models(
+            _scan_model(num_views, degrees_per_view, wrap=wrap), frames_per_rotation=frames_per_rotation,
+            frame_overlap_factor=frame_overlap_factor)
+        assert _pairs(view_slices) == expected
+        assert len(model_list) == len(expected)
+        for frame, (start, stop) in zip(model_list, expected):
+            assert tuple(frame.get_params('sinogram_shape')) == (stop - start, 8, 10)

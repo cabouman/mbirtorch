@@ -60,17 +60,20 @@ def test_dehydrate_rehydrate_parity(golden):
     assert err_d < 1e-6 and err_b < 1e-6 and err_r < 1e-6
 
 
-def test_rehydrate_of_golden_dehydration_is_exact(golden):
-    # Rehydration is a matmul; on the golden dehydrated arrays it must match to float precision.
-    out = mbirtorch.rehydrate([golden["hsnt_sub_data"].copy(), golden["hsnt_sub_basis"].copy(),
-                               'attenuation'])
-    err = float(np.max(np.abs(out - golden["hsnt_rehydrated"])) /
-                max(np.max(np.abs(golden["hsnt_rehydrated"])), 1e-30))
-    print(f"rehydrate-of-golden rel_max = {err:.2e}")
-    assert err < 1e-6
+def test_hsnt_hdf5_format_round_trips_and_reads_mbirjax(tmp_path, golden):
+    # mbirtorch's own write path first, so the round trip still runs when the
+    # mbirjax-written file has not been generated.
+    dehydrated = [golden["hsnt_sub_data"].copy(), golden["hsnt_sub_basis"].copy(), 'attenuation']
+    metadata = mbirtorch.hsnt.create_hsnt_metadata(dataset_name='rt', dataset_type='attenuation',
+                                                   angles=np.array([0.0, 90.0]))
+    rt_path = os.path.join(str(tmp_path), 'hsnt.h5')
+    mbirtorch.export_hsnt_data_hdf5(rt_path, dehydrated, metadata)
+    data2, md2 = mbirtorch.import_hsnt_data_hdf5(rt_path)
+    assert np.array_equal(data2[0], dehydrated[0])
+    assert np.array_equal(data2[1], dehydrated[1])
+    assert data2[2] == 'attenuation'
+    assert md2['dataset_name'] == 'rt' and np.allclose(md2['angles'], [0.0, 90.0])
 
-
-def test_read_mbirjax_hsnt_file(golden):
     path = os.path.join(GOLDEN_DIR, 'preprocess_goldens_hsnt.h5')
     if not os.path.exists(path):
         pytest.skip('mbirjax hsnt golden not generated')
@@ -80,19 +83,6 @@ def test_read_mbirjax_hsnt_file(golden):
     assert np.allclose(sub_basis, golden["hsnt_sub_basis"])
     assert dataset_type == 'attenuation'
     assert metadata['dataset_name'] == 'golden'
-
-
-def test_hsnt_hdf5_round_trip(tmp_path, golden):
-    dehydrated = [golden["hsnt_sub_data"].copy(), golden["hsnt_sub_basis"].copy(), 'attenuation']
-    metadata = mbirtorch.hsnt.create_hsnt_metadata(dataset_name='rt', dataset_type='attenuation',
-                                                   angles=np.array([0.0, 90.0]))
-    path = os.path.join(str(tmp_path), 'hsnt.h5')
-    mbirtorch.export_hsnt_data_hdf5(path, dehydrated, metadata)
-    data2, md2 = mbirtorch.import_hsnt_data_hdf5(path)
-    assert np.array_equal(data2[0], dehydrated[0])
-    assert np.array_equal(data2[1], dehydrated[1])
-    assert data2[2] == 'attenuation'
-    assert md2['dataset_name'] == 'rt' and np.allclose(md2['angles'], [0.0, 90.0])
 
 
 def test_get_opt_views_seeded_golden(golden):

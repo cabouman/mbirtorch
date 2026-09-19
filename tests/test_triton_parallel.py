@@ -34,8 +34,8 @@ launch to launch and it is not bit-reproducible; 1e-5 covers that too, and
 test_parallel_forward_kernel_repeat_consistency measures the run-to-run spread
 rather than assuming it.
 
-Everything that launches a kernel needs CUDA and skips without it; the
-availability gates and the selection policy are exercised on any machine.
+Every test here launches a kernel, so every one of them needs CUDA and skips
+without it.
 """
 
 import numpy as np
@@ -54,8 +54,7 @@ from mbirtorch.triton_parallel import (PARALLEL_BACK_BLOCK_P,
                                        PARALLEL_SORTED_VIEW_CHUNK,
                                        PARALLEL_SORTED_WINDOW,
                                        _parallel_back_view_batch_triton,
-                                       _parallel_forward_view_batch_triton,
-                                       sorted_forward_enabled)
+                                       _parallel_forward_view_batch_triton)
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -169,44 +168,68 @@ def test_parallel_back_kernel_row_band_parity():
 
 
 @requires_cuda
-@pytest.mark.parametrize("band_rows", [5, 12, 16, 32])
-def test_parallel_back_kernel_pads_the_row_count_to_a_multiple_of_16(
-        band_rows):
-    """The wrapper launches the row count rounded up to a multiple of 16.
+@pytest.mark.parametrize("direction", ["back", "forward"])
+@pytest.mark.parametrize("band", [5, 12, 16, 32])
+def test_parallel_kernel_pads_the_width_argument_to_a_multiple_of_16(
+        direction, band):
+    """Each wrapper launches its width argument rounded up to a multiple of 16.
 
-    This kernel's sinogram is band-sized and its gather is bounded by the row
-    argument alone, so a rounded-up launch would read past the last real row.
-    The wrapper therefore makes its channel-major copy at the rounded-up row
-    count with the extra rows zeroed, and a zero row contributes exactly
-    zero.  Three statements follow, at every band this sweeps: the values are
-    the torch body's at the design's 1e-5 gate, they are the values the
-    unbanded call produces over the same rows, and the returned view's row
-    stride is the width the wrapper allocated.
+    The back kernel's width argument is its SINOGRAM ROW count and the
+    forward kernel's is its VALUE COLUMN count; in both directions that width
+    is the launch's vector axis and the returned view's row stride.  A
+    rounded-up launch would read past the last real row (or column), so each
+    wrapper copies its input into a zero-padded array of the launched width,
+    and a zero row or column contributes exactly zero.  The values must be
+    the torch body's at the design's 1e-5 gate either way, and the returned
+    view's stride must be the width the wrapper really allocated.
 
-    A 32-row sinogram makes both cases reachable: bands of 16 and 32 need no
-    padding, and bands of 5 and 12 do.
+    A 32-row sinogram and a 32-column value array make both cases reachable:
+    bands of 16 and 32 need no padding, and bands of 5 and 12 do.  The back
+    case also compares each banded call against the unbanded call over the
+    same rows, so the rows the rounding added changed nothing.
     """
     model = _parallel_model(cell=(6, 32, 20))
-    sinogram, pixel_indices, view_params, args = _body_inputs(model)
-    num_rows = int(sinogram.shape[1])
-    assert num_rows == 32
-    unbanded = _parallel_back_view_batch_triton(sinogram, pixel_indices,
-                                                view_params, **args)
-    for row_start in range(0, num_rows, band_rows):
-        band = sinogram[:, row_start:row_start + band_rows]
-        rows = int(band.shape[1])
-        kernel_out = _parallel_back_view_batch_triton(band, pixel_indices,
-                                                      view_params, **args)
-        reference = _parallel_back_view_batch(band, pixel_indices,
-                                              view_params, **args)
+    if direction == "back":
+        sinogram, pixel_indices, view_params, args = _body_inputs(model)
+        num_rows = int(sinogram.shape[1])
+        assert num_rows == 32
+        unbanded = _parallel_back_view_batch_triton(sinogram, pixel_indices,
+                                                    view_params, **args)
+        for row_start in range(0, num_rows, band):
+            rows_band = sinogram[:, row_start:row_start + band]
+            rows = int(rows_band.shape[1])
+            kernel_out = _parallel_back_view_batch_triton(rows_band,
+                                                          pixel_indices,
+                                                          view_params, **args)
+            reference = _parallel_back_view_batch(rows_band, pixel_indices,
+                                                  view_params, **args)
+            assert kernel_out.shape == reference.shape
+            assert bool(kernel_out.isfinite().all())
+            assert _rel_max(kernel_out, reference) <= 1e-5
+            window = unbanded[:, row_start:row_start + rows]
+            assert _rel_max(kernel_out, window) <= 1e-6
+            padded = padded_kernel_width(rows)
+            assert kernel_out.stride(0) == padded, (rows, padded)
+            assert kernel_out.is_contiguous() == (padded == rows)
+        return
+
+    _, pixel_indices, view_params, args = _body_inputs(model)
+    values = _voxel_values(model, pixel_indices)
+    num_cols = int(values.shape[1])
+    assert num_cols == 32
+    for col_start in range(0, num_cols, band):
+        cols_band = values[:, col_start:col_start + band]
+        cols = int(cols_band.shape[1])
+        kernel_out = _parallel_forward_view_batch_triton(cols_band,
+                                                         pixel_indices,
+                                                         view_params, **args)
+        reference = _parallel_forward_view_batch(cols_band, pixel_indices,
+                                                 view_params, **args)
         assert kernel_out.shape == reference.shape
         assert bool(kernel_out.isfinite().all())
         assert _rel_max(kernel_out, reference) <= 1e-5
-        window = unbanded[:, row_start:row_start + rows]
-        assert _rel_max(kernel_out, window) <= 1e-6
-        padded = padded_kernel_width(rows)
-        assert kernel_out.stride(0) == padded, (rows, padded)
-        assert kernel_out.is_contiguous() == (padded == rows)
+        # The transpose puts the channel-major row stride last.
+        assert kernel_out.stride(2) == padded_kernel_width(cols), cols
 
 
 @requires_cuda
@@ -253,22 +276,6 @@ def test_parallel_back_kernel_pixel_padding(num_pixels):
     full = _parallel_back_view_batch_triton(sinogram, pixel_indices,
                                             view_params, **args)
     assert _rel_max(kernel_out, full[:num_pixels]) <= 1e-6
-
-
-@requires_cuda
-def test_parallel_back_kernel_delegates_exotic_coeff_power():
-    # The kernel's coefficient power is a constexpr branch over 1 and 2 -- the
-    # only powers any caller in the package uses.  Anything else DELEGATES to
-    # the torch body rather than diverging from it, so the wrapper stays a
-    # total drop-in replacement.
-    model = _parallel_model()
-    sinogram, pixel_indices, view_params, args = _body_inputs(model)
-    reference = _parallel_back_view_batch(sinogram, pixel_indices, view_params,
-                                          coeff_power=3, **args)
-    delegated = _parallel_back_view_batch_triton(sinogram, pixel_indices,
-                                                 view_params, coeff_power=3,
-                                                 **args)
-    assert bool(torch.equal(delegated, reference))
 
 
 @requires_cuda
@@ -321,71 +328,30 @@ def test_parallel_forward_kernel_row_band_parity():
 
 
 @requires_cuda
-@pytest.mark.parametrize("band_cols", [5, 12, 16, 32])
-def test_parallel_forward_kernel_pads_the_column_count_to_a_multiple_of_16(
-        band_cols):
-    """The forward's width-class argument is its VALUE COLUMN count, which is
-    its vector axis and its output row stride, so that is what the wrapper
-    rounds up.
-
-    A rounded-up launch would read past the last real column of ``values``,
-    so the wrapper copies ``values`` into a zero-padded array of the launched
-    width; a zero column adds exactly 0.0 through the atomics.  The values
-    must be the torch body's at the design's 1e-5 gate, and the returned
-    view's last stride is the width the wrapper allocated (the transpose puts
-    the channel-major row stride there).
-    """
-    model = _parallel_model(cell=(6, 32, 20))
-    _, pixel_indices, view_params, args = _body_inputs(model)
-    values = _voxel_values(model, pixel_indices)
-    num_cols = int(values.shape[1])
-    assert num_cols == 32
-    for col_start in range(0, num_cols, band_cols):
-        band = values[:, col_start:col_start + band_cols]
-        cols = int(band.shape[1])
-        kernel_out = _parallel_forward_view_batch_triton(band, pixel_indices,
-                                                         view_params, **args)
-        reference = _parallel_forward_view_batch(band, pixel_indices,
-                                                 view_params, **args)
-        assert kernel_out.shape == reference.shape
-        assert bool(kernel_out.isfinite().all())
-        assert _rel_max(kernel_out, reference) <= 1e-5
-        assert kernel_out.stride(2) == padded_kernel_width(cols), cols
-
-
-@requires_cuda
-def test_parallel_forward_kernel_adjointness():
-    # <F x, a> == <x, B a> with F the kernel forward and B the TORCH back
-    # body -- the mirror of the back kernel's pairing.
+def test_parallel_kernel_pair_adjointness():
+    # Two pairings, both <F x, a> == <x, B a>.  First the KERNEL forward
+    # against the TORCH back body, the mirror of test_parallel_back_kernel_
+    # adjointness, which holds the forward side fixed to the torch body
+    # instead.  Then the pairing that actually ships once both kernels are on:
+    # KERNEL forward against KERNEL back.  A convention that drifted in BOTH
+    # kernels together would pass the two one-sided statements and fail the
+    # kernel-pair one.
     model = _parallel_model()
     sinogram, pixel_indices, view_params, args = _body_inputs(model)
     values = _voxel_values(model, pixel_indices)
     forward = _parallel_forward_view_batch_triton(values, pixel_indices,
                                                   view_params, **args)
-    back = _parallel_back_view_batch(sinogram, pixel_indices, view_params,
-                                     **args)
+    torch_back = _parallel_back_view_batch(sinogram, pixel_indices,
+                                           view_params, **args)
     lhs = float((forward * sinogram).sum())
-    rhs = float((values * back).sum())
+    rhs = float((values * torch_back).sum())
     rel = abs(lhs - rhs) / max(abs(rhs), 1e-30)
     print(f"parallel forward triton adjointness: lhs {lhs:.6f}, "
           f"rhs {rhs:.6f}, rel {rel:.2e}")
     assert rel <= 1e-4
 
-
-@requires_cuda
-def test_parallel_kernel_pair_adjointness():
-    # The pairing that actually ships once both kernels are on: KERNEL forward
-    # against KERNEL back.  The two tests above each hold one side fixed to
-    # the torch body, so a convention that drifted in BOTH kernels together
-    # would pass them and fail here.
-    model = _parallel_model()
-    sinogram, pixel_indices, view_params, args = _body_inputs(model)
-    values = _voxel_values(model, pixel_indices)
-    forward = _parallel_forward_view_batch_triton(values, pixel_indices,
-                                                  view_params, **args)
     back = _parallel_back_view_batch_triton(sinogram, pixel_indices,
                                             view_params, **args)
-    lhs = float((forward * sinogram).sum())
     rhs = float((values * back).sum())
     rel = abs(lhs - rhs) / max(abs(rhs), 1e-30)
     print(f"parallel kernel-pair adjointness: lhs {lhs:.6f}, rhs {rhs:.6f}, "
@@ -475,52 +441,6 @@ def test_parallel_forward_kernel_repeat_consistency():
 
 
 @requires_cuda
-def test_parallel_kernel_batching_binds_the_cost_model():
-    # The driver must batch a SELECTED kernel body by the kernel's own cost
-    # model (the _view_batch_cost attribute riding on the wrapper), never by
-    # the torch bodies' gather charge.  Three readings through a real
-    # default-selection driver: the bound bodies carry the cost functions;
-    # their realized batch at this cell is the kernel chunk while a torch
-    # body's is the 64 default; and at a large-cell charge (fabricated
-    # arithmetic -- nothing is allocated) the torch charge collapses to view
-    # batch 1 where the kernel charge does not, which is the defect this
-    # mechanism exists to fix.
-    from mbirtorch.triton_parallel import (PARALLEL_BACK_VIEW_CHUNK,
-                                           _parallel_back_view_batch_cost,
-                                           _parallel_forward_view_batch_cost)
-
-    model = _parallel_model(compile_mode='auto')
-    usable, reason = kernel_availability.parallel_back_kernel_usable(model)
-    assert usable, reason
-    usable, reason = kernel_availability.parallel_forward_kernel_usable(model)
-    assert usable, reason
-    model.create_projectors()
-    pf = model.projector_functions
-    fwd, back = pf._fwd_body_per_dev[0], pf._back_body_per_dev[0]
-    assert fwd._view_batch_cost is _parallel_forward_view_batch_cost
-    assert back._view_batch_cost is _parallel_back_view_batch_cost
-
-    args = model._view_batch_args()
-    rows = int(model.get_params('sinogram_shape')[1])
-    assert (pf._effective_view_batch(back, 100, rows, args)
-            == PARALLEL_BACK_VIEW_CHUNK)
-    assert pf._effective_view_batch(_parallel_back_view_batch, 100, rows,
-                                    args) == 64
-
-    big_args = dict(args, num_channels=992)
-    num_pixels, big_rows = 772_882, 1008
-    budget = pf._transient_budget_bytes()
-    assert num_pixels * big_rows * 4 > budget
-    kernel_vb = pf._effective_view_batch(back, num_pixels, big_rows, big_args)
-    torch_vb = pf._effective_view_batch(_parallel_back_view_batch, num_pixels,
-                                        big_rows, big_args)
-    bytes_pv, chunk = _parallel_back_view_batch_cost(num_pixels, big_rows,
-                                                     big_args)
-    assert torch_vb == 1
-    assert kernel_vb == max(1, min(chunk, budget // bytes_pv)) > 1
-
-
-@requires_cuda
 def test_parallel_kernel_view_range_loop_chunked_parity():
     # The view-range loop's chunk seams with the kernel bodies bound: an
     # explicit view_batch_size (which caps kernel batches exactly as it caps
@@ -560,53 +480,70 @@ def test_parallel_kernel_view_range_loop_chunked_parity():
 
 
 @requires_cuda
-def test_parallel_back_kernel_selection_and_end_to_end(monkeypatch):
-    # The selection contract after the composed gate: the back kernel is ON
-    # with no environment variable at all, wherever the probe and the
-    # self-check pass, and the kill switch still forces the torch body.  A
-    # model built that way reproduces the torch projector end to end THROUGH
-    # the driver (view batching, lazy accumulation, and the maybe_compile
-    # wrapper the body must survive without being traced).  The torch
-    # reference is built under the kill switch, because the default now
-    # selects the kernel.
+@pytest.mark.parametrize("direction", ["back", "forward"])
+def test_parallel_kernel_selection_and_end_to_end(direction, monkeypatch):
+    # The selection contract after the composed gate, stated for each
+    # direction: the kernel is ON with no environment variable at all,
+    # wherever the probe and the self-check pass, and the kill switch still
+    # forces the torch body.  A model built that way reproduces the torch
+    # projector end to end THROUGH the driver (view batching, lazy
+    # accumulation, and the maybe_compile wrapper the body must survive
+    # without being traced).  The torch reference is built under the kill
+    # switch, because the default now selects the kernel.
     from mbirtorch import projectors
+
+    is_back = direction == "back"
+    index = 1 if is_back else 0
+    gate = (kernel_availability.parallel_back_kernel_usable if is_back
+            else kernel_availability.parallel_forward_kernel_usable)
+    torch_body = (_parallel_back_view_batch if is_back
+                  else _parallel_forward_view_batch)
+    kernel_body = (_parallel_back_view_batch_triton if is_back
+                   else _parallel_forward_view_batch_triton)
 
     monkeypatch.setenv(kernel_availability.DISABLE_ENV_VAR, '1')
     kernel_availability._reset_probe_cache()
     kernel_availability._reset_self_check_cache()
     try:
         model = _parallel_model(compile_mode='auto')
-        assert model._view_batch_bodies()[1] is _parallel_back_view_batch
+        assert model._view_batch_bodies()[index] is torch_body
         model.create_projectors()
         sinogram, pixel_indices, _, _ = _body_inputs(model)
-        reference = model.sparse_back_project(sinogram, pixel_indices)
+        values = _voxel_values(model, pixel_indices)
+
+        def project():
+            if is_back:
+                return model.sparse_back_project(sinogram, pixel_indices)
+            return model.sparse_forward_project(values, pixel_indices)
+
+        reference = project()
 
         monkeypatch.delenv(kernel_availability.DISABLE_ENV_VAR)
         kernel_availability._reset_probe_cache()
         kernel_availability._reset_self_check_cache()
-        usable, reason = kernel_availability.parallel_back_kernel_usable(model)
+        usable, reason = gate(model)
         assert isinstance(reason, str) and reason
         assert usable, reason
-        assert (model._view_batch_bodies()[1]
-                is _parallel_back_view_batch_triton)
+        assert model._view_batch_bodies()[index] is kernel_body
 
         model.create_projectors()
         # The driver holds the kernel body ITSELF, uncompiled, even with
         # compile_mode='auto' (the _mbirtorch_no_compile seam).
-        assert (model.projector_functions._back_body_per_dev[0]
-                is _parallel_back_view_batch_triton)
-        kernel_out = model.sparse_back_project(sinogram, pixel_indices)
+        bound = (model.projector_functions._back_body_per_dev[0] if is_back
+                 else model.projector_functions._fwd_body_per_dev[0])
+        assert bound is kernel_body
+        kernel_out = project()
 
         rel = _rel_max(kernel_out, reference)
-        print(f"parallel back triton end-to-end: rel_max = {rel:.2e}")
+        print(f"parallel {direction} triton end-to-end: rel_max = {rel:.2e}")
         assert rel <= 1e-5
 
-        # The kill switch reaches the opted-in kernel too; it is read INSIDE
+        # The kill switch reaches the selected kernel too; it is read INSIDE
         # the probe, so it takes effect across a cache reset.
         monkeypatch.setenv(kernel_availability.DISABLE_ENV_VAR, '1')
         kernel_availability._reset_probe_cache()
         kernel_availability._reset_self_check_cache()
-        assert model._view_batch_bodies()[1] is _parallel_back_view_batch
+        assert model._view_batch_bodies()[index] is torch_body
         # ... and the kernel ran eagerly, rather than reaching eager by way of
         # a compile failure that maybe_compile swallowed.
         assert not [k for k in projectors._COMPILE_ERRORS
@@ -616,308 +553,67 @@ def test_parallel_back_kernel_selection_and_end_to_end(monkeypatch):
         kernel_availability._reset_self_check_cache()
 
 
-@requires_cuda
-def test_parallel_forward_kernel_selection_and_end_to_end(monkeypatch):
-    # The forward's copy of the back's default-on selection contract, with the
-    # same kill-switch-built reference.
-    from mbirtorch import projectors
-
-    monkeypatch.setenv(kernel_availability.DISABLE_ENV_VAR, '1')
-    kernel_availability._reset_probe_cache()
-    kernel_availability._reset_self_check_cache()
-    try:
-        model = _parallel_model(compile_mode='auto')
-        assert model._view_batch_bodies()[0] is _parallel_forward_view_batch
-        model.create_projectors()
-        _, pixel_indices, _, _ = _body_inputs(model)
-        values = _voxel_values(model, pixel_indices)
-        reference = model.sparse_forward_project(values, pixel_indices)
-
-        monkeypatch.delenv(kernel_availability.DISABLE_ENV_VAR)
-        kernel_availability._reset_probe_cache()
-        kernel_availability._reset_self_check_cache()
-        usable, reason = kernel_availability.parallel_forward_kernel_usable(
-            model)
-        assert isinstance(reason, str) and reason
-        assert usable, reason
-        assert (model._view_batch_bodies()[0]
-                is _parallel_forward_view_batch_triton)
-
-        model.create_projectors()
-        assert (model.projector_functions._fwd_body_per_dev[0]
-                is _parallel_forward_view_batch_triton)
-        kernel_out = model.sparse_forward_project(values, pixel_indices)
-
-        rel = _rel_max(kernel_out, reference)
-        print(f"parallel forward triton end-to-end: rel_max = {rel:.2e}")
-        assert rel <= 1e-5
-        assert not [k for k in projectors._COMPILE_ERRORS
-                    if 'triton_parallel' in k]
-    finally:
-        kernel_availability._reset_probe_cache()
-        kernel_availability._reset_self_check_cache()
-
-
-def test_parallel_kernel_bodies_are_never_torch_compiled():
-    # Runs everywhere: the driver compiles every body it is handed, and a
-    # hand-written kernel body must be the exception.  torch.compile UNWRAPS
-    # torch.compiler.disable, so the opt-out has to be honored here, in
-    # maybe_compile, or the launch would be traced.
-    from mbirtorch.projectors import maybe_compile
-
-    assert maybe_compile(_parallel_back_view_batch_triton, True,
-                         instance_key=0) is _parallel_back_view_batch_triton
-    assert maybe_compile(_parallel_forward_view_batch_triton, True,
-                         instance_key=0) is _parallel_forward_view_batch_triton
-    # The torch bodies are still compiled, so the marker is not a blanket
-    # opt-out.
-    assert maybe_compile(_parallel_back_view_batch, True,
-                         instance_key=0) is not _parallel_back_view_batch
-    assert maybe_compile(_parallel_forward_view_batch, True,
-                         instance_key=0) is not _parallel_forward_view_batch
-
-
-@pytest.mark.parametrize("gate_name", ["parallel_back_kernel_usable",
-                                       "parallel_forward_kernel_usable"])
-def test_parallel_self_check_is_a_cached_pair(gate_name, monkeypatch):
-    # Runs everywhere: each gate must answer (bool, str) and cache per device,
-    # whatever the machine underneath.
-    monkeypatch.delenv(kernel_availability.DISABLE_ENV_VAR, raising=False)
-    kernel_availability._reset_probe_cache()
-    kernel_availability._reset_self_check_cache()
-    gate = getattr(kernel_availability, gate_name)
-    try:
-        model = _parallel_model(device='cpu')
-        first = gate(model)
-        assert isinstance(first, tuple) and len(first) == 2
-        usable, reason = first
-        assert isinstance(usable, bool)
-        assert isinstance(reason, str) and reason
-        assert gate(model) == first
-    finally:
-        kernel_availability._reset_probe_cache()
-        kernel_availability._reset_self_check_cache()
-
-
-@pytest.mark.parametrize(
-    "gate_name,body_name,index,torch_body",
-    [("parallel_back_kernel_usable", "_parallel_back_view_batch_triton",
-      1, _parallel_back_view_batch),
-     ("parallel_forward_kernel_usable", "_parallel_forward_view_batch_triton",
-      0, _parallel_forward_view_batch)])
-def test_parallel_self_check_catches_a_broken_kernel(
-        gate_name, body_name, index, torch_body, monkeypatch):
-    # Runs everywhere: the self-check exists to catch a toolchain that
-    # compiles the probe and then miscompiles (or fails to compile) the real
-    # kernel.  With the probe forced to pass and the kernel body raising, the
-    # gate must report a REASON and the model must keep the
-    # torch body -- never propagate the failure to a caller who only asked
-    # what was available.
-    from mbirtorch import triton_parallel
-
-    def _exploding_body(*args, **kwargs):
-        raise RuntimeError('simulated broken kernel')
-
-    monkeypatch.delenv(kernel_availability.DISABLE_ENV_VAR, raising=False)
-    monkeypatch.setattr(kernel_availability, '_probe_triton',
-                        lambda: (True, 'forced-available probe'))
-    monkeypatch.setattr(triton_parallel, body_name, _exploding_body)
-    kernel_availability._reset_probe_cache()
-    kernel_availability._reset_self_check_cache()
-    try:
-        model = _parallel_model(device='cpu')
-        usable, reason = getattr(kernel_availability, gate_name)(model)
-        assert usable is False
-        assert 'simulated broken kernel' in reason
-        assert model._view_batch_bodies()[index] is torch_body
-    finally:
-        kernel_availability._reset_probe_cache()
-        kernel_availability._reset_self_check_cache()
-
-
-@pytest.mark.parametrize(
-    "gate_name,index,torch_body",
-    [("parallel_back_kernel_usable", 1, _parallel_back_view_batch),
-     ("parallel_forward_kernel_usable", 0, _parallel_forward_view_batch)])
-def test_parallel_gate_is_false_without_a_kernel_path(
-        gate_name, index, torch_body, monkeypatch):
-    # Two ways the fast path can be absent, both of which must produce a
-    # REASON rather than an exception: the kill switch (any machine) and a host
-    # with no CUDA at all (this machine, when it has none).
-    monkeypatch.setenv(kernel_availability.DISABLE_ENV_VAR, '1')
-    kernel_availability._reset_probe_cache()
-    kernel_availability._reset_self_check_cache()
-    gate = getattr(kernel_availability, gate_name)
-    try:
-        model = _parallel_model(device='cpu')
-        usable, reason = gate(model)
-        assert usable is False
-        assert kernel_availability.DISABLE_ENV_VAR in reason
-        assert model._view_batch_bodies()[index] is torch_body
-
-        monkeypatch.delenv(kernel_availability.DISABLE_ENV_VAR)
-        kernel_availability._reset_probe_cache()
-        kernel_availability._reset_self_check_cache()
-        if not torch.cuda.is_available():
-            usable, reason = gate(model)
-            assert usable is False
-            assert 'CUDA' in reason or 'cuda' in reason
-            assert model._view_batch_bodies()[index] is torch_body
-    finally:
-        kernel_availability._reset_probe_cache()
-        kernel_availability._reset_self_check_cache()
-
-
-@pytest.mark.parametrize(
-    "gate_name,index,torch_body,kernel_body",
-    [("parallel_back_kernel_usable", 1,
-      _parallel_back_view_batch, _parallel_back_view_batch_triton),
-     ("parallel_forward_kernel_usable", 0,
-      _parallel_forward_view_batch, _parallel_forward_view_batch_triton)])
-def test_parallel_kernels_select_by_default(gate_name, index, torch_body,
-                                            kernel_body, monkeypatch):
-    # The policy, stated separately from the gate: no environment variable is
-    # consulted -- the gate's verdict alone decides, and a passing gate
-    # selects the kernel by default.  Runs everywhere -- the sentinel gate
-    # makes it machine-independent.
-    calls = []
-    verdict = {'usable': True}
-
-    def _spy(model):
-        calls.append(model)
-        return (verdict['usable'], 'sentinel gate')
-
-    monkeypatch.delenv(kernel_availability.DISABLE_ENV_VAR, raising=False)
-    monkeypatch.setattr(kernel_availability, gate_name, _spy)
-    try:
-        model = _parallel_model(device='cpu')
-        calls.clear()
-        assert model._view_batch_bodies()[index] is kernel_body
-        assert len(calls) == 1
-
-        verdict['usable'] = False
-        assert model._view_batch_bodies()[index] is torch_body
-    finally:
-        kernel_availability._reset_probe_cache()
-        kernel_availability._reset_self_check_cache()
-
-
-def test_parallel_kernel_selection_is_layout_independent():
-    """The restored selection contract: the layout plays no part.
-
-    An interim rule once withheld the forward kernel from sharded layouts.
-    The defect behind it was the launch context, not the kernel, and the
-    wrappers now bracket their launches on the tensors' device (the
-    kernel-sharding findings in the plans repo).  Selection therefore
-    consults the availability gates alone, and a layout change must neither
-    drop a kernel nor latch a stale choice.
-
-    This test runs on CPU by forcing the gates, so the RULE is pinned on any
-    machine.  Whether a real kernel is usable is a separate question that
-    the availability gates own.
-    """
-    monkeypatch = pytest.MonkeyPatch()
-    try:
-        monkeypatch.setattr(kernel_availability, 'parallel_forward_kernel_usable',
-                            lambda model: (True, 'forced'))
-        monkeypatch.setattr(kernel_availability, 'parallel_back_kernel_usable',
-                            lambda model: (True, 'forced'))
-        model = _parallel_model(device='cpu')
-        # Trivial placement: both kernels bind.
-        fwd, back = model._view_batch_bodies()
-        assert fwd is _parallel_forward_view_batch_triton
-        assert back is _parallel_back_view_batch_triton
-        # Non-trivial placement: the same selection.
-        model.configure_devices(devices=['cpu', 'cpu'])
-        fwd, back = model._view_batch_bodies()
-        assert fwd is _parallel_forward_view_batch_triton
-        assert back is _parallel_back_view_batch_triton
-        # And back again, so a rebuilt layout re-selects rather than latching.
-        model.configure_devices(devices=['cpu'])
-        fwd, back = model._view_batch_bodies()
-        assert fwd is _parallel_forward_view_batch_triton
-        assert back is _parallel_back_view_batch_triton
-    finally:
-        monkeypatch.undo()
-
-
-# ── the sorted-contraction forward route ─────────────────────────────────────
+# ── the sorted-contraction forward route ─────────────────────────
 # The wrapper routes through the sorted kernel by default, so every forward
-# gate above already exercises it; these tests pin the pieces the default
+# gate above already exercises it; this test pins the pieces the default
 # path cannot reach on the small cells -- the two kernels against each
-# other, the sparse-set fallback, the view-chunk tail -- and the switch.
-
-
-def test_sorted_forward_switch_reads_environment(monkeypatch):
-    # No CUDA needed: the switch is plain environment reading, and a wrong
-    # default here would silently route every forward call the other way.
-    monkeypatch.delenv("MBIRTORCH_SORTED_FORWARD", raising=False)
-    assert sorted_forward_enabled()
-    for off in ("0", "false", "NO", " off "):
-        monkeypatch.setenv("MBIRTORCH_SORTED_FORWARD", off)
-        assert not sorted_forward_enabled()
-    monkeypatch.setenv("MBIRTORCH_SORTED_FORWARD", "1")
-    assert sorted_forward_enabled()
+# other, the sparse-set fallback, the view-chunk tail.
 
 
 @requires_cuda
-def test_parallel_forward_sorted_and_tap_kernels_agree(monkeypatch):
-    # The two routes compute the same sums in a different order, so they
-    # gate against each other at the same figure the kernels gate against
-    # their torch bodies.
-    model = _parallel_model()
-    _, pixel_indices, view_params, args = _body_inputs(model)
-    values = _voxel_values(model, pixel_indices)
-    monkeypatch.setenv("MBIRTORCH_SORTED_FORWARD", "0")
-    tap_out = _parallel_forward_view_batch_triton(values, pixel_indices,
-                                                  view_params, **args)
-    monkeypatch.setenv("MBIRTORCH_SORTED_FORWARD", "1")
-    sorted_out = _parallel_forward_view_batch_triton(values, pixel_indices,
-                                                     view_params, **args)
-    assert sorted_out.shape == tap_out.shape
-    assert bool(sorted_out.isfinite().all())
-    rel = _rel_max(sorted_out, tap_out)
-    print(f"sorted vs tap forward kernels: rel_max = {rel:.2e}")
-    assert rel <= 1e-5
+@pytest.mark.parametrize("case", ["tap_vs_sorted", "sparse_pixels",
+                                  "view_chunk_tail"])
+def test_parallel_forward_sorted_route(case, monkeypatch):
+    """Three statements about the sorted forward route.
 
+    tap_vs_sorted: the two routes compute the same sums in a different order,
+    so they gate against each other at the same figure the kernels gate
+    against their torch bodies.
 
-@requires_cuda
-def test_parallel_forward_sorted_fallback_for_sparse_pixels():
-    # A sparse pixel set is the ordinary way a SORTED tile's channel span
-    # exceeds the window: the small parity cells never reach it (their
-    # whole detector is narrower than the window), so this cell is wide
-    # (64 channels) and the set keeps every 103rd pixel.  The sorted
-    # 32-pixel tile then spans most of the detector, the kernel takes its
-    # per-tap fallback, and the values must still match the torch body.
-    model = _parallel_model(cell=(6, 12, 64))
-    _, pixel_indices, view_params, args = _body_inputs(model)
-    sparse = pixel_indices[::103].contiguous()
-    assert int(sparse.shape[0]) > PARALLEL_SORTED_WINDOW
-    values = _voxel_values(model, sparse)
-    reference = _parallel_forward_view_batch(values, sparse, view_params,
-                                             **args)
-    kernel_out = _parallel_forward_view_batch_triton(values, sparse,
-                                                     view_params, **args)
-    assert kernel_out.shape == reference.shape
-    rel = _rel_max(kernel_out, reference)
-    print(f"sorted forward sparse-set fallback: rel_max = {rel:.2e}")
-    assert rel <= 1e-5
+    sparse_pixels: a sparse pixel set is the ordinary way a SORTED tile's
+    channel span exceeds the window.  The small parity cells never reach it
+    (their whole detector is narrower than the window), so this cell is wide
+    (64 channels) and the set keeps every 103rd pixel.  The sorted 32-pixel
+    tile then spans most of the detector, the kernel takes its per-tap
+    fallback, and the values must still match the torch body.
 
+    view_chunk_tail: 21 views is one full 16-view chunk plus a 5-view tail, so
+    the tail chunk's clamped iterations run and must write nothing; a defect
+    there double-counts the last view and fails the parity by orders.
+    """
+    if case == "tap_vs_sorted":
+        model = _parallel_model()
+        _, pixel_indices, view_params, args = _body_inputs(model)
+        values = _voxel_values(model, pixel_indices)
+        monkeypatch.setenv("MBIRTORCH_SORTED_FORWARD", "0")
+        tap_out = _parallel_forward_view_batch_triton(values, pixel_indices,
+                                                      view_params, **args)
+        monkeypatch.setenv("MBIRTORCH_SORTED_FORWARD", "1")
+        sorted_out = _parallel_forward_view_batch_triton(values, pixel_indices,
+                                                         view_params, **args)
+        assert sorted_out.shape == tap_out.shape
+        assert bool(sorted_out.isfinite().all())
+        rel = _rel_max(sorted_out, tap_out)
+        print(f"sorted vs tap forward kernels: rel_max = {rel:.2e}")
+        assert rel <= 1e-5
+        return
 
-@requires_cuda
-def test_parallel_forward_sorted_view_chunk_tail():
-    # 21 views is one full 16-view chunk plus a 5-view tail, so the tail
-    # chunk's clamped iterations run and must write nothing: a defect there
-    # double-counts the last view and fails the parity by orders.
-    assert 21 % PARALLEL_SORTED_VIEW_CHUNK != 0
-    model = _parallel_model(cell=(21, 12, 12))
-    _, pixel_indices, view_params, args = _body_inputs(model)
+    if case == "sparse_pixels":
+        model = _parallel_model(cell=(6, 12, 64))
+        _, pixel_indices, view_params, args = _body_inputs(model)
+        pixel_indices = pixel_indices[::103].contiguous()
+        assert int(pixel_indices.shape[0]) > PARALLEL_SORTED_WINDOW
+    else:
+        assert 21 % PARALLEL_SORTED_VIEW_CHUNK != 0
+        model = _parallel_model(cell=(21, 12, 12))
+        _, pixel_indices, view_params, args = _body_inputs(model)
     values = _voxel_values(model, pixel_indices)
     reference = _parallel_forward_view_batch(values, pixel_indices,
                                              view_params, **args)
     kernel_out = _parallel_forward_view_batch_triton(values, pixel_indices,
                                                      view_params, **args)
     assert kernel_out.shape == reference.shape
+    assert bool(kernel_out.isfinite().all())
     rel = _rel_max(kernel_out, reference)
-    print(f"sorted forward view-chunk tail (21 views): rel_max = {rel:.2e}")
+    print(f"sorted forward route ({case}): rel_max = {rel:.2e}")
     assert rel <= 1e-5

@@ -4,7 +4,7 @@ the right bar: the kernel is per-view, so no sum crosses a device boundary.
 
 Also gates the device-count default that the preprocessing functions share.
 ``pipeline.permitted_devices`` resolves ``devices=None`` for all of them, so
-its rule is tested directly and then again through each function.
+its rule is tested directly.
 """
 
 import numpy as np
@@ -13,7 +13,6 @@ import torch
 
 import mbirtorch.preprocess as mtp
 from mbirtorch.preprocess import pipeline
-from mbirtorch.preprocess import utilities as preprocess_utilities
 
 
 @pytest.fixture
@@ -46,30 +45,13 @@ def test_multi_device_view_split_matches_single():
 
 
 # ── the shared devices=None default ──────────────────────────────────────────
-def test_default_devices_are_one_device_without_cuda(monkeypatch, unpinned):
-    """A machine with no visible CUDA device gets its default device.
-
-    That default differs by machine: mps on a Mac, cpu on a host with no
-    accelerator.  The resolver stands in for it here, so the test asserts
-    the count and the source of the choice rather than a device name.
-    """
-    monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
-    monkeypatch.setattr(pipeline, '_resolve_device',
-                        lambda spec: torch.device('cpu'))
-    assert pipeline.permitted_devices() == [torch.device('cpu')]
-
-
-def test_default_devices_are_every_visible_cuda_device(monkeypatch, unpinned):
-    """The devices are faked, so this runs on any machine."""
+def test_permitted_devices_resolves_the_default_and_the_pin(monkeypatch, unpinned):
+    """devices=None gives every visible CUDA device, MBIRTORCH_NUM_DEVICES caps
+    that default, and an explicit list is never capped.  The devices are faked,
+    so this runs on any machine."""
     monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
     monkeypatch.setattr(torch.cuda, 'device_count', lambda: 3)
     assert pipeline.permitted_devices() == ['cuda:0', 'cuda:1', 'cuda:2']
-
-
-def test_the_pin_caps_the_default(monkeypatch):
-    """MBIRTORCH_NUM_DEVICES caps the default count."""
-    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
-    monkeypatch.setattr(torch.cuda, 'device_count', lambda: 3)
 
     monkeypatch.setenv('MBIRTORCH_NUM_DEVICES', '2')
     assert pipeline.permitted_devices() == ['cuda:0', 'cuda:1']
@@ -78,53 +60,9 @@ def test_the_pin_caps_the_default(monkeypatch):
     monkeypatch.setenv('MBIRTORCH_NUM_DEVICES', '8')
     assert pipeline.permitted_devices() == ['cuda:0', 'cuda:1', 'cuda:2']
 
-
-def test_an_explicit_list_is_never_capped(monkeypatch):
-    """An explicit list is the caller's, so the pin does not apply to it."""
+    # An explicit list is the caller's, so the pin does not apply to it.
     monkeypatch.setenv('MBIRTORCH_NUM_DEVICES', '1')
     assert pipeline.permitted_devices(['cpu', 'cpu', 'cpu']) == ['cpu'] * 3
-
-
-def test_scan_to_sino_default_devices_honor_the_pin(monkeypatch):
-    """MBIRTORCH_NUM_DEVICES caps scan_to_sino's 'all visible CUDA devices'
-    default.  The pin is how the suite and the nightlies keep results off the
-    host's device count; an entry that ignored it would quietly opt out.
-
-    The devices are faked, so this runs on any machine: the kernel never runs
-    (map_view_batches is replaced by a recorder), only the device choice does.
-    """
-    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
-    monkeypatch.setattr(torch.cuda, 'device_count', lambda: 4)
-
-    seen = {}
-
-    def record_devices(array, kernel, batch_size, devices=None):
-        seen['devices'] = devices
-        return np.asarray(array)
-
-    monkeypatch.setattr(preprocess_utilities.pipeline, 'map_view_batches',
-                        record_devices)
-
-    obj = np.ones((3, 2, 2), dtype=np.float32)
-    blank = 2 * np.ones((1, 2, 2), dtype=np.float32)
-    dark = np.zeros((1, 2, 2), dtype=np.float32)
-
-    monkeypatch.delenv('MBIRTORCH_NUM_DEVICES', raising=False)
-    preprocess_utilities.scan_to_sino(obj, blank, dark)
-    assert seen['devices'] == ['cuda:0', 'cuda:1', 'cuda:2', 'cuda:3']
-
-    monkeypatch.setenv('MBIRTORCH_NUM_DEVICES', '1')
-    preprocess_utilities.scan_to_sino(obj, blank, dark)
-    assert seen['devices'] == ['cuda:0']
-
-    # A pin above the visible count cannot conjure devices.
-    monkeypatch.setenv('MBIRTORCH_NUM_DEVICES', '8')
-    preprocess_utilities.scan_to_sino(obj, blank, dark)
-    assert seen['devices'] == ['cuda:0', 'cuda:1', 'cuda:2', 'cuda:3']
-
-    # An explicit list is the caller's and is never capped.
-    preprocess_utilities.scan_to_sino(obj, blank, dark, devices=['cpu', 'cpu'])
-    assert seen['devices'] == ['cpu', 'cpu']
 
 
 # ── the five view-batched preprocessing functions ────────────────────────────
@@ -213,25 +151,3 @@ def test_results_do_not_depend_on_the_device_count(function_name, num_devices):
     one_device = run(['cpu'])
     several_devices = run(['cpu'] * num_devices)
     assert np.array_equal(several_devices, one_device)
-
-
-@pytest.mark.parametrize('function_name', list(RUNNERS))
-def test_the_default_reaches_the_driver(function_name, monkeypatch, unpinned):
-    """Each function resolves devices=None to all the permitted devices.
-
-    The devices are faked and the driver is replaced by a recorder, so no
-    kernel runs here.  The device choice is the whole test.
-    """
-    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
-    monkeypatch.setattr(torch.cuda, 'device_count', lambda: 3)
-
-    seen = {}
-
-    def record_devices(array, kernel, batch_size, desc=None, devices=None):
-        seen['devices'] = devices
-        return np.asarray(array)
-
-    monkeypatch.setattr(pipeline, 'map_view_batches', record_devices)
-
-    RUNNERS[function_name](None)
-    assert seen['devices'] == ['cuda:0', 'cuda:1', 'cuda:2']

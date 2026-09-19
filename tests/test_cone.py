@@ -185,35 +185,24 @@ def curved_model(golden):
 
 
 @hel_golden
-def test_helical_auto_geometry(golden, helical_model):
+def test_helical_geometry_and_single_operators_match_the_golden(golden,
+                                                                helical_model):
     assert tuple(helical_model.get_params('recon_shape')) == \
         tuple(int(x) for x in golden["chel_recon_shape"])
 
-
-@hel_golden
-def test_helical_sparse_forward(golden, helical_model):
-    out = helical_model.sparse_forward_project(golden["chel_vals"],
-                                               golden["chel_subset"])
-    err = _rel_max(out.numpy(), golden["chel_sp_fwd"])
-    print(f"helical sparse_fwd rel_max = {err:.2e}")
-    assert err < 1e-4
-
-
-@hel_golden
-def test_helical_sparse_back(golden, helical_model):
-    out = helical_model.sparse_back_project(golden["chel_sino"],
-                                            golden["chel_subset"])
-    err = _rel_max(out.numpy(), golden["chel_sp_back"])
-    print(f"helical sparse_back rel_max = {err:.2e}")
-    assert err < 1e-4
-
-
-@hel_golden
-def test_helical_full_forward(golden, helical_model):
-    out = helical_model.forward_project(golden["chel_phantom"])
-    err = _rel_max(out, golden["chel_sino"])
-    print(f"helical forward rel_max = {err:.2e}")
-    assert err < 1e-4
+    sp_fwd = helical_model.sparse_forward_project(golden["chel_vals"],
+                                                  golden["chel_subset"])
+    sp_back = helical_model.sparse_back_project(golden["chel_sino"],
+                                                golden["chel_subset"])
+    full_fwd = helical_model.forward_project(golden["chel_phantom"])
+    sp_fwd_err = _rel_max(sp_fwd.numpy(), golden["chel_sp_fwd"])
+    sp_back_err = _rel_max(sp_back.numpy(), golden["chel_sp_back"])
+    fwd_err = _rel_max(full_fwd, golden["chel_sino"])
+    print(f"helical rel_max: sparse_fwd {sp_fwd_err:.2e}, "
+          f"sparse_back {sp_back_err:.2e}, forward {fwd_err:.2e}")
+    assert sp_fwd_err < 1e-4
+    assert sp_back_err < 1e-4
+    assert fwd_err < 1e-4
 
 
 @hel_golden
@@ -246,29 +235,20 @@ def test_helical_recon_convergence_parity(golden, helical_model):
 
 
 @hel_golden
-def test_curved_sparse_forward(golden, curved_model):
-    out = curved_model.sparse_forward_project(golden["ccurv_vals"],
-                                              golden["ccurv_subset"])
-    err = _rel_max(out.numpy(), golden["ccurv_sp_fwd"])
-    print(f"curved sparse_fwd rel_max = {err:.2e}")
-    assert err < 1e-4
-
-
-@hel_golden
-def test_curved_sparse_back(golden, curved_model):
-    out = curved_model.sparse_back_project(golden["ccurv_sino"],
-                                           golden["ccurv_subset"])
-    err = _rel_max(out.numpy(), golden["ccurv_sp_back"])
-    print(f"curved sparse_back rel_max = {err:.2e}")
-    assert err < 1e-4
-
-
-@hel_golden
-def test_curved_full_forward(golden, curved_model):
-    out = curved_model.forward_project(golden["ccurv_phantom"])
-    err = _rel_max(out, golden["ccurv_sino"])
-    print(f"curved forward rel_max = {err:.2e}")
-    assert err < 1e-4
+def test_curved_single_operators_match_the_golden(golden, curved_model):
+    sp_fwd = curved_model.sparse_forward_project(golden["ccurv_vals"],
+                                                 golden["ccurv_subset"])
+    sp_back = curved_model.sparse_back_project(golden["ccurv_sino"],
+                                               golden["ccurv_subset"])
+    full_fwd = curved_model.forward_project(golden["ccurv_phantom"])
+    sp_fwd_err = _rel_max(sp_fwd.numpy(), golden["ccurv_sp_fwd"])
+    sp_back_err = _rel_max(sp_back.numpy(), golden["ccurv_sp_back"])
+    fwd_err = _rel_max(full_fwd, golden["ccurv_sino"])
+    print(f"curved rel_max: sparse_fwd {sp_fwd_err:.2e}, "
+          f"sparse_back {sp_back_err:.2e}, forward {fwd_err:.2e}")
+    assert sp_fwd_err < 1e-4
+    assert sp_back_err < 1e-4
+    assert fwd_err < 1e-4
 
 
 @hel_golden

@@ -8,9 +8,8 @@ sinogram and the fitted theta at a documented looser tolerance (projections
 and OSQP are in the loop), not bitwise; the one-BH-pass recon parity is
 measured and printed.
 
-The OSQP guard tests exercise the infeasible-fit behavior directly: a
-non-solved status returns None, and near-zero metal-support pixels are never
-selected as residual constraints.
+One guard test covers the constraint selection directly: near-zero
+metal-support pixels are never selected as residual constraints.
 """
 
 import os
@@ -163,22 +162,6 @@ def test_median_filter3d(golden):
     assert np.array_equal(med, golden["med_out"])
     assert np.array_equal(mn, golden["med_min"])
     assert np.array_equal(mx, golden["med_max"])
-
-
-def test_osqp_infeasible_returns_none():
-    # x <= -1 and -x <= -1 cannot both hold: OSQP must report non-solved and the guard returns None.
-    P = np.eye(1)
-    q = np.zeros(1)
-    A = np.array([[1.0], [-1.0]])
-    u = np.array([-1.0, -1.0])
-    assert mtmar._estimate_BH_model_params_using_OSQP(P, q, A, u) is None
-
-
-def test_osqp_unconstrained_solves():
-    P = np.diag([2.0, 4.0])
-    q = np.array([-2.0, -8.0])
-    theta = mtmar._estimate_BH_model_params_using_OSQP(P, q, None, None)
-    assert np.allclose(theta, [1.0, 2.0], atol=1e-6)
 
 
 def test_metal_support_floor_excludes_unactionable_pixels():

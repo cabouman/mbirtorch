@@ -26,7 +26,6 @@ import pytest
 import mbirtorch
 from mbirtorch import _sharding
 from mbirtorch import utilities
-from mbirtorch.preprocess import pipeline
 
 GOLDEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "goldens")
 _paths = sorted(glob.glob(os.path.join(GOLDEN_DIR, "golden_*.npz")))
@@ -89,7 +88,8 @@ def test_slice_bands_equal_the_single_device_build(target_max_attenuation):
     The bands are then uneven, which is the only form the build has.  They cover
     the slice axis exactly, so there is no padded tail to crop.  The test
     asserts that split first, so that the equality below is known to have been
-    measured on uneven bands.
+    measured on uneven bands.  It then repeats the comparison with more devices
+    than slices, where some bands are empty.
     """
     phantom_shape = (12, 14, 10)
     devices = ['cpu'] * 3
@@ -110,24 +110,21 @@ def test_slice_bands_equal_the_single_device_build(target_max_attenuation):
     assert banded.shape == phantom_shape
     assert np.array_equal(banded, single)
 
-
-def test_a_device_count_above_the_slice_axis_leaves_an_empty_band():
-    """Five devices over three slices, so two devices get no slices at all.
-
-    An empty band is a legal band, and the build must produce the same phantom
-    with two of them present as without.
-    """
-    phantom_shape = (8, 9, 3)
-    devices = ['cpu'] * 5
+    # More devices than slices: two of the five bands are empty, which is a
+    # legal band, and the build must still give the single-device phantom.
+    empty_band_shape = (8, 9, 3)
+    many_devices = ['cpu'] * 5
     ranges = [r for _, r in _sharding.Placement(
-        devices, axis=-1, axis_len=phantom_shape[2]).shard_ranges()]
+        many_devices, axis=-1, axis_len=empty_band_shape[2]).shard_ranges()]
     assert ranges == [(0, 1), (1, 2), (2, 3), (3, 3), (3, 3)]
 
     single = mbirtorch.generate_3d_shepp_logan_low_dynamic_range(
-        phantom_shape, devices=['cpu'])
+        empty_band_shape, devices=['cpu'],
+        target_max_attenuation=target_max_attenuation)
     banded = mbirtorch.generate_3d_shepp_logan_low_dynamic_range(
-        phantom_shape, devices=devices)
-    assert banded.shape == phantom_shape
+        empty_band_shape, devices=many_devices,
+        target_max_attenuation=target_max_attenuation)
+    assert banded.shape == empty_band_shape
     assert np.array_equal(banded, single)
 
 
@@ -151,22 +148,3 @@ def test_row_blocking_does_not_change_the_phantom():
     blocked = mbirtorch.generate_3d_shepp_logan_low_dynamic_range(
         phantom_shape, devices=['cpu'], max_block_gb=1e-9)
     assert np.array_equal(blocked, unblocked)
-
-
-# ── the devices= default ─────────────────────────────────────────────────────
-def test_the_default_device_list_comes_from_permitted_devices(monkeypatch):
-    """devices=None is resolved by the shared preprocessing helper.
-
-    The helper's own rule is gated in tests/test_sharded_pipeline.py, so this
-    checks only the wiring: that None reaches it rather than being resolved
-    here.
-    """
-    seen = []
-
-    def record(devices=None):
-        seen.append(devices)
-        return ['cpu']
-
-    monkeypatch.setattr(pipeline, 'permitted_devices', record)
-    mbirtorch.generate_3d_shepp_logan_low_dynamic_range((6, 6, 4))
-    assert seen == [None]

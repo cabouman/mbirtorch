@@ -96,28 +96,28 @@ def _check_rotation_reaches_the_sinogram(reader):
     assert np.array_equal(default, unrotated)
 
 
-def test_zeiss_reader_applies_det_rotation(monkeypatch):
-    """The Zeiss Versa reader rotates every view by the ``det_rotation`` it is given."""
-    _patch_loader(monkeypatch, zeiss, _zeiss_scan_params())
+@pytest.mark.parametrize('reader_name', ['versa', 'translation'])
+def test_zeiss_readers_apply_det_rotation(monkeypatch, reader_name):
+    """Each Zeiss reader rotates every view by the ``det_rotation`` it is given.
 
-    def reader(det_rotation):
-        kwargs = {} if det_rotation is None else {'det_rotation': det_rotation}
-        sino, _ = zeiss.get_sino_and_model('unused', zinger_correction=False, bg_option=None,
-                                           verbose=0, **kwargs)
-        return np.asarray(sino)
+    The translation reader's background offset correction has no option to skip it, and the object
+    scan here leaves the detector edges at the blank level, so that correction subtracts exactly
+    zero in every case.
+    """
+    if reader_name == 'versa':
+        _patch_loader(monkeypatch, zeiss, _zeiss_scan_params())
 
-    _check_rotation_reaches_the_sinogram(reader)
+        def reader(det_rotation):
+            kwargs = {} if det_rotation is None else {'det_rotation': det_rotation}
+            sino, _ = zeiss.get_sino_and_model('unused', zinger_correction=False, bg_option=None,
+                                               verbose=0, **kwargs)
+            return np.asarray(sino)
+    else:
+        _patch_loader(monkeypatch, zeiss_tct, _tct_scan_params())
 
-
-def test_zeiss_tct_reader_applies_det_rotation(monkeypatch):
-    """The Zeiss translation reader rotates every view by the ``det_rotation`` it is given.  Its
-    background offset correction has no option to skip it, and the object scan here leaves the
-    detector edges at the blank level, so that correction subtracts exactly zero in every case."""
-    _patch_loader(monkeypatch, zeiss_tct, _tct_scan_params())
-
-    def reader(det_rotation):
-        kwargs = {} if det_rotation is None else {'det_rotation': det_rotation}
-        sino, _, _ = zeiss_tct.get_sino_and_model('unused', verbose=0, **kwargs)
-        return np.asarray(sino)
+        def reader(det_rotation):
+            kwargs = {} if det_rotation is None else {'det_rotation': det_rotation}
+            sino, _, _ = zeiss_tct.get_sino_and_model('unused', verbose=0, **kwargs)
+            return np.asarray(sino)
 
     _check_rotation_reaches_the_sinogram(reader)

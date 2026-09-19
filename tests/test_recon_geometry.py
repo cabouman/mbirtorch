@@ -110,7 +110,8 @@ def test_multiaxis_volume_covers_the_union_of_the_illuminated_bands():
 
 # ── build_model keeps what the dicts carry ───────────────────────────────────
 def test_build_model_round_trips_hand_set_geometry():
-    """Pitch, aspect ratio, recon shape, and slice offset set by hand come back from build_model."""
+    """Pitch, aspect ratio, recon shape, and slice offset set by hand come back from build_model,
+    and a supplied pitch with no shape sizes the automatic shape at that pitch."""
     cone = _cone(delta_voxel=0.37, voxel_row_aspect=1.25, recon_shape=(10, 12, 8), recon_slice_offset=1.4)
     rebuilt = mbirtorch.build_model(*cone.get_all_params())
     for name in ('delta_voxel', 'voxel_row_aspect', 'recon_slice_offset'):
@@ -122,10 +123,8 @@ def test_build_model_round_trips_hand_set_geometry():
     assert float(rebuilt.get_params('delta_voxel')) == pytest.approx(0.8)
     assert _shape(rebuilt) == (40, 44, 24)
 
-
-def test_build_model_sizes_the_automatic_shape_at_a_supplied_pitch():
-    """A supplied pitch without a shape gets the automatic shape rescaled to that pitch, so the
-    volume covers the same extent; parallel beam keeps one slice per detector row."""
+    # A supplied pitch without a shape gets the automatic shape rescaled to that pitch, so the
+    # volume covers the same extent; parallel beam keeps one slice per detector row.
     for make_model, slices_are_rows in ((_cone, False), (_parallel, True)):
         model = make_model()
         required, optional, regularization = model.get_all_params()

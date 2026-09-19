@@ -157,29 +157,18 @@ def test_multiaxis_auto_geometry(golden, ma_model):
 
 @pytest.mark.goldens
 @ma_golden
-def test_multiaxis_sparse_forward(golden, ma_model):
-    out = ma_model.sparse_forward_project(golden["ma_vals"], golden["ma_subset"])
-    err = _rel_max(out.numpy(), golden["ma_sp_fwd"])
-    print(f"multiaxis sparse_fwd rel_max = {err:.2e}")
-    assert err < 1e-4
-
-
-@pytest.mark.goldens
-@ma_golden
-def test_multiaxis_sparse_back(golden, ma_model):
-    out = ma_model.sparse_back_project(golden["ma_sino"], golden["ma_subset"])
-    err = _rel_max(out.numpy(), golden["ma_sp_back"])
-    print(f"multiaxis sparse_back rel_max = {err:.2e}")
-    assert err < 1e-4
-
-
-@pytest.mark.goldens
-@ma_golden
-def test_multiaxis_full_forward(golden, ma_model):
-    out = ma_model.forward_project(golden["ma_phantom"])
-    err = _rel_max(out, golden["ma_sino"])
-    print(f"multiaxis forward rel_max = {err:.2e}")
-    assert err < 1e-4
+def test_multiaxis_single_operators_match_the_golden(golden, ma_model):
+    sp_fwd = ma_model.sparse_forward_project(golden["ma_vals"], golden["ma_subset"])
+    sp_back = ma_model.sparse_back_project(golden["ma_sino"], golden["ma_subset"])
+    full_fwd = ma_model.forward_project(golden["ma_phantom"])
+    sp_fwd_err = _rel_max(sp_fwd.numpy(), golden["ma_sp_fwd"])
+    sp_back_err = _rel_max(sp_back.numpy(), golden["ma_sp_back"])
+    fwd_err = _rel_max(full_fwd, golden["ma_sino"])
+    print(f"multiaxis rel_max: sparse_fwd {sp_fwd_err:.2e}, "
+          f"sparse_back {sp_back_err:.2e}, forward {fwd_err:.2e}")
+    assert sp_fwd_err < 1e-4
+    assert sp_back_err < 1e-4
+    assert fwd_err < 1e-4
 
 
 @pytest.mark.goldens

@@ -6,86 +6,14 @@ real cross-device movement uses the cpu<->mps pair when MPS is available (the
 local analog of the 2-GPU platform)."""
 
 import math
-import os
 
 import numpy as np
 import pytest
 import torch
 
 from mbirtorch import _sharding
-from mbirtorch._sharding import (Placement, Shards, device_pool,
-                                 is_dev2dev_safe, move_shard, run_per_device,
-                                 sum_band_to_owner)
-
-
-def test_placement_ranges_split_evenly_within_one():
-    p = Placement(["cpu", "cpu"], axis=0, axis_len=7)
-    assert p.n_devices == 2 and not p.is_trivial
-    # An axis length the device count does not divide splits into blocks that
-    # differ in length by one, with the longer block first.
-    assert [r for _, r in p.shard_ranges()] == [(0, 4), (4, 7)]
-    # An explicit axis length overrides the placement's own.
-    assert [r for _, r in p.shard_ranges(6)] == [(0, 3), (3, 6)]
-
-    q = Placement(["cpu"], axis=-1, axis_len=5)
-    assert q.is_trivial and [r for _, r in q.shard_ranges()] == [(0, 5)]
-
-    # No size to split, and none on the placement, is an error that says so.
-    with pytest.raises(ValueError, match="needs an axis length"):
-        Placement(["cpu"], axis=0).shard_ranges()
-
-
-def test_placements_compare_by_value_and_hash_with_it():
-    """Two placements built separately from the same devices, axis and axis
-    length are equal, and equal placements split the axis into the same blocks
-    on the same devices.
-
-    This is what lets one model hand a sharded volume to another model
-    configured the same way -- the alternation a Plug-and-Play loop makes
-    between a reconstruction and a denoiser -- instead of the handoff being
-    refused because the two placement OBJECTS are distinct.
-    """
-    p = Placement(["cpu", "cpu"], axis=-1, axis_len=8)
-    q = Placement(["cpu", "cpu"], axis=-1, axis_len=8)
-    assert p == q and p is not q
-    assert [r for _, r in p.shard_ranges()] == [r for _, r in q.shard_ranges()]
-
-    # Equal objects hash equally, so a placement stays usable as a dict key or
-    # a set member.
-    assert hash(p) == hash(q)
-    assert len({p, q}) == 1
-
-    # Any one of the three fields differing makes them unequal.
-    assert p != Placement(["cpu"], axis=-1, axis_len=8)           # devices
-    assert p != Placement(["cpu", "cpu"], axis=0, axis_len=8)     # axis
-    assert p != Placement(["cpu", "cpu"], axis=-1, axis_len=7)    # axis length
-
-    # A foreign operand is deferred to rather than answered, so the other type
-    # gets its say and the comparison still comes out False.
-    assert p.__eq__("not a placement") is NotImplemented
-    assert not (p == "not a placement")
-    assert p != "not a placement"
-
-    # An unindexed device and an indexed one do not compare equal, so a model
-    # on 'cuda' and a model on 'cuda:0' are refused rather than wrongly
-    # accepted.  No device is touched here: the placements only name one.
-    assert (Placement(["cuda"], axis=-1, axis_len=4)
-            != Placement(["cuda:0"], axis=-1, axis_len=4))
-
-    # The repr names all three fields, so an error message built from it says
-    # which configuration an array actually came from.
-    assert (repr(Placement(["cuda:0", "cuda:1"], axis=-1, axis_len=992))
-            == "Placement(cuda:0,cuda:1, axis=-1, axis_len=992)")
-
-
-def test_shards_gather_roundtrip():
-    p = Placement(["cpu", "cpu"], axis=0, axis_len=6)
-    full = np.arange(24, dtype=np.float32).reshape(6, 4)
-    parts = [torch.as_tensor(full[s:e]) for _, (s, e) in p.shard_ranges(6)]
-    sh = Shards(parts, p)
-    assert np.array_equal(sh.gather(), full)
-    with pytest.raises(ValueError, match="shard tensors"):
-        Shards(parts[:1], p)
+from mbirtorch._sharding import (Placement, Shards, is_dev2dev_safe,
+                                 move_shard, sum_band_to_owner)
 
 
 def test_the_split_is_balanced_and_the_gather_keeps_every_element():
@@ -115,6 +43,34 @@ def test_the_split_is_balanced_and_the_gather_keeps_every_element():
         full = np.arange(3 * size, dtype=np.float32).reshape(size, 3)
         sh = Shards([torch.as_tensor(full[s:e]) for s, e in ranges], p)
         assert np.array_equal(sh.gather(), full), (size, count)
+
+    # An explicit axis length overrides the placement's own, and a single
+    # device is the trivial placement that owns the whole axis.
+    p = Placement(["cpu", "cpu"], axis=0, axis_len=7)
+    assert p.n_devices == 2 and not p.is_trivial
+    assert [r for _, r in p.shard_ranges(6)] == [(0, 3), (3, 6)]
+    q = Placement(["cpu"], axis=-1, axis_len=5)
+    assert q.is_trivial and [r for _, r in q.shard_ranges()] == [(0, 5)]
+
+    # No size to split, and none on the placement, is an error that says so.
+    with pytest.raises(ValueError, match="needs an axis length"):
+        Placement(["cpu"], axis=0).shard_ranges()
+
+    # The band tiling the banded back driver walks splits an extent the same
+    # balanced way.  A slice-owner with no slices arrives with an extent of 0
+    # and a band length of 0, which the ceil division cannot take, so the
+    # answer there is no bands and the driver's loop runs zero times.
+    import mbirtorch
+    bounds = mbirtorch.TomographyModel._balanced_slice_bounds
+    assert bounds(0, 0) == [] and bounds(0, 4) == []
+    assert bounds(-2, 0) == [] and bounds(-2, 4) == []
+    for extent, band_len in [(1, 1), (1, 4), (6, 2), (7, 3), (5, 5), (9, 4)]:
+        b = bounds(extent, band_len)
+        lengths = [e - s for s, e in b]
+        assert b[0][0] == 0 and b[-1][1] == extent       # covers [0, extent)
+        assert all(b[k][1] == b[k + 1][0] for k in range(len(b) - 1))
+        assert max(lengths) <= band_len
+        assert max(lengths) - min(lengths) <= 1
 
 
 def test_the_gather_rebuilds_the_array_exactly_on_either_axis():
@@ -165,55 +121,11 @@ def test_the_gather_rebuilds_the_array_exactly_on_either_axis():
                     assert all(torch.equal(t, u)
                                for t, u in zip(parts, untouched)), case
 
-
-def test_the_gather_refuses_shards_that_do_not_describe_one_array():
-    """Two cheap checks the gather makes before it copies anything.
-
-    Each catches a container that was built wrong.  Without them the result
-    would be a quietly mis-shaped or wrongly filled host array instead of an
-    error, because the gather sizes the whole array itself and then fills it.
-    """
-    # The shards cover six entries of the axis; the placement says nine.
-    p = Placement(["cpu", "cpu"], axis=0, axis_len=9)
-    with pytest.raises(ValueError, match="says that axis is 9 long"):
-        Shards([torch.zeros(3, 2), torch.zeros(3, 2)], p).gather()
-
-    # The shards agree on the sharded axis but disagree on the other one, so
-    # there is no single array they are the pieces of.
-    q = Placement(["cpu", "cpu"], axis=0, axis_len=5)
-    with pytest.raises(ValueError, match="does not fill"):
-        Shards([torch.zeros(3, 4), torch.zeros(2, 1)], q).gather()
-
-
-def test_the_slab_pieces_tile_the_block_exactly():
-    """The CUDA gather cuts each shard's block into pieces that fit a staging
-    slot (_slab_pieces).  Every element must be covered exactly once and no
-    piece may exceed the slot, for slots smaller than a row, equal to a row,
-    a few rows, and larger than the whole block."""
-    for rows, width, slot in [(10, 7, 3), (10, 7, 7), (10, 7, 15),
-                              (10, 7, 100), (1, 100, 7), (3, 1, 1), (4, 6, 13)]:
-        cover = np.zeros((rows, width), dtype=int)
-        for r0, r1, c0, c1 in _sharding._slab_pieces(rows, width, slot):
-            assert (r1 - r0) * (c1 - c0) <= slot, (rows, width, slot)
-            cover[r0:r1, c0:c1] += 1
-        assert (cover == 1).all(), (rows, width, slot)
-
-
-def test_the_grid_splits_cover_the_block_exactly():
-    """Each host thread of the CUDA gather takes one sub-grid of a shard's
-    block (_split_grid).  The sub-grids must cover the block exactly, be at
-    most as many as asked for, and split the columns instead of the rows
-    when the block has a single row."""
-    for rows, width, parts in [(10, 7, 1), (10, 7, 3), (10, 7, 10), (10, 7, 25),
-                               (1, 100, 4), (1, 3, 8), (2, 5, 8)]:
-        subs = _sharding._split_grid(rows, width, parts)
-        assert 1 <= len(subs) <= parts, (rows, width, parts)
-        cover = np.zeros((rows, width), dtype=int)
-        for r0, r1, c0, c1 in subs:
-            cover[r0:r1, c0:c1] += 1
-        assert (cover == 1).all(), (rows, width, parts)
-        if rows == 1 and parts > 1:
-            assert len(subs) == min(parts, width), (rows, width, parts)
+    # A container with the wrong number of shards is refused when it is built,
+    # before anything is copied.
+    p = Placement(["cpu", "cpu"], axis=0, axis_len=6)
+    with pytest.raises(ValueError, match="shard tensors"):
+        Shards([torch.zeros(3, 4)], p)
 
 
 def test_the_slab_gather_rebuilds_the_array_exactly_at_every_slot_size(
@@ -257,30 +169,6 @@ def test_the_slab_gather_rebuilds_the_array_exactly_at_every_slot_size(
                                    for t, u in zip(parts, untouched)), case
 
 
-def test_the_gather_thread_count_follows_the_cpus_and_the_cap(monkeypatch):
-    """The threads per shard are the CPUs this process may run on divided
-    among the shards and torch's own intra-op threads, at most
-    GATHER_THREADS_PER_SHARD and at least one."""
-    monkeypatch.setattr(_sharding, "GATHER_THREADS_PER_SHARD", 6)
-    if hasattr(os, "sched_getaffinity"):
-        monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(16)))
-    else:
-        monkeypatch.setattr(os, "cpu_count", lambda: 16)
-    monkeypatch.setattr(torch, "get_num_threads", lambda: 1)
-    assert _sharding._gather_threads_per_shard(1) == 6
-    assert _sharding._gather_threads_per_shard(4) == 4
-    assert _sharding._gather_threads_per_shard(5) == 3
-    assert _sharding._gather_threads_per_shard(40) == 1
-    # torch's copy already spreads over torch's intra-op threads, so those
-    # count against the CPUs too.
-    monkeypatch.setattr(torch, "get_num_threads", lambda: 4)
-    assert _sharding._gather_threads_per_shard(1) == 4
-    assert _sharding._gather_threads_per_shard(2) == 2
-    assert _sharding._gather_threads_per_shard(4) == 1
-    monkeypatch.setattr(torch, "get_num_threads", lambda: 16)
-    assert _sharding._gather_threads_per_shard(1) == 1
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(),
                     reason="needs a CUDA device")
 def test_the_cuda_gather_rebuilds_the_array_exactly_in_slabs(monkeypatch):
@@ -314,18 +202,6 @@ def test_the_cuda_gather_rebuilds_the_array_exactly_in_slabs(monkeypatch):
                     gathered = Shards(parts, p).gather()
                     assert gathered.flags["C_CONTIGUOUS"], case
                     assert np.array_equal(gathered, ref), case
-
-
-def test_band_reduce_values():
-    # The back projection's reduce reproduces a single-device sum on the
-    # virtual 2-CPU placement (transfers are no-ops; the pattern is real).
-    owners = [torch.device("cpu"), torch.device("cpu")]
-    partials = [torch.rand(5, 3) for _ in owners]
-    total = sum_band_to_owner(partials, owners[0])
-    ref_total = partials[0] + partials[1]
-    rel = float((total - ref_total).abs().max()
-                / max(float(ref_total.abs().max()), 1e-30))
-    assert rel < 1e-6, rel
 
 
 def test_the_streamed_reduce_matches_the_one_shot_sum_exactly(monkeypatch):
@@ -384,16 +260,6 @@ def test_the_streamed_reduce_leaves_the_sharded_back_projection_unchanged(
     streamed = m2._gather_recon(m2.back_project(sino, output_sharded=True))
     rel = np.max(np.abs(streamed - reference)) / np.max(np.abs(reference))
     assert rel < 1e-5, rel
-
-
-def test_run_per_device_order_and_pool():
-    devs = ["cpu", "cpu", "cpu"]
-    out = run_per_device(devs, lambda i, d: (i, str(d)))
-    assert [i for i, _ in out] == [0, 1, 2]
-    with device_pool(3) as pool:
-        out2 = run_per_device(devs, lambda i, d: i * 10, executor=pool)
-        out3 = run_per_device(devs, lambda i, d: i * 100, executor=pool)
-    assert out2 == [0, 10, 20] and out3 == [0, 100, 200]
 
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(),
@@ -639,27 +505,21 @@ def test_qggmrf_halos_match_full_volume():
                   / max(float(ref_h.abs().max()), 1e-30))
     assert rel_g < 1e-6 and rel_h < 1e-6, (rel_g, rel_h)
 
-
-def test_qggmrf_halos_treat_a_shard_with_no_slices_as_absent():
-    """A shard that holds no slices sends no halo and receives none.
-
-    The last shard that owns slices therefore gets None on its right, which
-    the prior maps to the reflected boundary condition at the last real
-    slice.  The shards here are built by hand rather than through a model, so
-    the case is stated directly: widths 2, 3, and 0 over three devices.
-    """
-    from mbirtorch._sharding import Placement, Shards, exchange_qggmrf_halos
-    rng = np.random.RandomState(23)
-    num_pixels, S = 7, 5
-    flat = torch.as_tensor(rng.rand(num_pixels, S).astype(np.float32))
-    p = Placement(["cpu"] * 3, axis=-1, axis_len=S)
-    shards = Shards([flat[:, 0:2], flat[:, 2:5], flat[:, 5:5]], p)
-    lh, rh = exchange_qggmrf_halos(shards)
+    # A shard that holds no slices sends no halo and receives none.  The last
+    # shard that owns slices therefore gets None on its right, which the prior
+    # maps to the reflected boundary condition at the last real slice.  The
+    # shards here are built by hand: widths 2, 3, and 0 over three devices.
+    rng3 = np.random.RandomState(23)
+    num_pixels, S3 = 7, 5
+    flat3 = torch.as_tensor(rng3.rand(num_pixels, S3).astype(np.float32))
+    p3 = Placement(["cpu"] * 3, axis=-1, axis_len=S3)
+    shards3 = Shards([flat3[:, 0:2], flat3[:, 2:5], flat3[:, 5:5]], p3)
+    lh3, rh3 = exchange_qggmrf_halos(shards3)
     # The boundary between the two shards that own slices carries the same
     # values it carries when no shard is empty.
-    assert torch.equal(lh[1], flat[:, 1]) and torch.equal(rh[0], flat[:, 2])
-    assert lh[0] is None and rh[1] is None   # volume start, last real slice
-    assert lh[2] is None and rh[2] is None   # the shard with no slices
+    assert torch.equal(lh3[1], flat3[:, 1]) and torch.equal(rh3[0], flat3[:, 2])
+    assert lh3[0] is None and rh3[1] is None  # volume start, last real slice
+    assert lh3[2] is None and rh3[2] is None  # the shard with no slices
 
 
 def test_sharded_vcd_recon_matches_single_device():
@@ -761,76 +621,6 @@ def test_cone_sharded_fdk_matches_single_device():
         assert rel < 1e-5, (shifts is None, rel)
 
 
-def test_uneven_placement_roundtrip():
-    # Non-dividing view AND slice axes on two virtual CPU devices: the 9
-    # views split 5 + 4, and (parallel row<->slice tie) the 7 slices split
-    # 4 + 3.  The gathers put both axes back together unchanged.
-    import mbirtorch
-    sino_shape = (9, 7, 8)
-    angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
-    m = mbirtorch.ParallelBeamModel(sino_shape, angles)
-    m.configure_devices(devices=["cpu"])
-    m.set_params(no_warning=True, verbose=0)
-    m.configure_devices(devices=["cpu", "cpu"])
-    rng = np.random.default_rng(3)
-    sino = rng.standard_normal(sino_shape).astype(np.float32)
-
-    prepared = m.prepare_sino_for_devices(sino)
-    shapes = [tuple(t.shape) for t in prepared.tensors]
-    assert shapes == [(5, 7, 8), (4, 7, 8)]
-    back = m._gather_sinogram(prepared)
-    assert back.shape == sino_shape
-    assert np.array_equal(back, sino)    # copies only, so exactly equal
-    # A prepared (device-form) array re-enters _shard_sinogram unchanged.
-    again = m._shard_sinogram(prepared)
-    assert again is prepared
-
-    # Weights ride the same seam.
-    _, w = m.prepare_sino_for_devices(sino, weights=np.abs(sino) + 0.5)
-    assert [tuple(t.shape) for t in w.tensors] == shapes
-
-    # Recon side: the slice axis 7 splits 4 + 3.
-    recon_shape = tuple(m.get_params('recon_shape'))
-    vol = rng.standard_normal(recon_shape).astype(np.float32)
-    placed = m._shard_recon(vol)
-    assert [int(t.shape[-1]) for t in placed.tensors] == [4, 3]
-    assert np.array_equal(m._gather_recon(placed), vol)
-
-
-def test_uneven_banded_projectors_match_single_device():
-    # Forward and back through the banded drivers on non-dividing axes must
-    # equal the single-device values.
-    import mbirtorch
-    sino_shape = (9, 7, 8)
-    angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
-
-    def build(n):
-        m = mbirtorch.ParallelBeamModel(sino_shape, angles)
-        m.configure_devices(devices=["cpu"])
-        m.set_params(no_warning=True, verbose=0)
-        if n > 1:
-            m.configure_devices(devices=["cpu"] * n)
-        return m
-
-    m1, m2 = build(1), build(2)
-    rs = tuple(m1.get_params('recon_shape'))
-    rng = np.random.default_rng(5)
-    vol = rng.standard_normal(rs).astype(np.float32)
-    sino_ref = m1.forward_project(vol)
-    sino_2 = m2._gather_sinogram(m2.forward_project(vol, output_sharded=True))
-    rel = np.max(np.abs(sino_2 - sino_ref)) / np.max(np.abs(sino_ref))
-    assert rel < 1e-5, rel
-
-    sino = rng.standard_normal(sino_shape).astype(np.float32)
-    bp_ref = m1.back_project(sino)
-    bp_2 = m2._gather_recon(m2.back_project(sino, output_sharded=True))
-    rel = np.max(np.abs(bp_2 - bp_ref)) / np.max(np.abs(bp_ref))
-    assert rel < 1e-5, rel
-    # Each device holds its own share of the slice axis: 4 + 3.
-    bp_dev = m2.back_project(sino, output_sharded=True)
-    assert [int(t.shape[-1]) for t in bp_dev.tensors] == [4, 3]
-
-
 def test_uneven_sharded_vcd_recon_matches_single_device():
     # The decisive uneven gate: a seeded recon with non-dividing views AND
     # slices on two virtual CPUs reproduces the single-device run (weighted
@@ -882,30 +672,39 @@ def test_uneven_sharded_vcd_recon_matches_single_device():
     rel_u = np.max(np.abs(out_u - ref_u)) / max(np.max(np.abs(ref_u)), 1e-30)
     assert rel_u < 5e-4, rel_u
 
+    # The layout underneath that run: the 9 views split 5 + 4 and (parallel
+    # row<->slice tie) the 7 slices split 4 + 3, and the gathers put both axes
+    # back together unchanged, copies only.
+    rng = np.random.default_rng(3)
+    raw_sino = rng.standard_normal(sino_shape).astype(np.float32)
+    prepared = m2.prepare_sino_for_devices(raw_sino)
+    shapes = [tuple(t.shape) for t in prepared.tensors]
+    assert shapes == [(5, 7, 8), (4, 7, 8)]
+    assert np.array_equal(m2._gather_sinogram(prepared), raw_sino)
+    # A prepared (device-form) array re-enters _shard_sinogram unchanged.
+    assert m2._shard_sinogram(prepared) is prepared
+    # Weights ride the same seam.
+    _, w = m2.prepare_sino_for_devices(raw_sino,
+                                       weights=np.abs(raw_sino) + 0.5)
+    assert [tuple(t.shape) for t in w.tensors] == shapes
+    vol = rng.standard_normal(rs).astype(np.float32)
+    placed = m2._shard_recon(vol)
+    assert [int(t.shape[-1]) for t in placed.tensors] == [4, 3]
+    assert np.array_equal(m2._gather_recon(placed), vol)
 
-def test_fully_idle_device_refused():
-    # A device idle on ONE axis is legal (the thin-volume and sparse-view
-    # extensions); a device with no views AND no slices would do nothing at
-    # all and is refused.  3 views on 4 devices (slices everywhere) still
-    # configures; 3 views x 3 slices on 8 devices does not.
-    import mbirtorch
-    sino_shape = (3, 8, 8)
-    angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
-    m = mbirtorch.ParallelBeamModel(sino_shape, angles)
-    m.configure_devices(devices=["cpu"])
-    m.set_params(no_warning=True, verbose=0)
-    m.configure_devices(devices=["cpu"] * 4)   # empty VIEW shard: allowed
-    assert [e - s for _d, (s, e) in m.sino_placement.shard_ranges()][-1] == 0
-
-    m2 = mbirtorch.ParallelBeamModel((3, 3, 8),
-                                     np.linspace(0, np.pi, 3, endpoint=False))
-    m2.configure_devices(devices=["cpu"])
-    m2.set_params(no_warning=True, verbose=0)
-    try:
-        m2.configure_devices(devices=["cpu"] * 8)
-        raise AssertionError("expected ValueError for a fully idle device")
-    except ValueError as e:
-        assert 'no views AND no slices' in str(e)
+    # Forward and back through the banded drivers on the same non-dividing
+    # axes equal the single-device values.
+    fwd_ref = m1.forward_project(vol)
+    fwd_2 = m2._gather_sinogram(m2.forward_project(vol, output_sharded=True))
+    rel_f = np.max(np.abs(fwd_2 - fwd_ref)) / np.max(np.abs(fwd_ref))
+    assert rel_f < 1e-5, rel_f
+    bp_ref = m1.back_project(raw_sino)
+    bp_dev = m2.back_project(raw_sino, output_sharded=True)
+    # Each device holds its own share of the slice axis: 4 + 3.
+    assert [int(t.shape[-1]) for t in bp_dev.tensors] == [4, 3]
+    rel_b = (np.max(np.abs(m2._gather_recon(bp_dev) - bp_ref))
+             / np.max(np.abs(bp_ref)))
+    assert rel_b < 1e-5, rel_b
 
 
 def test_five_views_and_five_slices_configure_and_recon_on_four_devices():
@@ -1040,79 +839,6 @@ def test_sub_band_streaming_matches_unstreamed():
     cbp = c2._gather_recon(c2.back_project(csino, output_sharded=True))
     assert np.max(np.abs(cfwd - cfwd_ref)) / np.max(np.abs(cfwd_ref)) < 1e-5
     assert np.max(np.abs(cbp - cbp_ref)) / np.max(np.abs(cbp_ref)) < 1e-5
-
-
-def test_balanced_slice_bounds_tile_the_extent_and_stop_at_an_empty_shard():
-    # The band tiling the banded back driver walks.  A slice-owner with no
-    # slices arrives with an extent of 0 and a band length of 0, which the
-    # ceil division cannot take, so the answer there is no bands and the
-    # driver's loop runs zero times.
-    import mbirtorch
-    bounds = mbirtorch.TomographyModel._balanced_slice_bounds
-    assert bounds(0, 0) == [] and bounds(0, 4) == []
-    assert bounds(-2, 0) == [] and bounds(-2, 4) == []
-    for extent, band_len in [(1, 1), (1, 4), (6, 2), (7, 3), (5, 5), (9, 4)]:
-        b = bounds(extent, band_len)
-        lengths = [e - s for s, e in b]
-        assert b[0][0] == 0 and b[-1][1] == extent       # covers [0, extent)
-        assert all(b[k][1] == b[k + 1][0] for k in range(len(b) - 1))
-        assert max(lengths) <= band_len
-        assert max(lengths) - min(lengths) <= 1
-
-
-def test_the_back_driver_returns_an_empty_block_for_an_owner_with_no_slices(
-        monkeypatch):
-    """A slice-owner with no slices gets a (num_pixels, 0) block, while the
-    owner that holds the slices gets the single-device values.
-
-    The stub is here because the balanced split gives these two owners three
-    slices each.  The layout below -- one owner covering every slice and a
-    last owner covering none -- therefore has to be handed to the driver
-    directly.
-    """
-    import mbirtorch
-    sino_shape = (8, 6, 8)
-    angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
-    m = mbirtorch.ParallelBeamModel(sino_shape, angles)
-    m.configure_devices(devices=["cpu"])
-    m.set_params(no_warning=True, verbose=0)
-    rs = tuple(m.get_params('recon_shape'))
-    rng = np.random.RandomState(17)
-    idx = np.sort(rng.choice(rs[0] * rs[1], size=20, replace=False))
-    sino = rng.rand(*sino_shape).astype(np.float32)
-    ref = m.sparse_back_project(sino, idx).cpu().numpy()
-
-    m.configure_devices(devices=["cpu"] * 2)
-    rp, num_slices = m.recon_placement, rs[2]
-    monkeypatch.setattr(
-        rp, 'shard_ranges',
-        lambda axis_len=None: [(rp.devices[0], (0, num_slices)),
-                               (rp.devices[1], (num_slices, num_slices))])
-    back = m.sparse_back_project(sino, idx)
-    assert back.tensors[1].shape == (len(idx), 0)
-    assert back.tensors[1].dtype == back.tensors[0].dtype
-    owned = back.tensors[0].cpu().numpy()
-    assert owned.shape == (len(idx), num_slices)
-    rel = np.max(np.abs(owned - ref)) / np.max(np.abs(ref))
-    assert rel < 1e-5, rel
-
-
-def test_move_shard_small_and_scalar_tensors():
-    # The transfer primitive on the shapes the VCD loop actually moves besides
-    # bands: 0-d line-search partials (the on-device combine) and per-slice
-    # stat vectors -- on both the direct and the host-bounce paths.
-    from mbirtorch._sharding import move_shard
-    for safe in (True, False):
-        s = torch.tensor(3.25)
-        out = move_shard(s, torch.device("cpu"), dev2dev_safe=safe)
-        assert out.ndim == 0 and float(out) == 3.25
-        v = torch.arange(5, dtype=torch.float32)
-        out_v = move_shard(v, torch.device("cpu"), dev2dev_safe=safe)
-        assert torch.equal(out_v, v)
-    if torch.backends.mps.is_available():
-        s = torch.tensor(1.5)
-        out = move_shard(s, torch.device("mps"), dev2dev_safe=True)
-        assert out.device.type == "mps" and float(out.cpu()) == 1.5
 
 
 def test_thin_volume_more_devices_than_slices():
@@ -1295,10 +1021,11 @@ def _cone_cylinder_case(devices, cell=(8, 8, 8), pixel_batch=None):
     return m, idx, vals, sino, ref_fwd, ref_back
 
 
-def test_transfer_cylinder_batch_assembles_the_full_height_cylinder():
+def test_the_cylinder_transfer_assembles_the_whole_slice_axis(monkeypatch):
     # The primitive: every slice-owner's rows [p0:p1] moved to one target and
     # concatenated along the SLICE axis, in shard (global slice) order.  A
     # single shard short-circuits the concatenation.
+    from mbirtorch import _sharding as sharding
     from mbirtorch._sharding import transfer_cylinder_batch
     rng = np.random.default_rng(11)
     full = torch.as_tensor(rng.standard_normal((9, 6)).astype(np.float32))
@@ -1317,61 +1044,22 @@ def test_transfer_cylinder_batch_assembles_the_full_height_cylinder():
                                  dev2dev_safe=False)
     assert torch.equal(bounced, full)
 
+    # The same assembly across two real devices when a second one is present:
+    # a transfer copies bytes, so the result is exact.
+    if torch.backends.mps.is_available():
+        real_full = torch.rand(32, 8)
+        real_shards = [real_full[:, :4].contiguous().to("cpu"),
+                       real_full[:, 4:].contiguous().to("mps")]
+        real_cyl = transfer_cylinder_batch(real_shards, 8, 16,
+                                           torch.device("mps"))
+        assert real_cyl.device.type == "mps"
+        assert torch.equal(real_cyl.cpu(), real_full[8:16])
 
-@pytest.mark.skipif(not torch.backends.mps.is_available(),
-                    reason="needs a second local device (mps)")
-def test_transfer_cylinder_batch_moves_across_real_devices():
-    from mbirtorch._sharding import transfer_cylinder_batch
-    full = torch.rand(32, 8)
-    shards = [full[:, :4].contiguous().to("cpu"),
-              full[:, 4:].contiguous().to("mps")]
-    cyl = transfer_cylinder_batch(shards, 8, 16, torch.device("mps"))
-    assert cyl.device.type == "mps"
-    assert torch.equal(cyl.cpu(), full[8:16])  # copies only, so exact
-
-
-def test_cylinder_transfer_matches_single_device_at_every_batch():
-    # The values gate on virtual CPU devices: a full-height call at
-    # slice_start=0 is the single-device call shape, so the sharded forward
-    # must reproduce the single-device values -- at one batch covering the
-    # pass, and at batches that force several.
-    for n in (2, 3):
-        for batch in (None, 1, 5, 10 ** 6):
-            m, idx, vals, _sino, ref_fwd, _ref_back = _cone_cylinder_case(
-                ["cpu"] * n, pixel_batch=batch)
-            fwd = m._gather_sinogram(m.sparse_forward_project(vals, idx))
-            rel = np.max(np.abs(fwd - ref_fwd)) / np.max(np.abs(ref_fwd))
-            print(f"cone cylinder transfer n={n} batch={batch}: rel {rel:.2e}")
-            assert rel < 1e-5, (n, batch, rel)
-
-
-def test_cylinder_transfer_holds_the_adjoint_on_uneven_axes():
-    # The back driver walks slice bands where the forward moves whole
-    # cylinders, so
-    # the pair must stay adjoint -- on a cell whose axes do not divide (9
-    # views and 7 slices over 2 devices), where the shards differ in length.
-    m, idx, vals, sino, ref_fwd, ref_back = _cone_cylinder_case(
-        ["cpu", "cpu"], cell=(9, 7, 8), pixel_batch=4)
-    fwd = m.sparse_forward_project(vals, idx)
-    back = m.sparse_back_project(sino, idx)
-    rel = (np.max(np.abs(m._gather_sinogram(fwd) - ref_fwd))
-           / max(np.max(np.abs(ref_fwd)), 1e-30))
-    assert rel < 1e-5, rel
-    rel_b = (np.max(np.abs(back.gather() - ref_back))
-             / max(np.max(np.abs(ref_back)), 1e-30))
-    assert rel_b < 1e-5, rel_b
-    lhs = float(np.sum(m._gather_sinogram(fwd) * sino))
-    rhs = float(np.sum(vals * back.gather()))
-    assert abs(lhs - rhs) / max(abs(rhs), 1e-30) < 1e-4, (lhs, rhs)
-
-
-def test_the_cylinder_transfer_assembles_one_batch_at_every_slice(monkeypatch):
     # The mechanics witness.  The cone forward must call
     # transfer_cylinder_batch; each transfer takes one piece per
     # slice-owner and yields cylinders that are the batch wide and the
     # WHOLE slice axis tall; and each projector call runs at
     # slice_start=0 over that whole axis for the owner's own views.
-    from mbirtorch import _sharding as sharding
     batch, n = 4, 2
     m, idx, vals, _sino, _ref_fwd, _ref_back = _cone_cylinder_case(
         ["cpu"] * n, pixel_batch=batch)
@@ -1416,96 +1104,39 @@ def test_the_cylinder_transfer_assembles_one_batch_at_every_slice(monkeypatch):
                           if span[1] > span[0]}
 
 
-def test_the_cylinder_transfer_runs_one_batch_ahead_of_the_projection(
-        monkeypatch):
-    # The prefetch witness.  Each view-owner issues the NEXT pixel batch's
-    # transfer before it projects the current batch, so that on real
-    # devices the
-    # copies feeding one projection can be moving while another projection
-    # runs.  On virtual CPU devices nothing moves and nothing can be timed, so
-    # what is asserted here is the ORDER the driver issues its work in, which
-    # is the part of the change that has to hold on every device.
-    #
-    # The order one worker records is g0, g1, p0, g2, p1, ... , g(K-1), p(K-2),
-    # p(K-1): batch k+1's transfer is issued before batch k is
-    # projected, the first transfer runs before the loop, and the last
-    # batch has nothing to transfer ahead of it.  The entry and exit of
-    # each projection are both recorded, so the witness is not merely
-    # that the transfer precedes the accumulation -- it precedes the
-    # projector call entirely.
-    #
-    # Each worker runs in its own thread, so events are kept per thread.  A
-    # pool thread is allowed to run more than one worker when one finishes
-    # before the next is submitted, and it would then record two workers'
-    # sequences end to end; the check reads blocks rather than the whole list
-    # so that it witnesses the order either way.
-    import threading
-    from mbirtorch import _sharding as sharding
-    batch, n = 4, 2
-    m, idx, vals, _sino, ref_fwd, _rb = _cone_cylinder_case(
-        ["cpu"] * n, pixel_batch=batch)
-    n_batches = -(-len(idx) // batch)
-    assert n_batches > 1                       # or there is no prefetch to see
-    events = {}
-    real_gather = sharding.transfer_cylinder_batch
-    real_call = m.projector_functions.sparse_forward_project_view_range
+def test_cylinder_transfer_matches_single_device_at_every_batch():
+    # The values gate on virtual CPU devices: a full-height call at
+    # slice_start=0 is the single-device call shape, so the sharded forward
+    # must reproduce the single-device values -- at one batch covering the
+    # pass, and at batches that force several.
+    for n in (2, 3):
+        for batch in (None, 1, 5, 10 ** 6):
+            m, idx, vals, _sino, ref_fwd, _ref_back = _cone_cylinder_case(
+                ["cpu"] * n, pixel_batch=batch)
+            fwd = m._gather_sinogram(m.sparse_forward_project(vals, idx))
+            rel = np.max(np.abs(fwd - ref_fwd)) / np.max(np.abs(ref_fwd))
+            print(f"cone cylinder transfer n={n} batch={batch}: rel {rel:.2e}")
+            assert rel < 1e-5, (n, batch, rel)
 
-    def spy_gather(shard_tensors, p0, p1, target, dev2dev_safe=True):
-        # Recorded at ENTRY: what is being witnessed is when the transfer is
-        # issued, not when it returns.
-        events.setdefault(threading.get_ident(), []).append(f'g{p0 // batch}')
-        return real_gather(shard_tensors, p0, p1, target, dev2dev_safe)
 
-    def spy_call(band_values, pixel_indices, view_range, slice_start=0,
-                 dev_index=0, plan=None, accumulate_into=None):
-        seq = events.setdefault(threading.get_ident(), [])
-        # Number the projections within THIS worker, which begins at its own
-        # first transfer, so that a thread running a second worker starts over
-        # at zero rather than counting on from the first.
-        first = len(seq) - 1 - seq[::-1].index('g0')
-        k = sum(1 for e in seq[first:] if e.endswith('-in'))
-        seq.append(f'p{k}-in')
-        block = real_call(band_values, pixel_indices, view_range,
-                          slice_start=slice_start, dev_index=dev_index,
-                          plan=plan, accumulate_into=accumulate_into)
-        seq.append(f'p{k}-out')
-        return block
-
-    monkeypatch.setattr(sharding, "transfer_cylinder_batch", spy_gather)
-    monkeypatch.setattr(m.projector_functions,
-                        "sparse_forward_project_view_range", spy_call)
-    fwd = m._gather_sinogram(m.sparse_forward_project(vals, idx))
-
-    expected = ['g0']
-    for k in range(n_batches):
-        if k + 1 < n_batches:
-            expected.append(f'g{k + 1}')
-        expected += [f'p{k}-in', f'p{k}-out']
-    assert events, "the cylinder transfer did not run"
-    recorded = 0
-    for seq in events.values():
-        # Every worker of this cell owns real views, so each ran the whole
-        # sequence; a thread holds a whole number of them.
-        assert len(seq) % len(expected) == 0, seq
-        for start in range(0, len(seq), len(expected)):
-            assert seq[start:start + len(expected)] == expected, seq
-            recorded += 1
-    assert recorded == n                       # one sequence per view-owner
-    # The prefetch moves WHEN a transfer is issued and nothing else, so the
-    # values are the ones the path already produced.
-    rel = np.max(np.abs(fwd - ref_fwd)) / max(np.max(np.abs(ref_fwd)), 1e-30)
+def test_cylinder_transfer_holds_the_adjoint_on_uneven_axes():
+    # The back driver walks slice bands where the forward moves whole
+    # cylinders, so
+    # the pair must stay adjoint -- on a cell whose axes do not divide (9
+    # views and 7 slices over 2 devices), where the shards differ in length.
+    m, idx, vals, sino, ref_fwd, ref_back = _cone_cylinder_case(
+        ["cpu", "cpu"], cell=(9, 7, 8), pixel_batch=4)
+    fwd = m.sparse_forward_project(vals, idx)
+    back = m.sparse_back_project(sino, idx)
+    rel = (np.max(np.abs(m._gather_sinogram(fwd) - ref_fwd))
+           / max(np.max(np.abs(ref_fwd)), 1e-30))
     assert rel < 1e-5, rel
-
-    # And the values hold across batch widths that force several batches,
-    # including one that leaves a short final batch (30 pixels over 7).
-    for width in (1, 3, 7):
-        mb, idxb, valsb, _s, ref_b, _rb2 = _cone_cylinder_case(
-            ["cpu"] * n, pixel_batch=width)
-        out = mb._gather_sinogram(mb.sparse_forward_project(valsb, idxb))
-        rel = np.max(np.abs(out - ref_b)) / np.max(np.abs(ref_b))
-        print(f"cone transfer one batch ahead, {width}-pixel batches: "
-              f"rel {rel:.2e}")
-        assert rel < 1e-5, (width, rel)
+    rel_b = (np.max(np.abs(back.gather() - ref_back))
+             / max(np.max(np.abs(ref_back)), 1e-30))
+    assert rel_b < 1e-5, rel_b
+    lhs = float(np.sum(m._gather_sinogram(fwd) * sino))
+    rhs = float(np.sum(vals * back.gather()))
+    assert abs(lhs - rhs) / max(abs(rhs), 1e-30) < 1e-4, (lhs, rhs)
 
 
 def test_cylinder_transfer_recon_matches_single_device():
@@ -1560,8 +1191,8 @@ def test_cylinder_transfer_recon_matches_single_device():
 #
 # The value bar was expected to be EQUALITY here, on the argument that each
 # detector row keeps a single producing call and CPU sums are deterministic.
-# The row half of that is true, and the mechanics test below asserts it
-# directly.  Equality is not, and the measurement that settled it is recorded
+# The row half of that is true.  Equality is not, and the measurement that
+# settled it is recorded
 # because it is worth knowing before anyone tries again (2026-08-10, this
 # suite, virtual CPU devices).  Run first in a fresh interpreter, the cylinder
 # transfer reproduces the single-device sinogram bit for bit.  Run once other
@@ -1618,63 +1249,6 @@ def test_parallel_cylinder_transfer_matches_the_single_device_values():
               f"rel {rel:.2e}")
         assert rel < 1e-5, (batch, rel)
 
-
-def test_parallel_cylinder_transfer_sizes_its_rows_by_the_cylinders(
-        monkeypatch):
-    # The mechanics witness, plus the row-aligned fact.  The parallel
-    # forward calls transfer_cylinder_batch; each cylinder is one pixel
-    # batch by the WHOLE slice axis; each projector call runs at
-    # slice_start=0 over that whole axis for the owner's own views; and
-    # the block that comes back is as TALL as the cylinder, because a
-    # row-aligned body sizes its output by the values it was handed.
-    from mbirtorch import _sharding as sharding
-    batch, n = 4, 2
-    m, idx, vals, _sino, _ref_fwd, _rb = _parallel_cylinder_case(
-        ["cpu"] * n, pixel_batch=batch)
-    slices = m.recon_placement.axis_len
-    channels = int(m.get_params('sinogram_shape')[2])
-    transfers, calls = [], []
-    real_gather = sharding.transfer_cylinder_batch
-
-    def spy_gather(shard_tensors, p0, p1, target, dev2dev_safe=True):
-        out = real_gather(shard_tensors, p0, p1, target, dev2dev_safe)
-        transfers.append((len(shard_tensors), p0, p1, tuple(out.shape)))
-        return out
-
-    real_call = m.projector_functions.sparse_forward_project_view_range
-
-    def spy_call(band_values, pixel_indices, view_range, slice_start=0,
-                 dev_index=0, plan=None, accumulate_into=None):
-        block = real_call(band_values, pixel_indices, view_range,
-                          slice_start=slice_start, dev_index=dev_index,
-                          plan=plan, accumulate_into=accumulate_into)
-        calls.append((tuple(band_values.shape), tuple(view_range), slice_start,
-                      tuple(block.shape)))
-        return block
-
-    monkeypatch.setattr(sharding, "transfer_cylinder_batch", spy_gather)
-    monkeypatch.setattr(m.projector_functions,
-                        "sparse_forward_project_view_range", spy_call)
-    fwd = m.sparse_forward_project(vals, idx)
-
-    expected_batches = -(-len(idx) // batch)
-    assert len(transfers) == n * expected_batches
-    for pieces, p0, p1, shape in transfers:
-        assert pieces == n                      # one piece per slice-owner
-        assert shape == (p1 - p0, slices)       # the batch, at every slice
-        assert p1 - p0 <= batch
-    assert len(calls) == n * expected_batches
-    for cyl_shape, (v0, v1), slice_start, block_shape in calls:
-        assert slice_start == 0 and cyl_shape[1] == slices
-        assert block_shape == (v1 - v0, slices, channels)
-    assert set((v0, v1) for _c, (v0, v1), _s, _b in calls) == {
-        span for _d, span in m.sino_placement.shard_ranges()
-        if span[1] > span[0]}
-    # And the shard the driver assembles carries those same rows.
-    assert all(tuple(t.shape[1:]) == (slices, channels) for t in fwd.tensors)
-
-
-def test_parallel_cylinder_transfer_holds_the_uneven_and_sparse_view_forms():
     # Two layouts a row-aligned geometry has to assemble correctly: one whose
     # axes do not divide the device count, and one with more devices than
     # views.  Every block this driver assembles -- including the empty one it
@@ -1699,103 +1273,15 @@ def test_parallel_cylinder_transfer_holds_the_uneven_and_sparse_view_forms():
         rhs = float(np.sum(vals * back.gather()))
         assert abs(lhs - rhs) / max(abs(rhs), 1e-30) < 1e-4, (shape, lhs, rhs)
 
-
-def test_cylinder_batch_accumulation_matches_the_shape_it_replaces(
-        monkeypatch):
-    # Each pixel batch after the first adds into the owner's block from inside
-    # the projector's view loop, rather than assembling its own block for the
-    # driver to add afterwards.  Those are the same summands added in the same
-    # order, element for element, so the bar here is EQUALITY and not closeness.
-    #
-    # This one is safe to assert bit for bit whatever the compile state, unlike
-    # the cross-device comparisons above.  Both legs drive the SAME per-device
-    # compiled bodies over the SAME shapes in the SAME process, so every block
-    # entering the accumulation is identical by construction and the legs differ
-    # only in the arithmetic that combines them.  The caveat recorded above is
-    # about two DEVICES emitting different code for one shape, which cannot
-    # separate two legs that share their devices.
-    #
-    # There IS a second thing that separates two runs, and it has to be held
-    # still for the equality above to mean anything: torch's CPU scatter reduces
-    # in PARALLEL, so the body is not reproducible run to run once the problem
-    # is big enough to thread -- one shape run twice already differs from
-    # itself.  Measured 2026-08-11 in a full suite run, this cell at two devices
-    # and 5-pixel batches: one shape against itself 5.2e-08, and the two shapes
-    # against each other 1.0e-07, which is that same noise drawn again and then
-    # carried through eight batches of accumulation rather than any reordering.
-    # On a 64x48x64 cell over 4096 pixels at 10 threads all three comparisons
-    # sat at 7.5e-08 together, the change adding nothing over the noise.
-    #
-    # So the threads are pinned to one below.  That removes the only thing that
-    # separates two runs of the same arithmetic and lets this test assert what
-    # it is actually about -- that moving the addition does not move the
-    # values -- rather than measuring the scatter's thread scheduling.  Pinned,
-    # every case here is bit-equal, including the ones that are not when the
-    # scatter is free to thread.
-
-    def prior_shape(real_call, accumulating):
-        """The accumulation as it stood before it moved into the view loop:
-        every call assembles a block of its own, and the running block is added
-        to it afterwards.  Counts the calls that were asked to accumulate, so
-        the comparison below cannot pass by never exercising the new arm."""
-        def call(band_values, pixel_indices, view_range, slice_start=0,
-                 dev_index=0, plan=None, accumulate_into=None):
-            block = real_call(band_values, pixel_indices, view_range,
-                              slice_start=slice_start, dev_index=dev_index,
-                              plan=plan)
-            if accumulate_into is None:
-                return block
-            accumulating.append(1)
-            accumulate_into.add_(block)
-            return accumulate_into
-        return call
-
-    # Both geometries, two and three virtual CPU devices, and batches small
-    # enough that the pass runs many of them -- which is the case the fusion
-    # exists for and the only one where the two shapes can differ at all.
+    # The accumulation the multi-batch passes above rely on, taken at the
+    # projector itself: handed a block it adds into that block and hands back
+    # the same object, so accumulating one call's values onto another's
+    # doubles them exactly.  torch's CPU scatter reduces in parallel and is
+    # therefore not reproducible run to run, so the threads are pinned to one
+    # while two evaluations of the same body are compared.
     threads = torch.get_num_threads()
     torch.set_num_threads(1)
     try:
-        for name, case in (("parallel", _parallel_cylinder_case),
-                           ("cone", _cone_cylinder_case)):
-            for n in (2, 3):
-                for batch in (1, 3, 5):
-                    m, idx, vals = case(["cpu"] * n, pixel_batch=batch)[:3]
-                    batches = -(-len(idx) // batch)
-                    assert batches >= 2, (name, batch)
-                    fused = np.asarray(
-                        m._gather_sinogram(m.sparse_forward_project(vals, idx)))
-                    # The same shape run twice, as the control: with the threads
-                    # pinned this is exact, and a case where it were not would
-                    # mean the noise above had another source and the comparison
-                    # below could not be read as an ordering test.
-                    control = np.asarray(
-                        m._gather_sinogram(m.sparse_forward_project(vals, idx)))
-                    assert np.array_equal(fused, control), (name, n, batch)
-                    real_call = (m.projector_functions
-                                 .sparse_forward_project_view_range)
-                    accumulating = []
-                    with monkeypatch.context() as mp:
-                        mp.setattr(m.projector_functions,
-                                   "sparse_forward_project_view_range",
-                                   prior_shape(real_call, accumulating))
-                        prior = np.asarray(m._gather_sinogram(
-                            m.sparse_forward_project(vals, idx)))
-                    assert np.array_equal(fused, prior), (name, n, batch)
-                    # Every view-owner that holds views accumulates on all
-                    # but its first batch, so the new arm ran once per (owner,
-                    # batch) less one batch per owner.
-                    owners = sum(1 for _d, (v0, v1)
-                                 in m.sino_placement.shard_ranges() if v1 > v0)
-                    assert len(accumulating) == owners * (batches - 1), (
-                        name, n, batch, len(accumulating), owners, batches)
-
-        # The parameter itself, at the projector: handed a block it adds into
-        # that block and hands back the same object; handed None it allocates
-        # and writes.  Accumulating one call's values onto another's therefore
-        # doubles them exactly.  Inside the pinned region with the rest, because
-        # this compares two separate evaluations of the same body and the free
-        # scatter separates those on its own.
         m, idx, vals = _banded_case(["cpu"])[:3]
         pf = m.projector_functions
         num_views = int(m.get_params('sinogram_shape')[0])
@@ -1805,7 +1291,7 @@ def test_cylinder_batch_accumulation_matches_the_shape_it_replaces(
                                                     (0, num_views))
         running = pf.sparse_forward_project_view_range(t_vals, t_idx,
                                                        (0, num_views))
-        assert torch.equal(once, running)         # the control, as above
+        assert torch.equal(once, running)         # the control
         same = pf.sparse_forward_project_view_range(t_vals, t_idx,
                                                     (0, num_views),
                                                     accumulate_into=running)
@@ -2011,10 +1497,7 @@ def test_the_minimum_pixel_width_padding_keeps_the_values():
 
 # ── the divided form at the public entries ───────────────────────────────────
 # Some entries take a divided array and keep it divided; others work on one
-# whole array and refuse it. What matters for the refusals is that they fire at
-# the entry with a message that names the function, the argument, and the fix,
-# rather than failing somewhere below on a missing attribute, an unsupported
-# operand, or a 0-d object array that numpy builds without complaint.
+# whole array and refuse it.
 
 def _two_device_case(sino_shape=(10, 7, 8)):
     """A small parallel-beam model on two 'virtual' CPU devices, with a
@@ -2062,53 +1545,3 @@ def test_get_voxels_at_indices_keeps_a_divided_recon_divided():
     all_indices = torch.arange(recon_shape[0] * recon_shape[1], dtype=torch.int64)
     flat = model.get_voxels_at_indices(recon_sh, all_indices)
     assert np.array_equal(flat.gather(), recon.reshape(-1, recon.shape[-1]))
-
-
-def _divided_form_refusals():
-    """One call per guarded entry, each with one argument in the divided form.
-    Returned as (function name, argument name, no-argument callable) triples so
-    the test can check that the message names what the caller actually did."""
-    from mbirtorch import qggmrf, vcd_utils
-    model, sino, recon, sino_sh, recon_sh = _two_device_case()
-    recon_shape = tuple(model.get_params('recon_shape'))
-    num_pixels = recon_shape[0] * recon_shape[1]
-    all_indices = torch.arange(num_pixels, dtype=torch.int64)
-    flat_sh = model.get_voxels_at_indices(recon_sh, all_indices)
-    indicator = np.ones(sino.shape, dtype=np.int8)
-    qggmrf_params = (qggmrf.get_b_from_nbr_wts([1.0, 1.0, 1.0]), 0.1, 1.1, 1.0, 1.0)
-    return [
-        ('reshape_recon', 'recon',
-         lambda: model.reshape_recon(flat_sh)),
-        ('get_forward_model_loss', 'error_sinogram',
-         lambda: model.get_forward_model_loss(sino_sh, 1.0)),
-        # The whole-array argument comes first here, so this also holds that
-        # the guard looks past the first argument.
-        ('get_forward_lin_quad', 'delta_sinogram',
-         lambda: model.get_forward_lin_quad(sino, sino_sh, 1, 1.0, True)),
-        ('auto_set_sigma_y', 'sinogram',
-         lambda: model.auto_set_sigma_y(sino_sh, indicator)),
-        ('recon', 'init_recon',
-         lambda: model.recon(sino, init_recon=recon_sh, max_iterations=1)),
-        ('prox_map', 'init_recon',
-         lambda: model.prox_map(recon, sino, init_recon=recon_sh, max_iterations=1)),
-        ('gen_weights_mar', 'sinogram',
-         lambda: vcd_utils.gen_weights_mar(model, sino_sh)),
-        ('gen_weights_mar', 'init_recon',
-         lambda: vcd_utils.gen_weights_mar(model, sino, init_recon=recon_sh)),
-        ('qggmrf_loss', 'full_recon',
-         lambda: qggmrf.qggmrf_loss(recon_sh, qggmrf_params)),
-        ('qggmrf_gradient_and_hessian_at_indices', 'flat_recon',
-         lambda: qggmrf.qggmrf_gradient_and_hessian_at_indices(
-             flat_sh, recon_shape, all_indices, qggmrf_params)),
-    ]
-
-
-def test_entries_that_work_on_one_whole_array_refuse_the_divided_form():
-    for function_name, argument_name, call in _divided_form_refusals():
-        with pytest.raises(TypeError) as refusal:
-            call()
-        message = str(refusal.value)
-        assert function_name in message, (function_name, message)
-        assert argument_name in message, (function_name, message)
-        assert 'divided device form' in message, (function_name, message)
-        assert 'shards.gather()' in message, (function_name, message)

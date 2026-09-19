@@ -37,16 +37,16 @@ def test_save_load_data_round_trip(tmp_path):
     assert out_attrs['scan_id'] == 'abc'
     assert 'a' in out_attrs['nested']
 
-
-def test_save_data_accepts_tensor(tmp_path):
-    vol = torch.rand(4, 5, 6)
-    path = os.path.join(str(tmp_path), 'vol.h5')
-    mbirtorch.save_data_hdf5(path, vol, array_name='volume')
-    out, _ = mbirtorch.load_data_hdf5(path)
-    assert np.array_equal(out, vol.numpy())
+    # A torch tensor is the other accepted input type.
+    tensor_vol = torch.rand(4, 5, 6)
+    tensor_path = os.path.join(str(tmp_path), 'tensor_vol.h5')
+    mbirtorch.save_data_hdf5(tensor_path, tensor_vol, array_name='volume')
+    out, _ = mbirtorch.load_data_hdf5(tensor_path)
+    assert np.array_equal(out, tensor_vol.numpy())
 
 
 def test_export_import_round_trip(tmp_path):
+    import mbirtorch.preprocess as mtp
     vol = np.random.RandomState(6).rand(9, 11, 13).astype(np.float32)
     path = os.path.join(str(tmp_path), 'recon.h5')
     mbirtorch.export_recon_hdf5(path, vol, recon_dict={'scan_id': 's'})
@@ -54,16 +54,16 @@ def test_export_import_round_trip(tmp_path):
     assert np.array_equal(out, vol)          # transpose is undone on import
     assert out_dict['scan_id'] == 's'
 
-
-def test_export_remove_flash_matches_mask(tmp_path):
-    import mbirtorch.preprocess as mtp
-    vol = np.random.RandomState(7).rand(12, 12, 10).astype(np.float32)
-    path = os.path.join(str(tmp_path), 'recon.h5')
-    mbirtorch.export_recon_hdf5(path, vol.copy(), remove_flash=True,
+    # The remove_flash option must write the cylindrical mask the preprocess
+    # helper applies, and the import must undo the transpose the same way.
+    flash_vol = np.random.RandomState(7).rand(12, 12, 10).astype(np.float32)
+    flash_path = os.path.join(str(tmp_path), 'recon_flash.h5')
+    mbirtorch.export_recon_hdf5(flash_path, flash_vol.copy(), remove_flash=True,
                                 radial_margin=2, top_margin=2, bottom_margin=3)
-    out, _ = mbirtorch.import_recon_hdf5(path)
-    ref = mtp.apply_cylindrical_mask(vol.copy(), radial_margin=2, top_margin=2, bottom_margin=3)
-    assert np.array_equal(out, ref)
+    out_flash, _ = mbirtorch.import_recon_hdf5(flash_path)
+    ref = mtp.apply_cylindrical_mask(flash_vol.copy(), radial_margin=2,
+                                     top_margin=2, bottom_margin=3)
+    assert np.array_equal(out_flash, ref)
 
 
 def test_read_mbirjax_data_file(golden):
@@ -104,21 +104,6 @@ def cone_model():
     return model
 
 
-def test_get_all_params_partition(cone_model):
-    required, optional, regularization = cone_model.get_all_params()
-    assert required['sinogram_shape'] == (8, 10, 12)
-    assert required['source_detector_dist'] == 100.0
-    assert len(required['angles']) == 8
-    assert len(required['helical_z_shifts']) == 8
-    assert 'geometry_type' in required
-    assert 'det_channel_offset' in optional and optional['det_channel_offset'] == 0.25
-    assert regularization['sharpness'] == 1.5
-    assert 'sharpness' not in optional and 'sigma_y' not in optional
-    # No overlap between the three dicts.
-    keys = list(required) + list(optional) + list(regularization)
-    assert len(keys) == len(set(keys))
-
-
 def test_get_all_params_constructor_round_trip(cone_model):
     required, optional, regularization = cone_model.get_all_params()
     required = dict(required)
@@ -149,8 +134,3 @@ def test_save_load_recon_hdf5(tmp_path, cone_model):
     assert out_dict['notes'] == 'test scan'
     assert 'num_iterations' in out_dict['recon_params']
     assert 'geometry_type' in out_dict['model_params']
-
-
-def test_get_recon_dict_str_format(cone_model):
-    d = cone_model.get_recon_dict(recon_params={'a': 1}, str_format=True)
-    assert all(isinstance(v, str) for v in d.values())

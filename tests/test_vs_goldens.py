@@ -44,10 +44,6 @@ def _rel_max(out, ref):
     return float(np.max(np.abs(out - ref)) / np.max(np.abs(ref)))
 
 
-def test_recon_shape_matches(golden, model):
-    assert tuple(model.get_params("recon_shape")) == tuple(int(x) for x in golden["recon_shape"])
-
-
 def test_sparse_forward(golden, model):
     out = model.sparse_forward_project(golden["voxel_values"], golden["subset"])
     err = _rel_max(out.numpy(), golden["sparse_fwd"])
@@ -106,6 +102,7 @@ def test_recon_convergence_parity(golden, model):
     """Seeded recon matches mbirjax iteration for iteration: same partitions,
     same subset order (the shared numpy RNG), traces at loose tolerance, final
     volume at the iterated tolerance."""
+    assert tuple(model.get_params("recon_shape")) == tuple(int(x) for x in golden["recon_shape"])
     model.set_params(no_warning=True, verbose=0)
     np.random.seed(int(golden["recon_seed"]))
     recon, recon_dict = model.recon(

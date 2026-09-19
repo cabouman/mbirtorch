@@ -117,6 +117,12 @@ def test_translation_sparse_forward(golden, tct_model):
     print(f"translation sparse_fwd rel_max = {err:.2e}")
     assert err < 1e-4
 
+    # The full forward projection is the same map over all the indices.
+    out = tct_model.forward_project(golden["tct_phantom"])
+    err = _rel_max(out, golden["tct_sino"])
+    print(f"translation forward rel_max = {err:.2e}")
+    assert err < 1e-4
+
 
 @pytest.mark.goldens
 @tct_golden
@@ -124,15 +130,6 @@ def test_translation_sparse_back(golden, tct_model):
     out = tct_model.sparse_back_project(golden["tct_sino"], golden["tct_subset"])
     err = _rel_max(out.numpy(), golden["tct_sp_back"])
     print(f"translation sparse_back rel_max = {err:.2e}")
-    assert err < 1e-4
-
-
-@pytest.mark.goldens
-@tct_golden
-def test_translation_full_forward(golden, tct_model):
-    out = tct_model.forward_project(golden["tct_phantom"])
-    err = _rel_max(out, golden["tct_sino"])
-    print(f"translation forward rel_max = {err:.2e}")
     assert err < 1e-4
 
 

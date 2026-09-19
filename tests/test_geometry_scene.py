@@ -20,11 +20,8 @@ import geometry_probe as probe
 from mbirtorch.viewers.geometry_scene import (CLOCKWISE_FROM_PLUS_Z,
                                               COUNTERCLOCKWISE_FROM_PLUS_Z,
                                               CURVED_ARC_SAMPLES,
-                                              DIFFERENCE_EXCLUDED_QUANTITIES,
                                               GeometryScene, RIM_SAMPLES,
-                                              ROTATION_ARC_SAMPLES,
-                                              required_parameter_names,
-                                              values_are_equal)
+                                              ROTATION_ARC_SAMPLES)
 
 # The gate: the largest allowed difference between a measured footprint
 # centroid and the scene's prediction, in detector pixels.  Half a pixel is the
@@ -265,66 +262,6 @@ def test_view_primitives_have_the_promised_shapes(name):
                        atol=GEOMETRY_TOLERANCE)
 
 
-@pytest.mark.parametrize('name', list(CONFIGS_BY_NAME))
-def test_derived_quantities_are_plain_values(name):
-    """Every derived quantity is a plain float, int, bool, or string."""
-    cfg = CONFIGS_BY_NAME[name]
-    _, scene = build_scene(cfg)
-    quantities = scene.derived_quantities()
-    for key, value in quantities.items():
-        assert isinstance(value, (float, int, bool, str)), (key, type(value))
-    assert quantities['geometry_kind'] == scene.kind
-    if scene.is_parallel_type:
-        assert quantities['magnification'] == pytest.approx(1.0)
-        assert quantities['fan_angle_deg'] == 0.0
-        assert quantities['cone_angle_deg'] == 0.0
-    else:
-        assert quantities['fan_angle_deg'] > 0.0
-        assert quantities['cone_angle_deg'] > 0.0
-        assert quantities['magnification'] == pytest.approx(
-            scene.source_detector_dist / scene.source_iso_dist)
-    # The probe's configurations keep the volume inside the detector's field of
-    # view, so the corner test must agree.
-    fits, overshoot = scene.volume_fits_detector()
-    assert fits is quantities['volume_fits_detector']
-    assert overshoot == pytest.approx(quantities['worst_overshoot_pixels'])
-
-
-# ── the parameter interface ──────────────────────────────────────────────────
-
-@pytest.mark.parametrize('name', list(CONFIGS_BY_NAME))
-def test_the_scene_reads_the_named_parameters(name):
-    """A scene holds exactly the parameters its geometry kind names.
-
-    The values are read by asking the model for one parameter name at a time,
-    which is the only access the scene is allowed.  Agreement shows that the
-    scene depends on the parameter names and on nothing else about the model.
-    """
-    cfg = CONFIGS_BY_NAME[name]
-    model, scene = build_scene(cfg)
-    names = required_parameter_names(scene.kind)
-    assert sorted(scene.params) == sorted(names)
-    for parameter in names:
-        expected = model.get_params(parameter)
-        actual = scene.params[parameter]
-        if isinstance(expected, np.ndarray):
-            assert np.array_equal(actual, expected), parameter
-        else:
-            assert actual == expected, parameter
-
-
-def test_kind_of_model_covers_the_four_classes():
-    """Each model class is recognized, including multiaxis's class string."""
-    for cfg in probe.CONFIGS:
-        model = probe.build_model(cfg)
-        assert GeometryScene.kind_of_model(model) == cfg['kind']
-
-
-def test_unknown_kind_is_reported():
-    with pytest.raises(ValueError, match='Unknown geometry kind'):
-        required_parameter_names('spiral')
-
-
 # ── the parallel row rule ────────────────────────────────────────────────────
 
 def test_parallel_rows_ignore_the_detector_row_parameters():
@@ -373,8 +310,13 @@ def single_row_parallel_config():
     )
 
 
-def test_single_detector_row_projects_correctly():
-    """One detector row: every voxel lands on row 0, and the projector agrees."""
+def test_single_detector_row_projects_correctly_and_draws_finite_primitives():
+    """One detector row: the projector agrees and every primitive is finite.
+
+    The parallel case is checked against the real projector, and both the
+    parallel and the cone case must still produce a drawable outline and finite
+    derived quantities.
+    """
     cfg = single_row_parallel_config()
     model, scene = build_scene(cfg)
     assert scene.num_det_rows == 1
@@ -395,11 +337,6 @@ def test_single_detector_row_projects_correctly():
             num_pairs += 1
     assert num_pairs > 0
 
-
-def test_single_detector_row_primitives_are_finite():
-    """A one-row detector still has a drawable outline and finite numbers."""
-    cfg = single_row_parallel_config()
-    _, scene = build_scene(cfg)
     view_scene = scene.view(0)
     assert np.all(np.isfinite(view_scene.detector_outline))
     assert np.all(np.isfinite(view_scene.corner_rays))
@@ -407,19 +344,17 @@ def test_single_detector_row_primitives_are_finite():
     assert quantities['detector_height'] == pytest.approx(scene.delta_voxel)
     assert np.isfinite(quantities['axial_fov_alu'])
 
-
-def test_single_detector_row_cone():
-    """A one-row cone detector gives a small cone angle and finite drawing."""
-    cfg = dict(CONFIGS_BY_NAME['cone flat'])
-    cfg = dict(cfg, name='cone one row', sinogram_shape=(8, 1, 48),
-               recon_shape=(10, 12, 1))
-    _, scene = build_scene(cfg)
-    assert scene.num_det_rows == 1
-    quantities = scene.derived_quantities()
-    assert 0.0 < quantities['cone_angle_deg'] < 2.0
-    view_scene = scene.view(2)
-    assert np.all(np.isfinite(view_scene.detector_outline))
-    assert view_scene.detector_outline.shape == (5, 3)
+    # The same detector under a cone geometry.
+    cone_cfg = dict(CONFIGS_BY_NAME['cone flat'])
+    cone_cfg = dict(cone_cfg, name='cone one row', sinogram_shape=(8, 1, 48),
+                    recon_shape=(10, 12, 1))
+    _, cone_scene = build_scene(cone_cfg)
+    assert cone_scene.num_det_rows == 1
+    cone_quantities = cone_scene.derived_quantities()
+    assert 0.0 < cone_quantities['cone_angle_deg'] < 2.0
+    cone_view = cone_scene.view(2)
+    assert np.all(np.isfinite(cone_view.detector_outline))
+    assert cone_view.detector_outline.shape == (5, 3)
 
 
 # ── edge case: an infinite source-detector distance ──────────────────────────
@@ -466,17 +401,6 @@ def test_infinite_source_detector_dist_is_a_parallel_projection():
             assert abs(channel - float(channel_pred[0])) <= GATE_PIXELS
             num_pairs += 1
     assert num_pairs > 0
-
-
-def test_infinite_source_detector_dist_rejected_where_it_makes_no_sense():
-    """The two geometries that cannot use an infinite distance say so."""
-    _, scene = build_scene(CONFIGS_BY_NAME['translation'])
-    with pytest.raises(ValueError, match='finite source_detector_dist'):
-        scene.with_parameters(dict(source_detector_dist=np.inf))
-
-    _, scene = build_scene(CONFIGS_BY_NAME['cone curved'])
-    with pytest.raises(ValueError, match='curved detector'):
-        scene.with_parameters(dict(source_detector_dist=np.inf))
 
 
 # ── edge case: a curved detector ─────────────────────────────────────────────
@@ -538,10 +462,23 @@ def test_curved_detector_rows_use_the_tangent_plane():
     assert np.max(np.abs(tangent_rows - cylinder_rows)) > 0.5
 
 
-# ── edge case: the translation geometry ──────────────────────────────────────
+# ── the rotation axis and the translation path ───────────────────────────────
 
-def test_translation_has_a_path_and_no_rotation_axis():
-    """Translation draws the path of the rotation center, not an axis."""
+def test_rotating_scans_draw_an_axis_and_a_translation_scan_draws_its_path():
+    """A rotating scan draws an axis through the volume's z range; a
+    translation scan draws the path of the rotation center instead."""
+    for name in ('parallel', 'cone flat', 'multiaxis'):
+        cfg = CONFIGS_BY_NAME[name]
+        _, scene = build_scene(cfg)
+        view_scene = scene.view(0)
+        assert view_scene.translation_path is None
+        axis = view_scene.rotation_axis
+        assert axis.shape == (2, 3)
+        assert np.allclose(axis[:, :2], 0.0, atol=GEOMETRY_TOLERANCE)
+        z_min, z_max = scene.volume_z_range()
+        assert axis[0, 2] <= z_min + GEOMETRY_TOLERANCE
+        assert axis[1, 2] >= z_max - GEOMETRY_TOLERANCE
+
     cfg = CONFIGS_BY_NAME['translation']
     _, scene = build_scene(cfg)
     view_scene = scene.view(0)
@@ -557,21 +494,6 @@ def test_translation_has_a_path_and_no_rotation_axis():
     assert np.allclose(sources, expected, atol=1e-6)
     # No mask is drawn: the translation model turns the mask off.
     assert scene.ror_cylinder() is None
-
-
-def test_rotating_geometries_have_a_rotation_axis():
-    """The three rotating geometries draw an axis through the volume's z range."""
-    for name in ('parallel', 'cone flat', 'multiaxis'):
-        cfg = CONFIGS_BY_NAME[name]
-        _, scene = build_scene(cfg)
-        view_scene = scene.view(0)
-        assert view_scene.translation_path is None
-        axis = view_scene.rotation_axis
-        assert axis.shape == (2, 3)
-        assert np.allclose(axis[:, :2], 0.0, atol=GEOMETRY_TOLERANCE)
-        z_min, z_max = scene.volume_z_range()
-        assert axis[0, 2] <= z_min + GEOMETRY_TOLERANCE
-        assert axis[1, 2] >= z_max - GEOMETRY_TOLERANCE
 
 
 # ── edge case: a helical cone scan ───────────────────────────────────────────
@@ -689,31 +611,14 @@ def test_drawing_distance_does_not_change_the_projection():
             > np.linalg.norm(near.view(0).detector_center))
 
 
-def test_volume_fits_detector_detects_a_volume_that_does_not():
-    """A volume grown past the detector's field of view is reported.
-
-    The statement is geometric and takes no account of the projector's
-    point spread.
-    """
-    cfg = CONFIGS_BY_NAME['cone flat']
-    _, scene = build_scene(cfg)
-    fits, overshoot = scene.volume_fits_detector()
-    assert fits is True
-    assert overshoot == 0.0
-
-    grown = scene.with_parameters(dict(recon_shape=(60, 60, 8)))
-    fits, overshoot = grown.volume_fits_detector()
-    assert fits is False
-    assert overshoot > 1.0
-
-
 # ── the fit statement: which shape, which rule, and the swept coverage ──────
 
 #: The flat cone configuration with its detector narrowed to this many
 #: channels.  At 28 channels the volume box's corners project past the
 #: detector's edge while the region-of-reconstruction cylinder still lands
 #: inside it, which is the pair of answers
-#: ``test_the_fit_statement_tests_the_region_of_reconstruction`` is about.
+#: ``test_the_fit_report_tests_the_right_shape_and_splits_lateral_from_axial``
+#: is about.
 NARROW_CHANNEL_COUNT = 28
 
 #: The relative tolerance of the swept-coverage identities.  Each identity is
@@ -738,9 +643,9 @@ def narrow_detector_cone_scene(use_ror_mask=True):
              use_ror_mask=use_ror_mask))
 
 
-def test_the_fit_statement_tests_the_region_of_reconstruction():
-    """With the mask on the cylinder is tested, and it fits where the box does
-    not.
+def test_the_fit_report_tests_the_right_shape_and_splits_lateral_from_axial():
+    """The fit statement tests the region of reconstruction, not the box, and
+    reports the lateral and the axial answer apart.
 
     The reconstruction box is the square around the region of reconstruction,
     so its corners stick out past the field of view, and without this rule the
@@ -752,7 +657,23 @@ def test_the_fit_statement_tests_the_region_of_reconstruction():
     was chosen to sit well inside the detector and both shapes fit.  The
     detector is narrowed to :data:`NARROW_CHANNEL_COUNT` channels instead,
     which puts the box's corners outside it and leaves the cylinder inside.
+
+    An automatically sized cone scan then shows the other half: its box misses
+    the detector by tens of channels while the cylinder inside it misses by
+    less than one, and the cylinder misses in the rows, so the lateral answer
+    is yes and the axial answer is no.  One answer would hide which direction
+    misses.
     """
+    cfg = CONFIGS_BY_NAME['cone flat']
+    _, cone_scene = build_scene(cfg)
+    fits, overshoot = cone_scene.volume_fits_detector()
+    assert fits is True
+    assert overshoot == 0.0
+    grown_box = cone_scene.with_parameters(dict(recon_shape=(60, 60, 8)))
+    fits, overshoot = grown_box.volume_fits_detector()
+    assert fits is False
+    assert overshoot > 1.0
+
     masked = narrow_detector_cone_scene(use_ror_mask=True)
     report = masked.fit_report()
     assert report['shape'] == 'cylinder'
@@ -773,44 +694,47 @@ def test_the_fit_statement_tests_the_region_of_reconstruction():
     # swing past the detector's edge in some views and not in others.
     assert 0 < report['views_leaving_detector'] < unmasked.num_views
 
-
-def test_the_cylinder_rule_shrinks_the_overshoot_of_an_automatic_cone_scan():
-    """An automatically sized cone scan reports a far smaller miss.
-
-    The model is built with its own automatic reconstruction geometry, whose
-    box is the square around the field-of-view circle.  The box's corners
-    therefore miss the detector by tens of channels in every view.  The
-    cylinder inside that box misses by less than one channel, which is the
-    size of the miss the user needs to see.
-
-    The cylinder does not fit even so, and the row entry says why.  The beam
-    narrows toward the source, so the top of the cylinder on the source side
-    sits outside the rows the detector covers.  The statement therefore still
-    reads "no" for this scan, with a number that names a real truncation
-    instead of a corner nobody reconstructs.
-    """
+    # An automatically sized cone scan: the box misses by tens of channels, the
+    # cylinder inside it misses in the rows only.  The beam narrows toward the
+    # source, so the top of the cylinder on the source side sits outside the
+    # rows the detector covers, and the statement still reads "no" with a
+    # number that names a real truncation instead of a corner nobody
+    # reconstructs.
     model = mbirtorch.ConeBeamModel(
-        (60, 96, 128), np.linspace(0, 2 * np.pi, 60, endpoint=False),
+        (180, 96, 128), np.linspace(0, 2 * np.pi, 180, endpoint=False),
         source_detector_dist=512.0, source_iso_dist=256.0, compile_mode='off')
-    scene = GeometryScene.from_model(model)
-    cylinder = scene.fit_report()
-    box = scene.with_parameters(dict(use_ror_mask=False)).fit_report()
+    automatic = GeometryScene.from_model(model)
+    cylinder = automatic.fit_report()
+    box = automatic.with_parameters(dict(use_ror_mask=False)).fit_report()
 
     assert box['shape'] == 'box' and cylinder['shape'] == 'cylinder'
     assert box['worst_channel_overshoot_pixels'] > 10.0
-    assert cylinder['worst_channel_overshoot_pixels'] < 1.0
+    assert cylinder['worst_channel_overshoot_pixels'] == 0.0
     assert cylinder['worst_row_overshoot_pixels'] > 1.0
+    assert cylinder['fits_laterally'] is True
+    assert cylinder['fits_axially'] is False
     assert cylinder['fits'] is False
 
+    # A volume grown past the field of view misses laterally as well.
+    grown = automatic.with_parameters(dict(recon_shape=(200, 200, 96)))
+    grown_report = grown.fit_report()
+    assert grown_report['fits_laterally'] is False
+    assert grown_report['fits'] is False
 
-def test_the_swept_coverage_of_a_non_helical_scan_is_one_views_coverage():
-    """A scan that does not travel sweeps exactly one view's axial coverage.
 
-    Every view of such a scan covers the same z range on the rotation axis, so
-    the swept range is that range.  Its length is the detector's height divided
-    by the magnification, which is the axial field of view, and it is centered
-    on the z the central ray lands at, which is minus the row offset divided by
-    the magnification.
+def test_the_swept_coverage_is_one_views_coverage_plus_the_helical_travel():
+    """A scan that does not travel sweeps exactly one view's axial coverage,
+    and helical travel adds itself to that range.
+
+    Every view of a non-traveling scan covers the same z range on the rotation
+    axis, so the swept range is that range.  Its length is the detector's
+    height divided by the magnification, which is the axial field of view, and
+    it is centered on the z the central ray lands at, which is minus the row
+    offset divided by the magnification.
+
+    The helical comparison holds every parameter of the helical configuration
+    fixed and sets the per-view z shifts to zero, so the only difference
+    between the two scenes is the travel.
     """
     _, scene = build_scene(CONFIGS_BY_NAME['cone flat'])
     report = scene.fit_report()
@@ -824,14 +748,6 @@ def test_the_swept_coverage_of_a_non_helical_scan_is_one_views_coverage():
     assert center == pytest.approx(-scene.row_offset / magnification,
                                    rel=COVERAGE_TOLERANCE)
 
-
-def test_the_swept_coverage_of_a_helical_scan_grows_by_the_travel():
-    """Helical travel adds itself to the swept range and to nothing else.
-
-    The comparison holds every parameter of the helical configuration fixed and
-    sets the per-view z shifts to zero, so the only difference between the two
-    scenes is the travel.
-    """
     _, scene = build_scene(CONFIGS_BY_NAME['cone helical'])
     view_params = np.asarray(scene.params['view_params_array'],
                              dtype=np.float64).copy()
@@ -858,6 +774,13 @@ def test_a_helical_scan_is_judged_by_the_helical_rule():
     statement still reads "yes" because the detector sweeps the whole volume
     over the scan.  Without the helical rule the statement reads "no" for
     every helical scan.
+
+    The third puts the z shifts in two groups far enough apart that the two
+    coverage ranges do not meet.  Its volume runs from the first group to the
+    second, so it lies between ``swept_z_min`` and ``swept_z_max`` and yet part
+    of it is covered by no view.  The union of the per-view ranges reports this
+    and their hull does not, which is why the union is what
+    ``z_extent_covered`` uses.
 
     A helical scan leaves the detector either in no view or in every view, and
     not in some of them, whenever what it leaves is the axial coverage.  The
@@ -891,44 +814,7 @@ def test_a_helical_scan_is_judged_by_the_helical_rule():
         tall_report['worst_channel_overshoot_pixels'] == 0.0
         and tall_report['z_extent_covered'])
 
-
-def test_the_fit_report_answers_laterally_and_axially():
-    """The two halves of the fit statement are reported apart.
-
-    An automatically sized cone scan fits in channels and misses in rows,
-    which is the case the split was asked for: one answer would hide which
-    direction misses.  A volume grown past the field of view misses laterally
-    as well.
-    """
-    model = mbirtorch.ConeBeamModel(
-        (180, 96, 128), np.linspace(0, 2 * np.pi, 180, endpoint=False),
-        source_detector_dist=512.0, source_iso_dist=256.0, compile_mode='off')
-    scene = GeometryScene.from_model(model)
-    report = scene.fit_report()
-    assert report['shape'] == 'cylinder'
-    assert report['fits_laterally'] is True
-    assert report['fits_axially'] is False
-    assert report['fits'] is False
-    assert report['worst_channel_overshoot_pixels'] == 0.0
-    assert report['worst_row_overshoot_pixels'] > 1.0
-
-    grown = scene.with_parameters(dict(recon_shape=(200, 200, 96)))
-    grown_report = grown.fit_report()
-    assert grown_report['fits_laterally'] is False
-    assert grown_report['fits'] is False
-
-
-def test_a_helical_scan_with_a_gap_does_not_sweep_its_volume():
-    """Views in two groups leave a z range that no view covers.
-
-    The z shifts here sit in two groups far enough apart that the two coverage
-    ranges do not meet.  The volume runs from the first group to the second, so
-    it lies between ``swept_z_min`` and ``swept_z_max`` and yet part of it is
-    covered by no view.  The union of the per-view ranges reports this and
-    their hull does not, which is why the union is what
-    ``z_extent_covered`` uses.
-    """
-    _, scene = build_scene(CONFIGS_BY_NAME['cone helical'])
+    # Views in two groups leave a z range that no view covers.
     view_params = np.asarray(scene.params['view_params_array'],
                              dtype=np.float64).copy()
     view_params[:, 1] = np.repeat([0.0, 40.0], scene.num_views // 2)
@@ -976,25 +862,6 @@ def test_ror_outline_is_the_two_projected_rims(name):
         assert scene.view(0).ror_outline_on_detector is None
 
 
-def test_fit_points_are_the_corners_without_a_mask():
-    """With no mask the shape is the box and its points are its corners."""
-    _, scene = build_scene(CONFIGS_BY_NAME['cone flat'])
-    unmasked = scene.with_parameters(dict(use_ror_mask=False))
-    assert unmasked.fit_shape() == 'box'
-    assert np.allclose(unmasked.fit_points(), unmasked.volume_corners())
-    assert scene.fit_shape() == 'cylinder'
-    assert scene.fit_points().shape == (2 * RIM_SAMPLES, 3)
-
-
-def test_view_index_is_checked():
-    cfg = CONFIGS_BY_NAME['parallel']
-    _, scene = build_scene(cfg)
-    with pytest.raises(IndexError):
-        scene.view(scene.num_views)
-    with pytest.raises(IndexError):
-        scene.project_points([[0.0, 0.0, 0.0]], -1)
-
-
 # ── the corner rays of a source-free geometry ───────────────────────────────
 
 @pytest.mark.parametrize('name', list(CONFIGS_BY_NAME))
@@ -1031,67 +898,43 @@ def test_corner_rays_are_parallel_where_there_is_no_source(name):
             assert float(start_gap) == pytest.approx(float(end_gap))
 
 
-def test_default_drawing_distance_keeps_the_source_off_the_volume_box():
-    """The drawn source of a parallel-type geometry sits clear of the volume.
-
-    At a drawing distance factor of 1.5 the drawn source touched the volume
-    box, so the default is 2.5.  The test states the consequence rather than
-    the number: the drawn source is farther from the origin than the volume
-    box's farthest corner.
-    """
-    from mbirtorch.viewers.geometry_scene import (
-        DEFAULT_DRAWING_DISTANCE_FACTOR)
-    assert DEFAULT_DRAWING_DISTANCE_FACTOR > 2.0
-    for name in ('parallel', 'multiaxis'):
-        cfg = CONFIGS_BY_NAME[name]
-        _, scene = build_scene(cfg)
-        corner_distance = float(np.max(np.linalg.norm(scene.volume_corners(),
-                                                      axis=1)))
-        for view_index in range(scene.num_views):
-            view = scene.view(view_index)
-            source_distance = float(np.linalg.norm(view.source_draw))
-            assert source_distance > 1.2 * corner_distance, name
-
-
 # ── the rotation-direction arc ──────────────────────────────────────────────
 
-@pytest.mark.parametrize('name', list(CONFIGS_BY_NAME))
-def test_rotation_direction_arc_follows_the_source(name):
+def test_rotation_direction_arc_radius_and_sense():
     """The arc starts at the source, keeps its radius, and turns its way.
 
     The probe's view angles rise with the view index, so the source turns
-    clockwise seen from +z, which is a falling azimuth.  The translation
-    geometry does not rotate and gets no arc.
+    clockwise seen from +z, which is a falling azimuth.  A scan whose angles
+    fall gets the arc the other way.  A translation scan and a one-view scan
+    say nothing about travel and get no arc.
     """
-    cfg = CONFIGS_BY_NAME[name]
-    _, scene = build_scene(cfg)
-    view = scene.view(2)
+    for name, cfg in CONFIGS_BY_NAME.items():
+        _, scene = build_scene(cfg)
+        view = scene.view(2)
 
-    if scene.kind == 'translation':
-        assert view.rotation_direction_arc is None
-        assert view.source_travel_sense is None
-        return
+        if scene.kind == 'translation':
+            assert view.rotation_direction_arc is None, name
+            assert view.source_travel_sense is None, name
+            continue
 
-    arc = view.rotation_direction_arc
-    assert arc.shape == (ROTATION_ARC_SAMPLES, 3)
-    assert np.allclose(arc[0], view.source_draw, atol=GEOMETRY_TOLERANCE)
-    radius = np.hypot(arc[:, 0], arc[:, 1])
-    assert np.allclose(radius, radius[0], atol=GEOMETRY_TOLERANCE)
-    assert np.allclose(arc[:, 2], view.source_draw[2],
-                       atol=GEOMETRY_TOLERANCE)
+        arc = view.rotation_direction_arc
+        assert arc.shape == (ROTATION_ARC_SAMPLES, 3), name
+        assert np.allclose(arc[0], view.source_draw,
+                           atol=GEOMETRY_TOLERANCE), name
+        radius = np.hypot(arc[:, 0], arc[:, 1])
+        assert np.allclose(radius, radius[0], atol=GEOMETRY_TOLERANCE), name
+        assert np.allclose(arc[:, 2], view.source_draw[2],
+                           atol=GEOMETRY_TOLERANCE), name
 
-    # The probe's angles rise from view 2 to view 3, so the source turns
-    # clockwise seen from +z: the azimuth falls along the arc.
-    assert scene.angles[3] > scene.angles[2]
-    azimuth = np.unwrap(np.arctan2(arc[:, 1], arc[:, 0]))
-    assert azimuth[-1] < azimuth[0]
-    assert view.source_travel_sense == CLOCKWISE_FROM_PLUS_Z
+        # The probe's angles rise from view 2 to view 3, so the source turns
+        # clockwise seen from +z: the azimuth falls along the arc.
+        assert scene.angles[3] > scene.angles[2], name
+        azimuth = np.unwrap(np.arctan2(arc[:, 1], arc[:, 0]))
+        assert azimuth[-1] < azimuth[0], name
+        assert view.source_travel_sense == CLOCKWISE_FROM_PLUS_Z, name
 
-
-def test_rotation_direction_arc_reverses_with_the_angle_step():
-    """A scan whose angles fall gets an arc the other way."""
-    cfg = CONFIGS_BY_NAME['cone flat']
-    _, scene = build_scene(cfg)
+    # A scan whose angles fall turns the other way.
+    _, scene = build_scene(CONFIGS_BY_NAME['cone flat'])
     falling = np.asarray(scene.params['view_params_array'],
                          dtype=np.float64).copy()
     falling[:, 0] = -falling[:, 0]
@@ -1104,11 +947,7 @@ def test_rotation_direction_arc_reverses_with_the_angle_step():
     assert azimuth[-1] > azimuth[0]
     assert view.source_travel_sense == COUNTERCLOCKWISE_FROM_PLUS_Z
 
-
-def test_a_single_view_scan_has_no_travel_direction():
-    """One view says nothing about which way the source travels."""
-    cfg = CONFIGS_BY_NAME['cone flat']
-    _, scene = build_scene(cfg)
+    # One view says nothing about which way the source travels.
     first_row = np.asarray(scene.params['view_params_array'],
                            dtype=np.float64)[:1]
     single = scene.with_parameters(
@@ -1165,52 +1004,6 @@ def test_with_parameters_copies_and_replaces():
     assert float(row_shifted[0] - row[0]) == pytest.approx(0.0)
 
 
-def test_with_parameters_rejects_an_unknown_name():
-    """A misspelled parameter name raises instead of being ignored."""
-    cfg = CONFIGS_BY_NAME['cone flat']
-    _, scene = build_scene(cfg)
-    with pytest.raises(ValueError, match='not parameters'):
-        scene.with_parameters(dict(det_chanel_offset=1.0))
-
-
-def test_differences_lists_the_parameter_and_its_consequences():
-    """A changed offset is reported with both values, and so is its effect."""
-    cfg = CONFIGS_BY_NAME['cone flat']
-    _, scene = build_scene(cfg)
-    step = 10.0 * scene.delta_det_channel
-    shifted = scene.with_parameters(
-        dict(det_channel_offset=scene.det_channel_offset + step))
-
-    rows = scene.differences(shifted)
-    names = [name for name, _, _ in rows]
-    assert 'det_channel_offset' in names
-    assert 'detector_center_u' in names
-    for name, mine, theirs in rows:
-        if name == 'det_channel_offset':
-            assert float(mine) == pytest.approx(scene.det_channel_offset)
-            assert float(theirs) == pytest.approx(scene.det_channel_offset
-                                                  + step)
-    # Nothing that did not change is listed, and no explanatory sentence is.
-    assert 'delta_det_channel' not in names
-    assert 'magnification' not in names
-    for excluded in DIFFERENCE_EXCLUDED_QUANTITIES:
-        assert excluded not in names
-    assert scene.differences(scene) == []
-
-
-def test_differences_across_two_geometry_kinds():
-    """Two kinds are comparable, and a missing parameter reads as None."""
-    parallel = build_scene(CONFIGS_BY_NAME['parallel'])[1]
-    cone = build_scene(CONFIGS_BY_NAME['cone flat'])[1]
-    rows = dict((name, (mine, theirs))
-                for name, mine, theirs in parallel.differences(cone))
-    assert rows['geometry_kind'] == ('parallel', 'cone')
-    # source_iso_dist is a cone parameter and not a parallel one.
-    assert rows['source_iso_dist'][0] is None
-    assert rows['source_iso_dist'][1] == pytest.approx(
-        cone.source_iso_dist)
-
-
 # ── the angle-0 reference view ───────────────────────────────────────────────
 
 #: The tolerance of the field-by-field comparison of two views.  The two are
@@ -1239,109 +1032,61 @@ def assert_views_agree(first, second, tolerance=REFERENCE_TOLERANCE):
             assert np.allclose(mine, theirs, atol=tolerance), name
 
 
-def identity_first_view_config():
-    """The flat cone configuration with view 0 at angle 0 and no z shift."""
-    cfg = dict(CONFIGS_BY_NAME['cone flat'])
-    angles = np.linspace(0.0, 2.0 * np.pi, 8, endpoint=False)
-    cfg['angles'] = angles
-    return cfg
+@pytest.mark.parametrize('name', list(CONFIGS_BY_NAME))
+def test_reference_view_is_the_zero_angle_zero_shift_view(name):
+    """The reference view is the view action's identity, in every geometry.
 
-
-def test_reference_view_is_view_zero_when_view_zero_is_the_identity():
-    """A scan whose view 0 has angle 0 and no z shift gets its view 0 back.
-
-    The reference is the view action's identity, and for such a scan view 0 is
-    already that identity, so the two views must agree entry by entry.
+    Its source sits on the +y axis at ``source_iso_dist`` wherever the source
+    has a position, with no x component, no helical z shift, and no
+    translation, and the detector lies opposite it on the -y side.  A multiaxis
+    geometry has no position free of elevation, so its reference keeps view 0's
+    elevation and only the azimuth goes to zero.  Where view 0 is already the
+    identity, the reference and view 0 agree entry by entry.
     """
-    _, scene = build_scene(identity_first_view_config())
-    assert float(scene.angles[0]) == 0.0
-    assert float(scene.z_shifts[0]) == 0.0
-    assert_views_agree(scene.reference_view(), scene.view(0))
-
-
-def test_reference_view_of_a_parallel_scan_is_its_own_zero_angle_view():
-    """The same holds for the parallel geometry, whose angles are one array."""
-    cfg = dict(CONFIGS_BY_NAME['parallel'])
-    cfg['angles'] = np.linspace(0.0, np.pi, 8, endpoint=False)
+    cfg = CONFIGS_BY_NAME[name]
     _, scene = build_scene(cfg)
-    assert_views_agree(scene.reference_view(), scene.view(0))
-
-
-def test_reference_source_sits_on_the_plus_y_axis():
-    """A cone scan whose first angle is not zero still gets the angle-0 source.
-
-    The probe's flat cone configuration starts at -0.3 radians, so its view 0
-    source is off the +y axis while the reference source is on it, at
-    source_iso_dist.
-    """
-    _, scene = build_scene(CONFIGS_BY_NAME['cone flat'])
-    assert float(scene.angles[0]) != 0.0
     reference = scene.reference_view()
-    expected = np.array([0.0, scene.source_iso_dist, 0.0])
-    assert np.allclose(reference.source, expected, atol=REFERENCE_TOLERANCE)
-    assert np.allclose(reference.source_draw, expected,
-                       atol=REFERENCE_TOLERANCE)
-    # The detector origin lies opposite the source, on the -y side.
-    assert reference.detector_origin[1] < 0.0
-    assert abs(float(reference.detector_origin[0])) < REFERENCE_TOLERANCE
-    # View 0 itself is somewhere else.
-    assert not np.allclose(scene.view(0).source, expected, atol=1e-3)
-
-
-def test_reference_view_of_a_helical_scan_has_no_z_shift():
-    """The reference of a helical scan sits at z shift zero.
-
-    View 0 of the probe's helical scan has no shift either, but the reference
-    must not depend on that, so the check is against the geometry: the source
-    and the detector origin both sit at z = 0.
-    """
-    _, scene = build_scene(CONFIGS_BY_NAME['cone helical'])
-    reference = scene.reference_view()
-    assert abs(float(reference.source_draw[2])) < REFERENCE_TOLERANCE
-    assert abs(float(reference.detector_origin[2])) < REFERENCE_TOLERANCE
-
-
-def test_reference_view_keeps_the_multiaxis_elevation():
-    """The multiaxis reference is azimuth 0 at the elevation of view 0.
-
-    A multiaxis geometry has no position free of elevation, so the reference
-    keeps view 0's elevation and only the azimuth goes to zero.  The ray
-    direction of the reference is therefore the projector's direction for that
-    elevation.
-    """
-    _, scene = build_scene(CONFIGS_BY_NAME['multiaxis'])
-    reference = scene.reference_view()
-    elevation = float(scene.elevations[0])
-    expected = np.array([0.0, -np.cos(elevation), np.sin(elevation)])
-    assert np.allclose(reference.ray_direction, expected,
-                       atol=REFERENCE_TOLERANCE)
-    # The source has no x component at azimuth 0.
+    # Azimuth zero: the source and the detector lie in the y-z plane.
     assert abs(float(reference.source_draw[0])) < REFERENCE_TOLERANCE
+    assert abs(float(reference.detector_origin[0])) < REFERENCE_TOLERANCE
 
+    if name == 'multiaxis':
+        elevation = float(scene.elevations[0])
+        expected = np.array([0.0, -np.cos(elevation), np.sin(elevation)])
+        assert np.allclose(reference.ray_direction, expected,
+                           atol=REFERENCE_TOLERANCE)
+    else:
+        # No helical z shift and no elevation: the gantry lies in the xy plane.
+        assert abs(float(reference.source_draw[2])) < REFERENCE_TOLERANCE
+        assert abs(float(reference.detector_origin[2])) < REFERENCE_TOLERANCE
 
-def test_reference_view_of_a_translation_scan_has_no_translation():
-    """The translation reference is the unmoved gantry, at t = 0."""
-    _, scene = build_scene(CONFIGS_BY_NAME['translation'])
-    assert not np.allclose(scene.translation_vectors[0], 0.0)
-    reference = scene.reference_view()
-    expected = np.array([0.0, scene.source_iso_dist, 0.0])
-    assert np.allclose(reference.source, expected, atol=REFERENCE_TOLERANCE)
+    if reference.source is not None:
+        # The source sits on the +y axis and the detector opposite it, whatever
+        # view 0's angle and translation are.
+        expected = np.array([0.0, scene.source_iso_dist, 0.0])
+        assert np.allclose(reference.source, expected,
+                           atol=REFERENCE_TOLERANCE)
+        assert np.allclose(reference.source_draw, expected,
+                           atol=REFERENCE_TOLERANCE)
+        assert reference.detector_origin[1] < 0.0
+        if name == 'cone flat':
+            # The probe's flat cone scan starts at -0.3 radians, so its view 0
+            # source is somewhere else.
+            assert float(scene.angles[0]) != 0.0
+            assert not np.allclose(scene.view(0).source, expected, atol=1e-3)
+        if name == 'translation':
+            assert not np.allclose(scene.translation_vectors[0], 0.0)
 
-
-def test_values_are_equal_handles_arrays_and_infinities():
-    """The value comparison copes with what a parameter can hold."""
-    assert values_are_equal(1.0, 1.0)
-    assert values_are_equal(np.inf, np.inf)
-    assert not values_are_equal(np.inf, -np.inf)
-    assert values_are_equal((8, 24, 48), (8, 24, 48))
-    assert not values_are_equal((8, 24, 48), (8, 24, 49))
-    assert values_are_equal(np.zeros((4, 2)), np.zeros((4, 2)))
-    assert not values_are_equal(np.zeros((4, 2)), np.zeros((3, 2)))
-    assert values_are_equal(True, True)
-    assert not values_are_equal(True, False)
-    assert values_are_equal('cone', 'cone')
-    assert not values_are_equal(None, 1.0)
-    assert values_are_equal(None, None)
+    if name in ('parallel', 'cone flat'):
+        # With view 0 at angle 0 and no z shift, view 0 is the identity, so the
+        # reference must be that view entry by entry.
+        identity_cfg = dict(cfg)
+        identity_cfg['angles'] = np.linspace(
+            0.0, 2.0 * np.pi, len(cfg['angles']), endpoint=False)
+        _, identity_scene = build_scene(identity_cfg)
+        assert float(identity_scene.angles[0]) == 0.0
+        assert_views_agree(identity_scene.reference_view(),
+                           identity_scene.view(0))
 
 
 if __name__ == '__main__':

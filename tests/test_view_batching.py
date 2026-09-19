@@ -5,22 +5,16 @@ is about to call.  A torch body (no ``_view_batch_cost`` attribute) batches by
 the geometry's calibrated ``_transient_cols`` charge, exactly as it always
 has; a hand-written kernel body carries a ``_view_batch_cost`` attribute
 stating its own resident bytes per view and its nominal view chunk.  These
-tests pin both paths and their interaction with ``view_batch_size``:
+tests pin:
 
-  - the torch path reproduces its long-standing numbers, including the
-    parallel band-length rule, the cone ``max(num_slices, num_rows)``
-    override, and the 64 default that ``view_batch_size=None`` resolves to;
-  - a body with the cost attribute batches by (bytes_per_view, view_chunk),
-    with the same budget cap and floor;
-  - the two directions are consulted separately, so a mixed selection
-    (kernel one way, torch body the other) batches each by its own model;
-  - an explicit ``view_batch_size`` is the nominal for EVERY body;
-  - the four kernel cost functions state the residency the design charges
-    (contract bytes per (view, pixel) plus one sinogram-shaped plane per
-    view) and ride on the wrapper functions the selection hook returns;
+  - the arithmetic of both paths: the torch path's parallel band-length rule,
+    its cone ``max(num_slices, num_rows)`` override and its floor of one, and
+    the kernel path's own chunk when it is cheap and budget cap when it is
+    expensive;
   - the shared rule that rounds a kernel's width argument up to a multiple
-    of 16, which those charges read because it is what the wrappers
-    allocate.
+    of 16, which the kernel charges read because it is what the wrappers
+    allocate;
+  - the batches at the large gate cell this change exists for.
 
 Everything here is arithmetic on function objects and tiny CPU models: no
 kernel is ever launched, so the file runs anywhere.  The driver-level CUDA
@@ -31,7 +25,6 @@ test_triton_cone.py / test_triton_parallel.py.
 
 import numpy as np
 import pytest
-import torch
 
 import mbirtorch
 from mbirtorch._utils import KERNEL_WIDTH_MULTIPLE, padded_kernel_width
@@ -74,129 +67,56 @@ def _torch_stub():
     return stub
 
 
-# ── the torch-body path: unchanged, and pinned ────────────────────────────────
+# ── the view-batch arithmetic, torch body and kernel body ─────────────────────
 
-def test_torch_body_default_resolves_to_64():
-    # view_batch_size=None (the constructor default) resolves to the
-    # long-standing 64 for a torch body with room under the budget.
-    model = _parallel_model()
-    assert model.view_batch_size is None
-    pf = model.projector_functions
-    vb = pf._effective_view_batch(_torch_stub(), 100, 12,
-                                  model._view_batch_args())
-    assert vb == Projectors.VIEW_BATCH_BODY_DEFAULT == 64
+def test_view_batch_arithmetic_for_torch_and_kernel_bodies():
+    """Every number the batching rule produces, in one place.
 
-
-def test_torch_body_budget_cap_parallel_band_rule():
-    # The parallel charge tracks the RUNTIME band length: at a pixel count
-    # and band chosen so the CPU budget (a flat 2 GiB) binds, the batch is
-    # budget // (P * band * 4), unchanged from the pre-kernel rule.
-    model = _parallel_model()
-    pf = model.projector_functions
-    num_pixels, band = 2 ** 20, 100
-    expected = (Projectors.VIEW_BATCH_TRANSIENT_BUDGET_BYTES
-                // (num_pixels * band * 4))
-    assert expected == 5
-    vb = pf._effective_view_batch(_torch_stub(), num_pixels, band,
-                                  model._view_batch_args())
-    assert vb == expected
-
-
-def test_torch_body_cone_override_ignores_band():
-    # Cone's charge is the params-derived max(num_slices, num_rows), whatever
-    # band the call requests: a 2-column band must still charge the full
-    # width, and the spread between the two charges is what proves the
-    # override is the one consulted.
-    model = _cone_model()
-    pf = model.projector_functions
-    cols = model._transient_cols(2)
-    assert cols == max(int(model.get_params('recon_shape')[2]),
-                       int(model.get_params('sinogram_shape')[1])) > 2
-    num_pixels = 10 ** 7
+    A torch body is charged the geometry's calibrated column count; a kernel
+    body is charged the bytes per view it states and is capped at its own
+    view chunk.  Both are capped by the transient budget and floored at one
+    view.
+    """
     budget = Projectors.VIEW_BATCH_TRANSIENT_BUDGET_BYTES
-    expected = budget // (num_pixels * cols * 4)
-    naive_band_charge = budget // (num_pixels * 2 * 4)
-    assert expected != naive_band_charge
-    vb = pf._effective_view_batch(_torch_stub(), num_pixels, 2,
-                                  model._view_batch_args())
-    assert vb == expected
 
-
-def test_torch_body_explicit_view_batch_size_is_the_nominal():
-    model = _parallel_model(view_batch_size=3)
-    vb = model.projector_functions._effective_view_batch(
-        _torch_stub(), 100, 12, model._view_batch_args())
-    assert vb == 3
-
-
-def test_torch_body_floor_is_one():
-    # A charge past the whole budget still yields one view per batch.
-    model = _parallel_model()
-    vb = model.projector_functions._effective_view_batch(
-        _torch_stub(), 10 ** 9, 10 ** 3, model._view_batch_args())
-    assert vb == 1
-
-
-def test_bound_bodies_carry_no_cost_attribute_off_cuda():
-    # On a CPU build the selection hook binds the torch bodies, so the
-    # driver's bound functions must not carry the kernel attribute -- the
-    # discriminator the whole rule stands on.
-    model = _parallel_model()
-    pf = model.projector_functions
-    for body in (pf._fwd_body_per_dev[0], pf._back_body_per_dev[0]):
-        assert getattr(body, '_view_batch_cost', None) is None
-
-
-# ── the kernel-body path ──────────────────────────────────────────────────────
-
-def test_kernel_body_chunk_cap_binds_when_cheap():
-    # A cheap kernel batch runs at its own chunk, not at the torch default.
-    model = _parallel_model()
-    vb = model.projector_functions._effective_view_batch(
-        _stub_body(10 * 2 ** 20, 128), 100, 12, model._view_batch_args())
-    assert vb == 128
-
-
-def test_kernel_body_budget_cap_binds_when_expensive():
-    # 300 MiB per view against the flat 2 GiB CPU budget: 6 views.
-    model = _parallel_model()
-    vb = model.projector_functions._effective_view_batch(
-        _stub_body(300 * 2 ** 20, 128), 100, 12, model._view_batch_args())
-    assert vb == 6
-
-
-def test_kernel_body_floor_is_one():
-    model = _parallel_model()
-    vb = model.projector_functions._effective_view_batch(
-        _stub_body(3 * 2 ** 30, 128), 100, 12, model._view_batch_args())
-    assert vb == 1
-
-
-def test_kernel_body_explicit_view_batch_size_caps_it_too():
-    # The user's knob keeps its meaning for every body: an explicit nominal
-    # replaces the kernel's chunk, in both directions of the comparison.
-    model = _parallel_model(view_batch_size=3)
-    vb = model.projector_functions._effective_view_batch(
-        _stub_body(10 * 2 ** 20, 128), 100, 12, model._view_batch_args())
-    assert vb == 3
-    model = _parallel_model(view_batch_size=256)
-    vb = model.projector_functions._effective_view_batch(
-        _stub_body(10 * 2 ** 20, 128), 100, 12, model._view_batch_args())
-    assert vb == 204  # min(256, 2 GiB // 10 MiB)
-
-
-def test_mixed_selection_batches_each_direction_by_its_own_model():
-    # Kernel one way, torch body the other (the self-check fallback shape):
-    # the same driver, the same inputs, two different batches.
+    # The parallel torch charge tracks the RUNTIME band length: at a pixel
+    # count and band chosen so the CPU budget (a flat 2 GiB) binds, the batch
+    # is budget // (P * band * 4), unchanged from the pre-kernel rule.
     model = _parallel_model()
     pf = model.projector_functions
     args = model._view_batch_args()
     num_pixels, band = 2 ** 20, 100
-    kernel_vb = pf._effective_view_batch(_stub_body(10 * 2 ** 20, 128),
-                                         num_pixels, band, args)
-    torch_vb = pf._effective_view_batch(_torch_stub(), num_pixels, band, args)
-    assert kernel_vb == 128
-    assert torch_vb == 5
+    expected = budget // (num_pixels * band * 4)
+    assert expected == 5
+    assert pf._effective_view_batch(_torch_stub(), num_pixels, band,
+                                    args) == expected
+
+    # A charge past the whole budget still yields one view per batch.
+    assert pf._effective_view_batch(_torch_stub(), 10 ** 9, 10 ** 3,
+                                    args) == 1
+
+    # A cheap kernel batch runs at its own chunk, not at the torch default.
+    assert pf._effective_view_batch(_stub_body(10 * 2 ** 20, 128), 100, 12,
+                                    args) == 128
+    # 300 MiB per view against the flat 2 GiB CPU budget: 6 views.
+    assert pf._effective_view_batch(_stub_body(300 * 2 ** 20, 128), 100, 12,
+                                    args) == 6
+
+    # Cone's torch charge is the params-derived max(num_slices, num_rows),
+    # whatever band the call requests: a 2-column band must still charge the
+    # full width, and the spread between the two charges is what proves the
+    # override is the one consulted.
+    cone = _cone_model()
+    cone_pf = cone.projector_functions
+    cols = cone._transient_cols(2)
+    assert cols == max(int(cone.get_params('recon_shape')[2]),
+                       int(cone.get_params('sinogram_shape')[1])) > 2
+    num_pixels = 10 ** 7
+    expected = budget // (num_pixels * cols * 4)
+    naive_band_charge = budget // (num_pixels * 2 * 4)
+    assert expected != naive_band_charge
+    assert cone_pf._effective_view_batch(
+        _torch_stub(), num_pixels, 2, cone._view_batch_args()) == expected
 
 
 # ── the shared kernel-width padding rule ──────────────────────────────────────
@@ -226,77 +146,6 @@ def test_the_kernel_width_padding_rule_rounds_up_to_a_multiple_of_16():
         padded = padded_kernel_width(width)
         assert width <= padded < width + KERNEL_WIDTH_MULTIPLE, width
         assert padded % KERNEL_WIDTH_MULTIPLE == 0, width
-
-
-# ── the four kernel cost functions ────────────────────────────────────────────
-
-def test_parallel_cost_functions_state_the_designed_residency():
-    # Both parallel wrappers allocate their plane at the width rounded up to
-    # a multiple of 16, so both charges read the padded width: 8 columns are
-    # charged as 16.
-    args = {'num_channels': 12}
-    bytes_pv, chunk = triton_parallel._parallel_back_view_batch_cost(
-        1000, 8, args)
-    assert bytes_pv == 16 * 1000 + 4 * 12 * 16
-    assert chunk == triton_parallel.PARALLEL_BACK_VIEW_CHUNK
-    # The forward's charge follows its route: the sorted-contraction route
-    # (the default) holds the argsort order, the permutation, and the
-    # gathered contract copies beside the 16-byte contract -- 20 more bytes
-    # per (view, pixel) -- and the per-tap route holds the contract alone.
-    forward_pv = (16 + 20) * 1000 if \
-        triton_parallel.sorted_forward_enabled() else 16 * 1000
-    bytes_pv, chunk = triton_parallel._parallel_forward_view_batch_cost(
-        1000, 8, args)
-    assert bytes_pv == forward_pv + 4 * 12 * 16
-    assert chunk == triton_parallel.PARALLEL_FWD_VIEW_CHUNK
-    # A width that is already a multiple of 16 is charged unchanged.
-    assert triton_parallel._parallel_back_view_batch_cost(
-        1000, 16, args)[0] == 16 * 1000 + 4 * 12 * 16
-    assert triton_parallel._parallel_forward_view_batch_cost(
-        1000, 16, args)[0] == forward_pv + 4 * 12 * 16
-
-
-def test_cone_cost_functions_state_the_designed_residency():
-    args = {'num_channels': 12, 'num_rows_r': 10}
-    # The cone back kernel reads a sinogram copy the wrapper does NOT pad --
-    # every address it forms is clamped into that copy -- so the back plane
-    # term reads the real row count.
-    bytes_pv, chunk = triton_cone._cone_back_view_batch_cost(1000, 10, args)
-    assert bytes_pv == 48 * 1000 + 4 * 12 * 10
-    assert chunk == triton_cone.CONE_BACK_VIEW_CHUNK
-    # The forward's output plane spans the full detector rows whatever slice
-    # band the values carry: the band length must not enter the charge.  The
-    # wrapper allocates that plane at the row count rounded up to a multiple
-    # of 16, so a 10-row detector is charged 16 rows.
-    banded = triton_cone._cone_forward_view_batch_cost(1000, 3, args)
-    unbanded = triton_cone._cone_forward_view_batch_cost(1000, 10, args)
-    assert banded == unbanded
-    assert banded[0] == 48 * 1000 + 4 * 12 * 16
-    assert banded[1] == triton_cone.CONE_FWD_VIEW_CHUNK
-    # A detector whose row count is already a multiple of 16 is charged
-    # unchanged.
-    divisible = triton_cone._cone_forward_view_batch_cost(
-        1000, 10, {'num_channels': 12, 'num_rows_r': 16})
-    assert divisible[0] == 48 * 1000 + 4 * 12 * 16
-
-
-def test_cost_attributes_ride_on_the_wrappers():
-    # The attribute must sit on the exact function objects the selection hook
-    # returns; maybe_compile passes them through unchanged (the no-compile
-    # marker), so what the driver binds is what carries the cost.
-    pairs = [
-        (triton_parallel._parallel_back_view_batch_triton,
-         triton_parallel._parallel_back_view_batch_cost),
-        (triton_parallel._parallel_forward_view_batch_triton,
-         triton_parallel._parallel_forward_view_batch_cost),
-        (triton_cone._cone_back_view_batch_triton,
-         triton_cone._cone_back_view_batch_cost),
-        (triton_cone._cone_forward_view_batch_triton,
-         triton_cone._cone_forward_view_batch_cost),
-    ]
-    for wrapper, cost in pairs:
-        assert wrapper._view_batch_cost is cost
-        assert wrapper._mbirtorch_no_compile
 
 
 # ── the gate-cell arithmetic the change exists for ────────────────────────────

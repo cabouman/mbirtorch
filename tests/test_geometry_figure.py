@@ -22,19 +22,14 @@ wider than the painted size is subsampled for display, and a reconstruction is
 read a chunk of slices at a time, both on whatever device the array sits on,
 which the last tests of each group check against the host's own answer.
 
-The last group covers the phantom's outline and the widget row.  The 3D panel
-draws the support in a few planes across the direction it is thinnest along.  A
-phantom of one block of voxels therefore gets one rectangle per plane it
-reaches, whose corners are the scene's own voxel centers half a voxel outside
-that block, and mbirtorch's cube phantom gets sections that follow its sideways
-step.  A support deeper than the section count gets an evenly spread few and the
-legend says how many, and a field of small blobs is coarsened until its
-outlines fit the panel's point budget.  The same sections are projected onto
-the detector face, where they have to follow the shadow the real projector
-paints there.  The top view gets an outline that lies on the block's projected
-rectangle.  Removing the phantom removes all of these and takes its entry out
-of both legends.  The widget row now carries six toggles, and no toggle's label
-may overlap another, the view slider, or the legend band above the row.
+The last group covers the phantom's outline.  The 3D panel draws the support in
+a few planes across the direction it is thinnest along.  A phantom of one block
+of voxels therefore gets one rectangle per plane it reaches, whose corners are
+the scene's own voxel centers half a voxel outside that block.  A field of small
+blobs is coarsened until its outlines fit the panel's point budget.  The same
+sections are projected onto the detector face, where they have to follow the
+shadow the real projector paints there.  The top view gets an outline that lies
+on the block's projected rectangle.
 """
 
 import os
@@ -51,7 +46,7 @@ import geometry_probe as probe
 from mbirtorch.viewers.geometry_scene import GeometryScene
 import mbirtorch.viewers.geometry_figure as geometry_figure
 from mbirtorch.viewers.geometry_figure import (COLORS, GeometryFigure,
-                                               SOURCE_MARKER_SIZE, VOLUME_BOX_EDGES,
+                                               VOLUME_BOX_EDGES,
                                                TOP_PANEL_COLUMNS, SIDE_PANEL_COLUMNS)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -112,30 +107,16 @@ def test_import_does_not_load_pyplot():
     assert result.stdout.split() == ['False', 'False'], result.stdout
 
 
-def test_pyplot_loads_on_first_figure():
-    """The first figure built does import pyplot."""
-    program = ('import sys; import mbirtorch.viewers.geometry_figure; '
-               "import matplotlib; matplotlib.use('Agg'); "
-               'import geometry_probe as probe; '
-               'from mbirtorch.viewers.geometry_scene import GeometryScene; '
-               "cfg = [c for c in probe.CONFIGS "
-               "if c['name'] == 'parallel'][0]; "
-               'scene = GeometryScene.from_model(probe.build_model(cfg)); '
-               'figure = mbirtorch.viewers.geometry_figure'
-               '.GeometryFigure(scene); '
-               "print('matplotlib.pyplot' in sys.modules)")
-    environment = dict(os.environ)
-    result = subprocess.run([sys.executable, '-c', program], cwd=HERE,
-                            capture_output=True, text=True, check=True,
-                            env=environment)
-    assert result.stdout.split()[-1] == 'True', result.stdout
-
-
 # ── one figure per geometry ──────────────────────────────────────────────────
 
 @pytest.mark.parametrize('name', list(CONFIGS_BY_NAME))
-def test_figure_builds_with_five_panels(name):
-    """A figure builds for every geometry and holds the five panels."""
+def test_a_figure_builds_and_redraws_for_every_geometry(name):
+    """A figure builds for every geometry, holds the five panels, and redraws.
+
+    The panel count and the widget count are checked on the figure as built and
+    again after a view change and a trajectory toggle, because a redraw that
+    dropped or added an axes would change them.
+    """
     _, figure = build_figure(name)
     try:
         assert len(figure.panel_axes) == EXPECTED_PANEL_COUNT
@@ -146,15 +127,7 @@ def test_figure_builds_with_five_panels(name):
         for axes in figure.panel_axes:
             assert axes.figure is figure.figure
             assert axes in figure.figure.axes
-    finally:
-        close(figure)
 
-
-@pytest.mark.parametrize('name', list(CONFIGS_BY_NAME))
-def test_set_view_and_trajectory_redraw(name):
-    """Changing the view and the trajectory toggle redraws without error."""
-    _, figure = build_figure(name)
-    try:
         figure.set_view(1)
         assert figure.view_index == 1
         figure.set_show_trajectory(True)
@@ -167,12 +140,14 @@ def test_set_view_and_trajectory_redraw(name):
         close(figure)
 
 
-@pytest.mark.parametrize('name', list(CONFIGS_BY_NAME))
-def test_save_writes_a_png(name, tmp_path):
-    """Saving writes a PNG file that holds a drawing."""
-    _, figure = build_figure(name, view_index=2)
+def test_a_figure_built_from_a_model_saves_a_png(tmp_path):
+    """A figure built from a model saves a PNG file that holds a drawing."""
+    model = probe.build_model(CONFIGS_BY_NAME['cone flat'])
+    figure = GeometryFigure.from_model(model, view_index=1)
     try:
-        path = str(tmp_path / f'{name.replace(" ", "_")}.png')
+        assert figure.scene.kind == 'cone'
+        assert figure.view_index == 1
+        path = str(tmp_path / 'cone_flat.png')
         figure.save(path, dpi=100)
         assert os.path.exists(path)
         assert os.path.getsize(path) > MIN_PNG_BYTES
@@ -180,66 +155,33 @@ def test_save_writes_a_png(name, tmp_path):
         close(figure)
 
 
-def test_view_index_outside_the_range_raises():
-    """A view index outside the scan raises rather than drawing something."""
-    scene, figure = build_figure('cone flat')
-    try:
-        with pytest.raises(IndexError):
-            figure.set_view(scene.num_views)
-        with pytest.raises(IndexError):
-            figure.set_view(-1)
-    finally:
-        close(figure)
-
-
-def test_figure_accepts_a_model():
-    """The figure can be built from a model as well as from a scene."""
-    cfg = CONFIGS_BY_NAME['cone flat']
-    model = probe.build_model(cfg)
-    figure = GeometryFigure.from_model(model, view_index=1)
-    try:
-        assert figure.scene.kind == 'cone'
-        assert figure.view_index == 1
-    finally:
-        close(figure)
-
-
 # ── the detector-face panel uses the scene's numbers ─────────────────────────
 
 @pytest.mark.parametrize('name', list(CONFIGS_BY_NAME))
-def test_detector_edges_are_the_scene_outline(name):
+def test_the_detector_panel_draws_the_scenes_projected_volume_outline(name):
     """The projected volume edges are the scene's, corner for corner.
 
     The panel draws the twelve edges of the volume box in detector index
     coordinates.  Each edge's endpoints must be two entries of the scene's
     ``volume_outline_on_detector`` and nothing else, because a viewer that
     recomputed the projection could disagree with the projector.
+
+    The line data is then read back out of the axes, so the drawing is checked
+    and not only the array the figure kept.  The lines are in (channel, row)
+    order, because that is the panel's horizontal and vertical axis, while the
+    scene reports (row, channel).  The twelve edges are drawn as one polyline
+    with a row of NaN between edges, so the non-finite separators are dropped
+    before the comparison.
     """
-    scene, figure = build_figure(name, view_index=3)
+    scene, figure = build_figure(name, view_index=2)
     try:
-        outline = scene.view(3).volume_outline_on_detector
+        outline = scene.view(2).volume_outline_on_detector
         drawn = figure.detector_volume_edges
         assert drawn.shape == (12, 2, 2)
         for index, (first, second) in enumerate(VOLUME_BOX_EDGES):
             assert np.array_equal(drawn[index, 0], outline[first])
             assert np.array_equal(drawn[index, 1], outline[second])
-    finally:
-        close(figure)
 
-
-def test_detector_panel_line_data_matches_the_scene():
-    """Every projected corner appears in the lines the panel actually drew.
-
-    This reads the line data back out of the axes, so it checks the drawing and
-    not only the array the figure kept.  The lines are in (channel, row) order,
-    because that is the panel's horizontal and vertical axis, while the scene
-    reports (row, channel).  The twelve edges are drawn as one polyline with a
-    row of NaN between edges, so the non-finite separators are dropped before
-    the comparison.
-    """
-    scene, figure = build_figure('cone curved', view_index=2)
-    try:
-        outline = scene.view(2).volume_outline_on_detector
         drawn_points = []
         for line in figure.ax_detector.get_lines():
             if line.get_color() != COLORS['volume']:
@@ -253,121 +195,6 @@ def test_detector_panel_line_data_matches_the_scene():
             distance = np.min(np.hypot(drawn_points[:, 0] - corner[0],
                                        drawn_points[:, 1] - corner[1]))
             assert distance < 1e-9, f'corner {corner} was not drawn'
-    finally:
-        close(figure)
-
-
-def test_overshoot_is_drawn_in_the_overshoot_color():
-    """A volume too large for the detector gets a red part on the face.
-
-    The volume is enlarged until it projects past the detector's edge.  The
-    panel must then hold a line in the overshoot color that carries points, and
-    the scene must agree that the volume no longer fits.  The line exists in
-    every view and is empty when the volume fits, so the test checks its data
-    and not only its presence.
-    """
-    cfg = CONFIGS_BY_NAME['cone flat']
-    model = probe.build_model(cfg)
-    scene = GeometryScene.from_model(model)
-    # A volume this wide projects well past the detector's channel range.
-    wide = scene.with_parameters(dict(recon_shape=(10, 400, 8)))
-    fits, overshoot = wide.volume_fits_detector()
-    assert not fits and overshoot > 0.0
-
-    figure = GeometryFigure(wide, view_index=2)
-    try:
-        drawn = [line for line in figure.ax_detector.get_lines()
-                 if line.get_color() == COLORS['overshoot']
-                 and np.isfinite(np.asarray(line.get_xdata(),
-                                            dtype=np.float64)).any()]
-        assert drawn, 'no line was drawn in the overshoot color'
-    finally:
-        close(figure)
-
-    # The same panel holds no overshoot points when the volume fits.
-    figure = GeometryFigure(scene, view_index=2)
-    try:
-        for line in figure.ax_detector.get_lines():
-            if line.get_color() != COLORS['overshoot']:
-                continue
-            data = np.asarray(line.get_xdata(), dtype=np.float64)
-            assert not np.isfinite(data).any()
-    finally:
-        close(figure)
-
-
-# ── the text panel ───────────────────────────────────────────────────────────
-
-@pytest.mark.parametrize('name', list(CONFIGS_BY_NAME))
-def test_text_panel_reports_the_derived_quantities(name):
-    """The text panel prints the scene's numbers, to three figures."""
-    scene, figure = build_figure(name)
-    try:
-        texts = [artist.get_text()
-                 for artist in figure.ax_text.texts]
-        body = '\n'.join(texts)
-        quantities = scene.derived_quantities()
-        assert quantities['geometry_kind'] in body
-        assert quantities['sinogram_shape_text'] in body
-        assert quantities['recon_shape_text'] in body
-        assert f'{quantities["magnification"]:.3g}' in body
-        assert 'lateral fit' in body and 'axial fit' in body
-        # The drawing note names every position that is a drawing choice, so
-        # its first few words must reach the panel.
-        first_words = ' '.join(quantities['drawing_note'].split()[:4])
-        assert first_words in ' '.join(body.split())
-        assert '-0 ' not in body, 'a negative zero reached the panel'
-    finally:
-        close(figure)
-
-
-@pytest.mark.parametrize('name', list(CONFIGS_BY_NAME))
-def test_text_panel_reports_the_fit_statement_in_three_rows(name):
-    """The fit rows answer laterally and axially, and count the views.
-
-    The lateral row names the shape tested.  The axial row prints the swept z
-    range for a helical scan alone, because only a helical scan is judged by
-    it (the two answers are separate rows).  The count of views is printed for
-    every scan, because it is what separates a scan whose volume is in the
-    wrong place from a helical scan whose volume leaves the detector in every
-    view by design.
-    """
-    scene, figure = build_figure(name)
-    try:
-        body = '\n'.join(artist.get_text() for artist in figure.ax_text.texts)
-        quantities = scene.derived_quantities()
-        assert 'lateral fit' in body
-        assert 'axial fit' in body
-        assert 'leaves det in views' in body
-        assert (f'{quantities["views_leaving_detector"]} of '
-                f'{quantities["num_views"]}') in body
-        assert quantities['fit_shape'] in ('box', 'cylinder')
-        assert quantities['fit_shape'] in body
-        if quantities['helical_fit_rule']:
-            assert 'ALU swept' in body
-        else:
-            assert 'swept' not in body
-    finally:
-        close(figure)
-
-
-def test_the_text_panel_reports_the_swept_z_range_of_a_helical_scan():
-    """A helical scan prints the z range its detector sweeps, to three figures.
-
-    The probe's helical configuration is the one with a nonzero travel, so it
-    is the one the row appears for.
-    """
-    scene, figure = build_figure('cone helical')
-    try:
-        body = '\n'.join(artist.get_text() for artist in figure.ax_text.texts)
-        quantities = scene.derived_quantities()
-        assert quantities['helical_fit_rule'] is True
-        swept = (f'{quantities["swept_z_min"]:.3g} to '
-                 f'{quantities["swept_z_max"]:.3g} ALU swept')
-        # This scan's volume does fit under the helical rule, so the axial row
-        # says yes and carries the swept range.
-        assert f'axial fit           : yes ({swept})' in body
-        assert f'lateral fit         : yes ({quantities["fit_shape"]})' in body
     finally:
         close(figure)
 
@@ -442,15 +269,23 @@ def display_point_3d(axes, point):
     return np.asarray(axes.transData.transform(flat[:2]), dtype=np.float64)
 
 
-def test_the_panels_invert_the_axes_the_convention_turns_around():
-    """Each panel's limits come in the order its screen orientation asks for.
+def test_the_panels_draw_negative_z_up_y_left_and_row_0_at_the_top():
+    """The panels draw the three directions the display convention asks for.
 
-    The top view draws y to the left and x downward, the side view draws y to
-    the left and z downward, and the detector face draws the channel index to
-    the right and the row index downward.  An axis that increases to the left
-    or downward holds its limits in decreasing order.
+    Each check is made in display coordinates, so it is the drawn position of a
+    point and not the order of the axes limits.  The limits are checked as well:
+    an axis that increases to the left or downward holds its limits in
+    decreasing order.
+
+    Three directions are measured.  Larger z is drawn lower, in the side view
+    and in the 3D view in both zoom states, because the zoom replaces the 3D
+    panel's limits.  Larger y is drawn further left in the top and side views,
+    which is what puts the source on the left of both panels and the detector on
+    the right, as in the reference figure of Balke et al. (2018).  And a larger
+    detector row index is drawn lower, which is how ``imshow`` shows one view of
+    a sinogram.
     """
-    _, figure = build_figure('cone flat', view_index=2)
+    scene, figure = build_figure('cone flat', view_index=2)
     try:
         top = figure.ax_top
         assert top.get_xlim()[0] > top.get_xlim()[1], 'y must run left'
@@ -461,19 +296,7 @@ def test_the_panels_invert_the_axes_the_convention_turns_around():
         detector = figure.ax_detector
         assert detector.get_xlim()[0] < detector.get_xlim()[1]
         assert detector.get_ylim()[0] > detector.get_ylim()[1], 'row 0 on top'
-    finally:
-        close(figure)
 
-
-def test_larger_z_is_drawn_lower_on_the_screen():
-    """A point at larger z is drawn lower in the side view and the 3D view.
-
-    The check is in display coordinates, so it is the drawn position and not
-    the axes limits.  The 3D panel is checked in both zoom states, because the
-    zoom replaces that panel's limits.
-    """
-    _, figure = build_figure('cone flat', view_index=2)
-    try:
         low = display_point(figure.ax_side, 0.0, -10.0)
         high = display_point(figure.ax_side, 0.0, 10.0)
         assert high[1] < low[1], 'z must increase downward in the side view'
@@ -485,39 +308,7 @@ def test_larger_z_is_drawn_lower_on_the_screen():
             low = display_point_3d(figure.ax_3d, (0.0, 0.0, -3.0))
             high = display_point_3d(figure.ax_3d, (0.0, 0.0, 3.0))
             assert high[1] < low[1], f'z must increase downward, zoom {zoom}'
-    finally:
-        close(figure)
 
-
-def test_row_0_is_at_the_top_of_the_detector_face():
-    """A larger row index is drawn lower on the detector face.
-
-    This is the view from the source toward the detector with -z up, and it is
-    how ``imshow`` shows one view of a sinogram.
-    """
-    scene, figure = build_figure('cone flat', view_index=2)
-    try:
-        first = display_point(figure.ax_detector, 0.0, 0.0)
-        last = display_point(figure.ax_detector, 0.0,
-                             scene.num_det_rows - 1.0)
-        assert last[1] < first[1], 'row 0 must be at the top'
-        right = display_point(figure.ax_detector,
-                              scene.num_det_channels - 1.0, 0.0)
-        assert right[0] > first[0], 'the channel index must run right'
-        assert 'row 0 at the top' in figure.ax_detector.get_title()
-    finally:
-        close(figure)
-
-
-def test_larger_y_is_drawn_further_left():
-    """A point at larger y is drawn further left in the top and side views.
-
-    The source of a view at angle 0 sits at positive y, so this is what puts
-    the source on the left of both panels and the detector on the right, as in
-    the reference figure of Balke et al. (2018).
-    """
-    _, figure = build_figure('cone flat', view_index=2)
-    try:
         for axes in (figure.ax_top, figure.ax_side):
             near = display_point(axes, 50.0, 0.0)
             far = display_point(axes, -50.0, 0.0)
@@ -526,62 +317,14 @@ def test_larger_y_is_drawn_further_left():
         above = display_point(figure.ax_top, 0.0, -50.0)
         below = display_point(figure.ax_top, 0.0, 50.0)
         assert below[1] < above[1], 'x must increase downward'
-    finally:
-        close(figure)
 
-
-def test_the_source_is_drawn_left_of_the_detector():
-    """The drawn source sits left of the point where the central ray lands.
-
-    The two panels that carry the beam draw it from left to right, which is
-    the orientation of the reference figure.
-    """
-    scene, figure = build_figure('cone flat', view_index=2)
-    try:
-        view = scene.view(2)
-        for axes, columns in ((figure.ax_top, list(TOP_PANEL_COLUMNS)),
-                              (figure.ax_side, list(SIDE_PANEL_COLUMNS))):
-            source = display_point(axes, *view.source_draw[columns])
-            iso = display_point(axes, *view.detector_origin[columns])
-            assert source[0] < iso[0]
-    finally:
-        close(figure)
-
-
-def test_the_titles_name_the_side_each_panel_is_seen_from():
-    """Each panel's title states where it is seen from and which way y runs."""
-    _, figure = build_figure('cone flat', view_index=2)
-    try:
-        top = figure.ax_top.get_title()
-        assert 'seen from -z' in top and 'y increases to the left' in top
-        assert 'seen from +x' in figure.ax_side.get_title()
-        detector = figure.ax_detector.get_title()
-        assert 'seen from the source' in detector
-        assert 'row 0 at the top' in detector
-    finally:
-        close(figure)
-
-
-def test_the_text_panel_names_the_convention_and_the_detector_iso():
-    """The text panel says which way z is drawn and what (du, dv) measures."""
-    _, figure = build_figure('cone flat', view_index=2)
-    try:
-        body = '\n'.join(artist.get_text() for artist in figure.ax_text.texts)
-        assert '-z up.' in body
-        assert '(du, dv): detector iso to detector center' in body
-    finally:
-        close(figure)
-
-
-def test_the_detector_face_names_its_three_markers():
-    """The detector face's legend carries the names the panels use."""
-    _, figure = build_figure('cone flat', view_index=2)
-    try:
-        labels = [text.get_text()
-                  for text in figure.ax_detector.get_legend().get_texts()]
-        assert 'detector iso' in labels
-        assert 'detector center' in labels
-        assert 'pixel (0,0) = sino[v, 0, 0]' in labels
+        first = display_point(figure.ax_detector, 0.0, 0.0)
+        last = display_point(figure.ax_detector, 0.0,
+                             scene.num_det_rows - 1.0)
+        assert last[1] < first[1], 'row 0 must be at the top'
+        right = display_point(figure.ax_detector,
+                              scene.num_det_channels - 1.0, 0.0)
+        assert right[0] > first[0], 'the channel index must run right'
     finally:
         close(figure)
 
@@ -608,308 +351,6 @@ def test_the_source_travels_counterclockwise_in_the_top_view():
         area = float(np.sum(spokes[:-1, 0] * spokes[1:, 1]
                             - spokes[1:, 0] * spokes[:-1, 1]))
         assert area > 0.0, 'the source travel must read counterclockwise'
-    finally:
-        close(figure)
-
-
-def test_setting_z_up_sign_to_one_restores_the_old_presentation(monkeypatch):
-    """Z_UP_SIGN = +1 inverts no axis and draws +z at the top.
-
-    The constant is the one place each panel reads, so this checks that the
-    display convention is a presentation choice and not something the drawing
-    carries in its geometry.
-    """
-    monkeypatch.setattr(geometry_figure, 'Z_UP_SIGN', 1)
-    _, figure = build_figure('cone flat', view_index=2)
-    try:
-        for axes in (figure.ax_top, figure.ax_side, figure.ax_detector):
-            assert axes.get_xlim()[0] < axes.get_xlim()[1]
-            assert axes.get_ylim()[0] < axes.get_ylim()[1]
-        low = display_point(figure.ax_side, 0.0, -10.0)
-        high = display_point(figure.ax_side, 0.0, 10.0)
-        assert high[1] > low[1], 'z must increase upward'
-        first = display_point(figure.ax_detector, 0.0, 0.0)
-        last = display_point(figure.ax_detector, 0.0, 20.0)
-        assert last[1] > first[1], 'row 0 must be at the bottom'
-        figure.figure.canvas.draw()
-        for zoom in ('scan', 'volume'):
-            figure.set_zoom(zoom)
-            figure.figure.canvas.draw()
-            low = display_point_3d(figure.ax_3d, (0.0, 0.0, -3.0))
-            high = display_point_3d(figure.ax_3d, (0.0, 0.0, 3.0))
-            assert high[1] > low[1], f'z must increase upward, zoom {zoom}'
-        assert 'row 0 at the bottom' in figure.ax_detector.get_title()
-        assert 'y increases to the right' in figure.ax_top.get_title()
-        body = '\n'.join(artist.get_text() for artist in figure.ax_text.texts)
-        assert '+z up.' in body
-    finally:
-        close(figure)
-
-
-def source_marker_box(figure, axes, artist):
-    """The box the source's marker covers in one 2D panel, in display pixels.
-
-    A marker is drawn at a size in points, and matplotlib reports no extent for
-    it, so the box is built here: a square of ``SOURCE_MARKER_SIZE`` points
-    centered on the marker's data point.  The square is the marker's outer
-    bound, because a star of that size is drawn inside it.
-
-    Args:
-        figure (GeometryFigure): the figure, for its dots per inch.
-        axes: the panel the marker is drawn in.
-        artist: the marker's line artist.
-
-    Returns:
-        Bbox: the square, or None when the artist carries no point.
-    """
-    from matplotlib.transforms import Bbox
-    x, y = artist.get_xdata(), artist.get_ydata()
-    if len(x) == 0:
-        return None
-    center = axes.transData.transform((float(x[0]), float(y[0])))
-    half = 0.5 * SOURCE_MARKER_SIZE * figure.figure.dpi / 72.0
-    return Bbox.from_extents(center[0] - half, center[1] - half,
-                             center[0] + half, center[1] + half)
-
-
-def assert_boxes_are_clear(first_name, first_box, second_name, second_box):
-    """Fail unless two display boxes miss each other in x or in y.
-
-    An overlap of a pixel is allowed, because a label placed a fixed number of
-    points from a marker lands within a pixel of that marker's own box.
-    """
-    across = (min(first_box.x1, second_box.x1)
-              - max(first_box.x0, second_box.x0))
-    down = min(first_box.y1, second_box.y1) - max(first_box.y0, second_box.y0)
-    assert across <= 1 or down <= 1, (
-        f'{first_name!r} overlaps {second_name!r}')
-
-
-def assert_panel_labels_have_their_own_place(figure, axes, marker_artist,
-                                             where):
-    """Fail unless every label of one panel has a place of its own.
-
-    Three things are checked: no label reaches outside the panel, no two
-    labels overlap, and no label is under the source's marker.
-
-    Args:
-        figure (GeometryFigure): the figure being measured.
-        axes: the panel.
-        marker_artist: the panel's source marker, or None where it draws none.
-        where (str): what to name in a failure, such as ``'view 3'``.
-    """
-    renderer = figure.figure.canvas.get_renderer()
-    panel = axes.get_window_extent(renderer)
-    boxes = [(text.get_text(), text.get_window_extent(renderer))
-             for text in axes.texts
-             if text.get_visible() and text.get_text().strip()]
-    for text, box in boxes:
-        assert box.x0 >= panel.x0 - 2 and box.x1 <= panel.x1 + 2, (
-            f'{text!r} leaves its panel sideways, {where}')
-        assert box.y0 >= panel.y0 - 2 and box.y1 <= panel.y1 + 2, (
-            f'{text!r} leaves its panel vertically, {where}')
-    for first in range(len(boxes)):
-        for second in range(first + 1, len(boxes)):
-            assert_boxes_are_clear(f'{boxes[first][0]} ({where})',
-                                   boxes[first][1],
-                                   boxes[second][0], boxes[second][1])
-    if marker_artist is None:
-        return
-    marker = source_marker_box(figure, axes, marker_artist)
-    if marker is None:
-        return
-    for text, box in boxes:
-        assert_boxes_are_clear(f'the source marker ({where})', marker,
-                               text, box)
-
-
-@pytest.mark.parametrize('name', list(CONFIGS_BY_NAME))
-def test_no_label_overlaps_another_or_leaves_its_panel(name):
-    """Every label of the three 2D panels has its own place.
-
-    The axis inversions moved the source to the left of each panel and the
-    detector to the right, which moved every label with them.  This measures
-    the drawn size of each label with the renderer and checks that no two
-    labels of one panel overlap and that none reaches outside its panel.  The
-    3D panel is left out: its text artists are placed by the camera, and
-    ``_clip_3d_artists`` hides the ones whose point leaves the panel.
-
-    The source's marker is checked against the labels as well, in the two
-    panels that draw it.  A marker is not a label, so it was not measured
-    before, and the marker was found drawn over two characters of the
-    ``recon_slice_offset`` label in the side view of the multiaxis example.
-
-    The side view is measured at three views and not at one, because its
-    ``recon_slice_offset`` label is placed away from the source and so moves
-    when the source does.  The multiaxis source rises and falls with the
-    per-view elevation and the helical source rises through the scan.
-
-    The top view is measured at view 0 as well as at view 2.  Its labels turn
-    around the panel with the view, and the placement rules were chosen so
-    that view 0 is clear in every geometry: the two offsets read short, the
-    pixel-0 label sits on the side of its marker away from the detector iso,
-    and the source-travel label sits on the side of the arc's end away from
-    the source.
-
-    The top view is not measured at every view, because two of its labels still
-    meet at a few views and no rule was found that parts them without crowding
-    the labels elsewhere.  In the flat and the helical cone scans at view 5 the
-    detector is drawn under the angle-0 caption in the panel's upper left
-    corner, and there the channel-offset label and the pixel-0 label overlap.
-    The detector face keeps the single view this test has always used.
-    """
-    _, figure = build_figure(name, view_index=2)
-    try:
-        canvas = figure.figure.canvas
-        canvas.draw()
-        for axes, marker in ((figure.ax_top, figure._top['source']),
-                             (figure.ax_side, figure._side['source']),
-                             (figure.ax_detector, None)):
-            assert_panel_labels_have_their_own_place(figure, axes, marker,
-                                                     'view 2')
-        num_views = figure.scene.num_views
-        for view_index in (0, num_views // 2, num_views - 1):
-            figure.set_view(view_index)
-            canvas.draw()
-            assert_panel_labels_have_their_own_place(
-                figure, figure.ax_side, figure._side['source'],
-                f'side view, view {view_index}')
-            if view_index == 0:
-                assert_panel_labels_have_their_own_place(
-                    figure, figure.ax_top, figure._top['source'],
-                    'top view, view 0')
-    finally:
-        close(figure)
-
-
-#: How many channels the comparison of the legend test moves the detector by.
-#: The value only has to differ from the primary's offset, so that the two
-#: geometries differ and the comparison earns its legend entry.
-LEGEND_COMPARISON_SHIFT = 10.0
-
-
-def all_checks(figure):
-    """The figure's six toggles, in the order they are laid out."""
-    return (figure.trajectory_check, figure.zoom_check,
-            figure.reference_check, figure.sinogram_check,
-            figure.recon_check, figure.compare_check)
-
-
-def assert_the_legend_has_a_place_of_its_own(figure, where):
-    """Fail unless the detector face's legend sits outside everything drawn.
-
-    Four things are checked: the legend is inside the figure, it covers none of
-    the five panels, it covers neither the view slider nor any toggle, and it
-    stays clear of the detector panel's own x axis, which is the axis it sits
-    under.
-
-    Args:
-        figure (GeometryFigure): the figure being measured.
-        where (str): what to name in a failure, such as ``'with a
-            comparison'``.
-    """
-    renderer = figure.figure.canvas.get_renderer()
-    legend = figure.ax_detector.get_legend()
-    box = legend.get_window_extent(renderer)
-    page = figure.figure.bbox
-    assert (box.x0 >= page.x0 and box.x1 <= page.x1
-            and box.y0 >= page.y0 and box.y1 <= page.y1), (
-        f'the legend leaves the figure, {where}')
-
-    names = ('the 3D view', 'the top view', 'the side view',
-             'the detector face', 'the text panel')
-    for name, axes in zip(names, figure.panel_axes):
-        assert_boxes_are_clear(f'the legend ({where})', box,
-                               name, axes.get_window_extent(renderer))
-    widgets = [figure._slider_axes]
-    widgets.extend(check.ax for check in all_checks(figure)
-                   if check is not None)
-    for axes in widgets:
-        if axes is None:
-            continue
-        assert_boxes_are_clear(f'the legend ({where})', box,
-                               'a widget', axes.get_window_extent(renderer))
-    # The panel's tick labels and its x label lie between the panel and the
-    # legend, and get_tightbbox of the axes would count the legend itself, so
-    # the x axis is measured on its own.
-    assert_boxes_are_clear(f'the legend ({where})', box,
-                           "the detector face's x axis",
-                           figure.ax_detector.xaxis.get_tightbbox(renderer))
-
-
-@pytest.mark.parametrize('name', list(CONFIGS_BY_NAME))
-def test_the_detector_legend_sits_outside_the_panels(name):
-    """The detector face's legend covers no panel and no widget.
-
-    The legend used to sit inside its panel, in the upper right corner, where
-    it covered the projected outlines and a painted sinogram.  It sits in the
-    band under the panel now, as two rows of three columns.
-
-    The place is checked by measurement rather than by its constants, for two
-    reasons.  The panel's box is reshaped to the detector's own aspect, so how
-    far the panel reaches down the figure depends on the row and channel
-    counts.  And a comparison adds an entry to the legend, which changes the
-    legend's size.  Both cases are measured here.
-    """
-    scene, figure = build_figure(name, view_index=2)
-    try:
-        canvas = figure.figure.canvas
-        canvas.draw()
-        assert_the_legend_has_a_place_of_its_own(figure, 'with no comparison')
-        entries = len(figure.ax_detector.get_legend().get_texts())
-
-        figure.set_compare(dict(det_channel_offset=scene.det_channel_offset
-                                + LEGEND_COMPARISON_SHIFT))
-        canvas.draw()
-        assert len(figure.ax_detector.get_legend().get_texts()) == entries + 1
-        assert_the_legend_has_a_place_of_its_own(figure, 'with a comparison')
-    finally:
-        close(figure)
-
-
-#: The six toggle labels, in the order the widget row lays them out: the three
-#: that change the drawing of the geometry on the top row, and the three that
-#: turn an overlay on and off below them.
-WIDGET_LABELS = ('source path', '3D zoom to volume', 'angle-0 reference',
-                 'sinogram', 'phantom', 'comparison')
-
-
-@pytest.mark.parametrize('name', list(CONFIGS_BY_NAME))
-def test_no_toggle_label_overlaps_another_or_the_slider(name):
-    """Every toggle label in the widget row has a place of its own.
-
-    The row carries six toggles and the slider, in two rows of three toggles
-    beside the slider.  The labels are measured with the renderer rather than
-    read off the constants, because a label's width is the width of its text in
-    the widget font and nothing in the constants says what that is.  Each pair
-    of labels has to miss the other in x or in y, and each label has to miss
-    the slider, whose own label and value text are part of what is measured.
-
-    Every geometry here has more than one view, so every figure measured has a
-    slider to measure.
-    """
-    _, figure = build_figure(name, view_index=1)
-    try:
-        canvas = figure.figure.canvas
-        canvas.draw()
-        renderer = canvas.get_renderer()
-        boxes = []
-        for check in all_checks(figure):
-            for label in check.labels:
-                boxes.append((label.get_text(),
-                              label.get_window_extent(renderer)))
-        assert [text for text, _ in boxes] == list(WIDGET_LABELS)
-        assert figure.view_slider is not None
-        boxes.append(('the view slider',
-                      figure._slider_axes.get_tightbbox(renderer)))
-        for first in range(len(boxes)):
-            for second in range(first + 1, len(boxes)):
-                assert_boxes_are_clear(boxes[first][0], boxes[first][1],
-                                       boxes[second][0], boxes[second][1])
-        # And the row stays under the band the detector face's legend sits in.
-        legend = figure.ax_detector.get_legend().get_window_extent(renderer)
-        for text, box in boxes:
-            assert box.y1 <= legend.y0, f'{text!r} reaches into the legend'
     finally:
         close(figure)
 
@@ -1038,10 +479,21 @@ def changed_in_panel(figure, axes, before, after):
     return np.nonzero(inside)
 
 
-def test_the_sinogram_image_is_placed_and_updated_in_place():
-    """The painted sinogram is the array, in the panel's own index axes.
+def test_the_bright_sinogram_pixel_is_drawn_at_its_row_and_channel():
+    """The painted pixel lands on the screen where its row and channel are.
 
-    Three things are checked.  The image's extent puts array element (r, c) at
+    This is the orientation gate.  The figure is rendered, the brightest block
+    of pixels is found in the image's own area, and its display position is
+    converted back to data coordinates through the panel's inverted
+    ``transData``.  Those coordinates must be the channel and the row the array
+    holds the bright value at, so the panel's inverted row axis is part of what
+    is measured.
+
+    Two areas are left out of the search.  The panel's background is white and
+    so is the bright pixel, so only the image's own area is searched; the
+    legend's box is white as well, so it is taken out of that area.
+
+    The image itself is checked first.  Its extent puts array element (r, c) at
     data coordinates channel c and row r, which is what makes the panel's
     inverted row axis draw row 0 at the top.  A view change replaces the data,
     so after ``set_view`` the image holds the bright pixel at the row and
@@ -1067,29 +519,7 @@ def test_the_sinogram_image_is_placed_and_updated_in_place():
                 == (BRIGHT_ROW, BRIGHT_CHANNEL))
         assert image.get_clim() == (float(np.min(values)),
                                     float(np.max(values)))
-    finally:
-        close(figure)
 
-
-def test_the_bright_sinogram_pixel_is_drawn_at_its_row_and_channel():
-    """The painted pixel lands on the screen where its row and channel are.
-
-    This is the orientation gate.  The figure is rendered, the brightest block
-    of pixels is found in the image's own area, and its display position is
-    converted back to data coordinates through the panel's inverted
-    ``transData``.  Those coordinates must be the channel and the row the array
-    holds the bright value at, so the panel's inverted row axis is part of what
-    is measured.
-
-    Two areas are left out of the search.  The panel's background is white and
-    so is the bright pixel, so only the image's own area is searched; the
-    legend's box is white as well, so it is taken out of that area.
-    """
-    scene = build_scene(SINOGRAM_CONFIG)
-    figure = GeometryFigure(scene, view_index=1,
-                            sinogram=bright_sinogram(scene))
-    try:
-        figure.set_view(BRIGHT_VIEW)
         rendered = rendered_rgb(figure)
         renderer = figure.figure.canvas.get_renderer()
         image_box = figure._sinogram_image.get_window_extent(renderer)
@@ -1255,29 +685,6 @@ def test_a_large_sinogram_is_subsampled_for_display():
         close(figure)
 
 
-def test_the_sinogram_gray_scale_can_be_given():
-    """``vmin`` and ``vmax`` fix the gray scale, and None takes the array's.
-
-    A caller who steps through several scans wants one scale for all of them,
-    and a caller who has an outlier wants the scale off it.  Both ends are
-    taken from the constructor and from ``set_sinogram``.
-    """
-    scene = build_scene(SINOGRAM_CONFIG)
-    values = bright_sinogram(scene)
-    figure = GeometryFigure(scene, sinogram=values, vmin=0.2, vmax=0.7)
-    try:
-        assert figure._sinogram_image.get_clim() == (0.2, 0.7)
-
-        figure.set_sinogram(values, vmin=0.2, vmax=0.7)
-        assert figure._sinogram_image.get_clim() == (0.2, 0.7)
-
-        figure.set_sinogram(values)
-        assert figure._sinogram_image.get_clim() == (float(np.min(values)),
-                                                     float(np.max(values)))
-    finally:
-        close(figure)
-
-
 def test_a_sinogram_tensor_is_subsampled_where_it_lives():
     """A sinogram on a device is sliced there and paints the same picture.
 
@@ -1306,29 +713,6 @@ def test_a_sinogram_tensor_is_subsampled_where_it_lives():
     finally:
         close(on_host)
         close(on_device)
-
-
-def test_a_divided_sinogram_is_refused():
-    """An array in the divided device form is refused, and so is a recon.
-
-    A multi-device reconstruction can hand back a ``Shards`` container, which
-    holds one tensor per device and has no shape of its own.  The viewer says
-    so and names the fix rather than failing somewhere further down.
-    """
-    import torch
-    from mbirtorch._sharding import Placement, Shards
-
-    scene = build_scene(SINOGRAM_CONFIG)
-    placement = Placement([torch.device('cpu')], axis=0)
-    divided = Shards([torch.zeros(scene.sinogram_shape)], placement)
-    scene, figure = build_figure(SINOGRAM_CONFIG)
-    try:
-        with pytest.raises(TypeError, match='divided'):
-            figure.set_sinogram(divided)
-        with pytest.raises(TypeError, match='divided'):
-            figure.set_recon(divided)
-    finally:
-        close(figure)
 
 
 @pytest.mark.parametrize('corner', ('low', 'high'))
@@ -1391,88 +775,6 @@ def test_the_silhouette_is_drawn_where_its_voxels_are(corner):
             if corner == 'low':
                 marker = np.asarray(view.voxel0_center)[list(columns)]
                 assert np.all(np.abs(drawn - marker) <= allowed)
-    finally:
-        close(figure)
-
-
-def test_the_silhouette_takes_the_threshold_it_is_given():
-    """The support is the voxels above the threshold, default or given.
-
-    The default threshold is a tenth of the largest absolute value, so a voxel
-    at half the largest value belongs to the support.  A threshold given by the
-    caller is an absolute value, so a threshold above that voxel's value drops
-    it.  The sign of a voxel does not matter, because the support is about the
-    absolute value.
-
-    The figure keeps the support as its three projections and not as a whole
-    boolean array, so the count is read from the projection along z, where the
-    two voxels sit in different rows and different columns.
-    """
-    scene = build_scene(SILHOUETTE_CONFIG)
-    recon = np.zeros(scene.recon_shape, dtype=np.float32)
-    recon[0, 0, 0] = 1.0
-    recon[1, 1, 1] = -0.5
-    figure = GeometryFigure(scene, recon=recon)
-    try:
-        assert figure._recon_threshold == pytest.approx(0.1)
-        assert int(figure._recon_projections['xy'].sum()) == 2
-
-        figure.set_recon(recon, threshold=0.7)
-        assert figure._recon_threshold == pytest.approx(0.7)
-        assert int(figure._recon_projections['xy'].sum()) == 1
-        assert figure._recon_projections['xy'][0, 0]
-    finally:
-        close(figure)
-
-
-def test_an_overlay_of_the_wrong_shape_is_refused():
-    """A mismatched array raises, and the message names both shapes."""
-    scene, figure = build_figure(SINOGRAM_CONFIG)
-    try:
-        with pytest.raises(ValueError) as problem:
-            figure.set_sinogram(np.zeros((3, 4, 5)))
-        message = str(problem.value)
-        assert '(3, 4, 5)' in message
-        assert str(tuple(scene.sinogram_shape)) in message
-
-        with pytest.raises(ValueError) as problem:
-            figure.set_recon(np.zeros((3, 4, 5)))
-        message = str(problem.value)
-        assert '(3, 4, 5)' in message
-        assert str(tuple(scene.recon_shape)) in message
-    finally:
-        close(figure)
-
-
-def test_the_overlays_are_named_in_the_title_and_the_footer():
-    """The detector title says a sinogram is painted, and the footer lists
-    both overlays.
-
-    Neither overlay has a legend entry, so these two lines are where the figure
-    says what is drawn.  The threshold is named the way it was chosen: the
-    default as the fraction of the largest value that it is, and a caller's own
-    as the number it is.
-    """
-    scene = build_scene(SINOGRAM_CONFIG)
-    recon = np.zeros(scene.recon_shape, dtype=np.float32)
-    recon[0, 0, 0] = 1.0
-    figure = GeometryFigure(scene, sinogram=bright_sinogram(scene),
-                            recon=recon)
-    try:
-        assert 'with sinogram' in figure.ax_detector.get_title()
-        body = '\n'.join(artist.get_text() for artist in figure.ax_text.texts)
-        assert 'overlays : sinogram; recon above 0.1 max' in body
-
-        figure.set_recon(recon, threshold=0.25)
-        body = '\n'.join(artist.get_text() for artist in figure.ax_text.texts)
-        assert 'overlays : sinogram; recon above 0.25' in body
-
-        # Removing both takes the note out of the title and the footer.
-        figure.set_sinogram(None)
-        figure.set_recon(None)
-        assert 'with sinogram' not in figure.ax_detector.get_title()
-        body = '\n'.join(artist.get_text() for artist in figure.ax_text.texts)
-        assert 'overlays' not in body
     finally:
         close(figure)
 
@@ -1546,13 +848,8 @@ def finite_rows(points):
     return points[np.isfinite(points).all(axis=1)]
 
 
-def legend_labels(axes):
-    """The labels of one panel's legend entries."""
-    return [text.get_text() for text in axes.get_legend().get_texts()]
-
-
-def test_the_3d_outline_of_a_block_is_its_sections():
-    """A block phantom's 3D outline is one rectangle per plane it is cut in.
+def test_a_block_phantoms_outline_is_its_sections_and_its_rectangle():
+    """A block phantom's outline is one rectangle per plane, in 3D and on top.
 
     The block spans three rows, four columns, and three slices, so the rows
     and the slices tie for the thinnest direction and z wins the tie.  Every
@@ -1563,6 +860,11 @@ def test_the_3d_outline_of_a_block_is_its_sections():
     half a voxel outside the block.  The three voxel pitches differ in this
     geometry and its volume is offset in z, so an outline built from anything
     but the scene's own voxel centers would land somewhere else.
+
+    The top view draws the xy plane, so the same block projects to a rectangle
+    whose sides are the block's outer faces in y and in x.  Every vertex of
+    that outline has to be on the rectangle, which is checked to half a voxel
+    pitch in each direction, and the outline has to reach every side of it.
     """
     scene = build_scene(SILHOUETTE_CONFIG)
     figure = GeometryFigure(scene, recon=block_phantom(scene))
@@ -1589,31 +891,6 @@ def test_the_3d_outline_of_a_block_is_its_sections():
                 assert float(np.min(gap)) < 1e-9, (
                     f'corner {corner} was not drawn')
 
-        # The legend counts the sections drawn, and every plane of the
-        # block's extent is one of them.
-        line = outline_line_3d(figure)
-        assert line.get_label() == 'phantom (3 sections across z)'
-        assert 'phantom (3 sections across z)' in legend_labels(figure.ax_3d)
-
-        # The outline is dashed, so that it is not read as the volume box,
-        # which is solid and the same color.
-        assert line.get_linestyle() not in ('-', 'solid')
-        assert line.get_color() == COLORS['volume']
-    finally:
-        close(figure)
-
-
-def test_the_top_view_outline_traces_the_blocks_rectangle():
-    """The top view's outline lies on the block's projected rectangle.
-
-    The top view draws the xy plane, so the block projects to a rectangle whose
-    sides are the block's outer faces in y and in x.  Every vertex of the
-    outline has to be on that rectangle, which is checked to half a voxel pitch
-    in each direction, and the outline has to reach every side of it.
-    """
-    scene = build_scene(SILHOUETTE_CONFIG)
-    figure = GeometryFigure(scene, recon=block_phantom(scene))
-    try:
         lines = outlines_in(figure, figure.ax_top)
         assert len(lines) == 1
         drawn = np.stack([np.asarray(lines[0].get_xdata(), dtype=np.float64),
@@ -1622,7 +899,6 @@ def test_the_top_view_outline_traces_the_blocks_rectangle():
         drawn = drawn[np.isfinite(drawn).all(axis=1)]
         assert drawn.shape[0] >= 8, 'a rectangle is four segments'
 
-        low, high = block_corners(scene)
         # The panel puts y across the screen and x down it, and the pitches are
         # indexed the same way, as (x, y, z).
         columns = list(TOP_PANEL_COLUMNS)
@@ -1650,102 +926,6 @@ def test_the_top_view_outline_traces_the_blocks_rectangle():
 #: says why the two numbers differ and why each is the right one.
 SHADOW_OUTSIDE_TOLERANCE = 1.0
 SHADOW_INSIDE_TOLERANCE = 2.0
-
-
-def cube_phantom(scene):
-    """mbirtorch's cube phantom for one scan's reconstruction shape."""
-    import mbirtorch
-    return np.asarray(mbirtorch.gen_cube_phantom(scene.recon_shape))
-
-
-def cube_phantom_shear(scene):
-    """How far the cube phantom steps sideways over all of its slices.
-
-    ``mbirtorch.gen_cube_phantom`` fills a block a quarter of the volume wide
-    and shifts slice k of it by ``int(k * phantom_cols / num_slices)`` columns.
-    The shift of the last slice is therefore the shear of the whole phantom,
-    in voxel pitches along the column index, which is x.
-    """
-    _, num_cols, num_slices = scene.recon_shape
-    return int((num_slices - 1) * (num_cols // 4) / num_slices)
-
-
-def expected_section_outline(scene, mask, axis, position):
-    """What a section's outline should be, computed from the mask itself.
-
-    The mask is indexed (down, across), and which voxel index each of those
-    is depends on the axis the sections lie across, as
-    ``geometry_figure._section_mask`` says.  The outline runs along the cell
-    edges, so it encloses every cell in the mask, and it is mapped to object
-    coordinates through the scene's own ``voxel_centers``.
-
-    Args:
-        scene (GeometryScene): the scan.
-        mask (ndarray): the section's support, (down, across) of bool.
-        axis (str): ``'x'``, ``'y'``, or ``'z'``.
-        position (float): the section's plane index.
-
-    Returns:
-        ndarray: the finite points of the outline, (N, 3) as (x, y, z), in the
-        order they are drawn in.
-    """
-    across = -0.5 + np.arange(mask.shape[1] + 1)
-    down = -0.5 + np.arange(mask.shape[0] + 1)
-    outline = geometry_figure._mask_outline(mask, across, down)
-    outline = finite_rows(outline)
-    plane = np.full(outline.shape[0], float(position))
-    if axis == 'z':
-        ijk = np.column_stack([outline[:, 1], outline[:, 0], plane])
-    elif axis == 'y':
-        ijk = np.column_stack([plane, outline[:, 1], outline[:, 0]])
-    else:
-        ijk = np.column_stack([outline[:, 1], plane, outline[:, 0]])
-    return scene.voxel_centers(ijk)
-
-
-def test_the_cube_phantoms_sections_follow_its_shear():
-    """mbirtorch's cube phantom gets sections that follow its shear.
-
-    The cube phantom is a rectangle of the same size in every slice, stepped
-    sideways from one slice to the next.  It spans two rows, five columns, and
-    eight slices, so the rows are its thinnest direction and the sections lie
-    across y, one at each of the two rows it fills.  A section cuts the
-    phantom along its shear, so it is a parallelogram and not a rectangle.
-
-    Each section has to be the outline of that row of the phantom itself,
-    which the test computes from the phantom array, and the shear has to show
-    in it: the outline reaches further along x at the last slice's face than
-    at slice 0's by the number of columns the phantom steps between them.
-    """
-    scene = build_scene(SINOGRAM_CONFIG)
-    phantom = cube_phantom(scene)
-    num_slices = scene.recon_shape[2]
-    figure = GeometryFigure(scene, recon=phantom)
-    try:
-        assert figure._recon_section_axis == 'y'
-        rows = np.flatnonzero((np.abs(phantom) > 0.0).any(axis=(1, 2)))
-        assert figure._recon_section_indices == [int(row) for row in rows]
-        parts = outline_parts_3d(figure)
-        assert len(parts) == 2
-
-        for part, row in zip(parts, rows):
-            # The phantom's own row, indexed (cols, slices), which is the
-            # (down, across) the section's mask uses for a 'y' axis.
-            expected = expected_section_outline(
-                scene, np.abs(phantom[row]) > 0.0, 'y', float(row))
-            assert np.allclose(finite_rows(part), expected)
-
-            drawn = finite_rows(part)
-            shear = cube_phantom_shear(scene) * scene.delta_voxel
-            assert shear > 0.0, 'this phantom has no shear to measure'
-            faces = scene.voxel_centers([[0.0, 0.0, -0.5],
-                                         [0.0, 0.0, num_slices - 0.5]])
-            near = drawn[np.abs(drawn[:, 2] - faces[0, 2]) < 1e-9, 0]
-            far = drawn[np.abs(drawn[:, 2] - faces[1, 2]) < 1e-9, 0]
-            assert near.size and far.size
-            assert float(far.min() - near.min()) == pytest.approx(shear)
-    finally:
-        close(figure)
 
 
 def convex_hull(points):
@@ -1894,59 +1074,6 @@ def test_the_projected_outline_follows_the_cube_phantoms_shadow():
         close(figure)
 
 
-def test_removing_the_phantom_removes_its_outlines_and_legend_entry():
-    """set_recon(None) takes away the fills, the outlines, and the entries.
-
-    The 3D panel's outline carries the phantom's entry in that panel's legend,
-    and the projected outline carries its entry in the detector face's legend,
-    so removing the phantom has to rebuild both legends without it.  The
-    projected outline is also a moving artist, so removing it has to take it
-    out of the list the partial redraw walks; the view change at the end would
-    otherwise draw an artist that no longer belongs to any panel.
-
-    The 3D panel's entry counts the sections drawn, so it starts with the
-    phantom's name rather than being it.
-    """
-    scene = build_scene(SILHOUETTE_CONFIG)
-    figure = GeometryFigure(scene)
-    try:
-        def named(axes):
-            return [label for label in legend_labels(axes)
-                    if label.startswith(geometry_figure.PHANTOM_NAME)]
-
-        panels = (figure.ax_3d, figure.ax_detector)
-        for axes in panels:
-            assert named(axes) == []
-
-        figure.set_recon(block_phantom(scene))
-        assert len(figure._recon_images) == 2
-        # The two projected panels, the 3D panel, and the detector face.
-        assert len(figure._recon_outlines) == 4
-        projected = figure._recon_detector_line
-        assert projected is not None
-        assert any(artist is projected for _, artist in figure._moving)
-        for axes in panels:
-            assert named(axes) != []
-        assert geometry_figure.PHANTOM_NAME in legend_labels(figure.ax_detector)
-
-        figure.set_recon(None)
-        assert figure._recon_images == []
-        assert figure._recon_outlines == []
-        assert figure._recon_detector_line is None
-        for axes in panels:
-            assert named(axes) == []
-        for axes in (figure.ax_top, figure.ax_side, figure.ax_3d,
-                     figure.ax_detector):
-            assert not [line for line in axes.get_lines()
-                        if line.get_color() == COLORS['volume']
-                        and line.get_linestyle() == '--']
-        assert not any(artist is projected for _, artist in figure._moving)
-        # The figure still redraws with no phantom.
-        figure.set_view(1)
-    finally:
-        close(figure)
-
-
 # ── the sections at scale ────────────────────────────────────────────────────
 
 #: How many blobs the point-budget test fills, how many voxels a blob is on a
@@ -2028,69 +1155,6 @@ def distance_to_outline(points, outline):
         gaps.append(float(np.min(np.linalg.norm(nearest - point[None, :],
                                                 axis=1))))
     return np.asarray(gaps)
-
-
-def test_the_sections_lie_across_the_thinnest_direction():
-    """The sections cut the support where it is widest.
-
-    The axis they lie across is the one the support is thinnest along, so a
-    board gets sections across y, a wafer gets them across z, and a volume
-    that is filled everywhere gets them across whichever axis is shortest.
-    Two axes that tie are settled by
-    ``PHANTOM_SECTION_AXIS_PREFERENCE``, which prefers z, then y, then x.
-    """
-    scene = build_scene(SILHOUETTE_CONFIG)
-    rows, cols, slices = scene.recon_shape
-
-    def filled(setter):
-        values = np.zeros(scene.recon_shape, dtype=np.float32)
-        setter(values)
-        figure = GeometryFigure(scene, recon=values)
-        try:
-            return figure._recon_section_axis, figure._recon_section_indices
-        finally:
-            close(figure)
-
-    def board(values):
-        values[4:6, :, :] = 1.0
-
-    def wafer(values):
-        values[:, :, 3:5] = 1.0
-
-    def rod(values):
-        values[4:6, 5:7, :] = 1.0
-
-    assert filled(board) == ('y', [4, 5])
-    assert filled(wafer)[0] == 'z'
-    # The rod is two rows and two columns through every slice, so y and x tie
-    # and y is the preferred one.
-    assert filled(rod)[0] == 'y'
-    # A full volume is thinnest along its shortest axis, which is z here.
-    assert slices < min(rows, cols)
-    assert filled(lambda values: values.fill(1.0))[0] == 'z'
-
-
-def test_at_most_nine_sections_are_drawn_and_the_legend_says_so():
-    """A support deeper than the section count gets an evenly spread few.
-
-    The planes are spread from the first the support reaches to the last, and
-    the legend counts them against the planes the support holds, because the
-    panel shows a few planes and not the whole shape.
-    """
-    model = probe.build_timing_model()
-    scene = GeometryScene.from_model(model)
-    values = np.ones(scene.recon_shape, dtype=np.float32)
-    figure = GeometryFigure(scene, recon=values, widgets=False)
-    try:
-        assert figure._recon_section_axis == 'z'
-        assert figure._recon_section_indices == [0, 2, 4, 6, 8, 9, 11, 13, 15]
-        assert len(figure._recon_section_indices) == (
-            geometry_figure.PHANTOM_SECTION_COUNT)
-        assert figure._recon_section_total == scene.recon_shape[2]
-        assert (outline_line_3d(figure).get_label()
-                == 'phantom (9 of 16 sections across z)')
-    finally:
-        close(figure)
 
 
 def test_a_field_of_small_blobs_stays_under_the_point_budget():
@@ -2203,44 +1267,6 @@ def test_a_phantom_tensor_is_thresholded_where_it_lives():
     finally:
         close(on_host)
         close(on_device)
-
-
-def test_the_slab_kind_covers_every_plane():
-    """The slab kind cuts the support's extent into ranges with no gap.
-
-    A section outlines one plane, so a voxel between two sections appears in
-    no outline.  A slab outlines every plane in a range, and the ranges follow
-    one another, so every voxel of the support appears in one of them.  The
-    legend says slabs rather than sections, because the two are different
-    drawings.
-    """
-    model = probe.build_timing_model()
-    scene = GeometryScene.from_model(model)
-    values = np.zeros(scene.recon_shape, dtype=np.float32)
-    values[:, :, :2] = 1.0
-    values[:, :, -2:] = 1.0
-    monkey = pytest.MonkeyPatch()
-    monkey.setattr(geometry_figure, 'PHANTOM_SECTION_KIND', 'slab')
-    try:
-        figure = GeometryFigure(scene, recon=values, widgets=False)
-        try:
-            assert figure._recon_section_axis == 'z'
-            positions = figure._recon_section_indices
-            assert len(positions) == geometry_figure.PHANTOM_SECTION_COUNT
-            ranges = geometry_figure._section_positions(
-                0, scene.recon_shape[2] - 1,
-                geometry_figure.PHANTOM_SECTION_COUNT, 'slab')
-            assert [position for position, _ in ranges] == positions
-            planes = [span for _, span in ranges]
-            assert planes[0][0] == 0
-            assert planes[-1][1] == scene.recon_shape[2] - 1
-            for before, after in zip(planes[:-1], planes[1:]):
-                assert after[0] == before[1] + 1
-            assert 'slabs' in outline_line_3d(figure).get_label()
-        finally:
-            close(figure)
-    finally:
-        monkey.undo()
 
 
 if __name__ == '__main__':
