@@ -84,7 +84,7 @@ __all__ = [
     "get_memory_stats", "SliceViewer", "VolumeStack", "slice_viewer",
     "GeometryScene", "GeometryFigure", "geometry_viewer",
     "stitch_arrays", "get_ct_model", "copy_ct_model", "save_volume_as_gif",
-    "MACE4DModel",
+    "MACE4DModel", "temporal_filter_matrix", "apply_temporal_filter",
     "generate_demo_data", "generate_3d_shepp_logan_reference",
     # Documented hsnt and vcls names; these resolve lazily through __getattr__.
     "hyper_denoise", "dehydrate", "rehydrate", "import_hsnt_data_hdf5",

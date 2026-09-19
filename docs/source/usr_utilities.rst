@@ -54,6 +54,7 @@ The functions here are for direct interactions with files.
 .. autofunction:: mbirtorch.utilities.load_data_hdf5
 .. autofunction:: mbirtorch.utilities.export_recon_hdf5
 .. autofunction:: mbirtorch.utilities.import_recon_hdf5
+.. autofunction:: mbirtorch.utilities.save_volume_as_gif
 
 
 .. _synthetic-data-generation:

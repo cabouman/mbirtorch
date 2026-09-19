@@ -1426,11 +1426,14 @@ def fit_inverse_beam_hardening_curve(forward_params, vmin=0.0, vmax=5.0, degree=
         forward_params (np.ndarray): Forward beam-hardening parameters from
             :func:`fit_beam_hardening_curve`.
         vmin (float, optional): Minimum input projection value to correct.
+            Defaults to 0.0.
         vmax (float, optional): Maximum input projection value to correct.
+            Defaults to 5.0.
         degree (int, optional): Chebyshev polynomial degree. Defaults to 10.
-        num_samples (int, optional): Number of fitting samples.
+        num_samples (int, optional): Number of fitting samples. Defaults to
+            2000.
         zero_offset_normalized (bool, optional): Match the forward model
-            normalization used to fit ``forward_params``.
+            normalization used to fit ``forward_params``. Defaults to True.
 
     Returns:
         tuple: ``(cheb_coeffs, y_domain)`` where ``cheb_coeffs`` is an

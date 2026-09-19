@@ -12,6 +12,7 @@ individual pages for more detail. See :ref:`DemosFAQs` for examples.
 * :ref:`TomographyModelDocs`
 * :ref:`GeometryModelsDocs`
 * :ref:`DenoisingDocs`
+* :ref:`MACE4DDocs`
 * :ref:`AutogradDocs`
 * :ref:`PreprocessDocs`
 * :ref:`Utilities`

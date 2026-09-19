@@ -898,8 +898,8 @@ def save_volume_as_gif(volume, filename, frame_axis=None, slice_axis=None, slice
     steps through the slices of a single time frame (``slice_axis=0``).
 
     A frame shows its two axes in increasing order, with the lower-numbered axis
-    vertical.  This is the layout that :func:`mbirtorch.slice_viewer` uses for the same
-    plane.  The axes are selected by indexing and reordering only, so the volume is not
+    vertical.  This is the layout that :func:`mbirtorch.view_utils.slice_viewer` uses
+    for the same plane.  The axes are selected by indexing and reordering only, so the volume is not
     copied.
 
     The frames are drawn with matplotlib and written with Pillow, which matplotlib

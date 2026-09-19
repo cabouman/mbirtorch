@@ -377,7 +377,7 @@ class MACE4DModel(ParameterHandler):
             frame.
 
     Example:
-        >>> mace = mbirtorch.mace4d.MACE4DModel(ct_model, frames_per_rotation=6)
+        >>> mace = mbirtorch.MACE4DModel(ct_model, frames_per_rotation=6)
         >>> mace.set_params(mace_prior_weight=0.5, rho_mann=0.5)
         >>> weights = mbirtorch.gen_weights(sinogram, weight_type='transmission_root')
         >>> recon_4d, recon_dict = mace.recon(sinogram, weights=weights, max_iterations=10)
