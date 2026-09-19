@@ -1269,6 +1269,17 @@ def fit_beam_hardening_curve(linear_projection, target_projection, num_parameter
     """
     Fit a parametric beam-hardening function from paired samples.
 
+    The fitted model is
+
+        f(p) = -log( sum_{i=1..N} exp(theta_i - i * theta_0 * p) )
+
+    with ``N = num_parameters - 1``.  The returned parameters are
+    ``[theta_0, theta_1, ..., theta_N]``.  With
+    ``zero_offset_normalized`` the model is shifted so that ``f(0) = 0``.
+    Evaluate the fitted curve with :func:`apply_beam_hardening_curve`, and
+    build the correction curve that inverts it with
+    :func:`fit_inverse_beam_hardening_curve`.
+
     Args:
         linear_projection (np.ndarray): Ideal linear projection or path-length
             samples.
