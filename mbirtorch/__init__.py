@@ -6,7 +6,7 @@ arrays by default; pass ``output_sharded=True`` to get the device tensor
 instead.  All available GPUs are used automatically.
 """
 
-__version__ = "0.1.0rc1"
+__version__ = "0.1.0"
 
 # ── persistent torch.compile cache ────────────────────────────────────────────
 # The inductor cache directory defaults to /tmp/torchinductor_<user>, which the
