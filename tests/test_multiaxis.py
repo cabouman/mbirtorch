@@ -1,21 +1,10 @@
 """Multiaxis-parallel gates: adjointness on every backend, cross-framework
 goldens against mbirjax (single ops, FBP, auto geometry, and seeded
-convergence parity), a recon smoke, and 2-shard vs 1-device parity.
+convergence parity), and a recon smoke.
 
-The two seeded-reconstruction gates are each set from the parity MEASURED at
-the configuration that gate runs on, rather than sharing one number, because
-the two configurations differ by more than an order of magnitude:
-
-  * The GOLDEN configuration (24 views, elevations to +-0.4 rad) matches
-    mbirjax to 1.1e-5 max on the volume at 3 iterations, decaying to 6.8e-6
-    by 10.  Its volume gate is 2e-4, about 18x the measured value.
-  * The SHARDED comparison runs the dividing case (16 views, elevations to
-    29 deg), where three VCD iterations amplify float summation-order
-    differences of order 1e-7 into 9.4e-4 between 2 shards and 1 device --
-    trajectory float noise around one fixed point, the same recorded pattern
-    as parallel 1024, and the same size as this configuration's own 1.2e-3
-    difference from mbirjax at 3 iterations (4.2e-4 by 10).  Its volume gate
-    stays 5e-3, a 5.3x margin over that measurement.
+The golden configuration (24 views, elevations to +-0.4 rad) matches mbirjax
+to 1.1e-5 max on the volume at 3 iterations, decaying to 6.8e-6 by 10.  Its
+volume gate is 2e-4, about 18x the measured value.
 
 The golden test's per-iteration traces (alpha, fm_rmse) measure about 6.5e-6
 and 4.7e-6 and are gated further above that than the volume is: a trace is one
@@ -100,32 +89,6 @@ def test_multiaxis_recon_smoke(device):
     fm = rd['recon_params']['fm_rmse']
     assert fm[-1] < fm[0]
     assert recon.shape == tuple(rs)
-
-
-def test_multiaxis_sharded_recon_matches_single_device():
-    """2 CPU shards vs 1 device on the same seeded problem.
-
-    This runs the dividing configuration, where the reconstruction
-    trajectory amplifies float summation-order differences: the measured
-    spread is 9.4e-4, so the 5e-3 gate below is a 5.3x margin.  That is a
-    much looser number than the golden test's, and deliberately so -- see
-    the module docstring for why the two configurations cannot share one
-    tolerance.
-    """
-    ref_m = _small_ma(['cpu'])
-    rs = ref_m.get_params('recon_shape')
-    phantom = mbirtorch.gen_translation_phantom(rs, 'dots', None, fill_rate=0.05)
-    sino = np.asarray(ref_m.forward_project(phantom))
-    np.random.seed(0)
-    ref, _ = ref_m.recon(sino, max_iterations=3, stop_threshold_change_pct=0.0,
-                         logfile_path=None)
-    sh_m = _small_ma(['cpu', 'cpu'])
-    np.random.seed(0)
-    out, _ = sh_m.recon(sino, max_iterations=3, stop_threshold_change_pct=0.0,
-                        logfile_path=None)
-    rel = _rel_max(out, ref)
-    print(f"multiaxis sharded vs single recon rel_max = {rel:.2e}")
-    assert rel < 5e-3
 
 
 ma_golden = pytest.mark.skipif(

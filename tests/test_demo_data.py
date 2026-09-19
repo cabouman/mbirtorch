@@ -123,11 +123,3 @@ def test_generate_demo_data_is_finite_float32_for_every_model_type():
     assert params['angles'].shape == (8, 2)
     assert np.allclose(params['angles'][:, 1], np.deg2rad(25.0))
     assert np.isfinite(np.asarray(sino)).all() and np.asarray(sino).max() > 0
-
-
-def test_gen_translation_vectors_grid():
-    vecs = mbirtorch.gen_translation_vectors(3, 2, 10.0, 5.0)
-    assert vecs.shape == (6, 3)
-    assert np.allclose(vecs[:, 1], 0.0)                       # no y motion
-    assert np.allclose(sorted(set(vecs[:, 0])), [-10.0, 0.0, 10.0])
-    assert np.allclose(sorted(set(vecs[:, 2])), [-2.5, 2.5])

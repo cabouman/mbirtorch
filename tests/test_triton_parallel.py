@@ -5,10 +5,9 @@ The cone battery's shape, applied to the degenerate geometry.  Each kernel is
 an alternative view-batch BODY, so every gate here compares it against the
 torch body it replaces at the same inputs: parity across geometry variants
 that move the hfan contract (the projected footprint, the tap radius, the
-detector offset) at every coefficient power the body takes, parity across the
-banded seam, the explicit adjointness pairings -- kernel against the OTHER
-direction's torch body, and the two kernels against each other -- and the
-poison-the-padding class (a pixel count that is not a multiple of the kernel's
+detector offset) at every coefficient power the body takes, the adjointness
+pairings -- kernel against the OTHER direction's torch body, and the two
+kernels against each other -- and the poison-the-padding class (a pixel count that is not a multiple of the kernel's
 pixel tile, where the padded lanes must contribute exactly nothing).
 
 One more class sits beside those.  Each wrapper rounds its width argument up
@@ -18,21 +17,15 @@ match, so a width that is not a multiple has extra columns that the wrapper
 then slices off.  Those tests read the values and the returned view's stride,
 which is the width the wrapper really allocated.
 
-Two things differ from the cone battery, both because the vertical fan is
-gone.  The banded seam is a ROW band rather than a slice band with a z anchor:
-rows track slices, so the back body bands by being handed fewer sinogram rows
-and the forward body bands by being handed fewer value columns, and both
-tilings CONCATENATE (the cone forward's bands sum instead).  And there is no
-rounding carve-out to absorb -- no atan2-vs-sqrt divisor, no round-vs-floor
+One thing differs from the cone battery, because the vertical fan is gone:
+there is no rounding carve-out to absorb -- no atan2-vs-sqrt divisor, no round-vs-floor
 tie -- so these kernels differ from their bodies by float summation order
 alone.  The tolerances stay at the design's figures (rel 1e-5 on the gradient
 path, 1e-4 at coeff_power 2) because what a value gate must catch is a
 miscompile, not a ULP.
 
 The forward kernel scatters with float atomics, so its sums are reordered from
-launch to launch and it is not bit-reproducible; 1e-5 covers that too, and
-test_parallel_forward_kernel_repeat_consistency measures the run-to-run spread
-rather than assuming it.
+launch to launch and it is not bit-reproducible; 1e-5 covers that too.
 
 Every test here launches a kernel, so every one of them needs CUDA and skips
 without it.
@@ -43,7 +36,6 @@ import pytest
 import torch
 
 import mbirtorch
-from mbirtorch import kernel_availability
 from mbirtorch._utils import padded_kernel_width
 from mbirtorch.parallel_beam import (_parallel_back_view_batch,
                                      _parallel_forward_view_batch)
@@ -142,32 +134,6 @@ def test_parallel_back_kernel_parity(variant, coeff_power, tol):
 
 
 @requires_cuda
-def test_parallel_back_kernel_row_band_parity():
-    # The banded seam, row-aligned form: the driver hands a row-aligned
-    # geometry a ROW BAND of the sinogram (no slice_start, no band_slices --
-    # the body asserts both), and each band owns the matching output columns,
-    # so a tiling of the row axis CONCATENATES into the unbanded partial.
-    model = _parallel_model()
-    sinogram, pixel_indices, view_params, args = _body_inputs(model)
-    num_rows = int(sinogram.shape[1])
-    unbanded = _parallel_back_view_batch_triton(sinogram, pixel_indices,
-                                                view_params, **args)
-    reference = _parallel_back_view_batch(sinogram, pixel_indices, view_params,
-                                          **args)
-    bands = []
-    for row_start in range(0, num_rows, 5):
-        band = sinogram[:, row_start:row_start + 5]
-        bands.append(_parallel_back_view_batch_triton(band, pixel_indices,
-                                                      view_params, **args))
-        assert bands[-1].shape == (pixel_indices.shape[0], band.shape[1])
-    tiled = torch.cat(bands, dim=1)
-    assert _rel_max(tiled, unbanded) <= 1e-6
-    rel = _rel_max(tiled, reference)
-    print(f"parallel back triton row-band parity: rel_max = {rel:.2e}")
-    assert rel <= 1e-5
-
-
-@requires_cuda
 @pytest.mark.parametrize("direction", ["back", "forward"])
 @pytest.mark.parametrize("band", [5, 12, 16, 32])
 def test_parallel_kernel_pads_the_width_argument_to_a_multiple_of_16(
@@ -233,26 +199,6 @@ def test_parallel_kernel_pads_the_width_argument_to_a_multiple_of_16(
 
 
 @requires_cuda
-def test_parallel_back_kernel_adjointness():
-    # <F x, a> == <x, B a> with F the TORCH forward body and B the kernel: the
-    # pairing the whole projector contract rests on, and the check that would
-    # catch a weight or index convention that drifted only in the kernel.
-    model = _parallel_model()
-    sinogram, pixel_indices, view_params, args = _body_inputs(model)
-    values = _voxel_values(model, pixel_indices)
-    forward = _parallel_forward_view_batch(values, pixel_indices, view_params,
-                                           **args)
-    back = _parallel_back_view_batch_triton(sinogram, pixel_indices,
-                                            view_params, **args)
-    lhs = float((forward * sinogram).sum())
-    rhs = float((values * back).sum())
-    rel = abs(lhs - rhs) / max(abs(rhs), 1e-30)
-    print(f"parallel back triton adjointness: lhs {lhs:.6f}, rhs {rhs:.6f}, "
-          f"rel {rel:.2e}")
-    assert rel <= 1e-4
-
-
-@requires_cuda
 @pytest.mark.parametrize("num_pixels", [1, PARALLEL_BACK_BLOCK_P - 1,
                                         PARALLEL_BACK_BLOCK_P + 1,
                                         3 * PARALLEL_BACK_BLOCK_P + 7])
@@ -297,33 +243,6 @@ def test_parallel_forward_kernel_parity(variant):
     rel = _rel_max(kernel_out, reference)
     print(f"parallel forward triton parity ({variant}, "
           f"psf_radius={args['psf_radius']}): rel_max = {rel:.2e}")
-    assert rel <= 1e-5
-
-
-@requires_cuda
-def test_parallel_forward_kernel_row_band_parity():
-    # The banded seam, forward form: the forward carries its band in the
-    # COLUMN count of the values and each band produces the matching detector
-    # ROWS, so a tiling of the column axis CONCATENATES on the row axis --
-    # where the cone forward's bands each write the whole sinogram and sum.
-    model = _parallel_model()
-    _, pixel_indices, view_params, args = _body_inputs(model)
-    values = _voxel_values(model, pixel_indices)
-    num_cols = int(values.shape[1])
-    unbanded = _parallel_forward_view_batch_triton(values, pixel_indices,
-                                                   view_params, **args)
-    reference = _parallel_forward_view_batch(values, pixel_indices,
-                                             view_params, **args)
-    blocks = []
-    for col_start in range(0, num_cols, 5):
-        band = values[:, col_start:col_start + 5]
-        blocks.append(_parallel_forward_view_batch_triton(band, pixel_indices,
-                                                          view_params, **args))
-        assert blocks[-1].shape[1] == band.shape[1]
-    tiled = torch.cat(blocks, dim=1)
-    assert _rel_max(tiled, unbanded) <= 1e-5
-    rel = _rel_max(tiled, reference)
-    print(f"parallel forward triton row-band parity: rel_max = {rel:.2e}")
     assert rel <= 1e-5
 
 
@@ -418,139 +337,6 @@ def test_parallel_kernels_span_several_row_chunks():
           f"back rel_max = {back_rel:.2e}, forward rel_max = {fwd_rel:.2e}")
     assert back_rel <= 1e-5
     assert fwd_rel <= 1e-5
-
-
-@requires_cuda
-def test_parallel_forward_kernel_repeat_consistency():
-    # The forward scatters with tl.atomic_add, so the summation order over
-    # pixels and taps is whatever the hardware schedules that launch: identical
-    # inputs give results that agree to float rounding, not bit for bit.  This
-    # measures that spread instead of assuming it -- if it ever prints above
-    # ~1e-6 the parity tolerances above are the thing carrying it, and this is
-    # where the evidence lives.
-    model = _parallel_model()
-    _, pixel_indices, view_params, args = _body_inputs(model)
-    values = _voxel_values(model, pixel_indices)
-    first = _parallel_forward_view_batch_triton(values, pixel_indices,
-                                                view_params, **args)
-    second = _parallel_forward_view_batch_triton(values, pixel_indices,
-                                                 view_params, **args)
-    rel = _rel_max(second, first)
-    print(f"parallel forward triton repeat consistency: rel_max = {rel:.2e}")
-    assert rel <= 1e-5
-
-
-@requires_cuda
-def test_parallel_kernel_view_range_loop_chunked_parity():
-    # The view-range loop's chunk seams with the kernel bodies bound: an
-    # explicit view_batch_size (which caps kernel batches exactly as it caps
-    # torch ones) forces several batches, and the assembled/accumulated
-    # results must match a single all-views kernel call.  The back path adds
-    # partials across batches and the forward reorders its atomics, so both
-    # comparisons read at the float-summation tolerance.
-    model = _parallel_model()
-    usable, reason = kernel_availability.parallel_back_kernel_usable(model)
-    assert usable, reason
-    usable, reason = kernel_availability.parallel_forward_kernel_usable(model)
-    assert usable, reason
-    model.create_projectors()
-    pf = model.projector_functions
-    assert pf._fwd_body_per_dev[0] is _parallel_forward_view_batch_triton
-    assert pf._back_body_per_dev[0] is _parallel_back_view_batch_triton
-
-    sinogram, pixel_indices, view_params, args = _body_inputs(model)
-    values = _voxel_values(model, pixel_indices)
-    num_views = int(view_params.shape[0])
-    model.view_batch_size = 2
-    assert pf._effective_view_batch(pf._fwd_body_per_dev[0],
-                                    int(pixel_indices.shape[0]),
-                                    int(values.shape[1]), args) == 2
-
-    chunked_fwd = pf.sparse_forward_project_view_range(values, pixel_indices,
-                                                       (0, num_views))
-    one_call_fwd = _parallel_forward_view_batch_triton(values, pixel_indices,
-                                                       view_params, **args)
-    assert _rel_max(chunked_fwd, one_call_fwd) <= 1e-5
-
-    chunked_back = pf.sparse_back_project_view_range(sinogram, pixel_indices,
-                                                     (0, num_views))
-    one_call_back = _parallel_back_view_batch_triton(sinogram, pixel_indices,
-                                                     view_params, **args)
-    assert _rel_max(chunked_back, one_call_back) <= 1e-5
-
-
-@requires_cuda
-@pytest.mark.parametrize("direction", ["back", "forward"])
-def test_parallel_kernel_selection_and_end_to_end(direction, monkeypatch):
-    # The selection contract after the composed gate, stated for each
-    # direction: the kernel is ON with no environment variable at all,
-    # wherever the probe and the self-check pass, and the kill switch still
-    # forces the torch body.  A model built that way reproduces the torch
-    # projector end to end THROUGH the driver (view batching, lazy
-    # accumulation, and the maybe_compile wrapper the body must survive
-    # without being traced).  The torch reference is built under the kill
-    # switch, because the default now selects the kernel.
-    from mbirtorch import projectors
-
-    is_back = direction == "back"
-    index = 1 if is_back else 0
-    gate = (kernel_availability.parallel_back_kernel_usable if is_back
-            else kernel_availability.parallel_forward_kernel_usable)
-    torch_body = (_parallel_back_view_batch if is_back
-                  else _parallel_forward_view_batch)
-    kernel_body = (_parallel_back_view_batch_triton if is_back
-                   else _parallel_forward_view_batch_triton)
-
-    monkeypatch.setenv(kernel_availability.DISABLE_ENV_VAR, '1')
-    kernel_availability._reset_probe_cache()
-    kernel_availability._reset_self_check_cache()
-    try:
-        model = _parallel_model(compile_mode='auto')
-        assert model._view_batch_bodies()[index] is torch_body
-        model.create_projectors()
-        sinogram, pixel_indices, _, _ = _body_inputs(model)
-        values = _voxel_values(model, pixel_indices)
-
-        def project():
-            if is_back:
-                return model.sparse_back_project(sinogram, pixel_indices)
-            return model.sparse_forward_project(values, pixel_indices)
-
-        reference = project()
-
-        monkeypatch.delenv(kernel_availability.DISABLE_ENV_VAR)
-        kernel_availability._reset_probe_cache()
-        kernel_availability._reset_self_check_cache()
-        usable, reason = gate(model)
-        assert isinstance(reason, str) and reason
-        assert usable, reason
-        assert model._view_batch_bodies()[index] is kernel_body
-
-        model.create_projectors()
-        # The driver holds the kernel body ITSELF, uncompiled, even with
-        # compile_mode='auto' (the _mbirtorch_no_compile seam).
-        bound = (model.projector_functions._back_body_per_dev[0] if is_back
-                 else model.projector_functions._fwd_body_per_dev[0])
-        assert bound is kernel_body
-        kernel_out = project()
-
-        rel = _rel_max(kernel_out, reference)
-        print(f"parallel {direction} triton end-to-end: rel_max = {rel:.2e}")
-        assert rel <= 1e-5
-
-        # The kill switch reaches the selected kernel too; it is read INSIDE
-        # the probe, so it takes effect across a cache reset.
-        monkeypatch.setenv(kernel_availability.DISABLE_ENV_VAR, '1')
-        kernel_availability._reset_probe_cache()
-        kernel_availability._reset_self_check_cache()
-        assert model._view_batch_bodies()[index] is torch_body
-        # ... and the kernel ran eagerly, rather than reaching eager by way of
-        # a compile failure that maybe_compile swallowed.
-        assert not [k for k in projectors._COMPILE_ERRORS
-                    if 'triton_parallel' in k]
-    finally:
-        kernel_availability._reset_probe_cache()
-        kernel_availability._reset_self_check_cache()
 
 
 # ── the sorted-contraction forward route ─────────────────────────

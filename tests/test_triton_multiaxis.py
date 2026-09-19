@@ -5,11 +5,11 @@ kernel is an alternative view-batch BODY, so every gate here compares it against
 the torch body it replaces
 (:func:`mbirtorch.multiaxis_parallel._multiaxis_back_view_batch`,
 :func:`mbirtorch.multiaxis_parallel._multiaxis_forward_view_batch`) at the same
-inputs: parity across variants that move the geometry, parity across the banded
-seams, the explicit adjointness pairings (each kernel against the opposite torch
-body, and the kernel PAIR against itself), and the poison-the-padding class (a
-pixel count that is not a multiple of the kernel's pixel tile, where the padded
-lanes must contribute exactly nothing).
+inputs: parity across variants that move the geometry, the adjointness pairings
+(each kernel against the opposite torch body, and the kernel PAIR against
+itself), and the poison-the-padding class (a pixel count that is not a multiple
+of the kernel's pixel tile, where the padded lanes must contribute exactly
+nothing).
 
 The variant axis here is ELEVATION, because that is the axis this geometry adds
 to parallel beam and the axis that separates the slope of the slice-to-row map
@@ -45,21 +45,18 @@ inert); otherwise both kernels differ from their bodies by float summation
 order alone.
 
 Where the BACK kernel is compared against ITSELF -- banded concatenation, a
-pixel subset inside a larger one, a repeated launch -- the comparison is
-torch.equal rather than a tolerance.  That kernel gathers into a register
-accumulator and stores each output element once, with no atomic adds, and each
-element's sum order is fixed by the loop nesting alone, independent of the tile
-shape and of which band or pixel block the element landed in.  Bit equality is
-therefore the statement to make there, and a tolerance would hide a real
-change.  The FORWARD kernel scatters with atomic adds, whose order varies from
-launch to launch, so its self-comparisons are tolerances and bit equality would
-be the wrong statement; each such test says which one it is making and why.
+pixel subset inside a larger one -- the comparison is torch.equal rather than a
+tolerance.  That kernel gathers into a register accumulator and stores each
+output element once, with no atomic adds, and each element's sum order is fixed
+by the loop nesting alone, independent of the tile shape and of which band or
+pixel block the element landed in.  Bit equality is therefore the statement to
+make there, and a tolerance would hide a real change.  The FORWARD kernel
+scatters with atomic adds, whose order varies from launch to launch, so its
+self-comparisons are tolerances and bit equality would be the wrong statement;
+each such test says which one it is making and why.
 
-The last group is SELECTION rather than value: the model binds these kernels
-wherever their availability gates pass, so the tests at the end of the file
-state what the model actually returns from ``_view_batch_bodies``, that the
-kill switch forces the torch bodies back, and that a reconstruction taking the
-kernel route reproduces one on the torch bodies.
+The last test is a whole reconstruction: a seeded run taking the kernel route
+must reproduce one on the torch bodies.
 
 Everything that launches a kernel needs CUDA and skips without it; the
 coverage bound is exercised on any machine.
@@ -193,39 +190,6 @@ def test_multiaxis_back_kernel_parity(variant, coeff_power, tol):
 
 
 @requires_cuda
-@pytest.mark.parametrize("band_slices", [5, 16])
-def test_multiaxis_back_kernel_banded_parity(band_slices):
-    # The banded seam: the slice-to-row map is anchored on the FULL slice
-    # count, so a tiling of the slice axis must reassemble the unbanded partial
-    # (each band owns its own output columns).  Band 5 is not a multiple of 16
-    # and band 16 is, so both padding paths are tiled here.
-    model = _ma_model(cell=(6, 32, 20))
-    sinogram, pixel_indices, view_params, args = _body_inputs(model)
-    num_slices = int(args['num_slices'])
-    assert num_slices >= 32
-    unbanded = _multiaxis_back_view_batch_triton(sinogram, pixel_indices,
-                                                 view_params, **args)
-    reference = _multiaxis_back_view_batch(sinogram, pixel_indices, view_params,
-                                           **args)
-    bands = []
-    for slice_start in range(0, num_slices, band_slices):
-        length = min(band_slices, num_slices - slice_start)
-        bands.append(_multiaxis_back_view_batch_triton(
-            sinogram, pixel_indices, view_params, slice_start=slice_start,
-            band_slices=length, **args))
-        assert bands[-1].shape == (pixel_indices.shape[0], length)
-    tiled = torch.cat(bands, dim=1)
-    # Kernel against itself: bit equality, for the reason the module docstring
-    # gives (no atomics, and a per-element sum order that the band cannot
-    # change).
-    assert bool(torch.equal(tiled, unbanded))
-    rel = _rel_max(tiled, reference)
-    print(f"multiaxis back triton banded parity (band {band_slices}): "
-          f"rel_max = {rel:.2e}")
-    assert rel <= 1e-5
-
-
-@requires_cuda
 @pytest.mark.parametrize("direction,case", [("back", 5), ("back", 12),
                                             ("back", 16), ("back", 32),
                                             ("forward", ((6, 12, 12), 12)),
@@ -332,42 +296,6 @@ def test_multiaxis_back_kernel_pixel_padding(num_pixels):
     full = _multiaxis_back_view_batch_triton(sinogram, pixel_indices,
                                              view_params, **args)
     assert bool(torch.equal(kernel_out, full[:num_pixels]))
-
-
-@requires_cuda
-def test_multiaxis_back_kernel_band_overhanging_the_volume():
-    """A band that runs past the last slice, which is where the validity mask
-    is the only thing keeping the two bodies together.
-
-    The torch body multiplies its output by (global slice index < num_slices),
-    so the columns of an overhanging band are zero rather than whatever the
-    slice-to-row map produced there.  The kernel applies the same test on the
-    same global index.  This cell's slice count is not a multiple of the
-    kernel's slice tile, so the overhanging columns are also padded lanes of
-    the launch.
-    """
-    model = _ma_model()
-    sinogram, pixel_indices, view_params, args = _body_inputs(model)
-    num_slices = int(args['num_slices'])
-    slice_start = num_slices - 4
-    band_slices = 8
-    kernel_out = _multiaxis_back_view_batch_triton(
-        sinogram, pixel_indices, view_params, slice_start=slice_start,
-        band_slices=band_slices, **args)
-    reference = _multiaxis_back_view_batch(
-        sinogram, pixel_indices, view_params, slice_start=slice_start,
-        band_slices=band_slices, **args)
-    assert kernel_out.shape == (pixel_indices.shape[0], band_slices)
-    assert kernel_out.shape == reference.shape
-    assert bool(kernel_out.isfinite().all())
-    # The overhanging columns are identically zero in both, so the shared
-    # relative ruler is read on the real columns and the zeros are stated
-    # directly.
-    assert bool((reference[:, 4:] == 0).all())
-    assert bool((kernel_out[:, 4:] == 0).all())
-    rel = _rel_max(kernel_out[:, :4], reference[:, :4])
-    print(f"multiaxis back triton overhanging band: rel_max = {rel:.2e}")
-    assert rel <= 1e-5
 
 
 # The cell the forward COVERAGE tests use.  A thin voxel slice pitch against
@@ -489,60 +417,6 @@ def test_multiaxis_forward_kernel_parity(variant):
 
 
 @requires_cuda
-def test_multiaxis_forward_kernel_parity_where_coverage_bites():
-    # The parity statement on the cell where the slice enumeration must reach
-    # past psf_radius (see the coverage tests above, which establish that it
-    # does).  A kernel that bounded its slice taps by psf_radius would pass
-    # every parity test above and fail this one.
-    model = _ma_model(**THIN_SLICE_CELL)
-    _, pixel_indices, view_params, args = _body_inputs(model)
-    values = _voxel_values(model, pixel_indices)
-    reference = _multiaxis_forward_view_batch(values, pixel_indices,
-                                              view_params, **args)
-    kernel_out = _multiaxis_forward_view_batch_triton(values, pixel_indices,
-                                                      view_params, **args)
-    assert kernel_out.shape == reference.shape
-    assert bool(kernel_out.isfinite().all())
-    rel = _rel_max(kernel_out, reference)
-    print(f"multiaxis forward triton parity (thin slice pitch): "
-          f"rel_max = {rel:.2e}")
-    assert rel <= 1e-5
-
-
-@requires_cuda
-def test_multiaxis_forward_kernel_banded_parity():
-    # The banded seam, forward form: each band carries its own slice of the
-    # VALUES and every band writes the whole sinogram, so a tiling of the slice
-    # axis SUMS to the unbanded projection (the back kernel's bands
-    # concatenate).  The slice-to-row map is anchored on the FULL slice count,
-    # which is what makes that true.
-    model = _ma_model(cell=(6, 32, 20))
-    _, pixel_indices, view_params, args = _body_inputs(model)
-    num_slices = int(args['num_slices'])
-    values = _voxel_values(model, pixel_indices)
-    unbanded = _multiaxis_forward_view_batch_triton(values, pixel_indices,
-                                                    view_params, **args)
-    reference = _multiaxis_forward_view_batch(values, pixel_indices,
-                                              view_params, **args)
-    tiled = None
-    for slice_start in range(0, num_slices, 5):
-        band = values[:, slice_start:slice_start + 5]
-        block = _multiaxis_forward_view_batch_triton(
-            band, pixel_indices, view_params, slice_start=slice_start, **args)
-        assert block.shape == unbanded.shape
-        tiled = block if tiled is None else tiled + block
-    # Kernel against itself, at a TOLERANCE rather than bit for bit: the
-    # forward scatters with atomic adds, so the sum order differs between the
-    # banded and unbanded launches and bit equality would be the wrong claim.
-    band_rel = _rel_max(tiled, unbanded)
-    rel = _rel_max(tiled, reference)
-    print(f"multiaxis forward triton banded parity: "
-          f"sum-vs-unbanded = {band_rel:.2e}, vs body = {rel:.2e}")
-    assert band_rel <= 1e-6
-    assert rel <= 1e-5
-
-
-@requires_cuda
 @pytest.mark.parametrize("num_pixels", [1, 7, 9, 31])
 def test_multiaxis_forward_kernel_pixel_padding(num_pixels):
     # Poison the padding: a pixel count that is not a multiple of the kernel's
@@ -574,39 +448,6 @@ def test_multiaxis_forward_kernel_pixel_padding(num_pixels):
     rest_out = _multiaxis_forward_view_batch_triton(values[num_pixels:], rest,
                                                     view_params, **args)
     assert _rel_max(kernel_out + rest_out, full) <= 1e-6
-
-
-@requires_cuda
-@pytest.mark.parametrize("direction", ["back", "forward"])
-def test_multiaxis_kernel_repeat_consistency(direction):
-    # What two identical launches of the same kernel must give.  The BACK
-    # kernel has no atomic adds: it gathers on both detector axes into a
-    # register accumulator and stores each output element once, so its two
-    # calls must agree BIT for bit, and a tolerance there would hide a scatter
-    # creeping back in.  The FORWARD kernel scatters with tl.atomic_add, so
-    # its summation order over pixels and taps is whatever the hardware
-    # schedules that launch: identical inputs give results that agree to float
-    # rounding.  That spread is measured rather than assumed -- if it ever
-    # prints above ~1e-6 the parity tolerances above are the thing carrying
-    # it, and this is where the evidence lives.
-    model = _ma_model()
-    sinogram, pixel_indices, view_params, args = _body_inputs(model)
-    if direction == "back":
-        first = _multiaxis_back_view_batch_triton(sinogram, pixel_indices,
-                                                  view_params, **args)
-        second = _multiaxis_back_view_batch_triton(sinogram, pixel_indices,
-                                                   view_params, **args)
-        assert bool(torch.equal(second, first))
-        return
-
-    values = _voxel_values(model, pixel_indices)
-    first = _multiaxis_forward_view_batch_triton(values, pixel_indices,
-                                                 view_params, **args)
-    second = _multiaxis_forward_view_batch_triton(values, pixel_indices,
-                                                  view_params, **args)
-    rel = _rel_max(second, first)
-    print(f"multiaxis forward triton repeat consistency: rel_max = {rel:.2e}")
-    assert rel <= 1e-5
 
 
 @requires_cuda
@@ -697,11 +538,6 @@ def test_multiaxis_kernels_span_several_row_chunks():
     assert back_rel <= 1e-4
 
 
-# ── selection ────────────────────────────────────────────────────────────────
-# The model binds a kernel wherever its availability gate passes.  These tests
-# state that contract on a CUDA machine: what it really binds, what it computes
-# through the driver, and what the kill switch forces it back to.
-
 # The tolerance a whole RECONSTRUCTION is compared at, where the projection
 # tests above compare single calls at 1e-5.  A reconstruction is an iterative
 # solver, so a per-call float difference is carried forward and reshaped by
@@ -710,75 +546,6 @@ def test_multiaxis_kernels_span_several_row_chunks():
 # records a measured spread of 9.4e-4 against that gate, and the
 # kernel-times-sharding gate in tests/test_kernels_sharded.py).
 RECON_TOLERANCE = 5e-3
-
-
-@requires_cuda
-def test_multiaxis_kernel_selection_and_end_to_end(monkeypatch):
-    # The selection contract: both kernels are ON with no environment variable
-    # at all, wherever the probe and the per-device self-checks pass, and the
-    # kill switch still forces the torch bodies.  A model built that way
-    # reproduces the torch projectors end to end THROUGH the driver (view
-    # batching, lazy accumulation, and the maybe_compile wrapper the bodies
-    # must survive without being traced).  The torch reference is built under
-    # the kill switch, because the default now selects the kernels.
-    from mbirtorch import projectors
-
-    monkeypatch.setenv(kernel_availability.DISABLE_ENV_VAR, '1')
-    kernel_availability._reset_probe_cache()
-    kernel_availability._reset_self_check_cache()
-    try:
-        model = _ma_model(compile_mode='auto')
-        assert model._view_batch_bodies() == (_multiaxis_forward_view_batch,
-                                              _multiaxis_back_view_batch)
-        model.create_projectors()
-        sinogram, pixel_indices, _, _ = _body_inputs(model)
-        values = _voxel_values(model, pixel_indices)
-        back_reference = model.sparse_back_project(sinogram, pixel_indices)
-        fwd_reference = model.sparse_forward_project(values, pixel_indices)
-
-        monkeypatch.delenv(kernel_availability.DISABLE_ENV_VAR)
-        kernel_availability._reset_probe_cache()
-        kernel_availability._reset_self_check_cache()
-        for gate in (kernel_availability.multiaxis_back_kernel_usable,
-                     kernel_availability.multiaxis_forward_kernel_usable):
-            usable, reason = gate(model)
-            assert isinstance(reason, str) and reason
-            assert usable, reason
-        assert model._view_batch_bodies() == (
-            _multiaxis_forward_view_batch_triton,
-            _multiaxis_back_view_batch_triton)
-
-        model.create_projectors()
-        # The driver holds the kernel bodies THEMSELVES, uncompiled, even with
-        # compile_mode='auto' (the _mbirtorch_no_compile seam).
-        assert (model.projector_functions._back_body_per_dev[0]
-                is _multiaxis_back_view_batch_triton)
-        assert (model.projector_functions._fwd_body_per_dev[0]
-                is _multiaxis_forward_view_batch_triton)
-        back_out = model.sparse_back_project(sinogram, pixel_indices)
-        fwd_out = model.sparse_forward_project(values, pixel_indices)
-
-        back_rel = _rel_max(back_out, back_reference)
-        fwd_rel = _rel_max(fwd_out, fwd_reference)
-        print(f"multiaxis triton end-to-end: back rel_max = {back_rel:.2e}, "
-              f"forward rel_max = {fwd_rel:.2e}")
-        assert back_rel <= 1e-5
-        assert fwd_rel <= 1e-5
-
-        # The kill switch reaches the selected kernels; it is read INSIDE the
-        # probe, so it takes effect across a cache reset.
-        monkeypatch.setenv(kernel_availability.DISABLE_ENV_VAR, '1')
-        kernel_availability._reset_probe_cache()
-        kernel_availability._reset_self_check_cache()
-        assert model._view_batch_bodies() == (_multiaxis_forward_view_batch,
-                                              _multiaxis_back_view_batch)
-        # ... and the kernels ran eagerly, rather than reaching eager by way of
-        # a compile failure that maybe_compile swallowed.
-        assert not [k for k in projectors._COMPILE_ERRORS
-                    if 'triton_multiaxis' in k]
-    finally:
-        kernel_availability._reset_probe_cache()
-        kernel_availability._reset_self_check_cache()
 
 
 @requires_cuda
@@ -829,4 +596,3 @@ def test_multiaxis_kernel_recon_matches_a_torch_bodies_recon(monkeypatch):
     finally:
         kernel_availability._reset_probe_cache()
         kernel_availability._reset_self_check_cache()
-

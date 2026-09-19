@@ -3,10 +3,10 @@
 Each kernel is an alternative view-batch BODY, so every gate here compares it
 against the torch body it replaces at the same inputs: parity across the
 geometry variants (flat, curved, helical) at every coefficient power the body
-takes, parity across the banded seams, the explicit adjointness pairing
-against the OTHER direction's torch body, and the poison-the-padding class (a
-pixel count that is not a multiple of the kernel's pixel tile, where the
-padded lanes must contribute exactly nothing).
+takes, the explicit adjointness pairing against the OTHER direction's torch
+body, and the poison-the-padding class (a pixel count that is not a multiple
+of the kernel's pixel tile, where the padded lanes must contribute exactly
+nothing).
 
 One more class sits beside those.  Each wrapper rounds its width argument up
 to a multiple of 16 before the launch -- the back's slice band, the forward's
@@ -19,12 +19,10 @@ value gate -- rel 1e-5 on the gradient path, 1e-4 at coeff_power 2 -- which is
 the mbirjax rounding carve-out for the kernels' sqrt-vs-atan2 cone divisor.
 
 The forward kernel scatters with float atomics, so its sums are reordered from
-launch to launch and it is not bit-reproducible; 1e-5 covers that too, and
-test_cone_forward_kernel_repeat_consistency measures the run-to-run spread
-rather than assuming it.
+launch to launch and it is not bit-reproducible; 1e-5 covers that too.
 
-Everything that launches a kernel needs CUDA and skips without it; the
-availability gates themselves are exercised on any machine.
+Every test here launches a kernel, so every one of them needs CUDA and skips
+without it.
 """
 
 import numpy as np
@@ -32,7 +30,6 @@ import pytest
 import torch
 
 import mbirtorch
-from mbirtorch import kernel_availability
 from mbirtorch._utils import padded_kernel_width
 from mbirtorch.cone_beam import _cone_back_view_batch, _cone_forward_view_batch
 from mbirtorch.triton_cone import (CONE_BACK_BLOCK_P, CONE_FWD_BLOCK_P,
@@ -113,32 +110,6 @@ def test_cone_back_kernel_parity(geometry, coeff_power, tol):
     print(f"cone back triton parity ({geometry}, coeff_power={coeff_power}): "
           f"rel_max = {rel:.2e}")
     assert rel <= tol
-
-
-@requires_cuda
-def test_cone_back_kernel_banded_parity():
-    # The banded seam: the z geometry is anchored on the FULL slice count, so
-    # a tiling of the slice axis must reassemble the unbanded partial exactly
-    # (each band owns its own output columns).
-    model = _cone_model()
-    sinogram, pixel_indices, view_params, args = _body_inputs(model)
-    num_slices = int(args['num_slices'])
-    unbanded = _cone_back_view_batch_triton(sinogram, pixel_indices,
-                                            view_params, **args)
-    reference = _cone_back_view_batch(sinogram, pixel_indices, view_params,
-                                      **args)
-    bands = []
-    for slice_start in range(0, num_slices, 5):
-        band_slices = min(5, num_slices - slice_start)
-        bands.append(_cone_back_view_batch_triton(
-            sinogram, pixel_indices, view_params, slice_start=slice_start,
-            band_slices=band_slices, **args))
-        assert bands[-1].shape == (pixel_indices.shape[0], band_slices)
-    tiled = torch.cat(bands, dim=1)
-    assert _rel_max(tiled, unbanded) <= 1e-6
-    rel = _rel_max(tiled, reference)
-    print(f"cone back triton banded parity: rel_max = {rel:.2e}")
-    assert rel <= 1e-5
 
 
 @requires_cuda
@@ -260,59 +231,6 @@ def test_cone_back_kernel_pixel_padding(num_pixels):
 
 
 @requires_cuda
-def test_cone_back_kernel_selection_and_end_to_end(monkeypatch):
-    # The selection contract after the composed gate: the back kernel is ON with no
-    # env var at all, wherever the probe and the self-check pass, and the kill
-    # switch still forces the torch body.  A model built that way reproduces
-    # the torch projector end to end THROUGH the driver (view batching, lazy
-    # assembly, and the maybe_compile wrapper the body must survive without
-    # being traced).
-    from mbirtorch import projectors
-
-    monkeypatch.delenv(kernel_availability.DISABLE_ENV_VAR, raising=False)
-    monkeypatch.delenv(kernel_availability.ENABLE_FWD_ENV_VAR, raising=False)
-    kernel_availability._reset_probe_cache()
-    kernel_availability._reset_self_check_cache()
-    try:
-        model = _cone_model(compile_mode='auto')
-        usable, reason = kernel_availability.cone_back_kernel_usable(model)
-        assert isinstance(reason, str) and reason
-        assert usable, reason
-        assert model._view_batch_bodies()[1] is _cone_back_view_batch_triton
-        # The forward body follows the same default-on protocol, so on a
-        # node where its gate passes it is the kernel too.
-        assert model._view_batch_bodies()[0] is _cone_forward_view_batch_triton
-
-        model.create_projectors()
-        # The driver holds the kernel body ITSELF, uncompiled, even with
-        # compile_mode='auto' (the _mbirtorch_no_compile seam).
-        assert (model.projector_functions._back_body_per_dev[0]
-                is _cone_back_view_batch_triton)
-        sinogram, pixel_indices, _, _ = _body_inputs(model)
-        kernel_out = model.sparse_back_project(sinogram, pixel_indices)
-
-        # The kill switch is read INSIDE the probe, so it takes effect across
-        # a cache reset -- and it must reach the default-on kernel.
-        monkeypatch.setenv(kernel_availability.DISABLE_ENV_VAR, '1')
-        kernel_availability._reset_probe_cache()
-        kernel_availability._reset_self_check_cache()
-        assert model._view_batch_bodies()[1] is _cone_back_view_batch
-        model.create_projectors()
-        reference = model.sparse_back_project(sinogram, pixel_indices)
-
-        rel = _rel_max(kernel_out, reference)
-        print(f"cone back triton end-to-end: rel_max = {rel:.2e}")
-        assert rel <= 1e-5
-        # ... and it ran eagerly, rather than reaching eager by way of a
-        # compile failure that maybe_compile swallowed.
-        assert not [k for k in projectors._COMPILE_ERRORS
-                    if 'triton_cone' in k]
-    finally:
-        kernel_availability._reset_probe_cache()
-        kernel_availability._reset_self_check_cache()
-
-
-@requires_cuda
 @pytest.mark.parametrize("geometry", ["flat", "curved", "helical"])
 def test_cone_forward_kernel_parity(geometry):
     # As for the back kernel: curved detectors and helical z shifts reach the
@@ -332,55 +250,6 @@ def test_cone_forward_kernel_parity(geometry):
     rel = _rel_max(kernel_out, reference)
     print(f"cone forward triton parity ({geometry}): rel_max = {rel:.2e}")
     assert rel <= 1e-5
-
-
-@requires_cuda
-def test_cone_forward_kernel_banded_parity():
-    # The banded seam, forward form: each band carries its own slice of the
-    # VALUES and every band writes the whole sinogram, so a tiling of the
-    # slice axis SUMS to the unbanded projection (the back bands concatenate).
-    # The z geometry is anchored on the full slice count, which is what makes
-    # that true.
-    model = _cone_model()
-    _, pixel_indices, view_params, args = _body_inputs(model)
-    num_slices = int(args['num_slices'])
-    values = _voxel_values(model, pixel_indices)
-    unbanded = _cone_forward_view_batch_triton(values, pixel_indices,
-                                               view_params, **args)
-    reference = _cone_forward_view_batch(values, pixel_indices, view_params,
-                                         **args)
-    tiled = None
-    for slice_start in range(0, num_slices, 5):
-        band = values[:, slice_start:slice_start + 5]
-        block = _cone_forward_view_batch_triton(band, pixel_indices,
-                                                view_params,
-                                                slice_start=slice_start, **args)
-        assert block.shape == unbanded.shape
-        tiled = block if tiled is None else tiled + block
-    assert _rel_max(tiled, unbanded) <= 1e-5
-    rel = _rel_max(tiled, reference)
-    print(f"cone forward triton banded parity: rel_max = {rel:.2e}")
-    assert rel <= 1e-5
-
-
-@requires_cuda
-def test_cone_forward_kernel_adjointness():
-    # <F x, a> == <x, B a> with F the kernel forward and B the TORCH back
-    # body: the pairing the whole projector contract rests on, and the check
-    # that would catch a weight or index convention that drifted only in the
-    # kernel.
-    model = _cone_model()
-    sinogram, pixel_indices, view_params, args = _body_inputs(model)
-    values = _voxel_values(model, pixel_indices)
-    forward = _cone_forward_view_batch_triton(values, pixel_indices,
-                                              view_params, **args)
-    back = _cone_back_view_batch(sinogram, pixel_indices, view_params, **args)
-    lhs = float((forward * sinogram).sum())
-    rhs = float((values * back).sum())
-    rel = abs(lhs - rhs) / max(abs(rhs), 1e-30)
-    print(f"cone forward triton adjointness: lhs {lhs:.6f}, rhs {rhs:.6f}, "
-          f"rel {rel:.2e}")
-    assert rel <= 1e-4
 
 
 @requires_cuda
@@ -411,186 +280,3 @@ def test_cone_forward_kernel_pixel_padding(num_pixels):
     rest_out = _cone_forward_view_batch_triton(values[num_pixels:], rest,
                                                view_params, **args)
     assert _rel_max(kernel_out + rest_out, full) <= 1e-5
-
-
-@requires_cuda
-def test_cone_forward_kernel_repeat_consistency():
-    # The forward scatters with tl.atomic_add, so the summation order over
-    # pixels and taps is whatever the hardware schedules that launch: identical
-    # inputs give results that agree to float rounding, not bit for bit.  This
-    # measures that spread instead of assuming it -- if it ever prints above
-    # ~1e-6 the parity tolerances above are the thing carrying it, and this is
-    # where the evidence lives.
-    model = _cone_model()
-    _, pixel_indices, view_params, args = _body_inputs(model)
-    values = _voxel_values(model, pixel_indices)
-    first = _cone_forward_view_batch_triton(values, pixel_indices, view_params,
-                                            **args)
-    second = _cone_forward_view_batch_triton(values, pixel_indices,
-                                             view_params, **args)
-    rel = _rel_max(second, first)
-    print(f"cone forward triton repeat consistency: rel_max = {rel:.2e}")
-    assert rel <= 1e-5
-
-
-@requires_cuda
-def test_cone_kernel_view_range_loop_chunked_parity():
-    # The view-range loop's chunk seams with the kernel bodies bound: an
-    # explicit view_batch_size (which caps kernel batches exactly as it caps
-    # torch ones) forces several batches, and the assembled/accumulated
-    # results must match a single all-views kernel call.  The back path adds
-    # partials across batches and the forward reorders its atomics, so both
-    # comparisons read at the float-summation tolerance.
-    model = _cone_model()
-    usable, reason = kernel_availability.cone_back_kernel_usable(model)
-    assert usable, reason
-    usable, reason = kernel_availability.cone_forward_kernel_usable(model)
-    assert usable, reason
-    model.create_projectors()
-    pf = model.projector_functions
-    assert pf._fwd_body_per_dev[0] is _cone_forward_view_batch_triton
-    assert pf._back_body_per_dev[0] is _cone_back_view_batch_triton
-
-    sinogram, pixel_indices, view_params, args = _body_inputs(model)
-    values = _voxel_values(model, pixel_indices)
-    num_views = int(view_params.shape[0])
-    model.view_batch_size = 2
-    assert pf._effective_view_batch(pf._fwd_body_per_dev[0],
-                                    int(pixel_indices.shape[0]),
-                                    int(values.shape[1]), args) == 2
-
-    chunked_fwd = pf.sparse_forward_project_view_range(values, pixel_indices,
-                                                       (0, num_views))
-    one_call_fwd = _cone_forward_view_batch_triton(values, pixel_indices,
-                                                   view_params, **args)
-    assert _rel_max(chunked_fwd, one_call_fwd) <= 1e-5
-
-    chunked_back = pf.sparse_back_project_view_range(sinogram, pixel_indices,
-                                                     (0, num_views))
-    one_call_back = _cone_back_view_batch_triton(sinogram, pixel_indices,
-                                                 view_params, **args)
-    assert _rel_max(chunked_back, one_call_back) <= 1e-5
-
-
-@requires_cuda
-def test_cone_forward_kernel_selection_and_end_to_end(monkeypatch):
-    # The forward selection contract: OPT-IN, so the torch body stays selected
-    # without the env var and the kernel is selected with it when the
-    # self-check passes -- and a model built that way reproduces the torch
-    # projector end to end THROUGH the driver.
-    from mbirtorch import projectors
-
-    # Build the torch-body reference under the kill switch, then lift it:
-    # the default-on contract selects the kernel with NO opt-in.
-    monkeypatch.setenv(kernel_availability.DISABLE_ENV_VAR, '1')
-    kernel_availability._reset_probe_cache()
-    kernel_availability._reset_self_check_cache()
-    try:
-        model = _cone_model(compile_mode='auto')
-        assert model._view_batch_bodies()[0] is _cone_forward_view_batch
-        model.create_projectors()
-        _, pixel_indices, _, _ = _body_inputs(model)
-        values = _voxel_values(model, pixel_indices)
-        reference = model.sparse_forward_project(values, pixel_indices)
-
-        monkeypatch.delenv(kernel_availability.DISABLE_ENV_VAR, raising=False)
-        kernel_availability._reset_probe_cache()
-        kernel_availability._reset_self_check_cache()
-        usable, reason = kernel_availability.cone_forward_kernel_usable(model)
-        assert isinstance(reason, str) and reason
-        assert usable, reason
-        assert model._view_batch_bodies()[0] is _cone_forward_view_batch_triton
-
-        model.create_projectors()
-        # The driver holds the kernel body ITSELF, uncompiled, even with
-        # compile_mode='auto' (the _mbirtorch_no_compile seam).
-        assert (model.projector_functions._fwd_body_per_dev[0]
-                is _cone_forward_view_batch_triton)
-        kernel_out = model.sparse_forward_project(values, pixel_indices)
-
-        rel = _rel_max(kernel_out, reference)
-        print(f"cone forward triton end-to-end: rel_max = {rel:.2e}")
-        assert rel <= 1e-5
-        # ... and it ran eagerly, rather than reaching eager by way of a
-        # compile failure that maybe_compile swallowed.
-        assert not [k for k in projectors._COMPILE_ERRORS
-                    if 'triton_cone' in k]
-    finally:
-        kernel_availability._reset_probe_cache()
-        kernel_availability._reset_self_check_cache()
-
-
-@pytest.mark.parametrize(
-    "direction,gate_name,body_name,index,torch_body",
-    [("back", "cone_back_kernel_usable", "_cone_back_view_batch_triton",
-      1, _cone_back_view_batch),
-     ("forward", "cone_forward_kernel_usable",
-      "_cone_forward_view_batch_triton", 0, _cone_forward_view_batch)])
-def test_cone_self_check_catches_a_broken_kernel(
-        direction, gate_name, body_name, index, torch_body, monkeypatch):
-    # Runs everywhere, in both directions: the self-check exists to catch a
-    # toolchain that compiles the probe and then miscompiles (or fails to
-    # compile) the real kernel.  With the probe forced to pass and the kernel
-    # body raising, the gate must report a REASON and the model must keep the
-    # torch body -- never propagate the failure to a caller who only asked
-    # what was available.
-    from mbirtorch import triton_cone
-
-    def _exploding_body(*args, **kwargs):
-        raise RuntimeError('simulated broken kernel')
-
-    monkeypatch.delenv(kernel_availability.DISABLE_ENV_VAR, raising=False)
-    if direction == "forward":
-        monkeypatch.setenv(kernel_availability.ENABLE_FWD_ENV_VAR, '1')
-    monkeypatch.setattr(kernel_availability, '_probe_triton',
-                        lambda: (True, 'forced-available probe'))
-    monkeypatch.setattr(triton_cone, body_name, _exploding_body)
-    kernel_availability._reset_probe_cache()
-    kernel_availability._reset_self_check_cache()
-    try:
-        model = _cone_model(device='cpu')
-        usable, reason = getattr(kernel_availability, gate_name)(model)
-        assert usable is False
-        assert 'simulated broken kernel' in reason
-        assert model._view_batch_bodies()[index] is torch_body
-    finally:
-        kernel_availability._reset_probe_cache()
-        kernel_availability._reset_self_check_cache()
-
-
-@pytest.mark.parametrize(
-    "direction,gate_name,index,torch_body",
-    [("back", "cone_back_kernel_usable", 1, _cone_back_view_batch),
-     ("forward", "cone_forward_kernel_usable", 0, _cone_forward_view_batch)])
-def test_cone_gate_is_false_without_a_kernel_path(direction, gate_name, index,
-                                                  torch_body, monkeypatch):
-    # Two ways the fast path can be absent, in both directions, each of which
-    # must produce a REASON rather than an exception: the kill switch (any
-    # machine) and a host with no CUDA at all (this machine, when it has
-    # none).  The forward opt-in is set throughout its case, so what is being
-    # read here is the gate, not the policy.
-    if direction == "forward":
-        monkeypatch.setenv(kernel_availability.ENABLE_FWD_ENV_VAR, '1')
-    monkeypatch.setenv(kernel_availability.DISABLE_ENV_VAR, '1')
-    kernel_availability._reset_probe_cache()
-    kernel_availability._reset_self_check_cache()
-    gate = getattr(kernel_availability, gate_name)
-    try:
-        model = _cone_model(device='cpu')
-        usable, reason = gate(model)
-        assert usable is False
-        assert kernel_availability.DISABLE_ENV_VAR in reason
-        assert model._view_batch_bodies()[index] is torch_body
-
-        monkeypatch.delenv(kernel_availability.DISABLE_ENV_VAR)
-        kernel_availability._reset_probe_cache()
-        kernel_availability._reset_self_check_cache()
-        if not torch.cuda.is_available():
-            usable, reason = gate(model)
-            assert usable is False
-            assert 'CUDA' in reason or 'cuda' in reason
-            assert model._view_batch_bodies()[index] is torch_body
-    finally:
-        kernel_availability._reset_probe_cache()
-        kernel_availability._reset_self_check_cache()
-

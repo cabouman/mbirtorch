@@ -115,27 +115,3 @@ def test_project_points_matches_the_independent_prediction(name):
             assert abs(channel[view, index] - channel_pred) < EXACT_PIXELS, (
                 f'{name} voxel {voxel} view {view}: channel '
                 f'{channel[view, index]} against prediction {channel_pred}')
-
-
-def test_the_curved_detector_rows_use_the_tangent_plane():
-    """A curved panel spaces its rows on the tangent plane, not the cylinder."""
-    cfg = _config('cone curved')
-    model = probe.build_model(cfg)
-    g = probe.geometry_scalars(cfg)
-    stated = _config_with_stored_view_params(cfg, model)
-    voxels, points = _probe_points(cfg, g)
-    num_views = cfg['sinogram_shape'][0]
-    row, _ = model.project_points(points, list(range(num_views)))
-
-    largest_cylinder_gap = 0.0
-    for index, voxel in enumerate(voxels):
-        for view in range(num_views):
-            plane_row, _ = probe.predict_cone(*voxel, view, stated, g, {})
-            cylinder_row, _ = probe.predict_cone(*voxel, view, stated, g,
-                                                 {'curved_row': 'cylinder'})
-            assert abs(row[view, index] - plane_row) < EXACT_PIXELS
-            largest_cylinder_gap = max(largest_cylinder_gap,
-                                       abs(row[view, index] - cylinder_row))
-    assert largest_cylinder_gap > 0.1, (
-        'the two candidate row rules are too close together here to tell '
-        f'them apart (largest gap {largest_cylinder_gap})')

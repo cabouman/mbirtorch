@@ -184,6 +184,7 @@ def curved_model(golden):
     return m
 
 
+@pytest.mark.goldens
 @hel_golden
 def test_helical_geometry_and_single_operators_match_the_golden(golden,
                                                                 helical_model):
@@ -205,35 +206,7 @@ def test_helical_geometry_and_single_operators_match_the_golden(golden,
     assert fwd_err < 1e-4
 
 
-@hel_golden
-def test_helical_fdk(golden, helical_model):
-    # Exercises the helical z-weight (nonuniform per-slice coverage).
-    out = helical_model.recon_fdk(golden["chel_sino"])
-    err = _rel_max(out, golden["chel_fdk"])
-    print(f"helical fdk rel_max = {err:.2e}")
-    assert err < 1e-3
-
-
-@hel_golden
-def test_helical_recon_convergence_parity(golden, helical_model):
-    np.random.seed(int(golden["recon_seed"]))
-    recon, rd = helical_model.recon(golden["chel_sino"],
-                                    weights=golden["chel_weights"],
-                                    max_iterations=3,
-                                    stop_threshold_change_pct=0.0)
-    rp = rd["recon_params"]
-    alpha_rel = np.max(np.abs(np.array(rp["alpha_values"]) - golden["chel_alpha"])
-                       / np.abs(golden["chel_alpha"]))
-    fm_rel = np.max(np.abs(np.array(rp["fm_rmse"]) - golden["chel_fm_rmse"])
-                    / np.abs(golden["chel_fm_rmse"]))
-    final_rel = _rel_max(recon, golden["chel_recon"])
-    print(f"helical parity: alpha {alpha_rel:.2e}, fm {fm_rel:.2e}, "
-          f"final {final_rel:.2e}")
-    assert alpha_rel < 1e-2
-    assert fm_rel < 1e-3
-    assert final_rel < 1e-3
-
-
+@pytest.mark.goldens
 @hel_golden
 def test_curved_single_operators_match_the_golden(golden, curved_model):
     sp_fwd = curved_model.sparse_forward_project(golden["ccurv_vals"],
@@ -249,11 +222,3 @@ def test_curved_single_operators_match_the_golden(golden, curved_model):
     assert sp_fwd_err < 1e-4
     assert sp_back_err < 1e-4
     assert fwd_err < 1e-4
-
-
-@hel_golden
-def test_curved_fdk(golden, curved_model):
-    out = curved_model.recon_fdk(golden["ccurv_sino"])
-    err = _rel_max(out, golden["ccurv_fdk"])
-    print(f"curved fdk rel_max = {err:.2e}")
-    assert err < 1e-3

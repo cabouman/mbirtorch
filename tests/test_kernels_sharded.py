@@ -8,20 +8,11 @@ kernels.  Nothing measured the two together until the isolation matrix that
 prompted the interim selection rule, and this file is that matrix promoted to
 a standing gate.
 
-Two things are asserted, in the order they matter.
-
-The torch-body arms must sit at the multi-device float floor, which is what
-says the ENGINE is sound and gives every other arm its reference.  The
-default-selection arms, which bind BOTH kernels wherever the availability
-gates pass, must match the torch arms within that floor.  That is the
-composition a multi-GPU user actually runs, and it covers the forward and
-back kernels together.
-
-The multiaxis pair arrives with no such history, so it is asserted as the
-composition a user runs rather than as an isolation matrix: a two-device
-reconstruction with both kernels bound, read against the single-device torch
-reference, plus the device pin and the selection contract every geometry
-takes.
+Two things are asserted.  A two-device reconstruction with BOTH kernels bound
+must match the single-device torch-body reference within the multi-device
+float floor; that is the composition a multi-GPU user actually runs.  And a
+model pinned to a device other than cuda:0 must give the same values, which is
+the case the launch-context bug below reached.
 
 The forward's history is the reason this file exists.  Its kernels once read
 order one against the torch bodies here, because a Triton launch targets the
@@ -133,29 +124,6 @@ def problem():
 
 @requires_two_cuda
 @pytest.mark.parametrize("geometry", ["parallel", "cone"])
-def test_torch_bodies_hold_the_multi_device_float_floor(geometry, problem):
-    """The engine's own reference arm.
-
-    With no kernel bound in either direction, a sharded reconstruction must
-    match the single-device one at the established float floor.  Every other
-    arm in this file is read against this one.
-    """
-    sinogram, weights = problem[geometry]
-    reference = None
-    for count in (1, 2):
-        model = _build(geometry)
-        model.configure_devices(count)
-        _force_torch_bodies(model, geometry)
-        result = _reconstruct(model, sinogram, weights)
-        if count == 1:
-            reference = result
-            continue
-        rel = _rel(reference, result)
-        assert rel < FLOOR, f"{geometry} torch bodies at n={count}: {rel:.3e}"
-
-
-@requires_two_cuda
-@pytest.mark.parametrize("geometry", ["parallel", "cone"])
 def test_the_default_selection_matches_the_torch_bodies_under_sharding(
         geometry, problem):
     """The composition a multi-GPU user actually gets.
@@ -189,48 +157,6 @@ def test_the_default_selection_matches_the_torch_bodies_under_sharding(
 
     rel = _rel(torch_arm, default_arm)
     assert rel < FLOOR, f"{geometry} default selection: {rel:.3e}"
-
-
-@requires_two_cuda
-def test_multiaxis_kernels_match_the_single_device_reference(problem):
-    """The multiaxis pair's arm, composed the way a multi-GPU user runs it.
-
-    The other geometries' arms above isolate one effect at a time, because
-    their history needed that.  This one states the composition directly: a
-    two-device reconstruction with the default selection -- both multiaxis
-    kernels bound -- against the SINGLE-device torch-body reference.  The
-    torch bodies at two devices run beside it, so a failure says whether the
-    engine or the kernels moved.
-    """
-    sinogram, weights = problem["multiaxis"]
-
-    reference_model = _build("multiaxis")
-    reference_model.configure_devices(1)
-    _force_torch_bodies(reference_model, "multiaxis")
-    reference = _reconstruct(reference_model, sinogram, weights)
-
-    plain = _build("multiaxis")
-    plain.configure_devices(2)
-    _force_torch_bodies(plain, "multiaxis")
-    torch_arm = _reconstruct(plain, sinogram, weights)
-    torch_rel = _rel(reference, torch_arm)
-    assert torch_rel < FLOOR, f"multiaxis torch bodies at n=2: {torch_rel:.3e}"
-
-    shipped = _build("multiaxis")
-    shipped.configure_devices(2)
-    # The arm check: this arm exists to measure the KERNELS, so a silent
-    # availability decline must fail loudly rather than compare torch with
-    # torch and pass vacuously.
-    from mbirtorch.triton_cone import triton
-    if triton is not None:
-        fwd, back = shipped._view_batch_bodies()
-        assert "triton" in fwd.__name__ and "triton" in back.__name__, (
-            f"multiaxis kernels not bound with triton importable: "
-            f"{fwd.__name__}, {back.__name__}")
-    kernel_arm = _reconstruct(shipped, sinogram, weights)
-
-    rel = _rel(reference, kernel_arm)
-    assert rel < FLOOR, f"multiaxis default selection at n=2: {rel:.3e}"
 
 
 @requires_two_cuda

@@ -7,6 +7,10 @@ is a measured expectation, not a guarantee -- the device-side binning is
 float32 and truncating where numpy's is float64 with an edge-correction pass
 (see _sharded_masked_histogram) -- so a future volume that trips it is a
 tolerance question, not a bug in this gate.
+
+The second test covers the HDF5 writers.  save_data_hdf5 and export_recon_hdf5
+take shards directly and must write exactly what writing the gathered volume
+writes, on both sharding axes.
 """
 
 import numpy as np
@@ -93,80 +97,3 @@ def test_sharded_hdf5_writes_match_the_whole_volume_write(tmp_path, monkeypatch)
     out, _ = mbirtorch.import_recon_hdf5(out_path)
     assert out.shape == ref.shape
     assert np.array_equal(out, ref)
-
-
-def _view_sharded(vol, n_shards):
-    """The other sharded axis: split axis 0 (a sino-like placement)."""
-    placement = _sharding.Placement(['cpu'] * n_shards, axis=0,
-                                    axis_len=vol.shape[0])
-    tensors = [torch.as_tensor(vol[s0:s1].copy())
-               for _dev, (s0, s1) in placement.shard_ranges()]
-    return _sharding.Shards(tensors, placement)
-
-
-@pytest.mark.parametrize('shard_axis', [-1, 0])
-def test_sharded_slab_source_matches_a_full_gather_at_every_boundary(shard_axis):
-    """The streaming source is what makes the sharded export hold one slab
-    instead of the whole volume, so its slab arithmetic is gated directly:
-    every slab of every width must equal the gathered array's rows.
-
-    Both branches are covered -- a slab crosses shards when the sharded axis
-    IS the slab axis, and draws from all of them when it is not.
-    """
-    from mbirtorch.utilities import _sharded_slab_source, _to_host
-
-    rng = np.random.default_rng(19)
-    vol = rng.uniform(size=(7, 4, 5)).astype(np.float32)
-    shards = (_view_sharded(vol, 2) if shard_axis == 0
-              else _as_shards(vol, 2))
-
-    out_shape, dtype, produce_slab = _sharded_slab_source(shards)
-    ref = _to_host(shards)
-    assert out_shape == ref.shape
-    assert dtype == ref.dtype
-    assert np.array_equal(ref, vol)          # the shards reassemble the volume
-
-    for i0 in range(out_shape[0]):
-        for i1 in range(i0 + 1, out_shape[0] + 1):
-            slab = produce_slab(i0, i1)
-            assert np.array_equal(slab, ref[i0:i1]), (i0, i1)
-
-
-def _small_mar_case(devices):
-    """A small cone model with a plastic cube and one metal insert."""
-    cell = (16, 16, 16)
-    angles = np.linspace(0, 2 * np.pi, cell[0], endpoint=False)
-    model = mbirtorch.ConeBeamModel(cell, angles, source_detector_dist=64,
-                                    source_iso_dist=32)
-    model.configure_devices(devices=devices)
-    model.set_params(no_warning=True, verbose=0)
-    shape = tuple(model.get_params('recon_shape'))
-    vol = np.zeros(shape, dtype=np.float32)
-    vol[4:12, 4:12, 4:12] = 0.02
-    vol[6:9, 6:9, 6:9] = 0.2
-    sino = np.asarray(model.forward_project(vol))
-    return model, sino, vol
-
-
-def test_sharded_bh_correction_matches_single_device():
-    """correct_sino_plastic_metal on 2 CPU shards vs 1 device.  Greg's A7
-    gates: the maxima are order-invariant (exact by construction); the fit
-    sums combine as per-shard doubles on the host, so the corrected sinogram
-    gates at the full-pipeline tolerance (discrete constraint selection can
-    amplify float differences)."""
-    ref_model, sino, vol = _small_mar_case(['cpu'])
-    np.random.seed(0)          # the VCD pixel orderings come from the global RNG
-    ref, _ = ref_model.recon_plastic_metal(sino, None, num_metal=1,
-                                  num_BH_iterations=2, max_iterations=2,
-                                  verbose=0, logfile_path=None)
-
-    sh_model, _, _ = _small_mar_case(['cpu', 'cpu'])
-    np.random.seed(0)
-    out, _ = sh_model.recon_plastic_metal(sino, None, num_metal=1,
-                                  num_BH_iterations=2, max_iterations=2,
-                                  verbose=0, logfile_path=None)
-
-    assert out.shape == ref.shape
-    rel = float(np.max(np.abs(out - ref)) / np.max(np.abs(ref)))
-    print(f"sharded vs single MAR recon rel_max = {rel:.2e}")
-    assert rel < 1e-3

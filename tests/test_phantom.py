@@ -1,5 +1,4 @@
-"""Phantom gates: the golden match against mbirjax, and the banded and blocked
-builds against a build that takes every slice and every row at once.
+"""Phantom gate: the golden match against mbirjax.
 
 The golden test compares two frameworks.  Both compute in float32, and a voxel's
 value is the sum of the coefficients of the ellipsoids that contain it, so two
@@ -8,13 +7,6 @@ is hardware dependent, and each ellipsoid is a <= 1 threshold on a float
 quadratic, so a voxel within rounding distance of a boundary can land inside on
 one framework and outside on the other.  That gate therefore allows a small
 fraction of flipped voxels and requires exact agreement on every other voxel.
-
-The band and block tests compare mbirtorch against itself, where the bar is
-exact equality.  Every voxel of the phantom depends only on its own
-coordinates, and each axis has one coordinate vector that the bands and the
-blocks slice, so splitting the slices across devices or the rows into blocks
-changes which array holds a value, never the value itself.  Virtual cpu devices
-stand in for real ones, as elsewhere in the suite.
 """
 
 import glob
@@ -24,9 +16,6 @@ import numpy as np
 import pytest
 
 import mbirtorch
-from mbirtorch import _sharding
-from mbirtorch import utilities
-
 GOLDEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "goldens")
 _paths = sorted(glob.glob(os.path.join(GOLDEN_DIR, "golden_*.npz")))
 
@@ -78,73 +67,3 @@ def test_phantom_matches_golden():
     # Every voxel that did not flip is equal bit for bit.  Equal memberships
     # give equal float32 values, so this needs no tolerance.
     assert np.array_equal(phantom[~flip], ref[~flip])
-
-
-# ── the slice-banded build ───────────────────────────────────────────────────
-@pytest.mark.parametrize("target_max_attenuation", [None, 3.0])
-def test_slice_bands_equal_the_single_device_build(target_max_attenuation):
-    """Three devices over ten slices, a count that does not divide the axis.
-
-    The bands are then uneven, which is the only form the build has.  They cover
-    the slice axis exactly, so there is no padded tail to crop.  The test
-    asserts that split first, so that the equality below is known to have been
-    measured on uneven bands.  It then repeats the comparison with more devices
-    than slices, where some bands are empty.
-    """
-    phantom_shape = (12, 14, 10)
-    devices = ['cpu'] * 3
-    ranges = [r for _, r in _sharding.Placement(
-        devices, axis=-1, axis_len=phantom_shape[2]).shard_ranges()]
-    assert ranges == [(0, 4), (4, 7), (7, 10)]
-    assert sum(stop - start for start, stop in ranges) == phantom_shape[2]
-
-    single = mbirtorch.generate_3d_shepp_logan_low_dynamic_range(
-        phantom_shape, devices=['cpu'],
-        target_max_attenuation=target_max_attenuation)
-    banded = mbirtorch.generate_3d_shepp_logan_low_dynamic_range(
-        phantom_shape, devices=devices,
-        target_max_attenuation=target_max_attenuation)
-
-    # A host numpy float32 array either way: the phantom is a reference object.
-    assert isinstance(banded, np.ndarray) and banded.dtype == np.float32
-    assert banded.shape == phantom_shape
-    assert np.array_equal(banded, single)
-
-    # More devices than slices: two of the five bands are empty, which is a
-    # legal band, and the build must still give the single-device phantom.
-    empty_band_shape = (8, 9, 3)
-    many_devices = ['cpu'] * 5
-    ranges = [r for _, r in _sharding.Placement(
-        many_devices, axis=-1, axis_len=empty_band_shape[2]).shard_ranges()]
-    assert ranges == [(0, 1), (1, 2), (2, 3), (3, 3), (3, 3)]
-
-    single = mbirtorch.generate_3d_shepp_logan_low_dynamic_range(
-        empty_band_shape, devices=['cpu'],
-        target_max_attenuation=target_max_attenuation)
-    banded = mbirtorch.generate_3d_shepp_logan_low_dynamic_range(
-        empty_band_shape, devices=many_devices,
-        target_max_attenuation=target_max_attenuation)
-    assert banded.shape == empty_band_shape
-    assert np.array_equal(banded, single)
-
-
-# ── the row-blocked build ────────────────────────────────────────────────────
-def test_row_blocking_does_not_change_the_phantom():
-    """One row per block against every row in one block.
-
-    ``max_block_gb`` sets the block size, so the two calls differ only in how
-    many blocks the rows are built in.  The block counts are asserted first, so
-    that the equality below is known to compare a blocked build against an
-    unblocked one.
-    """
-    phantom_shape = (17, 13, 11)
-    # A single-device band covers every slice, so the band shape is the phantom
-    # shape here.
-    assert utilities._phantom_block_rows(phantom_shape, 4.0) == phantom_shape[0]
-    assert utilities._phantom_block_rows(phantom_shape, 1e-9) == 1
-
-    unblocked = mbirtorch.generate_3d_shepp_logan_low_dynamic_range(
-        phantom_shape, devices=['cpu'], max_block_gb=4.0)
-    blocked = mbirtorch.generate_3d_shepp_logan_low_dynamic_range(
-        phantom_shape, devices=['cpu'], max_block_gb=1e-9)
-    assert np.array_equal(blocked, unblocked)

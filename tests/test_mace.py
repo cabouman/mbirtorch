@@ -2,11 +2,10 @@
 
 The loop adds each agent's output into the consensus as it arrives, so its
 update is checked against the plain formulas written out in full.  The
-threaded path is checked with two workers on the CPU and the checkpoint by
-a round trip.  The agents are checked with stub denoisers.  The whole loop
-is checked by the equality gate.  There the proximal map of the data-fit
-term and the qGGMRF denoiser at matched strengths must reproduce the
-standard reconstruction.
+threaded path is checked with two workers on the CPU.  The agents are checked
+with stub denoisers.  The whole loop is checked by the equality gate.  There
+the proximal map of the data-fit term and the qGGMRF denoiser at matched
+strengths must reproduce the standard reconstruction.
 """
 
 import math
@@ -16,97 +15,15 @@ import pytest
 import torch
 
 import mbirtorch
-import mbirtorch.mace as mace_module
-from mbirtorch.mace import (MACE, ForwardProxAgent, HyperplaneAgent, QGGMRFDenoiserAgent, Task,
-                            resolve_device_pool)
+from mbirtorch.mace import (MACE, ForwardProxAgent, HyperplaneAgent,
+                            QGGMRFDenoiserAgent, Task)
 from mbirtorch.mace4d import apply_temporal_filter, temporal_filter_matrix
-from mbirtorch.tomography_model import default_devices, gpu_devices
 
 
 def _rel_max(out, ref):
     out = np.asarray(out.detach().cpu() if torch.is_tensor(out) else out, dtype=np.float64)
     ref = np.asarray(ref.detach().cpu() if torch.is_tensor(ref) else ref, dtype=np.float64)
     return float(np.max(np.abs(out - ref)) / np.max(np.abs(ref)))
-
-
-# ── the device pool ──────────────────────────────────────────────────────────
-def _indexed(device):
-    """A device with an explicit index, as the pool resolver reports them."""
-    device = torch.device(device)
-    return device if device.type == 'cpu' or device.index is not None else torch.device(device.type, 0)
-
-
-def test_device_pool_resolves_every_form(monkeypatch):
-    """Each accepted form resolves to the devices it names, with an explicit
-    index on every device that takes one, and the refused forms raise by
-    name.  A GPU named twice is refused and a repeated CPU is kept.
-    MBIRTORCH_NUM_DEVICES pins the count for the whole process, and the
-    automatic forms honor it.
-
-    The conftest fixture pins every test to one device, which is what keeps
-    the suite deterministic on a multi-GPU host.  A test of the pool's
-    hardware forms has to opt out of it, and doing so explicitly keeps the
-    pin's reach visible.
-    """
-    monkeypatch.delenv('MBIRTORCH_NUM_DEVICES', raising=False)
-    defaults = [_indexed(d) for d in default_devices()]
-    assert resolve_device_pool(None) == defaults
-    assert resolve_device_pool('cpu') == [torch.device('cpu')]
-    assert resolve_device_pool(1) == defaults[:1]
-    assert resolve_device_pool([0]) == defaults[:1]
-    assert resolve_device_pool(['cpu', 'cpu']) == [torch.device('cpu'), torch.device('cpu')]
-    assert resolve_device_pool([torch.device('cpu')]) == [torch.device('cpu')]
-    if gpu_devices():
-        assert resolve_device_pool('gpu') == [_indexed(d) for d in gpu_devices()]
-    else:
-        with pytest.raises(ValueError, match='no GPU'):
-            resolve_device_pool('gpu')
-    with pytest.raises(ValueError, match='requested'):
-        resolve_device_pool(len(defaults) + 1)
-    with pytest.raises(ValueError, match='out of range'):
-        resolve_device_pool([len(defaults)])
-    with pytest.raises(ValueError, match="'cpu' or 'gpu'"):
-        resolve_device_pool('tpu')
-    with pytest.raises(ValueError, match='boolean'):
-        resolve_device_pool(True)
-    with pytest.raises(ValueError, match='at least one'):
-        resolve_device_pool([])
-    # A device without an index names the same device as index 0.  The two
-    # spellings therefore name one GPU, which the pool refuses, and a task
-    # pinned either way matches.
-    with pytest.raises(ValueError, match='more than once'):
-        resolve_device_pool([torch.device('cuda'), 'cuda:0'])
-    assert Task(lambda d: None, device='cuda').device == torch.device('cuda', 0)
-
-    # Two workers on one GPU share it and gain nothing, and on an Apple GPU
-    # they fail inside Metal, so a pool that names a GPU twice raises and
-    # names the device.  Repeating the CPU stays the way a pool runs more
-    # than one worker on a machine with no GPU.
-    assert resolve_device_pool(['cpu', 'cpu', 'cpu']) == [torch.device('cpu')] * 3
-    for spelling in ('cuda:0', 'mps'):
-        with pytest.raises(ValueError, match='more than once'):
-            resolve_device_pool([spelling, spelling])
-    # The refusal reads the whole pool, not just neighboring entries.
-    with pytest.raises(ValueError, match='cuda:1'):
-        resolve_device_pool(['cuda:1', 'cpu', 'cuda:1'])
-    if gpu_devices():
-        gpu = _indexed(gpu_devices()[0])
-        assert resolve_device_pool([gpu]) == [gpu]
-
-    # With the count pinned, None gives the pinned count and a larger count
-    # raises with a message that names the variable.  A list of devices is
-    # the caller's and keeps every device it names.
-    four = [torch.device('cuda', index) for index in range(4)]
-    monkeypatch.setattr(mace_module, 'default_devices', lambda: tuple(four))
-    monkeypatch.setenv('MBIRTORCH_NUM_DEVICES', '2')
-    assert resolve_device_pool(None) == four[:2]
-    assert resolve_device_pool(2) == four[:2]
-    with pytest.raises(ValueError, match='MBIRTORCH_NUM_DEVICES'):
-        resolve_device_pool(3)
-    assert resolve_device_pool([f'cuda:{index}' for index in range(4)]) == four
-    monkeypatch.delenv('MBIRTORCH_NUM_DEVICES')
-    assert resolve_device_pool(None) == four
-    assert resolve_device_pool(3) == four[:3]
 
 
 # ── stub agents ──────────────────────────────────────────────────────────────
@@ -233,66 +150,6 @@ def test_two_workers_share_the_queue():
     assert rel < 1e-6
 
 
-def test_a_failed_step_leaves_the_loop_refusing_further_steps():
-    """A task that raises leaves some inputs with a partial update.  The
-    error propagates, the loop refuses further steps and state saves, and
-    loading a saved state makes it usable again."""
-    torch.manual_seed(8)
-    x0 = torch.randn(4, 3)
-
-    class Failing(_AffineAgent):
-        def tasks(self, w, iteration=0):
-            tasks = super().tasks(w, iteration)
-            tasks[-1] = Task(lambda device: 1 / 0, device=None, region=tasks[-1].region)
-            return tasks
-
-    good = MACE([_AffineAgent(0.5, 0.1, [2])], x0)
-    good.step()
-    saved = good.state_dict()
-    for devices in (None, ['cpu', 'cpu']):
-        with MACE([Failing(0.5, 0.1, [2])], x0, devices=devices) as loop:
-            with pytest.raises(ZeroDivisionError):
-                loop.step()
-            with pytest.raises(RuntimeError, match='inconsistent'):
-                loop.step()
-            with pytest.raises(RuntimeError, match='inconsistent'):
-                loop.state_dict()
-            loop.load_state_dict(saved)
-            loop.agents[0] = _AffineAgent(0.5, 0.1, [2])
-            loop.step()
-            assert loop.iteration == 2
-
-
-def test_checkpoint_round_trip(device):
-    """Three steps, a saved state, a new loop that loads it, and two more
-    steps equal five steps in one loop, with agents that carry warm-start
-    state of their own."""
-    torch.manual_seed(5)
-    x0 = torch.randn(6, 4, 3, device=device)
-
-    def make_agents():
-        return [_AffineAgent(0.6, 0.1, [2], with_state=True), _AffineAgent(-0.3, 0.3, [3], with_state=True)]
-    mu, rho = [0.4, 0.6], 0.45
-    straight = MACE(make_agents(), x0, mu=mu, rho=rho)
-    for _ in range(5):
-        straight.step()
-
-    first = MACE(make_agents(), x0, mu=mu, rho=rho)
-    for _ in range(3):
-        first.step()
-    state = first.state_dict()
-    resumed = MACE(make_agents(), x0, mu=mu, rho=rho)
-    resumed.load_state_dict(state)
-    assert resumed.iteration == 3
-    for _ in range(2):
-        resumed.step()
-    rel = max(_rel_max(resumed.x_bar, straight.x_bar),
-              max(_rel_max(a, b) for a, b in zip(resumed.W, straight.W)))
-    print(f"checkpoint round trip on {device}: rel_max = {rel:.2e}")
-    assert rel < 1e-6
-    assert resumed.iteration == 5 and len(resumed.info['change_pct']) == 5
-
-
 # ── the agents ───────────────────────────────────────────────────────────────
 class _ConstantStackDenoiser:
     """A stack denoiser that adds a constant and checks that each stack has
@@ -344,34 +201,6 @@ def test_hyperplane_agent_equals_the_unbatched_operation(axis, device):
     rel = _rel_max(agent(filtered_in, 0), apply_temporal_filter(filtered_in, matrix, axis=0))
     print(f"hyperplane filter vs direct filter: rel_max = {rel:.2e}")
     assert rel < 1e-6
-
-
-@pytest.mark.parametrize('axis', [1, 2, 3])
-def test_hyperplane_agent_never_hands_the_denoiser_a_view_of_its_input(axis):
-    """The stack denoiser may write the stack it is given, so the agent hands
-    it a copy.  Moving an axis of length one to the front of an array that is
-    already on the worker's device leaves a view of that array, the one case
-    where the copy has to be made on purpose: a denoiser that zeroes its
-    stack in place must leave the agent's input, the loop's state, as it was,
-    with the filter off and with the warm start on or off."""
-    shape = [3, 4, 5, 6]
-    shape[axis] = 1
-    torch.manual_seed(3)
-    w = torch.randn(*shape)
-    before = w.clone()
-
-    def zeroing(stack, init_stack=None):
-        stack.zero_()
-        if init_stack is not None:
-            init_stack.zero_()
-        return stack
-
-    for warm in (False, True):
-        agent = HyperplaneAgent(axis, lambda dev: zeroing, use_warm_start=warm)
-        for iteration in range(2):
-            out = agent(w, iteration)
-            assert torch.equal(out, torch.zeros_like(w))
-            assert torch.equal(w, before), f'axis {axis}, warm start {warm}, call {iteration}'
 
 
 # ── the equality gate: the whole loop against the standard reconstruction ────

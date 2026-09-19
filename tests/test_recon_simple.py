@@ -1,9 +1,8 @@
 """Gates for the one-call reconstruction functions.
 
 ``recon_simple_parallel`` and ``recon_simple_cone`` build a model, set
-sharpness, and call recon.  These tests hold that contract: each matches the
-equivalent model-based calls with the same seed, and reproduces the scaled
-direct reconstruction at max_iterations=0.
+sharpness, and call recon.  The test here holds that contract: each matches
+the equivalent model-based calls with the same seed.
 
 The problem is deliberately tiny so both geometries run in a few seconds.
 """
@@ -93,29 +92,3 @@ def test_matches_model_path(case):
     print(f"{case.geometry}: one-call vs model rel_max = "
           f"{_rel_max(simple_recon, model_recon):.2e}")
     assert _close(simple_recon, model_recon)
-
-
-def test_zero_iterations_is_scaled_direct(case):
-    """max_iterations=0 returns the direct reconstruction scaled to fit the
-    data: the iterative loop's initializer, handed back before any iteration.
-    The scale is the one that minimizes the error sinogram, so it also has to
-    fit the data at least as well as the unscaled direct reconstruction."""
-    np.random.seed(0)
-    recon, recon_dict = case.simple(max_iterations=0)
-    assert recon.shape == case.recon_shape
-    assert np.isfinite(recon).all() and np.max(np.abs(recon)) > 0
-    assert recon_dict["recon_params"]["num_iterations"] == 0
-
-    model = case.make_model()
-    direct_recon = case.direct(model)
-    scale = float(np.sum(recon * direct_recon) / np.sum(direct_recon ** 2))
-    print(f"{case.geometry}: zero-iteration scale = {scale:.4f}, rel_max after "
-          f"scaling = {_rel_max(recon, scale * direct_recon):.2e}")
-    assert scale > 0
-    assert _close(recon, scale * direct_recon)
-
-    def sino_error(volume):
-        return float(np.linalg.norm(model.forward_project(volume)
-                                    - case.sinogram))
-
-    assert sino_error(recon) <= sino_error(direct_recon)

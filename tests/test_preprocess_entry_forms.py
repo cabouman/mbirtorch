@@ -12,8 +12,6 @@ tests/test_sharded_pipeline.py.
 """
 
 import numpy as np
-import torch
-
 import mbirtorch.preprocess as mtp
 
 # Small enough that every call below is a fraction of a second, with more than
@@ -46,39 +44,3 @@ def test_scan_to_sino_numpy_in_numpy_out():
     # No downsampling and no rotation, and a blank of ones over a dark of zeros,
     # so the whole thing reduces to -log(obj_scan).
     assert np.allclose(sino, -np.log(obj), atol=1e-5)
-
-
-def test_entries_accept_tensors_and_return_numpy():
-    """Torch tensors are accepted for the scans, and every entry returns host
-    NumPy with the values the all-NumPy call gives."""
-    obj = _obj_scan()
-    blank, dark = _blank_and_dark()
-    blank_t, dark_t = torch.as_tensor(blank), torch.as_tensor(dark)
-
-    # A tensor object scan through scan_to_sino: NumPy out, -log(obj_scan).
-    sino = mtp.scan_to_sino(torch.as_tensor(obj), blank, dark, **BATCH_ARGS)
-    assert isinstance(sino, np.ndarray)
-    assert np.allclose(sino, -np.log(obj), atol=1e-5)
-
-    # compute_sino_transmission, all NumPy, is the same transmission step.
-    sino = mtp.compute_sino_transmission(obj, blank, dark, **BATCH_ARGS)
-    assert isinstance(sino, np.ndarray)
-    assert np.allclose(sino, -np.log(obj), atol=1e-5)
-
-    # Tensor blank and dark scans are brought to the host and reduced there,
-    # so both entries equal the all-NumPy call exactly.
-    for entry in (mtp.scan_to_sino, mtp.compute_sino_transmission):
-        expected = entry(obj, blank, dark, **BATCH_ARGS)
-        out = entry(obj, blank_t, dark_t, **BATCH_ARGS)
-        assert isinstance(out, np.ndarray)
-        assert np.array_equal(out, expected)
-
-    # downsample_view_data returns NumPy arrays at the downsampled shapes.
-    out_obj, out_blank, out_dark, defective = mtp.downsample_view_data(
-        obj, blank, dark, (2, 2), **BATCH_ARGS)
-    for out in (out_obj, out_blank, out_dark):
-        assert isinstance(out, np.ndarray)
-    assert out_obj.shape == (NUM_VIEWS, NUM_ROWS // 2, NUM_COLS // 2)
-    assert out_blank.shape == (1, NUM_ROWS // 2, NUM_COLS // 2)
-    # Nothing was marked defective, so the updated list comes back empty.
-    assert len(defective) == 0

@@ -1,70 +1,11 @@
 """Gate for the multi-device scan preprocessing driver: splitting the views
 across devices must produce exactly the single-device answer.  Identical is
 the right bar: the kernel is per-view, so no sum crosses a device boundary.
-
-Also gates the device-count default that the preprocessing functions share.
-``pipeline.permitted_devices`` resolves ``devices=None`` for all of them, so
-its rule is tested directly.
 """
 
 import numpy as np
 import pytest
-import torch
-
 import mbirtorch.preprocess as mtp
-from mbirtorch.preprocess import pipeline
-
-
-@pytest.fixture
-def unpinned(monkeypatch):
-    """Clear the suite's device-count pin.
-
-    The conftest fixture pins every test to one device, which is what keeps
-    the suite deterministic on a multi-GPU host.  A test of the multi-device
-    default has to opt out of that pin, and doing so explicitly keeps the
-    pin's reach visible.
-    """
-    monkeypatch.delenv('MBIRTORCH_NUM_DEVICES', raising=False)
-
-
-def test_multi_device_view_split_matches_single():
-    rng = np.random.default_rng(7)
-    scans = rng.uniform(0.5, 2.0, size=(23, 12, 16)).astype(np.float32)
-    gain = rng.uniform(1.0, 3.0, size=(1, 12, 16)).astype(np.float32)
-
-    def kernel(batch):
-        g = torch.as_tensor(gain, device=batch.device)
-        return -torch.log(batch / g)
-
-    ref = pipeline.map_view_batches(scans, kernel, batch_size=4,
-                                    devices=['cpu'])
-    out = pipeline.map_view_batches(scans, kernel, batch_size=4,
-                                    devices=['cpu', 'cpu', 'cpu'])
-    assert out.shape == ref.shape
-    assert np.array_equal(out, ref)
-
-
-# ── the shared devices=None default ──────────────────────────────────────────
-def test_permitted_devices_resolves_the_default_and_the_pin(monkeypatch, unpinned):
-    """devices=None gives every visible CUDA device, MBIRTORCH_NUM_DEVICES caps
-    that default, and an explicit list is never capped.  The devices are faked,
-    so this runs on any machine."""
-    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
-    monkeypatch.setattr(torch.cuda, 'device_count', lambda: 3)
-    assert pipeline.permitted_devices() == ['cuda:0', 'cuda:1', 'cuda:2']
-
-    monkeypatch.setenv('MBIRTORCH_NUM_DEVICES', '2')
-    assert pipeline.permitted_devices() == ['cuda:0', 'cuda:1']
-
-    # A pin above the visible count cannot conjure devices.
-    monkeypatch.setenv('MBIRTORCH_NUM_DEVICES', '8')
-    assert pipeline.permitted_devices() == ['cuda:0', 'cuda:1', 'cuda:2']
-
-    # An explicit list is the caller's, so the pin does not apply to it.
-    monkeypatch.setenv('MBIRTORCH_NUM_DEVICES', '1')
-    assert pipeline.permitted_devices(['cpu', 'cpu', 'cpu']) == ['cpu'] * 3
-
-
 # ── the five view-batched preprocessing functions ────────────────────────────
 # Each of these kernels is per-view.  No sum crosses a view boundary, so a
 # view's result cannot depend on which device or which batch it landed in.

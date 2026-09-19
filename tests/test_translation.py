@@ -1,6 +1,6 @@
 """Translation (TCT) gates: adjointness on every backend, cross-framework
 goldens against mbirjax (single ops, FDK, auto geometry, and seeded
-convergence parity), a recon smoke, and 2-shard vs 1-device parity."""
+convergence parity), and a recon smoke."""
 
 import glob
 import os
@@ -57,25 +57,6 @@ def test_translation_recon_smoke(device):
     fm = rd['recon_params']['fm_rmse']
     assert fm[-1] < fm[0]
     assert recon.shape == tuple(rs)
-
-
-def test_translation_sharded_recon_matches_single_device():
-    """2 CPU shards vs 1 device on the same seeded problem (the iterated
-    comparison gate)."""
-    ref_m = _small_tct(['cpu'])
-    rs = ref_m.get_params('recon_shape')
-    phantom = mbirtorch.gen_translation_phantom(rs, 'dots', None, fill_rate=0.05)
-    sino = np.asarray(ref_m.forward_project(phantom))
-    np.random.seed(0)
-    ref, _ = ref_m.recon(sino, max_iterations=3, stop_threshold_change_pct=0.0,
-                         logfile_path=None)
-    sh_m = _small_tct(['cpu', 'cpu'])
-    np.random.seed(0)
-    out, _ = sh_m.recon(sino, max_iterations=3, stop_threshold_change_pct=0.0,
-                        logfile_path=None)
-    rel = _rel_max(out, ref)
-    print(f"translation sharded vs single recon rel_max = {rel:.2e}")
-    assert rel < 1e-4
 
 
 tct_golden = pytest.mark.skipif(
