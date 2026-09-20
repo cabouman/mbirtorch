@@ -53,6 +53,10 @@ dependencies = [
     "psutil",
 ]
 
+[project.scripts]
+# hsnt factorization from the shell: inspect / convert / factorize (mbirtorch/hsnt/cli.py).
+mbirtorch-hsnt = "mbirtorch.hsnt.cli:main"
+
 [project.optional-dependencies]
 
 test = ["pytest", "pytest-xdist"]
