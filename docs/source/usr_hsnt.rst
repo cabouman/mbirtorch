@@ -53,8 +53,11 @@ The rank is estimated by default when ``--rank`` is not given: ranks 1 to ``--ma
 subsample and each added component is kept while the log-likelihood it gains exceeds twice the noise floor (a
 noise-only component gains about half its parameter count), with the dose calibrated from the residual of the
 most flexible fit so a nominal open-beam dose does not matter. The log prints the gain of every component and
-the threshold, and the report stores them; ``--rank N`` overrides. At very low dose a weak material can fall
-below the threshold, so check the gain table when a component is expected. After the solve the log reports the
+the threshold, and the report stores them; ``--rank N`` overrides. Because every component gets a free
+coefficient per pixel, the noise floor grows with the pixel count as fast as a faint material's evidence does, so
+the test is also run on spatially pooled pixels (``--rank-pool``, blocks chosen so the pooled count is about half
+the bin count) where the floor is far lower, and the larger rank is taken; this recovers a faint material at low
+dose that the full-resolution test misses. After the solve the log reports the
 reduced chi-square of the fit against Poisson noise when the dose is known: near 1 the residual is at the noise
 level, well above 1 the rank is too small or the model misspecified, well below 1 the fit follows the noise.
 

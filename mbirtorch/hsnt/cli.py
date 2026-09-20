@@ -435,30 +435,18 @@ def _attenuation_sample(ds: Dataset, max_pixels=65536):
     return -np.log(np.maximum(T, floor)), floor
 
 
-def estimate_rank(ds: Dataset, device, seed=0, max_rank=6, subsample=16384):
-    """Choose the rank by sequential likelihood-ratio tests on a pixel subsample.
-
-    Ranks 1..max_rank are fitted in turn and the loss gain of each added component is converted to log-likelihood
-    units with a dose calibrated from the residual of the most flexible fit (mean (T - e^-X)^2 / e^-X = 1 / dose for
-    Poisson noise), so a nominal or unknown open-beam dose does not matter. A component that only fits noise gains
-    about (P + K) / 2, its parameter count; the noise floor is taken as the larger of that and the median gain of the
-    last three ranks, and a component is accepted while its gain exceeds twice the floor. On the three-material
-    phantom this recovers 3 at dose 30 and above and 2 at dose 3, where the weakest material is barely supported by
-    the likelihood; the singular-value estimator behind dehydrate was not usable here (1 at dose 3, 161 at dose 30).
-    Returns (rank, note, detail)."""
+def _lrt_rank(T, device, seed, max_rank, label):
+    """Sequential likelihood-ratio rank test on the pixels of T (a torch tensor on the device). Returns (rank, detail)."""
     import torch
     from mbirtorch.hsnt import nnal_factorization, stable_nnal
-    stride = max(1, ds.pixels // subsample)
-    T = torch.from_numpy(np.ascontiguousarray(ds.T[::stride])).to(device)
     P, K = T.shape
-    log.info("estimating the rank: fitting ranks 1..%d on %s pixels (every %d-th) x %d bins", max_rank, f"{P:,}", stride, K)
     torch.manual_seed(seed)
     losses, resid = [], []
     for r in range(1, max_rank + 1):
         W, H, _ = nnal_factorization(T, method="joint_newton", num_materials=r, max_steps=200, rel_tol=1e-6, random_state=seed)
         Xd = W.double() @ H.double(); Th = torch.exp(-Xd); Td = T.double()
         losses.append(stable_nnal(Xd, Td).item()); resid.append((((Td - Th) ** 2) / Th.clamp_min(1e-12)).mean().item())
-        log.debug("  rank %d: loss %.6g, mean chi-square term %.4g", r, losses[-1], resid[-1])
+        log.debug("  %s rank %d: loss %.6g, mean chi-square term %.4g", label, r, losses[-1], resid[-1])
     dose_eff = 1.0 / resid[-1]
     gains = [dose_eff * (losses[i - 1] - losses[i]) for i in range(1, len(losses))]     # gains[i - 1] belongs to component i + 1
     floor = max(0.5 * (P + K), float(np.median(gains[-3:])))
@@ -470,12 +458,70 @@ def estimate_rank(ds: Dataset, device, seed=0, max_rank=6, subsample=16384):
         else:
             break
     table = ", ".join(f"{r}: {g:,.0f}" for r, g in zip(range(2, max_rank + 1), gains))
-    log.info("rank search: effective dose %.3g; log-likelihood gain of component %s; noise floor %.0f, threshold %.0f -> rank %d",
-             dose_eff, table, floor, threshold, rank)
+    log.info("rank search (%s, %s pixels x %d bins): effective dose %.3g; log-likelihood gain of component %s; noise floor %.0f, "
+             "threshold %.0f -> rank %d", label, f"{P:,}", K, dose_eff, table, floor, threshold, rank)
+    return rank, dict(pixels=P, losses=losses, gains=gains, effective_dose=dose_eff, noise_floor=floor, threshold=threshold)
+
+
+def pool_pixels(T, spatial_shape, block):
+    """Block-average a (pixels, bins) array over block x block detector pixels within each view; rows and columns are
+    cropped to multiples of the block. The averaged transmission is the summed count over the block divided by the
+    block's summed dose, so it is a valid transmission ratio at block^2 times the dose."""
+    V, rows, cols = spatial_shape
+    r, c = rows // block * block, cols // block * block
+    X = np.asarray(T).reshape(V, rows, cols, -1)[:, :r, :c]
+    X = X.reshape(V, r // block, block, c // block, block, -1).mean(axis=(2, 4))
+    return X.reshape(-1, X.shape[-1])
+
+
+def estimate_rank(ds: Dataset, device, seed=0, max_rank=6, subsample=16384, pool="auto"):
+    """Choose the rank by sequential likelihood-ratio tests, at full resolution and on spatially pooled pixels.
+
+    Ranks 1..max_rank are fitted in turn and the loss gain of each added component is converted to log-likelihood
+    units with a dose calibrated from the residual of the most flexible fit (mean (T - e^-X)^2 / e^-X = 1 / dose for
+    Poisson noise), so a nominal or unknown open-beam dose does not matter. A component that only fits noise gains
+    about (P + K) / 2, its parameter count, because every pixel gives it a free coefficient; the noise floor is the
+    larger of that and the median gain of the last three ranks, and a component is accepted while its gain exceeds
+    twice the floor.
+
+    That floor grows with the pixel count as fast as a faint material's evidence does, so at low dose the test at
+    full resolution misses the weakest material (aluminium in the phantoms below dose ~18). Pooling blocks of
+    neighbouring pixels keeps the evidence, the summed counts stay Poisson, but divides the nuisance count, so the
+    same test on pooled pixels has far more power: on the sphere phantom pooling 8x8 recovers the true rank 3 at
+    dose 1 where full resolution gives 1, without over-estimating up to dose 1e4. The block is chosen so the pooled
+    pixel count falls to about the bin count, below which the floor is dominated by the spectrum's own K parameters
+    and pooling buys nothing more. The larger of the two ranks is returned: over-estimation costs a fraction of a
+    decibel while under-estimation caps the SNR. pool='auto' picks the block so the pooled pixel count is about half
+    the bin count; an integer fixes it; 0 disables it.
+    Returns (rank, note, detail)."""
+    import torch
+    stride = max(1, ds.pixels // subsample)
+    T = torch.from_numpy(np.ascontiguousarray(ds.T[::stride])).to(device)
+    log.info("estimating the rank: ranks 1..%d on %s pixels (every %d-th) at full resolution", max_rank, f"{T.shape[0]:,}", stride)
+    rank_full, d_full = _lrt_rank(T, device, seed, max_rank, "full resolution")
+    K = ds.bins
+    V, rows, cols = ds.spatial_shape
+    block = 0
+    if pool == "auto":
+        block = int(np.ceil(np.sqrt(2.0 * ds.pixels / K)))                      # pooled pixels ~ K / 2: 8x8 on the 37k-pixel sphere phantom
+        block = min(block, max(1, min(rows, cols) // 4))                          # keep at least 4x4 pooled pixels per view
+    elif pool:
+        block = int(pool)
+    detail = dict(full=d_full, pool_block=block, max_rank=max_rank)
+    rank, source = rank_full, "full resolution"
+    if block > 1:
+        Tp = torch.from_numpy(np.ascontiguousarray(pool_pixels(ds.T, ds.spatial_shape, block), dtype=np.float32)).to(device)
+        rank_pool, d_pool = _lrt_rank(Tp, device, seed, max_rank, f"pooled {block}x{block}")
+        detail["pooled"] = d_pool
+        if rank_pool > rank_full:
+            rank, source = rank_pool, f"pooled {block}x{block}"
     if rank == max_rank:
         log.warning("every rank up to --max-rank %d was accepted; the search may be capped, raise --max-rank", max_rank)
-    note = f"rank {rank} estimated by likelihood-ratio tests on {P:,} pixels (components beyond it gain less than twice the noise floor); pass --rank N to override"
-    detail = dict(subsample_pixels=P, losses=losses, gains=gains, effective_dose=dose_eff, noise_floor=floor, threshold=threshold, max_rank=max_rank)
+    parts = [f"full resolution gave {rank_full}"]
+    if block > 1:
+        parts.append(f"pooled {block}x{block} ({detail['pooled']['pixels']:,} pixels) gave {rank_pool}")
+    note = f"rank {rank} estimated by likelihood-ratio tests ({'; '.join(parts)}); pass --rank N to override"
+    detail.update(gains=(detail.get("pooled") or d_full)["gains"], effective_dose=d_full["effective_dose"], threshold=(detail.get("pooled") or d_full)["threshold"])
     return rank, note, detail
 
 
@@ -785,8 +831,9 @@ def cmd_inspect(args):
     for c in ds.checks:
         print(f"  [{c.level:5s}] {c.message}")
     if args.estimate_rank:
-        n, note, d = estimate_rank(ds, _device(args.device), args.seed, max_rank=args.max_rank)
-        print(f"  {note.split(';')[0]}; effective dose {d['effective_dose']:.3g}; gains by component: "
+        pool = args.rank_pool if str(args.rank_pool).lower() == "auto" else int(args.rank_pool)
+        n, note, d = estimate_rank(ds, _device(args.device), args.seed, max_rank=args.max_rank, pool=pool)
+        print(f"  {note.rsplit(';', 1)[0]}; effective dose {d['effective_dose']:.3g}; gains by component (deciding test): "
               + ", ".join(f"{r}: {g:,.0f}" for r, g in zip(range(2, d['max_rank'] + 1), d['gains'])) + f"; threshold {d['threshold']:,.0f}")
     try:
         import torch
@@ -831,7 +878,8 @@ def cmd_convert(args):
 def _resolve_rank(ds, args, device):
     """--rank N or auto: sets args.rank_value and args.rank_note."""
     if str(args.rank).lower() == "auto":
-        args.rank_value, args.rank_note, args.rank_detail = estimate_rank(ds, device, args.seed, max_rank=args.max_rank)
+        pool = args.rank_pool if str(args.rank_pool).lower() == "auto" else int(args.rank_pool)
+        args.rank_value, args.rank_note, args.rank_detail = estimate_rank(ds, device, args.seed, max_rank=args.max_rank, pool=pool)
         log.info("rank: %s", args.rank_note)
     else:
         args.rank_detail = None
@@ -936,6 +984,7 @@ def build_parser():
     add_input(s)
     s.add_argument("--estimate-rank", action="store_true", help="choose the rank by likelihood-ratio tests on a pixel subsample (runs solves)")
     s.add_argument("--max-rank", type=int, default=6, help="largest rank the estimate considers")
+    s.add_argument("--rank-pool", default="auto", metavar="auto|B|0", help="also test on B x B pooled pixels (default auto; 0 disables)")
     s.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     s.set_defaults(func=cmd_inspect)
 
@@ -950,6 +999,7 @@ def build_parser():
         g.add_argument("--rank", "-r", default="auto", metavar="N|auto",
                        help="number of materials; by default estimated by likelihood-ratio tests on a pixel subsample (see --max-rank)")
         g.add_argument("--max-rank", type=int, default=6, help="largest rank the estimate considers (default 6)")
+        g.add_argument("--rank-pool", default="auto", metavar="auto|B|0", help="also test on B x B pooled pixels and take the larger rank (default: B chosen so pooled pixels ~ bins; 0 disables)")
         g.add_argument("--method", choices=("joint_newton", "block_newton", "multiplicative", "lbfgsb"), default="joint_newton")
         g.add_argument("--max-steps", type=int, default=300)
         g.add_argument("--rel-tol", type=float, default=1e-6, help="relative loss change per step at which to stop")

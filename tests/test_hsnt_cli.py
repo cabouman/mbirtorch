@@ -126,8 +126,19 @@ def test_factorize_stream_mode_from_tiffs(stacks, tmp_path):
 
 def test_rank_is_estimated_by_default(stacks):
     ds = load_hdf5(stacks["h5"])
-    n, note, detail = estimate_rank(ds, "cpu", max_rank=4)
-    assert n == R and "estimated" in note and len(detail["gains"]) == 3 and 30 < detail["effective_dose"] < 90
+    n, note, detail = estimate_rank(ds, "cpu", max_rank=4, pool=0)
+    assert n == R and "estimated" in note and len(detail["gains"]) == 3 and 30 < detail["full"]["effective_dose"] < 90
+    n2, note2, detail2 = estimate_rank(ds, "cpu", max_rank=4, pool=2)                   # pooled pass runs and is recorded
+    assert n2 >= n and detail2["pool_block"] == 2 and detail2["pooled"]["pixels"] == (ROWS // 2) * (COLS // 2)
+
+
+def test_pool_pixels_averages_blocks():
+    from mbirtorch.hsnt.cli import pool_pixels
+    T = np.arange(2 * 6 * 4 * 3, dtype=np.float32).reshape(2 * 6 * 4, 3)             # 2 views, 6 x 4 pixels, 3 bins
+    Tp = pool_pixels(T, (2, 6, 4), 2)
+    assert Tp.shape == (2 * 3 * 2, 3)
+    block = T.reshape(2, 6, 4, 3)[0, :2, :2].mean(axis=(0, 1))
+    assert np.allclose(Tp[0], block)
 
 
 @cuda
