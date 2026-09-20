@@ -41,7 +41,9 @@ Releasing to TestPyPI
 Releasing to PyPI
 +++++++++++++++++
 
-3. Open the release pull request::
+This procedure stands on its own.  The TestPyPI steps above are optional.
+
+1. Open the release pull request::
 
        dev_scripts/release.sh 0.X.Y
 
@@ -53,7 +55,7 @@ Releasing to PyPI
 
    Next: Once the checks pass on GitHub, accept the pull request from prerelease to main.
 
-4. Publish the release::
+2. Publish the release::
 
        dev_scripts/release.sh 0.X.Y --publish
 
@@ -68,7 +70,7 @@ Releasing to PyPI
    To do this: On GitHub, open the Actions tab, click the running release
    workflow, click "Review deployments", check the "pypi" box, and click "Approve and deploy".
 
-5. Check the PyPI upload.  Make a clean conda environment, install the
+3. Check the PyPI upload.  Make a clean conda environment, install the
    package into it from PyPI, and run the tests::
 
        source dev_scripts/make_test_environment.sh
