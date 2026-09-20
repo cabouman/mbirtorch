@@ -11,8 +11,8 @@ authors:
     given-names: Jingsong
   - family-names: Li
     given-names: Ziyun
-version: 0.1.0
-date-released: 2026-09-18
+version: 0.1.1
+date-released: 2026-09-20
 url: "https://mbirtorch.readthedocs.io"
 repository-code: "https://github.com/cabouman/mbirtorch"
 license: BSD-3-Clause

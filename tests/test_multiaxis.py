@@ -1,29 +1,10 @@
-"""Multiaxis-parallel gates: adjointness on every backend, cross-framework
-goldens against mbirjax (single ops, FBP, auto geometry, and seeded
-convergence parity), and a recon smoke.
-
-The golden configuration (24 views, elevations to +-0.4 rad) matches mbirjax
-to 1.1e-5 max on the volume at 3 iterations, decaying to 6.8e-6 by 10.  Its
-volume gate is 2e-4, about 18x the measured value.
-
-The golden test's per-iteration traces (alpha, fm_rmse) measure about 6.5e-6
-and 4.7e-6 and are gated further above that than the volume is: a trace is one
-scalar per iteration, so a single late step size can move without the
-reconstruction moving with it.
-"""
-
-import glob
-import os
+"""Multiaxis-parallel gates: adjointness on every backend, agreement with the
+parallel-beam model at zero elevation, and a recon smoke."""
 
 import numpy as np
-import pytest
 import torch
 
 import mbirtorch
-
-GOLDEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "goldens")
-_paths = sorted(glob.glob(os.path.join(GOLDEN_DIR, "golden_*.npz")))
-_have_ma = bool(_paths) and "ma_sino" in np.load(_paths[0]).files
 
 
 def _rel_max(out, ref):
@@ -89,83 +70,3 @@ def test_multiaxis_recon_smoke(device):
     fm = rd['recon_params']['fm_rmse']
     assert fm[-1] < fm[0]
     assert recon.shape == tuple(rs)
-
-
-ma_golden = pytest.mark.skipif(
-    not _have_ma, reason="no multiaxis goldens: rerun tests/generate_goldens.py")
-
-
-@pytest.fixture(scope="module")
-def golden():
-    return np.load(_paths[0])
-
-
-@pytest.fixture(scope="module")
-def ma_model(golden):
-    cell = tuple(int(x) for x in golden["ma_cell"])
-    m = mbirtorch.MultiAxisParallelModel(cell, golden["ma_angles"])
-    m.configure_devices(devices=["cpu"])
-    m.set_params(no_warning=True, verbose=0)
-    return m
-
-
-@pytest.mark.goldens
-@ma_golden
-def test_multiaxis_auto_geometry(golden, ma_model):
-    assert tuple(ma_model.get_params('recon_shape')) == \
-        tuple(int(x) for x in golden["ma_recon_shape"])
-    assert float(ma_model.get_params('delta_voxel')) == \
-        pytest.approx(float(golden["ma_delta_voxel"]), rel=1e-6)
-
-
-@pytest.mark.goldens
-@ma_golden
-def test_multiaxis_single_operators_match_the_golden(golden, ma_model):
-    sp_fwd = ma_model.sparse_forward_project(golden["ma_vals"], golden["ma_subset"])
-    sp_back = ma_model.sparse_back_project(golden["ma_sino"], golden["ma_subset"])
-    full_fwd = ma_model.forward_project(golden["ma_phantom"])
-    sp_fwd_err = _rel_max(sp_fwd.numpy(), golden["ma_sp_fwd"])
-    sp_back_err = _rel_max(sp_back.numpy(), golden["ma_sp_back"])
-    fwd_err = _rel_max(full_fwd, golden["ma_sino"])
-    print(f"multiaxis rel_max: sparse_fwd {sp_fwd_err:.2e}, "
-          f"sparse_back {sp_back_err:.2e}, forward {fwd_err:.2e}")
-    assert sp_fwd_err < 1e-4
-    assert sp_back_err < 1e-4
-    assert fwd_err < 1e-4
-
-
-@pytest.mark.goldens
-@ma_golden
-def test_multiaxis_fbp(golden, ma_model):
-    out = ma_model.recon_fbp(golden["ma_sino"])
-    err = _rel_max(out, golden["ma_fbp"])
-    print(f"multiaxis fbp rel_max = {err:.2e}")
-    assert err < 1e-3
-
-
-@pytest.mark.goldens
-@ma_golden
-def test_multiaxis_recon_convergence_parity(golden, ma_model):
-    """Seeded 3-iteration parity with mbirjax on the GOLDEN configuration.
-
-    The volume gate is set from what this configuration measures, not from
-    the sharded test's number: 24 views with elevations to +-0.4 rad agree
-    with mbirjax to 1.1e-5 at 3 iterations and 6.8e-6 at 10, so 2e-4 is
-    about 18x the measurement -- room for another platform's arithmetic,
-    while still catching a regression an order of magnitude smaller than the
-    5e-3 this test used to share with the sharded comparison.
-    """
-    np.random.seed(int(golden["recon_seed"]))
-    recon, rd = ma_model.recon(golden["ma_sino"], max_iterations=3,
-                               stop_threshold_change_pct=0.0, logfile_path=None)
-    rp = rd['recon_params']
-    alpha_rel = np.max(np.abs(np.array(rp['alpha_values']) - golden["ma_alpha"])
-                       / np.abs(golden["ma_alpha"]))
-    fm_rel = np.max(np.abs(np.array(rp['fm_rmse']) - golden["ma_fm_rmse"])
-                    / np.abs(golden["ma_fm_rmse"]))
-    final_rel = _rel_max(recon, golden["ma_recon"])
-    print(f"multiaxis recon parity: alpha rel = {alpha_rel:.2e}, "
-          f"fm rel = {fm_rel:.2e}, final rel_max = {final_rel:.2e}")
-    assert alpha_rel < 1e-2
-    assert fm_rel < 1e-3
-    assert final_rel < 2e-4

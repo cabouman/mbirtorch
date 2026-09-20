@@ -32,8 +32,8 @@ def build_model():
     n_views, _, num_channels = SINOGRAM_SHAPE
     if MODEL_TYPE == "cone":
         # Cone beam: full-circle angles, and source-detector / source-iso
-        # distances in the goldens' convention (magnification 2).  The auto
-        # recon geometry sets the recon shape, including the axial padding.
+        # distances that give magnification 2.  The auto recon geometry sets
+        # the recon shape, including the axial padding.
         angles = np.linspace(0, 2 * np.pi, n_views, endpoint=False)
         source_detector_dist = 4 * num_channels
         source_iso_dist = 2 * num_channels
