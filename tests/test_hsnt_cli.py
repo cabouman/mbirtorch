@@ -107,6 +107,9 @@ def test_factorize_writes_readable_factors(stacks, tmp_path):
     assert den.shape == (1, ROWS, COLS, K)
     rep = json.load(open(os.path.join(out, "processed_report.json")))
     assert rep["result"]["mode"] == "full" and rep["result"]["loss_final"] > 0 and len(rep["result"]["gauge_cluster_sizes"]) == R
+    assert rep["result"]["components"]["proportional_pairs"] == []                     # two distinct materials
+    with h5py.File(os.path.join(out, "processed_factors.h5")) as f:
+        assert f["mean_pixel_spectrum"].shape == (K,) and f["mean_pixel_contributions"].shape == (R, K)
     W, H = _truth(); X = W @ H
     fit = -np.log(np.clip(den.reshape(-1, K), 1e-12, None)) if dtype == "transmission" else den.reshape(-1, K)
     assert np.linalg.norm(fit - X) / np.linalg.norm(X) < 0.35                                  # denoised attenuation near the truth
@@ -152,6 +155,18 @@ def test_denoise_no_factors_transmission(stacks, tmp_path):
     assert not any(f.endswith("_factors.h5") for f in files)
     data, meta = hsnt.import_hsnt_data_hdf5(os.path.join(out, "sample_denoised.h5"))
     assert meta["dataset_type"] == "transmission" and 0 < data.min() and data.max() < 2
+
+
+def test_component_check_flags_proportional_maps():
+    from mbirtorch.hsnt.cli import component_check, mean_pixel_spectrum
+    rng = np.random.default_rng(0); W, H = _truth()
+    ok = component_check(W, H)                                                        # distinct maps: no pair flagged
+    assert ok["max_map_correlation"] < 0.5 and ok["proportional_pairs"] == []
+    W2 = np.stack([W[:, 0], W[:, 0] * (1 + 0.05 * rng.standard_normal(W.shape[0]))], 1)   # a split material
+    bad = component_check(W2, np.stack([H[0] * 0.5, H[0] * 0.5]))
+    assert bad["proportional_pairs"] and bad["proportional_pairs"][0][:2] == (0, 1)
+    total, contrib, n = mean_pixel_spectrum(W2, np.stack([H[0] * 0.5, H[0] * 0.5]))
+    assert total.shape == (K,) and contrib.shape == (2, K) and n > 0 and np.allclose(total, contrib.sum(0))
 
 
 def test_gauge_without_dose_is_an_error(stacks, tmp_path):

@@ -498,6 +498,37 @@ def fit_quality(ds: Dataset, W, H, device, chunk=65536):
     return out
 
 
+def component_check(W, H, corr_warn=0.8):
+    """Are the components distinguishable? Two components whose maps are nearly proportional cannot have their spectra
+    told apart by the data: only the weighted sum of their rows is determined, and each row on its own is an arbitrary,
+    noisy slice of it (on a one-material sample every extra component behaves so, and the 'material' row gets noisier
+    with every one added: 3x at rank 2, 13x at rank 10). Returns a dict with the maximum correlation, the pairs above
+    corr_warn, and the per-row noise level (from second differences, relative to the row's median)."""
+    W = np.asarray(W, dtype=np.float64); H = np.asarray(H, dtype=np.float64); R = H.shape[0]
+    out = dict(max_map_correlation=0.0, proportional_pairs=[], row_noise_rel=[])
+    for k in range(R):
+        h = H[k]; lvl = float(np.median(h)) if np.median(h) > 0 else float(h.max()) or 1.0
+        out["row_noise_rel"].append(float(np.std(np.diff(h, 2)) / np.sqrt(6) / lvl) if h.size > 3 else 0.0)
+    if R < 2:
+        return out
+    C = np.corrcoef(W.T); np.fill_diagonal(C, 0.0); C = np.nan_to_num(C)
+    out["max_map_correlation"] = float(C.max())
+    out["proportional_pairs"] = [(int(i), int(j), round(float(C[i, j]), 3)) for i in range(R) for j in range(i + 1, R) if C[i, j] > corr_warn]
+    return out
+
+
+def mean_pixel_spectrum(W, H, frac=0.25):
+    """Attenuation of the average material pixel, sum_k mean(W_pk) H_k over pixels with material, and each component's
+    share of it. Unlike the rows of H it does not depend on how the solver split the spectrum among components, so it
+    shows the Bragg edges at any rank. Pixels count as material when their total map value exceeds frac of the 99th
+    percentile. Returns (total, contributions (R, K), number of pixels used)."""
+    tot = W.sum(1); mat = tot > frac * np.percentile(tot, 99)
+    if mat.sum() < 10:
+        mat = np.ones_like(mat)
+    wm = W[mat].mean(0)
+    return wm @ H, wm[:, None] * H, int(mat.sum())
+
+
 # ----------------------------------------------------------------------------------------------------------------------
 # Solve
 # ----------------------------------------------------------------------------------------------------------------------
@@ -647,8 +678,14 @@ def write_factors(base, ds: Dataset, W, H, rep, args):
     h5 = base + "_factors.h5"
     export_hsnt_data_hdf5(h5, [W4, H, out_type], {"dataset_type": out_type, "dataset_modality": "hyperspectral neutron"})
     _provenance(h5, ds, rep, args, dict(rank=R, loss=rep["loss_final"]))
-    log.info("wrote %s: subspace_data %s (maps, per material), subspace_basis %s (spectra); rehydrate() reconstructs the %s",
-             h5, W4.shape, H.shape, out_type)
+    total, contrib, n_mat = mean_pixel_spectrum(W, H)
+    import h5py
+    with h5py.File(h5, "a") as f:
+        d = f.create_dataset("mean_pixel_spectrum", data=total.astype(np.float32))
+        d.attrs["description"] = f"attenuation of the average material pixel ({n_mat} pixels), sum_k mean(W_pk) H_k; independent of the split among components"
+        f.create_dataset("mean_pixel_contributions", data=contrib.astype(np.float32))
+    log.info("wrote %s: subspace_data %s (maps, per material), subspace_basis %s (spectra), mean_pixel_spectrum over %s pixels; "
+             "rehydrate() reconstructs the %s", h5, W4.shape, H.shape, f"{n_mat:,}", out_type)
     return h5
 
 
@@ -709,12 +746,18 @@ def write_plots(base, ds, W4, H):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     R = H.shape[0]
-    colors = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#F0E442", "#000000"]
-    fig, ax = plt.subplots(figsize=(10, 4.5), constrained_layout=True)
+    colors = ["#0072B2", "#D55E00", "#009E73", "#CC79A7", "#E69F00", "#56B4E9", "#F0E442", "#8B4513", "#555555", "#7F00FF"]
+    W2 = W4.reshape(-1, R); total, contrib, n_mat = mean_pixel_spectrum(W2, H)
+    fig, (ax, ax2) = plt.subplots(2, 1, figsize=(10, 8), constrained_layout=True, sharex=True)
     for r in range(R):
-        ax.plot(ds.bin_indices, H[r], color=colors[r % len(colors)], lw=1.4, label=f"component {r}")
-    ax.set_xlabel("source wavelength index"); ax.set_ylabel("attenuation per unit map value"); ax.grid(alpha=0.3); ax.legend()
-    ax.set_title(f"fitted spectra, rank {R}: {_short(ds.source)}", fontsize=11)
+        ax.plot(ds.bin_indices, H[r], color=colors[r % len(colors)], lw=1.2, label=f"component {r}")
+    ax.set_ylabel("attenuation per unit map value"); ax.grid(alpha=0.3); ax.legend(fontsize=9, ncol=2 if R > 5 else 1)
+    ax.set_title(f"rows of H, rank {R}: {_short(ds.source)}\n(when maps are proportional, the split among rows is arbitrary)", fontsize=11)
+    ax2.plot(ds.bin_indices, total, color="black", lw=1.6, label=f"total, average of {n_mat:,} material pixels")
+    for r in range(R):
+        ax2.plot(ds.bin_indices, contrib[r], color=colors[r % len(colors)], lw=1.0, alpha=0.9, label=f"component {r} share")
+    ax2.set_xlabel("source wavelength index"); ax2.set_ylabel("attenuation of the average material pixel"); ax2.grid(alpha=0.3)
+    ax2.legend(fontsize=9, ncol=2 if R > 5 else 1); ax2.set_title("mean-pixel spectrum: independent of the split among components", fontsize=11)
     p1 = base + "_spectra.png"; fig.savefig(p1, dpi=130); plt.close(fig)
     V = W4.shape[0]
     fig, axes = plt.subplots(V, R, figsize=(3.2 * R, 3.2 * V), squeeze=False, constrained_layout=True)
@@ -813,6 +856,16 @@ def _pipeline(args, denoise):
         return 0
     W, H, rep = solve(ds, args, device)
     rep["fit"] = fit_quality(ds, W, H, device)
+    rep["components"] = comp = component_check(W, H)
+    if comp["proportional_pairs"]:
+        worst = max(comp["proportional_pairs"], key=lambda p: p[2])
+        log.warning("components %d and %d have nearly proportional maps (correlation %.2f; %d such pair(s)): the data cannot tell "
+                    "their spectra apart, so each row of H is an arbitrary noisy slice of their sum. The rank is probably above the "
+                    "number of distinct materials; %s. The mean-pixel spectrum in the outputs is unaffected.",
+                    worst[0], worst[1], worst[2], len(comp["proportional_pairs"]),
+                    "the estimate chose it" if args.rank_detail else "run without --rank to estimate it")
+    log.info("components: max map correlation %.2f; per-row noise (rel. to level) %s", comp["max_map_correlation"],
+             ", ".join(f"{x:.3f}" for x in comp["row_noise_rel"]))
     q = rep["fit"]
     if "reduced_chi2" in q:
         chi2 = q["reduced_chi2"]
