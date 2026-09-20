@@ -15,8 +15,7 @@ column onto the recon slices with the weight rule
     A = clip((W_p_r + 1) / 2 - |m_p - m|, 0, min(1, W_p_r)) / cos_phi
 
 (validity-masked, then raised to coeff_power).  The order of the arithmetic in
-the gather is deliberate; the golden-value tests (tests/test_vs_goldens.py)
-depend on it, so do not rearrange it.
+the gather is deliberate, so do not rearrange it.
 
 The drivers batch over views like the parallel drivers; the dominant
 transients are (view_batch, P, S) and (view_batch, P, R), so the effective

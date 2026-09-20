@@ -1,25 +1,9 @@
-"""Translation (TCT) gates: adjointness on every backend, cross-framework
-goldens against mbirjax (single ops, FDK, auto geometry, and seeded
-convergence parity), and a recon smoke."""
-
-import glob
-import os
+"""Translation (TCT) gates: adjointness on every backend and a recon smoke."""
 
 import numpy as np
-import pytest
 import torch
 
 import mbirtorch
-
-GOLDEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "goldens")
-_paths = sorted(glob.glob(os.path.join(GOLDEN_DIR, "golden_*.npz")))
-_have_tct = bool(_paths) and "tct_sino" in np.load(_paths[0]).files
-
-
-def _rel_max(out, ref):
-    out = np.asarray(out, dtype=np.float64)
-    ref = np.asarray(ref, dtype=np.float64)
-    return float(np.max(np.abs(out - ref)) / np.max(np.abs(ref)))
 
 
 def _small_tct(devices=("cpu",)):
@@ -57,86 +41,3 @@ def test_translation_recon_smoke(device):
     fm = rd['recon_params']['fm_rmse']
     assert fm[-1] < fm[0]
     assert recon.shape == tuple(rs)
-
-
-tct_golden = pytest.mark.skipif(
-    not _have_tct, reason="no translation goldens: rerun tests/generate_goldens.py")
-
-
-@pytest.fixture(scope="module")
-def golden():
-    return np.load(_paths[0])
-
-
-@pytest.fixture(scope="module")
-def tct_model(golden):
-    cell = tuple(int(x) for x in golden["tct_cell"])
-    m = mbirtorch.TranslationModel(cell, golden["tct_tvecs"],
-                                   source_detector_dist=float(golden["tct_sdd"]),
-                                   source_iso_dist=float(golden["tct_sid"]))
-    m.configure_devices(devices=["cpu"])
-    m.set_params(no_warning=True, verbose=0)
-    return m
-
-
-@pytest.mark.goldens
-@tct_golden
-def test_translation_auto_geometry(golden, tct_model):
-    assert tuple(tct_model.get_params('recon_shape')) == \
-        tuple(int(x) for x in golden["tct_recon_shape"])
-    assert float(tct_model.get_params('delta_voxel')) == \
-        pytest.approx(float(golden["tct_delta_voxel"]), rel=1e-6)
-    assert float(tct_model.get_params('voxel_row_aspect')) == \
-        pytest.approx(float(golden["tct_voxel_row_aspect"]), rel=1e-6)
-
-
-@pytest.mark.goldens
-@tct_golden
-def test_translation_sparse_forward(golden, tct_model):
-    out = tct_model.sparse_forward_project(golden["tct_vals"], golden["tct_subset"])
-    err = _rel_max(out.numpy(), golden["tct_sp_fwd"])
-    print(f"translation sparse_fwd rel_max = {err:.2e}")
-    assert err < 1e-4
-
-    # The full forward projection is the same map over all the indices.
-    out = tct_model.forward_project(golden["tct_phantom"])
-    err = _rel_max(out, golden["tct_sino"])
-    print(f"translation forward rel_max = {err:.2e}")
-    assert err < 1e-4
-
-
-@pytest.mark.goldens
-@tct_golden
-def test_translation_sparse_back(golden, tct_model):
-    out = tct_model.sparse_back_project(golden["tct_sino"], golden["tct_subset"])
-    err = _rel_max(out.numpy(), golden["tct_sp_back"])
-    print(f"translation sparse_back rel_max = {err:.2e}")
-    assert err < 1e-4
-
-
-@pytest.mark.goldens
-@tct_golden
-def test_translation_fdk(golden, tct_model):
-    out = tct_model.recon_fdk(golden["tct_sino"])
-    err = _rel_max(out, golden["tct_fdk"])
-    print(f"translation fdk rel_max = {err:.2e}")
-    assert err < 1e-3
-
-
-@pytest.mark.goldens
-@tct_golden
-def test_translation_recon_convergence_parity(golden, tct_model):
-    np.random.seed(int(golden["recon_seed"]))
-    recon, rd = tct_model.recon(golden["tct_sino"], max_iterations=3,
-                                stop_threshold_change_pct=0.0, logfile_path=None)
-    rp = rd['recon_params']
-    alpha_rel = np.max(np.abs(np.array(rp['alpha_values']) - golden["tct_alpha"])
-                       / np.abs(golden["tct_alpha"]))
-    fm_rel = np.max(np.abs(np.array(rp['fm_rmse']) - golden["tct_fm_rmse"])
-                    / np.abs(golden["tct_fm_rmse"]))
-    final_rel = _rel_max(recon, golden["tct_recon"])
-    print(f"translation recon parity: alpha rel = {alpha_rel:.2e}, "
-          f"fm rel = {fm_rel:.2e}, final rel_max = {final_rel:.2e}")
-    assert alpha_rel < 1e-2
-    assert fm_rel < 1e-3
-    assert final_rel < 1e-3

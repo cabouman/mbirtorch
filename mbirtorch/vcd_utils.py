@@ -1,10 +1,9 @@
 """Partitions, masks, and weights.
 
 The partition generators run in numpy and draw from the global np.random
-state.  That call sequence is deliberate: the golden-value tests
-(tests/test_vs_goldens.py) and restart reproducibility depend on a seeded run
-drawing the identical subsets in the identical order.  Do not reorder the
-calls.  Not implemented: the grid and blue-noise partition variants.
+state.  That call sequence is deliberate: restart reproducibility depends on
+a seeded run drawing the identical subsets in the identical order.  Do not
+reorder the calls.  Not implemented: the grid and blue-noise partition variants.
 """
 
 import warnings

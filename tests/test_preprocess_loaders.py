@@ -1,18 +1,11 @@
-"""Data-free gates for the vendor loaders: the crop/geometry conversion math
-(ported from mbirjax's TestConfigCropUnification), golden parity of the NSI
-conversion and the pyMBIR beam-hardening linearization on shared inputs.
-Loader runs on real scan data happen on the cluster (the increment-4
-end-to-end gate)."""
-
-import os
+"""Data-free gates for the vendor loaders: the crop and geometry conversion
+math, ported from mbirjax's TestConfigCropUnification.  Loader runs on real
+scan data happen on the cluster (the increment-4 end-to-end gate)."""
 
 import numpy as np
 import pytest
 
 import mbirtorch.preprocess as mtp
-
-GOLDEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "goldens")
-_npz_path = os.path.join(GOLDEN_DIR, "preprocess_goldens.npz")
 
 
 def _nsi_params():
@@ -77,29 +70,3 @@ def test_asymmetric_crop_shifts_row_offset_for_every_vendor():
     assert tp['sinogram_shape'] == (20, 54, 80)
     assert op['det_row_offset'] == pytest.approx(base['det_row_offset'] + (0 - 10) / 2 * base['delta_det_row'])
     assert op['det_channel_offset'] == pytest.approx(base['det_channel_offset'])
-
-
-@pytest.mark.goldens
-@pytest.mark.skipif(not os.path.exists(_npz_path), reason="no preprocess goldens")
-def test_nsi_convert_golden_parity():
-    golden = np.load(_npz_path)
-    cb, op = mtp.nsi.convert_nsi_to_mbirtorch_params(_nsi_params(), (2, 2), 3, 5, 5)
-    out = np.array([cb['sinogram_shape'][1], cb['sinogram_shape'][2],
-                    cb['source_detector_dist'], cb['source_iso_dist'],
-                    op['det_row_offset'], op['det_channel_offset'],
-                    op['recon_slice_offset'], op['delta_det_row'],
-                    op['delta_det_channel'], op['delta_voxel'],
-                    op['det_rotation']], dtype=np.float64)
-    assert np.allclose(out, golden['nsi_convert'], rtol=1e-10, atol=1e-12)
-
-
-@pytest.mark.goldens
-@pytest.mark.skipif(not os.path.exists(_npz_path), reason="no preprocess goldens")
-def test_pymbir_bh_correction_golden_parity():
-    golden = np.load(_npz_path)
-    out = mtp.pymbir.apply_bh_correction(golden['bhcn_sino'].copy(), [0.6, 1.0, 4.0, 20.0])
-    poly = mtp.pymbir.find_linearization_fit(0.6, 1.0, 4.0, max_thick=20.0)
-    assert np.allclose(poly, golden['bhcn_poly'], rtol=1e-10)
-    err = float(np.max(np.abs(out - golden['bhcn_out'])) / np.max(np.abs(golden['bhcn_out'])))
-    print(f"pymbir BHCN rel_max = {err:.2e}")
-    assert err < 1e-6

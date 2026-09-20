@@ -7,9 +7,9 @@ numpy-at-the-boundary API.  The loop's working state is always per-device
 (:class:`_sharding.Shards`); a single device is the one-shard case.  The
 checkpoint-resume path mutates the caller's arrays in place.
 
-The order of operations in every formula is deliberate.  The golden-value tests
-(tests/test_vs_goldens.py) require a seeded run to reproduce iteration for
-iteration, so do not reorder the arithmetic.
+The order of operations in every formula is deliberate.  A seeded run
+reproduces a reconstruction iteration for iteration, so do not reorder the
+arithmetic.
 """
 
 import contextlib

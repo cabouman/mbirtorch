@@ -100,9 +100,7 @@ def image_ell1(flat_image):
     the chunk totals, so it tracks the unchunked value to about 1e-7 at every
     size measured.
 
-    An array below one chunk is reduced whole, which is the arithmetic this
-    replaced, so small problems -- the goldens among them -- are unchanged bit
-    for bit.
+    An array below one chunk is reduced whole.
     """
     n_chunks = _chunk_count(flat_image.numel() * flat_image.element_size())
     if n_chunks == 1:
@@ -165,9 +163,7 @@ def weighted_dot(a, b, weights=None):
 
     Chunking keeps torch's pairwise summation inside each block and adds only
     the block totals, so it tracks the unchunked value the way image_ell1
-    does.  A sinogram below one chunk is reduced whole, which is the
-    arithmetic this replaced, so small problems -- the goldens among them --
-    are unchanged bit for bit.
+    does.  A sinogram below one chunk is reduced whole.
     """
     n_chunks = _chunk_count(a.numel() * a.element_size())
     if n_chunks == 1:
