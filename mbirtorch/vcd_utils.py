@@ -1,10 +1,14 @@
 """Partitions, masks, and weights.
 
-The partition generators run in numpy and draw from the global np.random
-state.  That call sequence is deliberate: the golden-value tests
+The partition generators run in numpy.  They draw from the global np.random
+state by default, and from a ``numpy.random.Generator`` given as ``rng``.
+That call sequence is deliberate: the golden-value tests
 (tests/test_vs_goldens.py) and restart reproducibility depend on a seeded run
 drawing the identical subsets in the identical order.  Do not reorder the
-calls.  Not implemented: the grid and blue-noise partition variants.
+calls.  :func:`named_rng` builds the generator of one named draw of a seeded
+run, so that a draw depends on neither the thread that makes it nor the
+moment it is made.  Not implemented: the grid and blue-noise partition
+variants.
 """
 
 import warnings
@@ -13,6 +17,41 @@ import numpy as np
 import torch
 
 from . import _sharding
+
+
+def named_rng(seed, name):
+    """
+    Return the random generator of one named draw of a seeded run.
+
+    The generator depends on the seed and the name alone, so two draws with
+    the same pair agree whatever thread, moment, or process makes them, and
+    two draws with different names are independent.
+
+    Args:
+        seed (int or None): the seed of the run.  None returns None, which
+            every generator argument in this package takes to mean the global
+            np.random state.
+        name (int or str): what the draw is for, such as an iteration number
+            or a short word.
+
+    Returns:
+        numpy.random.Generator or None
+    """
+    if seed is None:
+        return None
+    if isinstance(name, str):
+        # A seed sequence takes integers, so the name is read as one.
+        name = int.from_bytes(name.encode('utf-8'), 'little')
+    return np.random.default_rng([int(seed), int(name)])
+
+
+def named_seed(seed, name):
+    """
+    Return the seed of one named part of a seeded run, which that part then
+    uses as its own seed.  None returns None.
+    """
+    generator = named_rng(seed, name)
+    return None if generator is None else int(generator.integers(1 << 31))
 
 
 def get_2d_ror_mask(recon_shape, *, use_ror_mask=True, crop_radius_pixels=0,
@@ -94,13 +133,13 @@ def get_support_radius(recon_shape, delta_voxel_row, delta_voxel_col, use_ror_ma
     return float(np.hypot(half_width_row, half_width_col))
 
 
-def gen_pixel_partition(recon_shape, num_subsets, use_ror_mask=True):
+def gen_pixel_partition(recon_shape, num_subsets, use_ror_mask=True, rng=None):
     """
     Generates a partition of pixel indices into a specified number of subsets for
     use in tomographic reconstruction algorithms.  The function ensures that each
     subset contains an equal number of pixels, suitable for VCD reconstruction.
 
-    The np.random call sequence here (permutation, then choice) and the
+    The random call sequence here (permutation, then choice) and the
     single-subset RNG skip are deliberate; seeded runs must reproduce exactly.
     Do not reorder the calls.
 
@@ -108,11 +147,14 @@ def gen_pixel_partition(recon_shape, num_subsets, use_ror_mask=True):
         recon_shape (tuple): Shape of recon in (rows, columns, slices).
         num_subsets (int): The number of subsets to divide the pixel indices into.
         use_ror_mask: as in :func:`get_2d_ror_mask` (True / False / custom array).
+        rng (numpy.random.Generator, optional): the generator the subsets are
+            drawn from.  Defaults to None, the global np.random state.
 
     Returns:
         np.ndarray: each row is a subset of pixel indices, sorted within each
         subset.
     """
+    draw = np.random if rng is None else rng
     num_recon_rows, num_recon_cols = recon_shape[:2]
     max_index_val = num_recon_rows * num_recon_cols
     indices = np.arange(max_index_val, dtype=np.int32)
@@ -126,8 +168,8 @@ def gen_pixel_partition(recon_shape, num_subsets, use_ror_mask=True):
                       'pixels in the region of reconstruction.  \nReducing the number '
                       'of subsets to equal the number of indices.')
 
-    # A single subset is not permuted, so that it does not advance the global
-    # np.random state.  A restarted reconstruction then draws the same subsets.
+    # A single subset is not permuted, so that it does not advance the
+    # generator.  A restarted reconstruction then draws the same subsets.
     if num_subsets == 1:
         return np.sort(indices).reshape(1, -1)
 
@@ -135,19 +177,20 @@ def gen_pixel_partition(recon_shape, num_subsets, use_ror_mask=True):
     num_indices_per_subset = int(np.ceil(len(indices) / num_subsets))
     array_size = num_subsets * num_indices_per_subset
     num_extra_indices = array_size - len(indices)
-    indices = np.random.permutation(indices)
+    indices = draw.permutation(indices)
 
     # The padding indices are drawn from outside the final subset.
     num_non_final_indices = (num_subsets - 1) * num_indices_per_subset
-    extra_indices = np.random.choice(indices[:num_non_final_indices],
-                                     size=num_extra_indices, replace=False)
+    extra_indices = draw.choice(indices[:num_non_final_indices],
+                                size=num_extra_indices, replace=False)
     indices = np.concatenate((indices, extra_indices))
 
     indices = indices.reshape(num_subsets, indices.size // num_subsets)
     return np.sort(indices, axis=1)
 
 
-def gen_set_of_pixel_partitions(recon_shape, granularity, device=None, use_ror_mask=True):
+def gen_set_of_pixel_partitions(recon_shape, granularity, device=None, use_ror_mask=True,
+                                rng=None):
     """
     Generates a collection of voxel partitions for an array of specified
     partition sizes -- one randomly generated 2D partition per granularity entry.
@@ -157,6 +200,8 @@ def gen_set_of_pixel_partitions(recon_shape, granularity, device=None, use_ror_m
         granularity (list or tuple): num_subsets to use for each partition.
         device (torch.device): device on which to place each partition tensor.
         use_ror_mask: as in :func:`get_2d_ror_mask`.
+        rng (numpy.random.Generator, optional): the generator the partitions
+            are drawn from.  Defaults to None, the global np.random state.
 
     Returns:
         list of int64 tensors, each a partition of voxels into the specified
@@ -164,7 +209,8 @@ def gen_set_of_pixel_partitions(recon_shape, granularity, device=None, use_ror_m
     """
     partitions = []
     for num_subsets in granularity:
-        partition = gen_pixel_partition(recon_shape, num_subsets, use_ror_mask=use_ror_mask)
+        partition = gen_pixel_partition(recon_shape, num_subsets,
+                                        use_ror_mask=use_ror_mask, rng=rng)
         partitions.append(torch.as_tensor(np.ascontiguousarray(partition),
                                           dtype=torch.int64, device=device))
     return partitions

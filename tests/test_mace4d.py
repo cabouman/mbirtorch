@@ -2,8 +2,9 @@
 
 The filter matrix is checked against the transform it replaces.  The model
 is checked on a 24-view cone-beam scan with a smooth sinogram.  A run with
-three frames on one device gives finite values, and a four-frame run with
-the filter on differs from the same run with it off.  The smooth sinogram is
+three frames on one device gives finite values, a four-frame run with the
+filter on differs from the same run with it off, and a seeded four-frame run
+gives the same image on two CPU workers as on one.  The smooth sinogram is
 kept because a random one reconstructs to a volume with extreme values, on
 which the qGGMRF line search computes zero over zero.
 """
@@ -155,3 +156,37 @@ def test_reconstructions_run_end_to_end_with_and_without_the_filter(device):
     print(f"filter on vs off: rel_max = {rel:.2e}")
     assert rel > 1e-2                        # the filter is applied, not merely recorded
     assert on_dict['recon_params']['denoiser sigma_x'] != off_dict['recon_params']['denoiser sigma_x']
+
+
+def _four_frame_model():
+    """A four-frame model of the 24-view scan, at a period the frame count can
+    carry, so the filter stays on without a warning."""
+    model = MACE4DModel(_small_model(), frames_per_rotation=4, frame_overlap_factor=1.0)
+    model.set_params(verbose=0)
+    return model
+
+
+def test_two_workers_reproduce_one_worker_on_a_seeded_run():
+    """A seeded run derives every draw from the seed and the name of what the
+    draw is for, so no draw depends on which worker makes it or when.  Two CPU
+    workers must therefore reach the same image as one, to a relative maximum
+    difference of 1e-4.  The gate allows for the float rounding of a folding
+    update that adds task outputs in whatever order they arrive; a run that
+    drew on its worker instead differed by most of the image."""
+    seed = 5
+    one_worker = _four_frame_model()
+    shape = (4,) + one_worker.recon_shape
+    init = np.linspace(0.0, 0.1, int(np.prod(shape)), dtype=np.float32).reshape(shape)
+    init += 0.01 * np.random.default_rng(4).standard_normal(shape).astype(np.float32)
+
+    one_worker.set_device_pool(['cpu'])
+    one, one_dict = one_worker.recon(_smooth_sino(), init_recon=init, max_iterations=2,
+                                     stop_threshold_change_pct=0, seed=seed)
+    two_workers = _four_frame_model()
+    two_workers.set_device_pool(['cpu', 'cpu'])
+    two, _ = two_workers.recon(_smooth_sino(), init_recon=init, max_iterations=2,
+                               stop_threshold_change_pct=0, seed=seed)
+    rel = _rel_max(two, one)
+    print(f"two CPU workers vs one on seed {seed}: rel_max = {rel:.2e}")
+    assert one_dict['recon_params']['seed'] == seed
+    assert rel < 1e-4

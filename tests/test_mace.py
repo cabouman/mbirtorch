@@ -2,13 +2,15 @@
 
 The loop adds each agent's output into the consensus as it arrives, so its
 update is checked against the plain formulas written out in full.  The
-threaded path is checked with two workers on the CPU.  The agents are checked
+threaded path is checked with two workers on the CPU, both for the arithmetic
+and for the random draws an agent makes on its worker.  The agents are checked
 with stub denoisers.  The whole loop is checked by the equality gate.  There
 the proximal map of the data-fit term and the qGGMRF denoiser at matched
 strengths must reproduce the standard reconstruction.
 """
 
 import math
+import threading
 
 import numpy as np
 import pytest
@@ -148,6 +150,79 @@ def test_two_workers_share_the_queue():
     rel = _rel_max(threaded.x_bar, reference)
     print(f"two workers vs inline: rel_max = {rel:.2e}")
     assert rel < 1e-6
+
+
+class _SeededAgent:
+    """A stub agent whose one task draws from a generator named by the agent's
+    seed and the iteration, records the draw, and adds it to an affine map of
+    the input.  The draw is made where the task runs, so a draw that depended
+    on the worker or on the moment would show up in the record."""
+
+    def __init__(self, seed, scale, offset):
+        self.seed, self.scale, self.offset = seed, float(scale), float(offset)
+        self.draws = []
+        self._lock = threading.Lock()
+
+    def tasks(self, w, iteration=0):
+        def run(device, w=w, iteration=iteration):
+            value = int(np.random.default_rng([self.seed, iteration]).integers(1 << 30))
+            with self._lock:
+                self.draws.append((iteration, value))
+            return self.scale * w + self.offset + 1e-3 * (value % 1000)
+        return [Task(run, device=None, region=None)]
+
+    def state_dict(self):
+        return {'seed': self.seed}
+
+    def load_state_dict(self, state):
+        if 'seed' in state:
+            self.seed = state['seed']
+
+
+def _seeded_agents():
+    return [_SeededAgent(11, 0.6, 0.1), _SeededAgent(12, -0.3, 0.4)]
+
+
+def test_seeded_draws_do_not_depend_on_the_worker_or_the_restart():
+    """An agent that names its generator by its seed and the iteration makes
+    the same draws whichever worker runs it, so two workers reproduce the
+    inline run draw for draw and value for value.  The same naming survives a
+    restart: four steps, against two steps saved, rebuilt, loaded, and
+    stepped twice more, make the same draws from iteration 2 on and reach the
+    same average."""
+    torch.manual_seed(5)
+    x0 = torch.randn(6, 4, 5)
+
+    inline_agents = _seeded_agents()
+    inline = MACE(inline_agents, x0, rho=0.4)
+    for _ in range(4):
+        inline.step()
+
+    threaded_agents = _seeded_agents()
+    with MACE(threaded_agents, x0, rho=0.4, devices=['cpu', 'cpu']) as threaded:
+        for _ in range(4):
+            threaded.step()
+    for inline_agent, threaded_agent in zip(inline_agents, threaded_agents):
+        assert threaded_agent.draws == inline_agent.draws
+    rel_threaded = _rel_max(threaded.x_bar, inline.x_bar)
+
+    first_agents = _seeded_agents()
+    first = MACE(first_agents, x0, rho=0.4)
+    for _ in range(2):
+        first.step()
+    state = first.state_dict()
+    resumed_agents = _seeded_agents()
+    resumed = MACE(resumed_agents, x0, rho=0.4)
+    resumed.load_state_dict(state)
+    for _ in range(2):
+        resumed.step()
+    for resumed_agent, inline_agent in zip(resumed_agents, inline_agents):
+        assert resumed_agent.draws == [row for row in inline_agent.draws if row[0] >= 2]
+    rel_resumed = _rel_max(resumed.x_bar, inline.x_bar)
+    print(f"seeded draws: two workers vs inline {rel_threaded:.2e}, "
+          f"resumed vs inline {rel_resumed:.2e}")
+    assert rel_threaded < 1e-6
+    assert rel_resumed < 1e-6
 
 
 # ── the agents ───────────────────────────────────────────────────────────────

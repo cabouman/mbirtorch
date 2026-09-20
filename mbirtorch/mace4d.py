@@ -27,6 +27,7 @@ from .denoising import QGGMRFDenoiser
 from .mace import MACE, ForwardProxAgent, HyperplaneAgent, Task, resolve_device_pool
 from .parameter_handler import ParameterHandler
 from .utilities import construct_time_frame_models
+from .vcd_utils import gen_set_of_pixel_partitions, named_rng, named_seed
 
 # Iterations of the per-frame reconstruction that initializes the 4D image.
 _INIT_ITERATIONS = 15
@@ -517,7 +518,7 @@ class MACE4DModel(ParameterHandler):
         return list(self._devices) if self._devices is not None else resolve_device_pool(None)
 
     def recon(self, sinogram, weights=None, init_recon=None, max_iterations=10,
-              stop_threshold_change_pct=0.2, init_dir=None, log_dir=None):
+              stop_threshold_change_pct=0.2, init_dir=None, log_dir=None, seed=None):
         """
         Reconstruct one volume per time frame from the sinogram of the scan.
 
@@ -541,6 +542,13 @@ class MACE4DModel(ParameterHandler):
             log_dir (str, optional): directory for ``run_info.txt``,
                 ``timing_log.csv``, and ``task_log.csv``.  Defaults to None,
                 no log files.
+            seed (int, optional): the seed every random draw of the run is
+                derived from, so that two runs of one seed on one pool of
+                devices agree to float rounding whatever the workers do.
+                Defaults to None, which draws one from the global np.random
+                state at the start of the call, so ``np.random.seed(k)``
+                before this call fixes the run.  The seed used is recorded in
+                the run settings.
 
         Returns:
             (recon, recon_dict): the 4D reconstruction as a numpy array of
@@ -563,6 +571,9 @@ class MACE4DModel(ParameterHandler):
         Example:
             >>> recon_4d, recon_dict = mace.recon(sinogram, weights=weights, log_dir='./logs')
         """
+        # Every draw of the run comes from this seed, and this is the one draw
+        # the run makes from the global state.
+        seed = int(np.random.randint(1 << 31)) if seed is None else int(seed)
         num_frames = self.num_frames
         beta = _normalize_prior_weights(self.get_params('mace_prior_weight'))
         verbose = self.get_params('verbose')
@@ -619,7 +630,8 @@ class MACE4DModel(ParameterHandler):
                              inner_iterations=self.get_params('prox_num_iterations'),
                              device=frame_devices[t],
                              partition_advance=self.get_params('prox_partition_advance'),
-                             use_warm_start=prox_warm_start)
+                             use_warm_start=prox_warm_start,
+                             seed=named_seed(seed, t))
             for t in range(num_frames)]
 
         if init_recon is None:
@@ -662,12 +674,13 @@ class MACE4DModel(ParameterHandler):
                                 else apply_temporal_filter(x0, filter_matrix, axis=0))
         sigma_x, sigma_x_source, spread = self._denoiser_sigma_x(
             image_for_statistics, global_sigma, pool[0])
-        for _, axis in _ORIENTATIONS:
-            image_shape, params, batch_size = self._configure_orientation(
-                axis, image_for_statistics, global_sigma, sigma_x)
+        for name, axis in _ORIENTATIONS:
+            image_shape, params, batch_size, partition = self._configure_orientation(
+                axis, image_for_statistics, global_sigma, sigma_x,
+                named_rng(seed, name))
             batch_sizes.append(batch_size)
             make = self._stack_denoiser_factory(image_shape, params, global_sigma, batch_size,
-                                                iteration_counts, counts_lock)
+                                                partition, iteration_counts, counts_lock)
             priors.append(HyperplaneAgent(axis, make, batch_size=batch_size,
                                           filter_matrix=filter_matrix,
                                           use_warm_start=denoiser_warm_start))
@@ -679,7 +692,7 @@ class MACE4DModel(ParameterHandler):
 
         run_settings = self._run_settings(pool, init_source, global_sigma, sigma_source,
                                           weights, max_iterations, stop_threshold_change_pct,
-                                          sigma_x, sigma_x_source, spread, batch_sizes)
+                                          sigma_x, sigma_x_source, spread, batch_sizes, seed)
         run_settings['dejitter'] = dejitter
         if dejitter_note is not None:
             run_settings['temporal filter'] = dejitter_note
@@ -793,13 +806,15 @@ class MACE4DModel(ParameterHandler):
         regularization = denoiser.auto_set_regularization_params_from_stack(image)
         return (float(regularization['sigma_x']), 'estimated from the initial image', spread)
 
-    def _configure_orientation(self, axis, x0, sigma, sigma_x):
-        """Return the volume shape, the denoiser parameters, and the batch
-        size of one orientation.
+    def _configure_orientation(self, axis, x0, sigma, sigma_x, rng=None):
+        """Return the volume shape, the denoiser parameters, the batch size,
+        and the pixel partition of one orientation.
 
         Every orientation is given the same noise level and the same prior
         strength, so that the three priors add up to one 4D prior.  The batch
-        size comes from :func:`_slab_batch_size`.
+        size comes from :func:`_slab_batch_size`.  The partition is drawn once
+        here and used by every denoiser of the orientation, so that a slab
+        gives the same result on whichever worker takes it.
         """
         image_shape = tuple(int(x0.shape[d]) for d in _permutation(axis)[1:])
         # A subset with fewer than about 64 pixels makes the line search
@@ -812,19 +827,25 @@ class MACE4DModel(ParameterHandler):
         params = dict(sigma_noise=sigma, sigma_y=sigma, sigma_x=sigma_x,
                       granularity=[num_subsets], partition_sequence=[0],
                       auto_regularize_flag=False, **self._prior_params())
-        return image_shape, params, batch_size
+        partition = gen_set_of_pixel_partitions(image_shape, [num_subsets],
+                                                use_ror_mask=False, rng=rng)[0]
+        return image_shape, params, batch_size, partition
 
     @staticmethod
-    def _stack_denoiser_factory(image_shape, params, sigma, batch_size, iteration_counts, lock):
+    def _stack_denoiser_factory(image_shape, params, sigma, batch_size, partition,
+                                iteration_counts, lock):
         """Return a ``make_stack_denoiser(device)`` for
         :class:`HyperplaneAgent`.  Each denoiser it returns is pinned to its
-        device, uses the given parameters, sweeps every slab at
-        ``batch_size`` volumes, and records the iteration count of every
-        volume it sweeps."""
+        device, uses the given parameters and the given pixel partition,
+        sweeps every slab at ``batch_size`` volumes, and records the iteration
+        count of every volume it sweeps."""
         def make_stack_denoiser(device):
             denoiser = QGGMRFDenoiser(image_shape)
             denoiser.configure_devices(devices=[device])
             denoiser.set_params(no_warning=True, verbose=0, **params)
+            # The parameters are set and the automatic regularization is off,
+            # so nothing here needs an image.
+            denoiser.initialize_denoiser(partition=partition)
 
             def padded(stack, count):
                 """Return the stack with its last volume repeated up to
@@ -845,7 +866,8 @@ class MACE4DModel(ParameterHandler):
                     init_stack=None if init_stack is None else padded(init_stack, count),
                     max_iterations=_DENOISE_MAX_ITERATIONS,
                     stop_threshold_change_pct=_DENOISE_STOP_THRESHOLD_PCT,
-                    batch_size=count, overwrite_input=True)
+                    batch_size=count, overwrite_input=True,
+                    do_initialization=False)
                 with lock:
                     iteration_counts.extend(int(n) for n in info['num_iterations'][:real])
                 return out[:real]
@@ -877,7 +899,8 @@ class MACE4DModel(ParameterHandler):
                 agent = frame_agents[t]
                 volume, _ = agent.model.recon(
                     agent.sinogram, weights=agent.weights, max_iterations=_INIT_ITERATIONS,
-                    stop_threshold_change_pct=stop_threshold, logfile_path=None, print_logs=False)
+                    stop_threshold_change_pct=stop_threshold, logfile_path=None,
+                    print_logs=False, rng=agent.rng_for('initial image'))
                 volumes[t] = np.asarray(volume, dtype=np.float32)
 
         # Frames are grouped by pool entry, as the loop's workers are, so
@@ -941,7 +964,7 @@ class MACE4DModel(ParameterHandler):
 
     def _run_settings(self, pool, init_source, global_sigma, sigma_source, weights,
                       max_iterations, stop_threshold_change_pct, sigma_x, sigma_x_source,
-                      spread, batch_sizes):
+                      spread, batch_sizes, seed):
         """Return the settings of a run, for ``run_info.txt`` and the result
         dict."""
         from . import __version__
@@ -950,6 +973,7 @@ class MACE4DModel(ParameterHandler):
         return {
             'date': time.strftime('%Y-%m-%d %H:%M:%S'),
             'mbirtorch version': __version__,
+            'seed': seed,
             'time frames': self.num_frames,
             'frame shape': self.recon_shape,
             'views per frame': self.view_slices[0].stop - self.view_slices[0].start,
@@ -980,6 +1004,7 @@ class MACE4DModel(ParameterHandler):
                                  f"block {spread['block']}"),
             'denoise batch sizes [xyt, yzt, xzt]': list(batch_sizes),
             'denoise slab budget (GB)': float(self.get_params('denoise_slab_gb')),
+            'denoiser pixel partitions': 'one per orientation, drawn once from the seed',
             'dejitter': self.get_params('dejitter'),
             'frames_per_rotation': self.frames_per_rotation,
             'frame_overlap_factor': self.frame_overlap_factor,

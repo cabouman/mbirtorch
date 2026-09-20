@@ -2575,11 +2575,16 @@ class TomographyModel(ParameterHandler):
         return vcd_subset_updater
 
     def vcd_partition_iterator(self, vcd_subset_updater, flat_recon, error_sinogram,
-                               partition):
+                               partition, rng=None):
         """
         Calculate a full iteration of the VCD algorithm by scanning over the
         subsets of the partition, updating flat_recon and error_sinogram in
         place.
+
+        Args:
+            rng (numpy.random.Generator, optional): the generator the visiting
+                order is drawn from.  Defaults to None, the global np.random
+                state.
 
         Returns:
             (flat_recon, error_sinogram, ell1_for_partition, alpha,
@@ -2591,12 +2596,13 @@ class TomographyModel(ParameterHandler):
         # the partition.
         if hasattr(vcd_subset_updater, 'stage_halos'):
             vcd_subset_updater.stage_halos(flat_recon)
-        # The subsets are visited in a random order.  Do not change this np.random call, because
+        # The subsets are visited in a random order.  Do not change this draw, because
         # a different random sequence changes the iteration trace that the tests compare against.
         ell1_for_partition = 0
         alpha_sum = 0
         delta_sumsq_partition = 0
-        subset_indices = np.random.permutation(partition.shape[0])
+        draw = np.random if rng is None else rng
+        subset_indices = draw.permutation(partition.shape[0])
 
         for index in subset_indices:
             subset = partition[index]
@@ -2613,7 +2619,7 @@ class TomographyModel(ParameterHandler):
                    stop_threshold_change_pct, weights=None, init_recon=None,
                    prox_input=None, compute_prior_loss=False, first_iteration=0,
                    init_error_sinogram=None, fm_hessian=None,
-                   return_checkpoint=False):
+                   return_checkpoint=False, rng=None):
         """
         Perform MBIR reconstruction using the Multi-Granular Vector Coordinate
         Descent algorithm for a given set of partitions and a prescribed
@@ -2665,6 +2671,9 @@ class TomographyModel(ParameterHandler):
                 {'error_sinogram': ..., 'fm_hessian': ...} for the two
                 arguments above.  The dict references the loop's own final
                 device tensors with no copy; copy them to snapshot or persist.
+            rng (numpy.random.Generator, optional): the generator the order of
+                the subsets is drawn from at each iteration.  Defaults to
+                None, the global np.random state.
 
         Returns:
             (recon, recon_stats): the 3D reconstruction tensor and a tuple of
@@ -2821,7 +2830,8 @@ class TomographyModel(ParameterHandler):
                 partition = partitions[partition_sequence[i]]
                 (flat_recon, error_sinogram, ell1_for_partition, alpha,
                  delta_sumsq_partition) = self.vcd_partition_iterator(
-                    vcd_subset_updater, flat_recon, error_sinogram, partition)
+                    vcd_subset_updater, flat_recon, error_sinogram, partition,
+                    rng=rng)
 
                 # The element count is passed in, because a sharded error sinogram is a list
                 # of tensors and the statistics normalize by the total element count.
@@ -2905,14 +2915,15 @@ class TomographyModel(ParameterHandler):
     def initialize_recon(self, sinogram, weights=None, init_recon=None,
                          max_iterations=15, first_iteration=0,
                          logfile_path='~/.mbirtorch/logs/recon.log',
-                         print_logs=True):
+                         print_logs=True, rng=None):
         """
         Do the parameter initialization needed for recon: generate the set of
         voxel partitions and the partition sequence, validate the inputs, and
         run auto-regularization.
 
         Args:
-            See :meth:`recon` for arguments.
+            See :meth:`recon` for arguments.  ``rng`` is the generator the
+            partitions are drawn from; None uses the global np.random state.
 
         Returns:
             sinogram, weights, init_recon, partitions, partition_sequence,
@@ -2925,7 +2936,7 @@ class TomographyModel(ParameterHandler):
             ['recon_shape', 'granularity', 'use_ror_mask'])
         partitions = vcd_utils.gen_set_of_pixel_partitions(
             recon_shape, granularity, device=self.torch_device,
-            use_ror_mask=use_ror_mask)
+            use_ror_mask=use_ror_mask, rng=rng)
 
         partition_sequence = self.get_params('partition_sequence')
         partition_sequence = vcd_utils.gen_partition_sequence(
@@ -2986,7 +2997,7 @@ class TomographyModel(ParameterHandler):
     def recon(self, sinogram, weights=None, init_recon=None, max_iterations=15,
               stop_threshold_change_pct=0.2, first_iteration=0,
               logfile_path='~/.mbirtorch/logs/recon.log', print_logs=True,
-              output_sharded=False):
+              output_sharded=False, rng=None):
         """
         Perform MBIR reconstruction using the Multi-Granular Vector Coordinate
         Descent algorithm.  This function takes care of generating its own
@@ -3008,11 +3019,13 @@ class TomographyModel(ParameterHandler):
         ``MBIRTORCH_NUM_DEVICES`` pins the count process-wide, which is
         what a test suite or a nightly should use.
 
-        Reproducibility note: the pixel partitions are drawn from numpy's
-        global random number generator, so reconstructions vary slightly from
-        run to run.  For a reproducible result, call ``np.random.seed(seed)``
-        before calling this method.  Results also differ slightly with the
-        device count, and that difference decays as iterations proceed.
+        Reproducibility note: the pixel partitions and the order in which the
+        subsets are visited are drawn from numpy's global random number
+        generator, so reconstructions vary slightly from run to run.  For a
+        reproducible result, call ``np.random.seed(seed)`` before calling this
+        method, or pass ``rng``, which makes the draws independent of anything
+        else the process draws.  Results also differ slightly with the device
+        count, and that difference decays as iterations proceed.
 
         Args:
             sinogram (numpy or tensor or Shards): 3D sinogram data with shape
@@ -3040,6 +3053,9 @@ class TomographyModel(ParameterHandler):
                 numpy array.  If True, return the device form: a torch
                 tensor on a single device, or a Shards container (one
                 tensor per device) on a multi-device model.
+            rng (numpy.random.Generator, optional): the generator every random
+                draw of the run comes from, the partitions and the order of
+                the subsets.  Defaults to None, the global np.random state.
 
         Returns:
             (recon, recon_dict): the reconstruction volume, and a dict
@@ -3053,7 +3069,7 @@ class TomographyModel(ParameterHandler):
         (sinogram, weights, init_recon, partitions, partition_sequence, granularity,
          regularization_params) = self.initialize_recon(
             sinogram, weights, init_recon, max_iterations, first_iteration,
-            logfile_path=logfile_path, print_logs=print_logs)
+            logfile_path=logfile_path, print_logs=print_logs, rng=rng)
 
         # This uses no_grad rather than inference_mode, because torch.compile guards fail on
         # compiled calls with in place updates inside inference_mode.
@@ -3061,7 +3077,7 @@ class TomographyModel(ParameterHandler):
             recon, loss_vectors = self._vcd_recon(
                 sinogram, partitions, partition_sequence,
                 stop_threshold_change_pct, weights=weights, init_recon=init_recon,
-                first_iteration=first_iteration)
+                first_iteration=first_iteration, rng=rng)
 
         partition_sequence = [int(val) for val in partition_sequence]
         fm_rmse = [float(val) for val in loss_vectors[0]]
@@ -3135,20 +3151,50 @@ class TomographyModel(ParameterHandler):
                 error_sinogram, flat_recon, sigma_y, weights)
         return fm_loss, recon_l1, es_rmse
 
+    def initialize_prox(self, sinogram, weights=None, init_recon=None,
+                        max_iterations=3, first_iteration=0,
+                        logfile_path='~/.mbirtorch/logs/prox.log',
+                        print_logs=True, rng=None):
+        """
+        Do the initialization of :meth:`prox_map` and store it in
+        ``prox_data``, which later calls of ``prox_map`` reuse.
+
+        Call this to initialize with one generator and then sweep with
+        another, which is what makes a Plug-and-Play loop draw the same
+        partitions whatever thread runs its first iteration.  ``prox_map``
+        calls this itself on a call that asks for initialization or finds no
+        cache.
+
+        Args:
+            See :meth:`prox_map` for arguments.  ``rng`` is the generator the
+            partitions are drawn from; None uses the global np.random state.
+
+        Returns:
+            The tuple :meth:`initialize_recon` returns.
+        """
+        initialized = self.initialize_recon(
+            sinogram, weights, init_recon, max_iterations, first_iteration,
+            logfile_path=logfile_path, print_logs=print_logs, rng=rng)
+        # The cache holds the last four entries: the partitions, the partition
+        # sequence, the granularity, and the regularization parameters.
+        self.prox_data = tuple(initialized[3:])
+        return initialized
+
     def prox_map(self, prox_input, sinogram, sigma_prox=None, weights=None,
                  init_recon=None, do_initialization=True,
                  stop_threshold_change_pct=0.2, max_iterations=3,
                  first_iteration=0,
                  logfile_path='~/.mbirtorch/logs/prox.log', print_logs=True,
-                 output_sharded=False):
+                 output_sharded=False, rng=None):
         """
         Proximal Map function for use in Plug-and-Play applications.  This
         function is similar to recon, but it essentially uses a prior with a
         mean of prox_input and a standard deviation of sigma_prox.
 
-        Reproducibility note: the pixel partitions are drawn from numpy's global
-        random number generator; call ``np.random.seed(seed)`` first for a
-        reproducible result.
+        Reproducibility note: the pixel partitions and the order in which the
+        subsets are visited are drawn from numpy's global random number
+        generator; call ``np.random.seed(seed)`` first for a reproducible
+        result, or pass ``rng``.
 
         Args:
             prox_input (numpy or tensor or Shards): proximal map input with the
@@ -3171,8 +3217,9 @@ class TomographyModel(ParameterHandler):
             init_recon (numpy or tensor, optional): reconstruction used for
                 initialization.  Defaults to None (determined by _vcd_recon).
             do_initialization (bool, optional): If True, initialize parameters
-                (partitions and regularization).  Set False if a previous
-                prox_map call on this model already initialized this sinogram.
+                (partitions and regularization) through :meth:`initialize_prox`.
+                Set False if a previous prox_map call on this model, or a call
+                to :meth:`initialize_prox`, already initialized this sinogram.
             stop_threshold_change_pct (float, optional): stop when the NMAE
                 percent change drops below this value.  Defaults to 0.2.
             max_iterations (int, optional): maximum VCD iterations, counted
@@ -3196,6 +3243,10 @@ class TomographyModel(ParameterHandler):
                 numpy array.  If True, return the device form: a torch
                 tensor on a single device, or a Shards container (one
                 tensor per device) on a multi-device model.
+            rng (numpy.random.Generator, optional): the generator every random
+                draw of the call comes from, the partitions when this call
+                initializes and the order of the subsets.  Defaults to None,
+                the global np.random state.
 
         Returns:
             (recon, recon_dict): the reconstruction volume, and a dict
@@ -3209,14 +3260,15 @@ class TomographyModel(ParameterHandler):
         prior_loss = [0]
         if do_initialization or self.prox_data is None:
             (sinogram, weights, init_recon, partitions, partition_sequence,
-             granularity, regularization_params) = self.initialize_recon(
+             granularity, regularization_params) = self.initialize_prox(
                 sinogram, weights, init_recon, max_iterations, first_iteration,
-                logfile_path=logfile_path, print_logs=print_logs)
-            self.prox_data = (partitions, partition_sequence, granularity,
-                              regularization_params)
+                logfile_path=logfile_path, print_logs=print_logs, rng=rng)
         else:
             (partitions, partition_sequence, granularity,
              regularization_params) = self.prox_data
+            # The cache is dropped by a change of the device layout, and by nothing else: a
+            # change of granularity, partition_sequence, or use_ror_mask leaves it in place.
+            # The QGGMRFDenoiser cache checks those three and redraws when they move.
             # The cache holds the pixel partitions and the regularization estimates, which are
             # expensive.  The partition sequence is cheap and is recomputed here the same way.
             partition_sequence = vcd_utils.gen_partition_sequence(
@@ -3241,7 +3293,7 @@ class TomographyModel(ParameterHandler):
                 sinogram, partitions, partition_sequence,
                 stop_threshold_change_pct, weights=weights,
                 init_recon=init_recon, prox_input=prox_input,
-                first_iteration=first_iteration)
+                first_iteration=first_iteration, rng=rng)
 
         partition_sequence = [int(val) for val in partition_sequence]
         fm_rmse = [float(val) for val in loss_vectors[0]]

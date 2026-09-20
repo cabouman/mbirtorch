@@ -1,7 +1,7 @@
 """QGGMRFDenoiser gates: golden parity vs mbirjax, a denoising smoke on every
 backend, two shards against one device, the sigma_noise knob with the
-automatic regularization off, an all-zero input, and the stack denoiser
-against a loop of single-volume calls."""
+automatic regularization off, an all-zero input, the stack denoiser against a
+loop of single-volume calls, and one initialization reused across calls."""
 
 import glob
 import os
@@ -310,6 +310,57 @@ def test_denoise_stack_never_writes_the_caller_s_arrays(device):
             assert torch.equal(stack, before_stack) and torch.equal(init, before_init)
         else:
             assert np.array_equal(stack, before_stack) and np.array_equal(init, before_init)
+
+
+def test_one_initialization_fixes_the_stack_sweep(device):
+    """The pixel grouping is a random draw, and at 16 subsets it moves the
+    result by far more than the stopping threshold of a consensus loop.  A
+    denoiser initialized once must therefore reuse that grouping: two sweeps
+    with do_initialization=False agree to a relative maximum difference of
+    1e-6, while two sweeps that draw again differ by more than 1e-3.  A False
+    call that passes a new noise level uses that level and keeps the cache,
+    since the noise level is one scalar and the grouping is not.  And a
+    partition handed to initialize_denoiser is the one the cache holds and the
+    sweep uses."""
+    shape = (8, 10, 12)
+    stack = _ramp_stack(4, shape)
+    sweep = dict(sigma_noise=0.1, max_iterations=4, stop_threshold_change_pct=0.0)
+
+    denoiser = mbirtorch.QGGMRFDenoiser(shape)
+    denoiser.configure_devices(devices=[device])
+    denoiser.set_params(no_warning=True, verbose=0)
+    settled = denoiser.initialize_denoiser(image=stack, sigma_noise=0.1)
+    assert int(settled['partition'].shape[0]) == 16
+
+    fixed_first, _ = denoiser.denoise_stack(stack, do_initialization=False, **sweep)
+    fixed_again, _ = denoiser.denoise_stack(stack, do_initialization=False, **sweep)
+    rel_fixed = _rel_max(fixed_again, fixed_first)
+
+    drawn_first, _ = denoiser.denoise_stack(stack, **sweep)
+    drawn_again, _ = denoiser.denoise_stack(stack, **sweep)
+    rel_drawn = _rel_max(drawn_again, drawn_first)
+    print(f"stack sweeps on {device}: two reused initializations differ by "
+          f"{rel_fixed:.2e}, two fresh draws by {rel_drawn:.2e}")
+    assert rel_fixed < 1e-6
+    assert rel_drawn > 1e-3
+
+    # A new noise level on a reused initialization: the level is used and the
+    # grouping is kept.
+    held = denoiser.denoise_data['partition']
+    _out, info = denoiser.denoise_stack(stack, sigma_noise=0.25, max_iterations=1,
+                                        stop_threshold_change_pct=0.0,
+                                        do_initialization=False)
+    assert denoiser.denoise_data['partition'] is held
+    assert info['regularization_params']['sigma_y'] == pytest.approx(0.25)
+    assert float(denoiser.get_params('sigma_y')) == pytest.approx(0.25)
+
+    # A supplied partition.
+    supplied = mbirtorch.gen_set_of_pixel_partitions(shape, [16], use_ror_mask=False)[0]
+    cached = denoiser.initialize_denoiser(image=stack, sigma_noise=0.1,
+                                          partition=supplied)['partition']
+    assert torch.equal(cached.cpu(), supplied)
+    denoiser.denoise_stack(stack, do_initialization=False, **sweep)
+    assert denoiser.denoise_data['partition'] is cached
 
 
 # ── the regularization parameters of a stack ─────────────────────────────────
