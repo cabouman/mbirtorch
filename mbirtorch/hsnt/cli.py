@@ -491,8 +491,9 @@ def estimate_rank(ds: Dataset, device, seed=0, max_rank=6, subsample=16384, pool
     dose 1 where full resolution gives 1, without over-estimating up to dose 1e4. The block is chosen so the pooled
     pixel count falls to about the bin count, below which the floor is dominated by the spectrum's own K parameters
     and pooling buys nothing more. The larger of the two ranks is returned: over-estimation costs a fraction of a
-    decibel while under-estimation caps the SNR. pool='auto' picks the block so the pooled pixel count is about half
-    the bin count; an integer fixes it; 0 disables it.
+    decibel while under-estimation caps the SNR. pool='auto' picks the block from the calibrated dose so pooled pixels
+    hold about 64 counts per bin (no pooling above dose 64, where pooled mixed pixels start to add spurious rank);
+    an integer fixes it; 0 disables it.
     Returns (rank, note, detail)."""
     import torch
     stride = max(1, ds.pixels // subsample)
@@ -503,8 +504,12 @@ def estimate_rank(ds: Dataset, device, seed=0, max_rank=6, subsample=16384, pool
     V, rows, cols = ds.spatial_shape
     block = 0
     if pool == "auto":
-        block = int(np.ceil(np.sqrt(2.0 * ds.pixels / K)))                      # pooled pixels ~ K / 2: 8x8 on the 37k-pixel sphere phantom
-        block = min(block, max(1, min(rows, cols) // 4))                          # keep at least 4x4 pooled pixels per view
+        # Pool only as much as the counts require: to about 64 counts per pooled pixel and bin (8x8 at dose 1, 2x2 at
+        # dose 30, none above dose 64). Pooling at high dose over-estimates the rank: pooled pixels of mixed composition
+        # are not exactly low-rank (the exponential is applied to the block-averaged transmission) and that misfit's
+        # likelihood gain grows with dose; on the sphere phantom it chose rank 4 from dose 32 upward with an 8x8 block.
+        block = int(np.ceil(np.sqrt(64.0 / max(d_full["effective_dose"], 1e-9))))
+        block = int(min(block, np.ceil(np.sqrt(2.0 * ds.pixels / K)), max(1, min(rows, cols) // 4)))   # and never below ~K/2 pooled pixels
     elif pool:
         block = int(pool)
     detail = dict(full=d_full, pool_block=block, max_rank=max_rank)
