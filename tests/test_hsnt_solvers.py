@@ -108,3 +108,19 @@ def test_streaming_matches_monolithic_within_a_decibel_of_loss():
     W = torch.cat([w.cuda() for w in W_chunks])
     Wm, Hm, _ = hsnt.nnal_factorization(T, method="joint_newton", num_materials=3, max_steps=200, rel_tol=1e-8)
     assert _loss(W, H, T) <= 1.01 * _loss(Wm, Hm, T)
+
+
+def test_sphere_phantom_geometry():
+    """Chord lengths, the 10-unit diameter, in-plane overlaps, and the noiseless data equal to W @ H."""
+    rng = np.random.default_rng(0); basis = rng.uniform(0.05, 1.0, size=(3, 50))
+    noisy, angles, gt, maps = hsnt.generate_sphere_data(basis, num_angles=4, detector_rows=64, detector_columns=64,
+                                                        material_density={"Ni": 1.0, "Cu": 1.0, "Al": 1.0}, noisy=False, verbose=0)
+    assert noisy.shape == (4, 64, 64, 50) and maps.shape == (4, 64, 64, 3) and len(angles) == 4
+    assert abs(maps.max() - 10.0) < 0.05                                            # a diameter is 10 thickness units
+    assert np.allclose(gt.reshape(-1, 50), maps.reshape(-1, 3) @ basis, atol=1e-5)  # the data are exactly rank 3
+    assert np.allclose(noisy, gt, atol=1e-6)
+    n = (maps > 0).sum(-1)
+    assert (n[0] == 2).sum() > 100 and (n == 3).sum() < 0.01 * (n > 0).sum()         # view 0: Cu and Al coincide; triple overlaps only where their disc grazes Ni's
+    for a in range(4):
+        for m in range(3):
+            assert (maps[a, :, :, m] > 0).any()                                      # every material visible in every view

@@ -42,13 +42,13 @@ from .spectra import unconstrained_spectra, support_selected_spectra, pure_pixel
 from .denoise import hyper_denoise, dehydrate, rehydrate, _estimate_subspace_dimension
 from .io import (KEY_DESCRIPTIONS, VALIDATION_RULES, ALLOWED_KEYS, _validate_key, _with_key_docstring,
                  import_hsnt_data_hdf5, create_hsnt_metadata, export_hsnt_data_hdf5)
-from .simulate import generate_hyper_data
+from .simulate import generate_hyper_data, generate_sphere_data
 from .plots import compare_spectra
 
 __all__ = [
     "hyper_denoise", "dehydrate", "rehydrate",
     "import_hsnt_data_hdf5", "create_hsnt_metadata", "export_hsnt_data_hdf5",
-    "generate_hyper_data",
+    "generate_hyper_data", "generate_sphere_data",
     "nnal_factorization", "stable_nnal", "stable_nnal_derivatives",
     "compare_spectra",
     "stream_factorization",
