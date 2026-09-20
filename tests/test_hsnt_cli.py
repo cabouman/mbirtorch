@@ -11,7 +11,7 @@ tifffile = pytest.importorskip("tifffile")
 import h5py
 import torch
 
-from mbirtorch.hsnt.cli import main, infer_input_type, _parse_slice
+from mbirtorch.hsnt.cli import main, infer_input_type, _parse_slice, estimate_rank, load_hdf5
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 ROWS, COLS, K, R, DOSE = 12, 10, 40, 2, 50.0
@@ -67,7 +67,7 @@ def test_inspect_tiff_with_open_beam(stacks, capsys):
 def test_inspect_hdf5_finds_the_group(stacks, capsys):
     assert main(["inspect", stacks["h5"], "-q", "--estimate-rank"]) == 0
     out = capsys.readouterr().out
-    assert "type attenuation" in out and "1 view(s)" in out and "subspace dimension" in out
+    assert "type attenuation" in out and "1 view(s)" in out and f"rank {R} estimated" in out and "gains by component" in out
 
 
 def test_counts_without_open_beam_is_an_error(stacks):
@@ -97,7 +97,7 @@ def test_wave_bin_and_downsample(stacks):
 @cuda
 def test_factorize_writes_readable_factors(stacks, tmp_path):
     out = str(tmp_path / "res")
-    assert main(["factorize", stacks["h5"], "--rank", str(R), "-o", out, "--gauge", "--dose", str(DOSE), "--max-steps", "200", "-q"]) == 0
+    assert main(["factorize", stacks["h5"], "-o", out, "--gauge", "--dose", str(DOSE), "--max-steps", "200", "-q"]) == 0   # rank estimated
     files = sorted(os.listdir(out))
     assert any(f.endswith("_factors.h5") for f in files) and any(f.endswith("_report.json") for f in files) and any(f.endswith("_maps.png") for f in files)
     data, meta = hsnt.import_hsnt_data_hdf5(os.path.join(out, "processed_factors.h5"))
@@ -119,6 +119,39 @@ def test_factorize_stream_mode_from_tiffs(stacks, tmp_path):
                  "--chunk-pixels", "40", "--warmup-pixels", "60", "--max-passes", "2", "--no-plots", "-q"]) == 0
     rep = json.load(open(os.path.join(out, "sample_report.json")))
     assert rep["result"]["mode"] == "stream" and rep["result"]["passes"] >= 1 and rep["dose"] > 0
+
+
+def test_rank_is_estimated_by_default(stacks):
+    ds = load_hdf5(stacks["h5"])
+    n, note, detail = estimate_rank(ds, "cpu", max_rank=4)
+    assert n == R and "estimated" in note and len(detail["gains"]) == 3 and 30 < detail["effective_dose"] < 90
+
+
+@cuda
+def test_denoise_writes_readable_data_with_estimated_rank(stacks, tmp_path):
+    out = str(tmp_path / "den")
+    assert main(["denoise", stacks["h5"], "-o", out, "--dose", str(DOSE), "--max-steps", "200", "--no-plots", "-q"]) == 0
+    data, meta = hsnt.import_hsnt_data_hdf5(os.path.join(out, "processed_denoised.h5"))
+    assert data.shape == (1, ROWS, COLS, K) and meta["dataset_type"] == "attenuation" and np.isfinite(data).all()
+    W, H = _truth()
+    assert np.linalg.norm(data.reshape(-1, K) - W @ H) / np.linalg.norm(W @ H) < 0.35
+    rep = json.load(open(os.path.join(out, "processed_report.json")))
+    assert rep["result"]["rank"] == R and "estimated" in rep["result"]["rank_note"]
+    assert 0.5 < rep["result"]["fit"]["reduced_chi2"] < 2.0                          # the fit sits at the Poisson noise level
+    assert os.path.exists(os.path.join(out, "processed_factors.h5"))
+    with h5py.File(os.path.join(out, "processed_denoised.h5")) as f:
+        assert f.attrs["rank"] == R and f["bin_indices"].shape == (K,)
+
+
+@cuda
+def test_denoise_no_factors_transmission(stacks, tmp_path):
+    out = str(tmp_path / "den2")
+    assert main(["denoise", stacks["sample"], "--open-beam", stacks["open_beam"], "-o", out, "--rank", "2", "--no-factors",
+                 "--as-type", "transmission", "--no-plots", "--max-steps", "100", "-q"]) == 0
+    files = os.listdir(out)
+    assert not any(f.endswith("_factors.h5") for f in files)
+    data, meta = hsnt.import_hsnt_data_hdf5(os.path.join(out, "sample_denoised.h5"))
+    assert meta["dataset_type"] == "transmission" and 0 < data.min() and data.max() < 2
 
 
 def test_gauge_without_dose_is_an_error(stacks, tmp_path):

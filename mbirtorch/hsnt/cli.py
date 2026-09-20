@@ -5,6 +5,9 @@ Three subcommands share one loader and one set of data checks:
     inspect    load a dataset, run the checks, print what a solve would see (no GPU needed)
     convert    write a TIFF stack (with its open beam) to the package's HDF5 layout, once
     factorize  fit the NNAL factorization and write maps, spectra, plots and a JSON report
+    denoise    factorize and rehydrate: write the denoised hyperspectral data (and the factors)
+
+The rank (number of materials) is estimated from the singular values of the attenuation unless --rank gives it.
 
 Inputs are either an HDF5 file in the package layout (``data`` with the spectral axis last, ``dataset_type``,
 optionally inside a group) or a directory of one TIFF image per wavelength bin. A TIFF stack of counts needs an
@@ -424,6 +427,77 @@ def load_dataset(args):
     return ds
 
 
+def _attenuation_sample(ds: Dataset, max_pixels=65536):
+    """Attenuation on a strided pixel subsample, with zero counts floored at half the smallest positive transmission."""
+    T = ds.T[:: max(1, ds.pixels // max_pixels)]
+    pos = T[T > 0]
+    floor = 0.5 * float(pos.min()) if pos.size else np.finfo(np.float32).tiny
+    return -np.log(np.maximum(T, floor)), floor
+
+
+def estimate_rank(ds: Dataset, device, seed=0, max_rank=6, subsample=16384):
+    """Choose the rank by sequential likelihood-ratio tests on a pixel subsample.
+
+    Ranks 1..max_rank are fitted in turn and the loss gain of each added component is converted to log-likelihood
+    units with a dose calibrated from the residual of the most flexible fit (mean (T - e^-X)^2 / e^-X = 1 / dose for
+    Poisson noise), so a nominal or unknown open-beam dose does not matter. A component that only fits noise gains
+    about (P + K) / 2, its parameter count; the noise floor is taken as the larger of that and the median gain of the
+    last three ranks, and a component is accepted while its gain exceeds twice the floor. On the three-material
+    phantom this recovers 3 at dose 30 and above and 2 at dose 3, where the weakest material is barely supported by
+    the likelihood; the singular-value estimator behind dehydrate was not usable here (1 at dose 3, 161 at dose 30).
+    Returns (rank, note, detail)."""
+    import torch
+    from mbirtorch.hsnt import nnal_factorization, stable_nnal
+    stride = max(1, ds.pixels // subsample)
+    T = torch.from_numpy(np.ascontiguousarray(ds.T[::stride])).to(device)
+    P, K = T.shape
+    log.info("estimating the rank: fitting ranks 1..%d on %s pixels (every %d-th) x %d bins", max_rank, f"{P:,}", stride, K)
+    torch.manual_seed(seed)
+    losses, resid = [], []
+    for r in range(1, max_rank + 1):
+        W, H, _ = nnal_factorization(T, method="joint_newton", num_materials=r, max_steps=200, rel_tol=1e-6, random_state=seed)
+        Xd = W.double() @ H.double(); Th = torch.exp(-Xd); Td = T.double()
+        losses.append(stable_nnal(Xd, Td).item()); resid.append((((Td - Th) ** 2) / Th.clamp_min(1e-12)).mean().item())
+        log.debug("  rank %d: loss %.6g, mean chi-square term %.4g", r, losses[-1], resid[-1])
+    dose_eff = 1.0 / resid[-1]
+    gains = [dose_eff * (losses[i - 1] - losses[i]) for i in range(1, len(losses))]     # gains[i - 1] belongs to component i + 1
+    floor = max(0.5 * (P + K), float(np.median(gains[-3:])))
+    threshold = 2.0 * floor
+    rank = 1
+    for r, g in zip(range(2, max_rank + 1), gains):
+        if g > threshold:
+            rank = r
+        else:
+            break
+    table = ", ".join(f"{r}: {g:,.0f}" for r, g in zip(range(2, max_rank + 1), gains))
+    log.info("rank search: effective dose %.3g; log-likelihood gain of component %s; noise floor %.0f, threshold %.0f -> rank %d",
+             dose_eff, table, floor, threshold, rank)
+    if rank == max_rank:
+        log.warning("every rank up to --max-rank %d was accepted; the search may be capped, raise --max-rank", max_rank)
+    note = f"rank {rank} estimated by likelihood-ratio tests on {P:,} pixels (components beyond it gain less than twice the noise floor); pass --rank N to override"
+    detail = dict(subsample_pixels=P, losses=losses, gains=gains, effective_dose=dose_eff, noise_floor=floor, threshold=threshold, max_rank=max_rank)
+    return rank, note, detail
+
+
+def fit_quality(ds: Dataset, W, H, device, chunk=65536):
+    """Reduced chi-square of the fit against Poisson noise: mean of dose (T - e^-X)^2 / e^-X over the data.
+    Near 1 the residual is at the noise level; well above 1 the rank is too small or the model is wrong; well below 1
+    the fit follows the noise. Needs the dose; without it returns the relative residual in transmission instead."""
+    import torch
+    W = torch.as_tensor(W, device=device); H = torch.as_tensor(H, device=device)
+    num = den = res = tot = 0.0
+    for i in range(0, ds.pixels, chunk):
+        T = torch.from_numpy(ds.T[i:i + chunk]).to(device).double()
+        Th = torch.exp(-(W[i:i + chunk].double() @ H.double()))
+        d = T - Th
+        res += (d * d).sum().item(); tot += (T * T).sum().item()
+        num += ((d * d) / Th.clamp_min(1e-12)).sum().item(); den += T.numel()
+    out = dict(relative_residual=float(np.sqrt(res / tot)))
+    if ds.dose is not None:
+        out["reduced_chi2"] = ds.dose * num / den
+    return out
+
+
 # ----------------------------------------------------------------------------------------------------------------------
 # Solve
 # ----------------------------------------------------------------------------------------------------------------------
@@ -470,13 +544,14 @@ def solve(ds: Dataset, args, device):
     from mbirtorch.hsnt import (nnal_factorization, stream_factorization, stable_nnal, unconstrained_spectra,
                                 support_selected_spectra, pure_pixel_gauge)
     rep = {}
+    rank = args.rank_value
     mode, chunk, rep["memory_plan"] = plan_memory(ds, device, args.mode, args.chunk_pixels)
-    rep["mode"] = mode
+    rep["mode"], rep["rank"], rep["rank_note"], rep["rank_search"] = mode, rank, args.rank_note, args.rank_detail
     torch.manual_seed(args.seed)
     t0 = time.perf_counter()
     if mode == "full":
         T = torch.from_numpy(ds.T).to(device)
-        W, H, steps = nnal_factorization(T, method=args.method, num_materials=args.rank, max_steps=args.max_steps,
+        W, H, steps = nnal_factorization(T, method=args.method, num_materials=rank, max_steps=args.max_steps,
                                          rel_tol=args.rel_tol, random_state=args.seed)
         rep["steps"] = int(steps)
     else:
@@ -484,7 +559,7 @@ def solve(ds: Dataset, args, device):
             log.warning("stream mode always uses joint_newton for the warm-up and block Newton for the polish; --method %s ignored", args.method)
         chunks = [torch.from_numpy(ds.T[i:i + chunk]) for i in range(0, ds.pixels, chunk)]
         stats = {}
-        W_chunks, H, passes = stream_factorization(chunks, args.rank, max_passes=args.max_passes, rel_tol=args.rel_tol,
+        W_chunks, H, passes = stream_factorization(chunks, rank, max_passes=args.max_passes, rel_tol=args.rel_tol,
                                                    warmup_pixels=min(args.warmup_pixels, ds.pixels), device=device,
                                                    random_state=args.seed, verbose=log.isEnabledFor(logging.DEBUG), stats=stats,
                                                    nonneg_W=(args.spectra != "unconstrained"))
@@ -514,8 +589,8 @@ def solve(ds: Dataset, args, device):
         rep["unconstrained_steps"], rep["unconstrained_seconds"] = int(st), round(time.perf_counter() - t1, 2)
         log.info("unconstrained spectra: %d steps in %.1f s, loss %.6g", st, rep["unconstrained_seconds"], loss(W, H))
     elif mode == "full" and args.spectra == "support":
-        if args.rank > 6:
-            raise SystemExit("support selection enumerates all 2^R - 1 subsets and is limited to --rank 6")
+        if rank > 6:
+            raise SystemExit("support selection enumerates all 2^R - 1 subsets and is limited to rank 6")
         t1 = time.perf_counter(); W, H, support, st = support_selected_spectra(T, W, H, ds.dose)
         rep["support_steps"], rep["support_seconds"] = int(st), round(time.perf_counter() - t1, 2)
         rep["mean_support_size"] = support.sum(1).double().mean().item()
@@ -527,7 +602,7 @@ def solve(ds: Dataset, args, device):
         if mode != "full":
             raise SystemExit("--gauge needs a full solve (the clustering runs on all pixels at once); use --mode full, --downsample or --wave-bin")
         t1 = time.perf_counter(); W, H, A, labels = pure_pixel_gauge(T, W, H, ds.dose)
-        sizes = [int((labels == k).sum()) for k in range(args.rank)]
+        sizes = [int((labels == k).sum()) for k in range(rank)]
         rep["gauge_seconds"], rep["gauge_cluster_sizes"] = round(time.perf_counter() - t1, 2), sizes
         rep["gauge_condition"] = torch.linalg.cond(A).item()
         log.info("gauge fix: clusters %s of %d pixels with material, cond(A) %.1f, %.1f s", sizes, int((labels >= 0).sum()),
@@ -556,33 +631,68 @@ def _out_paths(args, ds):
     return os.path.join(d, stem)
 
 
+def _out_type(ds, args):
+    given = getattr(args, "as_type", None)
+    if given:
+        return given
+    return "attenuation" if ds.dataset_type in ("counts", "attenuation") else "transmission"
+
+
 def write_factors(base, ds: Dataset, W, H, rep, args):
-    """Write the factors in the dehydrated HDF5 layout plus the run's provenance; optionally plots and denoised data."""
-    import h5py
-    from mbirtorch.hsnt import export_hsnt_data_hdf5, rehydrate
+    """Write the factors in the dehydrated HDF5 layout plus the run's provenance. Returns the path."""
+    from mbirtorch.hsnt import export_hsnt_data_hdf5
     R = H.shape[0]
     W4 = W.reshape(*ds.spatial_shape, R)
-    out_type = "attenuation" if ds.dataset_type in ("counts", "attenuation") else "transmission"
+    out_type = _out_type(ds, args)
     h5 = base + "_factors.h5"
     export_hsnt_data_hdf5(h5, [W4, H, out_type], {"dataset_type": out_type, "dataset_modality": "hyperspectral neutron"})
-    with h5py.File(h5, "a") as f:
-        f.create_dataset("bin_indices", data=ds.bin_indices)
-        f.attrs.update(dict(source=ds.source, input_type=ds.dataset_type, rank=R, method=args.method, mode=rep["mode"],
-                            spectra=args.spectra, gauge=int(bool(args.gauge)), downsample=args.downsample, wave_bin=args.wave_bin,
-                            dose=-1.0 if ds.dose is None else float(ds.dose), loss=rep["loss_final"], mbirtorch_hsnt_cli="1"))
+    _provenance(h5, ds, rep, args, dict(rank=R, loss=rep["loss_final"]))
     log.info("wrote %s: subspace_data %s (maps, per material), subspace_basis %s (spectra); rehydrate() reconstructs the %s",
              h5, W4.shape, H.shape, out_type)
+    return h5
+
+
+def _provenance(h5, ds, rep, args, extra):
+    import h5py
+    with h5py.File(h5, "a") as f:
+        if "bin_indices" not in f:
+            f.create_dataset("bin_indices", data=ds.bin_indices)
+        f.attrs.update(dict(source=ds.source, input_type=ds.dataset_type, method=args.method, mode=rep["mode"], spectra=args.spectra,
+                            gauge=int(bool(args.gauge)), downsample=args.downsample, wave_bin=args.wave_bin,
+                            dose=-1.0 if ds.dose is None else float(ds.dose), mbirtorch_hsnt_cli="1", **extra))
+
+
+def write_denoised(path, ds: Dataset, W, H, out_type, rep, args, chunk=16384):
+    """Rehydrate W @ H into the package's hyperspectral HDF5 layout, written by pixel blocks so the full array is
+    never held in memory; import_hsnt_data_hdf5 reads it back."""
+    import h5py
+    R, K = H.shape
+    V, rows, cols = ds.spatial_shape
+    with h5py.File(path, "w") as f:
+        d = f.create_dataset("data", shape=(V, rows, cols, K), dtype=np.float32, chunks=(1, min(rows, 64), cols, K))
+        for i in range(0, ds.pixels, chunk):
+            X = W[i:i + chunk] @ H
+            block = (np.exp(-X) if out_type == "transmission" else X).astype(np.float32)
+            p0, p1 = i, min(i + chunk, ds.pixels)                           # pixel block -> (view, row, col) coordinates
+            idx = np.arange(p0, p1)
+            v, rc = np.divmod(idx, rows * cols); r, c = np.divmod(rc, cols)
+            if v[0] == v[-1] and c[0] == 0 and c[-1] == cols - 1:
+                d[v[0], r[0]:r[-1] + 1, :, :] = block.reshape(r[-1] - r[0] + 1, cols, K)
+            else:
+                for k in range(len(idx)):
+                    d[v[k], r[k], c[k], :] = block[k]
+        f.create_dataset("dataset_type", data=np.bytes_(out_type))
+        f.create_dataset("dataset_modality", data=np.bytes_("hyperspectral neutron"))
+    _provenance(path, ds, rep, args, dict(rank=R, loss=rep["loss_final"], denoised="1"))
+    log.info("wrote %s: data %s %s, %.2f GiB", path, (V, rows, cols, K), out_type, V * rows * cols * K * 4 / 2**30)
+    return path
+
+
+def write_report(base, ds, rep, args, outputs):
     rep_path = base + "_report.json"
     report = dict(input=ds.source, input_type=ds.dataset_type, spatial_shape=list(ds.spatial_shape), pixels=ds.pixels, bins=ds.bins,
                   dose=ds.dose, args={k: v for k, v in vars(args).items() if k not in ("func",)},
-                  checks=[dict(level=c.level, message=c.message) for c in ds.checks], info=ds.info, result=rep, outputs=[h5])
-    if args.save_denoised:
-        den = base + "_denoised.h5"
-        export_hsnt_data_hdf5(den, rehydrate([W4, H, out_type]).astype(np.float32), {"dataset_type": out_type, "dataset_modality": "hyperspectral neutron"})
-        report["outputs"].append(den)
-        log.info("wrote %s (%s, %.2f GiB)", den, out_type, W4.shape[0] * W4.shape[1] * W4.shape[2] * H.shape[1] * 4 / 2**30)
-    if not args.no_plots:
-        report["outputs"] += write_plots(base, ds, W4, H)
+                  checks=[dict(level=c.level, message=c.message) for c in ds.checks], info=ds.info, result=rep, outputs=outputs)
     with open(rep_path, "w") as f:
         json.dump(report, f, indent=1, default=str)
     log.info("wrote %s", rep_path)
@@ -632,11 +742,9 @@ def cmd_inspect(args):
     for c in ds.checks:
         print(f"  [{c.level:5s}] {c.message}")
     if args.estimate_rank:
-        from mbirtorch.hsnt.denoise import _estimate_subspace_dimension
-        A = -np.log(np.clip(ds.T, np.finfo(np.float32).tiny, None))
-        sub = A[:: max(1, ds.pixels // 65536)]
-        n = _estimate_subspace_dimension(sub, safety_factor=1, random_state=args.seed, verbose=0)
-        print(f"  estimated signal subspace dimension (log-singular-value fit on {sub.shape[0]} pixels): {n}; the material count is at most this")
+        n, note, d = estimate_rank(ds, _device(args.device), args.seed, max_rank=args.max_rank)
+        print(f"  {note.split(';')[0]}; effective dose {d['effective_dose']:.3g}; gains by component: "
+              + ", ".join(f"{r}: {g:,.0f}" for r, g in zip(range(2, d['max_rank'] + 1), d['gains'])) + f"; threshold {d['threshold']:,.0f}")
     try:
         import torch
         for dev in (["cuda"] if torch.cuda.is_available() else []) + ["cpu"]:
@@ -677,22 +785,66 @@ def cmd_convert(args):
     return 0
 
 
-def cmd_factorize(args):
-    if args.rank < 1:
-        raise SystemExit("--rank must be at least 1")
+def _resolve_rank(ds, args, device):
+    """--rank N or auto: sets args.rank_value and args.rank_note."""
+    if str(args.rank).lower() == "auto":
+        args.rank_value, args.rank_note, args.rank_detail = estimate_rank(ds, device, args.seed, max_rank=args.max_rank)
+        log.info("rank: %s", args.rank_note)
+    else:
+        args.rank_detail = None
+        try:
+            args.rank_value = int(args.rank)
+        except ValueError:
+            raise SystemExit(f"--rank expects an integer or 'auto', got {args.rank!r}")
+        if args.rank_value < 1:
+            raise SystemExit("--rank must be at least 1")
+        args.rank_note = f"rank {args.rank_value} given"
+
+
+def _pipeline(args, denoise):
+    """load -> checks -> rank -> solve -> fit quality -> outputs, for factorize and denoise."""
     ds = load_dataset(args)
     device = _device(args.device)
+    _resolve_rank(ds, args, device)
+    base = _out_paths(args, ds)
     if args.dry_run:
         plan_memory(ds, device, args.mode, args.chunk_pixels)
-        print("dry run: data loaded and checked, no solve. Output base:", _out_paths(args, ds))
+        print(f"dry run: data loaded and checked, {args.rank_note}; no solve. Output base: {base}")
         return 0
     W, H, rep = solve(ds, args, device)
-    base = _out_paths(args, ds)
-    write_factors(base, ds, W, H, rep, args)
+    rep["fit"] = fit_quality(ds, W, H, device)
+    q = rep["fit"]
+    if "reduced_chi2" in q:
+        chi2 = q["reduced_chi2"]
+        verdict = ("at the Poisson noise level" if 0.8 <= chi2 <= 1.3 else
+                   "above the noise level: the rank may be too small or the model misspecified" if chi2 > 1.3 else
+                   "below the noise level: the fit follows the noise (rank too large, or the dose is overestimated)")
+        log.info("fit: reduced chi-square %.3f (%s); relative residual in transmission %.4g", chi2, verdict, q["relative_residual"])
+        if not 0.5 <= chi2 <= 2.0:
+            log.warning("reduced chi-square %.2f is far from 1; check the rank (%s) and the dose", chi2, args.rank_note)
+    else:
+        log.info("fit: relative residual in transmission %.4g (no dose, so no chi-square)", q["relative_residual"])
+    outputs = []
+    if not denoise or not args.no_factors:
+        outputs.append(write_factors(base, ds, W, H, rep, args))
+    if denoise or args.save_denoised:
+        outputs.append(write_denoised(base + "_denoised.h5", ds, W, H, _out_type(ds, args), rep, args))
+    if not args.no_plots:
+        outputs += write_plots(base, ds, W.reshape(*ds.spatial_shape, H.shape[0]), H)
+    write_report(base, ds, rep, args, outputs)
     n_err = sum(c.level == "error" for c in ds.checks)
-    print(f"done: rank {args.rank}, {ds.pixels:,} pixels x {ds.bins} bins, {rep['mode']} solve in {rep['solve_seconds']} s, "
-          f"loss {rep['loss_final']:.6g}; outputs at {base}_*" + (f"; {n_err} data check(s) had errors" if n_err else ""))
+    print(f"done: {args.rank_note.split(';')[0]}, {ds.pixels:,} pixels x {ds.bins} bins, {rep['mode']} solve in {rep['solve_seconds']} s, "
+          f"loss {rep['loss_final']:.6g}" + (f", reduced chi-square {q['reduced_chi2']:.2f}" if "reduced_chi2" in q else "")
+          + f"; outputs at {base}_*" + (f"; {n_err} data check(s) had errors" if n_err else ""))
     return 0
+
+
+def cmd_factorize(args):
+    return _pipeline(args, denoise=False)
+
+
+def cmd_denoise(args):
+    return _pipeline(args, denoise=True)
 
 
 def build_parser():
@@ -702,8 +854,9 @@ def build_parser():
                                        "  mbirtorch-hsnt inspect data.h5\n"
                                        "  mbirtorch-hsnt inspect sample_tifs/ --open-beam open_beam/ --estimate-rank\n"
                                        "  mbirtorch-hsnt convert sample_tifs/ --open-beam open_beam/ --wave-bin 4 -o sample.h5\n"
-                                       "  mbirtorch-hsnt factorize sample.h5 --rank 3 -o results/\n"
-                                       "  mbirtorch-hsnt factorize sample_tifs/ --open-beam open_beam/ --rank 2 --downsample 2 --wave-bin 4 --gauge -v\n")
+                                       "  mbirtorch-hsnt factorize sample.h5 -o results/                    # rank estimated\n"
+                                       "  mbirtorch-hsnt factorize sample_tifs/ --open-beam open_beam/ --rank 2 --downsample 2 --wave-bin 4 --gauge -v\n"
+                                       "  mbirtorch-hsnt denoise sample.h5 -o results/                      # denoised data + factors\n")
     sub = p.add_subparsers(dest="command", required=True)
 
     def add_input(sp):
@@ -728,7 +881,9 @@ def build_parser():
 
     s = sub.add_parser("inspect", help="load, check and describe a dataset (no solve)")
     add_input(s)
-    s.add_argument("--estimate-rank", action="store_true", help="fit the signal-subspace dimension to the singular values")
+    s.add_argument("--estimate-rank", action="store_true", help="choose the rank by likelihood-ratio tests on a pixel subsample (runs solves)")
+    s.add_argument("--max-rank", type=int, default=6, help="largest rank the estimate considers")
+    s.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     s.set_defaults(func=cmd_inspect)
 
     s = sub.add_parser("convert", help="write a TIFF stack (and open beam) as an HDF5 dataset in the package layout")
@@ -737,29 +892,39 @@ def build_parser():
     s.add_argument("--as-type", choices=("attenuation", "transmission"), default="attenuation", help="stored quantity (default attenuation)")
     s.set_defaults(func=cmd_convert)
 
-    s = sub.add_parser("factorize", help="fit the NNAL factorization and write maps, spectra, plots and a report")
-    add_input(s)
-    g = s.add_argument_group("model")
-    g.add_argument("--rank", "-r", type=int, required=True, help="number of materials (see 'inspect --estimate-rank' for an upper bound)")
-    g.add_argument("--method", choices=("joint_newton", "block_newton", "multiplicative", "lbfgsb"), default="joint_newton")
-    g.add_argument("--max-steps", type=int, default=300)
-    g.add_argument("--rel-tol", type=float, default=1e-6, help="relative loss change per step at which to stop")
-    g.add_argument("--spectra", choices=("mle", "unconstrained", "support"), default="mle",
-                   help="spectra estimator: maximum likelihood, the unconstrained-W re-estimate (pays above ~65k pixels), or per-pixel "
+    def add_solve(sp, denoise):
+        g = sp.add_argument_group("model")
+        g.add_argument("--rank", "-r", default="auto", metavar="N|auto",
+                       help="number of materials; by default estimated by likelihood-ratio tests on a pixel subsample (see --max-rank)")
+        g.add_argument("--max-rank", type=int, default=6, help="largest rank the estimate considers (default 6)")
+        g.add_argument("--method", choices=("joint_newton", "block_newton", "multiplicative", "lbfgsb"), default="joint_newton")
+        g.add_argument("--max-steps", type=int, default=300)
+        g.add_argument("--rel-tol", type=float, default=1e-6, help="relative loss change per step at which to stop")
+        g.add_argument("--spectra", choices=("mle", "unconstrained", "support"), default="mle",
+                       help="spectra estimator: maximum likelihood, the unconstrained-W re-estimate (pays above ~65k pixels), or per-pixel "
                         "support selection (needs the dose, rank <= 6)")
-    g.add_argument("--gauge", action="store_true", help="pure-pixel gauge fix of the maps (assumes every material has pure pixels; needs the dose)")
-    g = s.add_argument_group("compute")
-    g.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
-    g.add_argument("--mode", choices=("auto", "full", "stream"), default="auto", help="full solve on the device or streamed by chunks (default: by free memory)")
-    g.add_argument("--chunk-pixels", type=int, help="pixels per chunk in stream mode (default: from free memory)")
-    g.add_argument("--max-passes", type=int, default=5, help="stream mode: polish passes over the data")
-    g.add_argument("--warmup-pixels", type=int, default=16384, help="stream mode: pixels for the initial spectra fit")
-    g.add_argument("--dry-run", action="store_true", help="load, check and plan, then stop")
-    g = s.add_argument_group("output")
-    g.add_argument("-o", "--output", help="output directory (created if needed; default: current directory), or a .h5 path whose stem names the files")
-    g.add_argument("--save-denoised", action="store_true", help="also write the rehydrated data (as large as the input)")
-    g.add_argument("--no-plots", action="store_true")
-    s.set_defaults(func=cmd_factorize)
+        g.add_argument("--gauge", action="store_true", help="pure-pixel gauge fix of the maps (assumes every material has pure pixels; needs the dose)")
+        g = sp.add_argument_group("compute")
+        g.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
+        g.add_argument("--mode", choices=("auto", "full", "stream"), default="auto", help="full solve on the device or streamed by chunks (default: by free memory)")
+        g.add_argument("--chunk-pixels", type=int, help="pixels per chunk in stream mode (default: from free memory)")
+        g.add_argument("--max-passes", type=int, default=5, help="stream mode: polish passes over the data")
+        g.add_argument("--warmup-pixels", type=int, default=16384, help="stream mode: pixels for the initial spectra fit")
+        g.add_argument("--dry-run", action="store_true", help="load, check and plan, then stop")
+        g = sp.add_argument_group("output")
+        g.add_argument("-o", "--output", help="output directory (created if needed; default: current directory), or a .h5 path whose stem names the files")
+        g.add_argument("--as-type", choices=("attenuation", "transmission"), help="quantity stored in the outputs (default: the input's)")
+        if denoise:
+            g.add_argument("--no-factors", action="store_true", help="write only the denoised data, not the factors file")
+        else:
+            g.add_argument("--save-denoised", action="store_true", help="also write the rehydrated data (as large as the input)")
+        g.add_argument("--no-plots", action="store_true")
+
+    s = sub.add_parser("factorize", help="fit the NNAL factorization and write maps, spectra, plots and a report")
+    add_input(s); add_solve(s, denoise=False); s.set_defaults(func=cmd_factorize, no_factors=False)
+
+    s = sub.add_parser("denoise", help="factorize and rehydrate: write the denoised hyperspectral data in the package's HDF5 layout")
+    add_input(s); add_solve(s, denoise=True); s.set_defaults(func=cmd_denoise, save_denoised=True)
     return p
 
 
