@@ -32,7 +32,8 @@ Releasing to TestPyPI
 2. Check the TestPyPI upload.  Make a clean conda environment with the
    release candidate and run the tests::
 
-       source dev_scripts/make_test_environment.sh 0.X.Yrc1
+       dev_scripts/make_test_environment.sh 0.X.Yrc1
+       conda activate test
        dev_scripts/run_tests.sh
 
    If a test fails, fix the problem and repeat from step 1 with ``0.X.Yrc2``.
@@ -72,6 +73,7 @@ This procedure stands on its own.  The TestPyPI steps above are optional.
 3. Check the PyPI upload.  Make a clean conda environment with the new
    version and run the tests::
 
-       source dev_scripts/make_test_environment.sh
+       dev_scripts/make_test_environment.sh
+       conda activate test
        dev_scripts/run_tests.sh
 
