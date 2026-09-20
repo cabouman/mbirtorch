@@ -2,7 +2,7 @@
 # Run one stage of the release procedure in dev_maintenance.rst.
 #
 #   dev_scripts/release.sh 0.2.0rc1           # rc: publish a pre-release to TestPyPI
-#   dev_scripts/release.sh 0.2.0              # final: fast-forward main to prerelease
+#   dev_scripts/release.sh 0.2.0              # final: open the pull request to main
 #   dev_scripts/release.sh 0.2.0 --publish    # after main advances: publish to PyPI
 #
 # Requires the gh CLI, logged in.  Uploads still need approval of the pypi
@@ -54,18 +54,13 @@ if [[ "$STAGE" == "rc" ]]; then
   echo "Pre-release v$VERSION created; TestPyPI upload is running.  Check with:"
   echo "  dev_scripts/check_published_wheel.sh --testpypi --version $VERSION"
 else
-  # main advances by fast-forward only, so it never gains a commit that
-  # prerelease lacks and the two branches never diverge.
-  git fetch -q origin main
-  if ! git merge-base --is-ancestor origin/main prerelease; then
-    echo "main has commits that prerelease does not, so it cannot fast-forward." >&2
-    echo "Run: git checkout prerelease && git merge origin/main" >&2
-    exit 1
+  # main changes only through a pull request, merged on GitHub.
+  if gh pr list --base main --head prerelease --state open --json number -q '.[0].number' | grep -q .; then
+    echo "The pull request from prerelease to main is already open and now carries $VERSION."
+  else
+    gh pr create --base main --head prerelease --title "MBIRTorch v$VERSION" \
+      --body "Release v$VERSION."
   fi
-  git checkout -q main
-  git merge --ff-only prerelease
-  git push -q origin main
-  git checkout -q prerelease
-  echo "main fast-forwarded to prerelease at $(git rev-parse --short HEAD).  Then run:"
+  echo "When the checks pass, merge the pull request on GitHub.  Then run:"
   echo "  dev_scripts/release.sh $VERSION --publish"
 fi
