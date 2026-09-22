@@ -97,7 +97,7 @@ def test_wave_bin_and_downsample(stacks):
 @cuda
 def test_dehydrate_writes_readable_output(stacks, tmp_path):
     out = str(tmp_path / "res")
-    assert main(["dehydrate", stacks["h5"], "-o", out, "--gauge", "--dose", str(DOSE), "--max-steps", "200", "-q"]) == 0   # rank estimated
+    assert main(["dehydrate", stacks["h5"], "-o", out, "--dose", str(DOSE), "--max-steps", "200", "-q"]) == 0   # rank estimated
     files = sorted(os.listdir(out))
     assert any(f.endswith("_dehydrated.h5") for f in files) and any(f.endswith("_report.json") for f in files) and any(f.endswith("_maps.png") for f in files)
     data, meta = hsnt.import_hsnt_data_hdf5(os.path.join(out, "processed_dehydrated.h5"))
@@ -106,7 +106,7 @@ def test_dehydrate_writes_readable_output(stacks, tmp_path):
     den = hsnt.rehydrate(data)
     assert den.shape == (1, ROWS, COLS, K)
     rep = json.load(open(os.path.join(out, "processed_report.json")))
-    assert rep["result"]["mode"] == "full" and rep["result"]["loss_final"] > 0 and len(rep["result"]["gauge_cluster_sizes"]) == R
+    assert rep["result"]["mode"] == "full" and rep["result"]["loss_final"] > 0 and rep["result"]["rank"] == R
     assert rep["result"]["components"]["proportional_pairs"] == []                     # two distinct materials
     with h5py.File(os.path.join(out, "processed_dehydrated.h5")) as f:
         assert f["mean_pixel_spectrum"].shape == (K,) and f["mean_pixel_contributions"].shape == (R, K)
@@ -180,9 +180,9 @@ def test_component_check_flags_proportional_maps():
     assert total.shape == (K,) and contrib.shape == (2, K) and n > 0 and np.allclose(total, contrib.sum(0))
 
 
-def test_gauge_without_dose_is_an_error(stacks, tmp_path):
+def test_support_selection_without_dose_is_an_error(stacks, tmp_path):
     with pytest.raises(SystemExit, match="dose"):
-        main(["dehydrate", stacks["h5"], "--rank", str(R), "--gauge", "-o", str(tmp_path), "--device", "cpu", "-q"])
+        main(["dehydrate", stacks["h5"], "--rank", str(R), "--spectra", "support", "-o", str(tmp_path), "--device", "cpu", "-q"])
 
 
 @cuda

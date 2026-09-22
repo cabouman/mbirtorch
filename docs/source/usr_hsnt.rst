@@ -56,7 +56,7 @@ per-file detail.
    mbirtorch-hsnt inspect sample_tifs/ --open-beam open_beam/
    mbirtorch-hsnt convert sample_tifs/ --open-beam open_beam/ --wave-bin 4 -o sample.h5     # read the TIFFs once, streamed
    mbirtorch-hsnt dehydrate sample.h5 -o results/                  # rank estimated from the data
-   mbirtorch-hsnt dehydrate sample_tifs/ --open-beam open_beam/ --rank 2 --downsample 2 --gauge
+   mbirtorch-hsnt dehydrate sample_tifs/ --open-beam open_beam/ --rank 2 --downsample 2
    mbirtorch-hsnt rehydrate results/sample_dehydrated.h5 --wave-range 100:200 -o results/
    mbirtorch-hsnt denoise sample.h5 -o results/                    # denoised data, plus the dehydrated file
 
@@ -88,5 +88,5 @@ of them and as attenuation or transmission (``--as-type``), block by block so th
 ``denoise`` does both in one run and writes ``<stem>_denoised.h5`` plus the dehydrated file unless
 ``--no-dehydrated``. The solve runs whole on the device
 when it fits and is streamed by chunks otherwise (``--mode``); ``--spectra unconstrained`` and ``--spectra support``
-select the bias-corrected spectra estimators, ``--gauge`` the pure-pixel fix of the maps. ``--dry-run`` loads,
+select the bias-corrected spectra estimators. ``--dry-run`` loads,
 checks and plans without solving.
