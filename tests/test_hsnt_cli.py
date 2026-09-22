@@ -219,3 +219,29 @@ def test_library_dehydrate_and_hyper_denoise(stacks):
     Tt = np.exp(-A); den_t = hsnt.hyper_denoise(Tt, "transmission", num_materials=R, verbose=0)   # transmission in, transmission out
     assert den_t.shape == A.shape and 0 < den_t.min() and np.linalg.norm(-np.log(den_t).reshape(-1, K) - X) / np.linalg.norm(X) < 0.35
     assert callable(hsnt.l2_dehydrate) and callable(hsnt.l2_hyper_denoise)               # the L2 baseline stays importable
+
+
+def test_convert_streams_in_small_blocks_and_matches_the_direct_load(stacks, tmp_path):
+    out = str(tmp_path / "blocks.h5")
+    assert main(["convert", stacks["sample"], "--open-beam", stacks["open_beam"], "-o", out, "--as-type", "transmission",
+                 "--wave-bin", "4", "--downsample", "2", "--block-bins", "7", "-q"]) == 0        # 7 -> 4, a multiple of --wave-bin
+    data, meta = hsnt.import_hsnt_data_hdf5(out)
+    from mbirtorch.hsnt.cli import load_tiff
+    ds = load_tiff(stacks["sample"], open_beam=[stacks["open_beam"]], wave_bin=4, downsample=2)
+    assert data.shape == (1,) + tuple(ds.spatial_shape[1:]) + (K // 4,) and np.allclose(data.reshape(-1, K // 4), ds.T, atol=1e-6)
+    with h5py.File(out) as f:
+        assert f.attrs["block_bins"] == 4 and f["bin_indices"][()].tolist() == list(range(0, K, 4)) and f.attrs["open_beam_observations"] == 2
+        assert f["data"].chunks[-1] <= 16 and abs(f.attrs["dose"] - ds.dose) / ds.dose < 0.05           # 16-bin slabs along the spectral axis
+        checks = json.loads(f.attrs["checks"])
+        assert any("dose" in c["message"] for c in checks) and all(c["level"] != "error" for c in checks)
+
+
+def test_convert_hdf5_to_hdf5_streams(stacks, tmp_path):
+    out = str(tmp_path / "h5h5.h5")
+    assert main(["convert", stacks["h5"], "-o", out, "--wave-bin", "2", "--downsample", "2", "--block-bins", "6", "-q"]) == 0   # attenuation in and out
+    data, meta = hsnt.import_hsnt_data_hdf5(out)
+    ds = load_hdf5(stacks["h5"], wave_bin=2, downsample=2)
+    assert meta["dataset_type"] == "attenuation" and data.shape == (1,) + tuple(ds.spatial_shape[1:]) + (K // 2,)
+    with np.errstate(divide="ignore"):
+        ref = -np.log(ds.T)
+    assert np.allclose(data.reshape(-1, K // 2), ref, atol=1e-5)

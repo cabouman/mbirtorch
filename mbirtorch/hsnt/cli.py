@@ -3,7 +3,7 @@
 Five subcommands share one loader and one set of data checks:
 
     inspect    load a dataset, run the checks, print what a solve would see (no GPU needed)
-    convert    write a TIFF stack (with its open beam) to the package's HDF5 layout, once
+    convert    write a TIFF stack (with its open beam) or an HDF5 dataset to the package's HDF5 layout, streamed by blocks of bins
     dehydrate  fit the NNAL factorization X = W H and write it in the dehydrated layout, with plots and a JSON report
     rehydrate  multiply a dehydrated file back into hyperspectral data (all bins or a range of them)
     denoise    dehydrate and rehydrate in one run: write the denoised hyperspectral data (and the dehydrated file)
@@ -97,20 +97,29 @@ def infer_input_type(a):
     return "attenuation", f"min {st['min']:.3g} max {st['max']:.3g} (negatives {st['negative']:.1%}): attenuation"
 
 
-def run_checks(ds: Dataset, strict=False):
-    """Append the standard checks to ds.checks and raise if strict and any is an error."""
-    T = ds.T
-    c = ds.checks
+def _summary_from_T(T, dose):
+    """The quantities the data checks need, computed from a transmission matrix held in memory."""
     st = _stats(T, "T")
-    ds.info["T_stats"] = st
     P, K = T.shape
-    c.append(Check("ok", f"{P:,} pixels x {K:,} bins ({ds.spatial_shape[0]} view(s) x {ds.spatial_shape[1]} x {ds.spatial_shape[2]}), "
-                         f"{T.nbytes / 2**30:.2f} GiB as float32"))
+    above = _frac(T > 1) if T.size <= 4_000_000 else _frac(T.reshape(-1)[:: max(1, T.size // 2_000_000)] > 1)
+    pos = T > 0
+    dead_bins = int((pos.sum(0) == 0).sum())
+    return dict(pixels=P, bins=K, nbytes=T.nbytes, stats=st, above_one=above, dead_px=_frac(pos.sum(1) == 0), dead_bins=dead_bins,
+                const_bins=int((T.std(0) == 0).sum()) - dead_bins, dose=dose)
+
+
+def _checks_from_summary(sm, spatial_shape, checks, strict=False):
+    """Append the standard checks for a summary (from `_summary_from_T` or the streaming accumulators) and raise if
+    strict and any is an error."""
+    st, c = sm["stats"], checks
+    P, K = sm["pixels"], sm["bins"]
+    c.append(Check("ok", f"{P:,} pixels x {K:,} bins ({spatial_shape[0]} view(s) x {spatial_shape[1]} x {spatial_shape[2]}), "
+                         f"{sm['nbytes'] / 2**30:.2f} GiB as float32"))
     if st["nonfinite"] > 0:
         c.append(Check("error", f"{st['nonfinite']:.2%} of T is NaN or inf; the loader should have replaced these"))
     if st["negative"] > 0:
         c.append(Check("error", f"{st['negative']:.2%} of T is negative: a transmission ratio cannot be"))
-    above = _frac(T > 1) if T.size <= 4_000_000 else _frac(T.reshape(-1)[:: max(1, T.size // 2_000_000)] > 1)
+    above = sm["above_one"]
     if above > 0.5:
         c.append(Check("warn", f"{above:.1%} of T exceeds 1: the open beam may be too low or the sample missing"))
     elif above > 0:
@@ -119,20 +128,18 @@ def run_checks(ds: Dataset, strict=False):
         c.append(Check("warn", f"{st['zero']:.1%} of T is exactly zero: very low dose or a mostly opaque sample"))
     elif st["zero"] > 0:
         c.append(Check("ok", f"{st['zero']:.2%} of T is exactly zero (zero counts; the likelihood handles them)"))
-    dead_px = _frac((T > 0).sum(1) == 0)
-    if dead_px > 0:
-        c.append(Check("warn", f"{dead_px:.2%} of pixels are zero in every bin (dead detector pixels or a mask)"))
-    dead_bins = int(((T > 0).sum(0) == 0).sum())
-    if dead_bins:
-        c.append(Check("warn", f"{dead_bins} bins are zero in every pixel; consider --wave-range to drop them"))
-    const_bins = int((T.std(0) == 0).sum()) - dead_bins
-    if const_bins > 0:
-        c.append(Check("warn", f"{const_bins} bins are constant across pixels"))
-    if ds.dose is not None:
-        if ds.dose < 1:
-            c.append(Check("warn", f"open-beam dose {ds.dose:.3g} counts per pixel and bin is below 1: expect mostly zero counts"))
+    if sm["dead_px"] > 0:
+        c.append(Check("warn", f"{sm['dead_px']:.2%} of pixels are zero in every bin (dead detector pixels or a mask)"))
+    if sm["dead_bins"]:
+        c.append(Check("warn", f"{sm['dead_bins']} bins are zero in every pixel; consider --wave-range to drop them"))
+    if sm["const_bins"] > 0:
+        c.append(Check("warn", f"{sm['const_bins']} bins are constant across pixels"))
+    dose = sm["dose"]
+    if dose is not None:
+        if dose < 1:
+            c.append(Check("warn", f"open-beam dose {dose:.3g} counts per pixel and bin is below 1: expect mostly zero counts"))
         else:
-            c.append(Check("ok", f"dose {ds.dose:.3g} open-beam counts per pixel and (binned) bin"))
+            c.append(Check("ok", f"dose {dose:.3g} open-beam counts per pixel and (binned) bin"))
     else:
         c.append(Check("warn", "dose unknown: --dose is needed for support selection and the gauge fix"))
     if K > P:
@@ -143,6 +150,13 @@ def run_checks(ds: Dataset, strict=False):
     if errors and strict:
         raise SystemExit(f"{len(errors)} data check(s) failed (see above); drop --strict to proceed anyway")
     return c
+
+
+def run_checks(ds: Dataset, strict=False):
+    """Append the standard checks to ds.checks and raise if strict and any is an error."""
+    sm = _summary_from_T(ds.T, ds.dose)
+    ds.info["T_stats"] = sm["stats"]
+    return _checks_from_summary(sm, ds.spatial_shape, ds.checks, strict)
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -175,7 +189,7 @@ def _check_host_memory(n_bytes, what):
         return
     if n_bytes > avail:
         raise SystemExit(f"{what} needs {n_bytes / 2**30:.1f} GiB of host memory but {avail / 2**30:.1f} GiB is available: use "
-                         f"--downsample, --wave-range or --wave-bin, or convert once to HDF5 on a larger machine")
+                         f"--downsample, --wave-range or --wave-bin (`mbirtorch-hsnt convert` streams and needs no such memory)")
     if n_bytes > 0.5 * avail:
         log.warning("%s needs %.1f GiB of the %.1f GiB of host memory available", what, n_bytes / 2**30, avail / 2**30)
 
@@ -247,10 +261,11 @@ def _bin_spectral(a, n, how):
     return g.sum(-1) if how == "sum" else g.mean(-1)
 
 
-def _to_transmission(a, input_type, open_beam=None, wave_bin=1):
-    """Convert a stack of the given type to a transmission ratio, binning bins if asked. Returns (T, dose, info)."""
+def _to_transmission(a, input_type, open_beam=None, wave_bin=1, quiet=False):
+    """Convert a stack of the given type to a transmission ratio, binning bins if asked. Returns (T, dose, info).
+    quiet=True (a block of a streamed conversion) skips the per-call logging and the count statistics."""
     info = {}
-    if wave_bin > 1:
+    if wave_bin > 1 and not quiet:
         log.info("--wave-bin %d: %d source bins -> %d (dropping the last %d)", wave_bin, a.shape[-1], a.shape[-1] // wave_bin, a.shape[-1] % wave_bin)
     if input_type == "counts":
         if open_beam is None:
@@ -260,13 +275,17 @@ def _to_transmission(a, input_type, open_beam=None, wave_bin=1):
         bad = ob <= 0
         if bad.any():
             info["open_beam_zero_frac"] = _frac(bad)
-            log.warning("open beam is zero or negative in %.3g%% of pixel-bins; those use the bin's median open beam", 100 * _frac(bad))
-            med = np.median(np.where(bad, np.nan, ob), axis=(0, 1))
-            med = np.nan_to_num(med, nan=float(np.nanmedian(ob)))
-            ob = np.where(bad, np.broadcast_to(med, ob.shape), ob)
+            if not quiet:
+                log.warning("open beam is zero or negative in %.3g%% of pixel-bins; those use the bin's median open beam", 100 * _frac(bad))
+            stride = max(1, ob.shape[0] // 8192)                                        # per-bin medians on a pixel subsample
+            sub = np.where(bad[::stride], np.nan, ob[::stride])
+            med = np.nanmedian(sub, axis=0)
+            med = np.nan_to_num(med, nan=float(np.nanmedian(sub)) if np.isfinite(sub).any() else 1.0)
+            ob = np.where(bad, med[None, :], ob)
         T = counts / ob
-        dose = float(np.median(ob))
-        info["counts_stats"] = _stats(counts, "counts")
+        dose = float(np.median(ob.reshape(-1)[:: max(1, ob.size // 1_000_000)]))
+        if not quiet:
+            info["counts_stats"] = _stats(counts, "counts")
     elif input_type == "transmission":
         T, dose = _bin_spectral(a, wave_bin, "mean"), None
     elif input_type == "attenuation":
@@ -274,8 +293,9 @@ def _to_transmission(a, input_type, open_beam=None, wave_bin=1):
         nonfinite = ~np.isfinite(A)
         if nonfinite.any():
             info["attenuation_nonfinite_frac"] = _frac(nonfinite)
-            log.warning("%.3g%% of the attenuation is NaN/inf (zero counts logged?); treated as zero transmission",
-                        100 * _frac(nonfinite))
+            if not quiet:
+                log.warning("%.3g%% of the attenuation is NaN/inf (zero counts logged?); treated as zero transmission",
+                            100 * _frac(nonfinite))
         T = np.exp(-np.where(nonfinite, np.inf, A))
         T = _bin_spectral(T, wave_bin, "mean")
         dose = None
@@ -742,6 +762,290 @@ def write_plots(base, ds, W4, H):
     return [p1, p2]
 
 
+
+# ----------------------------------------------------------------------------------------------------------------------
+# Streaming conversion: bins in blocks, never the whole stack
+# ----------------------------------------------------------------------------------------------------------------------
+class _TiffBlocks:
+    """Bins k0:k1 of a TIFF stack (one image per bin) as (1, rows, cols, k1 - k0) float32, decoded in parallel."""
+
+    def __init__(self, directory, wave_range, downsample, workers, desc):
+        import tifffile
+        files, subdirs = _tif_files(directory)
+        if files is None:
+            raise FileNotFoundError(f"{directory} holds only subdirectories ({len(subdirs)}); pass one of them, or pass the "
+                                    f"parent as --open-beam to average them")
+        self.all_files = files
+        self.files = files[slice(*wave_range)] if wave_range else files
+        self.first_index = files.index(self.files[0])
+        with tifffile.TiffFile(self.files[0]) as t:
+            page = t.pages[0]
+            self.full_shape, self.source_dtype = tuple(page.shape), str(page.dtype)
+        if len(self.full_shape) != 2:
+            raise ValueError(f"{self.files[0]}: expected a 2-D image per wavelength bin, got shape {self.full_shape}")
+        self.downsample, self.workers, self.desc = downsample, workers, desc
+        self.rows, self.cols = np.empty(self.full_shape, dtype=bool)[::downsample, ::downsample].shape
+        self.views = 1
+
+    @property
+    def bins(self):
+        return len(self.files)
+
+    def read(self, k0, k1):
+        import tifffile
+        sel = self.files[k0:k1]
+        if len(sel) == 1:
+            arr = tifffile.imread(sel[0])[None]
+        else:
+            try:
+                arr = tifffile.imread(sel, ioworkers=self.workers, maxworkers=1)
+            except TypeError:                                                          # older tifffile: no worker arguments
+                arr = np.stack([tifffile.imread(f) for f in sel])
+        if arr.ndim != 3 or tuple(arr.shape[1:]) != self.full_shape:
+            raise ValueError(f"{self.desc}: images {k0}..{k1 - 1} have shape {arr.shape[1:]}, the first image {self.full_shape}")
+        arr = arr[:, ::self.downsample, ::self.downsample]
+        return np.ascontiguousarray(np.moveaxis(arr, 0, -1), dtype=np.float32)[None]   # (1, rows, cols, b)
+
+    def close(self):
+        pass
+
+
+class _Hdf5Blocks:
+    """Bins k0:k1 of an HDF5 dataset in the package layout as (views, rows, cols, k1 - k0) float32."""
+
+    def __init__(self, path, dataset, views, wave_range, downsample):
+        import h5py
+        self.f = h5py.File(path, "r")
+        g, self.gname = _find_h5_dataset(self.f, dataset)
+        self.d = g["data"]
+        self.dtype_str = g["dataset_type"][()] if "dataset_type" in g else None
+        if isinstance(self.dtype_str, (bytes, np.bytes_)):
+            self.dtype_str = self.dtype_str.decode()
+        d = self.d
+        if d.ndim == 2:
+            self.sel, shape = (slice(None),), (1, d.shape[0], 1)
+        elif d.ndim == 3:
+            self.sel = (slice(None, None, downsample), slice(None, None, downsample))
+            shape = (1,) + np.empty(d.shape[:2], dtype=bool)[self.sel].shape
+        elif d.ndim == 4:
+            v = slice(*views) if views else slice(None)
+            self.sel = (v, slice(None, None, downsample), slice(None, None, downsample))
+            shape = np.empty(d.shape[:3], dtype=bool)[self.sel].shape
+        else:
+            raise SystemExit(f"data has {d.ndim} dimensions; expected (views, rows, cols, bins), (rows, cols, bins) or (pixels, bins)")
+        self.views, self.rows, self.cols = shape
+        self.full_shape = tuple(d.shape[1:3]) if d.ndim == 4 else tuple(d.shape[:2]) if d.ndim == 3 else (d.shape[0], 1)
+        self.source_dtype = str(d.dtype)
+        ks = range(d.shape[-1])[slice(*wave_range)] if wave_range else range(d.shape[-1])
+        self.first_index, self.bins = (ks[0], len(ks)) if len(ks) else (0, 0)
+        self.desc = f"{path}:{self.gname}"
+        log.info("HDF5 %s: dataset %s/data shape %s dtype %s chunks %s", path, self.gname.rstrip("/"), d.shape, d.dtype, d.chunks)
+
+    def read(self, k0, k1):
+        a = self.d[self.sel + (slice(self.first_index + k0, self.first_index + k1),)]
+        if self.d.ndim == 3:
+            a = a[None]
+        elif self.d.ndim == 2:
+            a = a[None, :, None, :]
+        return np.ascontiguousarray(a, dtype=np.float32)
+
+    def close(self):
+        self.f.close()
+
+
+def _open_beam_blocks(paths, wave_range, downsample, workers, sample):
+    """One block reader per open-beam observation (a directory of observation subdirectories expands to all of them),
+    checked against the sample's geometry."""
+    dirs = []
+    for p in paths:
+        files, subdirs = _tif_files(p)
+        dirs += subdirs if files is None else [p]
+    obs = [_TiffBlocks(d, wave_range, downsample, workers, desc=f"open beam {os.path.basename(d)}") for d in dirs]
+    for o in obs:
+        if (o.bins, o.rows, o.cols) != (sample.bins, sample.rows, sample.cols):
+            raise ValueError(f"{o.desc} has {o.bins} bins of {o.full_shape}, the sample {sample.bins} of {sample.full_shape}")
+    return obs
+
+
+def _block_bins(sample, n_obs, wave_bin, budget_mib, requested):
+    """Bins per block: the largest multiple of wave_bin whose working set (two blocks, the processed and the prefetched,
+    of sample and open-beam mean, one observation read in flight at full resolution before downsampling, the
+    transmission and the output) fits the budget."""
+    if requested:
+        block = max(wave_bin, requested // wave_bin * wave_bin)
+    else:
+        full = int(np.prod(sample.full_shape)) * sample.views * 4                      # bytes per bin as read
+        small = sample.rows * sample.cols * sample.views * 4                           # bytes per bin after downsampling
+        # two blocks alive (the one processed and the one prefetched), each the sample plus the open-beam mean, one
+        # observation read in flight at full resolution, and the transmission, its checks and the output block
+        per_bin = full * (2 + (3 if n_obs else 0)) + small * 4
+        block = int(budget_mib * 2**20 // per_bin) // wave_bin * wave_bin
+        block = max(wave_bin, block)
+    return min(block, sample.bins // wave_bin * wave_bin) or wave_bin
+
+
+def stream_convert(args):
+    """Read the input in blocks of bins, normalise, check and write each block to the HDF5 output: memory is a few
+    blocks, not the stack. Returns (path, checks, info)."""
+    import h5py
+    wave_range = _parse_slice(args.wave_range, "wave-range")
+    views = _parse_slice(args.views, "views")
+    p = args.input
+    if not os.path.exists(p):
+        raise SystemExit(f"input not found: {p}")
+    t0 = time.perf_counter()
+    workers = args.workers or min(8, os.cpu_count() or 1)
+    if os.path.isdir(p):
+        src = _TiffBlocks(p, wave_range, args.downsample, workers, desc="sample")
+        dtype_str = None
+    elif p.lower().endswith((".h5", ".hdf5", ".hdf")):
+        if args.open_beam:
+            log.warning("--open-beam is ignored for HDF5 input")
+        src = _Hdf5Blocks(p, args.dataset, views, wave_range, args.downsample)
+        dtype_str = src.dtype_str
+    else:
+        raise SystemExit(f"{p}: not a directory of TIFFs and not an .h5/.hdf5 file")
+    if src.bins == 0:
+        raise SystemExit("the selection holds no bins")
+    V, rows, cols, nb = src.views, src.rows, src.cols, src.bins
+    P = V * rows * cols
+    log.info("%s: %d view(s) x %dx%d pixels%s x %d bins, source dtype %s", src.desc, V, rows, cols,
+             f" (downsampled {args.downsample}x from {src.full_shape[0]}x{src.full_shape[1]})" if args.downsample > 1 else "", nb, src.source_dtype)
+    # input type from the first bins (or the file's dataset_type)
+    probe = src.read(0, min(nb, max(8, args.wave_bin)))
+    if args.input_type != "auto":
+        itype, why = args.input_type, "given"
+        if dtype_str and dtype_str != itype:
+            log.warning("--input-type %s overrides the file's dataset_type %r", itype, dtype_str)
+    elif dtype_str in ("attenuation", "transmission"):
+        itype, why = dtype_str, "from the file's dataset_type"
+    else:
+        itype, why = infer_input_type(probe)
+        why += f" (from the first {probe.shape[-1]} bins)"
+    log.info("input type: %s (%s)", itype, why)
+    del probe
+    obs = []
+    if itype == "counts":
+        if not (os.path.isdir(p) and args.open_beam):
+            raise SystemExit("a stack of counts needs an open beam: pass --open-beam DIR (or --input-type if the values are "
+                             "already transmissions or attenuations)")
+        obs = _open_beam_blocks(args.open_beam, wave_range, args.downsample, workers, src)
+        log.info("open beam: %d observation(s), averaged block by block", len(obs))
+    elif args.open_beam and os.path.isdir(p):
+        log.warning("--open-beam ignored: the input type is %s, not counts", itype)
+    wave_bin = max(1, args.wave_bin)
+    block = _block_bins(src, len(obs), wave_bin, args.memory_budget, args.block_bins)
+    K = nb // wave_bin
+    if K == 0:
+        raise SystemExit(f"--wave-bin {wave_bin} exceeds the {nb} selected bins")
+    if wave_bin > 1:
+        log.info("--wave-bin %d: %d source bins -> %d (dropping the last %d)", wave_bin, nb, K, nb % wave_bin)
+    out_type = "attenuation" if args.as_type == "attenuation" else "transmission"
+    out = args.output or (os.path.splitext(p.rstrip("/"))[0] + ".h5")
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    block_out = block // wave_bin
+    log.info("streaming %d bins per block (%d blocks, %d output bins each), %d TIFF reader threads -> %s (%s, %.2f GiB)",
+             block, -(-nb // block), block_out, workers, out, out_type, P * K * 4 / 2**30)
+    # accumulators for the checks
+    tot = dict(n=0, nonfinite=0, negative=0, zero=0, above=0, inf_out=0)
+    pos_px = np.zeros(P, dtype=np.int64); pos_bin = np.zeros(K, dtype=np.int64)
+    bin_min = np.full(K, np.inf, dtype=np.float32); bin_max = np.full(K, -np.inf, dtype=np.float32)
+    stride = max(1, -(-P * K // 4_000_000))
+    sample = np.empty((-(-P // stride), K), dtype=np.float32)
+    dose_blocks, ob_zero = [], 0.0
+    starts = [k0 for k0 in range(0, nb - nb % wave_bin, block) if min(k0 + block, nb) // wave_bin * wave_bin > k0]
+    try:
+        from tqdm import tqdm
+        blocks = tqdm(starts, desc="convert", unit="block", disable=not log.isEnabledFor(logging.INFO), leave=False)
+    except ImportError:
+        blocks = starts
+
+    def read_block(k0):
+        """The sample block and the open-beam mean over observations for bins k0:k1, as (pixels, bins)."""
+        k1 = min(k0 + block, nb) // wave_bin * wave_bin
+        a = src.read(k0, k1).reshape(P, k1 - k0)
+        ob = None
+        if obs:
+            for o in obs:                                                                # sum in place, divide once
+                blk = o.read(k0, k1).reshape(P, k1 - k0)
+                if ob is None:
+                    ob = blk
+                else:
+                    ob += blk
+                    del blk
+            ob /= len(obs)
+        return k1, a, ob
+    from concurrent.futures import ThreadPoolExecutor
+    pool = ThreadPoolExecutor(1)                                                         # the next block is read while this one is processed
+    pending = pool.submit(read_block, starts[0]) if starts else None
+    with h5py.File(out, "w") as f:
+        d = f.create_dataset("data", shape=(V, rows, cols, K), dtype=np.float32,
+                             chunks=(1, min(rows, 128), cols, min(16, K)))
+        for n_blk, k0 in enumerate(blocks):
+            k1, a, ob = pending.result()
+            pending = pool.submit(read_block, starts[n_blk + 1]) if n_blk + 1 < len(starts) else None
+            T, dose_b, info_b = _to_transmission(a, itype, open_beam=ob, wave_bin=wave_bin, quiet=True)
+            del a, ob
+            j0, j1 = k0 // wave_bin, k1 // wave_bin
+            if dose_b is not None:
+                dose_blocks.append((dose_b, j1 - j0))
+            ob_zero += info_b.get("open_beam_zero_frac", 0.0) * (j1 - j0)
+            finite = np.isfinite(T)
+            tot["n"] += T.size; tot["nonfinite"] += int((~finite).sum()); tot["negative"] += int((T < 0).sum())
+            tot["zero"] += int((T == 0).sum()); tot["above"] += int((T > 1).sum())
+            pos = T > 0
+            pos_px += pos.sum(1); pos_bin[j0:j1] = pos.sum(0)
+            bin_min[j0:j1] = T.min(0); bin_max[j0:j1] = T.max(0)
+            sample[:, j0:j1] = T[::stride]
+            if out_type == "attenuation":
+                with np.errstate(divide="ignore"):
+                    block_out_data = -np.log(T)
+                tot["inf_out"] += int(np.isinf(block_out_data).sum())
+            else:
+                block_out_data = T
+            d[:, :, :, j0:j1] = block_out_data.reshape(V, rows, cols, j1 - j0)
+            del T, pos, finite, block_out_data
+        pool.shutdown(wait=True)
+        src.close()
+        for o in obs:
+            o.close()
+        dose = None
+        if dose_blocks:
+            vals, w = np.array([v for v, _ in dose_blocks]), np.array([n for _, n in dose_blocks])
+            dose = float(np.median(np.repeat(vals, w)))
+        if args.dose is not None:
+            if dose is not None and abs(args.dose - dose) / dose > 0.5:
+                log.warning("--dose %.3g differs from the open-beam estimate %.3g by more than 50%%", args.dose, dose)
+            dose = args.dose
+        finite_s = sample[np.isfinite(sample)]
+        st = dict(min=float(finite_s.min()) if finite_s.size else float("nan"), max=float(finite_s.max()) if finite_s.size else float("nan"),
+                  mean=float(finite_s.mean()) if finite_s.size else float("nan"), median=float(np.median(finite_s)) if finite_s.size else float("nan"),
+                  nonfinite=tot["nonfinite"] / tot["n"], negative=tot["negative"] / tot["n"], zero=tot["zero"] / tot["n"], sampled=stride > 1)
+        dead_bins = int((pos_bin == 0).sum())
+        sm = dict(pixels=P, bins=K, nbytes=P * K * 4, stats=st, above_one=tot["above"] / tot["n"], dead_px=_frac(pos_px == 0), dead_bins=dead_bins,
+                  const_bins=int((bin_max == bin_min).sum()) - dead_bins, dose=dose)
+        checks = _checks_from_summary(sm, (V, rows, cols), [], strict=getattr(args, "strict", False))
+        if ob_zero:
+            log.warning("open beam is zero or negative in %.3g%% of pixel-bins; those used the block's median open beam", 100 * ob_zero / K)
+        if tot["inf_out"]:
+            log.warning("%d zero-transmission entries are inf in the attenuation output (exact zeros in transmission); the solver maps "
+                        "them back to zero transmission", tot["inf_out"])
+        f.create_dataset("dataset_type", data=np.bytes_(out_type))
+        f.create_dataset("dataset_modality", data=np.bytes_("hyperspectral neutron"))
+        f.create_dataset("bin_indices", data=np.arange(src.first_index, src.first_index + K * wave_bin, wave_bin))
+        attrs = dict(source=src.desc if not os.path.isdir(p) else p, input_type=itype, downsample=args.downsample, wave_bin=wave_bin,
+                     block_bins=block, mbirtorch_hsnt_cli="1", checks=json.dumps([dict(level=c.level, message=c.message) for c in checks]))
+        if dose is not None:
+            attrs["dose"] = float(dose)
+        if obs:
+            attrs["open_beam_observations"] = len(obs)
+        f.attrs.update(attrs)
+    seconds = time.perf_counter() - t0
+    info = dict(seconds=round(seconds, 2), block_bins=block, blocks=-(-nb // block), open_beam_observations=len(obs), stats=st, dose=dose)
+    log.info("wrote %s: data %s %s, %.2f GiB, in %.1f s (%.0f bins/s)", out, (V, rows, cols, K), out_type, P * K * 4 / 2**30, seconds, nb / seconds)
+    return out, checks, info
+
+
 # ----------------------------------------------------------------------------------------------------------------------
 # Subcommands
 # ----------------------------------------------------------------------------------------------------------------------
@@ -771,32 +1075,9 @@ def cmd_inspect(args):
 
 
 def cmd_convert(args):
-    from mbirtorch.hsnt import export_hsnt_data_hdf5
-    ds = load_dataset(args)
-    out = args.output
-    if out is None:
-        out = os.path.splitext(args.input.rstrip("/"))[0] + ".h5"
-    out_type = "attenuation" if args.as_type == "attenuation" else "transmission"
-    if out_type == "attenuation":
-        with np.errstate(divide="ignore"):
-            data = -np.log(ds.T)
-        n_inf = int(np.isinf(data).sum())
-        if n_inf:
-            log.warning("%d zero-count entries become inf in the attenuation (they are exact zeros in transmission); the solver "
-                        "maps them back to zero transmission", n_inf)
-    else:
-        data = ds.T
-    data = data.reshape(*ds.spatial_shape, ds.bins).astype(np.float32)
-    meta = {"dataset_type": out_type, "dataset_modality": "hyperspectral neutron"}
-    export_hsnt_data_hdf5(out, data, meta)
-    import h5py
-    with h5py.File(out, "a") as f:
-        f.create_dataset("bin_indices", data=ds.bin_indices)
-        if ds.dose is not None:
-            f.attrs["dose"] = float(ds.dose)
-        f.attrs.update(source=ds.source, input_type=ds.dataset_type, downsample=args.downsample, wave_bin=args.wave_bin)
-    log.info("wrote %s: data %s %s, %.2f GiB", out, data.shape, out_type, data.nbytes / 2**30)
-    print(out)
+    out, checks, info = stream_convert(args)
+    n_err = sum(c.level == "error" for c in checks)
+    print(out + (f"  ({n_err} data check(s) had errors)" if n_err else ""))
     return 0
 
 
@@ -960,10 +1241,15 @@ def build_parser():
     s.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
     s.set_defaults(func=cmd_inspect)
 
-    s = sub.add_parser("convert", help="write a TIFF stack (and open beam) as an HDF5 dataset in the package layout")
+    s = sub.add_parser("convert", help="write a TIFF stack (and open beam) or an HDF5 dataset as an HDF5 dataset in the package "
+                                       "layout, streamed in blocks of bins")
     add_input(s)
     s.add_argument("-o", "--output", help="output .h5 (default: <input>.h5)")
     s.add_argument("--as-type", choices=("attenuation", "transmission"), default="attenuation", help="stored quantity (default attenuation)")
+    g = s.add_argument_group("streaming")
+    g.add_argument("--block-bins", type=int, metavar="N", help="bins per block (default: from --memory-budget)")
+    g.add_argument("--memory-budget", type=float, default=256, metavar="MiB", help="working memory for the blocks (default 256 MiB; smaller blocks overlap reading and writing better)")
+    g.add_argument("--workers", type=int, metavar="N", help="threads decoding TIFF images of a block (default: min(8, CPUs))")
     s.set_defaults(func=cmd_convert)
 
     def add_solve(sp, denoise):

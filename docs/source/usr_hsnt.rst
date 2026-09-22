@@ -54,7 +54,7 @@ per-file detail.
 
    mbirtorch-hsnt inspect data.h5 --estimate-rank                  # checks, statistics, an upper bound on the rank
    mbirtorch-hsnt inspect sample_tifs/ --open-beam open_beam/
-   mbirtorch-hsnt convert sample_tifs/ --open-beam open_beam/ --wave-bin 4 -o sample.h5     # read the TIFFs once
+   mbirtorch-hsnt convert sample_tifs/ --open-beam open_beam/ --wave-bin 4 -o sample.h5     # read the TIFFs once, streamed
    mbirtorch-hsnt dehydrate sample.h5 -o results/                  # rank estimated from the data
    mbirtorch-hsnt dehydrate sample_tifs/ --open-beam open_beam/ --rank 2 --downsample 2 --gauge
    mbirtorch-hsnt rehydrate results/sample_dehydrated.h5 --wave-range 100:200 -o results/
@@ -71,6 +71,13 @@ the bin count) where the floor is far lower, and the larger rank is taken; this 
 dose that the full-resolution test misses. After the solve the log reports the
 reduced chi-square of the fit against Poisson noise when the dose is known: near 1 the residual is at the noise
 level, well above 1 the rank is too small or the model misspecified, well below 1 the fit follows the noise.
+
+``convert`` streams: it reads the input in blocks of bins (TIFF images decoded in parallel, the open-beam
+observations averaged block by block), normalises, checks and writes each block into the output, so its memory is
+the ``--memory-budget`` (256 MiB by default; ``--block-bins`` fixes the block) whatever the size of the stack, and
+the next block is read while the current one is processed, and its output is chunked in 16-bin slabs along the spectral axis. The data checks run as accumulations over the blocks
+and are stored in the file's ``checks`` attribute. ``convert`` also takes an HDF5 file, to downsample, bin or
+re-type an existing dataset.
 
 ``dehydrate`` writes ``<stem>_dehydrated.h5`` in the dehydrated layout (``subspace_data`` holds the material maps,
 ``subspace_basis`` the spectra; :func:`~mbirtorch.hsnt.import_hsnt_data_hdf5` reads it), ``<stem>_report.json``
