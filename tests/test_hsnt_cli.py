@@ -1,5 +1,5 @@
 """Tests for the mbirtorch-hsnt command line: loaders and checks on synthetic TIFF and HDF5 inputs, the
-convert round trip, and a factorize run whose output reads back through the package's HDF5 importer."""
+convert round trip, and dehydrate / rehydrate / denoise runs whose outputs read back through the package's HDF5 importer."""
 import json
 import os
 
@@ -95,12 +95,12 @@ def test_wave_bin_and_downsample(stacks):
 
 
 @cuda
-def test_factorize_writes_readable_factors(stacks, tmp_path):
+def test_dehydrate_writes_readable_output(stacks, tmp_path):
     out = str(tmp_path / "res")
-    assert main(["factorize", stacks["h5"], "-o", out, "--gauge", "--dose", str(DOSE), "--max-steps", "200", "-q"]) == 0   # rank estimated
+    assert main(["dehydrate", stacks["h5"], "-o", out, "--gauge", "--dose", str(DOSE), "--max-steps", "200", "-q"]) == 0   # rank estimated
     files = sorted(os.listdir(out))
-    assert any(f.endswith("_factors.h5") for f in files) and any(f.endswith("_report.json") for f in files) and any(f.endswith("_maps.png") for f in files)
-    data, meta = hsnt.import_hsnt_data_hdf5(os.path.join(out, "processed_factors.h5"))
+    assert any(f.endswith("_dehydrated.h5") for f in files) and any(f.endswith("_report.json") for f in files) and any(f.endswith("_maps.png") for f in files)
+    data, meta = hsnt.import_hsnt_data_hdf5(os.path.join(out, "processed_dehydrated.h5"))
     Wd, Hd, dtype = data
     assert Wd.shape == (1, ROWS, COLS, R) and Hd.shape == (R, K) and dtype == "attenuation" and Wd.min() >= 0 and Hd.min() >= 0
     den = hsnt.rehydrate(data)
@@ -108,7 +108,7 @@ def test_factorize_writes_readable_factors(stacks, tmp_path):
     rep = json.load(open(os.path.join(out, "processed_report.json")))
     assert rep["result"]["mode"] == "full" and rep["result"]["loss_final"] > 0 and len(rep["result"]["gauge_cluster_sizes"]) == R
     assert rep["result"]["components"]["proportional_pairs"] == []                     # two distinct materials
-    with h5py.File(os.path.join(out, "processed_factors.h5")) as f:
+    with h5py.File(os.path.join(out, "processed_dehydrated.h5")) as f:
         assert f["mean_pixel_spectrum"].shape == (K,) and f["mean_pixel_contributions"].shape == (R, K)
     W, H = _truth(); X = W @ H
     fit = -np.log(np.clip(den.reshape(-1, K), 1e-12, None)) if dtype == "transmission" else den.reshape(-1, K)
@@ -116,9 +116,9 @@ def test_factorize_writes_readable_factors(stacks, tmp_path):
 
 
 @cuda
-def test_factorize_stream_mode_from_tiffs(stacks, tmp_path):
+def test_dehydrate_stream_mode_from_tiffs(stacks, tmp_path):
     out = str(tmp_path / "stream")
-    assert main(["factorize", stacks["sample"], "--open-beam", stacks["open_beam"], "--rank", str(R), "-o", out, "--mode", "stream",
+    assert main(["dehydrate", stacks["sample"], "--open-beam", stacks["open_beam"], "--rank", str(R), "-o", out, "--mode", "stream",
                  "--chunk-pixels", "40", "--warmup-pixels", "60", "--max-passes", "2", "--no-plots", "-q"]) == 0
     rep = json.load(open(os.path.join(out, "sample_report.json")))
     assert rep["result"]["mode"] == "stream" and rep["result"]["passes"] >= 1 and rep["dose"] > 0
@@ -152,18 +152,18 @@ def test_denoise_writes_readable_data_with_estimated_rank(stacks, tmp_path):
     rep = json.load(open(os.path.join(out, "processed_report.json")))
     assert rep["result"]["rank"] == R and "estimated" in rep["result"]["rank_note"]
     assert 0.5 < rep["result"]["fit"]["reduced_chi2"] < 2.0                          # the fit sits at the Poisson noise level
-    assert os.path.exists(os.path.join(out, "processed_factors.h5"))
+    assert os.path.exists(os.path.join(out, "processed_dehydrated.h5"))
     with h5py.File(os.path.join(out, "processed_denoised.h5")) as f:
         assert f.attrs["rank"] == R and f["bin_indices"].shape == (K,)
 
 
 @cuda
-def test_denoise_no_factors_transmission(stacks, tmp_path):
+def test_denoise_without_dehydrated_file_transmission(stacks, tmp_path):
     out = str(tmp_path / "den2")
-    assert main(["denoise", stacks["sample"], "--open-beam", stacks["open_beam"], "-o", out, "--rank", "2", "--no-factors",
+    assert main(["denoise", stacks["sample"], "--open-beam", stacks["open_beam"], "-o", out, "--rank", "2", "--no-dehydrated",
                  "--as-type", "transmission", "--no-plots", "--max-steps", "100", "-q"]) == 0
     files = os.listdir(out)
-    assert not any(f.endswith("_factors.h5") for f in files)
+    assert not any(f.endswith("_dehydrated.h5") for f in files)
     data, meta = hsnt.import_hsnt_data_hdf5(os.path.join(out, "sample_denoised.h5"))
     assert meta["dataset_type"] == "transmission" and 0 < data.min() and data.max() < 2
 
@@ -182,4 +182,40 @@ def test_component_check_flags_proportional_maps():
 
 def test_gauge_without_dose_is_an_error(stacks, tmp_path):
     with pytest.raises(SystemExit, match="dose"):
-        main(["factorize", stacks["h5"], "--rank", str(R), "--gauge", "-o", str(tmp_path), "--device", "cpu", "-q"])
+        main(["dehydrate", stacks["h5"], "--rank", str(R), "--gauge", "-o", str(tmp_path), "--device", "cpu", "-q"])
+
+
+@cuda
+def test_rehydrate_command_reconstructs_from_the_dehydrated_file(stacks, tmp_path):
+    out = str(tmp_path / "rh")
+    assert main(["dehydrate", stacks["h5"], "-o", out, "--rank", str(R), "--max-steps", "150", "--no-plots", "-q"]) == 0
+    deh = os.path.join(out, "processed_dehydrated.h5")
+    assert main(["rehydrate", deh, "-o", out, "-q"]) == 0                              # all bins, the file's type
+    data, meta = hsnt.import_hsnt_data_hdf5(os.path.join(out, "processed_rehydrated.h5"))
+    W4, H, dtype = hsnt.import_hsnt_data_hdf5(deh)[0]
+    assert data.shape == (1, ROWS, COLS, K) and meta["dataset_type"] == "attenuation" and np.allclose(data, W4 @ H, atol=1e-5)
+    sub = str(tmp_path / "rh" / "part.h5")
+    assert main(["rehydrate", deh, "-o", sub, "--wave-range", "5:15", "--as-type", "transmission", "-q"]) == 0   # a range, as transmission
+    part, meta2 = hsnt.import_hsnt_data_hdf5(sub)
+    assert part.shape == (1, ROWS, COLS, 10) and meta2["dataset_type"] == "transmission" and np.allclose(part, np.exp(-(W4 @ H[:, 5:15])), atol=1e-5)
+    with h5py.File(sub) as f:
+        assert f["bin_indices"][()].tolist() == list(range(5, 15)) and f.attrs["rank"] == R and "dehydrated_source" in f.attrs
+    with pytest.raises(SystemExit, match="not a dehydrated file"):
+        main(["rehydrate", stacks["h5"], "-o", out, "-q"])                             # hyperspectral input is refused
+
+
+@cuda
+def test_library_dehydrate_and_hyper_denoise(stacks):
+    with h5py.File(stacks["h5"]) as f:
+        A = f["sample_dataset/data"][()]                                                  # (1, ROWS, COLS, K) attenuation
+    sub_data, basis, dtype = hsnt.dehydrate(A, "attenuation", num_materials=R, verbose=0)
+    assert sub_data.shape == (1, ROWS, COLS, R) and basis.shape == (R, K) and dtype == "attenuation"
+    assert sub_data.min() >= 0 and basis.min() >= 0 and sub_data.dtype == np.float32
+    W, H = _truth(); X = W @ H
+    den = hsnt.hyper_denoise(A, "attenuation", num_materials=R, verbose=0)
+    assert den.shape == A.shape and np.linalg.norm(den.reshape(-1, K) - X) / np.linalg.norm(X) < 0.35
+    est = hsnt.dehydrate(A[0], "attenuation", verbose=0)                                  # rank estimated, pooling over (rows, cols)
+    assert est[0].shape == (ROWS, COLS, R)
+    Tt = np.exp(-A); den_t = hsnt.hyper_denoise(Tt, "transmission", num_materials=R, verbose=0)   # transmission in, transmission out
+    assert den_t.shape == A.shape and 0 < den_t.min() and np.linalg.norm(-np.log(den_t).reshape(-1, K) - X) / np.linalg.norm(X) < 0.35
+    assert callable(hsnt.l2_dehydrate) and callable(hsnt.l2_hyper_denoise)               # the L2 baseline stays importable

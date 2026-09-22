@@ -14,7 +14,7 @@ plt.style.use('tableau-colorblind10')
 
 import torch
 
-from mbirtorch.hsnt import dehydrate, generate_hyper_data, nnal_factorization, compare_spectra, stable_nnal, stable_nnal_derivatives
+from mbirtorch.hsnt import l2_dehydrate, generate_hyper_data, nnal_factorization, compare_spectra, stable_nnal, stable_nnal_derivatives
 
 
 def main():
@@ -69,14 +69,14 @@ def main():
     material_projection[:, height:2 * height, width // 2:width + width // 2, 2] = material_density["Al"] * thickness
     material_projection = material_projection.reshape(-1, num_materials_true)
 
-    # Perform hyperspectral denoising (dehydrate + rehydrate)
+    # L2 baseline factorization (scikit-learn NMF), the starting point the NNAL solvers refine
     print("Performing L2 factorization...")
     start_time = time.time()
-    W, H, _ = dehydrate(noisy_hyper_projection.cpu().numpy(),
-                        dataset_type=dataset_type,
-                        num_materials=num_materials_fit,
-                        safety_factor=1,
-                        verbose=verbose)
+    W, H, _ = l2_dehydrate(noisy_hyper_projection.cpu().numpy(),
+                           dataset_type=dataset_type,
+                           num_materials=num_materials_fit,
+                           safety_factor=1,
+                           verbose=verbose)
     W = W.reshape(np.prod(noisy_hyper_projection.shape[:-1]), -1)
     H = H.reshape(-1, noisy_hyper_projection.shape[-1])
     print(f'L2 factorization completed in: {time.time() - start_time} seconds')

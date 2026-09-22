@@ -2,7 +2,7 @@
 
 Both modules use seeded randomness, so the goldens fix the seeds and the
 parity gates compare seeded runs on shared inputs (the plan's increment-6
-gates): dehydrate-then-rehydrate round-trip and the hsnt HDF5 format, and a
+gates): the L2 baseline (l2_dehydrate) then rehydrate round-trip and the hsnt HDF5 format, and a
 small seeded get_opt_views case against the mbirjax golden.  hsnt is
 host-side numpy/sklearn shared code, so it gates tight; vcls has each
 framework's own projections inside, so the view SELECTION must match and the
@@ -36,7 +36,7 @@ def test_dehydrate_rehydrate_parity(golden):
     # otherwise draws from the global RNG.  Unseeded, the factors are a different NMF local optimum
     # every run and this test failed ~35% of the time (over 500 unseeded runs: err_d p50 1.4e-3 /
     # p99 9.7e-3, err_r p50 9.1e-5 / p99 7.8e-4 -- even the product gate flaked, ~2% of runs).
-    dehydrated = mbirtorch.dehydrate(golden["hsnt_data"].copy(), num_materials=3, random_state=52,
+    dehydrated = mbirtorch.l2_dehydrate(golden["hsnt_data"].copy(), num_materials=3, random_state=52,
                                      verbose=0)
     sub_data, sub_basis, dataset_type = dehydrated
     assert dataset_type == 'attenuation'

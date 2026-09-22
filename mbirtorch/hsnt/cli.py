@@ -1,21 +1,22 @@
-"""Command-line interface for the hsnt factorization: ``mbirtorch-hsnt`` (or ``python -m mbirtorch.hsnt``).
+"""Command-line interface for the hsnt dehydration: ``mbirtorch-hsnt`` (or ``python -m mbirtorch.hsnt``).
 
-Three subcommands share one loader and one set of data checks:
+Five subcommands share one loader and one set of data checks:
 
     inspect    load a dataset, run the checks, print what a solve would see (no GPU needed)
     convert    write a TIFF stack (with its open beam) to the package's HDF5 layout, once
-    factorize  fit the NNAL factorization and write maps, spectra, plots and a JSON report
-    denoise    factorize and rehydrate: write the denoised hyperspectral data (and the factors)
+    dehydrate  fit the NNAL factorization X = W H and write it in the dehydrated layout, with plots and a JSON report
+    rehydrate  multiply a dehydrated file back into hyperspectral data (all bins or a range of them)
+    denoise    dehydrate and rehydrate in one run: write the denoised hyperspectral data (and the dehydrated file)
 
-The rank (number of materials) is estimated from the singular values of the attenuation unless --rank gives it.
+The rank (number of materials) is estimated by likelihood-ratio tests unless --rank gives it.
 
 Inputs are either an HDF5 file in the package layout (``data`` with the spectral axis last, ``dataset_type``,
 optionally inside a group) or a directory of one TIFF image per wavelength bin. A TIFF stack of counts needs an
 open-beam stack (``--open-beam``) to become a transmission ratio; a stack that already holds transmissions or
 attenuations is used as is, and the type is inferred from the values unless ``--input-type`` says otherwise.
 
-The factors are written in the package's dehydrated layout, so ``import_hsnt_data_hdf5`` reads them back and
-``rehydrate`` reconstructs the denoised data from them. Run any subcommand with ``-h`` for the options.
+The dehydrated layout (``subspace_data`` = maps, ``subspace_basis`` = spectra, ``dataset_type``) is the one
+``import_hsnt_data_hdf5`` reads and ``rehydrate`` reconstructs from. Run any subcommand with ``-h`` for the options.
 """
 import argparse
 import glob
@@ -28,6 +29,8 @@ import time
 from dataclasses import dataclass, field
 
 import numpy as np
+
+from .rank import _lrt_rank, pool_pixels, estimate_rank as _estimate_rank
 
 log = logging.getLogger("mbirtorch.hsnt")
 
@@ -435,99 +438,10 @@ def _attenuation_sample(ds: Dataset, max_pixels=65536):
     return -np.log(np.maximum(T, floor)), floor
 
 
-def _lrt_rank(T, device, seed, max_rank, label):
-    """Sequential likelihood-ratio rank test on the pixels of T (a torch tensor on the device). Returns (rank, detail)."""
-    import torch
-    from mbirtorch.hsnt import nnal_factorization, stable_nnal
-    P, K = T.shape
-    torch.manual_seed(seed)
-    losses, resid = [], []
-    for r in range(1, max_rank + 1):
-        W, H, _ = nnal_factorization(T, method="joint_newton", num_materials=r, max_steps=200, rel_tol=1e-6, random_state=seed)
-        Xd = W.double() @ H.double(); Th = torch.exp(-Xd); Td = T.double()
-        losses.append(stable_nnal(Xd, Td).item()); resid.append((((Td - Th) ** 2) / Th.clamp_min(1e-12)).mean().item())
-        log.debug("  %s rank %d: loss %.6g, mean chi-square term %.4g", label, r, losses[-1], resid[-1])
-    dose_eff = 1.0 / resid[-1]
-    gains = [dose_eff * (losses[i - 1] - losses[i]) for i in range(1, len(losses))]     # gains[i - 1] belongs to component i + 1
-    floor = max(0.5 * (P + K), float(np.median(gains[-3:])))
-    threshold = 2.0 * floor
-    rank = 1
-    for r, g in zip(range(2, max_rank + 1), gains):
-        if g > threshold:
-            rank = r
-        else:
-            break
-    table = ", ".join(f"{r}: {g:,.0f}" for r, g in zip(range(2, max_rank + 1), gains))
-    log.info("rank search (%s, %s pixels x %d bins): effective dose %.3g; log-likelihood gain of component %s; noise floor %.0f, "
-             "threshold %.0f -> rank %d", label, f"{P:,}", K, dose_eff, table, floor, threshold, rank)
-    return rank, dict(pixels=P, losses=losses, gains=gains, effective_dose=dose_eff, noise_floor=floor, threshold=threshold)
-
-
-def pool_pixels(T, spatial_shape, block):
-    """Block-average a (pixels, bins) array over block x block detector pixels within each view; rows and columns are
-    cropped to multiples of the block. The averaged transmission is the summed count over the block divided by the
-    block's summed dose, so it is a valid transmission ratio at block^2 times the dose."""
-    V, rows, cols = spatial_shape
-    r, c = rows // block * block, cols // block * block
-    X = np.asarray(T).reshape(V, rows, cols, -1)[:, :r, :c]
-    X = X.reshape(V, r // block, block, c // block, block, -1).mean(axis=(2, 4))
-    return X.reshape(-1, X.shape[-1])
-
-
 def estimate_rank(ds: Dataset, device, seed=0, max_rank=6, subsample=16384, pool="auto"):
-    """Choose the rank by sequential likelihood-ratio tests, at full resolution and on spatially pooled pixels.
-
-    Ranks 1..max_rank are fitted in turn and the loss gain of each added component is converted to log-likelihood
-    units with a dose calibrated from the residual of the most flexible fit (mean (T - e^-X)^2 / e^-X = 1 / dose for
-    Poisson noise), so a nominal or unknown open-beam dose does not matter. A component that only fits noise gains
-    about (P + K) / 2, its parameter count, because every pixel gives it a free coefficient; the noise floor is the
-    larger of that and the median gain of the last three ranks, and a component is accepted while its gain exceeds
-    twice the floor.
-
-    That floor grows with the pixel count as fast as a faint material's evidence does, so at low dose the test at
-    full resolution misses the weakest material (aluminium in the phantoms below dose ~18). Pooling blocks of
-    neighbouring pixels keeps the evidence, the summed counts stay Poisson, but divides the nuisance count, so the
-    same test on pooled pixels has far more power: on the sphere phantom pooling 8x8 recovers the true rank 3 at
-    dose 1 where full resolution gives 1, without over-estimating up to dose 1e4. The block is chosen so the pooled
-    pixel count falls to about the bin count, below which the floor is dominated by the spectrum's own K parameters
-    and pooling buys nothing more. The larger of the two ranks is returned: over-estimation costs a fraction of a
-    decibel while under-estimation caps the SNR. pool='auto' picks the block from the calibrated dose so pooled pixels
-    hold about 64 counts per bin (no pooling above dose 64, where pooled mixed pixels start to add spurious rank);
-    an integer fixes it; 0 disables it.
-    Returns (rank, note, detail)."""
-    import torch
-    stride = max(1, ds.pixels // subsample)
-    T = torch.from_numpy(np.ascontiguousarray(ds.T[::stride])).to(device)
-    log.info("estimating the rank: ranks 1..%d on %s pixels (every %d-th) at full resolution", max_rank, f"{T.shape[0]:,}", stride)
-    rank_full, d_full = _lrt_rank(T, device, seed, max_rank, "full resolution")
-    K = ds.bins
-    V, rows, cols = ds.spatial_shape
-    block = 0
-    if pool == "auto":
-        # Pool only as much as the counts require: to about 64 counts per pooled pixel and bin (8x8 at dose 1, 2x2 at
-        # dose 30, none above dose 64). Pooling at high dose over-estimates the rank: pooled pixels of mixed composition
-        # are not exactly low-rank (the exponential is applied to the block-averaged transmission) and that misfit's
-        # likelihood gain grows with dose; on the sphere phantom it chose rank 4 from dose 32 upward with an 8x8 block.
-        block = int(np.ceil(np.sqrt(64.0 / max(d_full["effective_dose"], 1e-9))))
-        block = int(min(block, np.ceil(np.sqrt(2.0 * ds.pixels / K)), max(1, min(rows, cols) // 4)))   # and never below ~K/2 pooled pixels
-    elif pool:
-        block = int(pool)
-    detail = dict(full=d_full, pool_block=block, max_rank=max_rank)
-    rank, source = rank_full, "full resolution"
-    if block > 1:
-        Tp = torch.from_numpy(np.ascontiguousarray(pool_pixels(ds.T, ds.spatial_shape, block), dtype=np.float32)).to(device)
-        rank_pool, d_pool = _lrt_rank(Tp, device, seed, max_rank, f"pooled {block}x{block}")
-        detail["pooled"] = d_pool
-        if rank_pool > rank_full:
-            rank, source = rank_pool, f"pooled {block}x{block}"
-    if rank == max_rank:
-        log.warning("every rank up to --max-rank %d was accepted; the search may be capped, raise --max-rank", max_rank)
-    parts = [f"full resolution gave {rank_full}"]
-    if block > 1:
-        parts.append(f"pooled {block}x{block} ({detail['pooled']['pixels']:,} pixels) gave {rank_pool}")
-    note = f"rank {rank} estimated by likelihood-ratio tests ({'; '.join(parts)}); pass --rank N to override"
-    detail.update(gains=(detail.get("pooled") or d_full)["gains"], effective_dose=d_full["effective_dose"], threshold=(detail.get("pooled") or d_full)["threshold"])
-    return rank, note, detail
+    """:func:`mbirtorch.hsnt.estimate_rank` on a loaded Dataset (pixels pooled within its views x rows x cols)."""
+    rank, note, detail = _estimate_rank(ds.T, ds.spatial_shape, device, seed=seed, max_rank=max_rank, subsample=subsample, pool=pool)
+    return rank, note.replace("give the rank to override", "pass --rank N to override"), detail
 
 
 def fit_quality(ds: Dataset, W, H, device, chunk=65536):
@@ -720,15 +634,30 @@ def _out_type(ds, args):
     return "attenuation" if ds.dataset_type in ("counts", "attenuation") else "transmission"
 
 
-def write_factors(base, ds: Dataset, W, H, rep, args):
-    """Write the factors in the dehydrated HDF5 layout plus the run's provenance. Returns the path."""
+def _run_attrs(ds, rep, args, extra):
+    """Provenance written as HDF5 attributes: where the data came from and how the solve was set up."""
+    return dict(source=ds.source, input_type=ds.dataset_type, method=args.method, mode=rep["mode"], spectra=args.spectra,
+                gauge=int(bool(args.gauge)), downsample=args.downsample, wave_bin=args.wave_bin,
+                dose=-1.0 if ds.dose is None else float(ds.dose), mbirtorch_hsnt_cli="1", **extra)
+
+
+def _provenance(h5, bin_indices, attrs):
+    import h5py
+    with h5py.File(h5, "a") as f:
+        if "bin_indices" not in f:
+            f.create_dataset("bin_indices", data=np.asarray(bin_indices))
+        f.attrs.update(attrs)
+
+
+def write_dehydrated(base, ds: Dataset, W, H, rep, args):
+    """Write the factorization in the dehydrated HDF5 layout plus the run's provenance. Returns the path."""
     from mbirtorch.hsnt import export_hsnt_data_hdf5
     R = H.shape[0]
     W4 = W.reshape(*ds.spatial_shape, R)
     out_type = _out_type(ds, args)
-    h5 = base + "_factors.h5"
+    h5 = base + "_dehydrated.h5"
     export_hsnt_data_hdf5(h5, [W4, H, out_type], {"dataset_type": out_type, "dataset_modality": "hyperspectral neutron"})
-    _provenance(h5, ds, rep, args, dict(rank=R, loss=rep["loss_final"]))
+    _provenance(h5, ds.bin_indices, _run_attrs(ds, rep, args, dict(rank=R, loss=rep["loss_final"])))
     total, contrib, n_mat = mean_pixel_spectrum(W, H)
     import h5py
     with h5py.File(h5, "a") as f:
@@ -736,32 +665,23 @@ def write_factors(base, ds: Dataset, W, H, rep, args):
         d.attrs["description"] = f"attenuation of the average material pixel ({n_mat} pixels), sum_k mean(W_pk) H_k; independent of the split among components"
         f.create_dataset("mean_pixel_contributions", data=contrib.astype(np.float32))
     log.info("wrote %s: subspace_data %s (maps, per material), subspace_basis %s (spectra), mean_pixel_spectrum over %s pixels; "
-             "rehydrate() reconstructs the %s", h5, W4.shape, H.shape, f"{n_mat:,}", out_type)
+             "`mbirtorch-hsnt rehydrate` or rehydrate() reconstructs the %s", h5, W4.shape, H.shape, f"{n_mat:,}", out_type)
     return h5
 
 
-def _provenance(h5, ds, rep, args, extra):
-    import h5py
-    with h5py.File(h5, "a") as f:
-        if "bin_indices" not in f:
-            f.create_dataset("bin_indices", data=ds.bin_indices)
-        f.attrs.update(dict(source=ds.source, input_type=ds.dataset_type, method=args.method, mode=rep["mode"], spectra=args.spectra,
-                            gauge=int(bool(args.gauge)), downsample=args.downsample, wave_bin=args.wave_bin,
-                            dose=-1.0 if ds.dose is None else float(ds.dose), mbirtorch_hsnt_cli="1", **extra))
-
-
-def write_denoised(path, ds: Dataset, W, H, out_type, rep, args, chunk=16384):
+def write_denoised(path, spatial_shape, W, H, out_type, bin_indices, attrs, chunk=16384):
     """Rehydrate W @ H into the package's hyperspectral HDF5 layout, written by pixel blocks so the full array is
-    never held in memory; import_hsnt_data_hdf5 reads it back."""
+    never held in memory; import_hsnt_data_hdf5 reads it back. W is (pixels, rank), spatial_shape (views, rows, cols)."""
     import h5py
     R, K = H.shape
-    V, rows, cols = ds.spatial_shape
+    V, rows, cols = spatial_shape
+    pixels = V * rows * cols
     with h5py.File(path, "w") as f:
         d = f.create_dataset("data", shape=(V, rows, cols, K), dtype=np.float32, chunks=(1, min(rows, 64), cols, K))
-        for i in range(0, ds.pixels, chunk):
+        for i in range(0, pixels, chunk):
             X = W[i:i + chunk] @ H
             block = (np.exp(-X) if out_type == "transmission" else X).astype(np.float32)
-            p0, p1 = i, min(i + chunk, ds.pixels)                           # pixel block -> (view, row, col) coordinates
+            p0, p1 = i, min(i + chunk, pixels)                              # pixel block -> (view, row, col) coordinates
             idx = np.arange(p0, p1)
             v, rc = np.divmod(idx, rows * cols); r, c = np.divmod(rc, cols)
             if v[0] == v[-1] and c[0] == 0 and c[-1] == cols - 1:
@@ -771,7 +691,7 @@ def write_denoised(path, ds: Dataset, W, H, out_type, rep, args, chunk=16384):
                     d[v[k], r[k], c[k], :] = block[k]
         f.create_dataset("dataset_type", data=np.bytes_(out_type))
         f.create_dataset("dataset_modality", data=np.bytes_("hyperspectral neutron"))
-    _provenance(path, ds, rep, args, dict(rank=R, loss=rep["loss_final"], denoised="1"))
+    _provenance(path, bin_indices, dict(attrs, rank=R, rehydrated="1"))
     log.info("wrote %s: data %s %s, %.2f GiB", path, (V, rows, cols, K), out_type, V * rows * cols * K * 4 / 2**30)
     return path
 
@@ -862,7 +782,7 @@ def cmd_convert(args):
             data = -np.log(ds.T)
         n_inf = int(np.isinf(data).sum())
         if n_inf:
-            log.warning("%d zero-count entries become inf in the attenuation (they are exact zeros in transmission); the factorizer "
+            log.warning("%d zero-count entries become inf in the attenuation (they are exact zeros in transmission); the solver "
                         "maps them back to zero transmission", n_inf)
     else:
         data = ds.T
@@ -898,7 +818,7 @@ def _resolve_rank(ds, args, device):
 
 
 def _pipeline(args, denoise):
-    """load -> checks -> rank -> solve -> fit quality -> outputs, for factorize and denoise."""
+    """load -> checks -> rank -> solve -> fit quality -> outputs, for dehydrate and denoise."""
     ds = load_dataset(args)
     device = _device(args.device)
     _resolve_rank(ds, args, device)
@@ -931,10 +851,11 @@ def _pipeline(args, denoise):
     else:
         log.info("fit: relative residual in transmission %.4g (no dose, so no chi-square)", q["relative_residual"])
     outputs = []
-    if not denoise or not args.no_factors:
-        outputs.append(write_factors(base, ds, W, H, rep, args))
-    if denoise or args.save_denoised:
-        outputs.append(write_denoised(base + "_denoised.h5", ds, W, H, _out_type(ds, args), rep, args))
+    if not denoise or not args.no_dehydrated:
+        outputs.append(write_dehydrated(base, ds, W, H, rep, args))
+    if denoise or args.rehydrate:
+        outputs.append(write_denoised(base + "_denoised.h5", ds.spatial_shape, W, H, _out_type(ds, args), ds.bin_indices,
+                                      _run_attrs(ds, rep, args, dict(loss=rep["loss_final"]))))
     if not args.no_plots:
         outputs += write_plots(base, ds, W.reshape(*ds.spatial_shape, H.shape[0]), H)
     write_report(base, ds, rep, args, outputs)
@@ -945,12 +866,57 @@ def _pipeline(args, denoise):
     return 0
 
 
-def cmd_factorize(args):
+def cmd_dehydrate(args):
     return _pipeline(args, denoise=False)
 
 
 def cmd_denoise(args):
     return _pipeline(args, denoise=True)
+
+
+def cmd_rehydrate(args):
+    """Multiply a dehydrated file back into hyperspectral data, for all bins or a --wave-range of them."""
+    import h5py
+    from mbirtorch.hsnt import import_hsnt_data_hdf5
+    if not os.path.isfile(args.input):
+        raise SystemExit(f"input not found: {args.input}")
+    data, meta = import_hsnt_data_hdf5(args.input)
+    if not isinstance(data, list):
+        raise SystemExit(f"{args.input}: not a dehydrated file (needs subspace_data, subspace_basis and dataset_type); "
+                         "run `mbirtorch-hsnt dehydrate` first")
+    W4, H, dtype = data
+    if W4.ndim == 3:
+        W4 = W4[None]
+    if W4.ndim != 4:
+        raise SystemExit(f"subspace_data has shape {W4.shape}; expected (views, rows, cols, rank) or (rows, cols, rank)")
+    if W4.shape[-1] != H.shape[0]:
+        raise SystemExit(f"rank mismatch: subspace_data has {W4.shape[-1]} components, subspace_basis {H.shape[0]} rows")
+    with h5py.File(args.input, "r") as f:
+        attrs = {k: (v.item() if hasattr(v, "item") else v) for k, v in f.attrs.items()}
+        bin_indices = f["bin_indices"][()] if "bin_indices" in f else np.arange(H.shape[1])
+    views = _parse_slice(args.views, "views")
+    if views:
+        W4 = W4[slice(*views)]
+    wave = _parse_slice(args.wave_range, "wave-range")
+    if wave:
+        H = H[:, slice(*wave)]; bin_indices = bin_indices[slice(*wave)]
+        if H.shape[1] == 0:
+            raise SystemExit(f"--wave-range {args.wave_range} selects no bins of the {data[1].shape[1]} in the file")
+    V, rows, cols, R = W4.shape
+    out_type = args.as_type or dtype
+    log.info("%s: %d component(s), %d view(s) x %d x %d pixels, %d of %d bins -> %s", args.input, R, V, rows, cols, H.shape[1],
+             data[1].shape[1], out_type)
+    stem = re.sub(r"_dehydrated$", "", os.path.splitext(os.path.basename(args.input))[0])
+    out = args.output
+    if out is not None and out.lower().endswith((".h5", ".hdf5")):
+        os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True); path = out
+    else:
+        os.makedirs(out or ".", exist_ok=True); path = os.path.join(out or ".", stem + "_rehydrated.h5")
+    attrs = {k: v for k, v in attrs.items() if k not in ("rank", "rehydrated")}
+    attrs.update(dehydrated_source=os.path.abspath(args.input), rehydrated_bins=f"{bin_indices[0]}..{bin_indices[-1]}")
+    write_denoised(path, (V, rows, cols), W4.reshape(-1, R).astype(np.float32), H.astype(np.float32), out_type, bin_indices, attrs)
+    print(path)
+    return 0
 
 
 def build_parser():
@@ -960,9 +926,10 @@ def build_parser():
                                        "  mbirtorch-hsnt inspect data.h5\n"
                                        "  mbirtorch-hsnt inspect sample_tifs/ --open-beam open_beam/ --estimate-rank\n"
                                        "  mbirtorch-hsnt convert sample_tifs/ --open-beam open_beam/ --wave-bin 4 -o sample.h5\n"
-                                       "  mbirtorch-hsnt factorize sample.h5 -o results/                    # rank estimated\n"
-                                       "  mbirtorch-hsnt factorize sample_tifs/ --open-beam open_beam/ --rank 2 --downsample 2 --wave-bin 4 --gauge -v\n"
-                                       "  mbirtorch-hsnt denoise sample.h5 -o results/                      # denoised data + factors\n")
+                                       "  mbirtorch-hsnt dehydrate sample.h5 -o results/                    # rank estimated\n"
+                                       "  mbirtorch-hsnt dehydrate sample_tifs/ --open-beam open_beam/ --rank 2 --downsample 2 --wave-bin 4 --gauge -v\n"
+                                       "  mbirtorch-hsnt rehydrate results/sample_dehydrated.h5 --wave-range 100:200 -o results/\n"
+                                       "  mbirtorch-hsnt denoise sample.h5 -o results/                      # denoised data + dehydrated file\n")
     sub = p.add_subparsers(dest="command", required=True)
 
     def add_input(sp):
@@ -1023,16 +990,26 @@ def build_parser():
         g.add_argument("-o", "--output", help="output directory (created if needed; default: current directory), or a .h5 path whose stem names the files")
         g.add_argument("--as-type", choices=("attenuation", "transmission"), help="quantity stored in the outputs (default: the input's)")
         if denoise:
-            g.add_argument("--no-factors", action="store_true", help="write only the denoised data, not the factors file")
+            g.add_argument("--no-dehydrated", action="store_true", help="write only the denoised data, not the dehydrated file")
         else:
-            g.add_argument("--save-denoised", action="store_true", help="also write the rehydrated data (as large as the input)")
+            g.add_argument("--rehydrate", action="store_true", help="also write the rehydrated (denoised) data, as large as the input")
         g.add_argument("--no-plots", action="store_true")
 
-    s = sub.add_parser("factorize", help="fit the NNAL factorization and write maps, spectra, plots and a report")
-    add_input(s); add_solve(s, denoise=False); s.set_defaults(func=cmd_factorize, no_factors=False)
+    s = sub.add_parser("dehydrate", help="fit the NNAL factorization and write it in the dehydrated layout, with plots and a report")
+    add_input(s); add_solve(s, denoise=False); s.set_defaults(func=cmd_dehydrate, no_dehydrated=False)
 
-    s = sub.add_parser("denoise", help="factorize and rehydrate: write the denoised hyperspectral data in the package's HDF5 layout")
-    add_input(s); add_solve(s, denoise=True); s.set_defaults(func=cmd_denoise, save_denoised=True)
+    s = sub.add_parser("rehydrate", help="multiply a dehydrated file back into hyperspectral data (all bins or a range)")
+    s.add_argument("input", help="a dehydrated .h5 (subspace_data, subspace_basis, dataset_type), as written by dehydrate")
+    s.add_argument("-o", "--output", help="output directory (default: current directory), or a .h5 path; default name <stem>_rehydrated.h5")
+    s.add_argument("--wave-range", help="spectral slice START:STOP of the dehydrated file's bins to rehydrate (default: all)")
+    s.add_argument("--views", help="view slice START:STOP (default: all)")
+    s.add_argument("--as-type", choices=("attenuation", "transmission"), help="quantity to write (default: the file's dataset_type)")
+    g = s.add_argument_group("logging")
+    g.add_argument("-v", "--verbose", action="count", default=0); g.add_argument("-q", "--quiet", action="store_true"); g.add_argument("--log-file")
+    s.set_defaults(func=cmd_rehydrate)
+
+    s = sub.add_parser("denoise", help="dehydrate and rehydrate: write the denoised hyperspectral data in the package's HDF5 layout")
+    add_input(s); add_solve(s, denoise=True); s.set_defaults(func=cmd_denoise, rehydrate=True)
     return p
 
 

@@ -73,7 +73,7 @@ __all__ = [
     "stitch_arrays", "get_ct_model", "copy_ct_model",
     "generate_demo_data", "generate_3d_shepp_logan_reference",
     # Documented hsnt and vcls names; these resolve lazily through __getattr__.
-    "hyper_denoise", "dehydrate", "rehydrate", "import_hsnt_data_hdf5",
+    "hyper_denoise", "dehydrate", "rehydrate", "estimate_rank", "l2_dehydrate", "l2_hyper_denoise", "import_hsnt_data_hdf5",
     "create_hsnt_metadata", "export_hsnt_data_hdf5", "generate_hyper_data",
     "get_opt_views", "show_image_with_projection_rays",
 ]
@@ -100,7 +100,8 @@ _LAZY_MODULES = ("preprocess", "hsnt", "vcls")
 # an explicit __all__ (mbirtorch/hsnt/__init__.py); this table lists the subset
 # promoted to the top level, so a new top-level name gets a line here.
 _LAZY_NAMES = {
-    'hyper_denoise': 'hsnt', 'dehydrate': 'hsnt', 'rehydrate': 'hsnt',
+    'hyper_denoise': 'hsnt', 'dehydrate': 'hsnt', 'rehydrate': 'hsnt', 'estimate_rank': 'hsnt',
+    'l2_dehydrate': 'hsnt', 'l2_hyper_denoise': 'hsnt',
     'import_hsnt_data_hdf5': 'hsnt', 'create_hsnt_metadata': 'hsnt',
     'export_hsnt_data_hdf5': 'hsnt', 'generate_hyper_data': 'hsnt',
     'subsample_R_gamma': 'vcls', 'max_abs_neighbor_diff': 'vcls',
