@@ -123,3 +123,30 @@ def test_sphere_phantom_geometry():
     for a in range(4):
         for m in range(3):
             assert (maps[a, :, :, m] > 0).any()                                      # every material visible in every view
+
+
+@cuda
+def test_support_search_methods_agree_and_scale():
+    """Branch and bound reproduces the enumeration's supports on nearly every pixel of the test problem at the same
+    criterion; the greedy search runs; both run at a rank the enumeration cannot (12)."""
+    from mbirtorch.hsnt import select_supports
+    T, W_true, Ht = _problem(dose=10.0)
+    W, H, _ = hsnt.nnal_factorization(T, method="joint_newton", num_materials=3, max_steps=200, rel_tol=1e-8)
+    s_enum, W_enum, f_enum = select_supports(T, W, H, dose=10.0, method="enumerate")
+    s_bb, W_bb, f_bb = select_supports(T, W, H, dose=10.0, method="branch_bound")
+    s_gr, W_gr, f_gr = select_supports(T, W, H, dose=10.0, method="greedy")
+    lam = 2 * np.log(T.shape[1])
+    crit = lambda s, f: (10.0 * f + lam * s.sum(1)).sum().item()
+    assert (s_bb == s_enum).all(1).double().mean() > 0.95 and crit(s_bb, f_bb) <= crit(s_enum, f_enum) * (1 + 2e-3)
+    assert (s_gr == s_enum).all(1).double().mean() > 0.8 and crit(s_gr, f_gr) <= crit(s_enum, f_enum) * (1 + 2e-2)
+    for s, W0 in ((s_bb, W_bb), (s_gr, W_gr)):
+        assert W0.min() >= 0 and bool((W0[~s] == 0).all()) and s.dtype == torch.bool
+    Ws, Hs, support, _ = hsnt.support_selected_spectra(T, W, H, dose=10.0, method="branch_bound")   # the full estimator
+    assert Ws.min() >= 0 and bool((Ws[~support] == 0).all())
+    with pytest.raises(ValueError, match="R <= 8"):
+        select_supports(T, torch.zeros(T.shape[0], 12, device="cuda"), torch.rand(12, T.shape[1], device="cuda"), dose=10.0, method="enumerate")
+    rng = np.random.default_rng(5); H12 = torch.tensor(rng.uniform(0.05, 1.0, (12, T.shape[1])), dtype=torch.float32, device="cuda")
+    W12 = torch.zeros(T.shape[0], 12, device="cuda")
+    for method in ("branch_bound", "greedy"):
+        s12, W0, f12 = select_supports(T, W12, H12, dose=10.0, method=method)                 # rank 12: no enumeration possible
+        assert s12.shape == (T.shape[0], 12) and s12.sum(1).max() <= 4 and torch.isfinite(f12).all()

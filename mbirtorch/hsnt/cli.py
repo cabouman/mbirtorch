@@ -615,9 +615,9 @@ def solve(ds: Dataset, args, device):
         rep["unconstrained_steps"], rep["unconstrained_seconds"] = int(st), round(time.perf_counter() - t1, 2)
         log.info("unconstrained spectra: %d steps in %.1f s, loss %.6g", st, rep["unconstrained_seconds"], loss(W, H))
     elif mode == "full" and args.spectra == "support":
-        if rank > 6:
-            raise SystemExit("support selection enumerates all 2^R - 1 subsets and is limited to rank 6")
-        t1 = time.perf_counter(); W, H, support, st = support_selected_spectra(T, W, H, ds.dose)
+        if args.support_method == "enumerate" and rank > 8:
+            raise SystemExit("--support-method enumerate solves all 2^R - 1 subsets and is limited to rank 8; use branch_bound")
+        t1 = time.perf_counter(); W, H, support, st = support_selected_spectra(T, W, H, ds.dose, method=args.support_method, wald_screen=args.wald_screen)
         rep["support_steps"], rep["support_seconds"] = int(st), round(time.perf_counter() - t1, 2)
         rep["mean_support_size"] = support.sum(1).double().mean().item()
         log.info("support selection: mean %.2f materials per pixel, refit %d steps in %.1f s, loss %.6g",
@@ -1268,7 +1268,12 @@ def build_parser():
         g.add_argument("--rel-tol", type=float, default=1e-6, help="relative loss change per step at which to stop")
         g.add_argument("--spectra", choices=("mle", "unconstrained", "support"), default="mle",
                        help="spectra estimator: maximum likelihood, the unconstrained-W re-estimate (pays above ~65k pixels), or per-pixel "
-                        "support selection (needs the dose, rank <= 6)")
+                        "support selection (needs the dose)")
+        g.add_argument("--support-method", choices=("branch_bound", "greedy", "enumerate"), default="branch_bound",
+                       help="subset search of support selection: branch and bound (any rank, default), greedy (fastest, heuristic), "
+                            "or the 2^R - 1 enumeration (rank <= 8)")
+        g.add_argument("--wald-screen", type=float, default=0.0, metavar="F",
+                       help="skip single-material fits below F x penalty of Wald statistic in the full fit (0 = off; trades rare-material recall for time)")
         g = sp.add_argument_group("compute")
         g.add_argument("--device", default="auto", metavar="auto|cpu|cuda|cuda:N", help="compute device (default: cuda if available)")
         g.add_argument("--mode", choices=("auto", "full", "stream"), default="auto", help="full solve on the device or streamed by chunks (default: by free memory)")
