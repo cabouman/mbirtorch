@@ -27,8 +27,8 @@ def lbfgsb_optimize(T, num_materials, max_steps, rel_tol, update_H=True, W_init=
     when verbose. memory is the number of correction pairs: with scipy's default
     of 10 the method stalled 6e-4 above the joint-Newton optimum at dose 3 on the
     4k phantom, the relative-decrease test firing on a slow crawl, while 20 pairs
-    reached it (1152 iterations against joint Newton's 45 steps; 9x the wall
-    clock on a laptop GPU). Not batchable, and update_H=False is not supported.
+    reached it (1152 iterations against joint Newton's 45 steps, about 9x the
+    wall clock). Not batchable, and update_H=False is not supported.
 
     Returns (W, H, iterations).
     """

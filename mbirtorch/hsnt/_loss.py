@@ -99,6 +99,5 @@ def _nnal_rowwise(X, T, prep, dim, dtype=None):
     drives a line search or a stopping test, because the float32 ulp of a sum over
     many pixels hides the improvement of a single H step (the float32 truncation
     of the elementwise terms remains, and is what _ARMIJO_FLOOR accounts for).
-    See the hsnt design notes, section 1.
     """
     return _nnal_elementwise(X, T, prep).sum(dim=dim, dtype=dtype)

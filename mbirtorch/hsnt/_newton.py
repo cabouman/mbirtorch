@@ -10,17 +10,17 @@ _COMPILED_KERNELS = {}
 # not trusted: elements whose step alpha*B falls below ulp(X) do not move in
 # float32, so the measured decrease is a biased truncation, linear in the row
 # length (not a random walk). c <= 2 backtracks spuriously; 4 is the smallest
-# safe value once the row sums are float64. See the hsnt design notes, section 1.
+# safe value once the row sums are float64.
 _ARMIJO_FLOOR = 4.0
 # Trust-region floor as a fraction of the mean row scale (0 -> machine epsilon).
 # Without it a row pinned near zero grows by at most 16x per step and the
-# loss-based stopping rule fires during the crawl. See the hsnt design notes, section 1.
+# loss-based stopping rule fires during the crawl.
 _TRUST_FLOOR = 1e-3
 # epsilon-active set (Bertsekas): a component within this fraction of the mean row
 # scale of zero, with a gradient pushing it out, is treated as AT the bound and
 # snapped to exactly zero. Otherwise a tiny residue left at the feasibility limit
 # is formally free, the row's shared step length min(V/d) is ~0, and the row
-# freezes at a non-stationary point. See the hsnt design notes, section 1.
+# freezes at a non-stationary point.
 _ACTIVE_TOL = 1e-6
 
 
@@ -40,8 +40,9 @@ def _kernels(compile_mode):
     default is therefore off. Compiled and eager agree bit-for-bit over short
     runs, but the fused reductions round differently and a long block_newton run
     can eventually flip an active-set decision, so do not expect such runs to be
-    reproducible across the compiled/eager boundary. Speedups and compile times:
-    the hsnt design notes, section 1.
+    reproducible across the compiled/eager boundary. Compiling costs a one-off
+    few seconds and saves a fraction of each step, so it pays only for repeated
+    or long solves.
     """
     if compile_mode is None:
         return stable_nnal, stable_nnal_derivatives, _nnal_rowwise, block_newton_step
@@ -66,8 +67,8 @@ def _two_metric_direction(V, grad, flat, rows, cols, jitter_rel=1e-9, nonneg=Tru
     bounds directions from rows without curvature; a non-descent direction falls
     back to the scaled gradient; alpha is the largest step keeping V >= 0. With
     nonneg=False there is no active set, no feasibility limit and alpha = 1. The
-    constants and their measurements are documented at _ARMIJO_FLOOR,
-    _TRUST_FLOOR and _ACTIVE_TOL and in the hsnt design notes, section 1.
+    constants are documented where they are defined (_ARMIJO_FLOOR, _TRUST_FLOOR
+    and _ACTIVE_TOL).
 
     Returns (d, slope, alpha, bound, projected_gnorm2): d is the descent
     direction (V decreases along +d), slope = <grad, d> per row, alpha the
@@ -164,7 +165,7 @@ def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9, non
         # The Armijo decrease can fall below what the float32 elementwise terms
         # resolve, which makes the test fail spuriously and backtrack to the cap.
         # Accept anything that is not measurably worse than the target; the size
-        # of "measurably" is set by _ARMIJO_FLOOR (the hsnt design notes, section 1).
+        # of "measurably" is set by _ARMIJO_FLOOR.
         noise = _ARMIJO_FLOOR * torch.finfo(V.dtype).eps * base.abs()
         ok = (rowwise(X - expand(trial) * B, T, prep, dim, dtype=torch.float64)
               <= base - 1e-4 * trial * slope + noise) | (trial == 0)
@@ -217,7 +218,7 @@ def block_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True,
             # to zero and its relative change stays O(1) forever, while the
             # gradient still vanishes. A KKT test alone is not enough because it is
             # relative to the gradient at the START, so a better initialization
-            # makes the same rel_tol a stricter target. See the hsnt design notes, section 3.
+            # makes the same rel_tol a stricter target.
             loss = rowwise(X, T, prep, 1, dtype=torch.float64).sum()
             gnorm = gnorm2.sqrt()
             if gnorm0 is None:
@@ -406,7 +407,6 @@ def joint_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True,
     warmup_steps=5 and cg_max=10 were chosen by interleaved A/B at equal converged
     quality: a block warm-up step costs more than a one-CG-iteration joint step,
     and past a handful of them the joint solver makes better use of the time.
-    See the hsnt design notes, section 3.
     """
     nnal_fn, deriv_fn, _, step_fn = _kernels(compile_mode)
     prep = _nnal_prep(T)

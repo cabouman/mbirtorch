@@ -24,7 +24,7 @@ def unconstrained_spectra(T, W, H, max_steps=300, cg_max=10, rel_tol=1e-10, w_ma
     Not for coefficients that are physically nonnegative and mostly zero, such as
     fractions over a dictionary of many similar atoms: there the unconstrained fit
     is ill-conditioned and the bound carries real information; see
-    support_selected_spectra. Measurements: the hsnt design notes, section 5.
+    support_selected_spectra.
 
     Returns (W, H, steps) with W >= 0 re-solved for the returned H.
     """
@@ -52,7 +52,7 @@ def support_selected_spectra(T, W, H, dose, penalty=None, max_steps=300, cg_max=
     own errors; a stronger penalty helped monotonically up to the default 2 log K,
     and a single select/refit round is the optimum (iterating degrades). It lifts
     the maps a little as well; the gauge fix, pure_pixel_gauge, lifts them far
-    more. Measurements: the hsnt design notes, section 5.
+    more.
 
     Args:
         dose: open-beam counts per pixel and bin, which converts the loss to
@@ -125,7 +125,6 @@ def pure_pixel_gauge(T, W, H, dose, penalty=None, seeds=8, kmeans_steps=100, w_m
     a material present only in mixtures pulls its axis into the data cone, and
     a mixture-dominated dataset yields clusters that are not materials. The
     order of the returned spectra is the cluster order, which is arbitrary.
-    Measurements: the hsnt design notes, section 5.
 
     Args:
         dose: open-beam counts per pixel and bin, converting the loss to

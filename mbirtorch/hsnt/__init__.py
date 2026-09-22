@@ -16,10 +16,10 @@ Submodules, one line each:
     simulate            generate_hyper_data, the Ni/Cu/Al phantom
     plots               compare_spectra
 
-Every name the former single-file module ``mbirtorch/hsnt.py`` defined is
-re-exported here, underscore-prefixed ones included, so
-``from mbirtorch.hsnt import X`` keeps working for every X it used to accept;
-``__all__`` lists the public ones.
+Every name of every submodule is re-exported here, underscore-prefixed ones
+included, so ``from mbirtorch.hsnt import X`` works for any X (the package began
+as one module whose private helpers callers import directly); ``__all__`` lists
+the public ones.
 
 The tuning constants ``_ARMIJO_FLOOR``, ``_TRUST_FLOOR`` and ``_ACTIVE_TOL``
 are owned by ``_newton`` and every solver reads them through that module at
@@ -27,9 +27,6 @@ call time. The copies bound here are plain floats and are for reading only:
 to monkeypatch one, target the owner, ``mbirtorch.hsnt._newton._ARMIJO_FLOOR``,
 not ``mbirtorch.hsnt._ARMIJO_FLOOR``. (``_COMPILED_KERNELS`` is a dict, so the
 name here is the same object as the owner's.)
-
-The "hsnt design notes" the docstrings cite (solver derivations, measured constants, dose sweeps) are the
-authors' working record and are kept outside the repository.
 
 matplotlib is imported lazily, inside the three functions that plot
 (compare_spectra, and the verbose plotting blocks of generate_hyper_data and

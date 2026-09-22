@@ -27,8 +27,7 @@ def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_
         # marks zero counts with a tiny positive value (1e-30); flooring THERE
         # gives an attenuation near 69 that the initialization's zero-fill smears
         # into every component. Any transmission below 1e-12 is treated as a zero
-        # count; no real measurement gets anywhere near that. See
-        # the hsnt design notes, section 2.
+        # count; no real measurement gets anywhere near that.
         real = T > 1e-12
         if bool(real.any()) and not bool(real.all()):
             floor = 0.5 * T[real].min()
@@ -71,7 +70,7 @@ def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_
         # losses and cannot be fooled by a single flat check. The multiplicative
         # method converges sublinearly, so rel_tol = 1e-6 leaves it ~0.009% above the
         # optimum where joint_newton is within 0.002%; 1e-8 reaches 0.0001% at 2.4x
-        # the sweeps. See the hsnt design notes, section 3.
+        # the sweeps.
         log_T, positive, _, _ = prep
         const = torch.sum(torch.where(positive, T * (1.0 - log_T), torch.zeros_like(T)),
                           dtype=torch.float64)
@@ -107,8 +106,7 @@ def optimize(T: torch.Tensor, update, num_materials, max_steps, rel_tol, update_
         return Wb, Hb, num_steps
 
     # Converge on a float64 sum: in float32 the loss is quantized coarser than the
-    # per-step progress at low dosage, and the test would fire on noise. See
-    # the hsnt design notes, section 1.
+    # per-step progress at low dosage, and the test would fire on noise.
     prev_loss = stable_nnal(W @ H, T, prep, dtype=torch.float64)
     for i in range(max_steps):
         # prep is threaded in rather than rebuilt inside `update`: it holds a
@@ -137,10 +135,7 @@ def nnal_factorization(T: torch.Tensor, method='joint_newton', num_materials=3, 
     reaches machine precision on exactly factorizable data. 'block_newton' is the
     alternating exact projected-Newton method (linear convergence; also the warm-up
     and the fixed-H solver). 'multiplicative' is the damped, extrapolated
-    multiplicative update, at parity with joint_newton in wall clock. The former
-    'quadratic' (IRLS) and 'quasi_newton' (diagonal Hessian) methods were removed
-    in the 2026-09 cleanup as dominated. Measurements: the hsnt design notes,
-    section 3.
+    multiplicative update, at parity with joint_newton in wall clock.
     'lbfgsb' is the generic bound-constrained baseline: scipy's L-BFGS-B over
     both factors at once on the same gradient (see lbfgsb_optimize); it is what a
     second-order method has to beat, and is typically 10-100x slower here.
@@ -154,7 +149,6 @@ def nnal_factorization(T: torch.Tensor, method='joint_newton', num_materials=3, 
     and reaches joint_newton's answer in comparable wall clock. On data the model
     fits exactly the loss goes to zero and this test never fires; a
     projected-gradient (KKT) test then takes over and runs to machine precision.
-    See the hsnt design notes, section 3.
 
     compile_mode: any non-None value compiles the elementwise hot kernels of
     block_newton and joint_newton (see _kernels), a one-off cost that pays for
