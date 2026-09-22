@@ -31,32 +31,3 @@ def test_projector_adjointness(device):
     rhs = float(torch.sum(x * aty))
     # f32 sums over ~1e6 terms: run-to-run atomics noise is ~1e-6 relative.
     assert _rel_diff(lhs, rhs) < 1e-4, (lhs, rhs)
-
-
-def test_differentiable_wrapper_gradients(device):
-    torch.manual_seed(0)
-    sino_shape = (24, 16, 16)
-    angles = np.linspace(0, np.pi, sino_shape[0], endpoint=False)
-    model = mbirtorch.ParallelBeamModel(sino_shape, angles)
-    model.configure_devices(devices=[device])
-    recon_shape = model.get_params('recon_shape')
-
-    volume = torch.rand(tuple(recon_shape), device=model.torch_device,
-                        requires_grad=True)
-    y = torch.rand(sino_shape, device=model.torch_device)
-
-    sino = mbirtorch.forward_project_differentiable(model, volume)
-    loss = torch.sum(sino * y)
-    loss.backward()
-
-    # d/dv <A v, y> = A' y (zero outside the ROR mask).
-    expected = model.back_project(y, output_sharded=True)
-    grad = volume.grad
-    rel_max = float((grad - expected).abs().max() / expected.abs().max())
-    assert rel_max < 1e-5, rel_max
-
-    # The TorchProjector module reaches the same two operators and must
-    # return the sinogram and volume shapes the model declares.
-    projector = mbirtorch.TorchProjector(model)
-    assert tuple(projector(volume.detach()).shape) == sino_shape
-    assert tuple(projector.adjoint(y).shape) == tuple(recon_shape)

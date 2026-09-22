@@ -2,13 +2,12 @@
 
 The partition generators run in numpy.  They draw from the global np.random
 state by default, and from a ``numpy.random.Generator`` given as ``rng``.
-That call sequence is deliberate: the golden-value tests
-(tests/test_vs_goldens.py) and restart reproducibility depend on a seeded run
-drawing the identical subsets in the identical order.  Do not reorder the
-calls.  :func:`named_rng` builds the generator of one named draw of a seeded
-run, so that a draw depends on neither the thread that makes it nor the
-moment it is made.  Not implemented: the grid and blue-noise partition
-variants.
+That call sequence is deliberate: restart reproducibility depends on a
+seeded run drawing the identical subsets in the identical order.  Do not
+reorder the calls.  :func:`named_rng` builds the generator of one named
+draw of a seeded run, so that a draw depends on neither the thread that
+makes it nor the moment it is made.  Not implemented: the grid and
+blue-noise partition variants.
 """
 
 import warnings

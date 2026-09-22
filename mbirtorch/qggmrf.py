@@ -8,7 +8,6 @@ one place.
 Shapes: the math is written directly batched -- per-cylinder over (N, S)
 arrays and per-slice via flat gathers.  The operations are elementwise on the
 same operands, so the batched form is value-identical to a per-cylinder loop.
-The golden-value tests (tests/test_vs_goldens.py) hold it to ~1e-7 rel-max.
 """
 
 import numpy as np

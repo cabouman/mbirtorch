@@ -84,6 +84,7 @@ MBIRTorch: High-performance tomographic reconstruction
    :caption: User Guide
 
    install
+   usr_migration
    unit_conversion
    usr_api
    usr_multi_gpu

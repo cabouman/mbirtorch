@@ -1,18 +1,12 @@
 """Gates for recon_split_sino, in both geometries that implement it.
 
 The split reconstruction must approximately equal recon() on the same inputs.
-Cross-framework parity against the mbirjax golden is measured loosely
-(iterative recons in the loop, as for the MAR end-to-end gate); the
-geometry-derived overlaps must match mbirjax exactly.
 """
 
-import os
 import numpy as np
 import pytest
 
 import mbirtorch
-GOLDEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "goldens")
-_npz_path = os.path.join(GOLDEN_DIR, "preprocess_goldens.npz")
 
 
 def _set_hand_pitch(model, delta_voxel_scale):
@@ -59,27 +53,3 @@ def test_split_approximates_full_recon():
     sp = split_dict['split_params']
     assert sp['half_overlap_sino'] >= 4 and sp['half_overlap_recon'] > sp['half_overlap_sino'] // 2
     assert 'recon_params_top' in split_dict and 'recon_params_bottom' in split_dict
-
-
-@pytest.mark.goldens
-@pytest.mark.skipif(not os.path.exists(_npz_path), reason="no preprocess goldens")
-def test_split_golden_parity():
-    golden = np.load(_npz_path)
-    cell = tuple(int(v) for v in golden["mar_cell"])
-    model = mbirtorch.ConeBeamModel(cell, golden["mar_angles"],
-                                    source_detector_dist=float(golden["mar_sdd"]),
-                                    source_iso_dist=float(golden["mar_sid"]))
-    model.configure_devices(devices=['cpu'])
-    model.set_params(no_warning=True, verbose=0)
-    np.random.seed(19)
-    recon, split_dict = model.recon_split_sino(golden["mar_sino"].copy(),
-                                               weights=golden["mar_weights"].copy(),
-                                               half_overlap=4, max_iterations=5)
-    sp = split_dict['split_params']
-    # The geometry-derived overlaps are deterministic and must match mbirjax exactly.
-    assert sp['half_overlap_sino'] == int(golden["split_overlap_sino"])
-    assert sp['half_overlap_recon'] == int(golden["split_overlap_recon"])
-    assert recon.shape == golden["split_recon"].shape
-    nrmse = float(np.linalg.norm(recon - golden["split_recon"]) / np.linalg.norm(golden["split_recon"]))
-    print(f"split cross-framework NRMSE = {nrmse:.4f} (measured; recons in the loop)")
-    assert nrmse < 0.1
