@@ -25,3 +25,16 @@ recon, recon_dict = mbirtorch.recon_simple_parallel(sinogram, angles)
 ```
 
 Full documentation at [https://mbirtorch.readthedocs.io/](https://mbirtorch.readthedocs.io/)
+
+## Hyperspectral neutron data (hsnt)
+
+`mbirtorch.hsnt` factorizes hyperspectral neutron transmission data into material maps and spectra by maximum
+likelihood (Poisson counts), estimates the number of materials, and denoises by dehydration and rehydration.
+From the shell:
+
+    mbirtorch-hsnt inspect data.h5
+    mbirtorch-hsnt convert sample_tifs/ --open-beam open_beam/ -o sample.h5
+    mbirtorch-hsnt dehydrate sample.h5 -o results/
+    mbirtorch-hsnt rehydrate results/sample_dehydrated.h5 -o results/
+
+See the Hyperspectral CT page of the documentation.

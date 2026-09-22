@@ -52,7 +52,7 @@ def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warm
             dtype -- chunks, W and H are cast on the way in -- while the warm-up
             stays in the chunks' native dtype. Insurance against a float32
             elementwise ceiling on H at very large P; the accumulated statistics
-            are float64 regardless. See docs/hsnt_solver_notes.md, section 6.
+            are float64 regardless. See the hsnt design notes, section 6.
         kkt_tol: If set, also stop once the relative KKT residual of H,
             ||P(grad_H L)||_F / ||W^T T||_F with P the projection onto the
             feasible directions, falls below it. The residual is scale-free and
@@ -60,13 +60,13 @@ def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warm
             precision plateau, where the line search cannot accept an improvement
             below its noise floor while H is still measurably non-stationary; the
             residual tells the two apart, and the run says so when it stops that
-            way. See docs/hsnt_solver_notes.md, section 4.
+            way. See the hsnt design notes, section 4.
         stats: Optional dict; receives 'loss' and 'kkt' lists, one entry per pass.
         nonneg_W: False estimates H with the bound on the pixel coefficients dropped
             during the polish passes (see unconstrained_spectra: it removes the
             truncation bias of the ML spectra), then re-solves W >= 0 for every
             chunk in one final pass. The warm-up fit stays constrained, since it
-            finds the basin. See docs/hsnt_solver_notes.md, section 5.
+            finds the basin. See the hsnt design notes, section 5.
 
     Returns:
         (W_chunks, H, passes): W as a list of CPU tensors aligned with `chunks`.

@@ -28,6 +28,9 @@ to monkeypatch one, target the owner, ``mbirtorch.hsnt._newton._ARMIJO_FLOOR``,
 not ``mbirtorch.hsnt._ARMIJO_FLOOR``. (``_COMPILED_KERNELS`` is a dict, so the
 name here is the same object as the owner's.)
 
+The "hsnt design notes" the docstrings cite (solver derivations, measured constants, dose sweeps) are the
+authors' working record and are kept outside the repository.
+
 matplotlib is imported lazily, inside the three functions that plot
 (compare_spectra, and the verbose plotting blocks of generate_hyper_data and
 l2_baseline._estimate_subspace_dimension), so importing this package does not import it.

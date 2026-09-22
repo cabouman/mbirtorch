@@ -37,7 +37,7 @@ def nndsvda(X, n_components, fill='sqrt', fill_scale=1.0):
     and a fill far below factor scale is frozen at zero by block_newton's
     two-metric projection, which then converges in a reduced subspace. c = 1 was
     chosen by measurement; its price is an initial X up to 2x the data where fills
-    coincide, which no solver minds. See docs/hsnt_solver_notes.md, section 2.
+    coincide, which no solver minds. See the hsnt design notes, section 2.
 
     Args:
         X: Nonnegative array of shape (n_samples, n_features).

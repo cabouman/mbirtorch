@@ -15,7 +15,7 @@ def _shifted(V, ratio, shift, mode, mean_dim):
     {V >= 0, grad >= 0, V*grad = 0} -- the KKT set -- for every d > 0. No decay
     schedule is needed for correctness. This is the inadmissible-zero offset of
     Chi & Kolda (2012) and the modified update of Lin (2007) in translated form,
-    not a new device. See docs/hsnt_solver_notes.md, section 3.
+    not a new device. See the hsnt design notes, section 3.
 
     mode='boundary' offsets only entries currently at zero, leaving the interior
     step bit-for-bit the original update. mode='const' offsets everything, which
@@ -67,7 +67,7 @@ def _reseed_dead(W, H, rel_tol=1e-6, mode='random'):
     The default seed is small random positive values from a fixed generator, so
     runs are reproducible. A constant seed leaves the component flat, and a flat
     spectrum makes the gauge fit against the true spectra ill-conditioned; the
-    random seed breaks that symmetry. See docs/hsnt_solver_notes.md, section 3.
+    random seed breaks that symmetry. See the hsnt design notes, section 3.
     """
     w = W.norm(dim=0); h = H.norm(dim=1)
     dead = (w <= rel_tol * w.max()) & (h <= rel_tol * h.max())

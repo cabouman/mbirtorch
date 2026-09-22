@@ -35,9 +35,12 @@ def main():
     # Fix seed for random number generation
     np.random.seed(129)
 
-    # Load theoretical linear attenuation coefficients for Ni, Cu, and Al
-    material_basis_path = '/home/harel/mbirjax/experiments/hsnt/binaries/'
-    filename = os.path.join(material_basis_path, 'material_basis.npy')
+    # Load theoretical linear attenuation coefficients for Ni, Cu, and Al: the phantom basis ships with the repository
+    # (experiments/hsnt/binaries; wavelength axis: mbirtorch.hsnt.simulate.material_basis_wavelengths)
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    filename = os.path.join(repo, 'experiments', 'hsnt', 'binaries', 'material_basis.npy')
+    if not os.path.exists(filename):
+        raise SystemExit(f"phantom basis not found at {filename}; run this demo from a checkout of the repository")
     material_basis = np.load(filename)
     num_materials_true = material_basis.shape[0]
 

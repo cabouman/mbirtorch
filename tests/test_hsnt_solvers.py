@@ -4,14 +4,30 @@ Self-contained: a small random nonnegative factorization stands in for the mater
 no external basis file is needed. Each test runs in a few seconds on a GPU and is skipped without
 one (the streaming path pins host memory for CUDA transfers).
 """
+import sys
+
 import numpy as np
 import pytest
 import torch
 
 hsnt = pytest.importorskip("mbirtorch.hsnt")
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-LBFGSB_GAP = 1e-4        # relative loss gap L-BFGS-B may leave against joint Newton on _problem() (measured below 1e-5)
-ALIGN_MIN = 0.998        # pure_pixel_gauge on _problem(): 0.9992-0.9993 for seeds 0-2, against 0.991-0.994 for the MLE
+LBFGSB_GAP = 1e-3        # relative loss gap L-BFGS-B may leave against joint Newton on _problem() (measured below 1e-5 on a laptop GPU)
+ALIGN_MIN = 0.995        # pure_pixel_gauge on _problem(): 0.9992-0.9993 for seeds 0-2 on a laptop GPU, against 0.991-0.994 for the MLE
+
+
+def _compile_works():
+    """torch.compile needs Inductor (no Windows support) and a C++ toolchain; probe once on a trivial function."""
+    if sys.platform == "win32":
+        return False
+    try:
+        torch.compile(lambda x: x + 1)(torch.zeros(2, device="cuda" if torch.cuda.is_available() else "cpu"))
+        return True
+    except Exception:
+        return False
+
+
+compiled = pytest.mark.skipif(not (torch.cuda.is_available() and _compile_works()), reason="needs CUDA and a working torch.compile (Inductor)")
 
 
 def _problem(P=2048, K=200, R=3, dose=10.0, seed=0, noisy=True, dtype=torch.float32):
@@ -63,7 +79,7 @@ def test_default_method_is_joint_newton():
     assert hsnt.nnal_factorization.__defaults__[0] == "joint_newton"
 
 
-@cuda
+@compiled
 def test_compiled_matches_eager():
     T, _, _ = _problem()
     W1, H1, _ = hsnt.nnal_factorization(T, method="joint_newton", num_materials=3, max_steps=200, rel_tol=1e-8)

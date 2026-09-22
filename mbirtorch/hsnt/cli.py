@@ -162,11 +162,15 @@ def run_checks(ds: Dataset, strict=False):
 # ----------------------------------------------------------------------------------------------------------------------
 # Loaders
 # ----------------------------------------------------------------------------------------------------------------------
+def _tif_names(directory):
+    """Sorted .tif/.tiff paths in a directory, in any letter case (a glob for *.tif misses .TIF on Linux)."""
+    return sorted(os.path.join(directory, f) for f in os.listdir(directory) if f.lower().endswith((".tif", ".tiff")))
+
+
 def _tif_files(directory):
-    files = sorted(glob.glob(os.path.join(directory, "*.tif")) + glob.glob(os.path.join(directory, "*.tiff")))
+    files = _tif_names(directory)
     if not files:
-        subdirs = sorted(d for d in glob.glob(os.path.join(directory, "*")) if os.path.isdir(d)
-                         and (glob.glob(os.path.join(d, "*.tif")) or glob.glob(os.path.join(d, "*.tiff"))))
+        subdirs = sorted(d for d in glob.glob(os.path.join(directory, "*")) if os.path.isdir(d) and _tif_names(d))
         if subdirs:
             return None, subdirs
         raise FileNotFoundError(f"no .tif/.tiff files in {directory}")
@@ -518,11 +522,18 @@ def mean_pixel_spectrum(W, H, frac=0.25):
 # Solve
 # ----------------------------------------------------------------------------------------------------------------------
 def _device(name):
+    """'auto' | 'cpu' | 'cuda' | 'cuda:N' -> the torch device string to use, validated."""
     import torch
     if name == "auto":
         name = "cuda" if torch.cuda.is_available() else "cpu"
-    if name == "cuda" and not torch.cuda.is_available():
-        raise SystemExit("--device cuda but no CUDA device is available")
+    if name.startswith("cuda"):
+        if not torch.cuda.is_available():
+            raise SystemExit(f"--device {name} but no CUDA device is available")
+        idx = name.split(":", 1)[1] if ":" in name else "0"
+        if not idx.isdigit() or int(idx) >= torch.cuda.device_count():
+            raise SystemExit(f"--device {name}: expected cuda or cuda:N with N below {torch.cuda.device_count()}")
+    elif name != "cpu":
+        raise SystemExit(f"--device {name}: expected auto, cpu, cuda or cuda:N")
     if name == "cpu":
         log.warning("running on the CPU: expect one to two orders of magnitude longer than a GPU")
     return name
@@ -533,9 +544,9 @@ def plan_memory(ds: Dataset, device, mode, chunk_pixels):
     import torch
     P, K = ds.T.shape
     need_full = P * K * _BYTES_PER_ELEMENT_FULL
-    if device == "cuda":
-        free, total = torch.cuda.mem_get_info()
-        name = torch.cuda.get_device_name(0)
+    if device.startswith("cuda"):
+        free, total = torch.cuda.mem_get_info(device)
+        name = torch.cuda.get_device_name(device)
     else:
         import psutil
         free = total = psutil.virtual_memory().available
@@ -544,7 +555,7 @@ def plan_memory(ds: Dataset, device, mode, chunk_pixels):
     if mode == "auto":
         mode = "full" if need_full < 0.7 * free else "stream"
     if mode == "stream":
-        if device != "cuda":
+        if not device.startswith("cuda"):
             raise SystemExit("stream mode needs a CUDA device (it pins host memory for the transfers); the data do not fit a full solve on the CPU")
         if chunk_pixels is None:
             chunk_pixels = int(0.4 * free / (K * _BYTES_PER_ELEMENT_STREAM)) // 1024 * 1024
@@ -582,8 +593,8 @@ def solve(ds: Dataset, args, device):
         W = torch.cat([w.to(device) for w in W_chunks])
         rep.update(passes=int(passes), loss_per_pass=stats.get("loss"), kkt_per_pass=stats.get("kkt"))
         T = None
-    if device == "cuda":
-        torch.cuda.synchronize()
+    if device.startswith("cuda"):
+        torch.cuda.synchronize(device)
     rep["solve_seconds"] = round(time.perf_counter() - t0, 2)
 
     def loss(Wx, Hx):
@@ -627,8 +638,8 @@ def solve(ds: Dataset, args, device):
             log.warning("one gauge cluster holds under 1%% of the material pixels: a material without pure pixels; the fix may have failed")
     rep["loss_final"] = loss(W, H)
     rep["W_zero_frac"], rep["H_zero_frac"] = (W == 0).double().mean().item(), (H == 0).double().mean().item()
-    if device == "cuda":
-        rep["gpu_peak_gib"] = round(torch.cuda.max_memory_allocated() / 2**30, 2)
+    if device.startswith("cuda"):
+        rep["gpu_peak_gib"] = round(torch.cuda.max_memory_allocated(device) / 2**30, 2)
     return W.cpu().numpy(), H.cpu().numpy(), rep
 
 
@@ -637,7 +648,7 @@ def solve(ds: Dataset, args, device):
 # ----------------------------------------------------------------------------------------------------------------------
 def _out_paths(args, ds):
     """Output base path: -o names a directory (created if needed) unless it ends in .h5/.hdf5, whose stem then names the files."""
-    stem = os.path.splitext(os.path.basename(args.input.rstrip("/")))[0]
+    stem = os.path.splitext(os.path.basename(os.path.normpath(args.input)))[0]
     out = args.output
     if out is not None and out.lower().endswith((".h5", ".hdf5")):
         os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
@@ -721,14 +732,20 @@ def write_report(base, ds, rep, args, outputs):
     report = dict(input=ds.source, input_type=ds.dataset_type, spatial_shape=list(ds.spatial_shape), pixels=ds.pixels, bins=ds.bins,
                   dose=ds.dose, args={k: v for k, v in vars(args).items() if k not in ("func",)},
                   checks=[dict(level=c.level, message=c.message) for c in ds.checks], info=ds.info, result=rep, outputs=outputs)
-    with open(rep_path, "w") as f:
+    with open(rep_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=1, default=str)
     log.info("wrote %s", rep_path)
     return report
 
 
 def _short(source, n=60):
-    s = os.path.basename(source.split(":")[0]) + (":" + source.split(":", 1)[1] if ":" in source else "")
+    """Basename of the source plus its HDF5 group, if any (the label is 'path' or 'path:group'); a drive letter's colon
+    is left alone because its tail is a path, not a group name."""
+    head, sep, tail = source.rpartition(":")
+    if sep and tail and not any(c in tail for c in "/\\") and os.path.exists(head):
+        s = os.path.basename(head) + ":" + tail
+    else:
+        s = os.path.basename(source)
     return s if len(s) <= n else "..." + s[-n:]
 
 
@@ -941,7 +958,7 @@ def stream_convert(args):
     if wave_bin > 1:
         log.info("--wave-bin %d: %d source bins -> %d (dropping the last %d)", wave_bin, nb, K, nb % wave_bin)
     out_type = "attenuation" if args.as_type == "attenuation" else "transmission"
-    out = args.output or (os.path.splitext(p.rstrip("/"))[0] + ".h5")
+    out = args.output or (os.path.splitext(os.path.normpath(p))[0] + ".h5")
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     block_out = block // wave_bin
     log.info("streaming %d bins per block (%d blocks, %d output bins each), %d TIFF reader threads -> %s (%s, %.2f GiB)",
@@ -1238,7 +1255,7 @@ def build_parser():
     s.add_argument("--estimate-rank", action="store_true", help="choose the rank by likelihood-ratio tests on a pixel subsample (runs solves)")
     s.add_argument("--max-rank", type=int, default=6, help="largest rank the estimate considers")
     s.add_argument("--rank-pool", default="auto", metavar="auto|B|0", help="also test on B x B pooled pixels (default auto; 0 disables)")
-    s.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
+    s.add_argument("--device", default="auto", metavar="auto|cpu|cuda|cuda:N", help="compute device (default: cuda if available)")
     s.set_defaults(func=cmd_inspect)
 
     s = sub.add_parser("convert", help="write a TIFF stack (and open beam) or an HDF5 dataset as an HDF5 dataset in the package "
@@ -1266,7 +1283,7 @@ def build_parser():
                         "support selection (needs the dose, rank <= 6)")
         g.add_argument("--gauge", action="store_true", help="pure-pixel gauge fix of the maps (assumes every material has pure pixels; needs the dose)")
         g = sp.add_argument_group("compute")
-        g.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
+        g.add_argument("--device", default="auto", metavar="auto|cpu|cuda|cuda:N", help="compute device (default: cuda if available)")
         g.add_argument("--mode", choices=("auto", "full", "stream"), default="auto", help="full solve on the device or streamed by chunks (default: by free memory)")
         g.add_argument("--chunk-pixels", type=int, help="pixels per chunk in stream mode (default: from free memory)")
         g.add_argument("--max-passes", type=int, default=5, help="stream mode: polish passes over the data")

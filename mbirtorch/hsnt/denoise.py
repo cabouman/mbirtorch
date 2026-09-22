@@ -50,7 +50,7 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, method="join
 
     The spectral axis must be the last axis; any leading axes are kept. Attenuation is converted to the transmission
     ratio exp(-X) and the factorization minimises the non-negative attenuation loss, the Poisson log-likelihood of
-    counts up to a constant (docs/hsnt_solver_notes.md), with W >= 0 and H >= 0. Unlike the L2 baseline no
+    counts up to a constant (the hsnt design notes), with W >= 0 and H >= 0. Unlike the L2 baseline no
     safety factor inflates the rank: the subspace dimension is the number of materials, estimated by
     likelihood-ratio tests when not given (:func:`~mbirtorch.hsnt.estimate_rank`, which pools pixels spatially when
     the leading axes are (views, rows, cols) or (rows, cols)).
