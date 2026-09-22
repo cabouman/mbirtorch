@@ -141,7 +141,7 @@ def _checks_from_summary(sm, spatial_shape, checks, strict=False):
         else:
             c.append(Check("ok", f"dose {dose:.3g} open-beam counts per pixel and (binned) bin"))
     else:
-        c.append(Check("warn", "dose unknown: --dose is needed for support selection and the gauge fix"))
+        c.append(Check("warn", "dose unknown: --dose is needed for support selection"))
     if K > P:
         c.append(Check("warn", f"more bins ({K}) than pixels ({P}): the spectra are poorly determined; use --downsample less or --wave-bin more"))
     errors = [x for x in c if x.level == "error"]
@@ -569,7 +569,7 @@ def solve(ds: Dataset, args, device):
     """Run the factorization and the requested post-estimators. Returns (W, H, report) with W, H numpy."""
     import torch
     from mbirtorch.hsnt import (nnal_factorization, stream_factorization, stable_nnal, unconstrained_spectra,
-                                support_selected_spectra, pure_pixel_gauge)
+                                support_selected_spectra)
     rep = {}
     rank = args.rank_value
     mode, chunk, rep["memory_plan"] = plan_memory(ds, device, args.mode, args.chunk_pixels)
@@ -607,9 +607,8 @@ def solve(ds: Dataset, args, device):
              f"{rep['steps']} steps" if "steps" in rep else f"{rep['passes']} polish passes", rep["solve_seconds"], rep["loss_mle"],
              100 * (W == 0).double().mean().item(), 100 * (H == 0).double().mean().item())
 
-    needs_dose = args.spectra == "support" or args.gauge
-    if needs_dose and ds.dose is None:
-        raise SystemExit("support selection and the gauge fix need the dose (open-beam counts per pixel and bin): pass --dose, "
+    if args.spectra == "support" and ds.dose is None:
+        raise SystemExit("support selection needs the dose (open-beam counts per pixel and bin): pass --dose, "
                          "or give --open-beam with a TIFF stack of counts")
     if mode == "full" and args.spectra == "unconstrained":
         t1 = time.perf_counter(); W, H, st = unconstrained_spectra(T, W, H)
@@ -625,17 +624,6 @@ def solve(ds: Dataset, args, device):
                  rep["mean_support_size"], st, rep["support_seconds"], loss(W, H))
     elif args.spectra != "mle" and mode == "stream":
         log.info("stream mode: %s spectra handled inside the polish passes (nonneg_W=%s)", args.spectra, args.spectra != "unconstrained")
-    if args.gauge:
-        if mode != "full":
-            raise SystemExit("--gauge needs a full solve (the clustering runs on all pixels at once); use --mode full, --downsample or --wave-bin")
-        t1 = time.perf_counter(); W, H, A, labels = pure_pixel_gauge(T, W, H, ds.dose)
-        sizes = [int((labels == k).sum()) for k in range(rank)]
-        rep["gauge_seconds"], rep["gauge_cluster_sizes"] = round(time.perf_counter() - t1, 2), sizes
-        rep["gauge_condition"] = torch.linalg.cond(A).item()
-        log.info("gauge fix: clusters %s of %d pixels with material, cond(A) %.1f, %.1f s", sizes, int((labels >= 0).sum()),
-                 rep["gauge_condition"], rep["gauge_seconds"])
-        if min(sizes) < 0.01 * sum(sizes):
-            log.warning("one gauge cluster holds under 1%% of the material pixels: a material without pure pixels; the fix may have failed")
     rep["loss_final"] = loss(W, H)
     rep["W_zero_frac"], rep["H_zero_frac"] = (W == 0).double().mean().item(), (H == 0).double().mean().item()
     if device.startswith("cuda"):
@@ -668,7 +656,7 @@ def _out_type(ds, args):
 def _run_attrs(ds, rep, args, extra):
     """Provenance written as HDF5 attributes: where the data came from and how the solve was set up."""
     return dict(source=ds.source, input_type=ds.dataset_type, method=args.method, mode=rep["mode"], spectra=args.spectra,
-                gauge=int(bool(args.gauge)), downsample=args.downsample, wave_bin=args.wave_bin,
+                downsample=args.downsample, wave_bin=args.wave_bin,
                 dose=-1.0 if ds.dose is None else float(ds.dose), mbirtorch_hsnt_cli="1", **extra)
 
 
@@ -1225,7 +1213,7 @@ def build_parser():
                                        "  mbirtorch-hsnt inspect sample_tifs/ --open-beam open_beam/ --estimate-rank\n"
                                        "  mbirtorch-hsnt convert sample_tifs/ --open-beam open_beam/ --wave-bin 4 -o sample.h5\n"
                                        "  mbirtorch-hsnt dehydrate sample.h5 -o results/                    # rank estimated\n"
-                                       "  mbirtorch-hsnt dehydrate sample_tifs/ --open-beam open_beam/ --rank 2 --downsample 2 --wave-bin 4 --gauge -v\n"
+                                       "  mbirtorch-hsnt dehydrate sample_tifs/ --open-beam open_beam/ --rank 2 --downsample 2 --wave-bin 4 -v\n"
                                        "  mbirtorch-hsnt rehydrate results/sample_dehydrated.h5 --wave-range 100:200 -o results/\n"
                                        "  mbirtorch-hsnt denoise sample.h5 -o results/                      # denoised data + dehydrated file\n")
     sub = p.add_subparsers(dest="command", required=True)
@@ -1281,7 +1269,6 @@ def build_parser():
         g.add_argument("--spectra", choices=("mle", "unconstrained", "support"), default="mle",
                        help="spectra estimator: maximum likelihood, the unconstrained-W re-estimate (pays above ~65k pixels), or per-pixel "
                         "support selection (needs the dose, rank <= 6)")
-        g.add_argument("--gauge", action="store_true", help="pure-pixel gauge fix of the maps (assumes every material has pure pixels; needs the dose)")
         g = sp.add_argument_group("compute")
         g.add_argument("--device", default="auto", metavar="auto|cpu|cuda|cuda:N", help="compute device (default: cuda if available)")
         g.add_argument("--mode", choices=("auto", "full", "stream"), default="auto", help="full solve on the device or streamed by chunks (default: by free memory)")
