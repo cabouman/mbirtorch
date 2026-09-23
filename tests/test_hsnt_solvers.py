@@ -150,3 +150,59 @@ def test_support_search_methods_agree_and_scale():
     for method in ("branch_bound", "greedy"):
         s12, W0, f12 = select_supports(T, W12, H12, dose=10.0, method=method)                 # rank 12: no enumeration possible
         assert s12.shape == (T.shape[0], 12) and s12.sum(1).max() <= 4 and torch.isfinite(f12).all()
+
+
+@cuda
+def test_free_refit_keeps_the_supports_and_w_nonnegative():
+    T, _, _ = _problem()
+    W, H, _ = hsnt.nnal_factorization(T, method="joint_newton", num_materials=3, max_steps=200, rel_tol=1e-8)
+    Ws, Hs, support, _ = hsnt.support_selected_spectra(T, W, H, dose=10.0)
+    Wf, Hf, support_f, _ = hsnt.support_selected_spectra(T, W, H, dose=10.0, free_refit=True)
+    assert bool((support_f == support).all())                                       # same selection, different refit
+    assert Wf.min() >= 0 and bool((Wf[~support_f] == 0).all()) and Hf.min() >= 0
+    assert abs(_loss(Wf, Hf, T) - _loss(Ws, Hs, T)) <= 1e-3 * _loss(Ws, Hs, T)     # the two refits fit the data alike
+    # with no penalty the selection keeps every material the constrained pixel fit uses, and the free refit then fits
+    # the data about as well as the unconstrained estimator (whose W is free everywhere)
+    Wz, Hz, support_z, _ = hsnt.support_selected_spectra(T, W, H, dose=10.0, penalty=0.0, free_refit=True)
+    Wu, Hu, _ = hsnt.unconstrained_spectra(T, W, H)
+    assert support_z.sum() >= support.sum() and abs(_loss(Wz, Hz, T) - _loss(Wu, Hu, T)) <= 2e-3 * _loss(Wu, Hu, T)
+
+
+@cuda
+def test_free_sign_pixel_fits_are_stationary():
+    from mbirtorch.hsnt.spectra import _fit_free_sets
+    from mbirtorch.hsnt._loss import _nnal_prep, stable_nnal_derivatives
+    T, Wt, Ht = _problem(P=512)
+    H = Ht.float(); idx = torch.arange(3, device="cuda").expand(512, 3).contiguous(); valid = torch.ones_like(idx, dtype=torch.bool)
+    w, _ = _fit_free_sets(T, H, idx, valid, torch.zeros(512, 3, device="cuda"), steps=40, nonneg=False)
+    G, _ = stable_nnal_derivatives(w @ H, T, _nnal_prep(T))
+    g = G @ H.T                                                                     # per-pixel gradient, all coefficients free
+    assert (g.norm(dim=1) / (T.shape[1] ** 0.5)).max() < 1e-3
+    assert bool((w < 0).any())                                                      # some coefficients go negative: the bound is off
+
+
+@cuda
+def test_component_guard_reverts_an_empty_component():
+    from mbirtorch.hsnt.spectra import _guard_components
+    P, R = 5000, 3
+    support = torch.rand(P, R, device="cuda") > 0.5; support[:, 1] = False; support[:3, 1] = True
+    W_mle = torch.rand(P, R, device="cuda"); W0 = torch.zeros(P, R, device="cuda")
+    weak = _guard_components(support, W_mle, W0)
+    assert weak.tolist() == [False, True, False]
+    assert bool(support[:, 1].all()) and torch.equal(W0[:, 1], W_mle[:, 1]) and bool((W0[:, 0] == 0).all())
+
+
+@cuda
+def test_streamed_support_selection_matches_the_monolithic_estimator():
+    T, _, _ = _problem(P=4096)
+    tiles = [T[i:i + 1024].cpu() for i in range(0, 4096, 1024)]
+    for free in (False, True):
+        stats = {}
+        W_chunks, H, passes = hsnt.stream_factorization(tiles, 3, max_passes=3, rel_tol=1e-8, warmup_pixels=1024, stats=stats,
+                                                        support_selection=dict(dose=10.0, free_refit=free))
+        W = torch.cat([w.cuda() for w in W_chunks]); S = torch.cat(stats["support_chunks"]).cuda()
+        assert S.shape == W.shape and bool((W[~S] == 0).all()) and W.min() >= 0 and "loss_refit" in stats
+        Wm, Hm, _ = hsnt.nnal_factorization(T, method="joint_newton", num_materials=3, max_steps=200, rel_tol=1e-8)
+        Ws, Hs, Sm, _ = hsnt.support_selected_spectra(T, Wm, Hm, dose=10.0, free_refit=free)
+        assert abs(S.sum(1).double().mean().item() - Sm.sum(1).double().mean().item()) < 0.1
+        assert _loss(W, H, T) <= 1.01 * _loss(Ws, Hs, T)

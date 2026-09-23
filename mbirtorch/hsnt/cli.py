@@ -22,6 +22,7 @@ import argparse
 import glob
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -571,6 +572,12 @@ def solve(ds: Dataset, args, device):
     from mbirtorch.hsnt import (nnal_factorization, stream_factorization, stable_nnal, unconstrained_spectra,
                                 support_selected_spectra)
     rep = {}
+    if args.spectra == "support" and ds.dose is None:
+        raise SystemExit("support selection needs the dose (open-beam counts per pixel and bin): pass --dose, "
+                         "or give --open-beam with a TIFF stack of counts")
+    K = ds.T.shape[1]
+    support_kw = dict(method=args.support_method, wald_screen=args.wald_screen, penalty=args.support_penalty * math.log(K),
+                      free_refit=args.free_refit)
     rank = args.rank_value
     mode, chunk, rep["memory_plan"] = plan_memory(ds, device, args.mode, args.chunk_pixels)
     rep["mode"], rep["rank"], rep["rank_note"], rep["rank_search"] = mode, rank, args.rank_note, args.rank_detail
@@ -589,7 +596,8 @@ def solve(ds: Dataset, args, device):
         W_chunks, H, passes = stream_factorization(chunks, rank, max_passes=args.max_passes, rel_tol=args.rel_tol,
                                                    warmup_pixels=min(args.warmup_pixels, ds.pixels), device=device,
                                                    random_state=args.seed, verbose=log.isEnabledFor(logging.DEBUG), stats=stats,
-                                                   nonneg_W=(args.spectra != "unconstrained"))
+                                                   nonneg_W=(args.spectra != "unconstrained"),
+                                                   support_selection=(dict(support_kw, dose=ds.dose) if args.spectra == "support" else None))
         W = torch.cat([w.to(device) for w in W_chunks])
         rep.update(passes=int(passes), loss_per_pass=stats.get("loss"), kkt_per_pass=stats.get("kkt"))
         T = None
@@ -607,9 +615,6 @@ def solve(ds: Dataset, args, device):
              f"{rep['steps']} steps" if "steps" in rep else f"{rep['passes']} polish passes", rep["solve_seconds"], rep["loss_mle"],
              100 * (W == 0).double().mean().item(), 100 * (H == 0).double().mean().item())
 
-    if args.spectra == "support" and ds.dose is None:
-        raise SystemExit("support selection needs the dose (open-beam counts per pixel and bin): pass --dose, "
-                         "or give --open-beam with a TIFF stack of counts")
     if mode == "full" and args.spectra == "unconstrained":
         t1 = time.perf_counter(); W, H, st = unconstrained_spectra(T, W, H)
         rep["unconstrained_steps"], rep["unconstrained_seconds"] = int(st), round(time.perf_counter() - t1, 2)
@@ -617,7 +622,7 @@ def solve(ds: Dataset, args, device):
     elif mode == "full" and args.spectra == "support":
         if args.support_method == "enumerate" and rank > 8:
             raise SystemExit("--support-method enumerate solves all 2^R - 1 subsets and is limited to rank 8; use branch_bound")
-        t1 = time.perf_counter(); W, H, support, st = support_selected_spectra(T, W, H, ds.dose, method=args.support_method, wald_screen=args.wald_screen)
+        t1 = time.perf_counter(); W, H, support, st = support_selected_spectra(T, W, H, ds.dose, **support_kw)
         rep["support_steps"], rep["support_seconds"] = int(st), round(time.perf_counter() - t1, 2)
         rep["mean_support_size"] = support.sum(1).double().mean().item()
         log.info("support selection: mean %.2f materials per pixel, refit %d steps in %.1f s, loss %.6g",
@@ -625,7 +630,11 @@ def solve(ds: Dataset, args, device):
     elif args.spectra == "unconstrained" and mode == "stream":
         log.info("stream mode: the unconstrained spectra were estimated inside the polish passes (nonneg_W=False)")
     elif args.spectra == "support" and mode == "stream":
-        log.warning("support selection is not available in stream mode; the maximum-likelihood spectra are kept")
+        S = torch.cat(stats["support_chunks"])
+        rep["mean_support_size"] = S.sum(1).double().mean().item()
+        rep["support_refit_passes"], rep["loss_per_pass_refit"] = int(stats.get("refit_passes", 0)), stats.get("loss_refit")
+        log.info("support selection (streamed): mean %.2f materials per pixel, refit %d passes, loss %.6g",
+                 rep["mean_support_size"], rep["support_refit_passes"], loss(W, H))
     rep["loss_final"] = loss(W, H)
     rep["W_zero_frac"], rep["H_zero_frac"] = (W == 0).double().mean().item(), (H == 0).double().mean().item()
     if device.startswith("cuda"):
@@ -658,6 +667,7 @@ def _out_type(ds, args):
 def _run_attrs(ds, rep, args, extra):
     """Provenance written as HDF5 attributes: where the data came from and how the solve was set up."""
     return dict(source=ds.source, input_type=ds.dataset_type, method=args.method, mode=rep["mode"], spectra=args.spectra,
+                support_penalty=args.support_penalty, free_refit=bool(args.free_refit),
                 downsample=args.downsample, wave_bin=args.wave_bin,
                 dose=-1.0 if ds.dose is None else float(ds.dose), mbirtorch_hsnt_cli="1", **extra)
 
@@ -1274,6 +1284,12 @@ def build_parser():
         g.add_argument("--support-method", choices=("branch_bound", "greedy", "enumerate"), default="branch_bound",
                        help="subset search of support selection: branch and bound (any rank, default), greedy (fastest, heuristic), "
                             "or the 2^R - 1 enumeration (rank <= 8)")
+        g.add_argument("--support-penalty", type=float, default=2.0, metavar="F",
+                       help="penalty per selected material, F x log(bins) nats (default 2: essentially no false admissions; "
+                            "smaller admits faint materials at the cost of some, harmless with --free-refit)")
+        g.add_argument("--free-refit", action="store_true",
+                       help="with --spectra support: drop the bound on the selected coefficients during the refit (as the "
+                            "unconstrained estimator does for all of them), then re-solve W >= 0 on the supports")
         g.add_argument("--wald-screen", type=float, default=0.0, metavar="F",
                        help="skip single-material fits below F x penalty of Wald statistic in the full fit (0 = off; trades rare-material recall for time)")
         g = sp.add_argument_group("compute")

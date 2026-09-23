@@ -88,10 +88,16 @@ of them and as attenuation or transmission (``--as-type``), block by block so th
 ``denoise`` does both in one run and writes ``<stem>_denoised.h5`` plus the dehydrated file unless
 ``--no-dehydrated``. The solve runs whole on the device
 when it fits and is streamed by chunks otherwise (``--mode``); ``--spectra unconstrained`` and ``--spectra support``
-select the bias-corrected spectra estimators (in stream mode only ``unconstrained`` is available: it runs inside the
-polish passes, whereas support selection needs the whole solve on the device); support selection searches each pixel's material subset by branch and
-bound (exact single-material fits, then subsets of up to four materials among each pixel's six best singletons for
-the pixels a likelihood lower bound leaves open), so any rank is allowed; ``--support-method greedy`` is a faster heuristic and
-``enumerate`` the 2^R - 1 reference for rank 8 or less; ``--wald-screen`` skips single-material fits far below the
-penalty in the full fit at the price of rare-material recall. ``--dry-run`` loads,
+select the bias-corrected spectra estimators, in both modes (streamed, support selection adds one selection pass
+and a second round of polish passes with the pixel coefficients confined to their supports). Support selection
+searches each pixel's material subset by branch and bound (exact single-material fits, then subsets of up to four
+materials among each pixel's six best singletons for the pixels a likelihood lower bound leaves open), so any rank
+is allowed; ``--support-method greedy`` is a faster heuristic and ``enumerate`` the 2^R - 1 reference for rank 8 or
+less; ``--wald-screen`` skips single-material fits far below the penalty in the full fit at the price of
+rare-material recall. ``--support-penalty F`` sets the charge per selected material to F log(bins) nats (default 2,
+which admits essentially no absent material; 0.5 to 1 keeps a faint material in more of its pixels at low dose, at
+the cost of some map fidelity at high dose), and ``--free-refit`` drops the bound on the selected coefficients
+during the refit (the unconstrained estimator restricted to the supports), which makes a smaller penalty harmless
+for the spectra. A component selected in almost no pixel reverts to the maximum-likelihood treatment, with a
+warning. ``--dry-run`` loads,
 checks and plans without solving.
