@@ -576,8 +576,8 @@ def solve(ds: Dataset, args, device):
         raise SystemExit("support selection needs the dose (open-beam counts per pixel and bin): pass --dose, "
                          "or give --open-beam with a TIFF stack of counts")
     K = ds.T.shape[1]
-    support_kw = dict(method=args.support_method, wald_screen=args.wald_screen, penalty=args.support_penalty * math.log(K),
-                      free_refit=args.free_refit)
+    support_kw = dict(method=args.support_method, wald_screen=args.wald_screen, free_refit=args.free_refit,
+                      penalty="auto" if args.support_penalty == "auto" else float(args.support_penalty) * math.log(K))
     rank = args.rank_value
     mode, chunk, rep["memory_plan"] = plan_memory(ds, device, args.mode, args.chunk_pixels)
     rep["mode"], rep["rank"], rep["rank_note"], rep["rank_search"] = mode, rank, args.rank_note, args.rank_detail
@@ -667,7 +667,7 @@ def _out_type(ds, args):
 def _run_attrs(ds, rep, args, extra):
     """Provenance written as HDF5 attributes: where the data came from and how the solve was set up."""
     return dict(source=ds.source, input_type=ds.dataset_type, method=args.method, mode=rep["mode"], spectra=args.spectra,
-                support_penalty=args.support_penalty, free_refit=bool(args.free_refit),
+                support_penalty=str(args.support_penalty), free_refit=bool(args.free_refit),
                 downsample=args.downsample, wave_bin=args.wave_bin,
                 dose=-1.0 if ds.dose is None else float(ds.dose), mbirtorch_hsnt_cli="1", **extra)
 
@@ -1284,9 +1284,10 @@ def build_parser():
         g.add_argument("--support-method", choices=("branch_bound", "greedy", "enumerate"), default="branch_bound",
                        help="subset search of support selection: branch and bound (any rank, default), greedy (fastest, heuristic), "
                             "or the 2^R - 1 enumeration (rank <= 8)")
-        g.add_argument("--support-penalty", type=float, default=2.0, metavar="F",
+        g.add_argument("--support-penalty", default="2", metavar="F|auto",
                        help="penalty per selected material, F x log(bins) nats (default 2: essentially no false admissions; "
-                            "smaller admits faint materials at the cost of some, harmless with --free-refit)")
+                            "0.5-1 keeps a faint material in more of its pixels below ~10 counts per bin at the cost of map "
+                            "noise above ~100) or 'auto', which moves from 0.5 to 2 with the counts per pixel and bin")
         g.add_argument("--free-refit", action="store_true",
                        help="with --spectra support: drop the bound on the selected coefficients during the refit (as the "
                             "unconstrained estimator does for all of them), then re-solve W >= 0 on the supports")

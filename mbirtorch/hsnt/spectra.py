@@ -285,6 +285,22 @@ def _select_enumerate(T, H, W, dose, lam, w_max_steps, compile_mode):
     return W0 > 0, W0, F.gather(1, best[:, None]).squeeze(1)
 
 
+def auto_penalty(T, dose, K=None):
+    """Penalty per selected material from the information per pixel: 0.5 log K when the median pixel has fewer than
+    10 counts per bin, 2 log K above 100, log-linear in between.
+
+    Measured on the sphere phantom at 37k and 10^6 pixels: below ~10 counts per bin the 2 log K charge rejects the weak
+    material from most of its pixels (recall 19-54 %) and the refit inherits the selection bias, so a smaller charge
+    is better for spectra and maps; above ~100 the recall is complete at any charge and the extra admissions a small
+    charge lets through are misfit-driven (their likelihood gains grow with the dose) and only add noise to the maps,
+    so the larger charge is better by 1.5-3 dB. Counts per bin, not the open-beam dose alone, is the quantity that
+    moves the crossover with the sample's thickness."""
+    K = T.shape[1] if K is None else K
+    counts = float(dose) * torch.median(T.float().mean(1)).item()
+    frac = min(1.0, max(0.0, (math.log10(max(counts, 1e-12)) - 1.0)))          # 0 at 10 counts, 1 at 100
+    return (0.5 * 4 ** frac) * math.log(K)                                        # 0.5 log K -> 2 log K
+
+
 def select_supports(T, W, H, dose, penalty=None, method="branch_bound", k_top=6, m_max=4, wald_screen=0.0,
                     w_max_steps=100, compile_mode=None):
     """Choose each pixel's material subset by penalised likelihood: minimise dose * f_p(subset) + penalty * |subset|.
@@ -306,7 +322,7 @@ def select_supports(T, W, H, dose, penalty=None, method="branch_bound", k_top=6,
 
     Returns (support (P, R) bool, W0 (P, R) the coefficients on the supports, f (P,) the per-pixel loss)."""
     R, K = H.shape
-    lam = 2.0 * math.log(K) if penalty is None else float(penalty)
+    lam = 2.0 * math.log(K) if penalty is None else auto_penalty(T, dose, K) if isinstance(penalty, str) else float(penalty)
     if method == "enumerate":
         return _select_enumerate(T, H, W, dose, lam, w_max_steps, compile_mode)
     prep = _nnal_prep(T)
@@ -357,7 +373,8 @@ def support_selected_spectra(T, W, H, dose, penalty=None, max_steps=300, cg_max=
     Args:
         dose: open-beam counts per pixel and bin, which converts the loss to
             log-likelihood units for the penalty.
-        penalty: per selected coefficient, in log-likelihood units. Default 2 log K.
+        penalty: per selected coefficient, in log-likelihood units. Default 2 log K;
+            'auto' sets it from the counts per pixel and bin (see auto_penalty).
         method, k_top, m_max, wald_screen: the subset search, see `select_supports`.
         free_refit: True drops the bound on the selected coefficients during the joint
             refit (as unconstrained_spectra does for all of them) and re-solves W >= 0

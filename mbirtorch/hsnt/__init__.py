@@ -40,7 +40,7 @@ from ._newton import (_COMPILED_KERNELS, _ARMIJO_FLOOR, _TRUST_FLOOR, _ACTIVE_TO
 from ._streaming import _h_stats_accumulate, _h_direction, stream_factorization
 from .factorization import optimize, nnal_factorization
 from ._lbfgsb import lbfgsb_optimize
-from .spectra import unconstrained_spectra, support_selected_spectra, select_supports
+from .spectra import unconstrained_spectra, support_selected_spectra, select_supports, auto_penalty
 from .denoise import hyper_denoise, dehydrate, rehydrate
 from .rank import estimate_rank, pool_pixels
 from .l2_baseline import l2_hyper_denoise, l2_dehydrate, _estimate_subspace_dimension
@@ -56,6 +56,6 @@ __all__ = [
     "nnal_factorization", "stable_nnal", "stable_nnal_derivatives",
     "compare_spectra",
     "stream_factorization",
-    "unconstrained_spectra", "support_selected_spectra", "select_supports",
+    "unconstrained_spectra", "support_selected_spectra", "select_supports", "auto_penalty",
     "nndsvda", "optimize", "block_newton_optimize", "joint_newton_optimize", "lbfgsb_optimize", "block_newton_step",
 ]
