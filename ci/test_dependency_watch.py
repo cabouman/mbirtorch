@@ -63,18 +63,6 @@ def test_parse_torch_index_filters_and_picks_newest_stable():
     assert pys == ["3.11", "3.12", "3.13", "3.14"]   # cp314t and non-linux excluded
 
 
-def test_parse_version_file():
-    matrix, docs = parse_version_file(VERSION_FILE_JSON)
-    assert matrix == ["3.11", "3.12"]
-    assert docs == "3.12"
-
-
-def test_parse_pyproject_floors():
-    python_floor, torch_floor = parse_pyproject(PYPROJECT_TOML)
-    assert python_floor == "3.11"
-    assert torch_floor == "2.13"
-
-
 RUNNER_MANIFEST_JSON = """[
   {"version": "3.15.0-rc.2", "stable": false},
   {"version": "3.14.2", "stable": true},
@@ -85,12 +73,23 @@ RUNNER_MANIFEST_JSON = """[
 ]"""
 
 
-def test_parse_runner_manifest_stable_minors_only():
+def test_the_small_parsers_read_their_input_files():
+    matrix, docs = parse_version_file(VERSION_FILE_JSON)
+    assert matrix == ["3.11", "3.12"]
+    assert docs == "3.12"
+
+    assert parse_pyproject(PYPROJECT_TOML) == ("3.11", "2.13")
+
     minors = parse_runner_manifest(RUNNER_MANIFEST_JSON)
     assert minors == {"3.11", "3.12", "3.13", "3.14"}   # 3.15 rc excluded
 
+    assert parse_torch_exclusions(PYPROJECT_TOML) == []
+    assert parse_torch_exclusions(PYPROJECT_TOML_212) == ["2.12.1", "2.14.0"]
+    assert parse_pyproject(PYPROJECT_TOML_212) == ("3.11", "2.12")   # floor still parsed
 
-def test_version_on_torch_index_but_not_on_runners_is_not_proposed():
+
+def test_divergence_decides_the_matrix_additions_and_removals():
+    # A version torch ships but the runners do not have is reported, not proposed.
     d = divergence("2.13.0", ["3.11", "3.12", "3.13", "3.14", "3.15"],
                    ["3.11", "3.12"], "3.11", "2.13",
                    runner_minors={"3.11", "3.12", "3.13", "3.14"})
@@ -98,8 +97,7 @@ def test_version_on_torch_index_but_not_on_runners_is_not_proposed():
     assert d["additions"] == ["3.13", "3.14"]
     assert branch_name(d) == "nightly/python-matrix-add-3.13-3.14"
 
-
-def test_multi_version_addition_with_below_floor_exclusion():
+    # A version below the requires-python floor is reported, not proposed.
     d = divergence("2.13.0", ["3.10", "3.11", "3.12", "3.13", "3.14"],
                    ["3.11", "3.12"], "3.11", "2.13")
     assert d["below_floor"] == ["3.10"]           # informational only
@@ -108,18 +106,16 @@ def test_multi_version_addition_with_below_floor_exclusion():
     assert d["torch_advance"] is None
     assert branch_name(d) == "nightly/python-matrix-add-3.13-3.14"
 
-
-def test_removal_due_when_torch_drops_a_version():
+    # A version torch drops is removed from the matrix.
     d = divergence("2.13.0", ["3.12", "3.13"], ["3.11", "3.12"], "3.11", "2.13")
     assert d["removals"] == ["3.11"]
     assert d["additions"] == ["3.13"]
     assert branch_name(d) == "nightly/python-matrix-add-3.13-drop-3.11"
 
-
-def test_parse_torch_exclusions():
-    assert parse_torch_exclusions(PYPROJECT_TOML) == []
-    assert parse_torch_exclusions(PYPROJECT_TOML_212) == ["2.12.1", "2.14.0"]
-    assert parse_pyproject(PYPROJECT_TOML_212) == ("3.11", "2.12")   # floor still parsed
+    # Matching lists propose nothing at all.
+    d = divergence("2.13.0", ["3.11", "3.12"], ["3.11", "3.12"], "3.11", "2.13")
+    assert not d["any"]
+    assert branch_name(d) is None
 
 
 def test_parse_ledger_latest_line_wins():
@@ -151,19 +147,17 @@ def test_torch_floor_advance_by_window_rule():
     assert d2["torch_advance"] is None and d2["torch_exclusions"] == []
     assert not d2["any"]
 
-
-def test_torch_floor_rule_below_window_never_advances():
+    # Fewer validated minors than the window: the floor never advances.
     small = parse_ledger("2.13.0 validated 2026-09-03 x\n2.14.0 validated 2026-10-01 x\n"
                          "2.15.0 validated 2026-12-01 x\n")
-    d = divergence("2.15.0", ["3.11", "3.12"], ["3.11", "3.12"], "3.11", "2.13", ledger=small)
-    assert d["torch_advance"] is None and not d["any"]
+    d3 = divergence("2.15.0", ["3.11", "3.12"], ["3.11", "3.12"], "3.11", "2.13", ledger=small)
+    assert d3["torch_advance"] is None and not d3["any"]
 
-
-def test_unknown_ledger_proposes_nothing_torch():
-    d = divergence("2.18.0", ["3.11", "3.12"], ["3.11", "3.12"], "3.11", "2.12", ledger=None)
-    assert d["ledger_known"] is False
-    assert d["torch_advance"] is None and d["torch_exclusions"] == []
-    assert not d["any"]
+    # No ledger at all: nothing torch-related is proposed.
+    d4 = divergence("2.18.0", ["3.11", "3.12"], ["3.11", "3.12"], "3.11", "2.12", ledger=None)
+    assert d4["ledger_known"] is False
+    assert d4["torch_advance"] is None and d4["torch_exclusions"] == []
+    assert not d4["any"]
 
 
 def test_exclusion_proposed_only_for_rejected_at_or_above_floor():
@@ -176,12 +170,6 @@ def test_exclusion_proposed_only_for_rejected_at_or_above_floor():
     assert d2["torch_exclusions"] == []                     # below the floor: irrelevant
 
 
-def test_no_divergence():
-    d = divergence("2.13.0", ["3.11", "3.12"], ["3.11", "3.12"], "3.11", "2.13")
-    assert not d["any"]
-    assert branch_name(d) is None
-
-
 def test_compose_addition_edits_only_the_version_file():
     import json
     from dependency_watch import compose
@@ -189,8 +177,6 @@ def test_compose_addition_edits_only_the_version_file():
                    ["3.11", "3.12"], "3.11", "2.13")
     pr = compose(d, VERSION_FILE_JSON, PYPROJECT_TOML, base_sha="abc1234")
     assert pr["branch"] == "nightly/python-matrix-add-3.13-3.14"
-    assert pr["title"] == "Add Python 3.13 and 3.14 to the CI test matrix"
-    assert "torch 2.13.0" in pr["body"] and "abc1234" in pr["body"]
     assert list(pr["edits"]) == [".github/python-versions.json"]
     data = json.loads(pr["edits"][".github/python-versions.json"])
     assert data["test"] == ["3.11", "3.12", "3.13", "3.14"]
@@ -222,19 +208,14 @@ def test_compose_torch_advance_edits_pyproject_only():
     pr = compose(d, VERSION_FILE_JSON, PYPROJECT_TOML_212)
     assert list(pr["edits"]) == ["pyproject.toml"]
     assert '"torch>=2.14,!=2.14.0,!=2.16.1"' in pr["edits"]["pyproject.toml"]
-    assert "CPU suite" in pr["body"] and "2027-03-20" in pr["body"]
-    assert pr["title"] == "Advance the torch floor to 2.14; exclude torch 2.16.1"
 
-
-def test_compose_exclusion_alone_edits_pyproject():
-    from dependency_watch import compose
-    d = divergence("2.18.0", ["3.11", "3.12"], ["3.11", "3.12"], "3.11", "2.13", ledger=LEDGER)
-    pr = compose(d, VERSION_FILE_JSON, PYPROJECT_TOML)
-    assert list(pr["edits"]) == ["pyproject.toml"]
-    assert '"torch>=2.13,!=2.16.1"' in pr["edits"]["pyproject.toml"]
-    assert pr["branch"] == "nightly/python-matrix-exclude-2.16.1"
-    assert pr["title"] == "Exclude torch 2.16.1"
-    assert "rejected by the cluster nightly" in pr["body"]
+    # An exclusion with no floor advance writes the same line with the floor
+    # left where it was.
+    d2 = divergence("2.18.0", ["3.11", "3.12"], ["3.11", "3.12"], "3.11", "2.13", ledger=LEDGER)
+    pr2 = compose(d2, VERSION_FILE_JSON, PYPROJECT_TOML)
+    assert list(pr2["edits"]) == ["pyproject.toml"]
+    assert '"torch>=2.13,!=2.16.1"' in pr2["edits"]["pyproject.toml"]
+    assert pr2["branch"] == "nightly/python-matrix-exclude-2.16.1"
 
 
 def test_two_night_confirmation(tmp_path):

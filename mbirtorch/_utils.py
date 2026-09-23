@@ -11,15 +11,8 @@ from typing import Any
 
 FILE_FORMAT_NUMBER = 1.0
 
-#: The multiple a hand-written kernel's width argument is rounded up to.
-#: Triton compiles a separate, faster kernel for each integer argument it can
-#: prove is a multiple of 16.  Two kernels have been measured against their
-#: unspecialized compilation, and they cost different amounts and for
-#: different reasons.  The cone back kernel used more registers and ran at
-#: roughly half the rate.  The multiaxis forward kernel ran at about a third
-#: of the rate with the SAME 32 registers and no spills, and its unspecialized
-#: compilation was 4 percent more PTX and 7 percent more cubin; what the
-#: specialization buys there was not isolated further.
+#: Width arguments to the hand written kernels are rounded up to this multiple.
+#: Triton compiles a faster kernel for an argument it can prove is a multiple of 16.
 KERNEL_WIDTH_MULTIPLE = 16
 
 
@@ -66,7 +59,6 @@ class Param:
         return f"Param(val={self.val}, recompile_flag={self.recompile_flag})"
 
 
-# The names, values, and recompile flags below are fixed; do not change them here.
 _forward_model_defaults_dict = {
     'geometry_type': Param(None, False),
     'file_format': Param(FILE_FORMAT_NUMBER, False),
@@ -98,8 +90,7 @@ _reconstruction_defaults_dict = {
     'positivity_flag': Param(False, False),
     'snr_db': Param(30.0, False),
     'sharpness': Param(1.0, False),
-    # 4 independent 128-subset partitions, cycled after warmup (covers 103
-    # iterations; last entry repeats after that).
+    # The four 128 subset partitions are independent and are cycled after warmup.
     'granularity': Param([1, 2, 4, 8, 16, 32, 64, 128, 128, 128, 128], False),
     'partition_sequence': Param([2, 4, 6] + [7, 8, 9, 10] * 25, False),
     'verbose': Param(1, False),

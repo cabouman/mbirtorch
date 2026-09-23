@@ -66,27 +66,15 @@ def get_sino_and_model(dataset_dir, *, crop_pixels_sides=0, crop_pixels_top=0, c
 
 def _compute_sino_and_params(dataset_dir, crop_pixels_sides=0, crop_pixels_top=0, crop_pixels_bottom=0, alu_unit='mm', det_rotation=0.0, verbose=1):
     """
-    Load Zeiss TCT scans and compute the sinogram, build_model-ready parameters, and a weight mask.
+    Load Zeiss TCT scans and compute the sinogram, the model parameters, and a weight mask.
 
-    Private helper for :func:`get_sino_and_model`.  Loads object/blank/dark scans and geometry, computes
-    the sinogram (transmission + background-offset correction), and builds a dark-boundary weight mask.
-
-    Args:
-        dataset_dir (str): Path to the Zeiss TCT scan directory (``obj_scan`` / ``blank_scan`` /
-            ``dark_scan`` subfolders).
-        crop_pixels_sides (int, optional): Pixels to crop from each side of the detector. Defaults to 0.
-        crop_pixels_top (int, optional): Pixels to crop from the top of the detector. Defaults to 0.
-        crop_pixels_bottom (int, optional): Pixels to crop from the bottom of the detector. Defaults to 0.
-        alu_unit (str, optional): The physical unit used to define 1 ALU. Defaults to ``'mm'``.
-        det_rotation (float, optional): Detector rotation in radians, applied to every view as the
-            sinogram is computed. Defaults to ``0.0``.
-        verbose (int, optional): Verbosity level. Defaults to 1.
+    This is the private helper for :func:`get_sino_and_model`, which documents the arguments.
 
     Returns:
-        tuple: ``(sino, required_params, optional_params, weights)`` where ``required_params`` holds the
-        TranslationModel constructor arguments plus a ``geometry_type`` entry so ``build_model`` can
-        resolve the class, ``optional_params`` holds the ``set_params`` arguments, and ``weights`` is the
-        dark-boundary weight mask (same shape as ``sino``).
+        tuple: ``(sino, required_params, optional_params, weights)``.  ``required_params`` holds the
+        TranslationModel constructor arguments and a ``geometry_type`` entry that ``build_model``
+        uses to select the model class.  ``optional_params`` holds the ``set_params`` arguments.
+        ``weights`` is the dark boundary weight mask, with the shape of ``sino``.
     """
     if verbose > 0:
         print("\n\n########## Loading object, blank, dark scans, and geometry parameters from Zeiss dataset directory")
@@ -100,18 +88,15 @@ def _compute_sino_and_params(dataset_dir, crop_pixels_sides=0, crop_pixels_top=0
 
     if verbose > 0:
         print("\n\n########## Cropping scans")
-    ### crop the scans based on input params
     obj_scan, blank_scan, dark_scan, defective_pixel_array = mtp.crop_view_data(obj_scan, blank_scan, dark_scan,
                                                                                 crop_pixels_sides=crop_pixels_sides,
                                                                                 crop_pixels_top=crop_pixels_top,
                                                                                 crop_pixels_bottom=crop_pixels_bottom)
 
-    # Generate weights that exclude dark boundary regions
     weights = compute_weight(blank_scan, obj_scan)
 
     if verbose > 0:
         print("\n\n########## Computing sinogram from object, blank, and dark scans")
-    # Transmission via the shared, view-sharded core (no downsample for translation CT).
     sino = mtp.scan_to_sino(obj_scan, blank_scan, dark_scan, defective_pixel_array,
                             downsample_factor=(1, 1), det_rotation=det_rotation)
 
@@ -124,7 +109,6 @@ def _compute_sino_and_params(dataset_dir, crop_pixels_sides=0, crop_pixels_top=0
         print('blank_scan shape = ', blank_scan.shape)
         print('dark_scan shape = ', dark_scan.shape)
 
-    # Normalize for build_model: tag the constructor dict with the geometry class identity.
     translation_params['geometry_type'] = str(mt.TranslationModel)
     return sino, translation_params, optional_params, weights
 
@@ -150,7 +134,6 @@ def load_scans_and_params(dataset_dir, verbose=1):
             - ``dark_scan`` (numpy.ndarray): 3D dark scan with shape ``(num_dark_scans, num_det_rows, num_channels)``, where ``num_dark_scans`` is the number of ``.xrm`` files in the ``dark_scan`` subfolder. If that subfolder is missing or empty, a zero array with the shape of ``blank_scan`` is returned.
             - ``zeiss_params`` (dict): Geometry parameters read from the ``.xrm`` files (e.g., geometry vectors, spacings, and angles).
     """
-    ### automatically parse the paths to Zeiss scans from dataset—dir
     obj_scan_dir, blank_scan_dir, dark_scan_dir = _parse_filenames_from_dataset_dir(dataset_dir)
 
     if verbose > 0:
@@ -159,20 +142,16 @@ def load_scans_and_params(dataset_dir, verbose=1):
               f"    - Blank scan directory: {blank_scan_dir}\n",
               f"    - Dark scan directory: {dark_scan_dir}\n",)
 
-    # Read object scans and metadata
     obj_scan, zeiss_params = read_xrm_dir(obj_scan_dir)
 
-    # Read blank scans
     blank_scan, _ = read_xrm_dir(blank_scan_dir)
 
-    # Read dark scans
     # TODO: If there is no dark scan available, using an array of all 0s.
     if os.path.isdir(dark_scan_dir) and len(os.listdir(dark_scan_dir)) > 0:
         dark_scan, _ = read_xrm_dir(dark_scan_dir)
     else:
         dark_scan = np.zeros(blank_scan.shape)
 
-    # Flip the scans vertically
     # TODO: It seems that we need to flip the scan to get the correct object orientation
     if verbose > 0:
         print("Flipping scans vertically")
@@ -181,41 +160,34 @@ def load_scans_and_params(dataset_dir, verbose=1):
     dark_scan = np.flip(dark_scan, axis=1)
 
     try:
-        # Get the list of measurement axis names and units
         axis_names = zeiss_params.get("axis_names")  # This is a list of names: ['Sample X', 'Sample Y', ..., 'CCD_X', ...]
         axis_units = zeiss_params.get("axis_units")  # This is a list of units: ['um', 'um', ..., ]
 
-        # Get source to iso distance
         source_iso_dist = zeiss_params["source_iso_dist"]
         source_iso_dist = float(np.abs(source_iso_dist))
         source_iso_dist_index = get_index_in_list(axis_names, 'Source Z')
         source_iso_dist_unit = axis_units[source_iso_dist_index] if source_iso_dist_index > -1 else 'mm'
 
-        # Get iso to detector distance
         iso_det_dist = zeiss_params["iso_det_dist"]
         iso_det_dist = float(np.abs(iso_det_dist)) if iso_det_dist is not None else 0.0
         iso_det_dist_unit = source_iso_dist_unit
 
-        # Get detector pixel pitch
         det_pixel_pitch = zeiss_params["det_pixel_pitch"]
         det_pixel_pitch = float(np.abs(det_pixel_pitch))
 
-        # Zeiss detector pixel has equal width and height
+        # A Zeiss detector pixel has equal width and height.
         delta_det_row = det_pixel_pitch
         delta_det_channel = det_pixel_pitch
         delta_det_index = get_index_in_list(axis_names, 'CCD_X')
         delta_det_row_unit = axis_units[delta_det_index] if delta_det_index > -1 else 'um'
         delta_det_channel_unit = delta_det_row_unit
 
-        # Get pixel pitch at iso
         iso_pixel_pitch = zeiss_params["iso_pixel_pitch"]
         iso_pixel_pitch = float(np.abs(iso_pixel_pitch))
         iso_pixel_pitch_index = get_index_in_list(axis_names, 'Sample X')
         iso_pixel_pitch_unit = axis_units[iso_pixel_pitch_index] if iso_pixel_pitch_index > -1 else 'um'
 
-        # Get object positions in x, y, z axis
-        # The scanner uses a coordinate system different from MBIRTORCH
-        # Axis mapping:
+        # The scanner uses a different coordinate system from MBIRTORCH.  The axes map as follows:
         #   Scanner x-axis -> MBIRTORCH -x-axis
         #   Scanner z-axis -> MBIRTORCH y-axis
         #   Scanner y-axis -> MBIRTORCH z-axis
@@ -231,7 +203,6 @@ def load_scans_and_params(dataset_dir, verbose=1):
         object_y_position_unit = axis_units[object_y_position_index] if object_y_position_index > -1 else 'um'
         object_z_position_unit = axis_units[object_z_position_index] if object_z_position_index > -1 else 'um'
 
-        # Get sinogram per-view shifts
         x_shifts = zeiss_params["x_shifts"]
         y_shifts = zeiss_params["y_shifts"]
 
@@ -239,17 +210,14 @@ def load_scans_and_params(dataset_dir, verbose=1):
         print("Unable to determine units for geometry parameters; cannot safely convert to mbirtorch format.")
         raise e
 
-    # Get optical Magnification
     opt_mag = zeiss_params["opt_mag"]
     opt_mag = 1 if opt_mag is None else opt_mag
 
-    # Get dimensions of radiograph
     num_views = zeiss_params["num_views"]
     num_det_channels = zeiss_params["num_det_channels"]
     num_det_rows = zeiss_params["num_det_rows"]
 
-    # Get detector offset
-    # MBIRTORCH has the reverse convention for the channel shift
+    # MBIRTORCH uses the opposite sign convention for the channel shift.
     center_shift = zeiss_params.get("center_shift")
 
     if center_shift is None:
@@ -296,7 +264,6 @@ def load_scans_and_params(dataset_dir, verbose=1):
         print(f"Number of views: {num_views}")
         print(f"Detector size: (num_det_rows, num_det_channels) = ({num_det_rows}, {num_det_channels})")
         print("############ End Zeiss geometry parameters ############")
-    ### END load Zeiss parameters from scan data
 
     return obj_scan, blank_scan, dark_scan, zeiss_params
 
@@ -317,7 +284,6 @@ def convert_zeiss_to_mbirtorch_params(zeiss_params, crop_pixels_sides=0, crop_pi
         translation_params (dict): Required parameters for the TranslationModel constructor.
         optional_params (dict): Additional TranslationModel parameters to be set using set_params()
     """
-    # Get zeiss parameters
     source_iso_dist, iso_det_dist, source_iso_dist_unit, iso_det_dist_unit = itemgetter('source_iso_dist', 'iso_det_dist', 'source_iso_dist_unit', 'iso_det_dist_unit')(zeiss_params)
     delta_det_channel, delta_det_row, delta_det_channel_unit, delta_det_row_unit = itemgetter('delta_det_channel', 'delta_det_row', 'delta_det_channel_unit', 'delta_det_row_unit')(zeiss_params)
     iso_pixel_pitch, iso_pixel_pitch_unit = itemgetter('iso_pixel_pitch', 'iso_pixel_pitch_unit')(zeiss_params)
@@ -328,10 +294,9 @@ def convert_zeiss_to_mbirtorch_params(zeiss_params, crop_pixels_sides=0, crop_pi
     object_z_positions, object_z_position_unit = itemgetter('object_z_positions', 'object_z_position_unit')(zeiss_params)
     det_row_offset, det_channel_offset = itemgetter('det_row_offset', 'det_channel_offset')(zeiss_params)
 
-    # Define 1 ALU as 1 unit of alu_unit
+    # One ALU is defined as one unit of alu_unit.
     alu_value = 1
 
-    # Convert physical units to ALU
     source_iso_dist = mtp.to_alu(source_iso_dist, source_iso_dist_unit, alu_unit)
     iso_det_dist = mtp.to_alu(iso_det_dist, iso_det_dist_unit, alu_unit)
     delta_det_channel = mtp.to_alu(delta_det_channel, delta_det_channel_unit, alu_unit)
@@ -341,45 +306,34 @@ def convert_zeiss_to_mbirtorch_params(zeiss_params, crop_pixels_sides=0, crop_pi
     object_y_positions = mtp.to_alu(object_y_positions, object_y_position_unit, alu_unit)
     object_z_positions = mtp.to_alu(object_z_positions, object_z_position_unit, alu_unit)
 
-    # Compute default value of source to detector distance
     source_detector_dist = source_iso_dist + iso_det_dist
 
-    # Compute translation vectors
     translation_vectors = calc_translation_vec_params(object_x_positions, object_y_positions, object_z_positions)
 
-    # Make conversions for optical magnification
-    # In this case, the "detector" is actually a scintillator
+    # In this case the detector is a scintillator.
     if opt_mag is not None:
-        # Compute total magnification = (optical magnification) * (magnification to scintillator)
         scintillator_mag = source_detector_dist / source_iso_dist
         magnification = opt_mag * scintillator_mag
     else:
         magnification = 1.0
 
-    # Compute source to equivalent quantities accounting for total magnification
     source_detector_dist = magnification * source_iso_dist
     delta_det_channel = magnification * iso_pixel_pitch
     delta_det_row = magnification * iso_pixel_pitch
 
-    # Convert offset parameters to ALU (using the raw pitch) BEFORE cropping, so the configuration crop
-    # can be routed through the shared detector-plane primitive.  Assumes det_channel_offset /
-    # det_row_offset have units of pixels.
+    # det_channel_offset and det_row_offset are in pixels here.  Convert them to ALU before the crop.
     det_channel_offset *= delta_det_channel
     det_row_offset *= delta_det_row
 
-    # Apply the configuration crop through the shared primitive: it reduces the shape and, for an
-    # asymmetric top/bottom crop, shifts det_row_offset (symmetric crops are a no-op).  Translation CT
-    # has no downsampling, so the raw pitch is the final pitch.
+    # Translation CT has no downsampling, so the raw detector pitch is the final pitch.
     num_views = len(translation_vectors)
     num_det_rows, num_det_channels, det_row_offset, det_channel_offset = mtp.apply_config_crop(
         num_det_rows, num_det_channels, det_row_offset, det_channel_offset, delta_det_row, delta_det_channel,
         crop_pixels_top=crop_pixels_top, crop_pixels_bottom=crop_pixels_bottom, crop_pixels_sides=crop_pixels_sides)
 
-    # Calculate recon_shape, delta_voxel, and voxel_row_aspect parameters from the cropped sinogram.
     sinogram_shape = (num_views, num_det_rows, num_det_channels)
     recon_shape, delta_voxel, voxel_row_aspect = mt.utilities.calc_tct_recon_params(source_detector_dist, source_iso_dist, delta_det_row, delta_det_channel, sinogram_shape, translation_vectors)
 
-    # Create a dictionary to store MBIR parameters
     translation_params = dict()
     translation_params['sinogram_shape'] = sinogram_shape
     translation_params['translation_vectors'] = translation_vectors
@@ -417,13 +371,10 @@ def _parse_filenames_from_dataset_dir(dataset_dir):
             - blank_scan_dir (string): Path to the blank scan directory
             - dark_scan_dir (string): Path to the dark scan directory
     """
-    # Object scan directory
     obj_scan_dir = os.path.join(dataset_dir, "obj_scan")
 
-    # Blank scan
     blank_scan_dir = os.path.join(dataset_dir, "blank_scan")
 
-    # Dark scan
     dark_scan_dir = os.path.join(dataset_dir, "dark_scan")
 
     return obj_scan_dir, blank_scan_dir, dark_scan_dir
@@ -566,28 +517,18 @@ def calc_translation_vec_params(obj_x_positions, obj_y_positions, obj_z_position
     Returns:
         translation_vectors (np.ndarray): Array of shape (num_views, 3) with translation vectors [dx, dy, dz]
     """
-    # Stack the object positions of all views in x, y, z axis into a 3D array of shape (number of views, 3)
     obj_xyz_positions = np.stack([obj_x_positions, obj_y_positions, obj_z_positions], axis=1)
 
-    # Calculate the max and min of object positions along the x, y, z axis
     max_obj_xyz_positions = np.max(obj_xyz_positions, axis=0)
     min_obj_xyz_positions = np.min(obj_xyz_positions, axis=0)
 
-    # Set the object position at the center to be the midpoint of the extremes along the x, y, z axis
+    # The center position is the midpoint of the extremes along each axis.
     center_xyz_position = (max_obj_xyz_positions + min_obj_xyz_positions) / 2
 
-    # Compute the translation vectors in um
     translation_vectors = center_xyz_position - obj_xyz_positions
 
     return translation_vectors
 ######## END subroutines for Zeiss-MBIR parameter conversion
-
-
-# NOTE: view-alignment shift correction (correct_sino_shifts) was REMOVED from this module:
-# it had no callers, and whether the .xrm shift fields carry the same meaning for a
-# translation-CT acquisition (where the per-view x/y POSITIONS are the geometry itself) is
-# unvalidated.  If TCT view alignment is needed, adapt zeiss.correct_sino_shifts -- the
-# per-view x_shifts/y_shifts are already collected by read_xrm_dir above.
 
 
 def compute_weight(blank_scan, obj_scan, dark_region_ratio=0.6, safety_buffer=20):
@@ -605,23 +546,17 @@ def compute_weight(blank_scan, obj_scan, dark_region_ratio=0.6, safety_buffer=20
     Returns:
         weights: A 3D array of weights with the same shape as the input obj_scan.
     """
-    # Get object scan shape
     num_views, num_rows, num_cols = obj_scan.shape
 
-    # Detect dark boundary regions using the blank scan
-    # Assume that dark boundary region intensity <= dark_region_ratio * median blank scan intensity
     weight_mask_2d = blank_scan[0] >= dark_region_ratio * np.median(blank_scan[0])
 
-    # Add a safety buffer around dark boundary regions
     if safety_buffer > 0:
         padded_mask = np.pad(weight_mask_2d, safety_buffer, mode='constant', constant_values=True)
-        # scipy.ndimage is imported at its one use site: it costs ~0.1 s to import
-        # and most preprocess callers never touch this loader's mask erosion.
+        # scipy.ndimage is imported here because the import costs about 0.1 seconds and most callers never need it.
         from scipy.ndimage import binary_erosion
         padded_mask = binary_erosion(padded_mask, iterations=safety_buffer)
         weight_mask_2d = padded_mask[safety_buffer:-safety_buffer, safety_buffer:-safety_buffer]
 
-    # Broadcast the same mask to all views
     weight_mask = np.broadcast_to(
         weight_mask_2d[np.newaxis, :, :],
         (num_views, num_rows, num_cols),

@@ -35,43 +35,24 @@ from .projectors import maybe_compile
 from .tomography_model import TomographyModel
 
 _F32_EPS = float(np.finfo(np.float32).eps)
-# The smallest sigma_x the stack statistics will set; see
-# QGGMRFDenoiser.auto_set_regularization_params_from_stack.
+# The stack statistics never set sigma_x below this value.
 _SIGMA_X_FLOOR = 1e-6
-# The most voxels the whole-volume statistics read.  It is the budget
-# estimate_image_noise_std already keeps for its own subsample.
+# The whole-volume statistics read at most this many voxels.
 _STATISTICS_POINT_BUDGET = 5_000_000
 
-
-#: The tile grid the point budget is spent on, and the smallest tile edge
-#: worth reading.  A grid of small tiles samples the whole field of view;
-#: one block of the same area would sample only the middle of it.
-#: Two tiles per axis, four in all, measured best: over five positions of an
-#: object boundary its worst error against the whole-stack estimate was
-#: 2.9e-2, against 4.3e-2 for one block and 6.2e-2 for four or eight tiles
-#: per axis.
+# The sampled statistics use this many tiles per axis, and a tile edge shorter
+# than _MIN_TILE is not read.
 _TILE_GRID = 2
 _MIN_TILE = 4
 
 
 def _sample_tiles(num_rows, num_cols, num_leading, point_budget):
-    """Tiles of two axes that together hold at most ``point_budget`` voxels,
-    counting ``num_leading`` entries of a third axis that is left whole.
+    """Return tiles of two axes that together hold at most ``point_budget``
+    voxels, counting ``num_leading`` entries of a third axis left whole.
 
-    The tiles are contiguous, so a neighbor difference inside one is between
-    adjacent voxels; a strided subsample would compare voxels a stride apart,
-    which measures something else.  They are spread evenly across both axes,
-    first tile at one edge and last at the other, because the estimate must
-    see the whole field of view.  One block of the same area would sample
-    only the middle: at 30 frames of 512 cubed the budget buys 18 voxels per
-    axis, so a single block reads a needle 3.5 percent as wide as the object,
-    and misses the boundaries, where the largest neighbor differences are.
-
-    Args:
-        num_rows (int): the extent of the first tiled axis.
-        num_cols (int): the extent of the second tiled axis.
-        num_leading (int): the number of entries of the axis left whole.
-        point_budget (int): the most voxels the tiles may hold together.
+    The tiles are contiguous, so a neighbor difference inside a tile is taken
+    between adjacent voxels.  The tiles are spread across both axes so that
+    the estimate sees the whole field of view.
 
     Returns:
         (list of slice, list of slice): the rows and the columns of the tiles.
@@ -82,19 +63,13 @@ def _sample_tiles(num_rows, num_cols, num_leading, point_budget):
     total = num_leading * num_rows * num_cols
     if total <= point_budget or total <= 0:
         return [slice(0, num_rows)], [slice(0, num_cols)]
-    # The extent each axis may keep, spent as a grid of equal tiles.
     side = max(2, int((point_budget / num_leading) ** 0.5))
     count = max(1, min(_TILE_GRID, side // _MIN_TILE))
     edge = max(2, side // count)
 
     def spread(extent):
-        """The tiles of one axis, centered on equal shares of it.
-
-        The shares are ``(index + 0.5) / count`` of the axis, so no tile sits
-        against an edge.  Tiles placed edge to edge instead would, at the
-        production budget, put four tiles nine voxels wide in the four
-        corners of a 512 by 512 field, where a reconstruction holds only air.
-        """
+        """Return the tiles of one axis.  Each tile is centered on an equal
+        share of the axis, so no tile lies against an edge."""
         width = min(edge, extent)
         if count == 1 or width >= extent:
             start = (extent - width) // 2
@@ -115,32 +90,28 @@ def vcd_subset_denoiser(flat_image, flat_error_image, pixel_indices,
 
     The formulas and their order of operations are fixed by the golden-value
     tests (tests/test_denoiser.py); do not rearrange them."""
-    # qGGMRF prior - compute the gradient and Hessian at each pixel in the set.
     prior_grad, prior_hess = _qggmrf.qggmrf_gradient_and_hessian_at_indices(
         flat_image, image_shape, pixel_indices, qggmrf_params)
 
-    # "Back project" the residual - the forward Hessian is all 1s for the
-    # qggmrf proximal map.
+    # The forward Hessian is all 1s for the qggmrf proximal map.
     cur_error_image = flat_error_image[pixel_indices]
     forward_grad = -fm_constant * cur_error_image
     forward_hess = 1
 
-    # Compute the update direction in the recon domain.
     delta_recon_at_indices = -((forward_grad + prior_grad)
                                / (forward_hess + prior_hess))
 
-    # Compute delta^T \nabla Q(x_hat; x'=x_hat) for use in finding alpha.
+    # These two sums are delta^T grad Q(x_hat; x'=x_hat) and an upper bound
+    # on the prior Hessian term.  Both are used to find the step size alpha.
     prior_linear = torch.sum(prior_grad * delta_recon_at_indices)
-
-    # Estimated upper bound for the prior Hessian term.
     prior_quadratic_approx = torch.sum(prior_hess * delta_recon_at_indices ** 2)
 
-    # The "sinogram-domain" direction IS the recon-domain direction (identity A).
+    # The forward model is the identity, so the sinogram domain direction is
+    # the recon domain direction.
     delta_sinogram = delta_recon_at_indices
     forward_linear = fm_constant * torch.sum(cur_error_image * delta_sinogram)
     forward_quadratic = fm_constant * torch.sum(delta_sinogram * delta_sinogram)
 
-    # Compute the optimal update step.
     alpha_numerator = forward_linear - prior_linear
     alpha_denominator = forward_quadratic + prior_quadratic_approx + _F32_EPS
     alpha = alpha_numerator / alpha_denominator
@@ -150,7 +121,6 @@ def vcd_subset_denoiser(flat_image, flat_error_image, pixel_indices,
     delta_recon_at_indices = alpha * delta_recon_at_indices
     flat_image.index_add_(0, pixel_indices, delta_recon_at_indices)
 
-    # Update the residual at the subset's pixels.
     cur_error_image = cur_error_image - alpha * delta_sinogram
     flat_error_image.index_copy_(0, pixel_indices, cur_error_image)
     ell1_for_subset = torch.sum(torch.abs(delta_recon_at_indices))
@@ -186,7 +156,6 @@ def vcd_subset_denoiser_batched(flat_image, flat_error_image, pixel_indices,
     delta_recon_at_indices = -((forward_grad + prior_grad)
                                / (forward_hess + prior_hess))
 
-    # The line-search sums, one per volume.
     prior_linear = torch.sum(prior_grad * delta_recon_at_indices, dim=(1, 2))
     prior_quadratic_approx = torch.sum(prior_hess * delta_recon_at_indices ** 2,
                                        dim=(1, 2))
@@ -215,12 +184,9 @@ def vcd_subset_denoiser_batched(flat_image, flat_error_image, pixel_indices,
 
 
 def _volume_shape(image):
-    """The shape of a 3D volume in any form the denoiser accepts: a numpy
-    array, a torch tensor on any device, or a slice-sharded Shards.
-
-    A denoiser image is sharded on the LAST axis, so its slice count is the
-    sum of the per-shard widths; rows and columns are not sharded, and every
-    shard holds all of them."""
+    """Return the shape of a 3D volume given as a numpy array, a torch
+    tensor, or a Shards.  A denoiser image is sharded on the last axis, which
+    is the slice axis."""
     if isinstance(image, _sharding.Shards):
         first = image.tensors[0]
         num_slices = sum(int(t.shape[-1]) for t in image.tensors)
@@ -232,37 +198,18 @@ def _volume_shape(image):
 
 def _subsample_to_host(image, row_step=1, col_step=1, slice_step=1):
     """Return ``numpy.asarray(image)[::row_step, ::col_step, ::slice_step]``
-    for a 3D volume in any form the denoiser accepts, without ever holding
-    the whole volume on the host.
+    for a 3D volume given as a numpy array, a tensor, or a Shards.  The
+    stride is applied on the device that holds the data, so only the sampled
+    elements are copied to the host.
 
-    The denoiser's two statistics -- the noise estimate and the
-    auto-regularization parameters -- each look at a small strided subsample
-    of the image and at nothing else, so only that subsample needs to cross
-    to the host.  For a tensor or for shards, the strided block is taken on
-    the device that holds the data and only its elements are copied over.
-
-    For sharded input the result is EXACT: the same elements in the same
-    order as striding the assembled volume, because this is data movement
-    rather than an approximation.  Rows and columns are not sharded, so every
-    shard is strided identically on those two axes.  On the sharded last
-    axis, shard k owns global slices ``[start_k, end_k)``, so the sampled
-    global positions ``0, slice_step, 2 * slice_step, ...`` that land in that
-    block are the local positions ``j`` with
-    ``(start_k + j) % slice_step == 0`` -- they begin at local offset
-    ``(-start_k) % slice_step`` and continue by ``slice_step``.  Taking each
-    shard's block from that offset and concatenating on the last axis
-    reproduces the strided volume slice for slice.  A shard that owns no
-    slices, or one in which no sampled position lands, contributes a
-    zero-width block, which changes nothing.
-
-    Incidentally this also removes a latent failure on a single-device CUDA
-    model: ``numpy.asarray`` raises on a CUDA tensor, so a caller's tensor
-    handed straight to numpy would fail there.  Every tensor path here goes
-    through ``.cpu()`` first.
+    For sharded input the result is exact.  Shard k owns global slices
+    ``[start_k, end_k)``, so its sampled local positions begin at offset
+    ``(-start_k) % slice_step``.  Concatenating those blocks on the last axis
+    reproduces the strided volume.
     """
     def block_to_host(tensor, slice_start):
-        """One tensor's strided block, made dense on its own device so that
-        the copy crossing to the host carries only the sampled elements."""
+        """Return one tensor's strided block as a numpy array.  The block is
+        made dense on its own device before it is copied to the host."""
         block = tensor[::row_step, ::col_step, slice_start::slice_step]
         return block.detach().contiguous().cpu().numpy()
 
@@ -306,12 +253,10 @@ class QGGMRFDenoiser(TomographyModel):
             compilation.
     """
 
-    # The measured widening speed floors that govern this class's automatic
-    # device count (see _widening_floors).  Both denoiser rows are sentinels:
-    # sharded denoising lost at every size probed up to a billion image
-    # voxels, so the automatic path holds a denoiser at one device and only
-    # capacity widens it.  The family's floors are read in IMAGE VOXELS,
-    # because this class's sinogram shape is its image shape.
+    # This name selects the speed floors in _widening_floors that set the
+    # automatic device count, read in image voxels.  Sharded denoising was
+    # slower at every size measured, so the automatic path uses one device
+    # unless memory capacity requires more.
     _floor_family = 'denoiser'
 
     def __init__(self, image_shape, compile_mode='auto'):
@@ -321,8 +266,8 @@ class QGGMRFDenoiser(TomographyModel):
         super().__init__(image_shape, compile_mode=compile_mode,
                          view_params_name='None', sigma_noise=None)
         self.set_params(use_ror_mask=False)
-        self.set_params(sharpness=0)   # the denoiser's default sharpness level
-        # For qggmrf denoising a single fixed partition suffices.
+        self.set_params(sharpness=0)
+        # A single fixed partition suffices for qggmrf denoising.
         self.set_params(granularity=[16], partition_sequence=[0])
 
     def get_magnification(self):
@@ -353,13 +298,13 @@ class QGGMRFDenoiser(TomographyModel):
                         recon_shape=sinogram_shape)
 
     def auto_set_sigma_y(self, sinogram, sino_indicator, weights=1):
-        # sigma_y IS the noise level for the identity forward model.
+        # For the identity forward model sigma_y is the noise level.
         sigma_y = self.get_params('sigma_noise')
         self.set_params(no_warning=True, sigma_y=sigma_y, auto_regularize_flag=True)
 
     def _check_lateral_truncation(self, sino_indicator):
-        """No-op override: the denoiser's 'sinogram' is an ordinary image, and
-        image content reaching the frame edge is normal."""
+        """Do nothing.  The denoiser's input is an ordinary image, and image
+        content reaching the frame edge is normal."""
         return
 
     def estimate_image_noise_std(self, image):
@@ -388,24 +333,14 @@ class QGGMRFDenoiser(TomographyModel):
         return sigma_noise
 
     def _get_estimate_of_recon_std(self, noisy_image, support_indicator):
-        """Neighbor-difference std over the support (the denoiser's own recon-std
-        estimate, replacing the projection-path-length formula).
-
-        Each voxel of the support is compared with itself and with its three
-        backward neighbors, one per axis, and the mean of those per-voxel
-        standard deviations is returned.  A voxel on an edge takes its
-        neighbor from the far side, which is what indexing with -1 did.
-
-        The four values are read as shifted views of the image rather than
-        gathered through an index array.  The gather held about sixteen
-        arrays of the image's size, because ``np.where`` returns three int64
-        arrays and the stack of four gathered copies doubles again; the
-        shifted views hold about five at their peak, and the spread is taken
-        in two passes, which is stable.
+        """Return an estimate of the noise standard deviation.  Each voxel of
+        the support is compared with its three backward neighbors, one per
+        axis, and the mean of the per-voxel standard deviations is returned.
+        A voxel on an edge takes its neighbor from the far side of that axis.
         """
         def views():
-            """The voxel and its three backward neighbors, one array at a
-            time, so that only one shifted copy exists at once."""
+            """Yield the voxel array and its three backward neighbor arrays.
+            Only one shifted copy exists at a time."""
             yield noisy_image
             for axis in range(3):
                 yield np.roll(noisy_image, 1, axis=axis)
@@ -427,8 +362,9 @@ class QGGMRFDenoiser(TomographyModel):
         return np.mean(spread[support_indicator.astype(bool)])
 
     def _get_sino_indicator(self, noisy_image, sigma_noise=None, verbose=1):
-        """Binary support indicator for the noisy image: threshold at a small
-        fraction of the mean magnitude plus the noise floor."""
+        """Return a binary support indicator for the noisy image.  The
+        threshold is a small fraction of the mean magnitude plus the noise
+        floor."""
         if sigma_noise is None:
             sigma_noise = self.get_params('sigma_noise')
         percent_noise_floor = 5.0
@@ -495,42 +431,24 @@ class QGGMRFDenoiser(TomographyModel):
             >>> denoised_image, d = denoiser.denoise(noisy_image, sigma_noise=0.1)
         """
         self._log_run_header(first_iteration, logfile_path, print_logs)
-        # Settle the device layout before the image is placed.  The denoiser
-        # prices its own plan: it has no projectors, so a recon-sized plan
-        # would charge arrays it never allocates.  init_image rides along so a
-        # caller-supplied initial image is priced as the fourth resident image.
+        # The device layout is settled before the image is placed.  The plan
+        # is priced for a denoise, which has no projectors.
         self._apply_device_policy(workload='denoise', init_recon=init_image)
         self._log_device_report()
 
-        # The noise and regularization estimates below each run on a small
-        # strided subsample of the image and never on the whole volume, so
-        # each one brings over only the elements it reads.  A sharded input is
-        # subsampled on its own devices, so no full copy crosses to the host
-        # and a caller that keeps its volume on the devices (a plug-and-play
-        # loop, say) pays no whole-volume transfer per denoise.
         self.set_params(no_warning=True, use_ror_mask=use_ror_mask)
         if sigma_noise is None:
-            # This one strides all three axes itself, so it takes the image in
-            # whatever form the caller supplied.  Handing it the row subsample
-            # built below would change the estimate.
+            # This estimate strides all three axes itself, so it takes the
+            # image in whatever form the caller supplied.
             sigma_noise = self.estimate_image_noise_std(image)
-        # For the identity forward model sigma_y IS sigma_noise, so the two
-        # are kept equal here rather than only in the flag-gated auto path:
-        # a pinned denoiser (auto_regularize_flag=False, the Plug-and-Play
-        # agent configuration) must still take its strength from sigma_noise.
+        # For the identity forward model sigma_y is sigma_noise, so the two
+        # are kept equal even when auto-regularization is off.
         self.set_params(no_warning=True, sigma_noise=sigma_noise,
                         sigma_y=sigma_noise)
         self.logger.info('Initializing QGGMRFDenoiser')
 
-        # Auto-regularization with the background-estimation warning suppressed.
-        # auto_set_regularization_params begins by calling subsample_views,
-        # which keeps every step_size-th row and reads nothing else, so giving
-        # it those rows instead of the volume gives it exactly the same data:
-        # one such subsample leaves at most 39 rows, and at 39 rows or fewer
-        # subsample_views uses a step size of 1, so its own call passes them
-        # through unchanged.  (Checked for every row count from 1 to 4999.)
-        # The step comes from subsample_views itself, applied to the row
-        # indices, rather than from a second copy of its rule here.
+        # auto_set_regularization_params starts by calling subsample_views, which
+        # keeps every step_size-th row, so passing those rows gives it the same data.
         num_rows = _volume_shape(image)[0]
         sampled_rows = self.subsample_views(np.arange(num_rows))
         row_step = int(sampled_rows[1] - sampled_rows[0]) if sampled_rows.size > 1 else 1
@@ -540,7 +458,8 @@ class QGGMRFDenoiser(TomographyModel):
         regularization_params = self.auto_set_regularization_params(small_image)
         self.set_params(no_warning=True, verbose=verbose)
 
-        # One fixed partition (sequential subsets; no per-iteration shuffle).
+        # The sweep uses one fixed partition.  The subsets run in order and
+        # are not reshuffled between iterations.
         image_shape, granularity = self.get_params(['recon_shape', 'granularity'])
         partition_sequence = self.get_params('partition_sequence')
         partition_index = partition_sequence[0]
@@ -570,7 +489,8 @@ class QGGMRFDenoiser(TomographyModel):
                 [t.reshape(s.shape) for t, s in zip(flat_image.tensors, image_t.tensors)],
                 flat_image.placement)
         else:
-            # Single device: the whole sweep through one compiled in-place update.
+            # On one device the whole sweep runs through one compiled
+            # in-place update.
             flat_image = init_t.clone().reshape((-1, image_shape[2])).contiguous()
             flat_error_image = (image_t.reshape((-1, image_shape[2]))
                                 - flat_image).contiguous()
@@ -589,12 +509,8 @@ class QGGMRFDenoiser(TomographyModel):
                         ell1_accum = ell1_accum + ell1_subset
                         alpha_accum = alpha_accum + alpha_subset
 
-                    # Chunked rather than sum(abs) over the whole image: see
-                    # image_ell1 for the temporary this avoids and for why the
-                    # fused norm is not used instead.  A zero image gives nan
-                    # rather than raising ZeroDivisionError, as in _vcd_recon's
-                    # iteration statistics (a Plug-and-Play loop initialized
-                    # at zero feeds one in).
+                    # A zero image gives nan rather than raising
+                    # ZeroDivisionError.
                     image_l1 = float(image_ell1(flat_image))
                     nmae = (float(ell1_accum) / image_l1 if image_l1
                             else float('nan'))
@@ -614,9 +530,8 @@ class QGGMRFDenoiser(TomographyModel):
                                  [100 * float(v) for v in nmae_update[:num_iters]],
                                  [float(v) for v in alpha_values[:num_iters]],
                                  None]))
-        # This call has written its last log line, so finish the file rather
-        # than holding it open, as recon and prox_map do.  A call continuing
-        # this run reopens it.
+        # The last log line is written, so the file is closed.  A later call
+        # reopens it.
         self.close_log_file()
         notes = 'Reconstruction completed: {}\n\n'.format(datetime.datetime.now())
         denoiser_dict = self.get_recon_dict(recon_params, notes=notes)
@@ -627,20 +542,13 @@ class QGGMRFDenoiser(TomographyModel):
                          first_iteration, verbose):
         """Run the denoising sweep across devices on slice-sharded state.
 
-        Mirrors _vcd_recon's sharded path: the qGGMRF halos are staged once
-        per pass, each device computes its shard's prior and identity-forward
-        terms, and the four line-search sums combine ON THE LEAD DEVICE into
-        one step size (the same formula as vcd_subset_denoiser).
-
-        The line search stays on device for the reason _vcd_recon states at
-        its own combine: alpha is a scalar tensor, so no host synchronization
-        is forced per subset.  Reading the four sums back as Python floats
-        would cost 5 x n_devices device-to-host syncs per subset per pass,
-        from inside worker threads, for a scalar that is only ever consumed
-        on the devices again.  The single-device denoiser already keeps these
-        as tensors (see :func:`vcd_subset_denoiser`), so this also puts the
-        two paths on the same float32 arithmetic; the host syncs that remain
-        are one per PASS, for the convergence test and the logged history.
+        The qGGMRF halos are staged once per pass.  Each device computes its
+        own shard's prior and forward terms.  The four line-search sums are
+        combined on the lead device into one step size, using the formula of
+        :func:`vcd_subset_denoiser`.  The step size stays a tensor on the
+        device, so no host synchronization is forced per subset.  One host
+        synchronization per pass reads the convergence test and the logged
+        history.
 
         Returns (flat_image shards, nmae history, alpha history, num_iters).
         """
@@ -650,18 +558,15 @@ class QGGMRFDenoiser(TomographyModel):
         dev0 = devices[0]
 
         def combine_on_lead(parts):
-            """Sum per-shard 0-d tensor partials on the lead device: the
-            identity on one device, scalar-sized device moves otherwise."""
+            """Sum the per-shard scalar tensors on the lead device."""
             total = parts[0]
             for part in parts[1:]:
                 total = total + _sharding.move_shard(part, dev0,
                                                      self.dev2dev_safe)
             return total
 
-        # Flat (num_pixels, local_slices) shards; residual = image - init.
-        # The pixel count is named rather than inferred: a shard that owns no
-        # slices has no elements, and reshape cannot infer a row count from an
-        # empty tensor whose column count is also zero.
+        # The state is held as flat (num_pixels, local_slices) shards.  The pixel
+        # count is explicit because reshape cannot infer it for a shard with no slices.
         num_pixels = int(image_shape[0]) * int(image_shape[1])
         flat_image = _sharding.Shards(
             [t.reshape(num_pixels, t.shape[-1]).clone().contiguous()
@@ -680,12 +585,8 @@ class QGGMRFDenoiser(TomographyModel):
         nmae_update = np.zeros(max_iters)
         alpha_values = np.zeros(max_iters)
         num_iters = 0
-        # ONE per-device thread pool for the whole sweep, as _vcd_recon keeps
-        # for its loop: the two fan-outs per subset reuse it instead of
-        # building and tearing down a private pool each time.  A caller that
-        # already installed one (a reconstruction driving the denoiser) keeps
-        # its own; n == 1 never needs one, since run_per_device short-circuits
-        # to a direct call there.
+        # One thread pool serves the whole sweep, and a caller that already
+        # installed a pool keeps its own.
         owns_pool = n > 1 and self._per_device_pool is None
         if owns_pool:
             self._per_device_pool = _sharding.device_pool(n)
@@ -708,8 +609,8 @@ class QGGMRFDenoiser(TomographyModel):
                             cur_error = flat_error.tensors[j][idx[j]]
                             forward_grad = -fm_constant * cur_error
                             delta = -((forward_grad + grad) / (1.0 + hess))
-                            # 0-d tensors, not floats: they combine on the lead
-                            # device below and are consumed back on the devices.
+                            # The four sums are scalar tensors, not floats, and
+                            # are combined on the lead device.
                             return (delta,
                                     torch.sum(grad * delta),
                                     torch.sum(hess * delta ** 2),
@@ -726,8 +627,8 @@ class QGGMRFDenoiser(TomographyModel):
                         alpha = ((forward_linear - prior_linear)
                                  / (forward_quadratic + prior_quadratic + _F32_EPS))
                         alpha = torch.clamp(alpha, _F32_EPS, 1.5)
-                        # The step size is a scalar tensor on the lead device,
-                        # so each shard needs its own copy to scale its delta.
+                        # Each shard needs its own copy of the step size to
+                        # scale its delta.
                         alpha_per_device = (
                             [alpha] if n == 1 else
                             [_sharding.move_shard(alpha, dev, self.dev2dev_safe)
@@ -744,16 +645,10 @@ class QGGMRFDenoiser(TomographyModel):
                         ell1_accum = ell1_accum + combine_on_lead(ell1_parts)
                         alpha_accum = alpha_accum + alpha
 
-                    # The three host reads per pass, all at this one
-                    # synchronization point: the convergence test and the two
-                    # logged histories need Python numbers.
-                    # Chunked per shard, for the reason image_ell1 gives: it
-                    # spares each device an image-shaped array of absolute
-                    # values at the pass's one synchronization point.
+                    # The convergence test needs Python numbers, so this is the one
+                    # host synchronization point of the pass.  A zero image gives nan.
                     image_l1 = float(combine_on_lead(
                         [image_ell1(t) for t in flat_image.tensors]))
-                    # A zero image gives nan rather than raising, as on the
-                    # single-device path.
                     nmae = (float(ell1_accum) / image_l1 if image_l1
                             else float('nan'))
                     nmae_update[i] = nmae
@@ -770,7 +665,6 @@ class QGGMRFDenoiser(TomographyModel):
                 self._per_device_pool = None
         return flat_image, nmae_update, alpha_values, num_iters
 
-    # ── denoising a stack of volumes at once ──────────────────────────────────
     def auto_set_regularization_params_from_stack(self, stack):
         """
         Set the regularization parameters (sigma_y, sigma_x, and sigma_prox)
@@ -810,16 +704,12 @@ class QGGMRFDenoiser(TomographyModel):
                 stack = np.asarray(stack)
             num_volumes = int(stack.shape[0])
             d0, d1, d2 = (int(n) for n in stack.shape[1:])
-            # The volumes chosen are the ones subsample_views keeps when it is
-            # handed the volume indices.  The same stride, applied to the stack
-            # viewed as (num_volumes, d0 * d1, d2), picks those volumes on the
-            # device that holds them and brings only them to the host.
+            # The volumes chosen are the ones subsample_views keeps when it
+            # is handed the volume indices.
             chosen = self.subsample_views(np.arange(num_volumes))
             step = int(chosen[1] - chosen[0]) if chosen.size > 1 else 1
-            # The chosen volumes are cropped to a point budget before they
-            # cross to the host.  The crop keeps the middle of the two
-            # trailing axes and the whole of the first, so every neighbor
-            # difference the estimate reads is still between adjacent voxels.
+            # The chosen volumes are cropped to a point budget before they cross to
+            # the host.  The crop keeps the whole first axis.
             rows, cols = _sample_tiles(d1, d2, int(chosen.size) * d0,
                                        _STATISTICS_POINT_BUDGET)
             blocks = []
@@ -827,24 +717,20 @@ class QGGMRFDenoiser(TomographyModel):
                 for col in cols:
                     tile = stack[:, :, row, col]
                     height, width = row.stop - row.start, col.stop - col.start
-                    # Only this tile's chosen volumes cross to the host.
                     piece = _subsample_to_host(
                         tile.reshape(num_volumes, d0 * height, width), row_step=step)
                     blocks.append(piece.reshape(-1, height, width))
-            # The tiles are stacked along the axis the volumes already join
-            # on, so the joins between them are of the same kind.
+            # The tiles are stacked along the axis on which the volumes
+            # already join.
             merged = blocks[0] if len(blocks) == 1 else np.concatenate(blocks, axis=0)
             tiled = len(blocks) > 1 or merged.shape[1:] != (d1, d2)
 
             sino_indicator = self._get_sino_indicator(merged)
             if tiled:
-                # The estimate reads each neighbor with a wrap, so entry 0 of
-                # an axis is compared with the far end of that axis.  Over a
-                # whole volume that is one plane in hundreds.  Over a tile it
-                # is one column in the tile's width, which on a structured
-                # image moves the estimate by tens of percent, so those
-                # entries are dropped from the support.  The planes where one
-                # tile meets the next are dropped for the same reason.
+                # The estimate reads each neighbor with a wrap, so entry 0 of an
+                # axis is compared with the far end of that axis.  Those entries
+                # are dropped from the support, and so are the planes where one
+                # tile meets the next.
                 sino_indicator[:, 0, :] = 0
                 sino_indicator[:, :, 0] = 0
                 sino_indicator[::merged.shape[0] // len(blocks)] = 0
@@ -856,7 +742,6 @@ class QGGMRFDenoiser(TomographyModel):
             self.auto_set_sigma_prox(recon_std)
             # A stack dominated by background gives a sigma_x near zero, and
             # the sweep then divides by it and returns NaN for every volume.
-            # The floor keeps sigma_x positive.
             sigma_x = self.get_params('sigma_x')
             if not np.isfinite(sigma_x) or sigma_x < _SIGMA_X_FLOOR:
                 self.set_params(no_warning=True, sigma_x=_SIGMA_X_FLOOR)
@@ -1023,9 +908,8 @@ class QGGMRFDenoiser(TomographyModel):
                 f'init_stack must have the shape of stack, {stack_shape}; got '
                 f'{tuple(init_stack.shape)}.')
         if init_stack is stack:
-            # The default start is the input, so the input passed twice means
-            # the same thing, and reading it so keeps the in-place forms below
-            # from writing one buffer as both the image and the residual.
+            # The default start is the input.  Treating the two as one keeps the
+            # in-place forms below from using one buffer as both image and residual.
             init_stack = None
         num_volumes = stack_shape[0]
         num_pixels = image_shape[0] * image_shape[1]
@@ -1035,10 +919,8 @@ class QGGMRFDenoiser(TomographyModel):
         out = None
         if batch_size is None:
             if stack_is_tensor:
-                # Allocated before the free-memory reading the automatic choice
-                # makes, so that a result living on the sweep device is counted
-                # in it; released again below when the stack turns out to be
-                # one batch, which needs no output array.
+                # The output is allocated before auto_batch_size reads the free
+                # memory, so that an output on the sweep device is counted.
                 out = torch.empty(stack_shape, dtype=torch.float32, device=stack.device)
             batch_size = self.auto_batch_size()
         if batch_size is None or int(batch_size) > num_volumes:
@@ -1047,7 +929,7 @@ class QGGMRFDenoiser(TomographyModel):
         if batch_size < 1:
             raise ValueError(f'batch_size must be at least 1; got {batch_size}.')
         # One batch returns the sweep's working image and allocates no output
-        # array.  Several batches write into one, on the input's device.
+        # array.  Several batches write into one output on the input's device.
         single = batch_size == num_volumes
         if single:
             out = None
@@ -1055,13 +937,11 @@ class QGGMRFDenoiser(TomographyModel):
             out = (torch.empty(stack_shape, dtype=torch.float32, device=stack.device)
                    if stack_is_tensor else np.empty(stack_shape, dtype=np.float32))
 
-        # The noise estimate strides all three axes of the stack merged into
-        # one 3D array, as denoise strides a single image.
         if sigma_noise is None:
             sigma_noise = self.estimate_image_noise_std(
                 stack.reshape(-1, image_shape[1], image_shape[2]))
-        # For the identity forward model sigma_y IS sigma_noise; kept equal
-        # here for the pinned path too, as in denoise.
+        # For the identity forward model sigma_y is sigma_noise, so the two
+        # are kept equal even when auto-regularization is off.
         self.set_params(no_warning=True, sigma_noise=sigma_noise,
                         sigma_y=sigma_noise)
         # The regularization parameters come from whole volumes, so the
@@ -1069,8 +949,7 @@ class QGGMRFDenoiser(TomographyModel):
         regularization_params = self.auto_set_regularization_params_from_stack(stack)
         verbose = self.get_params('verbose')
 
-        # One fixed partition over one volume's pixel grid, shared by every
-        # volume.
+        # Every volume shares one fixed partition of one volume's pixel grid.
         granularity = self.get_params('granularity')
         partition_sequence = self.get_params('partition_sequence')
         use_ror_mask = self.get_params('use_ror_mask')
@@ -1083,21 +962,20 @@ class QGGMRFDenoiser(TomographyModel):
             ['qggmrf_nbr_wts', 'sigma_x', 'p', 'q', 'T'])
         qggmrf_params = (_qggmrf.get_b_from_nbr_wts(qggmrf_nbr_wts), sigma_x, p, q, T)
         stop_thresh = stop_threshold_change_pct / 100.0
-        # One compiled instance per denoiser object, so that two denoisers
-        # swept at the same time from different threads, on the same device or
-        # on different ones, share no compiled state.
+        # Each denoiser object gets its own compiled instance, so that two
+        # denoisers swept at the same time share no compiled state.
         subset_denoiser = maybe_compile(vcd_subset_denoiser_batched,
                                         self.compile_enabled, instance_key=id(self))
 
         def flat_on_device(block):
-            """A block of volumes as a float32 (B, num_pixels, num_slices)
-            tensor on the sweep device, and whether the sweep may write it.
+            """Return a block of volumes as a float32 (B, num_pixels,
+            num_slices) tensor on the sweep device, together with a flag
+            saying whether the sweep may write it.
 
-            A block that crosses from the host, changes device or dtype, or
-            is copied by the reshape arrives as a copy the sweep owns.  A
-            caller's tensor that already sits on the sweep device in float32
-            and reshapes as a view stays the caller's, and is the sweep's to
-            write only under ``overwrite_input``; a numpy array never is.
+            The sweep owns any block it had to copy.  A caller's tensor that
+            already sits on the sweep device in float32 and reshapes as a
+            view stays the caller's, and the sweep may write it only under
+            ``overwrite_input``.  A numpy array is never written.
             """
             tensor = block if torch.is_tensor(block) else torch.as_tensor(block)
             moved = tensor.to(device=device, dtype=torch.float32)
@@ -1107,7 +985,8 @@ class QGGMRFDenoiser(TomographyModel):
             return flat, owned
 
         def padded(flat, pad):
-            """The block with its last volume repeated pad more times."""
+            """Return the block with its last volume repeated pad more
+            times."""
             if pad == 0:
                 return flat
             return torch.cat([flat, flat[-1:].expand(pad, -1, -1)])
@@ -1122,10 +1001,8 @@ class QGGMRFDenoiser(TomographyModel):
                 if pad:
                     flat, owned = padded(flat, pad), True
                 if init_stack is None:
-                    # The sweep writes its image in place, so the image is the
-                    # input when the input is the sweep's own and a copy of it
-                    # otherwise.  The residual, the input minus the image, is
-                    # then zero, and is allocated as zero rather than computed.
+                    # The sweep writes its image in place, so it uses the input
+                    # only when it owns it.  The residual is then zero.
                     flat_image = flat if owned else flat.clone()
                     flat_error_image = torch.zeros_like(flat_image)
                 else:
@@ -1134,15 +1011,13 @@ class QGGMRFDenoiser(TomographyModel):
                         init_flat, init_owned = padded(init_flat, pad), True
                     flat_image = init_flat if init_owned else init_flat.clone()
                     # The residual is formed in the input's own buffer when
-                    # that buffer is the sweep's, and in a new array otherwise.
+                    # the sweep owns that buffer, and in a new array otherwise.
                     flat_error_image = (flat.sub_(flat_image) if owned
                                         else flat - flat_image)
                 flat_image = flat_image.contiguous()
                 flat_error_image = flat_error_image.contiguous()
-                # The identity forward model carries the data term in the
-                # residual, so the input is not read again.  The sweep holds
-                # two arrays per volume from here, and a caller's tensor it
-                # did not take over stays beside them.
+                # The residual carries the data term, so the input is not
+                # read again.
                 del flat
                 counts, history = self._sweep_stack(
                     flat_image, flat_error_image, partition, fm_constant,
@@ -1176,9 +1051,9 @@ class QGGMRFDenoiser(TomographyModel):
         """Run the batched sweep in place on one batch of flat volumes.
 
         Each volume runs until its own change falls below ``stop_thresh`` or
-        until ``max_iters``.  A volume that has stopped is frozen: it keeps
-        its place in the batch with a step of zero.  The loop ends when no
-        volume is active.
+        until ``max_iters``.  A volume that has stopped keeps its place in
+        the batch and takes a step of zero.  The loop ends when no volume is
+        active.
 
         Returns:
             (num_iterations, nmae_pct): the iteration count of each volume,
@@ -1198,10 +1073,8 @@ class QGGMRFDenoiser(TomographyModel):
                     flat_image, flat_error_image, partition[k], fm_constant,
                     qggmrf_params, tuple(image_shape), active)
                 ell1_accum = ell1_accum + ell1_subset
-            # One host read per iteration: the stopping test needs Python
-            # numbers.  The ratio is formed in float64 on the host, as
-            # denoise forms it, and a zero volume gives nan rather than
-            # raising, as there.
+            # The stopping test needs Python numbers, so there is one host read per
+            # iteration.  The ratio is formed in float64, and a zero volume gives nan.
             stats = torch.stack([ell1_accum, stack_ell1(flat_image)])
             stats = stats.cpu().numpy().astype(np.float64)
             with np.errstate(divide='ignore', invalid='ignore'):
@@ -1252,11 +1125,8 @@ def median_filter3d(x, max_block_gb=4.0, return_min_max=False):
     import torch.nn.functional as F
     from .tomography_model import _resolve_device
 
-    # The filter works on one array on one device, and each output voxel needs
-    # the 26 around it, so a slice-divided volume would need its neighboring
-    # slices exchanged between devices.  It is refused rather than being taken
-    # for numpy by the check just below, which fails on a torch dtype message
-    # that says nothing about where the array actually is.
+    # Each output voxel needs the 26 voxels around it, so the slice-divided form
+    # is refused rather than exchanging neighboring slices between devices.
     _sharding.reject_shards('median_filter3d', x=x)
     was_numpy = not isinstance(x, torch.Tensor)
     if was_numpy:
@@ -1268,10 +1138,11 @@ def median_filter3d(x, max_block_gb=4.0, return_min_max=False):
     num_blocks = int(np.ceil(27 * x_gb / max_block_gb))
     block_size = max(d0 // max(num_blocks, 1), 1)
 
-    # 1) Pad every dim by 1 for the edge‐replicated halo
-    xp = F.pad(xt[None, None], (1, 1, 1, 1, 1, 1), mode='replicate')[0, 0]   # (d0+2, d1+2, d2+2)
+    # Every axis is padded by 1 to give the edge replicated boundary.
+    xp = F.pad(xt[None, None], (1, 1, 1, 1, 1, 1), mode='replicate')[0, 0]
 
-    # 2) Pad d0 *further* up to a multiple of block_size, only at the end so fixed-size blocks tile it
+    # Axis 0 is padded further, at the end only, up to a multiple of
+    # block_size, so that fixed-size blocks tile it.
     n_blocks = (d0 + block_size - 1) // block_size
     padded_Z = n_blocks * block_size
     pad_extra = padded_Z - d0
@@ -1284,12 +1155,11 @@ def median_filter3d(x, max_block_gb=4.0, return_min_max=False):
             z0 = i * block_size
             block = xp[z0:z0 + block_size + 2]
 
-            # the 27‐roll → stack → median recipe on this small block
             patches = [
                 torch.roll(block, shifts=(dz, dy, dx), dims=(0, 1, 2))
                 for dz in (-1, 0, 1) for dy in (-1, 0, 1) for dx in (-1, 0, 1)
             ]
-            stacked = torch.stack(patches, dim=0)          # (27, blkZ+2, d1+2, d2+2)
+            stacked = torch.stack(patches, dim=0)
             filtered = torch.median(stacked, dim=0).values
             med_blocks.append(filtered[1:-1, 1:-1, 1:-1])
             if return_min_max:

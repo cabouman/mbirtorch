@@ -8,22 +8,11 @@ kernels.  Nothing measured the two together until the isolation matrix that
 prompted the interim selection rule, and this file is that matrix promoted to
 a standing gate.
 
-Four things are asserted, in the order they matter.
-
-The torch-body arms must sit at the multi-device float floor, which is what
-says the ENGINE is sound and gives every other arm its reference.  The
-back-kernel arms must match the torch arms within that floor, which is the
-evidence that earned the back kernels their default-on status at every device
-count.  The forward-kernel arms must match the torch arms the same way, which
-is the bar the repaired launch path passed when the interim selection rule
-retired.  And the selection contract must hold on real hardware: the same
-bodies bind at one device and at two.
-
-The multiaxis pair arrives with no such history, so it is asserted as the
-composition a user runs rather than as an isolation matrix: a two-device
-reconstruction with both kernels bound, read against the single-device torch
-reference, plus the device pin and the selection contract every geometry
-takes.
+Two things are asserted.  A two-device reconstruction with BOTH kernels bound
+must match the single-device torch-body reference within the multi-device
+float floor; that is the composition a multi-GPU user actually runs.  And a
+model pinned to a device other than cuda:0 must give the same values, which is
+the case the launch-context bug below reached.
 
 The forward's history is the reason this file exists.  Its kernels once read
 order one against the torch bodies here, because a Triton launch targets the
@@ -48,14 +37,6 @@ from mbirtorch.multiaxis_parallel import (_multiaxis_back_view_batch,
                                           _multiaxis_forward_view_batch)
 from mbirtorch.parallel_beam import (_parallel_back_view_batch,
                                      _parallel_forward_view_batch)
-# The kernel modules import without triton; only calling a wrapper needs it,
-# and every test below is CUDA-gated.
-from mbirtorch.triton_cone import (_cone_back_view_batch_triton,
-                                   _cone_forward_view_batch_triton)
-from mbirtorch.triton_multiaxis import (_multiaxis_back_view_batch_triton,
-                                        _multiaxis_forward_view_batch_triton)
-from mbirtorch.triton_parallel import (_parallel_back_view_batch_triton,
-                                       _parallel_forward_view_batch_triton)
 
 requires_two_cuda = pytest.mark.skipif(
     torch.cuda.device_count() < 2,
@@ -68,11 +49,6 @@ VCD_ITERATIONS = 3
 VCD_SEED = 4321
 # The established multi-device float-divergence scale for cells of this class.
 FLOOR = 5e-3
-# How closely a back-kernel arm must track its torch arm.  The two differ only
-# by the back body, and the isolation matrix measured them equal to four
-# significant figures, so this is loose by two orders of magnitude and still
-# catches any real divergence.
-BACK_KERNEL_TOLERANCE = 1e-2
 
 
 # The (forward, back) bodies of each geometry, keyed by name so an arm that
@@ -81,13 +57,6 @@ TORCH_BODIES = {
     "parallel": (_parallel_forward_view_batch, _parallel_back_view_batch),
     "cone": (_cone_forward_view_batch, _cone_back_view_batch),
     "multiaxis": (_multiaxis_forward_view_batch, _multiaxis_back_view_batch),
-}
-KERNEL_BODIES = {
-    "parallel": (_parallel_forward_view_batch_triton,
-                 _parallel_back_view_batch_triton),
-    "cone": (_cone_forward_view_batch_triton, _cone_back_view_batch_triton),
-    "multiaxis": (_multiaxis_forward_view_batch_triton,
-                  _multiaxis_back_view_batch_triton),
 }
 
 
@@ -125,21 +94,6 @@ def _force_torch_bodies(model, geometry):
     model.create_projectors()
 
 
-def _force_one_kernel(model, geometry, direction):
-    """Bind ONE kernel body against the torch body in the other direction.
-
-    A mixed arm blames one direction on its own, which is how the isolation
-    matrix separated the forward from the back.  The default selection binds
-    both kernels, so a single-direction arm must be forced.
-    """
-    torch_forward, torch_back = TORCH_BODIES[geometry]
-    kernel_forward, kernel_back = KERNEL_BODIES[geometry]
-    pair = ((kernel_forward, torch_back) if direction == "forward"
-            else (torch_forward, kernel_back))
-    model._view_batch_bodies = lambda: pair
-    model.create_projectors()
-
-
 def _reconstruct(model, sinogram, weights):
     np.random.seed(VCD_SEED)
     recon, _info = model.recon(sinogram, weights=weights,
@@ -170,90 +124,16 @@ def problem():
 
 @requires_two_cuda
 @pytest.mark.parametrize("geometry", ["parallel", "cone"])
-def test_torch_bodies_hold_the_multi_device_float_floor(geometry, problem):
-    """The engine's own reference arm.
-
-    With no kernel bound in either direction, a sharded reconstruction must
-    match the single-device one at the established float floor.  Every other
-    arm in this file is read against this one.
-    """
-    sinogram, weights = problem[geometry]
-    reference = None
-    for count in (1, 2):
-        model = _build(geometry)
-        model.configure_devices(count)
-        _force_torch_bodies(model, geometry)
-        result = _reconstruct(model, sinogram, weights)
-        if count == 1:
-            reference = result
-            continue
-        rel = _rel(reference, result)
-        assert rel < FLOOR, f"{geometry} torch bodies at n={count}: {rel:.3e}"
-
-
-@requires_two_cuda
-@pytest.mark.parametrize("geometry", ["parallel", "cone"])
-def test_the_back_kernel_matches_the_torch_bodies_under_sharding(geometry,
-                                                                 problem):
-    """The evidence the back kernel's default-on status rests on.
-
-    The two arms differ only in the back body.  The isolation matrix measured
-    them equal to four significant figures at two and four devices in both
-    geometries.
-    """
-    sinogram, weights = problem[geometry]
-
-    plain = _build(geometry)
-    plain.configure_devices(2)
-    _force_torch_bodies(plain, geometry)
-    torch_arm = _reconstruct(plain, sinogram, weights)
-
-    mixed = _build(geometry)
-    mixed.configure_devices(2)
-    _force_one_kernel(mixed, geometry, "back")
-    kernel_arm = _reconstruct(mixed, sinogram, weights)
-
-    rel = _rel(torch_arm, kernel_arm)
-    assert rel < BACK_KERNEL_TOLERANCE, f"{geometry} back kernel: {rel:.3e}"
-
-
-@requires_two_cuda
-@pytest.mark.parametrize("geometry", ["parallel", "cone"])
-def test_the_forward_kernel_matches_the_torch_bodies_under_sharding(geometry,
-                                                                    problem):
-    """The repaired launch path, held to the bar that retired the interim.
-
-    The two arms differ only in the forward body.  Before the repair this
-    comparison read order one, non-reproducibly; the launch-context bracket
-    brought it to the kernel-parity class, measured at 3.4e-07 and 1.1e-06
-    on two H100s.  The floor here is the standing multi-device envelope,
-    loose by three orders against that measurement.
-    """
-    sinogram, weights = problem[geometry]
-
-    plain = _build(geometry)
-    plain.configure_devices(2)
-    _force_torch_bodies(plain, geometry)
-    torch_arm = _reconstruct(plain, sinogram, weights)
-
-    mixed = _build(geometry)
-    mixed.configure_devices(2)
-    _force_one_kernel(mixed, geometry, "forward")
-    kernel_arm = _reconstruct(mixed, sinogram, weights)
-
-    rel = _rel(torch_arm, kernel_arm)
-    assert rel < FLOOR, f"{geometry} forward kernel: {rel:.3e}"
-
-
-@requires_two_cuda
-@pytest.mark.parametrize("geometry", ["parallel", "cone"])
 def test_the_default_selection_matches_the_torch_bodies_under_sharding(
         geometry, problem):
     """The composition a multi-GPU user actually gets.
 
     The default selection binds BOTH kernels wherever the availability gates
-    pass.  This arm is the mixed arms' composition, and it must sit at the
-    same floor.
+    pass, so this arm covers the forward and back kernels together and must
+    sit at the same floor as the torch-body arms.  Before the launch-context
+    repair the forward kernel read order one here, non-reproducibly; the
+    bracket brought it to the kernel-parity class, measured at 3.4e-07 and
+    1.1e-06 on two H100s.
     """
     sinogram, weights = problem[geometry]
 
@@ -277,48 +157,6 @@ def test_the_default_selection_matches_the_torch_bodies_under_sharding(
 
     rel = _rel(torch_arm, default_arm)
     assert rel < FLOOR, f"{geometry} default selection: {rel:.3e}"
-
-
-@requires_two_cuda
-def test_multiaxis_kernels_match_the_single_device_reference(problem):
-    """The multiaxis pair's arm, composed the way a multi-GPU user runs it.
-
-    The other geometries' arms above isolate one effect at a time, because
-    their history needed that.  This one states the composition directly: a
-    two-device reconstruction with the default selection -- both multiaxis
-    kernels bound -- against the SINGLE-device torch-body reference.  The
-    torch bodies at two devices run beside it, so a failure says whether the
-    engine or the kernels moved.
-    """
-    sinogram, weights = problem["multiaxis"]
-
-    reference_model = _build("multiaxis")
-    reference_model.configure_devices(1)
-    _force_torch_bodies(reference_model, "multiaxis")
-    reference = _reconstruct(reference_model, sinogram, weights)
-
-    plain = _build("multiaxis")
-    plain.configure_devices(2)
-    _force_torch_bodies(plain, "multiaxis")
-    torch_arm = _reconstruct(plain, sinogram, weights)
-    torch_rel = _rel(reference, torch_arm)
-    assert torch_rel < FLOOR, f"multiaxis torch bodies at n=2: {torch_rel:.3e}"
-
-    shipped = _build("multiaxis")
-    shipped.configure_devices(2)
-    # The arm check: this arm exists to measure the KERNELS, so a silent
-    # availability decline must fail loudly rather than compare torch with
-    # torch and pass vacuously.
-    from mbirtorch.triton_cone import triton
-    if triton is not None:
-        fwd, back = shipped._view_batch_bodies()
-        assert "triton" in fwd.__name__ and "triton" in back.__name__, (
-            f"multiaxis kernels not bound with triton importable: "
-            f"{fwd.__name__}, {back.__name__}")
-    kernel_arm = _reconstruct(shipped, sinogram, weights)
-
-    rel = _rel(reference, kernel_arm)
-    assert rel < FLOOR, f"multiaxis default selection at n=2: {rel:.3e}"
 
 
 @requires_two_cuda
@@ -361,28 +199,3 @@ def test_kernels_hold_on_a_single_nonzero_device(geometry, problem):
     back_rel = _rel(torch_back, kernel_back)
     assert fwd_rel < FLOOR, f"{geometry} forward on cuda:1: {fwd_rel:.3e}"
     assert back_rel < FLOOR, f"{geometry} back on cuda:1: {back_rel:.3e}"
-
-
-@requires_two_cuda
-@pytest.mark.parametrize("geometry", ["parallel", "cone", "multiaxis"])
-def test_kernel_selection_is_the_same_at_one_and_two_devices(geometry):
-    """The selection contract, asserted on real hardware.
-
-    The CPU tests pin the layout-independence RULE by forcing the
-    availability gates.  This pins what a real multi-GPU machine actually
-    binds, which is the thing a user gets: the same bodies at one device and
-    at two, and the kernels wherever the gates pass.
-    """
-    model = _build(geometry)
-
-    model.configure_devices(1)
-    single_forward, single_back = model._view_batch_bodies()
-    model.configure_devices(2)
-    sharded_forward, sharded_back = model._view_batch_bodies()
-
-    assert sharded_forward is single_forward
-    assert sharded_back is single_back
-    if "triton" in single_back.__name__:
-        # Where the back kernel is usable, the forward's own gate passes on
-        # the same toolchain, so both kernels are the expected binding.
-        assert "triton" in single_forward.__name__

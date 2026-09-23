@@ -70,73 +70,53 @@ __all__ = ['GeometryScene', 'ViewScene', 'GEOMETRY_KINDS',
            'DIFFERENCE_EXCLUDED_QUANTITIES', 'values_are_equal']
 
 
-#: The geometry kinds this module knows.  Each names one mbirtorch model class.
+#: This module knows these geometry kinds.  Each one names an mbirtorch model
+#: class.
 GEOMETRY_KINDS = ('parallel', 'cone', 'multiaxis', 'translation')
 
-#: Number of points sampled along one edge of a curved detector's outline.  The
-#: outline is a closed polyline through the bottom edge and back along the top
-#: edge, so it holds 2 * CURVED_ARC_SAMPLES + 1 points.
+#: A curved detector's outline samples this many points along one edge.
 CURVED_ARC_SAMPLES = 33
 
-#: Number of points sampled around one rim of the region-of-reconstruction
-#: cylinder; see :meth:`GeometryScene.fit_points`.  The rim is a closed
-#: polyline whose last point repeats its first, so it holds 90 distinct points,
-#: one every four degrees.  A finite sample can miss the true widest point of a
-#: projected rim, and at this spacing that miss is far below half a detector
-#: pixel, the tolerance the projection tests use.
+#: Each rim of the region-of-reconstruction cylinder is sampled this many times.
+#: The last point repeats the first, so a rim holds 90 distinct points.
 RIM_SAMPLES = 91
 
-#: Default multiple of the volume's largest half-extent used as the drawing
-#: distance for a geometry whose source or detector has no physical position.
-#: This is a drawing choice, not a property of any model.  At 1.5 the drawn
-#: source of a parallel-type geometry sat close enough to the volume box to
-#: touch it in the 3D panel, so the factor is 2.5.
+#: The drawing distance is this multiple of the volume's largest half extent.  It
+#: is used where a source or a detector has no physical position.
 DEFAULT_DRAWING_DISTANCE_FACTOR = 2.5
 
-#: Default multiple of the volume's z half-extent used for the length of the
-#: drawn rotation axis, so that the axis sticks out past the volume box.
+#: The drawn rotation axis is this multiple of the volume's z half extent long,
+#: so that the axis sticks out past the volume box.
 DEFAULT_ROTATION_AXIS_EXTENSION = 1.25
 
-#: The angle the rotation-direction arc sweeps, in radians, and the number of
-#: points it is drawn with.  The arc starts at the drawn source and follows the
-#: circle the source travels on, so it needs no radius of its own.  Both are
-#: drawing choices and neither affects a detector index.
+#: The rotation direction arc sweeps this angle in radians and is drawn with
+#: this many points.  Both values are drawing choices.
 ROTATION_ARC_SWEEP = 0.5
 ROTATION_ARC_SAMPLES = 17
 
-#: The two values ``ViewScene.source_travel_sense`` can take.  The sense is
-#: named as it is seen from a point on the +z axis looking toward the origin,
-#: which is the view the top panel of a drawing shows.
+#: These are the two values ``ViewScene.source_travel_sense`` can take.  The
+#: sense is seen from a point on the +z axis looking toward the origin.
 CLOCKWISE_FROM_PLUS_Z = 'clockwise seen from +z'
 COUNTERCLOCKWISE_FROM_PLUS_Z = 'counterclockwise seen from +z'
 
-#: Entries of ``derived_quantities`` that :meth:`GeometryScene.differences`
-#: does not report.  Each is a sentence that explains the numbers beside it, so
-#: a comparison listing it would print a paragraph twice and would say nothing
-#: the other entries do not already say.
+#: :meth:`GeometryScene.differences` does not report these entries of
+#: ``derived_quantities``.  Each of them is explanatory prose and not a number.
 DIFFERENCE_EXCLUDED_QUANTITIES = ('angle_note', 'drawing_note')
 
-#: The multiaxis source-side convention.  A parallel projection is the same in
-#: both directions along a ray, so measurement cannot say which end of a ray
-#: holds the source.  True puts the source on the +y side, as the cone and
-#: translation geometries do.  A positive elevation then puts the source below
-#: the xy plane and the detector center above it.  Setting this to False
-#: reverses the direction of travel and swaps the two, and changes nothing about
-#: the detector indices a point receives.
+#: The multiaxis source side convention.  True puts the source on the +y side, as
+#: the cone and translation geometries do.  Detector indices do not depend on it.
 MULTIAXIS_SOURCE_ON_PLUS_Y = True
 
 
-# Parameter names read from a model, by geometry kind.  ``from_model`` reads
-# exactly these names through ``model.get_params``, so the scene depends on the
-# parameter interface and not on any model class.
+# Parameter names read from a model through ``get_params``, by geometry kind.
 _COMMON_PARAMETER_NAMES = (
     'sinogram_shape', 'recon_shape', 'delta_voxel', 'voxel_row_aspect',
     'voxel_slice_aspect', 'delta_det_channel', 'delta_det_row',
     'det_channel_offset', 'det_row_offset', 'use_ror_mask',
 )
 
-# The parallel and translation models have no recon_slice_offset parameter and
-# raise on that name, so it is requested only where it exists.
+# The parallel and translation models raise on recon_slice_offset, so that name
+# is requested only for the kinds that have it.
 _KIND_PARAMETER_NAMES = {
     'parallel': ('angles',),
     'cone': ('view_params_array', 'source_detector_dist', 'source_iso_dist',
@@ -165,9 +145,8 @@ def required_parameter_names(kind):
 def _rotation_about_z(angle):
     """The 3x3 matrix that rotates a point about the z axis by ``angle``.
 
-    The sense is the right-handed one: a positive angle carries the +x axis
-    toward the +y axis, which is counterclockwise seen from a point on the +z
-    axis looking toward the origin.
+    The rotation is right handed.  A positive angle carries the +x axis toward
+    the +y axis.
     """
     cosine, sine = np.cos(angle), np.sin(angle)
     return np.array([[cosine, -sine, 0.0],
@@ -213,11 +192,6 @@ def _merged_intervals(intervals):
     """Overlapping (low, high) pairs joined into the fewest pairs that cover
     the same set.
 
-    The pairs are sorted and then walked once.  A pair that starts at or before
-    the end of the pair being built extends it; a pair that starts after it
-    begins a new one, which is the gap that makes the union smaller than the
-    hull.
-
     Args:
         intervals (sequence): the (low, high) pairs, in any order.
 
@@ -245,16 +219,10 @@ def _unit(vector):
 def _model_with_parameters(model, overrides):
     """A new model of the same class with some parameters replaced.
 
-    The copy is for drawing only: it is never used to project data, so
-    compilation is off.  It is built directly from the model's own
-    parameters rather than with ``build_model`` or ``copy_ct_model``, so
-    that the automatic reconstruction geometry does not follow an override.
-    The constructor runs that automatic pass once, and every value it sets
-    is then replaced through ``set_params`` by the model's own values, with
-    the overrides applied last.  The copy therefore holds exactly the
-    model's values and the overrides, even when an override is a detector
-    parameter that the automatic pass would follow.  Warnings from the
-    constructor are silenced: the original model already issued them.
+    The copy is used for drawing only and never projects data, so compilation
+    is off.  The constructor sets an automatic reconstruction geometry.  Every
+    value it sets is then replaced by the model's own values, and the overrides
+    are applied last.
     """
     required, optional, regularization = model.get_all_params()
     constructor_args = {name: value for name, value in required.items()
@@ -441,9 +409,7 @@ class GeometryScene:
         self._read_source_and_detector_distances()
         self._set_drawing_distance()
 
-    # ------------------------------------------------------------------
     # Construction
-    # ------------------------------------------------------------------
 
     @classmethod
     def from_model(cls, model, **kwargs):
@@ -513,11 +479,10 @@ class GeometryScene:
     def _read_detector(self):
         """Read the detector pitches and offsets, and the pitches actually used.
 
-        The parallel geometry is the one exception: the projector sends recon
-        slice m to detector row m, so its row pitch is ``delta_voxel`` and its
-        row offset is zero.  ``delta_det_row`` and ``det_row_offset`` take no
-        part in a parallel projection at all, and a drawing that used them
-        would show rows in the wrong places.
+        The parallel projector sends recon slice m to detector row m.  Its row
+        pitch is therefore ``delta_voxel`` and its row offset is zero.  The
+        parameters ``delta_det_row`` and ``det_row_offset`` take no part in a
+        parallel projection.
         """
         self.delta_det_channel = float(self.params['delta_det_channel'])
         self.delta_det_row = float(self.params['delta_det_row'])
@@ -576,11 +541,10 @@ class GeometryScene:
     def _read_source_and_detector_distances(self):
         """Read the two distances and work out the magnification.
 
-        A cone geometry accepts an infinite source-detector distance, and its
-        magnification is then one.  Such a geometry is a parallel projection
-        that still uses ``delta_det_row`` and ``det_row_offset`` for its rows,
-        unlike the parallel model.  Its source and detector have no finite
-        position, so both become drawing choices.
+        A cone geometry accepts an infinite source to detector distance.  Its
+        magnification is then one and neither its source nor its detector has a
+        finite position.  It still uses ``delta_det_row`` and ``det_row_offset``
+        for its rows, unlike the parallel model.
         """
         self.source_detector_dist = None
         self.source_iso_dist = None
@@ -616,12 +580,9 @@ class GeometryScene:
     def _set_drawing_distance(self):
         """Choose the distance used where a position is a drawing choice.
 
-        The rule is a multiple of the volume's largest half-extent, taken over
-        all three axes so that the drawn source and detector always sit outside
-        the volume box.  This distance affects only where things are drawn.  It
-        never affects a detector index, because a parallel projection's
-        detector coordinates do not depend on where along the ray the detector
-        plane sits.
+        The distance is a multiple of the volume's largest half extent over all
+        three axes.  The drawn source and detector therefore sit outside the
+        volume box.  The distance affects no detector index.
         """
         half_extents = self.volume_half_extents()
         largest = float(max(half_extents))
@@ -629,9 +590,7 @@ class GeometryScene:
             largest = max(self.delta_voxel, 1.0)
         self.drawing_distance = self.drawing_distance_factor * largest
 
-    # ------------------------------------------------------------------
     # The volume
-    # ------------------------------------------------------------------
 
     def volume_half_extents(self):
         """Half the volume's physical size along x, y, and z, as a 3-tuple.
@@ -718,9 +677,7 @@ class GeometryScene:
                     radius=float(max(semi_axis_x, semi_axis_y)),
                     z_min=float(z_min), z_max=float(z_max))
 
-    # ------------------------------------------------------------------
     # The view action
-    # ------------------------------------------------------------------
 
     def view_action(self, view_index):
         """The affine map from the object frame to the projector frame.
@@ -778,9 +735,7 @@ class GeometryScene:
                              f'[0, {self.num_views}).')
         return view_index
 
-    # ------------------------------------------------------------------
     # Projection onto the detector
-    # ------------------------------------------------------------------
 
     def detector_iso_and_center_indices(self):
         """The fractional (row, channel) indices of the detector iso and of the
@@ -838,16 +793,12 @@ class GeometryScene:
         """
         return self.model.project_points(points_xyz, view_index)
 
-    # ------------------------------------------------------------------
     # The source and the detector in the projector frame
-    # ------------------------------------------------------------------
 
     def _source_projector_frame(self):
         """The source position in the projector frame, or None.
 
-        None means the source is infinitely far away, which is the case for the
-        parallel and multiaxis geometries and for a cone geometry with an
-        infinite source-detector distance.
+        None means that the source is infinitely far away.
         """
         if self.is_parallel_type:
             return None
@@ -856,11 +807,9 @@ class GeometryScene:
     def _ray_direction_projector_frame(self, view_index):
         """The central ray's unit direction in the projector frame.
 
-        The direction points from the source toward the detector.  It is
-        constant except for the multiaxis geometry, whose per-view elevation
-        tilts it out of the xy plane.  The multiaxis direction of travel is
-        ``(0, -cos(elevation), sin(elevation))`` under the source-on-+y
-        convention; see ``MULTIAXIS_SOURCE_ON_PLUS_Y``.
+        The direction points from the source toward the detector.  The
+        multiaxis direction is ``(0, -cos(elevation), sin(elevation))`` when
+        the source is on the +y side.
         """
         if self.kind != 'multiaxis':
             return np.array([0.0, -1.0, 0.0])
@@ -887,10 +836,8 @@ class GeometryScene:
     def _detector_origin_projector_frame(self, view_index):
         """Where the central ray meets the detector, in the projector frame.
 
-        For a finite cone or translation geometry this is a physical position:
-        the detector plane sits at ``source_detector_dist`` from the source on
-        the far side of the origin.  For a parallel projection the position
-        along the ray is a drawing choice, and the drawing distance is used.
+        For a parallel projection the position along the ray is a drawing
+        choice, and the drawing distance is used.
         """
         direction = self._ray_direction_projector_frame(view_index)
         if self.is_parallel_type:
@@ -901,14 +848,10 @@ class GeometryScene:
     def _uv_to_projector_frame(self, u, v, view_index):
         """Physical positions of detector coordinates (u, v), (N, 3).
 
-        A flat detector is a plane, and (u, v) are Cartesian coordinates on it.
         A curved detector is a cylinder of radius ``source_detector_dist``
-        whose axis passes through the source parallel to z.  On the cylinder u
-        is arc length from the central ray and v is height along z, so a pixel
-        at (u, v) sits at angle ``u / source_detector_dist`` around the axis.
-        The row spacing on that surface is the tangent-plane spacing the
-        projector uses, so a curved detector's rows are drawn at equal heights
-        rather than at equal angles.
+        whose axis passes through the source parallel to z.  On that cylinder u
+        is arc length from the central ray and v is height along z.  Its rows
+        are therefore drawn at equal heights rather than at equal angles.
         """
         u = np.atleast_1d(np.asarray(u, dtype=np.float64))
         v = np.atleast_1d(np.asarray(v, dtype=np.float64))
@@ -945,9 +888,7 @@ class GeometryScene:
         return (float(self.num_det_channels * self.delta_det_channel),
                 float(self.num_det_rows * self.row_pitch))
 
-    # ------------------------------------------------------------------
     # Drawable primitives
-    # ------------------------------------------------------------------
 
     def _detector_outline_uv(self):
         """The detector outline as (u, v) samples of a closed polyline.
@@ -1002,11 +943,8 @@ class GeometryScene:
         detector_origin = to_object(
             self._detector_origin_projector_frame(view_index))[0]
         if source is None:
-            # No finite source position exists, so the drawing places one at
-            # the drawing distance back along the ray from where the central
-            # ray meets the detector plane.  Every parallel-type detector
-            # origin is itself one drawing distance out from the origin, so
-            # this puts the drawn source symmetrically on the other side.
+            # No finite source position exists.  The drawn source goes two drawing
+            # distances back along the ray from the detector origin.
             source_draw = detector_origin - 2.0 * self.drawing_distance * ray_direction
         else:
             source_draw = source
@@ -1033,11 +971,8 @@ class GeometryScene:
             pixel0_u, pixel0_v, view_index))[0]
 
         if self.is_parallel_type:
-            # Four rays converging on the drawn source would draw a cone beam,
-            # which is not this geometry.  The rays are parallel to the ray
-            # direction instead, and each is drawn as long as the drawn central
-            # ray, so that the four rays and the central ray start in one
-            # plane through the drawn source.
+            # The four rays stay parallel to the ray direction.  Rays that
+            # converged on the drawn source would show a cone beam.
             length = float(np.linalg.norm(source_draw - detector_origin))
             starts = detector_corners - length * ray_direction[None, :]
             corner_rays = np.stack([starts, detector_corners], axis=1)
@@ -1051,9 +986,8 @@ class GeometryScene:
         row, channel = self.project_points(volume_corners, view_index)
         volume_outline_on_detector = np.stack([row, channel], axis=1)
 
-        # The region of reconstruction's own outline on the detector, from the
-        # same projection the box outline uses.  The two rims come back as one
-        # array of points, so the result is split into one entry per rim.
+        # The two rims come back from the projection as one array of points,
+        # so the result is split into one entry per rim.
         cylinder = self.ror_cylinder()
         ror_outline_on_detector = None
         if cylinder is not None:
@@ -1103,18 +1037,10 @@ class GeometryScene:
     def _source_travel(self, view_index, source_draw):
         """Which way the source moves from this view to the next one.
 
-        The arc lies on the circle about the rotation axis that the source
-        travels on, so its radius and its height are the drawn source's own.
-        It starts at the drawn source and sweeps ``rotation_arc_sweep``
-        radians.  The direction comes from the sign of the step between this
-        view's angle and the next one, so a model whose angles fall gets an arc
-        the other way.
-
-        The sense follows the projector's convention.  A growing view angle
-        turns the object counterclockwise seen from +z, so in a drawing that
-        holds the object fixed the source turns clockwise.  The source's
-        azimuth is ``pi / 2`` minus the view angle, which is why a rising
-        angle gives a falling azimuth.
+        The arc starts at the drawn source and sweeps ``rotation_arc_sweep``
+        radians along the circle the source travels on.  A growing view angle
+        turns the object counterclockwise seen from +z.  With the object held
+        fixed the source therefore turns clockwise.
 
         Args:
             view_index (int): the view.
@@ -1193,8 +1119,7 @@ class GeometryScene:
     def _ray_directions_all_views(self):
         """The central ray's unit direction in the projector frame, (V, 3).
 
-        This is the vectorized form of
-        :meth:`_ray_direction_projector_frame`, used by :meth:`trajectory`.
+        This is the vectorized form of :meth:`_ray_direction_projector_frame`.
         """
         if self.kind != 'multiaxis':
             return np.tile(np.array([0.0, -1.0, 0.0]), (self.num_views, 1))
@@ -1218,11 +1143,7 @@ class GeometryScene:
                 + self.source_detector_dist * directions)
 
     def _detector_centers_all_views(self, directions, origins):
-        """The center of the detector grid, projector frame, (V, 3).
-
-        This is the vectorized form of ``_uv_to_projector_frame`` evaluated at
-        (u, v) = (-det_channel_offset, -row_offset), which is the grid center.
-        """
+        """The center of the detector grid, projector frame, (V, 3)."""
         u = -self.det_channel_offset
         v = -self.row_offset
         if self.kind == 'cone' and self.use_curved_detector:
@@ -1245,9 +1166,7 @@ class GeometryScene:
     def _to_object_frame_all_views(self, points):
         """One projector-frame point per view, (V, 3), in the object frame.
 
-        This is :meth:`to_object_frame` applied view by view, written out over
-        the whole scan at once.  The rotation about z is written as its two
-        rows rather than as a matrix product, so no per-view matrix is built.
+        This is the vectorized form of :meth:`to_object_frame`.
         """
         points = np.asarray(points, dtype=np.float64).reshape(self.num_views, 3)
         if self.kind == 'translation':
@@ -1278,8 +1197,7 @@ class GeometryScene:
         directions = self._ray_directions_all_views()
         origins = self._detector_origins_all_views(directions)
         if self.is_parallel_type:
-            # The same rule source_draw uses: one drawing distance back from
-            # the detector origin on each side of the volume.
+            # The drawn source follows the same rule source_draw uses.
             sources = origins - 2.0 * self.drawing_distance * directions
         else:
             sources = np.tile(np.array([0.0, self.source_iso_dist, 0.0]),
@@ -1288,9 +1206,7 @@ class GeometryScene:
         return (self._to_object_frame_all_views(sources),
                 self._to_object_frame_all_views(centers))
 
-    # ------------------------------------------------------------------
     # Derived numbers
-    # ------------------------------------------------------------------
 
     def fit_shape(self):
         """Which shape the fit statement tests, as ``'cylinder'`` or ``'box'``.
@@ -1405,9 +1321,8 @@ class GeometryScene:
         points = self.fit_points()
         num_shape_points = int(points.shape[0])
         z_min, z_max = self.volume_z_range()
-        # The two axis points ride along with the shape's points, and every
-        # view is projected in one call, so the whole report costs one call to
-        # project_points.
+        # The two axis points ride along with the shape's points, so the whole
+        # report costs one call to project_points.
         probe_points = np.concatenate([points,
                                        np.array([[0.0, 0.0, z_min],
                                                  [0.0, 0.0, z_max]])])
@@ -1424,13 +1339,9 @@ class GeometryScene:
         views_leaving = int(np.count_nonzero(
             np.maximum(row_over, channel_over) > 0.0))
 
-        # The axial coverage, view by view, from the two axis columns.  The
-        # row index is an affine function of z along the line x = y = 0, so
-        # the two projected rows give that line's slope and intercept, and
-        # the coverage is the z range that lands between the detector's first
-        # and last row edge.  A view whose two rows are equal says nothing
-        # about z and is dropped, as is every view when the volume has no z
-        # extent.
+        # The row index is an affine function of z along the line x = y = 0, so the
+        # two projected rows give the z range between the first and last row edge.
+        # A view whose two rows are equal says nothing about z and is dropped.
         row_at_z_min = row[:, num_shape_points]
         row_at_z_max = row[:, num_shape_points + 1]
         if z_max == z_min:
@@ -1456,10 +1367,8 @@ class GeometryScene:
 
         worst = max(worst_row, worst_channel)
         helical_rule = self.kind == 'cone' and self.helical_travel() > 0.0
-        # The lateral question is the same for every scan.  The axial question
-        # is about the rows for a scan that does not travel, and about the
-        # swept coverage for one that does (the two answers are reported
-        # separately, because one answer would hide which direction misses).
+        # The axial question asks about the rows for a scan that does not
+        # travel and about the swept coverage for one that does.
         fits_laterally = worst_channel <= 0.0
         fits_axially = covered if helical_rule else worst_row <= 0.0
         fits = fits_laterally and fits_axially
@@ -1492,9 +1401,8 @@ class GeometryScene:
     def _overshoot(indices, count):
         """How far the given indices reach past the ends of a detector axis.
 
-        The reduction is along the last axis, so an array of one view's
-        indices gives one number and an array of shape (num_views, N) gives
-        one number per view.
+        The reduction runs along the last axis, so an array of shape
+        (num_views, N) gives one number per view.
         """
         indices = np.asarray(indices, dtype=np.float64)
         low = np.max(-0.5 - indices, axis=-1)
@@ -1505,9 +1413,7 @@ class GeometryScene:
         """The full fan and cone angles in degrees, and a note about them.
 
         Each angle is the angle the detector subtends at the source, measured
-        edge to edge, so a detector offset makes the fan asymmetric about the
-        central ray but does not change this total.  A parallel projection's
-        rays do not converge, so both angles are zero.
+        edge to edge.  Both angles are zero for a parallel projection.
         """
         if self.is_parallel_type:
             return 0.0, 0.0, ('The rays are parallel, so the source subtends '
@@ -1660,9 +1566,7 @@ class GeometryScene:
                     'choices at the drawing distance.')
         return 'Every position drawn is taken from the parameters.'
 
-    # ------------------------------------------------------------------
     # Comparing two scenes
-    # ------------------------------------------------------------------
 
     def drawing_options(self):
         """The drawing choices this scene was built with, as a dictionary.

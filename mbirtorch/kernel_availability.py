@@ -36,48 +36,24 @@ import os
 
 import torch
 
-# Kill switch: set to 1 to force the fallback paths (a bisection handle, and
-# the escape hatch when a toolchain compiles the probe but miscompiles the
-# real kernels).
+# Setting this variable to 1 forces the fallback paths for every kernel.
 DISABLE_ENV_VAR = 'MBIRTORCH_DISABLE_TRITON'
 
-# RETIRED opt-in switches.  The selection protocol is that each kernel is
-# opt-in through its own environment variable until ITS OWN composed
-# performance gate passes, and then defaults on wherever the availability
-# gates pass.  All four kernels have now passed their gates (cone 2026-08-07,
-# parallel later the same day), so every switch below is retired and no
-# selection reads them; they stay defined so any script still exporting one
-# is harmless.  MBIRTORCH_DISABLE_TRITON is the kill switch for all kernels.
-# The multiaxis pair, routed later, never had a switch of its own: its
-# selection reads the availability gates alone, and no composed performance
-# measurement has been made for that geometry yet (see
-# MultiAxisParallelModel._view_batch_bodies, which says so at the selection).
+# Nothing reads the three names below.  They stay defined so that a script
+# still exporting one of them is harmless.
 ENABLE_FWD_ENV_VAR = 'MBIRTORCH_ENABLE_TRITON_FWD'
 ENABLE_PBACK_ENV_VAR = 'MBIRTORCH_ENABLE_TRITON_PBACK'
 ENABLE_PFWD_ENV_VAR = 'MBIRTORCH_ENABLE_TRITON_PFWD'
 
-# Relative tolerance of the value self-checks, at the design's Hessian-path
-# figure: the cone kernels reproduce the torch bodies only up to the documented
-# rounding carve-out (the sqrt-vs-atan2 divisor and the floor-vs-round tie),
-# and the self-check runs coeff_power 2, where that gap is squared.  The
-# parallel kernels carry no such carve-out (no vertical fan, so no divisor and
-# no center rounding) and differ from their bodies by float summation order
-# alone; they share the figure rather than a tighter one of their own, because
-# what a self-check must catch is a miscompile, not a ULP.  The multiaxis
-# kernels have no cone-angle divisor either, and their one carve-out -- the
-# floor-vs-round row center -- moves only taps whose weight is exactly zero
-# (see the module docstring of triton_multiaxis.py), so they share the figure
-# for the same reason the parallel pair does.
+# Relative tolerance of the value self-checks.  It is set to catch a
+# miscompiled kernel, not a difference of a few units in the last place.
 SELF_CHECK_REL_TOL = 1e-4
 
-# Module-level cache of the single probe result: compiling even a trivial
-# kernel costs real time, and the answer cannot change within a process.
+# The probe result is cached, because the answer cannot change in a process.
 _PROBE_RESULT = None
 
-# Per-device caches of the six self-checks, keyed by device string: each
-# check builds a model, compiles a kernel, and runs both bodies, so it must
-# happen once per process -- and its answer is a property of the DEVICE and
-# its toolchain, not of the calling model.
+# The self-check results are cached per device string.  Each answer is a
+# property of the device and its toolchain, not of the calling model.
 _CONE_BACK_RESULTS = {}
 _CONE_FWD_RESULTS = {}
 _PARALLEL_BACK_RESULTS = {}
@@ -85,12 +61,8 @@ _PARALLEL_FWD_RESULTS = {}
 _MULTIAXIS_BACK_RESULTS = {}
 _MULTIAXIS_FWD_RESULTS = {}
 
-# Re-entrancy flag: a self-check builds its own tiny model, whose
-# create_projectors asks this same module which bodies to use.  While ANY
-# check runs, every answer must be "the torch body" -- otherwise the probe
-# model would recurse into the check it is part of.  One flag covers all six
-# checks because the recursion it blocks is not per geometry: the flag is read
-# by every gate, so a parallel check's model cannot trip a cone gate either.
+# A self-check builds its own small model, which asks this module which bodies to
+# use.  While any check runs, every gate must answer with the torch body.
 _SELF_CHECK_ACTIVE = False
 
 
@@ -246,8 +218,8 @@ def multiaxis_forward_kernel_usable(model):
 
 
 def _kernel_usable(model, cache, self_check):
-    """The shape all six gates above share: the re-entrancy guard, the
-    process-wide probe, then this device's cached value self-check."""
+    """Apply the recursion guard, the process wide probe, and this device's
+    cached self-check, in that order.  Returns (usable, reason)."""
     if _SELF_CHECK_ACTIVE:
         result = (False, 'kernel self-check in progress (its own probe model '
                          'uses the torch bodies)')
@@ -264,13 +236,11 @@ def _kernel_usable(model, cache, self_check):
 
 
 def _cone_self_check_cell(device_key):
-    """The tiny cone problem both cone self-checks run on: (model,
-    pixel_indices, view_params, body kwargs).
+    """Build the small cone problem the cone self-checks run on.
 
-    Small enough to cost milliseconds and shaped to reach every branch of the
-    kernels: four views (so the back kernel's view reduction runs), a real cone
-    angle, and one pixel dropped from the full index set so the pixel count is
-    not a multiple of any tile size (the last block is padded).
+    Returns (model, pixel_indices, view_params, body kwargs).  It uses four
+    views so the back kernel's view reduction runs, a real cone angle, and one
+    pixel dropped so the pixel count is not a multiple of any tile size.
     """
     import numpy as np
 
@@ -293,12 +263,11 @@ def _cone_self_check_cell(device_key):
 
 
 def _parallel_self_check_cell(device_key):
-    """The tiny parallel problem both parallel self-checks run on: (model,
-    pixel_indices, view_params, body kwargs) -- the cone cell's twin, at the
-    same size and with the same padded last pixel block, over a half turn of
-    real angles so the projected footprint varies from view to view (W_p_c and
-    weight_scale are per-view under parallel beam, so a single angle would
-    exercise one value of each)."""
+    """Build the small parallel beam problem the parallel self-checks run on.
+
+    Returns (model, pixel_indices, view_params, body kwargs).  The angles cover
+    a half turn, so the projected footprint varies from view to view.
+    """
     import numpy as np
 
     from .parallel_beam import ParallelBeamModel
@@ -319,17 +288,12 @@ def _parallel_self_check_cell(device_key):
 
 
 def _multiaxis_self_check_cell(device_key):
-    """The tiny multiaxis problem both multiaxis self-checks run on: (model,
-    pixel_indices, view_params, body kwargs) -- the cone and parallel cells'
-    twin, at the same size and with the same padded last pixel block, over a
-    half turn of azimuths so the horizontal footprint varies from view to view.
+    """Build the small multiaxis problem the multiaxis self-checks run on.
 
-    The elevations carry a REAL spread rather than sitting at zero.  At zero
-    elevation this geometry is parallel beam: the vertical footprint is the
-    voxel slice pitch, the mass-conserving amplitude is 1, and the slope of the
-    slice-to-row map is fixed, so a zero-elevation cell would leave untested
-    every term the geometry adds.  The spread stays well inside the model's
-    45-degree warning, so the check builds its model without a warning.
+    Returns (model, pixel_indices, view_params, body kwargs).  The elevations
+    are spread away from zero, because at zero elevation this geometry reduces
+    to parallel beam and the terms it adds would go untested.  The spread stays
+    inside the model's 45 degree warning.
     """
     import numpy as np
 
@@ -369,8 +333,8 @@ def _cone_back_self_check(device_key):
 
         model, pixel_indices, view_params, args = _cone_self_check_cell(
             device_key)
-        # A private generator: the seeded recon gates depend on the global RNG
-        # streams, and an availability check must not advance them.
+        # A private generator keeps this check from advancing the global RNG
+        # streams, which the seeded recon tests depend on.
         generator = torch.Generator().manual_seed(0)
         sinogram = torch.rand(tuple(model.get_params('sinogram_shape')),
                               generator=generator).to(model.torch_device)
@@ -410,10 +374,8 @@ def _cone_forward_self_check(device_key):
                             generator=generator).to(model.torch_device)
 
         worst_rel = 0.0
-        # The whole volume, then an interior band: the band exercises the
-        # slice_start seam, whose z anchor stays on the full slice count (the
-        # forward carries its band in the VALUES, so nothing else says which
-        # slices these are).
+        # The check runs the whole volume and then an interior band, which
+        # exercises the slice_start seam.
         interior = max(1, num_slices // 3)
         bands = ((0, num_slices), (interior, num_slices - 2 * interior))
         for slice_start, band_len in bands:
@@ -445,16 +407,15 @@ def _parallel_back_self_check(device_key):
 
         model, pixel_indices, view_params, args = _parallel_self_check_cell(
             device_key)
-        # A private generator: the seeded recon gates depend on the global RNG
-        # streams, and an availability check must not advance them.
+        # A private generator keeps this check from advancing the global RNG
+        # streams, which the seeded recon tests depend on.
         generator = torch.Generator().manual_seed(0)
         sinogram = torch.rand(tuple(model.get_params('sinogram_shape')),
                               generator=generator).to(model.torch_device)
 
         worst_rel = 0.0
-        # Every row, then an interior row band: a row-aligned geometry bands in
-        # the SINOGRAM's row axis (rows track slices), so slicing the input is
-        # the whole of the banded seam and the output band comes back with it.
+        # A row aligned geometry bands in the sinogram's row axis, so slicing
+        # the input is the whole of the banded seam.
         num_rows = int(sinogram.shape[1])
         interior = max(1, num_rows // 3)
         bands = ((0, num_rows), (interior, num_rows - 2 * interior))
@@ -494,10 +455,8 @@ def _parallel_forward_self_check(device_key):
                             generator=generator).to(model.torch_device)
 
         worst_rel = 0.0
-        # The whole volume, then an interior band: the forward carries its band
-        # in the COLUMN count of the values, and each band produces the
-        # matching detector rows rather than a partial of the whole sinogram
-        # (the row-aligned form's difference from the cone forward's).
+        # The forward carries its band in the column count of the values, and
+        # each band produces the matching detector rows.
         interior = max(1, num_slices // 3)
         bands = ((0, num_slices), (interior, num_slices - 2 * interior))
         for slice_start, band_len in bands:
@@ -528,16 +487,15 @@ def _multiaxis_back_self_check(device_key):
 
         model, pixel_indices, view_params, args = _multiaxis_self_check_cell(
             device_key)
-        # A private generator: the seeded recon gates depend on the global RNG
-        # streams, and an availability check must not advance them.
+        # A private generator keeps this check from advancing the global RNG
+        # streams, which the seeded recon tests depend on.
         generator = torch.Generator().manual_seed(0)
         sinogram = torch.rand(tuple(model.get_params('sinogram_shape')),
                               generator=generator).to(model.torch_device)
 
         worst_rel = 0.0
-        # The whole volume, then an interior slice band: the band exercises the
-        # band_slices seam, whose row anchor stays on the full slice count, and
-        # its length is not a multiple of the kernel's padded launch width.
+        # The interior band exercises the band_slices seam, and its length is
+        # not a multiple of the kernel's padded launch width.
         num_slices = int(args['num_slices'])
         interior = max(1, num_slices // 3)
         bands = ((0, num_slices), (interior, num_slices - 2 * interior))
@@ -578,10 +536,8 @@ def _multiaxis_forward_self_check(device_key):
                             generator=generator).to(model.torch_device)
 
         worst_rel = 0.0
-        # The whole volume, then an interior band: the band exercises the
-        # slice_start seam, whose row anchor stays on the full slice count (the
-        # forward carries its band in the VALUES, so nothing else says which
-        # slices these are).
+        # The check runs the whole volume and then an interior band, which
+        # exercises the slice_start seam.
         interior = max(1, num_slices // 3)
         bands = ((0, num_slices), (interior, num_slices - 2 * interior))
         for slice_start, band_len in bands:
@@ -617,16 +573,15 @@ def _self_check_verdict(name, device_key, worst_rel):
 
 
 def _reset_probe_cache():
-    """Drop the cached probe result so the next call probes again (tests:
-    the kill switch is read INSIDE the probe, so flipping it takes effect
-    only across a reset)."""
+    """Drop the cached probe result so the next call probes again.  The kill
+    switch is read inside the probe, so changing it takes effect only after
+    this reset."""
     global _PROBE_RESULT
     _PROBE_RESULT = None
 
 
 def _reset_self_check_cache():
-    """Drop the cached per-device self-check results (tests: the kill switch
-    and the probe cache are read inside the gates above)."""
+    """Drop the cached per-device self-check results."""
     _CONE_BACK_RESULTS.clear()
     _CONE_FWD_RESULTS.clear()
     _PARALLEL_BACK_RESULTS.clear()

@@ -36,26 +36,24 @@ from .tomography_model import cpu_devices, default_devices, gpu_devices
 
 
 def _canonical_device(device):
-    """A ``torch.device`` with an explicit index for the device types that
-    take one, so that ``'cuda'`` and ``'cuda:0'`` name the same device."""
+    """Return a ``torch.device`` with an explicit index for the device types
+    that take one, so that ``'cuda'`` and ``'cuda:0'`` name the same
+    device."""
     device = torch.device(device)
     if device.type in ('cuda', 'mps', 'xpu') and device.index is None:
         return torch.device(device.type, 0)
     return device
 
 
-# ── a matrix applied along one axis ──────────────────────────────────────────
 def _filter_along_axis(x, matrix, axis):
     """Apply a square matrix along one axis of a tensor, on the tensor's
-    device and in its dtype.  :func:`mbirtorch.mace4d.apply_temporal_filter`
-    is the public version of this helper."""
+    device and in its dtype."""
     matrix = matrix.to(device=x.device, dtype=x.dtype)
     moved = x.movedim(axis, 0)
     filtered = torch.tensordot(matrix, moved, dims=1)
     return filtered.movedim(0, axis)
 
 
-# ── the device pool ──────────────────────────────────────────────────────────
 def resolve_device_pool(devices=None):
     """
     Turn a description of a device pool into a list of ``torch.device``.
@@ -96,10 +94,9 @@ def resolve_device_pool(devices=None):
 def _reject_repeated_gpu(pool):
     """Return ``pool`` unchanged, or raise when it names a GPU twice.
 
-    Two workers on one GPU gain nothing: on a CUDA device they share one
-    stream, and on an Apple GPU they crash inside Metal.  A repeated CPU entry
-    stays allowed, because repeating the CPU is how a pool exercises its
-    threaded path on a machine with no GPU.
+    Two workers on one CUDA device share one stream, and two workers on one
+    Apple GPU fail inside Metal.  A repeated CPU entry is allowed, because
+    repeating the CPU runs the threaded path on a machine with no GPU.
     """
     seen = set()
     for device in pool:
@@ -115,17 +112,16 @@ def _reject_repeated_gpu(pool):
 
 
 def _available_devices():
-    """The default devices, capped by the count ``MBIRTORCH_NUM_DEVICES``
-    pins.  The pin holds for the whole process, so the automatic pool honors
-    it."""
+    """Return the default devices, capped by the count
+    ``MBIRTORCH_NUM_DEVICES`` pins."""
     pool = [_canonical_device(d) for d in default_devices()]
     pinned = pinned_device_count()
     return pool if pinned is None else pool[:pinned]
 
 
 def _device_pool(devices):
-    """The pool of :func:`resolve_device_pool`, before the repeated-GPU
-    check."""
+    """Return the pool of :func:`resolve_device_pool`, before the check for a
+    repeated GPU."""
     if devices is None:
         return _available_devices()
     if isinstance(devices, torch.device):
@@ -166,7 +162,6 @@ def _device_pool(devices):
     return [_canonical_device(d) for d in devices]
 
 
-# ── tasks: the unit of work the loop schedules ───────────────────────────────
 class Task:
     """
     One unit of an agent's work.
@@ -200,8 +195,8 @@ class Task:
 
 
 def _tasks_of(agent, w, iteration):
-    """The tasks of an agent: its own, or one task over the whole array on
-    its own device when it provides none."""
+    """Return the agent's own tasks, or one task over the whole array on the
+    agent's device when it provides none."""
     if hasattr(agent, 'tasks'):
         return list(agent.tasks(w, iteration))
     device = getattr(agent, 'device', None)
@@ -209,16 +204,15 @@ def _tasks_of(agent, w, iteration):
 
 
 def _chunk_count(tensor):
-    """How many chunks to reduce a tensor in, so that the temporaries of the
-    reduction stay near a fixed size whatever the tensor's size."""
+    """Return the number of chunks to reduce a tensor in, so that the
+    temporaries of the reduction stay near a fixed size."""
     n_bytes = tensor.numel() * tensor.element_size()
     return min(ELL1_MAX_CHUNKS, max(1, round(n_bytes / ELL1_CHUNK_BYTES)))
 
 
 def _norms_of_change(new, previous):
-    """``(||new - previous||, ||previous||)`` reduced a chunk at a time, so no
-    full-size temporary is allocated.  Both tensors are read flat, which is a
-    view because the loop's state tensors are contiguous."""
+    """Return ``(||new - previous||, ||previous||)``.  The sums are reduced a
+    chunk at a time, so no full-size temporary is allocated."""
     new_flat = new.reshape(-1)
     previous_flat = previous.reshape(-1)
     n_chunks = _chunk_count(new_flat)
@@ -231,10 +225,9 @@ def _norms_of_change(new, previous):
 
 
 def _sum_of_squared_difference(x, reference):
-    """``sum((x - reference)^2)`` reduced a chunk at a time along the first
-    axis, so the temporaries are a fraction of the region.  ``reference`` may
-    be a non-contiguous view, so the chunks are cut along an axis rather than
-    over a flattened copy."""
+    """Return ``sum((x - reference)^2)``, reduced a chunk at a time along the
+    first axis.  ``reference`` may be a non-contiguous view, so the chunks
+    are cut along an axis rather than over a flattened copy."""
     n_chunks = min(_chunk_count(x), max(1, int(x.shape[0]))) if x.ndim > 0 else 1
     total = 0.0
     for a, b in zip(torch.chunk(x, n_chunks, dim=0), torch.chunk(reference, n_chunks, dim=0)):
@@ -262,7 +255,6 @@ class _Worker(threading.Thread):
             job()
 
 
-# ── the loop ─────────────────────────────────────────────────────────────────
 class MACE:
     """
     The MACE consensus iteration over a list of agents.
@@ -344,8 +336,8 @@ class MACE:
         self._pool = None if devices is None else resolve_device_pool(devices)
         self._workers = None
         self._lock = threading.Lock()
-        # Set when a step raised partway: some inputs then hold a partial
-        # update and the loop refuses further steps until a state is loaded.
+        # This is set when a step raised partway.  Some inputs then hold a partial
+        # update, and the loop refuses further steps until a state is loaded.
         self._inconsistent = False
 
     @property
@@ -357,7 +349,6 @@ class MACE:
         """The device pool, or None when tasks run inline."""
         return None if self._pool is None else list(self._pool)
 
-    # ── the workers ──────────────────────────────────────────────────────────
     def _start_workers(self):
         self._workers = [_Worker(index, device) for index, device in enumerate(self._pool)]
         for worker in self._workers:
@@ -379,7 +370,6 @@ class MACE:
         self.close()
         return False
 
-    # ── one step ─────────────────────────────────────────────────────────────
     def step(self):
         """
         Run one iteration and return the percent change of the average.
@@ -457,7 +447,8 @@ class MACE:
             candidates = by_device.get(device)
             if not candidates:
                 raise ValueError(f'a task asks for device {device}, which is not in the pool {self._pool}.')
-            # Workers that share a device take that device's fixed tasks in turn.
+            # Workers that share a device take that device's fixed tasks in
+            # turn.
             index = candidates[next_on_device[device] % len(candidates)]
             next_on_device[device] += 1
             fixed[index].append(job)
@@ -511,13 +502,14 @@ class MACE:
             context['rows'].append((k, task_index, device_index, start, end))
 
     def _fold(self, k, region, x, context):
-        """Add one output region into the consensus, in place, under the lock."""
+        """Add one output region into the consensus, in place, under the
+        lock."""
         index = (Ellipsis,) if region is None else tuple(region)
         x = x.detach().to(device=self._device, dtype=self._x_bar.dtype)
         mu_k = context['mu'][k]
         rho = context['rho']
         # The previous average is not written during a step, so the spread
-        # term is reduced outside the lock, a chunk at a time.
+        # term is reduced outside the lock.
         spread = _sum_of_squared_difference(x, self._x_bar[index])
         with self._lock:
             w = self.W[k][index]
@@ -527,7 +519,6 @@ class MACE:
             w.sub_(x, alpha=2.0 * rho)
             context['spread'][k] += spread
 
-    # ── running and checkpoints ──────────────────────────────────────────────
     def run(self, max_iterations=30, stop_threshold_change_pct=0.0, callback=None):
         """
         Step until the percent change of the average falls below the
@@ -645,10 +636,9 @@ def mace(agents, x0, mu=None, rho=0.5, num_iterations=30, callback=None):
     return x_bar, info
 
 
-# ── the agents ───────────────────────────────────────────────────────────────
 def _reject_divided_output(output, agent_name):
-    """An agent returns one tensor.  A model configured on several devices
-    returns its output divided across them, which the loop cannot fold."""
+    """Raise when an agent output is divided across devices.  An agent must
+    return one tensor, which the loop can fold."""
     if isinstance(output, _sharding.Shards):
         raise ValueError(f'{agent_name} needs a model configured on one device; this model is '
                          f'configured on {output.placement.n_devices} and returned a divided array.')
@@ -851,10 +841,8 @@ class HyperplaneAgent:
             raise ValueError(f'batch_size must be at least 1; got {batch_size}.')
         self.filter_matrix = filter_matrix
         self.use_warm_start = bool(use_warm_start)
-        # The previous call's output, and whether a whole call has completed
-        # into it.  The flag turns on when the last task of a call finishes,
-        # so the tasks of the first call never read the array as a warm start,
-        # and building a call's tasks without running them changes nothing.
+        # These hold the previous call's output and whether a whole call has completed
+        # into it.  The flag turns on when the last task of a call finishes.
         self._previous_output = None
         self._have_previous = False
         self._pending_tasks = 0
@@ -862,7 +850,8 @@ class HyperplaneAgent:
         self._lock = threading.Lock()
 
     def _denoiser_for(self, device):
-        """The stack denoiser of the calling worker on ``device``, made on first use."""
+        """Return the stack denoiser of the calling worker on ``device``.  It
+        is made on first use."""
         key = (threading.get_ident(), torch.device(device))
         with self._lock:
             denoiser = self._denoisers.get(key)
@@ -894,13 +883,11 @@ class HyperplaneAgent:
         return output
 
     def _slab_copy(self, source, region, device):
-        """The slab of ``source`` over ``region`` as a fresh contiguous tensor
-        on ``device`` with the hyperplane axis first.
+        """Return the slab of ``source`` over ``region`` as a new contiguous
+        tensor on ``device``, with the hyperplane axis first.
 
-        Always a copy, because the stack denoiser may write what it is handed
-        and the array itself must not be written.  Moving a slab's axis first
-        leaves a view only when that axis has length one and the array is
-        already on ``device``, and that view is cloned."""
+        The result is always a copy, because the stack denoiser may write
+        what it is handed and ``source`` must not be written."""
         slab = source[region].to(device).movedim(self.axis, 0)
         return slab.contiguous() if not slab.is_contiguous() else slab.clone()
 
@@ -908,9 +895,8 @@ class HyperplaneAgent:
         device = torch.device(device)
         stack = self._slab_copy(w, region, device)
         if self.filter_matrix is not None:
-            # Contiguous, so that the stack denoiser's reshape to (volumes,
-            # pixels, slices) is a view and not a slab-sized copy held for
-            # the whole sweep; the filter's output is a permuted view.
+            # The filter returns a permuted view.  It is made contiguous so that the
+            # reshape to (volumes, pixels, slices) is a view rather than a copy.
             stack = _filter_along_axis(stack, self.filter_matrix, axis=1).contiguous()
         denoiser = self._denoiser_for(device)
         if self.use_warm_start and self._have_previous:
@@ -920,7 +906,8 @@ class HyperplaneAgent:
             denoised = denoiser(stack)
         result = denoised.movedim(0, self.axis).to(w.device)
         if self.use_warm_start:
-            # Tasks of one call write disjoint slabs, so the write needs no lock.
+            # Tasks of one call write disjoint slabs, so this write needs no
+            # lock.
             self._previous_output[region] = result
             with self._lock:
                 self._pending_tasks -= 1

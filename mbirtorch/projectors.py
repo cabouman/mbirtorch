@@ -27,72 +27,33 @@ from . import _sharding
 _F32 = torch.float32
 
 # ── torch.compile plumbing ────────────────────────────────────────────────────
-# Measured chain-level compile wins: 1.7-3.6x (CPU), 5-17x (MPS), and 2.6-22x
-# (CUDA), with the fan chain's peak-memory transients collapsing 6-41x.  The
-# compiled callables are cached per FUNCTION at
-# module level: torch.compile handles multiple input shapes itself (one
-# specialization per shape guard), and the VCD loop's shape set is small (one
-# subset size per partition granularity, plus the full-index size).  That set
-# must fit torch's per-function recompile budget once PER DEVICE, because the
-# per-device instances share one budget; _raise_recompile_budget below makes
-# the budget large enough.  A compile
-# failure falls back to eager silently-but-recorded, so exotic
-# backends/toolchains keep working.
+# A compile failure falls back to eager and is recorded in _COMPILE_ERRORS.
 _COMPILE_CACHE = {}
 _COMPILE_ERRORS = {}
-# Serializes COMPILE EVENTS process-wide: triton/inductor compilation is not
-# thread-safe (measured on A100, torch 2.13: two per-device threads cold-compiling
-# concurrently crash in static_triton_launcher EVEN WITH separate compiled
-# instances).  Each wrapper takes this lock only for input-shape keys it has
-# not completed before, so steady-state threaded execution stays lock-free.
+# Triton and inductor compilation is not thread safe, so this lock serializes compiles.
+# Two threads compiling at once crash in static_triton_launcher on an A100 with torch 2.13.
 _GLOBAL_COMPILE_LOCK = threading.Lock()
 
-#: The per-function recompile budget this module guarantees before it
-#: compiles anything.  torch caps how many specialized variants one function
-#: may hold (``torch._dynamo.config.recompile_limit``, default 8), and the
-#: cap attaches to the function's code object, so every per-device compiled
-#: instance of one body draws on one shared budget.  The variants guard on
-#: the input tensors' device index, so a run on n devices needs roughly n
-#: times the one-device variant count.  When a function's budget fills,
-#: torch stops compiling it, and calls that match no existing variant run
-#: eagerly from then on.  Measured 2026-08-19 on two H100s (job 15391547):
-#: the multiaxis and translation back bodies filled the default budget at
-#: several two-device cells, their remaining calls ran eagerly at 5x to 11x
-#: the compiled device time, and that was the whole measured two-device
-#: slowdown of both geometries (0.35x at the multiaxis 512-class cell).
-#: The one-device variant set fits inside torch's default of 8 at every
-#: measured cell, and a node holds at most 8 GPUs, so 8 x 8 covers the
-#: widest placement.  The accumulated limit across all functions
-#: (``accumulated_recompile_limit``, torch default 256) is left alone as
-#: the backstop against unbounded variant growth; the largest measured
-#: whole-process graph count is 36 (two devices, 3-iteration
-#: reconstruction).
+#: The per-function recompile budget this module raises before it compiles anything.  Torch's
+#: cap sits on the code object, so every per-device instance of one body shares one budget, and
+#: a run on n devices needs about n times the one-device variant count.  When the budget fills,
+#: the remaining calls run eagerly, which measured 5 to 11 times slower on two H100s.
 _RECOMPILE_LIMIT_FLOOR = 64
 
 
 def _raise_recompile_budget():
-    """Make torch's per-function recompile budget at least
-    ``_RECOMPILE_LIMIT_FLOOR``, on THIS thread, before compiling.
+    """Raise torch's per-function recompile budget to at least
+    ``_RECOMPILE_LIMIT_FLOOR`` on the calling thread.
 
-    The budget must be raised on every thread that can trigger a
-    compilation, because dynamo consults a per-thread view of this config:
-    an assignment made on one thread does not reach another (measured,
-    torch 2.13 -- a limit assigned on the main thread capped nothing on a
-    worker thread, and the same assignment made on the worker thread
-    capped it).  The per-device fan-outs run the compiled bodies on pool
-    threads, so a raise made only where the wrapper is created would leave
-    every pool thread at torch's default; that is exactly how the first
-    form of this remedy failed its gate.  ``maybe_compile``'s wrapper
-    therefore calls this on each first sight of an input shape, which is
-    on the calling thread and before any call that can compile.
+    Dynamo consults a per-thread view of this config, so the budget must be
+    raised on every thread that can trigger a compilation.  The per-device
+    fan-outs run the compiled bodies on pool threads, so each of those
+    threads raises the budget itself.
 
-    ``MBIRTORCH_RECOMPILE_LIMIT`` overrides the floor verbatim, including
-    downward, which is the debugging escape: a tiny limit makes torch's
-    recompile warnings fire early and name their guards.  Without the
-    override, a value someone already raised above the floor is kept.  Both
-    config names are set together: ``recompile_limit`` is the operative name
-    on current torch, ``cache_size_limit`` is its older spelling, and
-    leaving them different invites whichever one a future torch reads.
+    ``MBIRTORCH_RECOMPILE_LIMIT`` overrides the floor exactly, including
+    downward, which is useful for debugging.  Both config names are set
+    together, because ``recompile_limit`` is the current name and
+    ``cache_size_limit`` is its older spelling.
     """
     import torch._dynamo.config as dynamo_config
 
@@ -167,20 +128,15 @@ def maybe_compile(fn, enabled, instance_key=None):
         key = _shape_key(args, kwargs)
         if key in seen_keys:
             return state["impl"](*args, **kwargs)
-        # First sight of this shape: the call may trigger dynamo/inductor
-        # compilation, which must not run concurrently with any other
-        # compile in the process (see _GLOBAL_COMPILE_LOCK).  The budget is
-        # raised HERE, on the calling thread, because dynamo's view of it is
-        # per thread and this is the thread about to compile (see
-        # _raise_recompile_budget).
+        # This is the first call at this shape, so it may compile.  The lock keeps it
+        # from compiling at the same time as another thread.
         with _GLOBAL_COMPILE_LOCK:
             _raise_recompile_budget()
             try:
                 out = state["impl"](*args, **kwargs)
             except Exception as e:                            # noqa: BLE001
-                # Retry eagerly: if the failure was the compile backend, this
-                # succeeds and we fall back for good; a real input error
-                # re-raises.
+                # A compile backend failure succeeds on this eager retry and
+                # falls back for good.  A real input error raises again.
                 out = fn(*args, **kwargs)
                 _COMPILE_ERRORS[f"{fn.__module__}.{fn.__name__}"] = \
                     f"{type(e).__name__}: {e}"[:400]
@@ -193,37 +149,14 @@ def maybe_compile(fn, enabled, instance_key=None):
     return guarded
 
 
-# ── the minimum pixel width a compiled body is called at ─────────────────────
-# A model may declare that its compiled bodies must not be called with fewer
-# than N pixels (``min_compiled_pixel_width``, see TomographyModel).  The two
-# wrappers below pad a narrower call up to N and undo the padding on the way
-# out.  They are applied OUTSIDE torch.compile, around the callable
-# maybe_compile returns, so the padding is ordinary python that dynamo never
-# traces -- padding inside the body would be traced and specialized with it,
-# which is exactly what has to be avoided.
-#
-# Why they exist (measured 2026-08-11, linux CPU, torch 2.13.0): inductor
-# miscompiles the one-pixel specialization of both fused parallel-beam bodies.
-# A one-pixel call puts that pixel's horizontal-fan footprint one whole
-# detector channel away from where the same pixel lands in a call with more
-# pixels -- 6.56e-02 relative error on the forward (the pixel's mass at
-# channels {4, 5} instead of {3, 4}) and 5.04e-02 on the back, on a seeded
-# 8x6x8 test cell.  Eager is correct at one pixel (1.05e-07), every width of
-# two or more is correct compiled, and a one-pixel call is correct once the
-# process has compiled the body at a larger width, so what is wrong is the
-# one-pixel compile itself.  The cone bodies do not have the defect, and macOS
-# inductor compiles the same one-pixel body correctly.  One-pixel calls are
-# ordinary: sparse_forward_project with a single index makes one, and the
-# cylinder transfer's pixel batching makes one whenever a batch, or the
-# remainder of a batch, is a single pixel.
-#
-# The driver's view-batch charge is computed from the REAL pixel count, before
-# the padding: it prices the transient of a call this small at a batch far
-# below any cap, so the one padded pixel cannot move it.
+# The wrappers below pad a call narrower than ``min_compiled_pixel_width`` and undo the padding.
+# Inductor miscompiles the one-pixel specialization of both fused parallel-beam bodies, with a
+# relative error of about 5e-02.  Eager is correct at one pixel, and every width of two or more
+# is correct compiled.  The cone bodies do not have the defect.
 
 
 def _callable_name(fn, fallback):
-    """A readable name for a wrapped callable, for the wrapper's own name."""
+    """Return a readable name for a wrapped callable."""
     return getattr(fn, '__name__', fallback)
 
 
@@ -317,76 +250,23 @@ class Projectors:
     same chain on every call rather than cached, which preserves the property.
     """
 
-    # Rough per-batch transient budget for the fan kernels' (Vb, P, cols)
-    # arrays.  The back fan's gather output is a REAL materialized tensor even
-    # under torch.compile (a gather cannot fuse away), so an unbounded view
-    # batch at large cells allocates tens of GB (the 512-cell at the default
-    # batch of 64 wants ~13 GB).  The batch size never changes values beyond
-    # float summation order, so capping it is a pure memory knob.
-    #
-    # The BUDGET below applies to every body; WHAT one view is charged is the
-    # body's own model (see _effective_view_batch): the torch bodies' gather
-    # slab here, or a hand-written kernel body's _view_batch_cost.
-    #
-    # On the DEVICE backends the budget also scales DOWN with the problem: a
-    # flat 2 GiB let a 200-class cell hold a gather transient ~12x jax's whole
-    # peak (the CUDA gate readout's back/vcd memory breaches).  Scaling by the
-    # sinogram size (8x, floored at 256 MiB for batch efficiency) keeps small
-    # cells lean while leaving the large cells -- where torch already beat jax
-    # on memory -- at the 2 GiB cap.  CPU keeps the flat cap: host RSS was
-    # already 0.4-0.6x of jax's, and the small batches the scaled budget
-    # implies were measured slower there (the measured CPU optimum is a large
-    # batch).
-    # TODO(tuning): known limits of the current form (measured 2026-08-05,
-    # MPS 256^3), to be resolved with the fused-kernel work:
-    #   - The accounting is per-SLAB nominal, and the kernels hold several
-    #     slab-scale tensors at once (forward: product + accumulator; back:
-    #     transpose copy + gather), so the actual per-view transient is a small
-    #     multiple (~2-5x) of the nominal slab; the 8x sinogram multiple was
-    #     calibrated empirically with that multiplier baked in.  Recalibrate
-    #     against a measured per-view delta, not the nominal slab, if retuned.
-    #   - Below the 2 GiB cap the formula gives vb ~ 10 for ROR-masked cubes at
-    #     ANY size (8*sino / slab ~ 10.2 by construction); raising vb past that
-    #     bought only ~5-7% speed for ~6x more device memory, so the small vb
-    #     is deliberate, not accidental.
-    #   - Above ~810^3 the cap forces vb=1 and the SINGLE-view slab keeps
-    #     growing as N^3 (3.2 GB at 1024^3, 26 GB at 2048^3): past ~1400^3 the
-    #     knob no longer protects at all -- needs pixel-axis chunking or the
-    #     planned fused (Triton) kernels that never materialize the gather.
-    #     Detector growth makes this NEAR-TERM, not hypothetical: panels are
-    #     heading to ~6K x 10K (2026 estimate), where ONE view's slab against
-    #     a 512-class pixel set is ~6 GB -- the view axis alone cannot bound
-    #     it.  The driver loop is shaped as a two-axis tile walk with an
-    #     accumulating forward precisely so the pixel loop drops in without
-    #     touching the geometry contract.
-    #     Pixel chunking here means TWO-axis tiling: forward sums partial
-    #     sinograms over PIXEL batches around the view loop, back concatenates
-    #     per-PIXEL-batch outputs inside the view-sum loop, with a jointly
-    #     chosen (view_batch, pixel_batch) tile.  These drivers tile views
-    #     only; the joint tile choice needs a 2-D budget rule and its own
-    #     measurements (tile shape has changed kernel run time several-fold in
-    #     earlier work), so it belongs with the kernel work.
+    # Cap on the per-batch transient bytes for the fan kernels' (Vb, P, cols) arrays, since the
+    # back fan's gather is materialized.  The accounting charges one nominal slab per view while
+    # the kernels hold two to five at once, so any retuning must measure the real per-view
+    # transient.  Past about 1400 cubed one view's slab alone exceeds the cap.
     VIEW_BATCH_TRANSIENT_BUDGET_BYTES = 2 * 2**30
     VIEW_BATCH_TRANSIENT_FLOOR_BYTES = 256 * 2**20
     VIEW_BATCH_SINO_MULTIPLE = 8
-    # The torch bodies' nominal view batch when the model's view_batch_size
-    # is None (automatic) -- the value the constructor default has always
-    # been.  A kernel body's automatic nominal is its own swept view chunk,
-    # returned by its _view_batch_cost (see _effective_view_batch).
+    # The torch bodies' nominal view batch when model.view_batch_size is None.
+    # A kernel body's nominal is its own swept view chunk instead.
     VIEW_BATCH_BODY_DEFAULT = 64
 
     def _transient_budget_bytes(self, n_devices=None):
         if self.model.torch_device.type == 'cpu':
             return self.VIEW_BATCH_TRANSIENT_BUDGET_BYTES
         num_views, num_rows, num_channels = self.model.get_params('sinogram_shape')
-        # Under view sharding each device projects only its share of the
-        # views, so the size-scaled budget derives from the PER-DEVICE shard
-        # (the global sinogram would overshoot each device's transient by the
-        # device count).  Derived per call from the current params and
-        # placement -- never frozen at construction (the stale-bind lesson).
-        # ``n_devices`` overrides the live placement for a HYPOTHETICAL layout
-        # (the memory ledger pricing a candidate device count); None means the
-        # model's current placement, which is every production call site.
+        # Under view sharding each device projects only its share of the views, so the budget
+        # scales with the per-device shard.  ``n_devices`` prices a candidate layout.
         n_dev = (self.model.sino_placement.n_devices if n_devices is None
                  else int(n_devices))
         local_views = -(-int(num_views) // n_dev)
@@ -396,11 +276,8 @@ class Projectors:
                        self.VIEW_BATCH_SINO_MULTIPLE * sino_bytes))
 
     def __init__(self, model):
-        # The geometry supplies its per-view-batch bodies (module-level pure
-        # functions -- never bound methods, which would pin the model in the
-        # module-level compile cache) and the driver binds one compiled
-        # instance per device (see maybe_compile).  Index 0 serves the
-        # single-device path.
+        # The geometry supplies its per-view-batch bodies as module-level functions.  A bound
+        # method would pin the model in the module-level compile cache.
         self.model = model
         fwd_body, back_body = model._view_batch_bodies()
         use_compile = model.compile_enabled
@@ -408,17 +285,13 @@ class Projectors:
         min_width = int(getattr(model, 'min_compiled_pixel_width', 1))
 
         def bind(body, pad_narrow, i):
-            """One device's bound body: compiled, then wrapped when the model
-            declares a minimum pixel width AND the binding really did compile.
+            """Return one device's bound body.  It is compiled, then wrapped
+            when the model declares a minimum pixel width and the binding
+            really did compile.
 
-            The identity test is the whole gate.  maybe_compile hands back the
-            function itself when compilation is off and when the body is a
-            hand-written kernel (``_mbirtorch_no_compile``); neither can be
-            miscompiled, so neither needs the workaround, and leaving them
-            alone keeps the two things callers read off a bound body -- its
-            identity and its ``_view_batch_cost`` attribute -- exactly as they
-            were.  Every driver, plain and sharded, reads its body from these
-            two lists, so this is the one place per direction to wrap."""
+            maybe_compile hands back the function itself when compilation is
+            off and when the body is a hand-written kernel.  Neither can be
+            miscompiled, so neither is wrapped."""
             bound = maybe_compile(body, use_compile, instance_key=i)
             if min_width > 1 and bound is not body:
                 bound = pad_narrow(bound, min_width)
@@ -430,11 +303,8 @@ class Projectors:
         self._back_body_per_dev = [
             bind(back_body, back_at_min_pixel_width, i)
             for i in range(n_dev)]
-        # View parameters, read from the CURRENT params at every projector
-        # build (create_projectors re-runs on reconfigure/recompile, closing
-        # the stale-bind class) and PRE-PLACED once per device through the
-        # probed transfer primitive -- the per-band `.to(dev)` copies this
-        # replaces bypassed the dev2dev-safe policy.
+        # The view parameters are read from the current params at every projector build.
+        # Each device gets its copy through the probed transfer primitive.
         view_params_name = model.get_params('view_params_name')
         view_params = torch.as_tensor(model.get_params(view_params_name),
                                       dtype=_F32, device=model.torch_device)
@@ -444,32 +314,15 @@ class Projectors:
         self.view_params_array = self._view_params_per_dev[0]
 
     def _effective_view_batch(self, body, num_pixels, band_cols, args):
-        """The view batch for one call of ``body``: the nominal batch, capped
-        so one batch's transient stays within the budget above.
+        """Return the view batch for one call of ``body``.  It is the nominal
+        batch, capped so that one batch's transient stays within the budget.
 
-        The batching rule follows the BODY actually bound, never the
-        geometry.  A hand-written kernel body carries a ``_view_batch_cost``
-        attribute (attached in its own module, e.g. triton_cone.py) returning
-        ``(bytes_per_view, view_chunk)`` from ``(num_pixels, band_cols,
-        args)``: its real charged residency and its swept nominal chunk.  The
-        torch bodies' gather-transient model below would charge such a kernel
-        a transient it never materializes -- at large cells that mischarge
-        forces view batch 1 and a per-view contract rebuild per launch.  The
-        forward and back bodies are consulted separately, so a mixed
-        selection (kernel one way, torch body the other, including a
-        self-check fallback at create_projectors time) batches each direction
-        by its own model.
-
-        Torch-body path (any body without the attribute, compiled or eager):
-        unchanged.  The column count is a GEOMETRY hook (_transient_cols):
-        parallel's transient tracks the runtime band length, cone's tracks
-        max(num_slices, num_rows) from the params -- unifying them naively
-        would silently change each geometry's batch size, float summation
-        order, and calibrated peak memory.
-
-        ``model.view_batch_size`` is the user's nominal for every body; None
-        means automatic (VIEW_BATCH_BODY_DEFAULT for a torch body, the
-        kernel's own chunk for a kernel body)."""
+        The batching rule follows the body that is bound, not the geometry.
+        A hand-written kernel body carries a ``_view_batch_cost`` attribute
+        giving its own per-view bytes and its swept view chunk.  The forward
+        and back bodies are consulted separately, so a model that binds a
+        kernel one way and a torch body the other batches each direction by
+        its own rule."""
         return self.view_batch_charge(body, num_pixels, band_cols, args)[0]
 
     def view_batch_charge(self, body, num_pixels, band_cols, args,
@@ -564,10 +417,8 @@ class Projectors:
                                              band_values.shape[-1], args)
         view_params = self._view_params_per_dev[dev_index]
         out = accumulate_into
-        # Whether this call adds into a block it was handed or fills one of its
-        # own, decided ONCE here rather than per view batch: an accumulating
-        # call adds every batch, including the first, because the block already
-        # holds earlier calls' work.
+        # An accumulating call adds every batch, including the first, because
+        # the block it was handed already holds earlier calls' work.
         adding = out is not None
         for v in range(v0, v1, vb_size):
             view_params_batch = view_params[v:min(v + vb_size, v1)]
@@ -578,9 +429,8 @@ class Projectors:
                 out = torch.empty((v1 - v0,) + tuple(block.shape[1:]),
                                   dtype=block.dtype, device=block.device)
             rows = slice(v - v0, v - v0 + block.shape[0])
-            # View batches cover DISJOINT rows of the block, so neither arm
-            # sums anything across this loop -- assignment and addition touch
-            # each row exactly once either way.
+            # View batches cover disjoint rows of the block, so each row is
+            # touched exactly once whichever branch runs.
             if adding:
                 out[rows].add_(block)
             else:
@@ -632,28 +482,17 @@ class Projectors:
                 out = block
             else:
                 out.add_(block)
-            # Released AFTER the accumulation, so the summation order is
-            # untouched -- this changes only how much memory is held.
-            # Without it the next iteration's `back_body(...)` evaluates
-            # before rebinding `block`, holding accumulator + outgoing +
-            # incoming: min(3, nb) cylinder-shards where min(2, nb) is what
-            # the loop needs.  On the first iteration `out` IS `block`, so
-            # dropping the name costs nothing there.  The saving measures
-            # smaller than the counts suggest, because the outgoing block is
-            # often freed partway through the next kernel anyway: expect
-            # about half a cylinder-shard, not a whole one.
+            # Releasing the block here keeps the loop to two cylinder shards instead of
+            # three.  The summation order is unchanged.
             block = None
         return out
 
     def _sparse_forward_project_single_device(self, voxel_values, pixel_indices):
-        """Forward project voxel cylinders into a full sinogram on ONE device:
-        the view-range loop at (0, num_views) on device 0, coercing
-        array-likes to placed tensors first.  This is the trivial-placement
-        form only -- both of its callers are the trivial branches in
-        TomographyModel, and every external call funnels through
-        TomographyModel.sparse_forward_project.  For a row-aligned geometry
-        the output row count equals the input column count -- the
-        rows==slices invariant its verify_valid_params enforces."""
+        """Forward project voxel cylinders into a full sinogram on one device.
+
+        This runs the view-range loop at (0, num_views) on device 0.  Every
+        external call goes through TomographyModel.sparse_forward_project.
+        """
         m = self.model
         num_views = int(m.get_params('sinogram_shape')[0])
         voxel_values = torch.as_tensor(voxel_values, dtype=_F32,
@@ -666,10 +505,10 @@ class Projectors:
     def _sparse_back_project_single_device(self, sinogram, pixel_indices,
                                            coeff_power=1):
         """Back project a full sinogram onto the voxel cylinders at
-        ``pixel_indices`` on ONE device: the view-range loop at
-        (0, num_views) on device 0.  The trivial-placement form only (see
-        :meth:`_sparse_forward_project_single_device`); every external call
-        funnels through TomographyModel.sparse_back_project.
+        ``pixel_indices`` on one device.
+
+        This runs the view-range loop at (0, num_views) on device 0.  Every
+        external call goes through TomographyModel.sparse_back_project.
 
         Args:
             sinogram: (num_views, num_det_rows, num_det_channels).

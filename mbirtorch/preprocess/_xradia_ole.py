@@ -24,20 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 def _check_read(fname):
-    """
-    Validate the file path and ensure it has a recognized extension.
-
-    Notes:
-        Portions of this code are adapted from the DXchange library: https://github.com/data-exchange/dxchange
-
-    Args:
-        fname (str) : Path to the file to be read. Must be a string and have one of the recognized file extensions:
-        ['.edf', '.tiff', '.tif', '.h5', '.hdf', '.npy', '.nc', '.xrm', '.txrm', '.txm', '.xmt', '.nxs'].
-
-
-    Returns:
-        str: Absolute path to the file.
-    """
+    """Check that ``fname`` has a recognized extension and return its absolute path."""
     known_extensions = {
         '.edf', '.tiff', '.tif', '.h5', '.hdf', '.npy', '.nc',
         '.xrm', '.txrm', '.txm', '.xmt', '.nxs'
@@ -68,21 +55,11 @@ def get_index_in_list(input_list, target):
 
 
 def _get_ole_data_type(metadata, datatype=None):
+    """Return the numpy dtype of the image data in a Zeiss OLE file.
+
+    The OLE type code is taken from ``datatype``, or from ``metadata["data_type"]``
+    when ``datatype`` is None.
     """
-    Determine the Numpy data type for image data stored in a Zeiss OLE (.xrm, .txrm, .txm) file.
-
-    Notes:
-        Portions of this code are adapted from the DXchange library: https://github.com/data-exchange/dxchange
-
-    Args:
-        metadata (dict) : Dictionary containing metadata extracted from the OLE file.
-                          Must include the key "data_type" which is an integer code indicating the pixel data format.
-        datatype (int, optional): Integer code for the data type. If None, the function uses `metadata["data_type"]`.
-
-    Returns:
-        np.dtype: The data type of the image data.
-    """
-    # 10 float; 5 uint16 (unsigned 16-bit (2-byte) integers)
     if datatype is None:
         datatype = metadata["data_type"]
     if datatype == 10:
@@ -94,20 +71,7 @@ def _get_ole_data_type(metadata, datatype=None):
 
 
 def _read_ole_struct(ole, label, struct_fmt):
-    """
-    Reads the struct associated with label in an ole file
-
-    Notes:
-        Portions of this code are adapted from the DXchange library: https://github.com/data-exchange/dxchange
-
-    Args:
-        ole (OleFileIO) : An ole file to read from.
-        label (str) : Label associated with the OLE file.
-        struct_fmt (str) : Format of the OLE file.
-
-    Returns:
-        tuple or None: A tuple of unpacked values from the binary stream if the label exists.
-    """
+    """Return the struct stored under ``label`` as a tuple, or None if it is absent."""
     value = None
     if ole.exists(label):
         stream = ole.openstream(label)
@@ -117,20 +81,7 @@ def _read_ole_struct(ole, label, struct_fmt):
 
 
 def _read_ole_value(ole, label, struct_fmt):
-    """
-    Reads the value associated with label in an ole file
-
-    Notes:
-        Portions of this code are adapted from the DXchange library: https://github.com/data-exchange/dxchange
-
-    Args:
-        ole (OleFileIO) : An ole file to read from.
-        label (str) : Label associated with the OLE file.
-        struct_fmt (str) : Format of the OLE file.
-
-    Returns:
-        int or float : The unpacked scalar value from the binary stream if the label exists,
-    """
+    """Return the scalar stored under ``label``, or None if it is absent."""
     value = _read_ole_struct(ole, label, struct_fmt)
     if value is not None:
         value = value[0]
@@ -138,20 +89,7 @@ def _read_ole_value(ole, label, struct_fmt):
 
 
 def _read_ole_arr(ole, label, struct_fmt):
-    """
-    Reads the numpy array associated with label in an ole file
-
-    Notes:
-        Portions of this code are adapted from the DXchange library: https://github.com/data-exchange/dxchange
-
-    Args:
-        ole (OleFileIO) : An ole file to read from.
-        label (str) : Label associated with the OLE file.
-        struct_fmt (str) : Format of the OLE file.
-
-    Returns:
-        np.ndarray: The unpacked numpy array from the binary stream if the label exists.
-    """
+    """Return the array stored under ``label``, or None if it is absent."""
     arr = _read_ole_struct(ole, label, struct_fmt)
     if arr is not None:
         arr = np.array(arr)
@@ -159,21 +97,7 @@ def _read_ole_arr(ole, label, struct_fmt):
 
 
 def _read_ole_image(ole, label, metadata, datatype=None):
-    """
-    Reads the image data associated with label in an ole file
-
-    Notes:
-        Portions of this code are adapted from the DXchange library: https://github.com/data-exchange/dxchange
-
-    Args:
-        ole (OleFileIO) : An ole file to read from.
-        label (str) : Label associated with the OLE file.
-        metadata (dict) : Dictionary containing metadata extracted from the OLE file.
-        datatype: Data type of the image data. Defaults to None.
-
-    Returns:
-        np.ndarray: Output 2D image with shape (num_det_rows, num_det_channels).
-    """
+    """Return the image stored under ``label``, shape (num_det_rows, num_det_channels)."""
     stream = ole.openstream(label)
     data = stream.read()
     data_type = _get_ole_data_type(metadata, datatype)
@@ -186,16 +110,7 @@ def _read_ole_image(ole, label, metadata, datatype=None):
 
 
 def _read_ole_str(ole, label):
-    """
-    Reads the string associated with label in an ole file
-
-    Args:
-        ole (OleFileIO) : An ole file to read from.
-        label (str) : Label associated with the OLE file.
-
-    Returns:
-        list: A list contain all the strings from the binary stream if the label exists
-    """
+    """Return the strings stored under ``label`` as a list, or None if it is absent."""
     str = None
     if ole.exists(label):
         stream = ole.openstream(label)
@@ -205,16 +120,7 @@ def _read_ole_str(ole, label):
 
 
 def _log_imported_data(fname, arr):
-    """
-    Log information about imported data.
-
-    Notes:
-        Portions of this code are adapted from the DXchange library: https://github.com/data-exchange/dxchange
-
-    Args:
-        fname (str) : Path of the file from which data was imported.
-        arr (np.ndarray) : Array containing the image data.
-    """
+    """Log the shape and dtype of the data read from ``fname``."""
     logger.debug('Data shape & type: %s %s', arr.shape, arr.dtype)
     logger.info('Data successfully imported: %s', fname)
 
@@ -247,18 +153,14 @@ def read_xrm(fname, read_metadata, *, normalize_to_float32=True):
         print('No such file or directory: %s', fname)
         return False
 
-    # Read metadata from xrm file
     metadata = read_metadata(ole)
 
-    # Read scan data from xrm file
     stream = ole.openstream("ImageData1/Image1")
     data = stream.read()
 
-    # Get the data type of scan data
     data_type = _get_ole_data_type(metadata)
     data_type = data_type.newbyteorder('<')
 
-    # Reshape the scan data into 2D array
     arr = np.reshape(
         np.frombuffer(data, data_type),
         (
@@ -269,7 +171,6 @@ def read_xrm(fname, read_metadata, *, normalize_to_float32=True):
 
     _log_imported_data(fname, arr)
 
-    # Optionally normalize the scan data to float32.
     if normalize_to_float32:
         arr = _normalize_to_float32(arr)
 
@@ -297,18 +198,13 @@ def read_xrm_dir(dir_path, read_metadata):
     dir_path = Path(dir_path)
     files = [p for p in dir_path.iterdir() if p.is_file()]
 
-    # Load the scan data and metadata from the first file.  Each projection is read RAW
-    # (normalize_to_float32=False) and the whole stack is normalized once at the end below.  This is
-    # numerically identical to normalizing each projection first (the float32 conversion is a fixed
-    # per-dtype scaling, so a second pass on already-float32 data is a no-op) and avoids the redundant
-    # per-file normalization.
+    # Each projection is read raw.  The whole stack is normalized once at the end.
     proj0, md0 = read_xrm(str(files[0]), read_metadata, normalize_to_float32=False)
     num_views = len(files)
     num_det_rows, num_det_channels = proj0.shape
     arr = np.empty((num_views, num_det_rows, num_det_channels), dtype=proj0.dtype)
     arr[0] = proj0
 
-    # Load the x, y, z object positions of the first file
     x0 = md0['x_positions'][0]
     y0 = md0['y_positions'][0]
     z0 = md0['z_positions'][0]
@@ -318,17 +214,13 @@ def read_xrm_dir(dir_path, read_metadata):
     metadata['x_positions'] = [x0]
     metadata['y_positions'] = [y0]
     metadata['z_positions'] = [z0]
-    # Per-view alignment shifts: accumulated like the positions (metadata starts as a copy of
-    # the FIRST file's dict, whose shift entries cover only that file).
     metadata['x_shifts'] = [md0['x_shifts'][0]]
     metadata['y_shifts'] = [md0['y_shifts'][0]]
-    # Per-view rotation angles: collect them when the OLE 'Angles' stream is present.  Some acquisitions
-    # (e.g. pure translation scans) have no Angles stream, in which case read_metadata returns 'thetas'
-    # as None; we then leave metadata['thetas'] as None rather than index into None.
+    # A scan with no OLE 'Angles' stream has no rotation angles.  read_metadata
+    # returns 'thetas' as None in that case, and metadata['thetas'] stays None.
     collect_thetas = md0.get('thetas') is not None
     metadata['thetas'] = [md0['thetas'][0]] if collect_thetas else None
 
-    # Load the remaining files and stack them together
     for i, p in enumerate(files[1:], start=1):
         proj, md = read_xrm(str(p), read_metadata, normalize_to_float32=False)
         arr[i] = proj
@@ -342,7 +234,6 @@ def read_xrm_dir(dir_path, read_metadata):
 
     _log_imported_data(str(dir_path), arr)
 
-    # Normalize the whole stack to float32 (see the per-projection note above).
     arr = _normalize_to_float32(arr)
 
     return arr, metadata

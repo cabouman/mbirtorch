@@ -33,19 +33,18 @@ __all__ = ['CalibrationResult', 'build_reduced_problem', 'reduce_sinogram', 'par
            'check_rotation_direction', 'apply_calibration', 'estimate_det_channel_offset',
            'estimate_det_rotation', 'conjugate_difference']
 
-# The parameters parameter_sweep accepts.  'det_rotation' is not a model parameter.  It is applied
-# by resampling the sinogram, and the sweep does that per candidate.
+# parameter_sweep accepts these parameters.  'det_rotation' is applied by resampling the
+# sinogram rather than by setting a model parameter.
 _SWEEP_PARAMETERS = ('det_channel_offset', 'det_row_offset', 'det_rotation')
 
-# Views of the full sinogram read per step when a reduced sinogram is built.  The block held per
-# step is this many views by the kept rows by every channel, so the transient stays small.
+# This many views of the full sinogram are read per step when a reduced sinogram is built.
 _REDUCE_VIEW_BATCH = 64
 
-# Views rotated per step when a detector rotation is applied in place.
+# This many views are rotated per step when a detector rotation is applied in place.
 _ROTATE_VIEW_BATCH = 30
 
-# The largest detector rotation, in radians, that a sweep, an estimator, or a difference image
-# accepts.  LEAP caps its detector tilt at the same five degrees.
+# A sweep, an estimator, and a difference image all refuse a detector rotation larger than this,
+# in radians.  LEAP caps its detector tilt at the same five degrees.
 _MAX_DET_ROTATION = math.radians(5.0)
 
 
@@ -271,10 +270,8 @@ def build_reduced_problem(ct_model, *, view_stride=4, bin_factor=2, num_slab_sli
                          f'{full_recon_shape[2]} slices.')
     axial_thinning = num_slab_slices is not None and not _is_helical(ct_model)
 
-    # First reduction: a copy with the kept views and the binned detector, at the full row count.
-    # The detector pitches grow by the bin factor and the recon geometry is recomputed from them,
-    # so the copy covers the same field of view in ALU with coarser voxels.  This copy is only read
-    # for its geometry.  It never projects, so it compiles nothing.
+    # The first reduction is a copy with the kept views and the binned detector.  The detector
+    # pitches grow by the bin factor, so the copy covers the same field of view with coarser voxels.
     required, _, _ = ct_model.get_all_params()
     angles = np.asarray(required['angles'])[::view_stride]
     copy_kwargs = dict(new_angles=angles, new_num_det_rows=num_det_rows // bin_factor,
@@ -290,13 +287,12 @@ def build_reduced_problem(ct_model, *, view_stride=4, bin_factor=2, num_slab_sli
     binned.auto_set_recon_geometry()
     binned_rows = num_det_rows // bin_factor
 
-    # Second reduction: the slab, and the detector rows it needs.
+    # The second reduction selects the slab and the detector rows it needs.
     slab_z_center = None
     if not axial_thinning:
         row_lo, row_hi = 0, binned_rows
     elif kind == 'parallel':
-        # Row r is slice r.  The slab is the binned rows around the binned row that holds the
-        # requested slice.
+        # Row r is slice r, so the slab is a band of binned rows.
         row_center = slice_index // bin_factor
         row_lo = max(0, min(row_center - num_slab_slices // 2, binned_rows - num_slab_slices))
         row_hi = min(binned_rows, row_lo + num_slab_slices)
@@ -318,8 +314,8 @@ def build_reduced_problem(ct_model, *, view_stride=4, bin_factor=2, num_slab_sli
     reduced.compile_mode = ct_model.compile_mode
     det_row_offset_shift = 0.0
     if kind != 'parallel' and (row_lo, row_hi) != (0, binned_rows):
-        # The crop moves the detector center, and the row offset moves with it by the rule
-        # apply_detector_crop uses: half the difference of the rows removed at the two ends.
+        # The row offset moves with the detector center by half the difference of the rows removed
+        # at the two ends.
         crop_top, crop_bottom = row_lo, binned_rows - row_hi
         det_row_offset_shift = (crop_bottom - crop_top) / 2.0 * binned.get_params('delta_det_row')
         reduced.set_params(det_row_offset=binned.get_params('det_row_offset') + det_row_offset_shift)
@@ -330,10 +326,8 @@ def build_reduced_problem(ct_model, *, view_stride=4, bin_factor=2, num_slab_sli
                            recon_slice_offset=slab_z_center)
     reduced.configure_devices(devices=[ct_model.torch_device])
 
-    # The reduced model's slice nearest the requested slice.  In parallel beam it is the row's
-    # place in the band.  With a slab it is the slab's middle, which is exact for an odd slice
-    # count and half a slice off for an even one.  With the whole extent kept, the reduced volume
-    # has its own automatic slice grid, and the requested slice's axial position is looked up on it.
+    # This is the reduced model's slice nearest the requested slice.  With a slab it is the middle
+    # slice, which is half a slice off when the slab has an even number of slices.
     if kind == 'parallel':
         slice_in_slab = slice_index // bin_factor - row_lo
     elif axial_thinning:
@@ -389,7 +383,6 @@ def reduce_sinogram(sino, reduction, *, det_rotation=0.0):
     num_views, num_rows, num_channels = full_shape
     stride, bin_factor = reduction['view_stride'], reduction['bin_factor']
     row_lo, row_hi = reduction['row_window']
-    # The views kept are every stride-th view, or an explicit list when the record names one.
     view_indices = reduction.get('view_indices')
     if view_indices is None:
         view_indices = np.arange(0, num_views, stride)
@@ -397,9 +390,8 @@ def reduce_sinogram(sino, reduction, *, det_rotation=0.0):
     kept_views, kept_rows = int(view_indices.size), row_hi - row_lo
     out = np.empty((kept_views, kept_rows // bin_factor, num_channels // bin_factor), dtype=np.float32)
 
-    # A rotation reads rows beyond the window.  The block read per batch is widened by the rows
-    # the rotation can sample, and the rotation turns about the full detector's center, expressed
-    # in the block's own row indices.
+    # A rotation reads rows beyond the window, so the block read per batch is widened.  The
+    # rotation turns about the full detector's center, expressed in the block's own row indices.
     rotate = float(det_rotation) != 0.0
     if rotate:
         center_row = (num_rows - 1) / 2.0
@@ -419,7 +411,6 @@ def reduce_sinogram(sino, reduction, *, det_rotation=0.0):
             if rotate:
                 block = _rotation_kernel(block, det_rotation, center=center)
                 block = block[:, row_lo - band_lo:row_hi - band_lo, :]
-            # Average each bin_factor x bin_factor block of detector pixels.
             binned = block.reshape(k1 - k0, kept_rows // bin_factor, bin_factor,
                                    num_channels // bin_factor, bin_factor).mean(dim=(2, 4))
             out[k0:k1] = binned.to('cpu', torch.float32).numpy()
@@ -546,9 +537,8 @@ def _direct_residual_score(ct_model, sino, filtered_sino=None, row_fraction=0.5)
     return float(residual / energy)
 
 
-# The ratio of the worse direction's score to the better one below which check_rotation_direction
-# warns that its answer rests on a small margin.  The value is provisional, and the ratio falls
-# with the fan angle, so a narrow-fan scan may sit below it.
+# check_rotation_direction warns when the worse direction's score is less than this many times
+# the better one.  The ratio falls with the fan angle.
 _DIRECTION_MIN_RATIO = 1.5
 
 
@@ -600,9 +590,8 @@ def check_rotation_direction(ct_model, sino, *, view_stride=4, bin_factor=2):
     reduced, reduction = build_reduced_problem(ct_model, **reduction_kwargs)
     sino_reduced = reduce_sinogram(sino, reduction)
     filtered = sino_high_pass_filtering(sino_reduced)
-    # The reversed model is the full model with every angle negated, reduced the same way.  The
-    # reduction depends on the geometry and not on the angle signs, so one reduced sinogram serves
-    # both.
+    # The reversed model is the full model with every angle negated, reduced in the same way.  One
+    # reduced sinogram serves both models, because the reduction does not depend on the angles.
     required, _, _ = ct_model.get_all_params()
     reversed_full = copy_ct_model(ct_model, new_angles=-np.asarray(required['angles']),
                                   new_helical_z_shifts=np.asarray(required['helical_z_shifts']), no_warning=True)
@@ -717,9 +706,8 @@ def apply_calibration(ct_model, sino, results):
                 sino = _rotate_views_in_place(sino, value)
         elif name == 'rotation_direction':
             if value == -1.0:
-                # The angles are the first column of the model's per-view parameter array for cone
-                # and multiaxis, and the whole array for parallel beam.  Setting the array rebuilds
-                # the projectors, which hold their own copies of it.
+                # The angles are the first column of the per-view parameter array for cone and
+                # multiaxis, and the whole array for parallel beam.
                 view_params_name = ct_model.get_params('view_params_name')
                 view_params = np.array(ct_model.get_params(view_params_name), copy=True)
                 if view_params.ndim == 2:
@@ -736,7 +724,7 @@ def apply_calibration(ct_model, sino, results):
 
 # ── the conjugate-view method ─────────────────────────────────────────────────────────────────────
 
-# Defaults of the conjugate-view estimator.  Each is described where it is used.
+# These are the defaults of the conjugate-view estimator.  Each one is described where it is used.
 _CONJUGATE_OFFSET_HALF_RANGE_CHANNELS = 4.0     # search range on each side of the model's value
 _CONJUGATE_OFFSET_MAX_SLIDES = 8                # the search window moves this many times at most
 _CONJUGATE_MIN_REGION_FRACTION = 0.25           # the least fraction of channels a comparison may use
@@ -745,10 +733,8 @@ _CONJUGATE_NUM_ROWS = 16                        # detector rows compared, before
 _CONJUGATE_VIEW_STRIDE = 1                      # every reference view is kept
 _CONJUGATE_TRIM_FRACTION = 0.1                  # fraction of the worst view pairs dropped
 _CONJUGATE_EDGE_MARGIN = 4                      # channels excluded at each edge beyond the shift
-# A scan has a full rotation when no gap between neighboring view angles exceeds both this many
-# times the median gap and this many radians.  The rule accepts irregular spacing, a few dropped
-# views, and more than one turn, and it refuses a scan over a half rotation, whose largest gap is
-# the missing half.
+# A scan covers a full rotation when no gap between neighboring view angles exceeds both this
+# many times the median gap and this many radians.  A scan over a half rotation is refused.
 _CONJUGATE_MAX_GAP_RATIO = 3.0
 _CONJUGATE_MAX_GAP = math.radians(5.0)
 
@@ -856,8 +842,7 @@ class _ConjugatePairs:
         if reduction is None:
             reduction = self._default_reduction(ct_model, num_rows)
         elif self.kind == 'cone':
-            # A caller's row window is used as given.  The cone-beam comparison is only sound
-            # near the central plane, so a window that leaves that plane out gets a warning.
+            # The cone-beam comparison is only sound near the central plane.
             central_row = (num_det_rows - 1) / 2.0 + det_row_offset / delta_det_row
             lo, hi = reduction['row_window']
             if not lo <= central_row < hi:
@@ -871,20 +856,17 @@ class _ConjugatePairs:
         self.model_offset = float(det_channel_offset)
         self.pairing_offset = self.model_offset if pairing_offset is None else float(pairing_offset)
 
-        # The reference views are every stride-th view, and their partners come from every view.
         angles = _view_angles(ct_model)
         self.reference_indices = np.arange(0, num_views, stride)
         self.num_views = int(self.reference_indices.size)
-        # The record describes the reference views, so that reduce_sinogram with this record and
-        # the difference image of conjugate_difference have the same shape.
+        # The record describes the reference views, so that a reduced sinogram and the difference
+        # image of conjugate_difference have the same shape.
         self.reduction['view_indices'] = self.reference_indices
         self.reduction['sinogram_shape'] = (self.num_views,) + tuple(self.reduction['sinogram_shape'][1:])
 
-        # The opposite ray's view angle, per reference view and per channel of the mirrored
-        # opposite.  Column m of the mirrored array holds channel 2c - m of the partner view, whose
-        # detector coordinate is u = (c - m) delta - d, and the ray there is the opposite of a
-        # reference ray at fan angle -gamma(u).  The partner therefore lies at
-        # beta + pi + 2 gamma(u), which is beta + pi - 2 gamma((m - c) delta + d).
+        # These are the opposite ray's view angles, one per reference view and per channel.
+        # A reference ray at fan angle -gamma(u) has its opposite at beta + pi + 2 gamma(u),
+        # where u = (m - c) delta + d for mirrored column m.
         center_channel = (self.num_channels - 1) / 2.0
         u = (np.arange(self.num_channels) - center_channel) * self.delta + self.pairing_offset
         if self.kind == 'cone':
@@ -899,8 +881,6 @@ class _ConjugatePairs:
             gamma = np.zeros_like(u)
         target = angles[self.reference_indices][:, None] + np.pi - 2.0 * gamma[None, :]
         low, high, self.partner_weight = self._partners(angles, target)
-        # The partner views are read once, as a compact set, and the partner indices are remapped
-        # into that set.
         self.partner_indices = np.unique(np.concatenate([low.ravel(), high.ravel()]))
         self.partner_low = np.searchsorted(self.partner_indices, low)
         self.partner_high = np.searchsorted(self.partner_indices, high)
@@ -913,10 +893,8 @@ class _ConjugatePairs:
         if num_rows is None:
             num_rows = _CONJUGATE_NUM_ROWS
             if isinstance(ct_model, ConeBeamModel):
-                # Opposite rays through a point off the central plane reach the detector at
-                # different heights.  At a distance r from the axis and a height of m rows the
-                # difference is about m * 2 r / sid rows, so the band is limited to the rows where
-                # that difference stays within one row.
+                # Opposite rays through a point off the central plane reach the detector
+                # at different heights.  The band keeps that difference within one row.
                 min_mag, _ = ct_model.pixel_magnification_bounds()
                 source_detector_dist, source_iso_dist = ct_model.get_params(
                     ['source_detector_dist', 'source_iso_dist'])
@@ -925,8 +903,8 @@ class _ConjugatePairs:
                     half = max(1, math.floor(source_iso_dist / (2.0 * support_radius)))
                     num_rows = min(num_rows, 2 * half + 1)
         num_rows = max(1, min(int(num_rows), num_det_rows))
-        # The row the central plane reaches is where the detector height v is zero, and the band
-        # is centered on it.
+        # The central plane reaches the row where the detector height v is zero, and
+        # the band is centered there.
         central_row = (num_det_rows - 1) / 2.0 + det_row_offset / delta_det_row
         lo = int(round(central_row - (num_rows - 1) / 2.0))
         lo = max(0, min(lo, num_det_rows - num_rows))
@@ -1063,7 +1041,8 @@ def _search_minimum(score_fn, bounds, num_coarse, tolerance):
     a = float(coarse[max(best - 1, 0)])
     b = float(coarse[min(best + 1, num_coarse - 1)])
 
-    # Golden-section search on [a, b].  Each step drops the worse end and keeps one interior point.
+    # The golden-section search runs on [a, b].  Each step drops the worse end and
+    # keeps one interior point.
     ratio = (math.sqrt(5.0) - 1.0) / 2.0
     x1 = b - ratio * (b - a)
     x2 = a + ratio * (b - a)
@@ -1164,10 +1143,8 @@ def estimate_det_channel_offset(ct_model, sino, *, method='auto', bounds=None, n
         return _search_minimum(lambda offset: problem.score(prepared, opposites, offset, keep),
                                bounds, num_coarse, tolerance) + (keep,)
 
-    # A coarse minimum at an edge of the window means the window is in the wrong place, so the
-    # window moves to center on that edge and the search repeats, up to a limit.  The width is kept
-    # so that the coarse grid keeps its spacing.  The window stops moving when the channels
-    # excluded for the circular shift would leave less than a quarter of the detector to compare.
+    # A coarse minimum at an edge of the window means the window is in the wrong place,
+    # so the window moves to center on that edge and the search repeats.
     best, candidates, scores, notes, keep = search(problem)
     slides = 0
     while ('the coarse minimum sits at an edge of the bounds' in notes and user_bounds is None
@@ -1183,9 +1160,8 @@ def estimate_det_channel_offset(ct_model, sino, *, method='auto', bounds=None, n
         best, candidates, scores, notes, keep = search(problem)
         slides += 1
 
-    # Two passes for cone beam.  The fan angle of a channel, and so its partner view, depends on
-    # the offset, and the first pass pairs at the model's value.  The second pass pairs at the
-    # first estimate, which removes a small trend in the result and doubles the cost.
+    # Cone beam uses two passes.  The partner view of a channel depends on the offset, so the
+    # second pass pairs at the estimate from the first pass.
     first_pass = best
     if problem.kind == 'cone' and abs(best - problem.pairing_offset) > tolerance:
         problem = _ConjugatePairs(ct_model, reduction, num_rows, pairing_offset=best)
@@ -1202,10 +1178,8 @@ def estimate_det_channel_offset(ct_model, sino, *, method='auto', bounds=None, n
                              reduction=record)
 
 
-# The rotation estimate's search stops when its bracket is shorter than the first constant, in
-# radians, and the second constant is an edge displacement in pixels.  Below one pixel of edge
-# displacement the estimate is uncertain, and the function warns.  On one real scan its zero point
-# was off by about a tenth of a degree.
+# The rotation search stops when its bracket is shorter than the first constant, in radians.
+# The second is an edge displacement in pixels, below which the function warns.
 _CONJUGATE_ROTATION_TOLERANCE = math.radians(0.005)
 _CONJUGATE_MIN_EDGE_DISPLACEMENT = 1.0
 
@@ -1299,8 +1273,8 @@ def estimate_det_rotation(ct_model, sino, *, method='auto', bounds=None, num_coa
         return problem.pairs(sino, bands=(_rotated_band(sino, problem.reduction, float(det_rotation)),
                                           _rotated_band(sino, partner, float(det_rotation))))
 
-    # The pairs kept by the trimmed mean are chosen at the model's own geometry, with no
-    # rotation applied, and every candidate is scored on that set.
+    # The pairs kept by the trimmed mean are chosen with no rotation applied, and every candidate
+    # is scored on that set.
     views, opposites = pairs_at(0.0)
     prepared = problem.prepare(views, opposites, margin)
     keep = problem.keep_set(prepared, opposites, offset)

@@ -46,28 +46,10 @@ def get_sino_and_model(filename, *, bh_correction=True, auto_crop=False, subsamp
 
 
 def _compute_sino_and_params(filename, bh_correction=True):
-    """
-    Load ORNL sinogram data from an HDF5 file and prepare build_model-ready cone-beam parameters.
+    """Read an ORNL HDF5 scan and return ``(sino, required_params, optional_params)``.
 
-    Private helper for :func:`get_sino_and_model`.  It extracts geometry via
-    ``create_proj_params_dict_ornl``, reads the raw sinogram via ``load_projection_data_ornl``, and
-    optionally applies beam hardening correction and detector-rotation correction.
-
-    Args:
-        filename (str):
-            Path to the ORNL HDF5 file containing projection data and geometry attributes.
-        bh_correction (bool, optional):
-            If True, apply beam hardening correction using the file’s stored parameters. Defaults to True.
-
-    Returns:
-        tuple: ``(sino, required_params, optional_params)`` where
-
-            - ``sino`` (numpy.ndarray): sinogram of shape (num_views, num_det_rows, num_det_channels).
-            - ``required_params`` (dict): ConeBeamModel constructor arguments (``sinogram_shape``,
-              ``angles``, ``source_detector_dist``, ``source_iso_dist``) plus a ``geometry_type`` entry
-              so ``build_model`` can resolve the model class.
-            - ``optional_params`` (dict): ``set_params()`` settings (``delta_det_channel``,
-              ``delta_det_row``, ``delta_voxel``, ``det_channel_offset``, ``det_row_offset``).
+    The two parameter dicts are the ConeBeamModel constructor arguments and the
+    ``set_params()`` settings.
     """
     import mbirtorch
     import mbirtorch.preprocess as mtp
@@ -80,11 +62,10 @@ def _compute_sino_and_params(filename, bh_correction=True):
             sinogram = apply_bh_correction(sinogram, BHCN_params)
 
         if np.abs(det_rotation) > 1e-6:
-            # Correct the sinogram for detector rotation
             sinogram = mtp.correct_det_rotation(sinogram, det_rotation=det_rotation)
             warnings.warn('TODO: Verify the direction of sinogram rotation.')
 
-    # Normalize for build_model: tag the constructor dict with the geometry class identity.
+    # build_model resolves the model class from this entry.
     cone_beam_params['geometry_type'] = str(mbirtorch.ConeBeamModel)
     return sinogram, cone_beam_params, optional_params
 
@@ -229,7 +210,7 @@ def find_linearization_fit(alpha, density1, density2, poly_order=8, max_thick=30
     xxi_l = np.concatenate(([0], prfit_l))
     yyi_l = np.concatenate(([0], uavg0 * t_l))
     coefs = np.polyfit(xxi_l, yyi_l, poly_order)
-    return coefs  # np.poly1d(np.polyfit(xxi_l, yyi_l, poly_order))
+    return coefs
 
 
 

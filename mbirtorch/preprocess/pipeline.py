@@ -53,19 +53,16 @@ def permitted_devices(devices=None):
     return [f'cuda:{i}' for i in range(num_visible)]
 
 
-# The preprocessing functions take whole host arrays: NumPy in, NumPy out, with torch tensors
-# also accepted as input.  Any use of a GPU is internal -- they move one batch of views to a
-# device themselves and bring the result back.  So they never take an array that is already
-# divided across devices, and each entry refuses one by name with the shared check.
+# The preprocessing functions take whole host arrays and never take an array
+# that is already sharded across devices.  Each entry point refuses one here.
 reject_shards = _sharding.reject_shards
 
 
 def _stage_batch(batch, device):
-    """Stage one batch onto the device: contiguous (a flipped/strided source view, e.g. the
-    NSI reader's np.flip, cannot be wrapped as a tensor) and floating point (integer scans, e.g.
-    the Zeiss reader's uint16, promote to float32 as the kernels' arithmetic expects).  The copy
-    is one batch, not the full array.  A batch that is already a tensor is moved to the device
-    with the same dtype rule, and a tensor already on that device is not copied."""
+    """Move one batch of views onto ``device`` as a contiguous floating point tensor.
+
+    An integer batch is promoted to float32.  A tensor already on the device is not copied.
+    """
     if torch.is_tensor(batch):
         batch = batch.detach()
         if not torch.is_floating_point(batch):
@@ -78,12 +75,9 @@ def _stage_batch(batch, device):
 
 
 def _fill_view_batches(array, kernel, output, batch_size, device, lo, hi, desc=None):
-    """Run ``kernel`` over views ``[lo, hi)`` of ``array`` in ``batch_size`` chunks on ``device``,
-    writing each batch's host result directly into ``output[j:...]`` (a pre-allocated host array).
+    """Run ``kernel`` over views ``[lo, hi)`` of ``array`` in ``batch_size`` chunks on ``device``.
 
-    Host->device per batch, device->host per batch.  Writing in place (rather than collecting
-    per-batch results and concatenating) keeps the host footprint at the input + the single output
-    array, with only one batch's result transiently live.
+    Each batch result is written in place into the pre-allocated host array ``output``.
     """
     import tqdm
     steps = range(lo, hi, batch_size)
@@ -133,10 +127,8 @@ def map_view_batches(array, kernel, batch_size, desc=None, devices=None):
         devices = [torch.device(d) for d in devices]
     num_views = array.shape[0]
 
-    # Probe the kernel's output shape/dtype on the first batch so a SINGLE host output array can be
-    # pre-allocated and every batch can write its view-slice in place.  This avoids the per-batch
-    # result list + the final concatenate, which together hold extra full-size copies of the result
-    # on the host.  Writing in place bounds the host footprint to input + output (~2x).
+    # The first batch gives the kernel's output shape and dtype, so the whole host
+    # output array can be allocated once and every batch can write into it in place.
     probe_hi = min(batch_size, num_views)
     with torch.no_grad():
         probe = kernel(_stage_batch(array[0:probe_hi], devices[0])).cpu().numpy()
@@ -149,16 +141,15 @@ def map_view_batches(array, kernel, batch_size, desc=None, devices=None):
                            desc=desc)
         return output
 
-    # Multiple devices: contiguous, in-order view shards, one per device, each filled by its own
-    # thread (torch releases the GIL during CUDA work and transfers, so the devices genuinely
-    # overlap).  Workers write disjoint view-slices of the shared host output.
+    # With several devices, each device takes one contiguous shard of views in its
+    # own thread.  The workers write disjoint view slices of the shared host output.
     view_ranges = np.array_split(np.arange(num_views), len(devices))
 
     def worker(i, device):
         rng = view_ranges[i]
         if len(rng) == 0:
             return
-        lo = max(int(rng[0]), probe_hi)  # views [0:probe_hi] are already filled by the probe
+        lo = max(int(rng[0]), probe_hi)  # The first probe_hi views are already filled.
         hi = int(rng[-1]) + 1
         if lo >= hi:
             return

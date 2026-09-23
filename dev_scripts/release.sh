@@ -2,8 +2,8 @@
 # Run one stage of the release procedure in dev_maintenance.rst.
 #
 #   dev_scripts/release.sh 0.2.0rc1           # rc: publish a pre-release to TestPyPI
-#   dev_scripts/release.sh 0.2.0              # final: open the PR from prerelease to main
-#   dev_scripts/release.sh 0.2.0 --publish    # after the PR merges: publish to PyPI
+#   dev_scripts/release.sh 0.2.0              # final: open the pull request to main
+#   dev_scripts/release.sh 0.2.0 --publish    # after main advances: publish to PyPI
 #
 # Requires the gh CLI, logged in.  Uploads still need approval of the pypi
 # environment on the workflow run page.
@@ -42,7 +42,9 @@ git checkout -q prerelease
 git pull -q origin prerelease
 sed -i '' "s/^__version__ = \".*\"/__version__ = \"$VERSION\"/" $INIT
 grep -q "__version__ = \"$VERSION\"" $INIT
-git add $INIT
+# Stamp the version and date into CITATION.cff and the BibTeX entries.
+python3 dev_scripts/update_citation.py
+git add $INIT CITATION.cff README.md docs/source/credits.rst docs/source/refs.bib
 git commit -q -m "Set version to $VERSION"
 git push -q origin prerelease
 
@@ -52,8 +54,13 @@ if [[ "$STAGE" == "rc" ]]; then
   echo "Pre-release v$VERSION created; TestPyPI upload is running.  Check with:"
   echo "  dev_scripts/check_published_wheel.sh --testpypi --version $VERSION"
 else
-  gh pr create --base main --head prerelease --title "Release $VERSION" \
-    --body "Merges prerelease into main for the $VERSION release."
-  echo "Merge the PR when the checks pass, then run:"
+  # main changes only through a pull request, merged on GitHub.
+  if gh pr list --base main --head prerelease --state open --json number -q '.[0].number' | grep -q .; then
+    echo "The pull request from prerelease to main is already open and now carries $VERSION."
+  else
+    gh pr create --base main --head prerelease --title "MBIRTorch v$VERSION" \
+      --body "Release v$VERSION."
+  fi
+  echo "When the checks pass, merge the pull request on GitHub.  Then run:"
   echo "  dev_scripts/release.sh $VERSION --publish"
 fi

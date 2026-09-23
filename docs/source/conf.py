@@ -16,14 +16,17 @@ import sys
 # Ensure autodoc imports the local package from this checkout.
 sys.path.insert(0, os.path.abspath('../..'))
 
+import mbirtorch
+
 # -- Project information -----------------------------------------------------
 
 project = 'MBIRTorch'
 copyright = '2026, MBIRTorch Development Team'
 author = 'MBIRTorch Development Team'
 
-# The full version, including alpha/beta/rc tags
-release = '0.0.1'
+# The full version, including alpha/beta/rc tags, read from the package so
+# the docs always match the release.
+release = mbirtorch.__version__
 
 
 def skip(app, what, name, obj, would_skip, options):

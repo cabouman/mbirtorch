@@ -61,42 +61,20 @@ def get_sino_and_model(dataset_dir, *, downsample_factor=(1, 1), subsample_view_
 def _compute_sino_and_params(dataset_dir, downsample_factor=(1, 1), subsample_view_factor=1,
                              crop_pixels_sides=None, crop_pixels_top=None, crop_pixels_bottom=None, verbose=1, offset_correction=True):
     """
-    Load NSI scans and compute the sinogram plus build_model-ready geometry parameters.
+    Load NSI scans and compute the sinogram and the model parameters.
 
-    Private helper for :func:`get_sino_and_model`.  It loads object/blank/dark scans and geometry,
-    computes the sinogram (defective-pixel interpolation, detector rotation, background offset), and
-    returns the parameters needed to build a ConeBeamModel.
-
-    Args:
-        dataset_dir (str): Path to the NSI scan directory. Expected structure:
-            - ``*.nsipro`` (NSI config file)
-            - ``Geometry*.rtf`` (geometry report)
-            - ``Radiographs*/`` (radiograph images)
-            - ``**/gain0.tif`` (blank scan)
-            - ``**/offset.tif`` (dark scan)
-            - ``**/*.defect`` (defective pixel info)
-        downsample_factor (Tuple[int, int], optional): Downsample factors for detector rows and channels. Defaults to (1, 1).
-        subsample_view_factor (int, optional): Factor by which to subsample views. Defaults to 1.
-        crop_pixels_sides (int, optional): Pixels to crop from each side of the sinogram. If None, uses NSI config file.
-        crop_pixels_top (int, optional): Pixels to crop from the top. If None, uses NSI config file.
-        crop_pixels_bottom (int, optional): Pixels to crop from the bottom. If None, uses NSI config file.
-        verbose (int, optional): Verbosity level. Defaults to 1.
-        offset_correction (bool): Whether to apply detector offset correction using values from the Geometry Report. Defaults to True.
+    This is the private helper for :func:`get_sino_and_model`, which documents the arguments.
 
     Returns:
-        tuple: ``(sino, required_params, optional_params)`` where
-
-            - ``sino`` (numpy.ndarray): Sinogram of shape (num_views, num_det_rows, num_det_channels).
-            - ``required_params`` (dict): ConeBeamModel constructor arguments plus a ``geometry_type``
-              entry, so ``build_model`` can resolve the model class.
-            - ``optional_params`` (dict): Parameters to be applied via ``set_params()``.
+        tuple: ``(sino, required_params, optional_params)``.  ``required_params`` holds the
+        ConeBeamModel constructor arguments and a ``geometry_type`` entry that ``build_model`` uses
+        to select the model class.  ``optional_params`` holds the ``set_params`` arguments.
     """
     if verbose > 0:
         print("\n\n########## Loading object, blank, dark scans, and geometry parameters from NSI dataset directory")
     obj_scan, blank_scan, dark_scan, nsi_params, defective_pixel_array = \
             load_scans_and_params(dataset_dir, subsample_view_factor=subsample_view_factor, verbose=verbose, offset_correction=offset_correction)
 
-    # Get the crops from the config file if not provided and make sure they are symmetric
     # TODO:  adjust detector offsets for asymmetric crops
     max_crop = nsi_params['max_crop']
     if crop_pixels_sides is None:
@@ -117,7 +95,6 @@ def _compute_sino_and_params(dataset_dir, downsample_factor=(1, 1), subsample_vi
 
     if verbose > 0:
         print("\n\n########## Cropping scans")
-    ### crop the scans based on input params
     obj_scan, blank_scan, dark_scan, defective_pixel_array = mtp.crop_view_data(obj_scan, blank_scan, dark_scan,
                                                                                        crop_pixels_sides=crop_pixels_sides,
                                                                                        crop_pixels_top=crop_pixels_top,
@@ -129,23 +106,18 @@ def _compute_sino_and_params(dataset_dir, downsample_factor=(1, 1), subsample_vi
         print("\n\n########## Computing sinogram (downsample -> transmission -> detector rotation, fused)")
     # det_rotation is not an allowed TomographyModel parameter, so pop it for the fused pipeline.
     det_rotation = optional_params.pop("det_rotation")
-    # Fused scan -> sinogram: (downsample) -> transmission -> (rotation) in one on-device pass per
-    # view-batch -- the object scan is uploaded once and the sinogram gathered once, with no per-stage
-    # host round-trips.
     sino = mtp.scan_to_sino(obj_scan, blank_scan, dark_scan, defective_pixel_array,
                             downsample_factor=downsample_factor, det_rotation=det_rotation)
     del obj_scan, blank_scan, dark_scan  # delete scan images to save memory
 
     if verbose > 0:
         print("\n\n########## Correcting sinogram data to account for background offset")
-    # Background offset correction (a cheap host pass).
     sino = mtp.correct_background_offset(sino, option='per_view')
 
     if verbose > 0:
         print('cropped obj_scan shape = ', obj_scan_shape)
         print('sinogram shape = ', sino.shape)
 
-    # Normalize for build_model: tag the constructor dict with the geometry class identity.
     cone_beam_params['geometry_type'] = str(mbirtorch.ConeBeamModel)
     return sino, cone_beam_params, optional_params
 
@@ -180,7 +152,6 @@ def load_scans_and_params(dataset_dir, view_id_start=0, view_id_end=None, subsam
             - nsi_params (dict): Geometry parameters read from the NSI config file (e.g., geometry vectors, spacings, and angles).
             - defective_pixel_array (numpy.ndarray | tuple): If a defective-pixel file is present, an (N, 2) integer array of (detector_row_idx, detector_channel_idx) pairs; otherwise an empty tuple ``()``.
     """
-    ### automatically parse the paths to NSI metadata and scans from dataset_dir
     config_file_path, geom_report_path, obj_scan_dir, blank_scan_path, dark_scan_path, defective_pixel_path = \
         _parse_filenames_from_dataset_dir(dataset_dir)
 
@@ -193,7 +164,7 @@ def load_scans_and_params(dataset_dir, view_id_start=0, view_id_end=None, subsam
               f"    - Dark scan image: {dark_scan_path}\n",
               f"    - Defective pixel information: {defective_pixel_path}\n")
 
-    ### NSI param tags in nsipro file
+    ### These are the parameter tags read from the nsipro file.
     tag_section_list = [['source', 'Result'],                           # vector from origin to source
                         ['reference', 'Result'],                        # vector from origin to first row and column of the detector
                         ['pitch', 'Object Radiograph'],                 # detector pixel pitch
@@ -212,18 +183,18 @@ def load_scans_and_params(dataset_dir, view_id_start=0, view_id_end=None, subsam
                         ['crop', 'Radiograph']                          # 4-tuple of pixels to crop from each view
                        ]
     assert(os.path.isfile(config_file_path)), f'Error! NSI config file does not exist. Please check whether {config_file_path} is a valid file.'
-    # raw_nsi_fields: list of raw strings from .nsipro in the same order as tag_section_list
+    # raw_nsi_fields holds the raw strings from the nsipro file in the order of tag_section_list.
     raw_nsi_fields = _read_str_from_config(config_file_path, tag_section_list)
 
-    # vector from origin to source
+    # r_s is the vector from the origin to the source.
     r_s = raw_nsi_fields[0].split(' ')
     r_s = np.array([np.single(elem) for elem in r_s])
 
-    # vector from origin to reference, where reference is the center of first row and column of the detector
+    # r_r is the vector from the origin to the center of the first detector row and column.
     r_r = raw_nsi_fields[1].split(' ')
     r_r = np.array([np.single(elem) for elem in r_r])
 
-    # correct the coordinate of (0,0) detector pixel based on "Geometry Report.rtf"
+    # The Geometry Report gives a more accurate coordinate for the (0,0) detector pixel.
     if offset_correction:
         if geom_report_path is not None:
             x_r, y_r = _read_detector_location_from_geom_report(geom_report_path)
@@ -237,22 +208,19 @@ def load_scans_and_params(dataset_dir, view_id_start=0, view_id_end=None, subsam
         if verbose > 0:
             print("Offset correction disabled. Using original r_r =", r_r)
 
-    # detector pixel pitch
     pixel_pitch_det = raw_nsi_fields[2].split(' ')
     delta_det_channel = np.single(pixel_pitch_det[0])
     delta_det_row = np.single(pixel_pitch_det[1])
 
-    # dimension of radiograph
     num_det_channels = int(raw_nsi_fields[3])
     num_det_rows = int(raw_nsi_fields[4])
 
-    # total number of radiograph scans
     num_acquired_scans = int(raw_nsi_fields[5])
 
-    # total angles (usually 360 for 3D data, and (360*number_of_full_rotations) for 4D data
+    # The total rotation is usually 360 degrees, or 360 times the number of turns for 4D data.
     total_angles = int(raw_nsi_fields[6])
 
-    # Radiograph rotation (degree)
+    # The radiograph rotation is in degrees.
     scan_rotate = int(raw_nsi_fields[7])
     if (scan_rotate == 180) or (scan_rotate == 0):
         if verbose > 0:
@@ -265,7 +233,6 @@ def load_scans_and_params(dataset_dir, view_id_start=0, view_id_end=None, subsam
         warnings.warn("Picture mode unknown! Should be either portrait (0 or 180 deg rotation) or landscape (90 or 270 deg rotation). Automatically setting picture mode to portrait.")
         scan_rotate = 180
 
-    # Radiograph horizontal & vertical flip
     if raw_nsi_fields[8] == "True":
         flipH = True
     else:
@@ -275,31 +242,28 @@ def load_scans_and_params(dataset_dir, view_id_start=0, view_id_end=None, subsam
     else:
         flipV = False
 
-    # Detector rotation angle step (degree)
+    # The angle step between views is in degrees.
     angle_step = np.single(raw_nsi_fields[10])
 
-    # Detector rotation direction
     if raw_nsi_fields[11] == "True":
         if verbose > 0:
             print("clockwise rotation.")
     else:
         if verbose > 0:
             print("counter-clockwise rotation.")
-        # counter-clockwise rotation
         angle_step = -angle_step
 
-    # Rotation axis
     r_a = raw_nsi_fields[12].split(' ')
     r_a = np.array([np.single(elem) for elem in r_a])
-    # make sure rotation axis points down
+    # The rotation axis is made to point down.
     if r_a[1] > 0:
         r_a = -r_a
 
-    # Detector normal vector
+    # r_n is the detector normal vector.
     r_n = raw_nsi_fields[13].split(' ')
     r_n = np.array([np.single(elem) for elem in r_n])
 
-    # Detector horizontal vector
+    # r_h is the detector horizontal vector.
     r_h = raw_nsi_fields[14].split(' ')
     r_h = np.array([np.single(elem) for elem in r_h])
     crops = raw_nsi_fields[15].split(' ')
@@ -317,16 +281,13 @@ def load_scans_and_params(dataset_dir, view_id_start=0, view_id_end=None, subsam
         print(f"Detector size: (num_det_rows, num_det_channels) = ({num_det_rows},{num_det_channels})")
         print(f"Pixels to crop from the border of each view = {max_crop}")
         print("############ End NSI geometry parameters ############")
-    ### END load NSI parameters from an nsipro file
 
-    ### read blank scans and dark scans
     blank_scan = np.expand_dims(mtp.read_tif_img(blank_scan_path), axis=0)
     if dark_scan_path is not None:
         dark_scan = np.expand_dims(mtp.read_tif_img(dark_scan_path), axis=0)
     else:
         dark_scan = np.zeros(blank_scan.shape)
 
-    ### read object scans
     if view_id_end is None:
         view_id_end = num_acquired_scans
     view_ids = np.arange(start=view_id_start, stop=view_id_end, step=subsample_view_factor, dtype=np.int32)
@@ -336,7 +297,6 @@ def load_scans_and_params(dataset_dir, view_id_start=0, view_id_end=None, subsam
     if verbose > 0:
         print('Scans loaded.')
 
-    ### Load defective pixel information
     if defective_pixel_path is not None:
         tag_section_list = [['Defect', 'Defective Pixels']]
         defective_loc = _read_str_from_config(defective_pixel_path, tag_section_list)
@@ -345,14 +305,12 @@ def load_scans_and_params(dataset_dir, view_id_start=0, view_id_end=None, subsam
         defective_pixel_array = ()
     num_defective_pixels = len(defective_pixel_array)
 
-    ### flip the scans according to flipH and flipV information from nsipro file
     if flipV:
         if verbose > 0:
             print("Flipping scans vertically")
         obj_scan = np.flip(obj_scan, axis=1)
         blank_scan = np.flip(blank_scan, axis=1)
         dark_scan = np.flip(dark_scan, axis=1)
-        # adjust the defective pixel information: vertical flip
         if num_defective_pixels > 0:
             defective_pixel_array[:, 0] = blank_scan.shape[1] - defective_pixel_array[:, 0] - 1
 
@@ -362,22 +320,18 @@ def load_scans_and_params(dataset_dir, view_id_start=0, view_id_end=None, subsam
         obj_scan = np.flip(obj_scan, axis=2)
         blank_scan = np.flip(blank_scan, axis=2)
         dark_scan = np.flip(dark_scan, axis=2)
-        # adjust the defective pixel information: horizontal flip
         if num_defective_pixels > 0:
             defective_pixel_array[:, 1] = blank_scan.shape[2] - defective_pixel_array[:, 1] - 1
 
-    ### rotate the scans according to scan_rotate param
     rot_count = scan_rotate // 90
     for n in range(rot_count):
         obj_scan = np.rot90(obj_scan, 1, axes=(2,1))
         blank_scan = np.rot90(blank_scan, 1, axes=(2,1))
         dark_scan = np.rot90(dark_scan, 1, axes=(2,1))
-        # adjust the defective pixel information: rotation (clockwise)
         if num_defective_pixels > 0:
             defective_pixel_array = np.fliplr(defective_pixel_array)
             defective_pixel_array[:, 1] = blank_scan.shape[2] - defective_pixel_array[:, 1] - 1
 
-    ### compute projection angles based on angle_step and view_ids
     angles = np.deg2rad(np.array([(view_idx*angle_step) % 360.0 for view_idx in view_ids]))
 
     nsi_params = {
@@ -413,7 +367,6 @@ def convert_nsi_to_mbirtorch_params(nsi_params, downsample_factor=(1, 1), crop_p
         cone_beam_params (dict): Required parameters for the ConeBeamModel constructor.
         optional_params (dict): Additional ConeBeamModel parameters to be set using set_params().
     """
-    # Get the nsi parameters and convert them
     r_a, r_n, r_h, r_s, r_r = itemgetter('r_a', 'r_n', 'r_h', 'r_s', 'r_r')(nsi_params)
     delta_det_channel, delta_det_row = itemgetter('delta_det_channel', 'delta_det_row')(nsi_params)
     num_det_channels, num_det_rows, angles = itemgetter('num_det_channels', 'num_det_rows', 'angles')(nsi_params)
@@ -422,22 +375,17 @@ def convert_nsi_to_mbirtorch_params(nsi_params, downsample_factor=(1, 1), crop_p
     det_channel_offset, det_row_offset = calc_row_channel_params(r_a, r_n, r_h, r_s, r_r, delta_det_channel, delta_det_row, num_det_channels, num_det_rows, magnification)
     recon_slice_offset = - det_row_offset / magnification
 
-    # Apply the configuration crop through the shared primitive: it reduces the shape and, for an
-    # asymmetric top/bottom crop, shifts det_row_offset (NSI forces a symmetric crop upstream, so this is
-    # byte-identical for NSI).  The crop is in raw detector pixels (matched by the raw pitch);
-    # downsampling is applied afterward.
+    # The crop is in raw detector pixels, and the offsets are in ALU.  Downsampling is applied afterward.
     num_det_rows, num_det_channels, det_row_offset, det_channel_offset = mtp.apply_config_crop(
         num_det_rows, num_det_channels, det_row_offset, det_channel_offset, delta_det_row, delta_det_channel,
         crop_pixels_top=crop_pixels_top, crop_pixels_bottom=crop_pixels_bottom, crop_pixels_sides=crop_pixels_sides)
 
-    # Adjust detector size and pixel pitch params w.r.t. downsampling arguments
     num_det_rows = num_det_rows // downsample_factor[0]
     num_det_channels = num_det_channels // downsample_factor[1]
 
     delta_det_row *= downsample_factor[0]
     delta_det_channel *= downsample_factor[1]
 
-    # Create a dictionary to store MBIR parameters
     num_views = len(angles)
     cone_beam_params = dict()
     cone_beam_params["sinogram_shape"] = (num_views, num_det_rows, num_det_channels)
@@ -481,11 +429,9 @@ def _parse_filenames_from_dataset_dir(dataset_dir):
             - dark_scan_path (string): Path to the dark scan image.
             - defective_pixel_path (string): Path to the file containing defective pixel information.
     """
-    # NSI config file
     config_file_path_list = glob.glob(os.path.join(dataset_dir, "*.nsipro"))
     config_file_path = _prompt_user_choice("NSI config files", config_file_path_list)
 
-    # geometry report
     geom_report_path_list = glob.glob(os.path.join(dataset_dir, "Geometry*.rtf"))
     if len(geom_report_path_list) == 0:
         print("No Geometry Report found. Skipping offset correction.")
@@ -493,19 +439,15 @@ def _parse_filenames_from_dataset_dir(dataset_dir):
     else:
         geom_report_path = _prompt_user_choice("Geometry Report", geom_report_path_list)
 
-    # Radiograph directory
     obj_scan_dir_list = glob.glob(os.path.join(dataset_dir, "Radiographs*"))
     obj_scan_dir = _prompt_user_choice("radiograph directories", obj_scan_dir_list)
 
-    # blank scan
     blank_scan_path_list = glob.glob(os.path.join(dataset_dir, "**/gain0.tif"))
     blank_scan_path = _prompt_user_choice("blank scans", blank_scan_path_list)
 
-    # dark scan
     dark_scan_path_list = glob.glob(os.path.join(dataset_dir, "**/offset.tif"))
     dark_scan_path = _prompt_user_choice("dark scans", dark_scan_path_list)
 
-    # defective pixel file
     defective_pixel_path_list = glob.glob(os.path.join(dataset_dir, "**/*.defect"))
     defective_pixel_path = _prompt_user_choice("defective pixel files", defective_pixel_path_list)
 
@@ -516,14 +458,11 @@ def _prompt_user_choice(file_description, file_path_list):
     """ Given a list of candidate files, prompt the user to select the desired one.
         If only one candidate exists, the function will return the name of that file without any user prompts.
     """
-    # file_path_list should contain at least one element
     assert(len(file_path_list) > 0), f"No {file_description} found!! Please make sure you provided a valid NSI scan path."
 
-    # if only file_path_list contains only one file, then return it without user prompt.
     if len(file_path_list) == 1:
         return file_path_list[0]
 
-    # file_path_list contains multiple files. Prompt the user to select the desired one.
     choice_min = 0
     choice_max = len(file_path_list)-1
     question = f"Multiple {file_description} detected. Please select the desired one from the following candidates "
@@ -545,21 +484,18 @@ def _prompt_user_choice(file_description, file_path_list):
 
 
 def _read_detector_location_from_geom_report(geom_report_path):
-    """ Give the path to "Geometry Report.rtf", returns the X and Y coordinates of the first row and first column of the detector.
-        It is observed that the coordinates given in "Geometry Report.rtf" is more accurate than the coordinates given in the <reference> field in nsipro file.
-        Specifically, this function parses the information of "Image center" from "Geometry Report.rtf".
-        Example:
-            - content in "Geometry Report.rtf": Image center    (95.707, 123.072) [mm]  / (3.768, 4.845) [in]
-            - Returns: (95.707, 123.072)
-    Args:
-        geom_report_path (string): Path to "Geometry Report.rtf" file. This file contains more accurate information regarding the coordinates of the first detector row and column.
+    """ Read the coordinates of the first detector row and column from "Geometry Report.rtf".
+
+        The function parses the "Image center" line of the report.  The line
+        "Image center    (95.707, 123.072) [mm]  / (3.768, 4.845) [in]" gives (95.707, 123.072).
+        These coordinates are more accurate than the <reference> field of the nsipro file.
+
     Returns:
-        (x_r, y_r): A tuple containing the X and Y coordinates of center of the first detector row and column.
+        (x_r, y_r): The X and Y coordinates in mm.
     """
     rtf_file = open(geom_report_path, 'r')
     rtf_raw = rtf_file.read()
     rtf_file.close()
-    # Find the image center in mm
     start_index = rtf_raw.find('Image center')
     end_index = start_index + rtf_raw[start_index:].find('[mm]')
     line = rtf_raw[start_index:end_index+1]
@@ -624,9 +560,7 @@ def calc_det_rotation(r_a, r_n, r_h, r_v):
     Returns:
         float number specifying the angle between the rotation axis and the detector columns in units of radians.
     """
-    # project the rotation axis onto the detector plane
     r_a_p = mtp.unit_vector(r_a - mtp.project_vector_to_vector(r_a, r_n))
-    # calculate angle between the projected rotation axis and the horizontal detector vector
     det_rotation = -np.arctan(np.dot(r_a_p, r_h)/np.dot(r_a_p, r_v))
     return det_rotation
 
@@ -650,10 +584,10 @@ def calc_source_detector_params(r_a, r_n, r_h, r_s, r_r):
     r_n = mtp.unit_vector(r_n)      # make sure r_n is normalized
     r_v = np.cross(r_n, r_h)    # r_v = r_n x r_h
 
-    #### vector pointing from source to center of rotation along the source-detector line.
+    # r_s_r points from the source to the center of rotation along the source to detector line.
     r_s_r = mtp.project_vector_to_vector(-r_s, r_n) # project -r_s to r_n
 
-    #### vector pointing from source to detector along the source-detector line.
+    # r_s_d points from the source to the detector along the source to detector line.
     r_s_d = mtp.project_vector_to_vector(r_r-r_s, r_n)
 
     source_detector_dist = np.linalg.norm(r_s_d) # ||r_s_d||
@@ -685,18 +619,16 @@ def calc_row_channel_params(r_a, r_n, r_h, r_s, r_r, delta_det_channel, delta_de
     r_h = mtp.unit_vector(r_h) # make sure r_h is normalized
     r_v = np.cross(r_n, r_h) # r_v = r_n x r_h
 
-    # vector pointing from center of detector to the first row and column of detector along detector columns.
+    # c_v points from the center of the detector to the first row and column along the detector columns.
     c_v = (num_det_rows-1)/2*delta_det_row*r_v
-    # vector pointing from center of detector to the first row and column of detector along detector rows.
+    # c_h points from the center of the detector to the first row and column along the detector rows.
     c_h = (num_det_channels-1)/2*delta_det_channel*r_h
-    # vector pointing from source to first row and column of detector.
+    # r_s_r points from the source to the first detector row and column.
     r_s_r = r_r - r_s
-    # vector pointing from source-detector line to center of detector.
+    # r_delta points from the source to detector line to the center of the detector.
     r_delta = r_s_r - mtp.project_vector_to_vector(r_s_r, r_n) + c_v + c_h
-    # detector row and channel offsets
     det_channel_offset = -np.dot(r_delta, r_h)
     det_row_offset = -np.dot(r_delta, r_v)
-    # rotation offset
     r_a = mtp.unit_vector(r_a)  # make sure r_a is normalized
     rotation_offset = np.dot(r_s, np.cross(r_n, r_a))
     det_channel_offset += rotation_offset*magnification

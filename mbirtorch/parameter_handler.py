@@ -19,8 +19,7 @@ import numpy as np
 from . import _utils
 from ._utils import Param
 
-# Counts the model instances created in this process, to give each one a
-# logger name of its own (see ParameterHandler.__init__).
+# This counter gives each model instance a unique logger name.
 _instance_counter = itertools.count(1)
 
 
@@ -31,26 +30,20 @@ class ParameterHandler:
 
     def __init__(self):
         self.params = _utils.get_default_params()
-        # Every instance gets a logger of its own, named for the class plus a
-        # count that is never reused.  Python's logging module hands out one
-        # shared logger per name, so a name shared by all instances of a class
-        # would mean that setting up the log for a second model tears down the
-        # handlers of a first model that is still running: its later lines
-        # would land in the second model's file and log buffer.  The count is
-        # used instead of id(self) because ids are recycled once an object is
-        # freed, so a new model could inherit a dead one's logger.
+        # The logger name must be different for each instance, because Python logging
+        # keeps one logger per name and two instances would share handlers.  The counter
+        # is used instead of id(self), because Python reuses an id after a free.
         self.logger_name = 'mbirtorch.{}.{}'.format(type(self).__name__,
                                                     next(_instance_counter))
-        # Messages logged before a run starts go to the console only; a run
-        # replaces these handlers in setup_logger.
+        # Until a run calls setup_logger, messages go to the console only.
         self.logger = logging.getLogger(self.logger_name)
         console_handler = logging.StreamHandler()
         console_handler.setFormatter(logging.Formatter('%(message)s'))
         self.logger.addHandler(console_handler)
         self.logger.setLevel(logging.INFO)
         self.log_buffer = None
-        # The log file of the run in progress, remembered so that a call
-        # continuing that run can reopen the file the previous call closed.
+        # This holds the log file of the run in progress, so that a call which
+        # continues the run can reopen it.
         self._logfile_path = None
 
     def setup_logger(self, *, logfile_path: str = "~/.mbirtorch/logs/recon.log", print_logs: bool = True):
@@ -69,7 +62,6 @@ class ParameterHandler:
         """
         if logfile_path:
             logfile_path = os.path.expanduser(logfile_path)
-        # Map verbosity to logging level
         verbose = self.get_params('verbose')
         if verbose < 1:
             level = logging.WARNING
@@ -78,18 +70,12 @@ class ParameterHandler:
         else:
             level = logging.DEBUG
 
-        # Configure logger.  This is the instance's own logger (see
-        # __init__), so setting it up here cannot disturb the log of another
-        # model that is still running.
         logger = self.logger
         logger.setLevel(level)
-        # The handlers attached below are the complete set of intended outputs:
-        # the in-memory buffer, the console when print_logs is on, and the file
-        # when a path is given.  Without this, records also reach whatever the
-        # application configured on the root logger, so print_logs=False would
-        # still print the whole run log through a caller's logging.basicConfig.
+        # The handlers attached below are the complete set of outputs.  Setting
+        # propagate to False keeps records from also reaching the root logger.
         logger.propagate = False
-        # Close and remove any existing handlers to prevent leaked file descriptors
+        # Close existing handlers to avoid leaking file descriptors.
         for h in list(logger.handlers):
             try:
                 h.flush()
@@ -97,7 +83,6 @@ class ParameterHandler:
                 h.close()
                 logger.removeHandler(h)
 
-        # In-memory buffer handler (always enabled)
         self.log_buffer = io.StringIO()
         buffer_handler = logging.StreamHandler(self.log_buffer)
         buffer_handler.setLevel(level)
@@ -105,7 +90,6 @@ class ParameterHandler:
         buffer_handler.setFormatter(buffer_formatter)
         logger.addHandler(buffer_handler)
 
-        # Console handler
         if print_logs:
             console_handler = logging.StreamHandler()
             console_handler.setLevel(level)
@@ -113,7 +97,7 @@ class ParameterHandler:
             console_handler.setFormatter(console_formatter)
             logger.addHandler(console_handler)
 
-        # File handler (optional).  mode='w' starts a new log for a new run.
+        # Mode 'w' starts a new log for a new run.
         self._logfile_path = logfile_path if logfile_path else None
         if logfile_path:
             self._add_log_file_handler(logfile_path, mode='w', level=level)
@@ -121,11 +105,7 @@ class ParameterHandler:
     def _add_log_file_handler(self, logfile_path, mode, level):
         """Attach a handler that copies the log to ``logfile_path``.
 
-        ``delay=True`` leaves the file unopened until the first line is
-        actually written to it.  Without it, opening in mode 'w' would create
-        the file (and truncate an existing one) right here, so a run that logs
-        nothing -- at verbose=0 only warnings are logged at all -- would leave
-        an empty file behind.
+        The handler uses delay=True, so a run that logs nothing creates no file.
         """
         from .utilities import makedirs
         makedirs(logfile_path)
@@ -159,14 +139,9 @@ class ParameterHandler:
                     self.logger.removeHandler(h)
 
     def _reopen_log_file(self):
-        """Reattach the log file of a run that is being continued.
-
-        A run's last call closed the file (see ``close_log_file``), so a call
-        that continues that run -- a resumed recon, or a later pass of a
-        Plug-and-Play loop -- has to open it again.  Mode 'a' keeps what the
-        earlier calls wrote.  Nothing happens if the run never had a log file,
-        or if one is already attached.
-        """
+        """Reattach the log file that ``close_log_file`` closed, opening it in
+        append mode.  Do nothing if the run has no log file, or if a file
+        handler is already attached."""
         if self.logger is None or not self._logfile_path:
             return
         if any(isinstance(h, logging.FileHandler) for h in self.logger.handlers):
@@ -175,59 +150,40 @@ class ParameterHandler:
                                    level=self.logger.level)
 
     def _log_run_header(self, first_iteration, logfile_path, print_logs):
-        """Set up the run logger (on the first iteration, or whenever none has been set up) and log
-        the MBIRTorch version.
+        """Set up the run logger if needed and log the MBIRTorch version.
 
-        Shared by recon and prox_map.  The devices are logged separately, by
-        :meth:`_log_device_report`, because mbirtorch chooses the device layout
-        only once the reconstruction is about to start; see that method.
+        Both recon and prox_map call this method.  The devices are logged
+        separately by :meth:`_log_device_report`, once the layout is final.
         """
-        # log_buffer, not logger, is what says "setup_logger has never run".
-        # TomographyModel fills the logger slot at construction with a
-        # console-only logger for messages that happen before a recon starts,
-        # so testing self.logger here would skip setup on every resumed run
-        # (first_iteration > 0) and drop the log entirely.  Only setup_logger
-        # ever creates the buffer.
+        # The log buffer, not the logger, tells whether setup_logger has run.
+        # The constructor always fills the logger slot with a console logger.
         if first_iteration == 0 or self.log_buffer is None:
             self.setup_logger(logfile_path=logfile_path, print_logs=print_logs)
         else:
-            # Continuing a run that is already set up: reopen the log file the
-            # previous call closed, so this call's lines join it.
             self._reopen_log_file()
         from . import __version__
         self.logger.info('MBIRTorch Version = {}'.format(__version__))
 
     def _log_device_report(self):
-        """Log the devices the reconstruction will actually use.
-
-        Called once the device layout is final.  The report cannot go in the
-        run header, because the automatic layout is chosen when a
-        reconstruction starts: a header-time report would name the placement
-        the run was about to leave, and a widened run would log '1 x CUDA'.
-        """
+        """Log the devices the reconstruction will use.  Call only once the
+        device layout is final, which is after the run header is written."""
         self.logger.info('Reconstruction devices: {}'.format(
             self._device_report()))
 
     def _device_report(self):
-        """An 'N x PLATFORM (sharded)' summary of the recon devices, for the
-        recon log."""
+        """Return a summary of the reconstruction devices for the log, in the
+        form 'N x PLATFORM (sharded)'."""
         devices = self.recon_placement.devices
         platform = devices[0].type.upper()
         report = '{} x {} (sharded)'.format(len(devices), platform)
-        # Automatic selection that used fewer than the visible devices: say
-        # which counts were turned down and why, so idle hardware is never
-        # silent.  Only a layout the library chose can have a search to
-        # explain, so an explicitly configured layout never carries this
-        # clause -- an explicit call also clears the recorded rejections.
+        # When the library chose the layout itself and used fewer than the visible
+        # devices, the report names each rejected device count and the reason.
         rejected = getattr(self, 'device_choice_rejections', None)
         automatic = getattr(self, 'device_layout_is_automatic', False)
         if rejected and automatic:
             visible = max([count for count, _why in rejected] + [len(devices)])
-            # One entry can name the count actually IN USE: the speed guard
-            # records why a count was reached before the outcome is known,
-            # and _settle rewrites that note when the search settles on it.
-            # Calling the chosen count 'rejected' would contradict the line
-            # it appears on, so it is labelled for what it is.
+            # One recorded entry can name the count that is actually in use, so
+            # each entry is labelled either 'used' or 'rejected'.
             report += ' (using {} of {} {} devices: {})'.format(
                 len(devices), visible, platform,
                 '; '.join('{} {}, {}'.format(
@@ -299,7 +255,7 @@ class ParameterHandler:
         meta_parameter_change = False
 
         for key, val in kwargs.items():
-            # Default to forcing a recompile for new parameters.
+            # New parameters force a recompile.
             recompile_flag = True
             if key in self.params:
                 recompile_flag = self.params[key].recompile_flag
@@ -313,7 +269,6 @@ class ParameterHandler:
             clean_val = ParameterHandler.normalize_scalar(val)
             self.params[key] = Param(clean_val, recompile_flag)
 
-            # Handle special cases.
             if recompile_flag:
                 recompile = True
             elif key in ["sigma_y", "sigma_x", "sigma_prox"]:
@@ -321,8 +276,6 @@ class ParameterHandler:
             elif key in ["sharpness", "snr_db"]:
                 meta_parameter_change = True
 
-        # Directly-set regularization parameters disable auto-regularization,
-        # so the user's value survives recon's auto_set pass.
         if regularization_parameter_change:
             if not no_warning:
                 self.set_params(auto_regularize_flag=False)
@@ -330,8 +283,6 @@ class ParameterHandler:
                               'sigma_x, sigma_y or sigma_prox. This is an advanced '
                               'feature that will disable auto-regularization.')
 
-        # Setting sharpness/snr_db re-enables a disabled auto-regularization,
-        # so those parameters take effect.
         if meta_parameter_change:
             if self.get_params('auto_regularize_flag') is False:
                 self.set_params(auto_regularize_flag=True)
@@ -348,10 +299,8 @@ class ParameterHandler:
         raise NotImplementedError
 
     def refresh_device_bindings(self):
-        # TomographyModel overrides: rebuilds the device placements from the
-        # CURRENT shapes before recreating the projectors, so a
-        # geometry-changing set_params can never leave a stale placement
-        # silently truncating sharded arrays.
+        # TomographyModel overrides this to rebuild device placements from the
+        # current shapes before recreating the projectors.
         self.create_projectors()
 
     def verify_valid_params(self):
@@ -388,9 +337,8 @@ class ParameterHandler:
                 print(f'{key} = {entry.val}')
         print('----')
 
-    # ── shared geometry-params namedtuple cache ───────────────────────────────
-    # The namedtuple CLASS is cached per field-name tuple (module-level).  A shared
-    # class keeps equality and repr behavior consistent across instances.
+    # The namedtuple class is cached and shared for each set of field names, so
+    # that equality and repr behave the same way for all instances.
     _geometry_param_classes = {}
 
     @classmethod

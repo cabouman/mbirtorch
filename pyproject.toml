@@ -71,16 +71,8 @@ docs = [
 
 
 [tool.pytest.ini_options]
-# The cross-framework golden tests are OPT-IN: addopts deselects them, so a
-# plain `pytest tests` runs the self-contained suite only.  They pin mbirtorch
-# to mbirjax and will retire once mbirjax freezes and intentional
-# non-backward-compatible changes begin, so they must not sit in every run's
-# path.  Opt in with `-m goldens` (parity tests alone) or
-# `-m "goldens or not goldens"` (the full suite, e.g. the release gate) -- a
-# -m on the command line overrides this default.
-addopts = "-m 'not goldens'"
 markers = [
-    "goldens: opt-in cross-framework parity tests; need tests/goldens artifacts generated from the mbirjax env",
+    "performance: timing-gate tests; exclude with -m 'not performance' on loaded machines",
 ]
 
 [tool.setuptools.dynamic]

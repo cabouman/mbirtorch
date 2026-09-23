@@ -71,80 +71,38 @@ import torch
 from ._utils import padded_kernel_width
 from .parallel_beam import _parallel_back_view_batch, _parallel_hfan_math
 from .projectors import compile_serialized
-# The Triton language shims are IMPORTED from the cone module rather than
-# duplicated or hoisted to a third module.  The import graph stays acyclic
-# (triton_parallel -> triton_cone -> cone_beam; the geometry classes import
-# their kernel modules lazily, inside _view_batch_bodies), and the shims exist
-# to absorb Triton API drift -- ``_tl_builtin``'s tl-vs-tl.math lookup and the
-# static_range fallback -- which is a single moving target that should have a
-# single home.  ``_COMPILED_LAUNCH_KEYS`` is deliberately shared too: every key
-# leads with its kernel's name, so one set serves all four kernels and a
-# cross-kernel false hit is impossible.
+# The Triton language shims live in the cone module.  _COMPILED_LAUNCH_KEYS is
+# shared by all four kernels, and every key leads with its kernel's name.
 from .triton_cone import (_COMPILED_LAUNCH_KEYS, _jit, _tap_range, _tile_size,
                           _tl_abs, tl, triton)
 
 _F32 = torch.float32
 
-# ── H100 PINNED constants (from the 60-config sweep at both gate cells) ──────
-# The register-pressure prediction held: with only ~3 live tiles per program
-# (the cone back holds ~6), the taller BLOCK_R=256 back rectangle runs
-# without spilling (50 regs/thread, 0 spills) and wins the 1024 cell.  The
-# back winners split by cell -- BLOCK_R=64 wins the 512 cell and BLOCK_R=256
-# wins the 1024 cell, each by about 9 and 24 percent over the other -- and
-# one config is pinned anyway: (8, 256, 4, 1) sits within 0.6 percent of
-# best at 1024, where the back kernel dominates the composed time, and its
-# 9 percent concession at 512 is invisible in composition (the whole back
-# call is under 0.8 ms against a 10.6 ms compiled body).  Isolated speedups
-# at the pin: 13x over the compiled torch body at 512 and 7.8x at 1024,
-# bit-exact across repeat launches (no atomics on the back path).
+# The tile constants below were chosen by a sweep on an H100.
 PARALLEL_BACK_BLOCK_P = 8
 PARALLEL_BACK_BLOCK_R = 256
 PARALLEL_BACK_NUM_WARPS = 4
-# 1 stage = no software pipelining: the view loop is gather-bound, not
-# dot-bound, and extra stages buy latency hiding only at more register
-# pressure (the stages=2 twin of the pin measured within noise of it).
 PARALLEL_BACK_NUM_STAGES = 1
-# The smallest tile worth launching: a row band or pixel subset below this pads
-# rather than shrinking further.
+# A row band or pixel subset smaller than this tile is padded, not shrunk.
 PARALLEL_BACK_MIN_TILE = 8
-# The driver's nominal view chunk for this kernel's batches: the batch this
-# body asks for when the model's view_batch_size is None (automatic).  The
-# batching rule rides on the body (see _parallel_back_view_batch_cost and
-# Projectors._effective_view_batch), because the torch bodies' gather-slab
-# charge would force view batch 1 at large cells for a kernel that holds no
-# such slab.  Swept beside the tile constants; the driver's transient budget
-# may cap the realized batch below it.
+# The view batch this body asks for when the model's view_batch_size is None.
+# The driver's transient budget may cap the realized batch below it.
 PARALLEL_BACK_VIEW_CHUNK = 128
 
-# The forward pin is the cone-seeded config, confirmed by its own sweep: best
-# at the 1024 cell outright and within 3.5 percent of best at 512, where the
-# forward is a 5 ms term.  Isolated it is 1.21x over the compiled body at 512
-# and 0.78x at 1024 -- and composition reverses the 1024 loss (see the
-# selection hook in parallel_beam.py): the composed both-kernels arm beats
-# the back-only arm by 19-24 percent.
 PARALLEL_FWD_BLOCK_P = 8
 PARALLEL_FWD_BLOCK_R = 128
 PARALLEL_FWD_NUM_WARPS = 8
-# 1 stage: the tap loop is atomic-bound rather than dot-bound.
 PARALLEL_FWD_NUM_STAGES = 1
 PARALLEL_FWD_MIN_TILE = 8
-# The forward's nominal view chunk (see PARALLEL_BACK_VIEW_CHUNK).
 PARALLEL_FWD_VIEW_CHUNK = 128
 
-# The sorted-contraction forward's pins: the mg33 spike's winner (32 pixels,
-# a 16-channel window, 128 columns, 8 warps, 16-view chunks), where it read
-# 3.97x over the tap kernel at the full mask and 2.8x to 3.9x at the VCD
-# subset sizes, with the atomic adds down 31.6x (findings 1.30 in the plans
-# repository).  The window is a hard tl.dot minimum (16) and the sorted
-# spans measured 2 to 3 channels, so there is no headroom question in the
-# window choice itself.
+# Constants for the sorted contraction forward kernel.
 PARALLEL_SORTED_BLOCK_P = 32
 PARALLEL_SORTED_WINDOW = 16
 PARALLEL_SORTED_BLOCK_R = 128
 PARALLEL_SORTED_NUM_WARPS = 8
 PARALLEL_SORTED_NUM_STAGES = 1
-# tl.dot needs every dimension at 16 or more, so the column tile never
-# shrinks below 16 (the tap kernel's floor is 8).
+# tl.dot needs every dimension at 16 or more.
 PARALLEL_SORTED_MIN_R = 16
 PARALLEL_SORTED_VIEW_CHUNK = 16
 
@@ -171,38 +129,20 @@ def _parallel_back_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
                           sino_view_stride,
                           PSF_RADIUS: tl.constexpr, COEFF_POWER: tl.constexpr,
                           BLOCK_P: tl.constexpr, BLOCK_R: tl.constexpr):
-    """One program per (pixel block, row chunk) of the output partial:
+    """One program per (pixel block, row chunk) of the output partial.
 
         out[p, r] = sum over views v, channel taps tc of
                     Wchan[v, p, tc] ** coeff_power * sino[v, c(v, p) + tc, r]
 
-    -- the cone back kernel with its vertical fan deleted.  The row axis is
-    inert geometry here (row r is slice r), so it rides as the vector axis and
-    the gathered row band IS the output's slice band; a banded call simply
-    hands the kernel fewer rows.
+    Detector row r is recon slice r, so the row axis is the vector axis and the
+    gathered row band is the output's slice band.  The pixel block is the fast
+    grid axis, so programs that run together gather the same detector rows.
 
-    The pixel block is the FAST grid axis so that concurrently scheduled
-    programs gather from the same detector rows of the same view -- the L2
-    residency the pallas grid ordering bought for these transaction-bound
-    gathers.
-
-    ``coeff_power`` rides on the CHANNEL weight, the only weight there is (the
-    cone kernel splits it across the row and channel weights).  It is a
-    constexpr branch, so power 2 costs one multiply and no divergence.
-
-    Pixels beyond ``num_pixels`` ride as padded lanes: their loaded contract
-    values are zeroed, which zeroes the tap weight, and their stores are
-    masked (the poison-the-padding rule).
-
-    The row axis works differently.  ``num_band_rows`` is the row count the
-    WRAPPER launches, which is the band's real row count rounded up to a
-    multiple of 16 (see :func:`mbirtorch._utils.padded_kernel_width`).  Row
-    lanes between the two are ordinary live lanes: they load, they compute,
-    and they store.  Two things make that safe.  The wrapper hands this
-    kernel a sinogram copy allocated at the padded row count whose extra rows
-    are zero, so those lanes read zeros and accumulate exactly zero.  And
-    their stores land in the extra output columns, which the wrapper slices
-    off before it returns.
+    Pixel lanes beyond ``num_pixels`` load zeroed contract values, which zeroes
+    their weights, and their stores are masked.  ``num_band_rows`` is the
+    padded row count the wrapper launches at.  Row lanes past the real rows
+    read zeros from the padded sinogram copy and store into extra output
+    columns that the wrapper slices off.
     """
     p_offs = tl.program_id(0) * BLOCK_P + tl.arange(0, BLOCK_P)     # (BLOCK_P,)
     r_offs = tl.program_id(1) * BLOCK_R + tl.arange(0, BLOCK_R)     # (BLOCK_R,)
@@ -215,17 +155,16 @@ def _parallel_back_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
         pix_base = v.to(tl.int64) * num_pixels + p_offs
         n_p = tl.load(n_p_ptr + pix_base, mask=p_mask, other=0.0)
         centers = tl.load(centers_ptr + pix_base, mask=p_mask, other=0)
-        # Per-VIEW scalars (see the module docstring): the projected footprint
-        # of a voxel depends on the view angle alone under parallel beam.
+        # These are per view scalars.  Under parallel beam the projected
+        # footprint of a voxel depends on the view angle alone.
         w_p_c = tl.load(w_p_c_ptr + v)
         weight_scale = tl.load(weight_scale_ptr + v)
         clip = tl.minimum(w_p_c, 1.0)
         sino_view_ptr = sino_ptr + v.to(tl.int64) * sino_view_stride
 
         for tc in _tap_range(0, 2 * PSF_RADIUS + 1):
-            # The horizontal_fan trapezoid rule, in-kernel: zero the weight
-            # where the unclipped tap left the detector, then clamp the index
-            # (the zero-and-clamp convention).
+            # The trapezoid rule zeroes the weight where the unclipped tap
+            # left the detector, then clamps the index.
             n_tap = centers + (tc - PSF_RADIUS)
             w_chan = tl.maximum((w_p_c + 1.0) / 2.0
                                 - _tl_abs(n_p - n_tap.to(tl.float32)), 0.0)
@@ -235,8 +174,8 @@ def _parallel_back_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
             if COEFF_POWER == 2:
                 w_chan = w_chan * w_chan
             n_chan = tl.minimum(tl.maximum(n_tap, 0), num_channels - 1)
-            # Channel-major views: the row axis walks the CONTIGUOUS axis, so a
-            # tile's gather is a unit-stride read.
+            # The views are channel major, so the row axis is contiguous and
+            # a tile's gather is a unit stride read.
             row_ptr = sino_view_ptr + n_chan.to(tl.int64) * num_band_rows
             vals = tl.load(row_ptr[:, None] + r_offs[None, :], mask=tile_mask,
                            other=0.0)
@@ -255,32 +194,18 @@ def _parallel_back_view_batch_triton(sino_batch, pixel_indices,
                                      delta_voxel_row, psf_radius,
                                      coeff_power=1, slice_start=0,
                                      band_slices=None, plan=None):
-    """The Triton parallel back body: a drop-in replacement for
-    :func:`mbirtorch.parallel_beam._parallel_back_view_batch` (same signature,
-    same (P, rows) return, freshly written each call so the driver may
-    accumulate into it in place).
+    """Triton parallel back body, replacing
+    :func:`mbirtorch.parallel_beam._parallel_back_view_batch`.
 
-    The row count is rounded up to a multiple of 16 before the launch,
-    because Triton compiles a faster kernel for an integer argument it can
-    prove divisible by 16.  The channel-major sinogram copy is then made at
-    the padded row count with its extra rows zeroed, and the return is the
-    real-row slice of a slightly wider output.  A row count that IS a
-    multiple of 16 takes exactly the path it took before, with the same
-    allocations.
-
-    Eager python by construction, declared twice over because the two
-    mechanisms cover different callers: ``torch.compiler.disable`` keeps dynamo
-    out when a compiled region CALLS this body, and the
-    ``_mbirtorch_no_compile`` marker set below keeps the driver's
-    ``maybe_compile`` from compiling it DIRECTLY (torch.compile unwraps the
-    disable decorator and would trace the launch anyway).  The hfan builder
-    runs ONCE per call, outside every loop (the hoisted-builders rule).
-
-    The band asserts are the torch body's, inherited rather than relaxed: a
-    row-aligned geometry carries its band in the SINOGRAM's row axis, so the
-    two-fan band keywords must stay at their defaults and the returned column
-    count is the input's row count.  ``plan`` is accepted and ignored -- the
-    sorted/CSR stream slot, not yet built.
+    It has the same signature and the same (P, rows) return, written fresh
+    each call so the driver may accumulate into it in place.  The row count is
+    rounded up to a multiple of 16 for the launch, the channel major sinogram
+    copy is made at that padded count with zeros in the extra rows, and the
+    return is the real row slice.  This body must stay eager, which the
+    ``torch.compiler.disable`` decorator and the ``_mbirtorch_no_compile``
+    marker below enforce for the two kinds of caller.  A row aligned geometry
+    carries its band in the sinogram's row axis, so the band keywords stay at
+    their defaults.  ``plan`` is ignored.
     """
     if triton is None:
         raise RuntimeError('the Triton parallel back body was called without '
@@ -288,8 +213,7 @@ def _parallel_back_view_batch_triton(sino_batch, pixel_indices,
                            'ParallelBeamModel._view_batch_bodies should have '
                            'kept the torch body (see kernel_availability).')
     assert slice_start == 0 and band_slices is None
-    # Powers other than 1 and 2 are outside the kernel's static branch (and
-    # outside every caller in the package): delegate rather than diverge.
+    # The kernel has static branches for powers 1 and 2 only.
     if coeff_power not in (1, 2):
         return _parallel_back_view_batch(
             sino_batch, pixel_indices, view_params_batch, num_rows, num_cols,
@@ -303,33 +227,23 @@ def _parallel_back_view_batch_triton(sino_batch, pixel_indices,
 
     num_views, num_pixels = n_p.shape
     num_band_rows = int(sino_batch.shape[1])
-    # The row count the kernel is LAUNCHED at, rounded up to a multiple of 16
-    # so that Triton compiles the faster specialization of it.  Every use of
-    # the row argument takes this value -- the grid, the tile mask, the
-    # sinogram row stride and the output row stride.  A row count that is
-    # already a multiple of 16 gets its own value back, so every allocation
-    # and every argument below is exactly what it was before this padding
-    # existed.
+    # The kernel is launched at a row count rounded up to a multiple of 16.
+    # Every use of the row argument takes this value.
     launch_rows = padded_kernel_width(num_band_rows)
-    # Channel-major views, as in the torch body: the kernel's per-tile gather
-    # walks the row axis, which is contiguous in this layout.
+    # The views are made channel major, so the per tile gather is contiguous.
     if launch_rows == num_band_rows:
         sino_t = sino_batch.permute(0, 2, 1).contiguous()
     else:
-        # This kernel's sinogram is band-sized and its gather is bounded by
-        # the row argument alone, so a padded row lane would read past the
-        # last real row.  The copy the wrapper already makes is therefore
-        # made at the padded row count instead, with the extra rows set to
-        # zero: a zero sinogram row contributes exactly zero to the sum, and
-        # the sliced return below discards the columns it lands in.  The
-        # extra cost is the zero fill, not a second pass over the data.
+        # A padded row lane would read past the last real row, so the copy is
+        # made at the padded row count with zeros in the extra rows.
         sino_t = torch.empty(
             (int(sino_batch.shape[0]), int(sino_batch.shape[2]), launch_rows),
             dtype=sino_batch.dtype, device=sino_batch.device)
         sino_t[:, :, :num_band_rows] = sino_batch.permute(0, 2, 1)
         sino_t[:, :, num_band_rows:] = 0.0
     contract = [t.contiguous() for t in (n_p, centers)]
-    # Per-view scalars, and the shape check that they really are per view.
+    # The reshape both converts to per view scalars and checks that they are
+    # per view.
     contract += [t.reshape(num_views).contiguous()
                  for t in (w_p_c, weight_scale)]
     out = torch.empty((num_pixels, launch_rows), dtype=_F32,
@@ -340,17 +254,14 @@ def _parallel_back_view_batch_triton(sino_batch, pixel_indices,
     block_r = _tile_size(PARALLEL_BACK_BLOCK_R, launch_rows,
                          PARALLEL_BACK_MIN_TILE)
     grid = (-(-num_pixels // block_p), -(-launch_rows // block_r))
-    # The padded row count keys the launch, because it is the integer the
-    # compilation is keyed on.
     launch_key = ('pback', sino_batch.device.index, int(psf_radius),
                   int(coeff_power), block_p, block_r,
                   int(num_views), int(num_pixels), int(num_channels),
                   launch_rows)
     first_launch = launch_key not in _COMPILED_LAUNCH_KEYS
     guard = compile_serialized() if first_launch else contextlib.nullcontext()
-    # The launch must be bracketed on the tensors' device, and the device
-    # leads the launch key -- see _cone_back_view_batch_triton (triton_cone),
-    # whose comment carries the measured basis.
+    # The launch runs on the tensors' own device, and the device leads the
+    # launch key.
     with torch.cuda.device(sino_batch.device), guard:
         _parallel_back_kernel[grid](
             *contract, sino_t, out,
@@ -363,34 +274,24 @@ def _parallel_back_view_batch_triton(sino_batch, pixel_indices,
     _COMPILED_LAUNCH_KEYS.add(launch_key)
     if launch_rows == num_band_rows:
         return out
-    # The padded columns hold values no caller reads, so they are sliced off.
-    # The result is a strided view, which the driver's accumulation and the
-    # cross-device reduce both handle: each row is still one contiguous run.
+    # The padded columns are sliced off.  The result is a strided view whose
+    # rows are each still contiguous.
     return out[:, :num_band_rows]
 
 
-# See the wrapper's docstring: the driver reads this marker in maybe_compile.
+# The driver reads this marker in maybe_compile.
 _parallel_back_view_batch_triton._mbirtorch_no_compile = True
 
 
 def _parallel_back_view_batch_cost(num_pixels, band_rows, args):
-    """Charged bytes resident per view in one back-kernel batch, and this
-    kernel's nominal view chunk -- the driver's batching rule for this body,
-    read through the ``_view_batch_cost`` attribute in
-    ``Projectors._effective_view_batch``.
+    """Return the bytes resident per view in one back kernel batch, and this
+    kernel's nominal view chunk.
 
-    One view of a batch holds the hfan contract at 16 bytes per
-    (view, pixel): ``n_p`` (f32) and ``centers`` (i32) held, plus the
-    builder's live intermediate and an expression temporary of the same
-    footprint (``W_p_c`` and ``weight_scale`` ride as per-view scalars).  It
-    also holds the channel-major copy of its sinogram plane (``sino_t``
-    above), which the wrapper allocates at the PADDED row count, so the plane
-    term reads the padded value.  Call-fixed tensors -- the (P, rows) output
-    partial -- exist at any batch size, so the batch choice cannot control
-    them and they are not charged, exactly as the torch-body budget never
-    charged its own fixed outputs.  The charge is a counted estimate that
-    protects the budget boundary; the chunk constant is the swept performance
-    chooser, and the composed gates re-measure the real peaks."""
+    The driver reads this through the ``_view_batch_cost`` attribute.  One view
+    holds the horizontal fan contract at 16 bytes per (view, pixel), plus the
+    channel major copy of its sinogram plane at the padded row count.  Tensors
+    whose size does not depend on the batch are not charged.
+    """
     plane_bytes = (4 * int(args['num_channels'])
                    * padded_kernel_width(band_rows))
     return 16 * int(num_pixels) + plane_bytes, PARALLEL_BACK_VIEW_CHUNK
@@ -407,52 +308,24 @@ def _parallel_forward_kernel(n_p_ptr, centers_ptr, w_p_c_ptr,
                              out_view_stride,
                              PSF_RADIUS: tl.constexpr, BLOCK_P: tl.constexpr,
                              BLOCK_R: tl.constexpr):
-    """One program per (pixel block, column chunk, view) of the sinogram:
+    """One program per (pixel block, column chunk, view) of the sinogram.
 
         out[v, c, r] += sum over pixels p, channel taps tc of
                         Wchan[v, p, tc] * values[p, r]
 
-    -- the cone forward kernel's horizontal scatter alone, with the vertical
-    fan deleted: under parallel beam a voxel cylinder's column r lands on
-    detector row r whatever the view, so the (BLOCK_P, BLOCK_R) tile of
-    ``values`` that the cone kernel had to BUILD from a slice tap loop is here
-    simply LOADED, once per program, before the tap loop starts.
+    Under parallel beam a voxel cylinder's column r lands on detector row r in
+    every view, so each program loads its tile of ``values`` once before the
+    tap loop.  The view is a grid axis because each view writes its own output
+    plane.  The pixel block is the fast axis, so programs that run together
+    read the same rows of ``values`` and hit neighboring channels.
 
-    Grid choice, inherited from the cone forward: the VIEW axis has to be a
-    grid axis rather than an in-program loop, because the forward writes a
-    separate output plane per view and a view loop would only serialize.  The
-    PIXEL block is the fast axis so concurrently scheduled programs read the
-    same rows of ``values`` and hit neighbouring channels of the same view with
-    their atomics (neighbouring pixels project to neighbouring channels).  The
-    view axis is last because it is the only small one; it inherits CUDA's
-    65535 limit on grid dims 1 and 2, which the driver's view batch is nowhere
-    near.
+    The output is channel major (Vb, C, R), which puts the row axis on the
+    contiguous stride.  The wrapper transposes the view on return.
 
-    One specialization this grid leaves on the table, for the sweep to measure
-    rather than for this increment to assume: because ``values`` does not
-    depend on the view here (it does for cone), moving the view axis into an
-    in-program LOOP would read each values tile once instead of once per view,
-    at the cost of a grid smaller by the view batch.  Whether that trade wins
-    depends on whether the kernel is atomic-bound or load-bound, which is a
-    measurement, not an argument -- measure, then specialize.
-
-    The output is CHANNEL-MAJOR (Vb, C, R), the layout fan_forward_batch also
-    accumulates in: it puts the row axis -- the kernel's vector axis -- on the
-    contiguous stride, so one tile row's atomics land on consecutive addresses
-    instead of striding by C.  The wrapper transposes the view on return, as
-    the torch body does.
-
-    Pixels beyond ``num_pixels`` ride as padded lanes: their atomics are
-    masked off entirely (the poison-the-padding rule).
-
-    The column axis works differently.  ``num_cols`` is the column count the
-    WRAPPER launches, which is the real count rounded up to a multiple of 16
-    (see :func:`mbirtorch._utils.padded_kernel_width`).  Column lanes between
-    the two are ordinary live lanes: they load and their atomics land.  Two
-    things make that safe.  The wrapper hands this kernel a ``values`` copy
-    allocated at the padded column count whose extra columns are zero, so
-    those lanes add exactly 0.0 wherever they land.  And they land in the
-    extra output columns, which the wrapper slices off before it returns.
+    Pixel lanes beyond ``num_pixels`` have their atomics masked off.
+    ``num_cols`` is the padded column count the wrapper launches at.  Column
+    lanes past the real columns read zeros from the padded ``values`` copy and
+    add into extra output columns that the wrapper slices off.
     """
     p_offs = tl.program_id(0) * BLOCK_P + tl.arange(0, BLOCK_P)     # (BLOCK_P,)
     r_offs = tl.program_id(1) * BLOCK_R + tl.arange(0, BLOCK_R)     # (BLOCK_R,)
@@ -464,22 +337,19 @@ def _parallel_forward_kernel(n_p_ptr, centers_ptr, w_p_c_ptr,
     pix_base = v.to(tl.int64) * num_pixels + p_offs
     n_p = tl.load(n_p_ptr + pix_base, mask=p_mask, other=0.0)
     centers = tl.load(centers_ptr + pix_base, mask=p_mask, other=0)
-    # Per-VIEW scalars (see the module docstring).
+    # These are per view scalars.
     w_p_c = tl.load(w_p_c_ptr + v)
     weight_scale = tl.load(weight_scale_ptr + v)
     clip = tl.minimum(w_p_c, 1.0)
 
-    # The voxel cylinders, read ONCE and held in registers across every tap:
-    # ``values`` does not depend on the view or the tap, so a per-tap reload
-    # would be the same bytes psf_width times over.
+    # The voxel cylinders are read once and held in registers across the taps.
     vals = tl.load(values_ptr + p_offs.to(tl.int64)[:, None] * num_cols
                    + r_offs[None, :], mask=tile_mask, other=0.0)
 
     out_view_ptr = out_ptr + v.to(tl.int64) * out_view_stride
     for tc in _tap_range(0, 2 * PSF_RADIUS + 1):
-        # The horizontal_fan trapezoid rule, in-kernel (as in the back kernel);
-        # here the out-of-detector taps drop out of the atomic MASK rather than
-        # being added as zeros, which is the same value and one less atomic.
+        # The trapezoid rule again.  Taps outside the detector drop out of the
+        # atomic mask instead of being added as zeros.
         n_tap = centers + (tc - PSF_RADIUS)
         w_chan = tl.maximum((w_p_c + 1.0) / 2.0
                             - _tl_abs(n_p - n_tap.to(tl.float32)), 0.0)
@@ -502,25 +372,19 @@ def _parallel_forward_sorted_kernel(n_p_ptr, centers_ptr, w_p_c_ptr,
                                     PSF_RADIUS: tl.constexpr,
                                     BLOCK_P: tl.constexpr,
                                     BLOCK_R: tl.constexpr):
-    """The sorted-contraction forward: one program per (pixel block, column
-    chunk, view chunk), with the pixels PRE-SORTED per view by channel
-    center and the values rows reached through that view's permutation.
+    """One program per (pixel block, column chunk, view chunk), with the
+    pixels sorted per view by channel center.
 
-    Sorted, a tile's taps land in a narrow channel window, so the scatter
-    becomes a small dense contraction: the tile's trapezoid weights form a
-    (BLOCK_P, WINDOW) matrix, transpose(W) @ values accumulates the whole
-    tile (a segmented reduction where many pixels share a channel), and the
-    window lands with one atomic add per (channel, column) instead of one
-    per (pixel, tap, column).  The contraction runs in the full-precision
-    input mode; the tensor-core default rounds inputs to a 10-bit mantissa
-    and would fail the 1e-5 value gates.
+    Sorting puts a tile's taps in a narrow channel window, so the scatter
+    becomes a small dense contraction.  The tile's trapezoid weights form a
+    (BLOCK_P, WINDOW) matrix, transpose(W) @ values accumulates the tile, and
+    the window lands with one atomic add per (channel, column).  The
+    contraction runs in full precision input mode, because the tensor core
+    default rounds inputs to a 10 bit mantissa and fails the value checks.
 
-    A tile whose sorted span still exceeds the window -- a sparse pixel
-    set is the ordinary cause -- takes the original per-tap block below,
-    so correctness never rests on the span.  A view chunk past the batch's
-    end clamps its view index for every address and masks its stores, so a
-    batch of any length is safe (the driver's tail batches are shorter
-    than the chunk).
+    A tile whose sorted span exceeds the window falls back to the per tap
+    block below.  A view chunk past the end of the batch clamps its view index
+    and masks its stores.
     """
     p_offs = tl.program_id(0) * BLOCK_P + tl.arange(0, BLOCK_P)
     r_offs = tl.program_id(1) * BLOCK_R + tl.arange(0, BLOCK_R)
@@ -532,8 +396,8 @@ def _parallel_forward_sorted_kernel(n_p_ptr, centers_ptr, w_p_c_ptr,
     for dv in range(VIEW_CHUNK):
         v = v0 + dv
         v_ok = v < num_views
-        # The clamp keeps every address in bounds for a tail chunk; the
-        # store masks carry v_ok, so a clamped iteration writes nothing.
+        # The clamp keeps every address in bounds for a tail chunk.  The store
+        # masks carry v_ok, so a clamped iteration writes nothing.
         v_safe = tl.minimum(v, num_views - 1)
         pix_base = v_safe.to(tl.int64) * num_pixels + p_offs
         n_p = tl.load(n_p_ptr + pix_base, mask=p_mask, other=0.0)
@@ -551,10 +415,8 @@ def _parallel_forward_sorted_kernel(n_p_ptr, centers_ptr, w_p_c_ptr,
         c_hi = tl.max(tl.where(p_mask, centers, -big)) + PSF_RADIUS
         span = c_hi - c_lo + 1
         if span <= WINDOW:
-            # The window weights are the tap path's trapezoid formula
-            # evaluated at every window channel: the psf radius is chosen
-            # so the trapezoid's support sits inside the taps, so the
-            # window holds the same nonzero weights plus true zeros.
+            # The window weights are the same trapezoid formula evaluated at every
+            # window channel.  The window adds exact zeros to the tap path weights.
             j = tl.arange(0, WINDOW)
             c = c_lo + j
             w = tl.maximum(
@@ -569,9 +431,8 @@ def _parallel_forward_sorted_kernel(n_p_ptr, centers_ptr, w_p_c_ptr,
             win_ptrs = (out_view_ptr
                         + c_addr.to(tl.int64)[:, None] * num_cols
                         + r_offs[None, :])
-            # The span mask keeps the power-of-two window from inflating
-            # the adds: lanes past the tile's real span carry zero weight
-            # AND issue no atomic.
+            # The span mask keeps lanes past the tile's real span from
+            # issuing an atomic.
             tl.atomic_add(win_ptrs, out_window,
                           mask=(v_ok
                                 & ((j <= (c_hi - c_lo))
@@ -602,27 +463,16 @@ def _parallel_forward_view_batch_triton(values, pixel_indices,
                                         det_channel_offset, delta_voxel,
                                         delta_voxel_row, psf_radius,
                                         slice_start=0, plan=None):
-    """The Triton parallel forward body: a drop-in replacement for
-    :func:`mbirtorch.parallel_beam._parallel_forward_view_batch` (same
-    signature, same (Vb, rows, C) return, freshly zeroed each call because the
-    kernel accumulates into it with atomics).
+    """Triton parallel forward body, replacing
+    :func:`mbirtorch.parallel_beam._parallel_forward_view_batch`.
 
-    The column count is rounded up to a multiple of 16 before the launch, for
-    the reason :func:`_parallel_back_view_batch_triton` gives for its rows.
-    ``values`` is then copied into a zero-padded array of that width and the
-    return is the real-column slice of a slightly wider output.  A column
-    count that IS a multiple of 16 takes exactly the path it took before,
-    with the same allocations, which covers the production slice counts.
-
-    Eager python by construction and declared twice over, for the two reasons
-    :func:`_parallel_back_view_batch_triton` spells out, and with the same
-    hoisted builder.
-
-    ``values`` is (P, cols), and cols is the detector ROW count of the block
-    this call produces -- rows track slices, so a slice band is a row band and
-    needs no z anchor, which is what the inherited ``slice_start == 0`` assert
-    states.  ``plan`` is accepted and ignored -- the sorted/CSR stream slot,
-    not yet built.
+    It has the same signature and the same (Vb, rows, C) return, zeroed each
+    call because the kernel accumulates into it with atomics.  The column count
+    is rounded up to a multiple of 16 for the launch, ``values`` is copied into
+    a zero padded array of that width, and the return is the real column slice.
+    ``values`` is (P, cols), where cols is the detector row count of the block
+    this call produces.  Rows track slices, so a slice band is a row band and
+    needs no z anchor.  ``plan`` is ignored.
     """
     if triton is None:
         raise RuntimeError('the Triton parallel forward body was called '
@@ -636,38 +486,22 @@ def _parallel_forward_view_batch_triton(values, pixel_indices,
 
     num_views, num_pixels = n_p.shape
     num_value_cols = int(values.shape[1])
-    # The column count the kernel is LAUNCHED at, rounded up to a multiple of
-    # 16 so that Triton compiles the faster specialization of it.  Every use
-    # of the column argument takes this value -- the grid, the tile mask, the
-    # values row stride and the output row stride.  A column count that is
-    # already a multiple of 16 gets its own value back, so every allocation
-    # and every argument below is exactly what it was before this padding
-    # existed; the production slice counts (1008, 2016) are such values.
+    # The kernel is launched at a column count rounded up to a multiple of 16.
+    # Every use of the column argument takes this value.
     launch_cols = padded_kernel_width(num_value_cols)
     if launch_cols == num_value_cols:
         values = values.contiguous()
     else:
-        # A padded column lane would read past the last real column of
-        # ``values``, so the copy the wrapper already makes is made at the
-        # padded width instead, with the extra columns set to zero.  Those
-        # lanes then add exactly 0.0 through the atomics, and the sliced
-        # return below discards the columns they land in.
+        # A padded column lane would read past the last real column, so the
+        # copy is made at the padded width with zeros in the extra columns.
         padded_values = torch.empty((int(values.shape[0]), launch_cols),
                                     dtype=values.dtype, device=values.device)
         padded_values[:, :num_value_cols] = values
         padded_values[:, num_value_cols:] = 0.0
         values = padded_values
     if sorted_forward_enabled():
-        # THE SORTED ROUTE (the default; findings 1.30 in the plans
-        # repository).  Per view, the pixels are sorted by channel center
-        # and the contract is gathered into that order, so the sorted
-        # kernel's tiles sit in narrow channel windows and its contraction
-        # replaces almost all of the atomic scatter.  The permutation maps
-        # each sorted position back to its values row; the kernel gathers
-        # the rows per view.  The sort computes per call; the orderings
-        # depend only on (pixel set, view batch), so a memoization through
-        # the ``plan`` slot is the recorded follow-up if the per-call
-        # milliseconds ever matter.
+        # On the sorted route the pixels are sorted per view by channel center.  The
+        # permutation maps each sorted position back to its row of ``values``.
         order = torch.argsort(n_p, dim=1)
         contract = [torch.gather(n_p, 1, order).contiguous(),
                     torch.gather(centers, 1, order).contiguous(),
@@ -705,11 +539,12 @@ def _parallel_forward_view_batch_triton(values, pixel_indices,
         return out[:, :, :num_value_cols].permute(0, 2, 1)
 
     contract = [t.contiguous() for t in (n_p, centers)]
-    # Per-view scalars, and the shape check that they really are per view.
+    # The reshape both converts to per view scalars and checks that they are
+    # per view.
     contract += [t.reshape(num_views).contiguous()
                  for t in (w_p_c, weight_scale)]
-    # Channel-major, zeroed: the atomics accumulate, and the return transposes
-    # the view exactly as the torch body transposes fan_forward_batch's.
+    # The output is channel major and zeroed, because the atomics accumulate
+    # into it.  The return transposes each view.
     out = torch.zeros((num_views, num_channels, launch_cols), dtype=_F32,
                       device=values.device)
 
@@ -719,16 +554,13 @@ def _parallel_forward_view_batch_triton(values, pixel_indices,
                          PARALLEL_FWD_MIN_TILE)
     grid = (-(-num_pixels // block_p), -(-launch_cols // block_r),
             num_views)
-    # The padded column count keys the launch, because it is the integer the
-    # compilation is keyed on.
     launch_key = ('pfwd', values.device.index, int(psf_radius), block_p,
                   block_r, int(num_views),
                   int(num_pixels), int(num_channels), launch_cols)
     first_launch = launch_key not in _COMPILED_LAUNCH_KEYS
     guard = compile_serialized() if first_launch else contextlib.nullcontext()
-    # The launch must be bracketed on the tensors' device, and the device
-    # leads the launch key -- see _cone_back_view_batch_triton (triton_cone),
-    # whose comment carries the measured basis.
+    # The launch runs on the tensors' own device, and the device leads the
+    # launch key.
     with torch.cuda.device(values.device), guard:
         _parallel_forward_kernel[grid](
             *contract, values, out,
@@ -740,30 +572,23 @@ def _parallel_forward_view_batch_triton(values, pixel_indices,
     _COMPILED_LAUNCH_KEYS.add(launch_key)
     if launch_cols == num_value_cols:
         return out.permute(0, 2, 1)
-    # The extra columns hold values no caller reads, so they are sliced off
-    # before the transpose.
+    # The extra columns are sliced off before the transpose.
     return out[:, :, :num_value_cols].permute(0, 2, 1)
 
 
-# See the back wrapper's docstring: the driver reads this marker in
-# maybe_compile.
+# The driver reads this marker in maybe_compile.
 _parallel_forward_view_batch_triton._mbirtorch_no_compile = True
 
 
 def _parallel_forward_view_batch_cost(num_pixels, num_value_cols, args):
-    """The forward twin of :func:`_parallel_back_view_batch_cost`: one view
-    holds the same 16-byte-per-(view, pixel) hfan contract and its zeroed
-    channel-major output plane (the atomics' target).  ``values`` is
-    call-fixed and not charged.
+    """Return the bytes resident per view in one forward kernel batch, and
+    this kernel's nominal view chunk.
 
-    The plane is allocated at the PADDED column count, because that is what
-    the wrapper launches at, so the charge reads the padded value too.
-
-    The sorted route adds per-(view, pixel) residents beside the 16-byte
-    contract: the argsort's int64 order (8), the int32 permutation (4), and
-    the gathered float32 and int32 contract copies (8).  Twenty bytes per
-    (view, pixel), charged only while the route is on, so the code and the
-    charge cannot disagree."""
+    One view holds the horizontal fan contract at 16 bytes per (view, pixel),
+    plus its zeroed channel major output plane at the padded column count.
+    The sorted route adds 20 more bytes per (view, pixel) for the sort order,
+    the permutation, and the gathered contract copies.
+    """
     plane_bytes = (4 * int(args['num_channels'])
                    * padded_kernel_width(num_value_cols))
     per_view = 16 * int(num_pixels) + plane_bytes
