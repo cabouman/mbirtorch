@@ -17,12 +17,12 @@ output/
 results/
 logs/
 
-# cross-framework golden data: generated on demand by tests/generate_goldens.py
-# (run in the mbirjax env); binary, regenerable, so not committed
-tests/goldens/
-
 # environments
 .venv/
 
 # scratch from dev_scripts/refresh_widening_floors.py (staged sinograms, arm rows)
 dev_scripts/_widening_floor_runs/
+
+# macOS Finder metadata
+.DS_Store
+._*

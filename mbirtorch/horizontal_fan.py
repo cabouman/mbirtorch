@@ -93,9 +93,8 @@ def fan_forward_batch(hfan_data, values, num_channels, psf_radius):
     vb, num_pixels = n_p.shape
     num_cols = values.shape[-1]
     dev = values.device
-    # One flat (Vb*C, num_cols) accumulator so a single index_add_ covers the
-    # whole batch: row v*C + n receives pixel p's contribution to view v,
-    # channel n.
+    # The accumulator is flat, so one index_add_ covers the whole batch.
+    # Row v*C + n holds view v, channel n.
     acc = torch.zeros((vb * num_channels, num_cols), dtype=_F32, device=dev)
     row_base = torch.arange(vb, device=dev)[:, None] * num_channels
     for offset in range(-psf_radius, psf_radius + 1):

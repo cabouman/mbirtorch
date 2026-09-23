@@ -3,15 +3,15 @@ import torch
 import mbirtorch.preprocess as mtp
 from mbirtorch import _sharding
 
-# Chunk bound for the per-shard histogram passes, in elements: keeps each
-# temporary well under a GB and each chunk's counts exact in int64.
+# Largest number of elements in one chunk of the per-shard histogram passes.
 _HISTOGRAM_CHUNK_ELEMENTS = 1 << 24
 
 
 def _shard_valid_masks(valid_mask, placement, ndim):
-    """Split a broadcastable host mask into per-shard pieces: the placement's
-    axis is sliced to each shard's range; size-1 (broadcast) axes stay whole.
-    Returns a list of numpy arrays, or Nones when there is no mask."""
+    """Split a broadcastable host mask into one piece per shard.
+
+    Returns a list of numpy arrays, or a list of Nones when there is no mask.
+    """
     if valid_mask is None:
         return [None] * placement.n_devices
     mask = np.asarray(valid_mask)
@@ -28,9 +28,11 @@ def _shard_valid_masks(valid_mask, placement, ndim):
 
 
 def _shard_chunks(tensor, mask_piece):
-    """Yield (chunk, mask_chunk) pairs over the leading axis, each chunk at
-    most _HISTOGRAM_CHUNK_ELEMENTS elements.  The mask chunk is a torch bool
-    tensor broadcast to the chunk's shape, or None."""
+    """Yield (chunk, mask_chunk) pairs over the leading axis.
+
+    Each chunk holds at most _HISTOGRAM_CHUNK_ELEMENTS elements.  The mask
+    chunk is a torch bool tensor broadcast to the chunk's shape, or None.
+    """
     per_row = max(1, int(np.prod(tensor.shape[1:], dtype=np.int64)))
     step = max(1, _HISTOGRAM_CHUNK_ELEMENTS // per_row)
     m = None
@@ -47,59 +49,33 @@ def _shard_chunks(tensor, mask_piece):
 
 
 def _sharded_masked_histogram(shards, valid_mask, num_bins):
-    """Histogram of the valid entries of a sharded volume, computed shard by
-    shard on each shard's own device.  Only the small per-shard count tables
-    ever leave a device; the volume is never gathered.
+    """Histogram the valid entries of a sharded volume, one shard at a time.
 
-    A histogram is a sum of counts, so summing the per-shard tables adds no
-    error of its own: the tables are exact int64 and their sum is exact.  The
-    range is the masked min/max, combined across shards on the host, and the
-    bin EDGES come from numpy itself, so both paths cut at the same places.
-
-    The per-value BINNING is not bit-for-bit numpy, and the thresholds are
-    therefore not guaranteed to equal the unsharded ones.  ``np.histogram``
-    computes each bin index in float64 and then runs a ULP correction pass
-    against the actual edges; the device-side rule below is a float32 multiply
-    truncated toward zero, with no correction.  Measured over 200 trials of
-    20 000 uniform float32 samples into 1024 bins, at most 3 values per trial
-    (mean 0.36) land in a different bin than the edge semantics numpy
-    implements, and most of those are values sitting exactly ON an interior
-    bin edge, where the two rules break the tie differently.  (Any
-    histogram-based threshold is approximate to begin with -- an order
-    statistic of float data cannot be recovered from a fixed number of
-    bins.)  Otsu's DP
-    maximizes between-class variance over bins whose counts are in the
-    millions at production scale, so a handful of displaced counts is not
-    expected to move a boundary -- but "expected not to" is the claim, not
-    "cannot".
+    The volume is never gathered.  Only the per-shard count tables leave a
+    device.  The binning here is a truncated float32 multiply, so a few values
+    near a bin edge can land in a different bin than np.histogram would choose.
 
     Returns:
-        (hist, bin_edges): host numpy arrays in the single-array path's dtypes
-        (int64 counts; edges computed by np.histogram's own edge arithmetic).
+        (hist, bin_edges): host numpy arrays, int64 counts and numpy's edges.
 
     Raises:
-        ValueError: if the valid entries are empty or span a degenerate range
-            (min == max), which has no meaningful binning here.
+        ValueError: if the valid entries are empty or span a degenerate range.
     """
     masks = _shard_valid_masks(valid_mask, shards.placement,
                                shards.tensors[0].ndim)
 
-    # Pass 1: masked min and max per chunk, combined on the host.
+    # Pass 1 takes the masked min and max per chunk and combines them on the host.
     lo, hi = np.inf, -np.inf
     for t, mp in zip(shards.tensors, masks):
         for chunk, mc in _shard_chunks(t, mp):
             vals = chunk.reshape(-1) if mc is None else chunk[mc]
             if vals.numel() == 0:
-                continue          # an empty shard, or one the mask excludes
+                continue          # The shard is empty, or the mask excludes it.
             lo = min(lo, float(vals.min()))
             hi = max(hi, float(vals.max()))
 
-    # A degenerate range must raise, not bin.  numpy EXPANDS a zero-width
-    # range to (lo - 0.5, lo + 0.5) when it derives the edges, so the edges
-    # below would describe a different partition than the counts above --
-    # every value in bin 0 against edges centered on lo.  The counts and the
-    # edges would disagree and the derived thresholds would be quietly wrong,
-    # which is the one failure mode worse than stopping.
+    # A degenerate range raises rather than binning.  numpy expands a zero
+    # width range when it derives edges, so the counts and edges would disagree.
     if not (np.isfinite(lo) and np.isfinite(hi)):
         raise ValueError(
             'The sharded volume has no valid entries to histogram: every '
@@ -110,11 +86,8 @@ def _sharded_masked_histogram(shards, valid_mask, num_bins):
             f'(min == max), so there are no intensity classes to separate.  '
             f'Segmentation needs a volume that takes more than one value.')
 
-    # Pass 2: count per chunk into num_bins buckets (exact int64 on device),
-    # summed on the host.  Values are mapped to buckets by the linear map
-    # np.histogram uses, in float32 and truncating rather than float64 with
-    # numpy's edge-correction pass (see the docstring); hi lands in the last
-    # (closed) bin.
+    # Pass 2 counts each chunk into num_bins buckets on the device and sums the
+    # counts on the host.  The value hi lands in the last bin, which is closed.
     hist = np.zeros(num_bins, dtype=np.int64)
     scale = num_bins / (hi - lo)
     for t, mp in zip(shards.tensors, masks):
@@ -127,8 +100,8 @@ def _sharded_masked_histogram(shards, valid_mask, num_bins):
                               max=num_bins - 1)
             hist += torch.bincount(idx, minlength=num_bins).cpu().numpy()
 
-    # Edges from np.histogram itself (on an empty array), so both paths use
-    # numpy's exact edge arithmetic.
+    # The edges come from np.histogram on an empty array, so the sharded and
+    # unsharded paths use the same edge arithmetic.
     edges_dtype = shards.dtype
     empty = np.empty(0, dtype=str(edges_dtype).replace('torch.', ''))
     _, bin_edges = np.histogram(empty, bins=num_bins, range=(float(lo), float(hi)))
@@ -136,23 +109,18 @@ def _sharded_masked_histogram(shards, valid_mask, num_bins):
 
 
 def _masked_histogram(image, valid_mask, num_bins, xp):
-    """Histogram of the valid entries of ``image``, matching ``histogram(image, num_bins,
-    range=(min, max))`` computed over the valid entries only.
+    """Histogram the valid entries of ``image`` over their own min to max range.
 
-    The range comes from masked min/max, and invalid entries are pushed to a finite sentinel ABOVE the
-    range, which ``histogram``'s range semantics then drop -- so the bin EDGES and counts are exactly
-    those of the valid entries (no post-hoc count correction needed).  ``xp`` is the array module
-    (currently always ``np``, on the host).  The infinity/one constants are typed to ``image.dtype``
-    so the ``where`` cannot
-    silently upcast (a float64 scalar would double the full-size temporaries).
+    Invalid entries are replaced by a finite sentinel above the range, which
+    ``histogram`` then drops.  The constants are typed to ``image.dtype`` so
+    that ``where`` does not upcast and double the size of the temporaries.
     """
     inf = xp.asarray(xp.inf, dtype=image.dtype)
     lo = xp.min(xp.where(valid_mask, image, inf))
     hi = xp.max(xp.where(valid_mask, image, -inf))
-    sentinel = hi + xp.maximum(xp.abs(hi), xp.asarray(1.0, dtype=image.dtype))  # finite, strictly > hi
-    # Python-float range endpoints: numpy computes the bin edges in the RANGE's dtype, so float
-    # endpoints give the f64-computed, image-dtype-cast edges, whereas f32 endpoints would shift some
-    # edges by a few ULP.
+    sentinel = hi + xp.maximum(xp.abs(hi), xp.asarray(1.0, dtype=image.dtype))  # Finite and above hi.
+    # The range endpoints are Python floats.  numpy computes the bin edges in
+    # the dtype of the range, and float32 endpoints would shift some edges.
     return xp.histogram(xp.where(valid_mask, image, sentinel), bins=num_bins, range=(float(lo), float(hi)))
 
 
@@ -195,53 +163,31 @@ def multi_threshold_otsu(image, classes=2, num_bins=1024, valid_mask=None):
     if isinstance(valid_mask, torch.Tensor):
         valid_mask = valid_mask.detach().cpu().numpy()
 
-    # Compute the histogram of the valid entries.
     if isinstance(image, _sharding.Shards):
-        # Sharded volume: histogram shard by shard on each shard's device.
         hist, bin_edges = _sharded_masked_histogram(image, valid_mask, num_bins)
     elif valid_mask is not None:
         hist, bin_edges = _masked_histogram(image, np.asarray(valid_mask), num_bins, np)
     else:
-        # Python-float range endpoints for the same reason as in _masked_histogram (edge consistency).
         hist, bin_edges = np.histogram(image, bins=num_bins, range=(float(np.min(image)), float(np.max(image))))
 
-    # Find the optimal thresholds (half-open class-boundary bin indices) by dynamic programming
     thresholds = _otsu_thresholds_dp(hist, classes - 1)
 
-    # Convert boundary indices to image values.  bin_edges[t] is the exact cut for boundary t: values
-    # below it fall precisely in bins < t (the lower classes), matching the histogram split.
+    # bin_edges[t] is the cut for boundary t.  Values below it fall in bins
+    # less than t, which are the lower classes.
     scaled_thresholds = [bin_edges[t] for t in thresholds]
 
     return scaled_thresholds
 
 
 def _otsu_thresholds_dp(hist, num_thresholds):
-    """
-    Multi-threshold Otsu via dynamic programming.
+    """Find multi-threshold Otsu boundaries by dynamic programming.
 
-    Otsu's criterion minimizes the total within-class variance: for thresholds t_1 < ... < t_k, class
-    ``c`` spans the bin interval ``[t_c, t_{c+1})`` (with t_0 = 0 and t_{k+1} = num_bins) and the
-    objective is
-
-        sum over classes of   sum_{i in class} (i - class mean)^2 * hist[i].
-
-    The objective is separable over the classes, so the optimal thresholds solve the classic 1-D
-    segmentation DP
-
-        D[c][b] = min over s < b of  D[c-1][s] + cost(s, b),
-
-    where ``cost(a, b)`` is the within-class term of a single class spanning bins ``[a, b)``.  The cost
-    is O(1) from prefix sums of the histogram's zeroth/first/second moments, each DP stage is one
-    vectorized (B+1)^2 min-reduction, and the thresholds come from an argmin backtrack: O(k B^2)
-    float64 NumPy with no recursion and no per-bin Python loops, exact for every ``num_thresholds``.
-
-    Threshold convention: returned values are half-open class boundaries -- threshold ``t`` means bin
-    ``t`` starts the next class.  The consistent threshold VALUE is therefore the left bin edge
-    ``bin_edges[t]``: values below it fall exactly in bins < t (the lower classes).
+    The returned boundaries are half open.  Boundary ``t`` means that bin ``t``
+    starts the next class, so the matching threshold value is ``bin_edges[t]``.
 
     Args:
-        hist (ndarray): Histogram of the image (counts; any nonnegative dtype).
-        num_thresholds (int): Number of thresholds to find (k = classes - 1).
+        hist (ndarray): Histogram counts of the image.
+        num_thresholds (int): Number of thresholds to find.
 
     Returns:
         list of int: strictly increasing boundary indices in ``[1, len(hist) - 1]``.
@@ -251,48 +197,38 @@ def _otsu_thresholds_dp(hist, num_thresholds):
 
     hist = np.asarray(hist, dtype=np.float64)
     num_bins = len(hist)
-    # Bin coordinates centered and scaled to [-1, 1].  The within-class variance is shift-invariant,
-    # and a uniform scale multiplies EVERY interval cost by the same factor, so the DP's argmin -- and
-    # hence the returned thresholds -- is unchanged in exact arithmetic.  Centering removes the
-    # mean-offset cancellation in the prefix-difference arithmetic below; scaling keeps the moment
-    # prefix sums O(total count) instead of O(count * bins^2) (~1e15 for a 1e9-voxel volume), so all
-    # magnitudes stay comfortably conditioned in float64.
-    half_span = max((num_bins - 1) / 2.0, 1.0)     # max() guards the degenerate 1-bin histogram
+    # The bin coordinates are centered and scaled to [-1, 1].  This leaves the
+    # thresholds unchanged and keeps the moment prefix sums well conditioned.
+    half_span = max((num_bins - 1) / 2.0, 1.0)     # The max guards a one bin histogram.
     bin_coord = (np.arange(num_bins, dtype=np.float64) - (num_bins - 1) / 2.0) / half_span
 
-    # Moment prefix sums, each with a leading 0 so that P[j] = (sum over bins i < j) and the moment of
-    # any bin interval [a, b) is P[b] - P[a].  m0 = counts, m1 = first moment, m2 = second moment.
+    # Each prefix sum has a leading zero, so the moment of bins [a, b) is P[b] - P[a].
     m0 = np.concatenate(([0.0], np.cumsum(hist)))
     m1 = np.concatenate(([0.0], np.cumsum(bin_coord * hist)))
     m2 = np.concatenate(([0.0], np.cumsum(bin_coord * bin_coord * hist)))
 
-    # Moments of every candidate class interval at once: outer differences, entry [a, b] = P[b] - P[a]
-    # = the moment of bins [a, b).
+    # Entry [a, b] of each outer difference is the moment of bins [a, b).
     int_m0 = m0[None, :] - m0[:, None]
     int_m1 = m1[None, :] - m1[:, None]
     int_m2 = m2[None, :] - m2[:, None]
 
-    # Within-class cost of the interval [a, b): expanding sum (i - mean)^2 h_i with mean = M1/M0 gives
-    # M2 - M1^2/M0.  Empty (zero-count) intervals cost 0 (an empty class contributes no variance);
-    # structurally invalid entries (a >= b) are +inf so the argmin can never produce non-increasing
-    # boundaries.
+    # The within class cost of bins [a, b) is M2 - M1^2/M0, and an empty interval costs
+    # zero.  Entries with a >= b are infinite, so the boundaries must increase.
     mean_sq_term = np.divide(int_m1 ** 2, int_m0, out=np.zeros_like(int_m0), where=int_m0 > 0)
-    cost = np.maximum(int_m2 - mean_sq_term, 0.0)      # clip tiny negative rounding residue
+    cost = np.maximum(int_m2 - mean_sq_term, 0.0)      # Clip negative rounding residue.
     invalid = ~np.triu(np.ones((num_bins + 1, num_bins + 1), dtype=bool), k=1)   # a >= b
     cost[invalid] = np.inf
 
-    # DP stages: best[b] = minimal cost of covering bins [0, b) with the current number of classes.
-    # Each stage adds one class: total[s, b] = (best cover of [0, s) so far) + (one new class [s, b));
-    # the argmin over s is recorded per b for the backtrack.
-    best = cost[0, :].copy()                           # one class: [0, b)
+    # best[b] is the least cost of covering bins [0, b) with the classes so far.
+    # Each stage adds one class and records the argmin for the backtrack.
+    best = cost[0, :].copy()                           # One class covering [0, b).
     split_of = np.zeros((num_thresholds, num_bins + 1), dtype=np.int64)
     for stage in range(num_thresholds):
         total = best[:, None] + cost                   # total[s, b]
         split_of[stage] = np.argmin(total, axis=0)
         best = np.min(total, axis=0)
 
-    # Backtrack from the full range [0, num_bins): the last stage's argmin at b = num_bins is the last
-    # threshold; each recovered threshold then indexes the previous stage's argmin row.
+    # The backtrack starts at b = num_bins and walks the stages in reverse.
     boundaries = []
     b = num_bins
     for stage in range(num_thresholds - 1, -1, -1):
@@ -337,7 +273,7 @@ def segment_plastic_metal(recon, num_metal, radial_margin=None, top_margin=None,
 
     is_shards = isinstance(recon, _sharding.Shards)
     if is_shards and recon.placement.is_trivial:
-        # One shard: compute through the tensor path, return in the form given.
+        # There is one shard, so the tensor path handles it.
         pl = recon.placement
         plastic_mask, metal_masks, plastic_scale, metal_scales = segment_plastic_metal(
             recon.tensors[0], num_metal, radial_margin=radial_margin,
@@ -346,8 +282,8 @@ def segment_plastic_metal(recon, num_metal, radial_margin=None, top_margin=None,
                 [_sharding.Shards([m], pl) for m in metal_masks],
                 plastic_scale, metal_scales)
 
-    # Size-relative default margins: the former fixed 10 at production sizes, smaller for small
-    # volumes so the mask never carves off a large fraction of the field of view.
+    # The default margins scale with the volume, so the mask never removes a
+    # large fraction of a small field of view.
     shape = recon.tensors[0].shape if is_shards else recon.shape
     num_slices = recon.placement.axis_len if is_shards else recon.shape[2]
     if radial_margin is None:
@@ -357,16 +293,15 @@ def segment_plastic_metal(recon, num_metal, radial_margin=None, top_margin=None,
     if bottom_margin is None:
         bottom_margin = max(2, min(10, num_slices // 25))
 
-    # Remove any flash from the boundary of the recon
+    # The mask removes flash at the boundary of the recon.
     recon = mtp.apply_cylindrical_mask(recon, radial_margin=radial_margin, top_margin=top_margin,
                                        bottom_margin=bottom_margin)
 
-    # Compute thresholds using multi-threshold Otsu
     thresholds = multi_threshold_otsu(recon, classes=num_metal + 2)
 
     is_torch = isinstance(recon, torch.Tensor)
 
-    # Plastic: lowest class
+    # Plastic is the lowest class.
     plastic_low_threshold = thresholds[0]
     plastic_metal_threshold = thresholds[1]
 
@@ -375,7 +310,7 @@ def segment_plastic_metal(recon, num_metal, radial_margin=None, top_margin=None,
 
     def class_mask(lower, upper):
         if is_shards:
-            # Shard by shard, each on its own device; the mask comes back
+            # The mask is built on each shard's own device and comes back
             # sharded the same way as the volume.
             return _sharding.Shards(
                 [_tensor_class_mask(t, lower, upper) for t in recon.tensors],
@@ -388,10 +323,9 @@ def segment_plastic_metal(recon, num_metal, radial_margin=None, top_margin=None,
     plastic_mask = class_mask(plastic_low_threshold, plastic_metal_threshold)
     plastic_scale = mtp.compute_scaling_factor(recon, plastic_mask)
 
-    # Metal masks and scaling
     metal_masks = []
     metal_scales = []
-    for i in range(1, num_metal + 1):  # start from index 1
+    for i in range(1, num_metal + 1):
         lower = thresholds[i]
         upper = thresholds[i + 1] if i + 1 < len(thresholds) else np.inf
         metal_mask = class_mask(lower, upper)

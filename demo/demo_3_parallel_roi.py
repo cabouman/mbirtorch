@@ -60,6 +60,13 @@ nrmse_padded = (np.linalg.norm(padded_roi - phantom_roi)
 print(f'Region-of-interest error without enlargement: {nrmse_default:.3f}')
 print(f'Region-of-interest error with enlargement:    {nrmse_padded:.3f}')
 
+# Display the default geometry
+mbirtorch.geometry_viewer(model_default, show_trajectory=True, sinogram=sinogram, recon=recon_default, block=False,
+                          title='Default model')
+# Display the padded geometry
+mbirtorch.geometry_viewer(model_padded, show_trajectory=True, sinogram=sinogram, recon=recon_padded, block=False,
+                          title='Lateral (side) padded model')
+
 # View: phantom region, the artifacted reconstruction, and the fixed one.
 mbirtorch.slice_viewer(
     phantom_roi, recon_default, padded_roi,

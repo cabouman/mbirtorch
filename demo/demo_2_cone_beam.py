@@ -71,6 +71,10 @@ filepath = './output/demo2_recon.h5'
 ct_model.save_recon_hdf5(filepath, recon, recon_dict)
 print(f'Reconstruction saved to {filepath}')
 
+# Display the geometry
+mbirtorch.geometry_viewer(ct_model, show_trajectory=True, sinogram=sinogram, recon=phantom,
+                          title='Conebeam Model', block=False)
+
 # View the phantom and the reconstruction side by side.
 mbirtorch.slice_viewer(phantom, recon, data_dicts=[None, recon_dict], vmin=0.0,
                        title='Phantom (left) and cone-beam MBIR reconstruction (right)', block=False)

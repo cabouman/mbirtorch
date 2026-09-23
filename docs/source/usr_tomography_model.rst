@@ -31,6 +31,8 @@ Reconstruction and Projection
 
 .. automethod:: mbirtorch.TomographyModel.recon_plastic_metal
 
+.. automethod:: mbirtorch.TomographyModel.project_points
+
 
 Parameter Handling
 ------------------

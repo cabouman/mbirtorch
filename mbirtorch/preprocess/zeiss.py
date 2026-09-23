@@ -15,7 +15,8 @@ pp = pprint.PrettyPrinter(indent=4)
 
 def get_sino_and_model(dataset_dir, *, downsample_factor=(1, 1), subsample_view_factor=1,
                        crop_pixels_sides=0, crop_pixels_top=0, crop_pixels_bottom=0, alu_unit='mm',
-                       bg_option="global", zinger_correction=True, auto_crop=False, verbose=1):
+                       bg_option="global", zinger_correction=True, auto_crop=False,
+                       det_rotation=0.0, verbose=1):
     """
     Load a Zeiss Ultra/Versa scan dataset, compute its sinogram, and return a ready-to-reconstruct model.
 
@@ -41,6 +42,11 @@ def get_sino_and_model(dataset_dir, *, downsample_factor=(1, 1), subsample_view_
         zinger_correction (bool, optional): Detect and interpolate zinger pixels. Defaults to ``True``.
         auto_crop (bool, optional): If True, detect and remove blank sinogram margins after the sinogram
             is computed, shrinking the reconstruction. Defaults to False.
+        det_rotation (float, optional): Detector rotation in radians, applied to every view as the
+            sinogram is computed. This is the same rotation that
+            :func:`mbirtorch.preprocess.correct_det_rotation` applies. The value to pass is the estimate
+            returned by :func:`mbirtorch.preprocess.geometry_calibration.estimate_det_rotation`.
+            Defaults to ``0.0``, which leaves the views unrotated.
         verbose (int, optional): Verbosity level. Defaults to ``1``.
 
     Returns:
@@ -63,38 +69,23 @@ def get_sino_and_model(dataset_dir, *, downsample_factor=(1, 1), subsample_view_
         dataset_dir, downsample_factor=downsample_factor, subsample_view_factor=subsample_view_factor,
         crop_pixels_sides=crop_pixels_sides, crop_pixels_top=crop_pixels_top,
         crop_pixels_bottom=crop_pixels_bottom, alu_unit=alu_unit, bg_option=bg_option,
-        zinger_correction=zinger_correction, verbose=verbose)
+        zinger_correction=zinger_correction, det_rotation=det_rotation, verbose=verbose)
     return mtp.finalize_model(sino, required_params, optional_params, auto_crop=auto_crop)
 
 
-def _compute_sino_and_params(dataset_dir, downsample_factor=(1, 1), subsample_view_factor=1, crop_pixels_sides=0, crop_pixels_top=0, crop_pixels_bottom=0, alu_unit='mm', bg_option="global", zinger_correction=True, verbose=1):
+def _compute_sino_and_params(dataset_dir, downsample_factor=(1, 1), subsample_view_factor=1, crop_pixels_sides=0, crop_pixels_top=0, crop_pixels_bottom=0, alu_unit='mm', bg_option="global", zinger_correction=True, det_rotation=0.0, verbose=1):
     """
-    Compute the sinogram and build_model-ready parameters from a Zeiss Ultra/Versa ``.txrm`` dataset.
+    Compute the sinogram and the model parameters from a Zeiss Ultra or Versa ``.txrm`` dataset.
 
-    Private helper for :func:`get_sino_and_model`.  Loads scans and geometry, computes the sinogram
-    (downsample -> transmission, then background-offset, optional zinger, and sinogram-shift
-    corrections), and resolves the geometry class from the scanner type.
+    This is the private helper for :func:`get_sino_and_model`, which documents the arguments.
 
     Thanks to contributions of Amir Koushyar Ziabari of Oak Ridge National Laboratory (ORNL).
     Portions of this code are adapted from the DXchange library: https://github.com/data-exchange/dxchange
 
-    Args:
-        dataset_dir (str): Path to the Zeiss ``.txrm`` dataset.
-        downsample_factor (tuple[int, int], optional): Downsample factors for detector rows and channels. Defaults to ``(1, 1)``.
-        subsample_view_factor (int, optional): Factor by which to subsample views. Defaults to ``1``.
-        crop_pixels_sides (int, optional): Pixels to crop from each lateral side of the detector. Defaults to ``0``.
-        crop_pixels_top (int, optional): Pixels to crop from the top of the detector. Defaults to ``0``.
-        crop_pixels_bottom (int, optional): Pixels to crop from the bottom of the detector. Defaults to ``0``.
-        alu_unit (str, optional): The physical unit used to define 1 ALU. Defaults to ``'mm'``.
-        bg_option (str or None): Background offset correction (``None``, ``'global'``, ``'per_view'``). Defaults to ``'global'``.
-        zinger_correction (bool, optional): Detect and interpolate zinger pixels. Defaults to ``True``.
-        verbose (int, optional): Verbosity level. Defaults to ``1``.
-
     Returns:
-        tuple: ``(sino, required_params, optional_params)`` where ``required_params`` holds the model
-        constructor arguments plus a ``geometry_type`` entry (``ParallelBeamModel`` for an ``'ultra'``
-        scan, ``ConeBeamModel`` otherwise) so ``build_model`` can resolve the class, and
-        ``optional_params`` holds the ``set_params`` arguments.
+        tuple: ``(sino, required_params, optional_params)``.  ``required_params`` holds the model
+        constructor arguments and a ``geometry_type`` entry that ``build_model`` uses to select the
+        model class.  ``optional_params`` holds the ``set_params`` arguments.
     """
     if verbose > 0:
         print("\n\n########## Loading object, blank, dark scans, and geometry parameters from Zeiss dataset directory")
@@ -108,7 +99,6 @@ def _compute_sino_and_params(dataset_dir, downsample_factor=(1, 1), subsample_vi
 
     if verbose > 0:
         print("\n\n########## Cropping scans")
-    ### crop the scans based on input params
     obj_scan, blank_scan, dark_scan, defective_pixel_array = mtp.crop_view_data(obj_scan, blank_scan, dark_scan,
                                                                                 crop_pixels_sides=crop_pixels_sides,
                                                                                 crop_pixels_top=crop_pixels_top,
@@ -117,14 +107,13 @@ def _compute_sino_and_params(dataset_dir, downsample_factor=(1, 1), subsample_vi
     if verbose > 0:
         print("\n\n########## Computing sinogram")
     sino = mtp.scan_to_sino(obj_scan, blank_scan, dark_scan, defective_pixel_array,
-                            downsample_factor=downsample_factor, det_rotation=0.0)
+                            downsample_factor=downsample_factor, det_rotation=det_rotation)
 
     if verbose > 0:
         print("\n\n########## Correcting any residual background sinogram offset")
     sino = mtp.correct_background_offset(sino, option=bg_option)
 
-    # Zinger detection needs the background-corrected sinogram, and must run before the view
-    # shifts below resample (and spread) any zinger pixels.
+    # Zinger detection needs the background-corrected sinogram.  It must run before the per-view shifts below.
     if zinger_correction:
         if verbose > 0:
             print("\n\n########## Correcting zinger pixels")
@@ -139,9 +128,7 @@ def _compute_sino_and_params(dataset_dir, downsample_factor=(1, 1), subsample_vi
         print('blank_scan shape = ', blank_scan.shape)
         print('dark_scan shape = ', dark_scan.shape)
 
-    # Normalize for build_model: resolve the geometry class from the Zeiss scanner type, mirroring
-    # convert_zeiss_to_mbirtorch_params -- 'ultra' -> parallel-beam, everything else (versa, or an
-    # undetermined 'unknown' for which classify_zeiss_system already warns it is assuming cone) -> cone.
+    # An 'ultra' scan is parallel beam.  Every other scanner type is treated as cone beam.
     scanner_type = zeiss_metadata['scanner_type']
     if scanner_type == 'ultra':
         geometry_params['geometry_type'] = str(mbirtorch.ParallelBeamModel)
@@ -174,14 +161,12 @@ def load_scans_and_params(dataset_dir, subsample_view_factor, verbose=1):
               format carries no dark scan, so one is never loaded.
             - zeiss_params (dict): Geometry parameters read from the ``.txrm`` file.
     """
-    ### automatically parse the paths to Zeiss scans from dataset_dir
     data_dir = _parse_filenames_from_dataset_dir(dataset_dir)
 
     if verbose > 0:
         print("The following files will be used to compute the Zeiss reconstruction:\n",
               f"    - txrm file: {data_dir}\n")
 
-    # Read object scans and metadata
     file_name = _check_read(data_dir)
     try:
         ole = olefile.OleFileIO(file_name)
@@ -189,13 +174,10 @@ def load_scans_and_params(dataset_dir, subsample_view_factor, verbose=1):
         print('No such file or directory: %s', file_name)
         raise e
 
-    # Get scanner type
     scanner_type = classify_zeiss_system(file_name)
 
-    # Read metadata from txrm file
     zeiss_params = read_metadata(ole)
 
-    # Create an empty array to store the scan data
     obj_scan = np.empty(
         (
             zeiss_params["num_views"],
@@ -205,7 +187,6 @@ def load_scans_and_params(dataset_dir, subsample_view_factor, verbose=1):
         dtype=_get_ole_data_type(zeiss_params)
     )
 
-    # Read the (subsampled) scan data from txrm file
     view_indices = np.arange(zeiss_params["num_views"], step=subsample_view_factor)
     obj_scan = np.zeros((len(view_indices), zeiss_params["num_det_rows"], zeiss_params["num_det_channels"]),
                         dtype=_get_ole_data_type(zeiss_params))
@@ -214,41 +195,34 @@ def load_scans_and_params(dataset_dir, subsample_view_factor, verbose=1):
             int(np.ceil((idx + 1) / 100.0)), int(idx + 1))
         obj_scan[i] = _read_ole_image(ole, img_string, zeiss_params)
 
-    # Read blank scans
     blank_scan = zeiss_params["reference"]
 
-    # Read dark scans
     # TODO: Currently we assume that there is no dark scan for txrm file
     dark_scan = np.zeros(obj_scan.shape, dtype=obj_scan.dtype)
 
     try:
-        # Get the list of measurement axis names and units
         axis_names = zeiss_params.get("axis_names")  # This is a list of names: ['Sample X', 'Sample Y', ..., 'CCD_X', ...]
         axis_units = zeiss_params.get("axis_units")  # This is a list of units: ['um', 'um', ..., ]
 
-        # Get source to iso distance
         source_iso_dist = zeiss_params["source_iso_dist"]
         source_iso_dist = float(np.abs(source_iso_dist))
         source_iso_dist_index = get_index_in_list(axis_names, 'Source Z')
         source_iso_dist_unit = axis_units[source_iso_dist_index] if source_iso_dist_index > -1 else 'mm'
 
-        # Get iso to detector distance
         iso_det_dist = zeiss_params["iso_det_dist"]
         iso_det_dist = float(np.abs(iso_det_dist)) if iso_det_dist is not None else 0.0
         iso_det_dist_unit = source_iso_dist_unit
 
-        # Get detector pixel pitch
         det_pixel_pitch = zeiss_params["det_pixel_pitch"]
         det_pixel_pitch = float(np.abs(det_pixel_pitch))
 
-        # Zeiss detector pixel has equal width and height
+        # A Zeiss detector pixel has equal width and height.
         delta_det_row = det_pixel_pitch
         delta_det_channel = det_pixel_pitch
         delta_det_index = get_index_in_list(axis_names, 'CCD_X')
         delta_det_row_unit = axis_units[delta_det_index] if delta_det_index > -1 else 'um'
         delta_det_channel_unit = delta_det_row_unit
 
-        # Get pixel pitch at iso
         iso_pixel_pitch = zeiss_params["iso_pixel_pitch"]
         iso_pixel_pitch = float(np.abs(iso_pixel_pitch))
         iso_pixel_pitch_index = get_index_in_list(axis_names, 'Sample X')
@@ -264,21 +238,17 @@ def load_scans_and_params(dataset_dir, subsample_view_factor, verbose=1):
         print("Unable to determine units for geometry parameters; cannot safely convert to mbirtorch format.")
         raise e
 
-    # Get optical Magnification
     opt_mag = zeiss_params["opt_mag"]
     opt_mag = 1 if opt_mag is None else opt_mag
 
-    # Get dimensions of radiograph
     num_views = zeiss_params["num_views"]
     num_det_channels = zeiss_params["num_det_channels"]
     num_det_rows = zeiss_params["num_det_rows"]
 
-    # Rotation angles
     angles = -np.array(zeiss_params['thetas'], dtype=float).ravel()
     angles = angles[view_indices]
 
-    # Detector offset parameters
-    # MBIRTORCH has the reverse convention for the channel shift
+    # MBIRTORCH uses the opposite sign convention for the channel shift.
     det_channel_offset = -zeiss_params["center_shift"]
     det_row_offset = 0.0    # There doesn't appear to be a Zeiss parameter for detector row offset
 
@@ -316,7 +286,6 @@ def load_scans_and_params(dataset_dir, subsample_view_factor, verbose=1):
         print(f"Number of views: {num_views}")
         print(f"Detector size: (num_det_rows, num_det_channels) = ({num_det_rows}, {num_det_channels})")
         print("############ End Zeiss geometry parameters ############")
-    ### END load Zeiss parameters from scan data
 
     return obj_scan, blank_scan, dark_scan, zeiss_params
 
@@ -343,7 +312,6 @@ def convert_zeiss_to_mbirtorch_params(zeiss_params, downsample_factor=(1, 1), cr
         optional_params (dict): Additional geometry model parameters to be set using set_params()
         zeiss_metadata (dict): some metadata stored in Zeiss txrm file.
     """
-    # Get zeiss parameters
     source_iso_dist, iso_det_dist, source_iso_dist_unit, iso_det_dist_unit = itemgetter('source_iso_dist', 'iso_det_dist', 'source_iso_dist_unit', 'iso_det_dist_unit')(zeiss_params)
     delta_det_channel, delta_det_row, delta_det_channel_unit, delta_det_row_unit = itemgetter('delta_det_channel', 'delta_det_row', 'delta_det_channel_unit', 'delta_det_row_unit')(zeiss_params)
     iso_pixel_pitch, iso_pixel_pitch_unit = itemgetter('iso_pixel_pitch', 'iso_pixel_pitch_unit')(zeiss_params)
@@ -354,52 +322,42 @@ def convert_zeiss_to_mbirtorch_params(zeiss_params, downsample_factor=(1, 1), cr
 
     scanner_type = zeiss_params['scanner_type']
 
-    # Define 1 ALU as 1 unit of alu_unit
+    # One ALU is defined as one unit of alu_unit.
     alu_value = 1
 
-    # Convert physical units to ALU
     source_iso_dist = mtp.to_alu(source_iso_dist, source_iso_dist_unit, alu_unit)
     iso_det_dist = mtp.to_alu(iso_det_dist, iso_det_dist_unit, alu_unit)
     delta_det_channel = mtp.to_alu(delta_det_channel, delta_det_channel_unit, alu_unit)
     delta_det_row = mtp.to_alu(delta_det_row, delta_det_row_unit, alu_unit)
     iso_pixel_pitch = mtp.to_alu(iso_pixel_pitch, iso_pixel_pitch_unit, alu_unit)
 
-    # Compute default value of source to detector distance
     source_detector_dist = source_iso_dist + iso_det_dist
 
-    # Convert angles to radians
     if angle_unit == 'deg':
         angles = np.deg2rad(angles)
     else:
         pass
 
-    # Make conversions for optical magnification
-    # In this case, the "detector" is actually a scintillator
+    # In this case the detector is a scintillator.
     if opt_mag is not None and not np.isinf(opt_mag):
-        # Compute total magnification = (optical magnification) * (magnification to scintillator)
         scintillator_mag = source_detector_dist/source_iso_dist
         magnification = opt_mag * scintillator_mag
     else:
         magnification = 1.0
 
-    # Compute source to equivalent quantities accounting for total magnification
     source_detector_dist = magnification * source_iso_dist
     delta_det_channel = magnification * iso_pixel_pitch
     delta_det_row = magnification * iso_pixel_pitch
 
-    # Convert to ALU: This assumes that the det_channel_offset and det_row_offset have units of pixels.
+    # det_channel_offset and det_row_offset are in pixels here.  Convert them to ALU.
     det_channel_offset *= delta_det_channel
     det_row_offset *= delta_det_row
 
-    # Apply the configuration crop through the shared primitive: it reduces the shape and, for an
-    # asymmetric top/bottom crop, shifts det_row_offset (symmetric crops are a no-op).  Offsets are
-    # already in ALU and the crop is in raw detector pixels (matched by the raw pitch); downsampling is
-    # applied afterward.
+    # The crop is in raw detector pixels, and the offsets are in ALU.  Downsampling is applied afterward.
     num_det_rows, num_det_channels, det_row_offset, det_channel_offset = mtp.apply_config_crop(
         num_det_rows, num_det_channels, det_row_offset, det_channel_offset, delta_det_row, delta_det_channel,
         crop_pixels_top=crop_pixels_top, crop_pixels_bottom=crop_pixels_bottom, crop_pixels_sides=crop_pixels_sides)
 
-    # Adjust detector size and pixel pitch params w.r.t. downsampling arguments
     num_det_rows = num_det_rows // downsample_factor[0]
     num_det_channels = num_det_channels // downsample_factor[1]
 
@@ -408,7 +366,6 @@ def convert_zeiss_to_mbirtorch_params(zeiss_params, downsample_factor=(1, 1), cr
 
     iso_pixel_pitch *= downsample_factor[0]
 
-    # Create a dictionary to store MBIR parameters
     # 'ultra' is treated as parallel-beam, and 'versa' is treated as cone-beam.
     if scanner_type == "ultra":
         num_views = len(angles)
@@ -441,7 +398,6 @@ def convert_zeiss_to_mbirtorch_params(zeiss_params, downsample_factor=(1, 1), cr
         optional_params['alu_unit'] = alu_unit
         optional_params['alu_value'] = alu_value
 
-    # Create a dictionary for other zeiss metadata
     # TODO: More metadata will be added in the future based on users' interest
     zeiss_metadata = {"scanner_type": scanner_type}
 
@@ -671,18 +627,13 @@ def correct_sino_shifts(sino, zeiss_params, downsample_factor, subsample_view_fa
     Returns:
         corrected_sino (numpy.ndarray): 3D sinogram data after alignment
     """
-    # Get sinogram view offset
-    # OUT-OF-PLACE scaling: the slice of a numpy array is a VIEW, so an in-place /= here would
-    # silently rescale the caller's zeiss_params (and a second call would double-divide).
+    # The scaling is out of place.  An in-place division would rescale the caller's copy of zeiss_params.
     sino_x_offset = np.asarray(zeiss_params["x_shifts"][::subsample_view_factor],
                                dtype=np.float64) / downsample_factor[1]
     sino_y_offset = np.asarray(zeiss_params["y_shifts"][::subsample_view_factor],
                                dtype=np.float64) / downsample_factor[0]
 
-    ### Pad the sinogram to handle boundaries
-    # The translation below applies each view's ABSOLUTE offset, so the padding must cover the
-    # largest absolute shift (padding by the across-view RANGE under-pads whenever the shifts
-    # share a common offset, corrupting the boundary region).
+    # Each view is translated by its absolute offset, so the padding covers the largest absolute shift.
     pad_size = int(np.ceil(np.maximum(np.max(np.abs(sino_x_offset)),
                                       np.max(np.abs(sino_y_offset)))))
 
@@ -691,13 +642,10 @@ def correct_sino_shifts(sino, zeiss_params, downsample_factor, subsample_view_fa
     else:
         sino_pad = sino
 
-    # Apply per-view translation (bilinear, zero outside; the edge padding above supplies the
-    # boundary values)
     from .utilities import _translate_views_bilinear
     shifts = np.stack([sino_y_offset, sino_x_offset], axis=1)
     corrected_sino = _translate_views_bilinear(sino_pad, shifts).cpu().numpy()
 
-    # Remove padding
     if pad_size > 0:
         corrected_sino = corrected_sino[:, pad_size:-pad_size, pad_size:-pad_size]
 

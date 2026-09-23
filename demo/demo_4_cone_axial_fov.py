@@ -73,6 +73,13 @@ def end_error(recon):
 print(f'End-slice error without axial padding: {end_error(recon_default):.3f}')
 print(f'End-slice error with axial padding:    {end_error(padded_fov):.3f}')
 
+# Display the default geometry
+mbirtorch.geometry_viewer(model_default, show_trajectory=True, sinogram=sinogram, recon=recon_default,
+                          title='Default model', block=False)
+# Display the padded geometry
+mbirtorch.geometry_viewer(model_padded, show_trajectory=True, sinogram=sinogram, recon=recon_padded,
+                          title='Axial (top/bottom) padded model', block=False)
+
 # View all three.  Look at the top and bottom slices, where the difference
 # is largest.
 mbirtorch.slice_viewer(

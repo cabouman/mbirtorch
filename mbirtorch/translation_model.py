@@ -29,28 +29,35 @@ import warnings
 import numpy as np
 import torch
 
-from .cone_beam import ConeBeamModel
+from .cone_beam import (ConeBeamModel, _cone_channel_coordinate,
+                        _cone_row_coordinate)
+from .geometry_rules import channel_index, pixel_xy, row_index
 from .horizontal_fan import fan_back_batch, fan_forward_batch
 from .tomography_model import TomographyModel
 
 _F32 = torch.float32
 
 
-# ── geometry chains (pure, compiled) ─────────────────────────────────────────
 def _translation_pixel_xy_mag(pixel_indices, t_x, t_y, num_rows, num_cols,
                               delta_voxel, delta_voxel_row, magnification,
                               source_detector_dist):
     """Translated in-plane coordinates and the per-pixel magnification.
 
-    Returns x (Vb, P), y (Vb, P), pixel_mag (Vb, P).  No rotation: the object
-    shifts by (t_x, t_y) per view.
+    The object shifts by (-t_x, -t_y) per view and is never rotated.
+    Returns x (Vb, P), y (Vb, P), and pixel_mag (Vb, P).
     """
-    row_index = (pixel_indices // num_cols).to(_F32)
-    col_index = (pixel_indices % num_cols).to(_F32)
-    y = (delta_voxel_row * (row_index - (num_rows - 1) / 2.0))[None, :] \
-        - t_y[:, None]
-    x = (delta_voxel * (col_index - (num_cols - 1) / 2.0))[None, :] \
-        - t_x[:, None]
+    x_tilde, y_tilde = pixel_xy(pixel_indices, num_rows, num_cols, delta_voxel,
+                                delta_voxel_row)
+    return _translation_xy_mag(x_tilde, y_tilde, t_x, t_y, magnification,
+                               source_detector_dist)
+
+
+def _translation_xy_mag(x_tilde, y_tilde, t_x, t_y, magnification,
+                        source_detector_dist):
+    """The same map as :func:`_translation_pixel_xy_mag`, taking positions
+    rather than pixel indices.  Returns x, y, and pixel_mag, each (Vb, P)."""
+    y = y_tilde[None, :] - t_y[:, None]
+    x = x_tilde[None, :] - t_x[:, None]
     pixel_mag = 1.0 / (1.0 / magnification - y / source_detector_dist)
     return x, y, pixel_mag
 
@@ -60,22 +67,22 @@ def _translation_horizontal_data(pixel_indices, view_params_batch, num_rows,
                                  delta_voxel_row, delta_det_channel,
                                  det_channel_offset, magnification,
                                  source_detector_dist):
-    """The horizontal fan's inputs for a view batch (compute_horizontal_data +
-    the wrapper's center rounding).  n_p, centers (int32), W_p_c, weight_scale
-    are (Vb, P) -- the hfan contract (horizontal_fan.py) -- and pixel_mag is
-    returned for the vertical fan.  The weight scale is per pixel:
-    delta_voxel_row / cos(theta_p), the projection length through a voxel.
+    """The horizontal fan inputs for one view batch.
+
+    Returns n_p, centers (int32), W_p_c, and weight_scale, each (Vb, P), plus
+    pixel_mag for the vertical fan.  The weight scale is the projection length
+    through a voxel, delta_voxel_row / cos(theta_p).
     """
     t_x = view_params_batch[:, 0]
     t_y = view_params_batch[:, 1]
     x, y, pixel_mag = _translation_pixel_xy_mag(
         pixel_indices, t_x, t_y, num_rows, num_cols, delta_voxel,
         delta_voxel_row, magnification, source_detector_dist)
-    u = pixel_mag * x
+    u = _cone_channel_coordinate(x, y, pixel_mag, magnification,
+                                 source_detector_dist, False)
     theta = torch.atan2(u, torch.as_tensor(source_detector_dist, dtype=_F32,
                                            device=u.device))
-    det_center_channel = (num_channels - 1) / 2.0
-    n_p = (u + det_channel_offset) / delta_det_channel + det_center_channel
+    n_p = channel_index(u, delta_det_channel, det_channel_offset, num_channels)
     W_p_c = pixel_mag * (delta_voxel / delta_det_channel)
     weight_scale = delta_voxel_row / torch.cos(theta)
     centers = torch.round(n_p).to(torch.int32)
@@ -84,17 +91,16 @@ def _translation_horizontal_data(pixel_indices, view_params_batch, num_rows,
 
 def _translation_vertical_affine(pixel_mag, t_z, num_slices, delta_voxel_slice,
                                  delta_det_row, det_row_offset, num_rows_r):
-    """The vertical fan's affine map from GLOBAL slice index to detector row,
-    m(v, p, l) = m0 + W_p_r * l -- cone's _cone_vertical_affine with the
-    object's z translation in place of the helical shift.  Returns
-    (m0 (Vb, P), W_p_r (Vb, P), z_offset (Vb,)).
+    """The vertical fan's affine map from global slice index to detector row.
+
+    The map is m(v, p, l) = m0 + W_p_r * l.  Returns m0 (Vb, P), W_p_r (Vb, P),
+    and z_offset (Vb,).
     """
     z_offset = -t_z                                              # (Vb,)
-    det_center_row = (num_rows_r - 1) / 2.0
     W_p_r = pixel_mag * delta_voxel_slice / delta_det_row        # (Vb, P)
     z_at_slice_0 = z_offset[:, None] - delta_voxel_slice * (num_slices - 1) / 2.0
-    m0 = (pixel_mag * z_at_slice_0 + det_row_offset) / delta_det_row \
-        + det_center_row                                         # (Vb, P)
+    m0 = row_index(_cone_row_coordinate(pixel_mag, z_at_slice_0),
+                   delta_det_row, det_row_offset, num_rows_r)    # (Vb, P)
     return m0, W_p_r, z_offset
 
 
@@ -106,17 +112,12 @@ def _translation_forward_view_batch(values, pixel_indices, view_params_batch,
                                     det_channel_offset, det_row_offset,
                                     magnification, source_detector_dist,
                                     psf_radius, slice_start=0, plan=None):
-    """Translation forward for one view batch: the detector-side vertical fan,
-    then the per-pixel horizontal fan scatter.  Returns (Vb, R, C).
+    """Translation forward projection for one view batch.  Returns (Vb, R, C).
 
-    ``slice_start`` supports a slice-BANDED call exactly as in cone:
-    ``values`` may be a band (P, L) with global indices [slice_start,
-    slice_start + L); the z geometry stays anchored on the full num_slices
-    center and taps outside the band contribute zero.
-
-    ``plan`` is accepted and ignored.  It reserves a place for a future
-    body that would precompute its geometry once and reuse it across
-    calls; nothing reads it today."""
+    ``values`` may be a slice band (P, L) with global indices starting at
+    ``slice_start``.  The z geometry stays anchored on the full num_slices
+    center, and taps outside the band contribute zero.  ``plan`` is ignored.
+    """
     n_p, centers, W_p_c, weight_scale, pixel_mag = _translation_horizontal_data(
         pixel_indices, view_params_batch, num_recon_rows, num_recon_cols,
         num_channels, delta_voxel, delta_voxel_row, delta_det_channel,
@@ -125,13 +126,12 @@ def _translation_forward_view_batch(values, pixel_indices, view_params_batch,
     dev = values.device
     t_z = view_params_batch[:, 2]
 
-    # ── vertical fan (detector side; forward_vertical_fan_one_pixel) ─────────
+    # Vertical fan, detector side.
     m0, W_p_r, z_offset = _translation_vertical_affine(
         pixel_mag, t_z, num_slices, delta_voxel_slice, delta_det_row,
         det_row_offset, num_rows_r)
 
-    # Scale the cylinder values by 1/cos(phi), the projection length through a
-    # voxel at vertical cone angle phi.
+    # 1/cos(phi) is the projection length through a voxel at cone angle phi.
     band_len = values.shape[1]
     k = torch.arange(slice_start, slice_start + band_len, dtype=_F32, device=dev)
     z = (delta_voxel_slice * (k - (num_slices - 1) / 2.0))[None, None, :] \
@@ -141,15 +141,15 @@ def _translation_forward_view_batch(values, pixel_indices, view_params_batch,
         source_detector_dist, dtype=_F32, device=dev)))
     scaled_values = values[None, :, :] / cos_phi
 
-    # Detector rows -> voxel fractional indices: the inverse of the shared
-    # affine map (the back body evaluates the direct form).
+    # This is the inverse of the affine map, from detector rows to fractional
+    # slice indices.  The back projection body evaluates the direct form.
     m = torch.arange(num_rows_r, dtype=_F32, device=dev)         # (R,)
     k_m = (m[None, None, :] - m0.unsqueeze(-1)) / W_p_r.unsqueeze(-1)
     k_center = torch.round(k_m).to(torch.int64)                  # (Vb, P, R)
 
     slope = W_p_r.unsqueeze(-1)
     L_max_r = torch.clamp(W_p_r, max=1.0).unsqueeze(-1)
-    m_p = slope * (k_center.to(_F32) - k_m)                      # projection offset
+    m_p = slope * (k_center.to(_F32) - k_m)                      # Projection offset.
 
     det_col = torch.zeros((vb, num_pixels, num_rows_r), dtype=_F32, device=dev)
     for k_off in range(-psf_radius, psf_radius + 1):
@@ -162,7 +162,6 @@ def _translation_forward_view_batch(values, pixel_indices, view_params_batch,
                          (k_ind - slice_start).clamp(0, band_len - 1))
         det_col = det_col + A * g
 
-    # ── horizontal fan scatter (the shared kernel; per-view values) ──────────
     acc = fan_forward_batch((n_p, centers, W_p_c, weight_scale), det_col,
                             num_channels, psf_radius)
     return acc.permute(0, 2, 1)
@@ -177,14 +176,10 @@ def _translation_back_view_batch(sino_batch, pixel_indices, view_params_batch,
                                  magnification, source_detector_dist,
                                  psf_radius, coeff_power=1, slice_start=0,
                                  band_slices=None, plan=None):
-    """Translation back projection for one view batch, summed over the batch's
-    views: horizontal fan gather -> per-pixel detector columns -> vertical fan
-    gather onto the slices.  Returns (P, S), or (P, band_slices) for a slice
-    band, exactly as in cone.
+    """Translation back projection for one view batch, summed over its views.
 
-    ``plan`` is accepted and ignored.  It reserves a place for a future
-    body that would precompute its geometry once and reuse it across
-    calls; nothing reads it today."""
+    Returns (P, S), or (P, band_slices) for a slice band.  ``plan`` is ignored.
+    """
     n_p, centers, W_p_c, weight_scale, pixel_mag = _translation_horizontal_data(
         pixel_indices, view_params_batch, num_recon_rows, num_recon_cols,
         num_channels, delta_voxel, delta_voxel_row, delta_det_channel,
@@ -193,13 +188,13 @@ def _translation_back_view_batch(sino_batch, pixel_indices, view_params_batch,
     dev = sino_batch.device
     t_z = view_params_batch[:, 2]
 
-    # ── horizontal fan gather (the shared kernel, view axis kept) ────────────
+    # Horizontal fan gather, with the view axis kept.
     sino_T = sino_batch.permute(0, 2, 1).contiguous()            # (Vb, C, R)
     det_col = fan_back_batch(sino_T, (n_p, centers, W_p_c, weight_scale),
                              num_channels, psf_radius,
                              coeff_power=coeff_power, reduce_views=False)
 
-    # ── vertical fan gather (compute_vertical_data + vertical_fan_band_gather)
+    # Vertical fan gather.
     m0, W_p_r, z_offset = _translation_vertical_affine(
         pixel_mag, t_z, num_slices, delta_voxel_slice, delta_det_row,
         det_row_offset, num_rows_r)
@@ -211,7 +206,7 @@ def _translation_back_view_batch(sino_batch, pixel_indices, view_params_batch,
     v_slices = pixel_mag.unsqueeze(-1) * z                       # (Vb, P, S)
     sdd_t = torch.as_tensor(source_detector_dist, dtype=_F32, device=dev)
     cos_phi = torch.cos(torch.atan2(v_slices, sdd_t))
-    # Slice -> detector row: the direct form of the shared affine map.
+    # This is the direct form of the affine map, from slice to detector row.
     slope = W_p_r.unsqueeze(-1)
     m_p = m0.unsqueeze(-1) + slope * k[None, None, :]            # (Vb, P, S)
     m_center = torch.round(m_p).to(torch.int64)
@@ -240,22 +235,21 @@ class TranslationModel(TomographyModel):
         sinogram_shape (tuple): (num_views, num_det_rows, num_det_channels),
             where num_views is the number of translation steps.
         translation_vectors (ndarray): (num_views, 3) array of object
-            translations (x, y, z) in ALU.  Positive x shifts the object left,
-            z shifts up, and y shifts away from the source.
+            translations (x, y, z) in ALU.  Each view moves the object by minus
+            its vector, in the object frame that
+            :meth:`~mbirtorch.TomographyModel.project_points` describes: a
+            positive t_x moves the object toward -x, so its image moves toward
+            lower channel index; a positive t_y moves it toward -y, away from
+            the source, so its image shrinks toward the point where the central
+            ray meets the detector; a positive t_z moves it toward -z, so its
+            image moves toward lower row index.
         source_detector_dist (float): Distance from source to detector in ALU.
         source_iso_dist (float): Distance from source to isocenter in ALU.
         view_batch_size, compile_mode: as in ParallelBeamModel.
     """
 
-    # Translation has its own floor family rather than borrowing parallel's,
-    # because it is measured on production-anchored translation cells rather
-    # than on the shared ladder.  The thresholds themselves, the runs behind
-    # them, and their dates are the translation rows of
-    # _widening_floors.FLOORS; they are not restated here, because a refresh
-    # moves them and a copy would go stale.  Historical note: the 2026-08-17
-    # readings that first justified a separate family (both counts losing at
-    # every size probed) were torch's per-function recompile budget filling,
-    # which projectors._raise_recompile_budget has since fixed.
+    # The thresholds for this family are the translation rows of
+    # _widening_floors.FLOORS.
     _floor_family = 'translation'
 
     def __init__(self, sinogram_shape, translation_vectors, source_detector_dist,
@@ -264,9 +258,8 @@ class TranslationModel(TomographyModel):
         if translation_vectors.ndim != 2 or translation_vectors.shape[1] != 3:
             raise ValueError('translation_vectors must have shape '
                              f'(num_views, 3); got {translation_vectors.shape}.')
-        # Translation defaults: weaker row-neighbor regularization
-        # (thin objects), and no cylindrical mask (the object typically spans
-        # the whole field of view).
+        # Row neighbor regularization is weak because the objects are thin.  There is
+        # no cylindrical mask because the object usually spans the field of view.
         super().__init__(sinogram_shape,
                          view_batch_size=view_batch_size, compile_mode=compile_mode,
                          geometry_type='translation',
@@ -275,14 +268,30 @@ class TranslationModel(TomographyModel):
                          source_detector_dist=source_detector_dist,
                          source_iso_dist=source_iso_dist,
                          qggmrf_nbr_wts=[0.1, 1.0, 1.0], use_ror_mask=False)
-        # Smaller line-search cap due to observed instabilities with larger
-        # values.
+        # A larger line search cap has shown instabilities in this geometry.
         self.set_params(no_warning=True, max_alpha=1.3)
 
     def _view_batch_bodies(self):
-        # No hand-written kernels for translation yet; the compiled torch
-        # bodies are the only bodies.
+        # Translation has no hand written kernels, only the compiled torch bodies.
         return _translation_forward_view_batch, _translation_back_view_batch
+
+    def _project_points_batch(self, points, view_params):
+        # points is (N, 3) float64 on the CPU.  view_params is (V, 3) holding
+        # (t_x, t_y, t_z).  Returns (row, channel), each (V, N).
+        ddr, ddc, dro, dco, sdd = self.get_params(
+            ['delta_det_row', 'delta_det_channel', 'det_row_offset',
+             'det_channel_offset', 'source_detector_dist'])
+        _, num_rows_r, num_channels = self.get_params('sinogram_shape')
+        magnification = self.get_magnification()
+        x, y, pixel_mag = _translation_xy_mag(
+            points[:, 0], points[:, 1], view_params[:, 0], view_params[:, 1],
+            magnification, sdd)
+        u = _cone_channel_coordinate(x, y, pixel_mag, magnification, sdd, False)
+        # Each view moves the object by minus its translation vector.
+        z = points[:, 2][None, :] - view_params[:, 2][:, None]
+        v = _cone_row_coordinate(pixel_mag, z)
+        return (row_index(v, ddr, dro, num_rows_r),
+                channel_index(u, ddc, dco, num_channels))
 
     def _view_batch_args(self):
         gp_names = ['delta_det_row', 'delta_det_channel', 'det_row_offset',
@@ -302,8 +311,8 @@ class TranslationModel(TomographyModel):
                     psf_radius=self.get_psf_radius())
 
     def _transient_cols(self, band_cols):
-        # The bodies hold (Vb, P, S) and (Vb, P, R) transients whatever the
-        # requested band, so the budget width is params-derived (as in cone).
+        # The bodies hold (Vb, P, S) and (Vb, P, R) temporaries whatever band is
+        # requested, so the budget width comes from the parameters.
         sinogram_shape, recon_shape = self.get_params(['sinogram_shape',
                                                        'recon_shape'])
         return max(int(recon_shape[2]), int(sinogram_shape[1]))
@@ -343,7 +352,7 @@ class TranslationModel(TomographyModel):
             ['delta_det_row', 'delta_det_channel', 'source_iso_dist',
              'source_detector_dist', 'recon_shape', 'delta_voxel',
              'translation_vectors', 'voxel_row_aspect', 'voxel_slice_aspect'])
-        magnification = self.get_magnification()   # raises at infinite SDD
+        magnification = self.get_magnification()   # Raises at infinite SDD.
         delta_voxel_row = voxel_row_aspect * delta_voxel
         delta_voxel_slice = voxel_slice_aspect * delta_voxel
         delta_det = min(delta_det_row, delta_det_channel)
@@ -387,13 +396,11 @@ class TranslationModel(TomographyModel):
                         voxel_row_aspect=voxel_row_aspect)
 
     def _check_lateral_truncation(self, sino_indicator):
-        """No-op override: in translation tomography the object (typically a
-        plate wider than the detector) routinely spans the whole field of view,
-        so edge-touching sinogram support is the normal operating condition
-        rather than the lateral-truncation defect the base check warns about."""
+        """Do nothing.  In translation tomography the object routinely spans
+        the whole field of view, so sinogram support that touches the edge is
+        normal rather than the defect the base check warns about."""
         return
 
-    # ── direct recon (FDK) ────────────────────────────────────────────────────
     def fdk_filter(self, sinogram, filter_name="ramp", output_sharded=False):
         """FDK filtering: the shared row filter with the FDK cosine pre-weight
         per detector element and the voxel-size scale alpha (as in cone;
@@ -412,7 +419,7 @@ class TranslationModel(TomographyModel):
             * (voxel_slice_aspect * delta_voxel)
         M_0 = self.get_magnification()
 
-        # FDK cosine pre-weight (rows, channels), view-independent.
+        # The FDK cosine pre-weight is (rows, channels) and does not vary with view.
         m_grid, n_grid = np.meshgrid(np.arange(num_rows), np.arange(num_channels),
                                      indexing='ij')
         u_grid, v_grid = ConeBeamModel.detector_mn_to_uv(
@@ -439,12 +446,8 @@ class TranslationModel(TomographyModel):
             this direct reconstruction is only approximate; it is intended as
             an initializer for the iterative ``recon()``.
         """
-        # Settle the device layout before the first large allocation, as
-        # recon() does: a no-op when the user already chose devices;
-        # otherwise the automatic selection runs here, so a bare FDK call
-        # spreads across the GPUs instead of landing whole on one.  The
-        # workload tells the memory check to price this reconstruction rather
-        # than the full recon the device count is chosen for.
+        # The device layout is settled before the first large allocation, so a
+        # bare FDK call spreads across the GPUs instead of landing on one.
         self._apply_device_policy(workload='direct')
         filtered_sinogram = self.fdk_filter(sinogram, filter_name=filter_name,
                                             output_sharded=True)
@@ -466,8 +469,8 @@ class TranslationModel(TomographyModel):
 
     def _get_estimate_of_recon_std(self, sinogram, sino_indicator):
         """Estimate the standard deviation of the reconstruction from the
-        sinogram, accounting for anisotropic row pitch in translation geometry
-        (used to scale sigma_prox and sigma_x)."""
+        sinogram.  The estimate accounts for the anisotropic row pitch and is
+        used to scale sigma_prox and sigma_x."""
         delta_voxel = self.get_params('delta_voxel')
         recon_shape = self.get_params('recon_shape')
         voxel_row_aspect = self.get_params('voxel_row_aspect')
@@ -475,8 +478,7 @@ class TranslationModel(TomographyModel):
 
         typical_sinogram_value = np.average(np.abs(sinogram),
                                             weights=sino_indicator)
-        # Assume projections along the row direction through an object filling
-        # about half the row extent.
+        # The object is assumed to fill about half the row extent.
         fraction_of_fill = 0.5
         typical_path_length = fraction_of_fill * recon_shape[0] * delta_voxel_row
         return typical_sinogram_value / typical_path_length

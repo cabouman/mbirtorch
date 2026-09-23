@@ -11,10 +11,8 @@ from typing import Any
 
 FILE_FORMAT_NUMBER = 1.0
 
-#: The multiple a hand-written kernel's width argument is rounded up to.
-#: Triton compiles a separate, faster kernel for each integer argument it can
-#: prove is a multiple of 16; the unspecialized compilation uses more
-#: registers and runs at roughly half the rate on the cone back kernel.
+#: Width arguments to the hand written kernels are rounded up to this multiple.
+#: Triton compiles a faster kernel for an argument it can prove is a multiple of 16.
 KERNEL_WIDTH_MULTIPLE = 16
 
 
@@ -29,6 +27,14 @@ def padded_kernel_width(width):
     it to size the launch and the arrays they allocate, and the memory ledger
     calls it to charge those same arrays, so the code and the charge cannot
     disagree.
+
+    The rule covers every width-class argument a kernel receives, including
+    the bound it masks its vector axis against, not only the arrays it
+    allocates.  The multiaxis forward wrapper padded its allocation and its
+    stride but passed the real detector row count as that bound, and it cost a
+    factor of 3.1 at every row count that was not a multiple of 16 (measured
+    2026-08-24; the record is multigpu_findings.md section 1.51 in the plans
+    repository).
 
     Args:
         width (int): a non-negative length -- a slice band, a detector row
@@ -53,7 +59,6 @@ class Param:
         return f"Param(val={self.val}, recompile_flag={self.recompile_flag})"
 
 
-# The names, values, and recompile flags below are fixed; do not change them here.
 _forward_model_defaults_dict = {
     'geometry_type': Param(None, False),
     'file_format': Param(FILE_FORMAT_NUMBER, False),
@@ -85,8 +90,7 @@ _reconstruction_defaults_dict = {
     'positivity_flag': Param(False, False),
     'snr_db': Param(30.0, False),
     'sharpness': Param(1.0, False),
-    # 4 independent 128-subset partitions, cycled after warmup (covers 103
-    # iterations; last entry repeats after that).
+    # The four 128 subset partitions are independent and are cycled after warmup.
     'granularity': Param([1, 2, 4, 8, 16, 32, 64, 128, 128, 128, 128], False),
     'partition_sequence': Param([2, 4, 6] + [7, 8, 9, 10] * 25, False),
     'verbose': Param(1, False),

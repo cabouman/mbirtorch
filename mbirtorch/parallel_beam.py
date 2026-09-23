@@ -13,6 +13,7 @@ import warnings
 import numpy as np
 import torch
 
+from .geometry_rules import channel_index, pixel_xy, rotate_about_z
 from .horizontal_fan import fan_back_batch, fan_forward_batch
 from .tomography_model import TomographyModel
 
@@ -22,29 +23,17 @@ _F32 = torch.float32
 def _parallel_hfan_math(pixel_indices, view_params_batch, num_rows, num_cols,
                         num_channels, delta_det_channel, det_channel_offset,
                         delta_voxel, delta_voxel_row):
-    """The parallel geometry chain producing the hfan data contract (see
-    horizontal_fan.py); the view parameters are the view angles here.  Pure,
-    fused into the view-batch bodies below by torch.compile (the scalar
-    parameters specialize as constants; they are fixed per model)."""
-    row_index = (pixel_indices // num_cols).to(_F32)
-    col_index = (pixel_indices % num_cols).to(_F32)
-    # Compute the un-rotated coordinates relative to iso.  Note the change in
-    # order from (i, j) to (y, x).
-    y_tilde = delta_voxel_row * (row_index - (num_rows - 1) / 2.0)
-    x_tilde = delta_voxel * (col_index - (num_cols - 1) / 2.0)
-
-    # Precompute cosine and sine of the view angles, then do the rotation; only
-    # the x coordinate is needed for the channel projection.
+    """Return the horizontal fan data contract of horizontal_fan.py for the
+    parallel geometry.  The view parameters are the view angles."""
+    x_tilde, y_tilde = pixel_xy(pixel_indices, num_rows, num_cols, delta_voxel,
+                                delta_voxel_row)
+    # Only the rotated x is needed.  It is the channel coordinate of a
+    # parallel projection whose rays travel along -y.
     cosine = torch.cos(view_params_batch)[:, None]
     sine = torch.sin(view_params_batch)[:, None]
-    x = cosine * x_tilde[None, :] - sine * y_tilde[None, :]
+    x, _ = rotate_about_z(x_tilde, y_tilde, cosine, sine)
+    n_p = channel_index(x, delta_det_channel, det_channel_offset, num_channels)
 
-    # Calculate indices on the detector grid.
-    det_center_channel = (num_channels - 1) / 2.0
-    n_p = (x + det_channel_offset) / delta_det_channel + det_center_channel
-
-    # Compute the footprint of a voxel projected onto the channels, the
-    # projected voxel width in channel units, and the weight scale.
     footprint_xy = torch.maximum(cosine.abs() * delta_voxel,
                                  sine.abs() * delta_voxel_row)
     W_p_c = footprint_xy / delta_det_channel
@@ -58,13 +47,11 @@ def _parallel_forward_view_batch(values, pixel_indices, view_params_batch,
                                  delta_det_channel, det_channel_offset,
                                  delta_voxel, delta_voxel_row, psf_radius,
                                  slice_start=0, plan=None):
-    """Parallel forward for one view batch: the geometry chain fused with
-    the shared horizontal fan in ONE compiled body (detector row r is recon
-    slice r, so the slice axis rides through the fan as the column axis and
-    a slice band IS a row band -- banding needs no z anchor).
+    """Parallel forward projection for one view batch.  Detector row r is
+    recon slice r, so the slice axis passes through the fan as the column
+    axis and a band of slices is a band of rows.
 
-    ``plan`` is the memoization slot for a future sorted/CSR stream variant
-    (per pixel-subset x view-range); unused today."""
+    ``plan`` is unused."""
     assert slice_start == 0
     hfan_data = _parallel_hfan_math(
         pixel_indices, view_params_batch, num_rows, num_cols, num_channels,
@@ -79,12 +66,11 @@ def _parallel_back_view_batch(sino_batch, pixel_indices, view_params_batch,
                               delta_voxel, delta_voxel_row, psf_radius,
                               coeff_power=1, slice_start=0, band_slices=None,
                               plan=None):
-    """Parallel back for one view batch, summed over the batch's views (the
-    adjoint of :func:`_parallel_forward_view_batch`); rows==slices, so the
-    input's row band is already the output's slice band.
+    """Parallel back projection for one view batch, summed over the batch's
+    views.  It is the adjoint of :func:`_parallel_forward_view_batch`.  Rows
+    are slices, so the input's row band is already the output's slice band.
 
-    ``plan`` is the memoization slot for a future sorted/CSR stream variant
-    (per pixel-subset x view-range); unused today."""
+    ``plan`` is unused."""
     assert slice_start == 0 and band_slices is None
     hfan_data = _parallel_hfan_math(
         pixel_indices, view_params_batch, num_rows, num_cols, num_channels,
@@ -139,6 +125,21 @@ class ParallelBeamModel(TomographyModel):
                          geometry_type='parallel', view_params_name='angles',
                          angles=angles)
 
+    def _project_points_batch(self, points, view_params):
+        # points is (N, 3) float64 on the CPU.  view_params is (V,) view
+        # angles.  Returns (row, channel), each of shape (V, N).
+        ddc, dco = self.get_params(['delta_det_channel', 'det_channel_offset'])
+        num_channels = self.get_params('sinogram_shape')[2]
+        cosine = torch.cos(view_params)[:, None]
+        sine = torch.sin(view_params)[:, None]
+        x, _ = rotate_about_z(points[:, 0], points[:, 1], cosine, sine)
+        channel = channel_index(x, ddc, dco, num_channels)
+        # Detector row r receives recon slice r, with no spreading and no offset,
+        # so the row of a point is the fractional slice index of its z.
+        row = self._fractional_slice_index(points[:, 2])[None, :].expand(
+            channel.shape[0], -1)
+        return row, channel
+
     def get_magnification(self):
         """
         Compute the scale factor from a voxel at iso (at the origin on the center
@@ -150,23 +151,18 @@ class ParallelBeamModel(TomographyModel):
         """
         return 1.0
 
-    # Parallel beam ties detector row r to recon slice r 1:1 (see the base
-    # attribute): the sharded drivers take the row-aligned path.
+    # Parallel beam ties detector row r to recon slice r, so the sharded
+    # drivers take the row-aligned path.
     rows_track_slices = True
 
-    # The measured set of widening speed floors that governs this geometry's
-    # automatic device count (see _widening_floors).
+    # This name selects the measured speed floors that set the automatic
+    # device count.  See _widening_floors.
     _floor_family = 'parallel'
 
-    # Never call the compiled parallel bodies with a single pixel: on linux
-    # with torch 2.13.0, CPU inductor miscompiles that one-pixel case in both
-    # bodies and lands the pixel's footprint one detector channel off (6.56e-02
-    # relative error on the forward, 5.04e-02 on the back; eager is right, and
-    # so is every width of two or more).  The driver pads a one-pixel call to
-    # two and takes the padding back out, outside the compiled region --
-    # projectors.forward_at_min_pixel_width holds the full measurement and the
-    # argument that the padding cannot change a value.  Cone beam does not need
-    # this and does not declare it.
+    # The compiled parallel bodies are never called with a single pixel.  On linux
+    # with torch 2.13.0 the CPU inductor miscompiles that case and places the pixel's
+    # footprint one detector channel off.  The driver pads a one-pixel call to two
+    # pixels and removes the padding outside the compiled region.
     min_compiled_pixel_width = 2
 
     def get_psf_radius(self):
@@ -232,23 +228,8 @@ class ParallelBeamModel(TomographyModel):
                              f'{sinogram_shape} for sinogram_shape')
 
     def _view_batch_bodies(self):
-        # The hand-written kernels are alternative BODIES: same signatures, so
-        # nothing downstream of this hook changes.  Each is available wherever
-        # BOTH availability gates pass -- the triton probe and the first-use
-        # value self-check on the actual device (the probe-the-hardware
-        # protocol; MBIRTORCH_DISABLE_TRITON=1 is the kill switch inside the
-        # probe) -- and both kernels passed their composed performance gate,
-        # so both are ON by default, gates alone (the cone protocol).
-        #
-        # Composed five-arm gate on H100, warm seeded vcd, pinned constants:
-        # with BOTH kernels the 512 cell runs at 1.21x of jax's time and the
-        # 1024 cell at 1.90x, at 0.63x of jax's memory -- the replacement
-        # rule passes at both parallel gate cells (the compiled torch bodies
-        # stood at 2.98x and 5.56x).  The forward kernel loses its ISOLATED
-        # full-pixel-set bench at the 1024 cell (0.78x of the compiled body)
-        # yet wins composition by 19-24% (the both-kernels arm vs the
-        # back-only arm): vcd calls the forward on pixel subsets, where the
-        # body pays transients and per-shape recompiles the kernel does not.
+        # Each Triton kernel is used where the Triton probe and the first-use
+        # value check both pass.  Set MBIRTORCH_DISABLE_TRITON=1 to turn them off.
         from .kernel_availability import (parallel_back_kernel_usable,
                                           parallel_forward_kernel_usable)
         if parallel_back_kernel_usable(self)[0]:
@@ -256,18 +237,6 @@ class ParallelBeamModel(TomographyModel):
             back_body = _parallel_back_view_batch_triton
         else:
             back_body = _parallel_back_view_batch
-        # Selection is layout-independent.  An interim rule once withheld the
-        # forward kernel from sharded layouts: under the multi-device
-        # drivers it disagreed with the torch forward by order one,
-        # non-reproducibly, in both geometries.  The defect was the LAUNCH,
-        # not the kernel: a Triton launch targets the launching thread's
-        # current device, the per-device workers launch from threads whose
-        # current device is 0, and the shard's consumers raced the misplaced
-        # kernel.  The wrappers now bracket their launches on the tensors'
-        # device, the repair is measured at the kernel-parity class on two
-        # GPUs, and the standing kernel-times-sharding gate
-        # (tests/test_kernels_sharded.py) holds the contract (the
-        # kernel-sharding findings in the plans repo).
         if parallel_forward_kernel_usable(self)[0]:
             from .triton_parallel import _parallel_forward_view_batch_triton
             fwd_body = _parallel_forward_view_batch_triton
@@ -290,7 +259,6 @@ class ParallelBeamModel(TomographyModel):
                     delta_voxel_row=voxel_row_aspect * delta_voxel,
                     psf_radius=self.get_psf_radius())
 
-    # ── direct recon ──────────────────────────────────────────────────────────
     def fbp_filter(self, sinogram, filter_name="ramp", output_sharded=False):
         """
         Perform FBP filtering on the given sinogram.
@@ -305,11 +273,8 @@ class ParallelBeamModel(TomographyModel):
         Returns:
             The filtered sinogram.
         """
-        # Voxel-size scaling factor: adjusts the filter to account for voxel
-        # size.  For the theoretical derivation see the zip linked at
-        # https://mbirtorch.readthedocs.io/en/latest/theory.html
-        # The FBP weight pi/num_views is folded into the filter by the shared
-        # method; parallel beam has no FDK cosine pre-weight.
+        # The scaling factor adjusts the filter for the voxel size.  For the
+        # derivation see https://mbirtorch.readthedocs.io/en/latest/theory.html
         delta_voxel, voxel_row_aspect = self.get_params(['delta_voxel',
                                                          'voxel_row_aspect'])
         delta_voxel_row = voxel_row_aspect * delta_voxel
@@ -347,23 +312,14 @@ class ParallelBeamModel(TomographyModel):
         Returns:
             recon (numpy or tensor): the reconstructed volume.
         """
-        # Settle the device layout before the first large allocation, as
-        # recon() does: a no-op when the user already chose devices;
-        # otherwise the automatic selection runs here, so a bare FBP call
-        # spreads across the GPUs instead of landing whole on one.  The
-        # workload tells the memory check to price this reconstruction rather
-        # than the full recon the device count is chosen for.
+        # The device layout is settled before the first large allocation.  The workload
+        # name prices this direct reconstruction rather than a full iterative recon.
         self._apply_device_policy(workload='direct')
-        # Place once at entry so the filter receives device-form data (a no-op
-        # when already placed; a single device is the trivial 1-shard case).
+        # The sinogram is placed on the devices here, so the filter and the
+        # back projection both run on the devices with no host transfer.
         sinogram = self._shard_sinogram(sinogram)
-
-        # Internal pipeline stage: keep the device form, no host transfer.
         filtered_sinogram = self.fbp_filter(sinogram, filter_name=filter_name,
                                             output_sharded=True)
-
-        # Keep the recon in the device form through the pipeline; the exit
-        # handling below is the single place the output form is decided.
         recon = self.back_project(filtered_sinogram, output_sharded=True)
         return recon if output_sharded else self._gather_recon(recon)
 
@@ -452,17 +408,12 @@ class ParallelBeamModel(TomographyModel):
         from . import _sharding
         from .utilities import copy_ct_model, stitch_arrays, merge_log_files
 
-        # -------- Basic validation --------
         if half_overlap < 2:
             raise ValueError('half_overlap must be >= 2.')
         if sino is None:
             raise ValueError("sino must be provided.")
-        # An input already placed on the devices is refused.  Each part settles
-        # a device layout of its own, so this method works from the host array.
-        # Gathering here would leave the caller's placed copy on the devices
-        # for the whole call, which is the memory the split is meant to save.
-        # The initial reconstruction is included in the check: it is sliced on
-        # the host below, which the device form does not support.
+        # An input already placed on the devices is refused.  Each part settles a
+        # device layout of its own, so this method works from host arrays.
         if (isinstance(sino, _sharding.Shards)
                 or isinstance(weights, _sharding.Shards)
                 or isinstance(init_recon, _sharding.Shards)):
@@ -475,9 +426,8 @@ class ParallelBeamModel(TomographyModel):
         if weights is not None and getattr(weights, "shape", None) != sino.shape:
             raise AssertionError("weights, if provided, must have the same shape as sino.")
 
-        # Operate on the host: split here and let each part's recon re-shard its own part, so the
-        # full sinogram is never on the devices at once (the memory saving).  The per-part slices
-        # below are then cheap host views.
+        # The split is done on the host, so the full sinogram is never on the devices
+        # at once.  The per-part slices below are host views.
         if isinstance(sino, torch.Tensor):
             sino = sino.detach().cpu().numpy()
         sino = np.asarray(sino)
@@ -486,30 +436,25 @@ class ParallelBeamModel(TomographyModel):
                 weights = weights.detach().cpu().numpy()
             weights = np.asarray(weights)
         if init_recon is not None and isinstance(init_recon, torch.Tensor):
-            # Same host-side treatment as sino/weights: host slicing keeps only one part's arrays
-            # device-resident at a time.
             init_recon = self._gather_recon(init_recon)
 
         num_rows = sino.shape[1]
         recon_rows, recon_cols = self.get_params('recon_shape')[:2]
 
-        # -------- Model builders shared by the estimate and the reconstruction --------
         def _part_model(num_part_rows):
-            """A copy of this model covering ``num_part_rows`` detector rows, and therefore that
-            many recon slices.  The recon rows and columns are set explicitly so a parent with a
-            custom in-plane recon shape keeps it; the copy's own automatic pass would recompute it
-            from the detector."""
-            model = copy_ct_model(self, new_num_det_rows=num_part_rows)
-            # The regularization values come from the parent, which derives them from the FULL
-            # sinogram below, so a part must not re-derive them from its own partial data.
+            """Return a copy of this model covering ``num_part_rows``
+            detector rows, and therefore that many recon slices."""
+            model = copy_ct_model(self, new_num_det_rows=num_part_rows, no_warning=True)
+            # The regularization values come from the parent, which derives them from
+            # the full sinogram below.  A part must not derive its own from part data.
             model.set_params(no_warning=True, auto_regularize_flag=False)
             model.set_params(recon_shape=(recon_rows, recon_cols, num_part_rows))
             return model
 
         def _worst_part_model_rows(num_parts):
-            """Rows in the largest part model at this part count: the largest kept part, plus
-            half_overlap for each interior side it has.  A middle part has two, an end part of a
-            two-part split has one, and a single part has none."""
+            """Return the number of rows in the largest part model at this
+            part count.  It is the largest kept part plus half_overlap for
+            each interior side it has."""
             biggest_kept = -(-num_rows // num_parts)
             if num_parts == 1:
                 return biggest_kept
@@ -517,9 +462,8 @@ class ParallelBeamModel(TomographyModel):
                 return biggest_kept + half_overlap
             return biggest_kept + 2 * half_overlap
 
-        # -------- Choose the number of parts --------
-        # Each part must keep at least 2 * half_overlap slices, so that the overlaps at its two
-        # seams do not run into each other, which bounds the number of parts.
+        # Each part must keep at least 2 * half_overlap slices, so that the overlaps
+        # at its two seams do not run into each other.
         max_parts = num_rows // (2 * half_overlap)
         estimated = False
         if slices_per_part is not None:
@@ -535,8 +479,8 @@ class ParallelBeamModel(TomographyModel):
                     f'{2 * half_overlap}; use at most {max_parts} parts, or a smaller '
                     f'half_overlap.')
         elif max_parts < 2:
-            # Fewer than 4 * half_overlap slices: no split leaves both parts with the slices their
-            # overlaps need, so warn and do a normal MBIR recon.
+            # With fewer than 4 * half_overlap slices no split leaves both parts the
+            # slices their overlaps need, so a normal MBIR recon runs instead.
             warnings.warn(
                 "the volume has too few slices to split at this half_overlap; "
                 "falling back to standard MBIR reconstruction.",
@@ -544,9 +488,8 @@ class ParallelBeamModel(TomographyModel):
             )
             num_parts = 1
         else:
-            # The fewest parts whose largest part model is priced to fit the devices.  The
-            # candidates are built and discarded here, so nothing about the estimate is left
-            # behind on this model or on them.
+            # This chooses the fewest parts whose largest part model is priced to
+            # fit the devices.
             num_parts = max_parts
             for candidate in range(1, max_parts + 1):
                 if _part_model(_worst_part_model_rows(candidate))._fits_available_devices():
@@ -566,7 +509,7 @@ class ParallelBeamModel(TomographyModel):
                 print_logs=print_logs,
             )
 
-        # -------- The kept slice ranges, which tile [0, num_rows) in nearly equal parts --------
+        # The kept slice ranges tile [0, num_rows) in nearly equal parts.
         base, extra = divmod(num_rows, num_parts)
         part_ranges, start = [], 0
         for index in range(num_parts):
@@ -574,29 +517,28 @@ class ParallelBeamModel(TomographyModel):
             part_ranges.append((start, stop))
             start = stop
 
-        # Regularization params come from the FULL sinogram; the parts copy them and set
-        # auto_regularize_flag=False so they do not re-derive from their partial sinograms.
+        # The regularization parameters come from the full sinogram.  The parts copy
+        # them and set auto_regularize_flag=False.
         self.auto_set_regularization_params(sino)
 
         def _recon_one_part(model_lo, model_hi, part_logfile_path):
-            """Reconstruct one band of detector rows on the host; return (host_recon, recon_dict).
+            """Reconstruct one band of detector rows and return (host_recon,
+            recon_dict).
 
-            Builds the part's model, sinogram slice, and weights, runs recon, and gathers the result
-            to the host.  All the heavy state (the part model, the device recon) is local, so it is
-            released when this returns -- only ONE part's inputs are resident at a time, which is
-            the point of doing one part at a time.  The returned reconstruction is a host array.
+            The part's model, sinogram slice, and weights are local, so they
+            are released when this returns.  Only one part's inputs are
+            resident at a time.  The returned reconstruction is a host array.
             """
             model = _part_model(model_hi - model_lo)
 
-            # Sinogram and weight slices are host VIEWS (nothing mutates them; weights=None passes
-            # through so the part recon uses its constant-weight path with no ones array built).
+            # The sinogram and weight slices are host views, and nothing writes them.
+            # A weights value of None passes through to the constant-weight path.
             sino_part = sino[:, model_lo:model_hi, :]
             weights_part = None if weights is None else weights[:, model_lo:model_hi, :]
-            # Rows are slices, so the part's initial reconstruction is the matching slice band.
+            # Rows are slices, so the part's initial reconstruction is the
+            # matching slice band.
             part_init = None if init_recon is None else init_recon[:, :, model_lo:model_hi]
 
-            # recon() already returns a host NumPy array (its output_sharded=False gather), so the
-            # part is on the host here.
             return model.recon(sino_part, weights=weights_part, init_recon=part_init,
                                max_iterations=max_iterations,
                                stop_threshold_change_pct=stop_threshold_change_pct,
@@ -604,11 +546,8 @@ class ParallelBeamModel(TomographyModel):
                                logfile_path=part_logfile_path,
                                print_logs=print_logs)
 
-        # -------- Reconstruct the parts ONE AT A TIME (each part is built, recon'd, gathered to the
-        # host, and freed before the next is built), so only one part's sino/weights/model and one
-        # part's device recon are resident at any moment. --------
-        # Each part logs to its own temp file; they are merged into logfile_path afterward
-        # (in finally, so any part logs written before a failure are preserved).
+        # The parts are reconstructed one at a time, and each logs to its own file.
+        # The merge runs in a finally block so that logs from a failure are kept.
         if logfile_path:
             log_path = os.path.expanduser(logfile_path)
             part_log_paths = [log_path + '.part{}'.format(index) for index in range(num_parts)]
@@ -617,7 +556,8 @@ class ParallelBeamModel(TomographyModel):
         part_recons, part_dicts = [], []
         try:
             for index, (lo, hi) in enumerate(part_ranges):
-                # The part's model spans its kept rows plus half_overlap on each interior side.
+                # The part's model spans its kept rows plus half_overlap on
+                # each interior side.
                 model_lo, model_hi = max(lo - half_overlap, 0), min(hi + half_overlap, num_rows)
                 part_recon, part_dict = _recon_one_part(model_lo, model_hi, part_log_paths[index])
                 part_recons.append(part_recon)
@@ -629,26 +569,18 @@ class ParallelBeamModel(TomographyModel):
                     for index, (lo, hi) in enumerate(part_ranges)]
                 merge_log_files(log_path, zip(labels, part_log_paths))
 
-        # -------- Stitch the parts together --------
-        # The parts are host arrays, so stitch_arrays (host-preserving) assembles the full volume ON
-        # THE HOST -- the full recon is never rebuilt on a single device, which would defeat the
-        # part-at-a-time memory saving (and OOM for a recon too large to fit whole on the GPUs).
-        # half_overlap is used on both sides of each seam, so the total overlap between consecutive
-        # parts is 2 * half_overlap, the same for every seam.  ramp_overlap determines which slices
-        # are blended, which is usually less than 2 * half_overlap to avoid possible boundary
-        # effects.  ramp_overlap should be even so that it applies equally to slices on either side
-        # of the seam.
+        # stitch_arrays assembles the full volume on the host, with an overlap of
+        # half_overlap on each side of every seam.  ramp_overlap sets which slices
+        # are blended.  It is smaller than the overlap, and it is even.
         ramp_overlap = 4
         ramp_overlap = min(ramp_overlap, half_overlap)
-        ramp_overlap -= ramp_overlap % 2  # ensure even
+        ramp_overlap -= ramp_overlap % 2
         recon_full = stitch_arrays(part_recons, axis=2, overlap=2 * half_overlap,
                                    ramp_overlap=ramp_overlap)
 
-        # -------- Construct full reconstruction dictionary --------
-        # One entry per part, in part order.  The last three split_params entries have no parallel
-        # beam meaning -- rows and slices share one grid, so there is no grid shift and no cut/split
-        # mismatch -- and are carried so a reader of either geometry's dictionary finds the same
-        # fields.
+        # The dictionary holds one entry per part, in part order.  The last three
+        # split_params entries have no meaning for parallel beam, and are carried
+        # so that both geometries return the same fields.
         recon_full_dict = {'recon_params_parts': [d.get('recon_params') for d in part_dicts],
                            'recon_log_parts': [d.get('recon_log', '# Log info not saved.')
                                                for d in part_dicts],
@@ -707,14 +639,12 @@ def recon_simple_parallel(sinogram, angles, weights=None, sharpness=1.0,
         >>> angles = np.linspace(0, np.pi, 180, endpoint=False)
         >>> recon, recon_dict = mbirtorch.recon_simple_parallel(sinogram, angles)
     """
-    # The model's geometry is read off the sinogram's shape, which a divided
-    # array does not have, so that form is refused here rather than failing on
-    # a missing attribute in the line that builds the model.
+    # The model's geometry is read from the sinogram's shape, which a divided
+    # array does not have, so that form is refused.
     from . import _sharding
     _sharding.reject_shards('recon_simple_parallel', sinogram=sinogram,
                             weights=weights)
-    # A torch sinogram or torch angles are converted here, so that the model
-    # gets the same plain shape tuple and host angles either way.
+    # Torch angles are converted here so that the model gets host angles.
     if torch.is_tensor(angles):
         angles = angles.detach().cpu().numpy()
     model = ParallelBeamModel(tuple(sinogram.shape), angles)

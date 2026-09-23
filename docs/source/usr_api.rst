@@ -12,9 +12,11 @@ individual pages for more detail. See :ref:`DemosFAQs` for examples.
 * :ref:`TomographyModelDocs`
 * :ref:`GeometryModelsDocs`
 * :ref:`DenoisingDocs`
+* :ref:`MACE4DDocs`
 * :ref:`AutogradDocs`
 * :ref:`PreprocessDocs`
 * :ref:`Utilities`
+* :ref:`GeometryViewerDocs`
 * :ref:`VCLSDocs`
 * :ref:`HSNTDocs`
 
@@ -50,8 +52,10 @@ individual pages for more detail. See :ref:`DemosFAQs` for examples.
    usr_tomography_model
    usr_geometry_models
    usr_denoising
+   usr_mace4d
    usr_autograd
    usr_preprocess
    usr_utilities
+   usr_geometry_viewer
    usr_vcls
    usr_hsnt

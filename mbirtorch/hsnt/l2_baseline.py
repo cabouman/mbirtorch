@@ -15,11 +15,6 @@ from sklearn.utils.extmath import randomized_svd
 from .denoise import rehydrate
 
 
-# -----------------------------------------------------------------------
-# Hyperspectral Neutron Radiographic/Tomographic Data Denoising Functions
-# -----------------------------------------------------------------------
-
-
 def l2_hyper_denoise(data, dataset_type='attenuation', num_materials=None, safety_factor=2, beta_loss='frobenius',
                   max_iter=300, tolerance=1e-10, batch_size=2 ** 27, subspace_basis=None, random_state=None,
                   verbose=1):
@@ -56,7 +51,6 @@ def l2_hyper_denoise(data, dataset_type='attenuation', num_materials=None, safet
         ((N_x, N_y, N_z, ..., N_k), (N_x, N_y, N_z, ..., N_k))
 
     """
-    # --------------------- Dehydrate ----------------------
     dehydrated_data = l2_dehydrate(data,
                                 dataset_type=dataset_type,
                                 num_materials=num_materials,
@@ -69,7 +63,6 @@ def l2_hyper_denoise(data, dataset_type='attenuation', num_materials=None, safet
                                 random_state=random_state,
                                 verbose=verbose)
 
-    # --------------------- Rehydrate ----------------------
     denoised_data = rehydrate(dehydrated_data)
 
     return denoised_data
@@ -114,20 +107,20 @@ def l2_dehydrate(data, dataset_type='attenuation', num_materials=None, safety_fa
         >>> data.shape, subspace_data.shape, subspace_basis.shape
         ((N_x, N_y, N_z, ..., N_k), (N_x, N_y, N_z, ..., 10), (10, N_k))
     """
-    epsilon = 1e-3  # Define epsilon
+    epsilon = 1e-3
 
-    # --------------- Dataset type validation --------------
     if dataset_type not in ('attenuation', 'transmission'):
         raise ValueError("'dataset_type' must be either 'attenuation' or 'transmission'.")
 
-    # ------------------ Data preparation ------------------
     data_shape = data.shape
     num_bands = data_shape[-1]
     num_points = data.size // num_bands
-    data = data.reshape(num_points, num_bands).astype(np.float64)  # Reshape to 2D and cast to float64 for stability
+    # float64 is used for numerical stability.
+    data = data.reshape(num_points, num_bands).astype(np.float64)
 
     if dataset_type == 'transmission':
-        # Initial cleanup in the transmission domain to get rid of defective measurements
+        # This first pass in the transmission domain removes defective
+        # measurements.
         data = l2_hyper_denoise(data,
                              dataset_type='attenuation',
                              num_materials=num_materials,
@@ -139,28 +132,25 @@ def l2_dehydrate(data, dataset_type='attenuation', num_materials=None, safety_fa
                              random_state=random_state,
                              verbose=0)
         data[data < epsilon] = epsilon
-        data = - np.log(data)  # Convert to attenuation
+        data = - np.log(data)
 
-    data[data < 0] = 0  # Enforce non-negativity
+    data[data < 0] = 0
 
     if subspace_basis is not None:
-        subspace_basis = np.asarray(subspace_basis, dtype=np.float64)  # Cast to float64 for stability
+        subspace_basis = np.asarray(subspace_basis, dtype=np.float64)
 
-    # --------------------- Batch setup ---------------------
-    num_points_batch = max(1, batch_size // num_bands)  # Number of hyperspectral points per batch
-    num_batches = int(np.ceil(num_points / num_points_batch))  # Number of batches
+    num_points_batch = max(1, batch_size // num_bands)
+    num_batches = int(np.ceil(num_points / num_points_batch))
 
-    # ------------------- NMF solver setup ------------------
     if beta_loss == 'frobenius':
-        solver = 'cd'  # Coordinate Descent
+        solver = 'cd'   # coordinate descent
     elif beta_loss == 'kullback-leibler':
-        solver = 'mu'  # Multiplicative Update
+        solver = 'mu'   # multiplicative update
     else:
         warnings.warn(f"Invalid beta_loss '{beta_loss}' specified: falling back to 'frobenius'.")
         beta_loss = 'frobenius'
         solver = 'cd'
 
-    # ------------- Subspace dimension setup -----------------
     if subspace_basis is not None:
         subspace_dimension = subspace_basis.shape[0]
     elif num_materials is not None:
@@ -169,12 +159,10 @@ def l2_dehydrate(data, dataset_type='attenuation', num_materials=None, safety_fa
         subspace_dimension = _estimate_subspace_dimension(data, safety_factor=safety_factor,
                                                           random_state=random_state, verbose=verbose)
 
-    # ------- Subspace basis estimation for multi-batch ------
     if subspace_basis is None and num_batches > 1:
         row_idx = np.random.default_rng(random_state).permutation(num_points)
         subspace_basis_batch = [None] * num_batches
 
-        # Estimate subspace basis for each batch using NMF
         for batch in range(num_batches):
             b_start = batch * num_points_batch
             b_stop = min((batch + 1) * num_points_batch, num_points)
@@ -192,7 +180,7 @@ def l2_dehydrate(data, dataset_type='attenuation', num_materials=None, safety_fa
                                                         random_state=random_state,
                                                         update_H=True)
 
-        # Estimate final subspace basis from batch estimations using NMF
+        # The per-batch bases are factored together to give the final basis.
         subspace_basis_batch = np.reshape(np.array(subspace_basis_batch), (-1, num_bands))
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -205,13 +193,11 @@ def l2_dehydrate(data, dataset_type='attenuation', num_materials=None, safety_fa
                                        max_iter=max_iter,
                                        random_state=random_state)
 
-    # --------------- Subspace data estimation ---------------
     if num_batches == 1:
         nmf_init, update_basis = 'nndsvd', True
     else:
         nmf_init, update_basis = 'custom', False
 
-    # Estimate subspace data in batches using NMF
     subspace_data = np.zeros((num_points, subspace_dimension))
     for batch in range(num_batches):
         b_start = batch * num_points_batch
@@ -230,13 +216,12 @@ def l2_dehydrate(data, dataset_type='attenuation', num_materials=None, safety_fa
                                                                     random_state=random_state,
                                                                     update_H=update_basis)
 
-    # ------------------ Final formatting -------------------
-    subspace_data = subspace_data.reshape(*data_shape[:-1], -1)  # Reshape to original dimensions (except last axis)
-    subspace_data = np.asarray(subspace_data, dtype=np.float32)  # Cast to float32 to reduce memory footprint
-    subspace_basis = np.asarray(subspace_basis, dtype=np.float32)  # Cast to float32 to reduce memory footprint
-    dehydrated_data = [subspace_data, subspace_basis, dataset_type]  # Package outputs for return
+    subspace_data = subspace_data.reshape(*data_shape[:-1], -1)
+    # float32 is used to reduce the memory the outputs occupy.
+    subspace_data = np.asarray(subspace_data, dtype=np.float32)
+    subspace_basis = np.asarray(subspace_basis, dtype=np.float32)
+    dehydrated_data = [subspace_data, subspace_basis, dataset_type]
 
-    # --------------- Print details if required -------------
     if verbose >= 1:
         print("l2_dehydrate(): ")
         print("   -Number of data batches: ", num_batches)
@@ -268,46 +253,35 @@ def _estimate_subspace_dimension(data, safety_factor=2, noise_fit_window=[25.0, 
         raise ValueError("`data` must be a 2D array shaped (samples, N_k).")
 
     n_points, n_bands = data.shape
-
-    # Decide how many rows to sample for speed/robustness
     sample_size = min(n_points, n_bands)
 
-    # Sample rows without replacement
     rng = np.random.default_rng(random_state)
     row_idx = rng.choice(n_points, size=sample_size, replace=False)
 
-    # Cast to float64 for numerical stability in svd
+    # float64 is used for numerical stability in the SVD.
     Y = np.asarray(data[row_idx, :], dtype=np.float64)
 
-    # Compute singular values via randomized SVD
     _, s, _ = randomized_svd(Y, n_components=sample_size, random_state=random_state)
 
-    # Guard against degenerate cases
     s = np.asarray(s, dtype=float)
     if s.size == 0:
         return 0
 
-    # Extract start and stop percent from noise_fit_window
     start_percent, stop_percent = noise_fit_window
-    # Fit window around percentile: [percentile-10, percentile+10], in s-index space
     start_idx = int(np.floor((start_percent / 100.0) * s.size))
     stop_idx = int(np.ceil((stop_percent / 100.0) * s.size))
 
-    # Clip and ensure at least 2 points
+    # The fit window is clipped to the array and holds at least 2 points.
     start_idx = max(0, min(start_idx, s.size - 2))
     stop_idx = max(start_idx + 2, min(stop_idx, s.size))
 
-    # Fit log(s) ≈ a*n + b on [start_idx:stop_idx]
+    # The noise model is a straight line fit to log(s) over the window.
     n = np.arange(s.size)
     a, b = np.polyfit(n[start_idx:stop_idx], np.log(s[start_idx:stop_idx] + 1e-12), 1)
-
-    # Predicted singular values for all indices
     s_pred = np.exp(a * n + b)
-
-    # Compute tau by scaling the predicted singular values with the threshold
     tau = threshold * s_pred
 
-    # Consider singular values > the corresponding tau values to be associated with signals
+    # A singular value above its tau is taken to carry signal.
     signal_flag = s > tau
     num_materials = int(np.sum(signal_flag[:start_idx]))
 
@@ -322,7 +296,6 @@ def _estimate_subspace_dimension(data, safety_factor=2, noise_fit_window=[25.0, 
         plt.ylabel("singular value")
         plt.legend()
 
-    # Multiply by safety factor
     subspace_dimension = int(np.ceil(safety_factor * num_materials))
 
     return max(1, subspace_dimension)

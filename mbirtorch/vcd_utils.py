@@ -1,10 +1,9 @@
 """Partitions, masks, and weights.
 
 The partition generators run in numpy and draw from the global np.random
-state.  That call sequence is deliberate: the golden-value tests
-(tests/test_vs_goldens.py) and restart reproducibility depend on a seeded run
-drawing the identical subsets in the identical order.  Do not reorder the
-calls.  Not implemented: the grid and blue-noise partition variants.
+state.  That call sequence is deliberate: restart reproducibility depends on
+a seeded run drawing the identical subsets in the identical order.  Do not
+reorder the calls.  Not implemented: the grid and blue-noise partition variants.
 """
 
 import warnings
@@ -113,12 +112,10 @@ def gen_pixel_partition(recon_shape, num_subsets, use_ror_mask=True):
         np.ndarray: each row is a subset of pixel indices, sorted within each
         subset.
     """
-    # Determine the 2D indices within the RoR.
     num_recon_rows, num_recon_cols = recon_shape[:2]
     max_index_val = num_recon_rows * num_recon_cols
     indices = np.arange(max_index_val, dtype=np.int32)
 
-    # Mask off indices that are outside the region of reconstruction.
     if use_ror_mask is not False:
         mask = get_2d_ror_mask(recon_shape, use_ror_mask=use_ror_mask)
         indices = indices[mask.flatten() == 1]
@@ -128,30 +125,23 @@ def gen_pixel_partition(recon_shape, num_subsets, use_ror_mask=True):
                       'pixels in the region of reconstruction.  \nReducing the number '
                       'of subsets to equal the number of indices.')
 
-    # A single subset needs no permutation: the subsets are SORTED below, so a
-    # shuffle would be exactly undone -- but it would consume global np.random
-    # state.  Skipping it keeps full-index "partitions" (gen_full_indices: the
-    # Hessian diagonal, the direct-recon init) from advancing the RNG, so a
-    # restarted recon reproduces a continuous run's per-iteration subset
-    # permutations -- and hence its trajectory -- exactly.
+    # A single subset is not permuted, so that it does not advance the global
+    # np.random state.  A restarted reconstruction then draws the same subsets.
     if num_subsets == 1:
         return np.sort(indices).reshape(1, -1)
 
-    # Determine the number of indices to repeat to make the total divisible by
-    # num_subsets.
+    # The index array is padded to a length divisible by num_subsets.
     num_indices_per_subset = int(np.ceil(len(indices) / num_subsets))
     array_size = num_subsets * num_indices_per_subset
     num_extra_indices = array_size - len(indices)
     indices = np.random.permutation(indices)
 
-    # Enlarge the array to the desired length by adding random indices that are
-    # not in the final subset.
+    # The padding indices are drawn from outside the final subset.
     num_non_final_indices = (num_subsets - 1) * num_indices_per_subset
     extra_indices = np.random.choice(indices[:num_non_final_indices],
                                      size=num_extra_indices, replace=False)
     indices = np.concatenate((indices, extra_indices))
 
-    # Reorganize into subsets, then sort each subset.
     indices = indices.reshape(num_subsets, indices.size // num_subsets)
     return np.sort(indices, axis=1)
 
@@ -187,7 +177,6 @@ def gen_partition_sequence(partition_sequence, max_iterations):
     partition_sequence = np.array(partition_sequence)
     current_length = partition_sequence.size
     if max_iterations > current_length:
-        # Repeat the last element for the additional iterations needed.
         extension = np.full(max_iterations - current_length, partition_sequence[-1])
         return np.concatenate((partition_sequence, extension))
     return partition_sequence[:max_iterations]
@@ -238,8 +227,8 @@ def gen_weights(sinogram, weight_type):
         large (e.g., > 5), as this corresponds to near-zero transmission, which
         is not physically meaningful in typical X-ray imaging.
     """
-    # A placed sinogram would fall through to the numpy branch below and give a
-    # silently wrong answer, so it is refused here instead.
+    # A placed sinogram would fall through to the numpy branch below and give
+    # a wrong answer with no error, so it is refused here.
     if isinstance(sinogram, _sharding.Shards):
         raise ValueError(
             'gen_weights does not accept a sinogram that has been placed on '
@@ -274,11 +263,9 @@ def estimate_background_cluster_boundaries(sinogram):
         left_boundary (float): value of the left boundary of the background cluster.
         right_boundary (float): value of the right boundary of the background cluster.
     """
-    # Compute histogram of sinogram values.
     hist, edges = np.histogram(np.asarray(sinogram).ravel(), bins=400)
     centers = 0.5 * (edges[:-1] + edges[1:])
 
-    # Find all local peaks in the histogram.
     peak_indices = []
     if len(hist) > 1 and hist[0] > hist[1]:
         peak_indices.append(0)
@@ -286,16 +273,16 @@ def estimate_background_cluster_boundaries(sinogram):
         if hist[i] >= hist[i - 1] and hist[i] > hist[i + 1]:
             peak_indices.append(i)
 
-    # Choose the peak closest to intensity 0 (the background peak).
+    # The background peak is the histogram peak closest to intensity 0.
     if len(peak_indices) == 0:
         peak_idx = int(np.argmin(np.abs(centers - 0.0)))
     else:
         peak_idx = min(peak_indices, key=lambda i: abs(centers[i] - 0.0))
 
-    # Define the background width cutoff level (10% of peak height).
+    # The background cluster ends where the histogram falls to a tenth of the
+    # peak height.
     cutoff = 0.1 * hist[peak_idx]
 
-    # Find the left and right boundaries of the background cluster.
     left_boundary_idx = peak_idx
     while left_boundary_idx > 0 and hist[left_boundary_idx] > cutoff:
         left_boundary_idx -= 1
@@ -346,44 +333,38 @@ def gen_weights_mar(ct_model, sinogram, init_recon=None, metal_threshold=None, b
         too large for the available devices.  The Otsu branch works on the
         host throughout and leaves the layout alone.
     """
-    # The thresholding and the exponential below run on whole host arrays.  A
-    # divided array survives np.asarray as a 0-d object array, so the first
-    # comparison against it fails on an unsupported operand instead of saying
-    # what went wrong; it is refused here instead, before the import below.
+    # The thresholding and the exponential below run on whole host arrays, so
+    # a divided array is refused here.
     _sharding.reject_shards('gen_weights_mar', sinogram=sinogram,
                             init_recon=init_recon)
 
     import mbirtorch.preprocess as mtp
 
-    # If init_recon is not provided, then identify the distorted sino entries with Otsu's thresholding method.
+    # With no init_recon, the distorted sinogram entries are found by Otsu
+    # thresholding with three classes: metal, non-metal, and background.
     if init_recon is None:
         print("init_recon is not provided. Automatically determine distorted sinogram entries with Otsu's method.")
-        # assuming three categories: metal, non_metal, and background.
         [bk_thresh_sino, metal_thresh_sino] = mtp.multi_threshold_otsu(sinogram, classes=3)
         print("Distorted sinogram threshold = ", metal_thresh_sino)
         delta_metal = (np.asarray(sinogram) > metal_thresh_sino).astype(np.float32)
 
-    # If init_recon is provided, identify the distorted sino entries by forward projecting init_recon.
+    # With an init_recon, they are found by forward projecting the metal mask.
     else:
         if metal_threshold is None:
             print("Metal_threshold calculated with Otsu's method.")
-            # assuming three categories: metal, non_metal, and background.
             [bk_threshold, metal_threshold] = mtp.multi_threshold_otsu(init_recon, classes=3)
 
         print("metal_threshold = ", metal_threshold)
-        # Identify metal voxels
         metal_mask = (np.asarray(init_recon) > metal_threshold).astype(np.float32)
-        # Settle the model's layout before the projection below places the mask
-        # and the sinogram it produces.  Only this branch reaches a device; the
-        # Otsu branch above works on the host throughout.
+        # This branch is the only one that reaches a device, so the model's
+        # layout is settled here before the projection places anything.
         ct_model._apply_device_policy()
-        # Forward project metal mask to generate a sinogram mask
         metal_mask_projected = ct_model.forward_project(metal_mask)
 
-        # metal mask in the sinogram domain, where 1 means a distorted sino entry, and 0 else.
+        # In delta_metal, 1 marks a distorted sinogram entry and 0 marks the
+        # rest.
         delta_metal = (np.asarray(metal_mask_projected) > 0.0).astype(np.float32)
 
-    # weights for undistorted sino entries
     weights = np.exp(-np.asarray(sinogram) * (1 + gamma * delta_metal) / beta)
 
     return weights

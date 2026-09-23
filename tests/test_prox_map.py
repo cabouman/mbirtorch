@@ -1,5 +1,5 @@
-"""prox_map smoke: the proximal map pulls the recon toward prox_input, and the
-prox_data caching path (do_initialization=False) works."""
+"""prox_map smoke: the proximal map pulls the reconstruction toward prox_input
+at a small sigma and toward the data at a large one."""
 
 import numpy as np
 

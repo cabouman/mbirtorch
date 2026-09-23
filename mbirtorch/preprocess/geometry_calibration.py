@@ -1,0 +1,1333 @@
+"""Geometric calibration from the sinogram.
+
+The functions here estimate scan geometry that the vendor metadata got wrong or left out, and they
+show the evidence behind an estimate.  Only :func:`apply_calibration` changes the caller's model or
+sinogram.
+
+The order of preprocessing matters.  Run in this order:
+ 1. defective-pixel interpolation, background offset correction, and stripe removal
+ 2. the functions here
+ 3. ``align_sino_views``.
+Stripe removal comes first because a gain stripe sits at a fixed channel, and a geometry estimate
+would take it for a feature of the object.  ``align_sino_views`` comes last because a wrong
+``det_channel_offset`` looks like a per-view shift, which aligning first would partly remove.
+"""
+
+import math
+import warnings
+from typing import NamedTuple
+
+import numpy as np
+import torch
+
+from .. import _sharding
+from ..cone_beam import ConeBeamModel
+from ..multiaxis_parallel import MultiAxisParallelModel
+from ..parallel_beam import ParallelBeamModel
+from ..utilities import _automatic_recon_geometry, copy_ct_model
+from ..vcd_utils import get_support_radius
+from . import pipeline
+from .utilities import _rotation_kernel, sino_high_pass_filtering
+
+__all__ = ['CalibrationResult', 'build_reduced_problem', 'reduce_sinogram', 'parameter_sweep',
+           'check_rotation_direction', 'apply_calibration', 'estimate_det_channel_offset',
+           'estimate_det_rotation', 'conjugate_difference']
+
+# parameter_sweep accepts these parameters.  'det_rotation' is applied by resampling the
+# sinogram rather than by setting a model parameter.
+_SWEEP_PARAMETERS = ('det_channel_offset', 'det_row_offset', 'det_rotation')
+
+# This many views of the full sinogram are read per step when a reduced sinogram is built.
+_REDUCE_VIEW_BATCH = 64
+
+# This many views are rotated per step when a detector rotation is applied in place.
+_ROTATE_VIEW_BATCH = 30
+
+# A sweep, an estimator, and a difference image all refuse a detector rotation larger than this,
+# in radians.  LEAP caps its detector tilt at the same five degrees.
+_MAX_DET_ROTATION = math.radians(5.0)
+
+
+def _check_det_rotation(det_rotation):
+    """Refuse a detector rotation beyond the cap.  A detector tilt is a small correction, and the
+    resampling that applies it degrades with the angle."""
+    if abs(float(det_rotation)) > _MAX_DET_ROTATION:
+        raise ValueError(f'A det_rotation of {math.degrees(float(det_rotation)):.2f} degrees is beyond '
+                         f'the {math.degrees(_MAX_DET_ROTATION):.0f} degree limit.')
+
+
+class CalibrationResult(NamedTuple):
+    """What one estimator returns.
+
+    Attributes:
+        parameter (str): the name of the estimated quantity, for example ``'det_channel_offset'``.
+        value (float): the estimate.
+        score (float): the score at the estimate.  Lower is better for every method here.
+        candidates (numpy.ndarray): the values that were scored, shape ``(num_candidates,)``.
+        scores (numpy.ndarray): the score at each candidate, shape ``(num_candidates,)``.
+        method (str): the name of the scoring method.
+        reduction (dict): the reduced problem the scores were computed on, as returned by
+            :func:`build_reduced_problem`.
+    """
+    parameter: str
+    value: float
+    score: float
+    candidates: np.ndarray
+    scores: np.ndarray
+    method: str
+    reduction: dict
+
+
+# ── geometry helpers ──────────────────────────────────────────────────────────────────────────────
+
+def _automatic_slice_offset(ct_model):
+    """The recon_slice_offset the automatic pass gives for the model's current detector, or None for
+    a geometry without that parameter."""
+    return _automatic_recon_geometry(*ct_model.get_all_params())[1]
+
+
+def _geometry_kind(ct_model):
+    """Classify a model as 'parallel', 'cone', or 'multiaxis', or raise for anything else.
+
+    The translation geometry has no rotation, so none of the quantities calibrated here apply to
+    it, and it is refused by name.
+    """
+    if isinstance(ct_model, ConeBeamModel):
+        return 'cone'
+    if isinstance(ct_model, MultiAxisParallelModel):
+        return 'multiaxis'
+    if isinstance(ct_model, ParallelBeamModel):
+        return 'parallel'
+    raise TypeError(f'geometry_calibration supports ConeBeamModel, ParallelBeamModel, and '
+                    f'MultiAxisParallelModel; got {type(ct_model).__name__}.')
+
+
+def _is_helical(ct_model):
+    """True for a cone-beam model with any nonzero per-view axial shift."""
+    if not isinstance(ct_model, ConeBeamModel):
+        return False
+    z_shifts = np.asarray(ct_model.get_params('view_params_array'))[:, 1]
+    return bool(np.any(z_shifts != 0))
+
+
+def _slab_row_window(ct_model, z_lo, z_hi, binned_row_margin=0):
+    """The detector rows ``[lo, hi)`` that any ray through the slab ``z_lo <= z <= z_hi`` can reach.
+
+    A sinogram cropped to this window carries every measurement the slab contributes to, which
+    makes the reduced problem small.  For cone beam a voxel at axial position z lands on the
+    detector at height ``v = z * pixel_mag``, where ``pixel_mag`` ranges over
+    ``ConeBeamModel.pixel_magnification_bounds``.  For multiaxis parallel beam a voxel at axial
+    position z and in-plane depth y lands at ``v = z * cos(elevation) + y * sin(elevation)``, with
+    ``|y| <= r`` for the support radius ``r``.  In both geometries the detector row of a height v is
+    ``(v + det_row_offset) / delta_det_row + center_row``.  The window takes the extreme v over the
+    slab's two faces and the support, then widens it by one voxel's vertical footprint at each end,
+    by one row below and two above for the rounding, and by ``binned_row_margin`` rows at each end.
+
+    Args:
+        ct_model: a cone or multiaxis model.
+        z_lo, z_hi (float): the slab's axial extent in ALU, including the half-voxel at each end.
+        binned_row_margin (int): extra rows kept at each end, in this model's rows.
+
+    Returns:
+        tuple: ``(lo, hi, clipped)``.  ``lo`` and ``hi`` are clipped to the detector, and
+        ``clipped`` is True when the clip removed rows the window asked for.
+
+    Raises:
+        ValueError: when no detector row can see the slab.
+    """
+    kind = _geometry_kind(ct_model)
+    sinogram_shape, recon_shape = ct_model.get_params(['sinogram_shape', 'recon_shape'])
+    num_rows = int(sinogram_shape[1])
+    delta_det_row, det_row_offset, delta_voxel, voxel_row_aspect, voxel_slice_aspect, use_ror_mask = \
+        ct_model.get_params(['delta_det_row', 'det_row_offset', 'delta_voxel', 'voxel_row_aspect',
+                             'voxel_slice_aspect', 'use_ror_mask'])
+    delta_voxel_slice = voxel_slice_aspect * delta_voxel
+    support_radius = get_support_radius(recon_shape, voxel_row_aspect * delta_voxel, delta_voxel,
+                                        use_ror_mask=use_ror_mask)
+
+    if kind == 'cone':
+        mags = np.array(ct_model.pixel_magnification_bounds())
+        if np.isinf(mags[1]):
+            # The source lies inside the support, so no ray bound holds.  Keep every row.
+            return 0, num_rows, False
+        v_values = np.outer(mags, [z_lo, z_hi])
+        footprint = float(mags.max()) * delta_voxel_slice
+    else:
+        elevations = np.asarray(ct_model.get_params('angles'))[:, 1]
+        cos_el, sin_el = np.cos(elevations), np.sin(elevations)
+        v_values = np.stack([z * cos_el + y * sin_el for z in (z_lo, z_hi)
+                             for y in (-support_radius, support_radius)])
+        # A tilted voxel's vertical footprint is bounded by its diagonal.
+        footprint = math.hypot(delta_voxel_slice, max(delta_voxel, voxel_row_aspect * delta_voxel))
+
+    center_row = (num_rows - 1) / 2.0
+    v_min, v_max = float(v_values.min()) - footprint, float(v_values.max()) + footprint
+    lo = math.floor((v_min + det_row_offset) / delta_det_row + center_row) - 1 - int(binned_row_margin)
+    hi = math.ceil((v_max + det_row_offset) / delta_det_row + center_row) + 2 + int(binned_row_margin)
+    if hi <= 0 or lo >= num_rows:
+        raise ValueError(f'No detector row can see the slab from z = {z_lo:.4g} to {z_hi:.4g} ALU: '
+                         f'its rows would be {lo} to {hi} on a detector of {num_rows} rows.')
+    return max(0, lo), min(num_rows, hi), bool(lo < 0 or hi > num_rows)
+
+
+def _rotation_row_margin(det_rotation, max_row_distance, num_channels):
+    """Rows beyond a window that a rotation of the detector can sample from.
+
+    An output pixel at row i and channel j reads the input at a row displaced by
+    ``(cos(a) - 1) * (i - center_row) + sin(a) * (j - center_col)``.  Over the detector's channels
+    that displacement is at most ``(1 - cos(a)) * |i - center_row| + |sin(a)| * num_channels / 2``.
+    The caller passes the largest ``|i - center_row|`` in its window.  One row is added for the
+    bilinear neighbor.
+    """
+    a = abs(float(det_rotation))
+    bound = (1.0 - math.cos(a)) * max_row_distance + math.sin(a) * num_channels / 2.0
+    return int(math.ceil(bound)) + 1
+
+
+# ── the reduced problem ───────────────────────────────────────────────────────────────────────────
+
+def build_reduced_problem(ct_model, *, view_stride=4, bin_factor=2, num_slab_slices=8,
+                          slice_index=None, row_margin=0):
+    """Build the smaller model that a calibration search scores candidates on.
+
+    The reduced model keeps every ``view_stride``-th view, bins the detector by ``bin_factor`` in
+    rows and in channels, and reconstructs a slab of ``num_slab_slices`` slices around recon slice
+    ``slice_index`` of the full model.  Each reduction leaves the geometry in ALU unchanged, so a
+    value estimated on the reduced model applies to the full model as it is.  The bin factor must
+    divide the row and channel counts exactly, because a dropped leftover channel would move the
+    detector center by half a bin.
+
+    The slab is chosen per geometry.  In parallel beam detector row r is recon slice r, so the slab
+    is a band of detector rows.  In cone beam and multiaxis parallel beam the slab is set through
+    ``recon_shape`` and ``recon_slice_offset``, and the detector rows are cropped to the rows that
+    rays through the slab can reach.  Rays through a slab also cross material outside it, which no
+    score can explain, so a caller that needs the whole axial extent passes
+    ``num_slab_slices=None``.  A helical cone-beam scan always keeps the whole extent, because
+    every ray through a slab comes from a different axial position.
+
+    The reduced model runs on the full model's lead device with the full model's ``compile_mode``,
+    and it uses the default ``use_ror_mask`` because a caller's mask has the full model's shape.
+
+    Args:
+        ct_model (TomographyModel): a cone, parallel, or multiaxis parallel model.  Not modified.
+        view_stride (int, optional): keep every ``view_stride``-th view.  Must divide the view
+            count.  Defaults to 4.
+        bin_factor (int, optional): detector binning factor in rows and channels.  Must divide both
+            detector counts.  Defaults to 2.
+        num_slab_slices (int or None, optional): recon slices in the slab, or None for the whole
+            axial extent.  A helical scan always keeps the whole extent.  Defaults to 8.
+        slice_index (int, optional): the full model's recon slice at the center of the slab.  None
+            (the default) is the middle slice.
+        row_margin (int, optional): extra full-resolution detector rows kept on each side of the
+            slab's row window, for a sweep that moves where the slab lands on the detector.
+            Parallel beam ignores it.  Defaults to 0.
+
+    Returns:
+        tuple: ``(reduced_model, reduction)``.  ``reduction`` records the reduction, and it is what
+        :func:`reduce_sinogram` needs to reduce a sinogram or a weights array to match.  Its
+        entries are these:
+
+        - ``'geometry'``, ``'view_stride'``, ``'bin_factor'``;
+        - ``'row_window'``, the full-resolution rows kept, as ``(lo, hi)``;
+        - ``'axial_thinning'``, False when the whole axial extent is kept;
+        - ``'slice_index'``, the requested slice of the full model, and ``'slice_in_slab'``, the
+          reduced model's slice whose center is nearest to it;
+        - ``'num_slab_slices'`` and ``'slab_z_center'``, which is None unless a cone or multiaxis
+          slab was selected;
+        - ``'det_row_offset_shift'``, what the row crop added to the reduced model's
+          ``det_row_offset``, so a candidate value for the full model is set on the reduced model
+          as the candidate plus this shift;
+        - ``'full_sinogram_shape'``, ``'sinogram_shape'``, ``'recon_shape'``, and ``'devices'``.
+
+    Raises:
+        TypeError: for a translation model.
+        ValueError: when ``view_stride`` does not divide the view count, when ``bin_factor`` does not
+            divide the detector counts, when ``slice_index`` is outside the recon, or when no
+            detector row can see the requested slab.
+    """
+    kind = _geometry_kind(ct_model)
+    view_stride, bin_factor = int(view_stride), int(bin_factor)
+    if num_slab_slices is not None:
+        num_slab_slices = int(num_slab_slices)
+    if view_stride < 1 or bin_factor < 1 or (num_slab_slices is not None and num_slab_slices < 1):
+        raise ValueError('view_stride, bin_factor, and num_slab_slices must each be at least 1; got '
+                         f'{view_stride}, {bin_factor}, {num_slab_slices}.')
+    num_views, num_det_rows, num_det_channels = (int(s) for s in ct_model.get_params('sinogram_shape'))
+    if num_views % view_stride != 0:
+        raise ValueError(f'view_stride must divide the view count: {num_views} views, stride '
+                         f'{view_stride}.  A stride that divides keeps a 360-degree scan\'s opposite '
+                         'views.')
+    if num_det_rows % bin_factor != 0 or num_det_channels % bin_factor != 0:
+        raise ValueError(f'bin_factor must divide both detector counts exactly: {num_det_rows} rows '
+                         f'and {num_det_channels} channels, factor {bin_factor}.  A dropped leftover '
+                         'channel would move the detector center by half a bin.')
+    full_recon_shape = tuple(int(s) for s in ct_model.get_params('recon_shape'))
+    if slice_index is None:
+        slice_index = (full_recon_shape[2] - 1) // 2
+    slice_index = int(slice_index)
+    if not 0 <= slice_index < full_recon_shape[2]:
+        raise ValueError(f'slice_index {slice_index} is outside the recon, which has '
+                         f'{full_recon_shape[2]} slices.')
+    axial_thinning = num_slab_slices is not None and not _is_helical(ct_model)
+
+    # The first reduction is a copy with the kept views and the binned detector.  The detector
+    # pitches grow by the bin factor, so the copy covers the same field of view with coarser voxels.
+    required, _, _ = ct_model.get_all_params()
+    angles = np.asarray(required['angles'])[::view_stride]
+    copy_kwargs = dict(new_angles=angles, new_num_det_rows=num_det_rows // bin_factor,
+                       new_num_det_cols=num_det_channels // bin_factor)
+    if kind == 'cone':
+        copy_kwargs['new_helical_z_shifts'] = np.asarray(required['helical_z_shifts'])[::view_stride]
+    binned = copy_ct_model(ct_model, no_warning=True, **copy_kwargs)
+    if not isinstance(ct_model.get_params('use_ror_mask'), bool):
+        binned.set_params(use_ror_mask=True)
+    delta_det_channel, delta_det_row = ct_model.get_params(['delta_det_channel', 'delta_det_row'])
+    binned.set_params(delta_det_channel=bin_factor * delta_det_channel,
+                      delta_det_row=bin_factor * delta_det_row)
+    binned.auto_set_recon_geometry()
+    binned_rows = num_det_rows // bin_factor
+
+    # The second reduction selects the slab and the detector rows it needs.
+    slab_z_center = None
+    if not axial_thinning:
+        row_lo, row_hi = 0, binned_rows
+    elif kind == 'parallel':
+        # Row r is slice r, so the slab is a band of binned rows.
+        row_center = slice_index // bin_factor
+        row_lo = max(0, min(row_center - num_slab_slices // 2, binned_rows - num_slab_slices))
+        row_hi = min(binned_rows, row_lo + num_slab_slices)
+    else:
+        slab_z_center = float(ct_model.recon_slice_z(slice_index))
+        delta_voxel, voxel_slice_aspect = binned.get_params(['delta_voxel', 'voxel_slice_aspect'])
+        half_height = 0.5 * num_slab_slices * voxel_slice_aspect * delta_voxel
+        binned_row_margin = math.ceil(row_margin / bin_factor)
+        row_lo, row_hi, clipped = _slab_row_window(binned, slab_z_center - half_height,
+                                                   slab_z_center + half_height,
+                                                   binned_row_margin=binned_row_margin)
+        if clipped and binned_row_margin > 0:
+            warnings.warn('The slab sits near the edge of the detector, so the row margin a sweep '
+                          'asked for was cut off by the detector edge.  Candidates that move the '
+                          'slab toward that edge lose part of their data.')
+
+    reduced = copy_ct_model(binned, new_num_det_rows=row_hi - row_lo, no_warning=True)
+    # The model reads compile_mode when it first builds its projectors, which has not happened yet.
+    reduced.compile_mode = ct_model.compile_mode
+    det_row_offset_shift = 0.0
+    if kind != 'parallel' and (row_lo, row_hi) != (0, binned_rows):
+        # The row offset moves with the detector center by half the difference of the rows removed
+        # at the two ends.
+        crop_top, crop_bottom = row_lo, binned_rows - row_hi
+        det_row_offset_shift = (crop_bottom - crop_top) / 2.0 * binned.get_params('delta_det_row')
+        reduced.set_params(det_row_offset=binned.get_params('det_row_offset') + det_row_offset_shift)
+    reduced.auto_set_recon_geometry()
+    if slab_z_center is not None:
+        recon_rows, recon_cols, _ = reduced.get_params('recon_shape')
+        reduced.set_params(recon_shape=(recon_rows, recon_cols, num_slab_slices),
+                           recon_slice_offset=slab_z_center)
+    reduced.configure_devices(devices=[ct_model.torch_device])
+
+    # This is the reduced model's slice nearest the requested slice.  With a slab it is the middle
+    # slice, which is half a slice off when the slab has an even number of slices.
+    if kind == 'parallel':
+        slice_in_slab = slice_index // bin_factor - row_lo
+    elif axial_thinning:
+        slice_in_slab = (num_slab_slices - 1) // 2
+    else:
+        slice_in_slab = reduced.nearest_recon_slice(float(ct_model.recon_slice_z(slice_index)))
+
+    reduction = {
+        'geometry': kind,
+        'view_stride': view_stride,
+        'bin_factor': bin_factor,
+        'row_window': (row_lo * bin_factor, row_hi * bin_factor),
+        'axial_thinning': axial_thinning,
+        'slice_index': slice_index,
+        'slice_in_slab': int(slice_in_slab),
+        'num_slab_slices': int(reduced.get_params('recon_shape')[2]),
+        'slab_z_center': slab_z_center,
+        'det_row_offset_shift': float(det_row_offset_shift),
+        'full_sinogram_shape': (num_views, num_det_rows, num_det_channels),
+        'sinogram_shape': tuple(int(s) for s in reduced.get_params('sinogram_shape')),
+        'recon_shape': tuple(int(s) for s in reduced.get_params('recon_shape')),
+        'devices': [str(d) for d in reduced.sino_placement.devices],
+    }
+    return reduced, reduction
+
+
+def reduce_sinogram(sino, reduction, *, det_rotation=0.0):
+    """Reduce a sinogram, or a weights array, to match a reduced model.
+
+    The reduction keeps every ``view_stride``-th view, crops the rows to the reduced model's row
+    window, and averages each ``bin_factor`` by ``bin_factor`` block of detector pixels.  A nonzero
+    ``det_rotation`` rotates the kept rows first, at full resolution and about the full detector's
+    center, so the result equals a crop of the rotated full sinogram.  A reduced weights array
+    holds the mean weight of each bin, which is a fixed factor away from the inverse-variance
+    weight and so does not change which candidate scores lowest.
+
+    Args:
+        sino (ndarray or tensor): the full sinogram, shape ``reduction['full_sinogram_shape']``.  A
+            host array or a device tensor; an array in the divided device form is refused.
+        reduction (dict): the record returned by :func:`build_reduced_problem`.  A record may name
+            the views to keep as ``'view_indices'`` in place of the stride.
+        det_rotation (float, optional): detector rotation in radians to apply before the crop.
+            Defaults to 0.0.
+
+    Returns:
+        ndarray: float32, shape ``reduction['sinogram_shape']``.
+    """
+    _sharding.reject_shards('reduce_sinogram', sino=sino)
+    full_shape = tuple(reduction['full_sinogram_shape'])
+    if tuple(sino.shape) != full_shape:
+        raise ValueError(f'reduce_sinogram: the sinogram has shape {tuple(sino.shape)}, and the '
+                         f'reduction was built for {full_shape}.')
+    num_views, num_rows, num_channels = full_shape
+    stride, bin_factor = reduction['view_stride'], reduction['bin_factor']
+    row_lo, row_hi = reduction['row_window']
+    view_indices = reduction.get('view_indices')
+    if view_indices is None:
+        view_indices = np.arange(0, num_views, stride)
+    view_indices = np.asarray(view_indices, dtype=np.int64)
+    kept_views, kept_rows = int(view_indices.size), row_hi - row_lo
+    out = np.empty((kept_views, kept_rows // bin_factor, num_channels // bin_factor), dtype=np.float32)
+
+    # A rotation reads rows beyond the window, so the block read per batch is widened.  The
+    # rotation turns about the full detector's center, expressed in the block's own row indices.
+    rotate = float(det_rotation) != 0.0
+    if rotate:
+        center_row = (num_rows - 1) / 2.0
+        max_row_distance = max(abs(row_lo - center_row), abs(row_hi - 1 - center_row))
+        margin = _rotation_row_margin(det_rotation, max_row_distance, num_channels)
+        band_lo, band_hi = max(0, row_lo - margin), min(num_rows, row_hi + margin)
+        center = (center_row - band_lo, (num_channels - 1) / 2.0)
+    else:
+        band_lo, band_hi = row_lo, row_hi
+    device = torch.device(reduction['devices'][0])
+
+    with torch.no_grad():
+        for k0 in range(0, kept_views, _REDUCE_VIEW_BATCH):
+            k1 = min(k0 + _REDUCE_VIEW_BATCH, kept_views)
+            batch = view_indices[k0:k1]
+            block = pipeline._stage_batch(sino[batch, band_lo:band_hi, :], device)
+            if rotate:
+                block = _rotation_kernel(block, det_rotation, center=center)
+                block = block[:, row_lo - band_lo:row_hi - band_lo, :]
+            binned = block.reshape(k1 - k0, kept_rows // bin_factor, bin_factor,
+                                   num_channels // bin_factor, bin_factor).mean(dim=(2, 4))
+            out[k0:k1] = binned.to('cpu', torch.float32).numpy()
+    return out
+
+
+# ── the parameter sweep ───────────────────────────────────────────────────────────────────────────
+
+def parameter_sweep(ct_model, sino, parameter, values, *, slice_index=None, filter_name='ramp'):
+    """Reconstruct one slice per candidate value of a geometry parameter, for viewing.
+
+    This is the manual calibration workflow.  A user looks at the stack in the slice viewer, picks
+    the candidate whose slice is sharpest or free of rings, and sets the value on the model.  Each
+    slice is a direct reconstruction from every view at the full channel resolution, with no view
+    stride and no binning.  For a parallel or circular cone-beam scan the detector is cropped to
+    the rows that rays through the slice can reach, so each candidate costs one filter pass over
+    those rows and one back projection into one slice.  A helical scan keeps every row and every
+    slice, and the requested slice is read out of the whole volume.
+
+    The candidate index is the last axis, the axis the slice viewer pages through by default::
+
+        from mbirtorch.preprocess import geometry_calibration
+        values = np.linspace(-4.0, 4.0, 17)
+        slices = geometry_calibration.parameter_sweep(ct_model, sino, 'det_channel_offset', values)
+        mbirtorch.slice_viewer(slices, title='det_channel_offset sweep')
+
+    Args:
+        ct_model (TomographyModel): a cone, parallel, or multiaxis parallel model.  Not modified.
+        sino (ndarray or tensor): the sinogram, shape ``ct_model.get_params('sinogram_shape')``.
+            Not modified.
+        parameter (str): ``'det_channel_offset'`` or ``'det_row_offset'``, in ALU, or
+            ``'det_rotation'``, in radians.  ``det_row_offset`` is refused for parallel beam, which
+            does not use it.  A row-offset sweep shows the object at a different height in each
+            candidate, so read the stack for where the object sits rather than for sharpness.
+            ``det_rotation`` is refused for a curved detector, whose channel coordinate is an arc
+            rather than a distance in the detector plane.
+        values (sequence of float): the candidate values.
+        slice_index (int, optional): the full model's recon slice to reconstruct.  None (the
+            default) is the middle slice.
+        filter_name (str, optional): the direct reconstruction filter.  Defaults to ``'ramp'``.
+
+    Returns:
+        ndarray: float32 stack of shape ``(num_recon_rows, num_recon_cols, num_candidates)``.
+    """
+    kind = _geometry_kind(ct_model)
+    _sharding.reject_shards('parameter_sweep', sino=sino)
+    if parameter not in _SWEEP_PARAMETERS:
+        raise ValueError(f'parameter_sweep accepts {", ".join(_SWEEP_PARAMETERS)}; got {parameter!r}.')
+    if parameter == 'det_row_offset' and kind == 'parallel':
+        raise ValueError('det_row_offset has no effect in parallel beam geometry, so there is nothing '
+                         'to sweep.')
+    if parameter == 'det_rotation' and kind == 'cone' and ct_model.get_params('use_curved_detector'):
+        raise ValueError('det_rotation cannot be applied to a curved detector: the rotation resamples '
+                         'a flat detector plane.')
+    values = np.asarray(values, dtype=np.float64).ravel()
+    if values.size == 0 or not np.all(np.isfinite(values)):
+        raise ValueError('values must be a non-empty sequence of finite numbers.')
+    if parameter == 'det_rotation':
+        _check_det_rotation(np.max(np.abs(values)))
+
+    # A row-offset candidate moves where the slice lands on the detector, so the row window is
+    # widened by the largest move among the candidates.
+    row_margin = 0
+    if parameter == 'det_row_offset':
+        current = float(ct_model.get_params('det_row_offset'))
+        row_margin = math.ceil(np.max(np.abs(values - current)) / ct_model.get_params('delta_det_row'))
+    reduced, reduction = build_reduced_problem(ct_model, view_stride=1, bin_factor=1,
+                                               num_slab_slices=1, slice_index=slice_index,
+                                               row_margin=row_margin)
+    if parameter != 'det_rotation':
+        sino_reduced = reduce_sinogram(sino, reduction)
+
+    recon_rows, recon_cols, _ = reduction['recon_shape']
+    slice_in_slab = reduction['slice_in_slab']
+    stack = np.empty((recon_rows, recon_cols, values.size), dtype=np.float32)
+    # Setting an offset rebuilds the projector bindings, so the first changed value retraces once.
+    for k, value in enumerate(values):
+        if parameter == 'det_rotation':
+            sino_reduced = reduce_sinogram(sino, reduction, det_rotation=float(value))
+        elif parameter == 'det_row_offset':
+            reduced.set_params(det_row_offset=float(value) + reduction['det_row_offset_shift'])
+        else:
+            reduced.set_params(**{parameter: float(value)})
+        recon = reduced.recon_direct(sino_reduced, filter_name=filter_name)
+        stack[:, :, k] = np.asarray(recon)[:, :, slice_in_slab]
+    return stack
+
+
+# ── the rotation-direction check ──────────────────────────────────────────────────────────────────
+
+def _direct_residual_score(ct_model, sino, filtered_sino=None, row_fraction=0.5):
+    """The normalized high-pass residual of a direct reconstruction, over the central rows.
+
+    The model reconstructs the sinogram directly, forward projects the result, and high-pass
+    filters both the sinogram and the projection with ``sino_high_pass_filtering``.  The score is
+    the mean squared difference divided by the mean squared filtered sinogram.  A direct
+    reconstruction does not iterate against the data, so the residual measures how consistent the
+    data are with the model's geometry.  The high-pass filter removes the smooth mismatch that
+    scatter, cupping, and the cone-beam approximation leave, and it keeps the edges that a geometry
+    error displaces.  Only the central ``row_fraction`` of the detector rows is scored, because the
+    direct reconstruction's own error grows with the cone angle.
+
+    Args:
+        ct_model: the reduced model.
+        sino (ndarray): the reduced sinogram.
+        filtered_sino (ndarray, optional): ``sino_high_pass_filtering(sino)``, when the caller has
+            it already.
+        row_fraction (float, optional): the fraction of central rows scored.  Defaults to 0.5.
+    """
+    if filtered_sino is None:
+        filtered_sino = sino_high_pass_filtering(sino)
+    recon = ct_model.recon_direct(sino)
+    projection = ct_model.forward_project(recon)
+    filtered_projection = sino_high_pass_filtering(projection)
+    num_rows = sino.shape[1]
+    keep = max(1, int(round(num_rows * row_fraction)))
+    lo = (num_rows - keep) // 2
+    filtered_sino = filtered_sino[:, lo:lo + keep]
+    filtered_projection = filtered_projection[:, lo:lo + keep]
+    energy = np.mean(filtered_sino ** 2, dtype=np.float64)
+    if energy == 0.0:
+        raise ValueError('The reduced sinogram is zero over the scored rows, so no score exists.')
+    residual = np.mean((filtered_sino - filtered_projection) ** 2, dtype=np.float64)
+    return float(residual / energy)
+
+
+# check_rotation_direction warns when the worse direction's score is less than this many times
+# the better one.  The ratio falls with the fan angle.
+_DIRECTION_MIN_RATIO = 1.5
+
+
+def check_rotation_direction(ct_model, sino, *, view_stride=4, bin_factor=2):
+    """Decide whether the view angles run in the right direction for a cone-beam scan.
+
+    A reversed rotation direction is a common metadata failure, and its symptom is a reconstruction
+    that is subtly warped rather than obviously wrong.  The check reconstructs the data directly
+    with the angles as given and again with every angle negated, scores each reconstruction by its
+    high-pass residual over the central detector rows, and reports which scores lower.  With the
+    wrong direction each measurement is assigned to a ray whose angle is off by twice its fan
+    angle, so the reconstruction cannot reproduce the data away from the center channel.  Both
+    reconstructions cover the whole axial extent, because a thin slab cannot explain the rays that
+    cross material outside it.
+
+    Both scores are returned, so the caller can see the margin between them.  The function warns
+    when the worse score is less than 1.5 times the better one, and an answer that comes with that
+    warning is undecided.  A larger ``bin_factor`` raises the margin when the score is dominated by
+    pixel-scale noise.
+
+    Only cone beam is supported.  In parallel beam, negating the angles mirrors the reconstruction
+    and changes nothing else, so the direction cannot be decided from the data.  A multiaxis
+    parallel model and a helical scan are refused.
+
+    Args:
+        ct_model (ConeBeamModel): the model.  Not modified.
+        sino (ndarray or tensor): the sinogram.  Not modified.
+        view_stride (int, optional): passed to :func:`build_reduced_problem`.  Defaults to 4.
+        bin_factor (int, optional): passed to :func:`build_reduced_problem`.  Defaults to 2.
+
+    Returns:
+        CalibrationResult: ``parameter`` is ``'rotation_direction'``, ``candidates`` is
+        ``[1.0, -1.0]`` for the angles as given and negated, and ``value`` is the better of the two.
+        A value of -1.0 means the angles should be negated; :func:`apply_calibration` does that.
+    """
+    kind = _geometry_kind(ct_model)
+    if kind == 'parallel':
+        raise ValueError('check_rotation_direction needs a cone-beam model.  In parallel-beam '
+                         'geometry negating the view angles mirrors the reconstruction, so the two '
+                         'directions cannot be told apart from the data.')
+    if kind == 'multiaxis':
+        raise ValueError('check_rotation_direction supports cone beam only; a '
+                         'multiaxis parallel model is not supported yet.')
+    if _is_helical(ct_model):
+        raise ValueError('check_rotation_direction does not support a helical scan yet.')
+    _sharding.reject_shards('check_rotation_direction', sino=sino)
+    reduction_kwargs = dict(view_stride=view_stride, bin_factor=bin_factor, num_slab_slices=None)
+
+    reduced, reduction = build_reduced_problem(ct_model, **reduction_kwargs)
+    sino_reduced = reduce_sinogram(sino, reduction)
+    filtered = sino_high_pass_filtering(sino_reduced)
+    # The reversed model is the full model with every angle negated, reduced in the same way.  One
+    # reduced sinogram serves both models, because the reduction does not depend on the angles.
+    required, _, _ = ct_model.get_all_params()
+    reversed_full = copy_ct_model(ct_model, new_angles=-np.asarray(required['angles']),
+                                  new_helical_z_shifts=np.asarray(required['helical_z_shifts']), no_warning=True)
+    reversed_full.compile_mode = ct_model.compile_mode
+    reversed_reduced, _ = build_reduced_problem(reversed_full, **reduction_kwargs)
+
+    candidates = np.array([1.0, -1.0])
+    scores = np.array([_direct_residual_score(reduced, sino_reduced, filtered),
+                       _direct_residual_score(reversed_reduced, sino_reduced, filtered)])
+    best = int(np.argmin(scores))
+    ratio = float(scores.max() / max(scores.min(), 1e-30))
+    if ratio < _DIRECTION_MIN_RATIO:
+        warnings.warn(f'check_rotation_direction: the worse direction scored only {ratio:.2f} times '
+                      f'the better one, below the margin of {_DIRECTION_MIN_RATIO} that the check '
+                      'expects.  Treat the answer as undecided.  A small margin comes from a narrow '
+                      'fan angle or from a score dominated by pixel-scale noise, and a larger '
+                      'bin_factor raises the margin in the second case.')
+    return CalibrationResult(parameter='rotation_direction', value=float(candidates[best]),
+                             score=float(scores[best]), candidates=candidates, scores=scores,
+                             method='direct_residual', reduction=reduction)
+
+
+# ── applying a result ─────────────────────────────────────────────────────────────────────────────
+
+def _resolve_work_device():
+    """The device a host array's views are rotated on: the process's default device."""
+    from ..tomography_model import _resolve_device
+    return _resolve_device('auto')
+
+
+def _rotate_views_in_place(sino, det_rotation):
+    """Rotate every view of ``sino`` by ``det_rotation`` radians, writing each batch back in place.
+
+    The sinogram may be a writable floating-point host array or a floating-point tensor on any
+    device.  The rotation runs in float32 and the result is written back in the array's own dtype.
+    A read-only host array is refused, because the alternative is a second full-size sinogram.
+    """
+    if torch.is_tensor(sino):
+        if not torch.is_floating_point(sino):
+            raise TypeError(f'apply_calibration needs a floating-point sinogram; got {sino.dtype}.')
+        device = sino.device if sino.device.type != 'cpu' else _resolve_work_device()
+    else:
+        if not isinstance(sino, np.ndarray):
+            raise TypeError('apply_calibration needs the sinogram as a numpy array or a torch tensor, '
+                            f'so the rotation can be written in place; got {type(sino).__name__}.')
+        if not np.issubdtype(sino.dtype, np.floating):
+            raise TypeError(f'apply_calibration needs a floating-point sinogram; got {sino.dtype}.')
+        if not sino.flags.writeable:
+            raise ValueError('apply_calibration rotates the sinogram in place, and the array is '
+                             'read-only.  Pass a writable copy.')
+        device = _resolve_work_device()
+    num_views = sino.shape[0]
+    with torch.no_grad():
+        for j in range(0, num_views, _ROTATE_VIEW_BATCH):
+            end = min(j + _ROTATE_VIEW_BATCH, num_views)
+            rotated = _rotation_kernel(pipeline._stage_batch(sino[j:end], device), det_rotation)
+            if torch.is_tensor(sino):
+                sino[j:end] = rotated.to(sino.device, sino.dtype)
+            else:
+                sino[j:end] = rotated.cpu().numpy()
+    return sino
+
+
+def apply_calibration(ct_model, sino, results):
+    """Apply calibration results to the model and the sinogram.
+
+    This is the only function in the module that changes state.  A model parameter is set on
+    ``ct_model`` with ``set_params``.  A detector rotation is not a model parameter, so it is applied
+    by rotating every view of ``sino`` in place, one batch of views at a time, with no second
+    full-size sinogram.  A rotation direction of -1 negates every view angle of the model.
+
+    A change to ``det_row_offset`` moves the volume's axial center with the detector, by the change
+    in the automatic ``recon_slice_offset``, so a center the caller chose keeps its place relative to
+    the detector; the recon shape and voxel pitch are left as they were.
+
+    Args:
+        ct_model (TomographyModel): the model to change.
+        sino (ndarray or tensor): the sinogram, changed in place when a rotation is applied.  A host
+            array must be writable and floating point.
+        results (CalibrationResult, or dict or sequence of CalibrationResult): the results to apply.
+            A dict is read for its values, so a mapping from parameter name to result is accepted.
+
+    Returns:
+        tuple: ``(ct_model, sino)``, the same two objects after the changes.
+
+    Raises:
+        ValueError: for a result whose ``parameter`` this function does not know how to apply.
+    """
+    if isinstance(results, CalibrationResult):
+        results = [results]
+    elif isinstance(results, dict):
+        results = list(results.values())
+    else:
+        results = list(results)
+    for result in results:
+        if not isinstance(result, CalibrationResult):
+            raise TypeError(f'apply_calibration expects CalibrationResult values; got '
+                            f'{type(result).__name__}.')
+
+    for result in results:
+        name, value = result.parameter, float(result.value)
+        if name in ('det_channel_offset', 'det_row_offset'):
+            before = _automatic_slice_offset(ct_model) if name == 'det_row_offset' else None
+            ct_model.set_params(**{name: value})
+            if before is not None:
+                shift = _automatic_slice_offset(ct_model) - before
+                ct_model.set_params(no_warning=True, recon_slice_offset=float(
+                    ct_model.get_params('recon_slice_offset')) + shift)
+        elif name == 'det_rotation':
+            if value != 0.0:
+                _sharding.reject_shards('apply_calibration', sino=sino)
+                sino = _rotate_views_in_place(sino, value)
+        elif name == 'rotation_direction':
+            if value == -1.0:
+                # The angles are the first column of the per-view parameter array for cone and
+                # multiaxis, and the whole array for parallel beam.
+                view_params_name = ct_model.get_params('view_params_name')
+                view_params = np.array(ct_model.get_params(view_params_name), copy=True)
+                if view_params.ndim == 2:
+                    view_params[:, 0] *= -1
+                else:
+                    view_params *= -1
+                ct_model.set_params(**{view_params_name: view_params})
+            elif value != 1.0:
+                raise ValueError(f'rotation_direction must be 1.0 or -1.0; got {value}.')
+        else:
+            raise ValueError(f'apply_calibration does not know how to apply {name!r}.')
+    return ct_model, sino
+
+
+# ── the conjugate-view method ─────────────────────────────────────────────────────────────────────
+
+# These are the defaults of the conjugate-view estimator.  Each one is described where it is used.
+_CONJUGATE_OFFSET_HALF_RANGE_CHANNELS = 4.0     # search range on each side of the model's value
+_CONJUGATE_OFFSET_MAX_SLIDES = 8                # the search window moves this many times at most
+_CONJUGATE_MIN_REGION_FRACTION = 0.25           # the least fraction of channels a comparison may use
+_CONJUGATE_OFFSET_TOLERANCE_CHANNELS = 0.01     # where the search stops, as a fraction of a channel
+_CONJUGATE_NUM_ROWS = 16                        # detector rows compared, before the cone-beam limit
+_CONJUGATE_VIEW_STRIDE = 1                      # every reference view is kept
+_CONJUGATE_TRIM_FRACTION = 0.1                  # fraction of the worst view pairs dropped
+_CONJUGATE_EDGE_MARGIN = 4                      # channels excluded at each edge beyond the shift
+# A scan covers a full rotation when no gap between neighboring view angles exceeds both this
+# many times the median gap and this many radians.  A scan over a half rotation is refused.
+_CONJUGATE_MAX_GAP_RATIO = 3.0
+_CONJUGATE_MAX_GAP = math.radians(5.0)
+
+
+def _view_angles(ct_model):
+    """The view angles in radians of a parallel or cone model, as a float64 array."""
+    required, _, _ = ct_model.get_all_params()
+    return np.asarray(required['angles'], dtype=np.float64).ravel()
+
+
+def _angular_gaps(angles):
+    """The gaps between neighboring distinct view angles on the circle, in radians."""
+    wrapped = np.unique(np.mod(angles, 2 * np.pi))
+    if wrapped.size < 2:
+        return np.array([2 * np.pi])
+    return np.diff(np.append(wrapped, wrapped[0] + 2 * np.pi))
+
+
+def _angular_coverage(angles):
+    """The angular range the views cover, in radians: the full circle minus the largest gap between
+    neighboring distinct angles.  A full rotation gives 2 pi minus one view spacing, and views over
+    a half rotation give about pi."""
+    return float(2 * np.pi - _angular_gaps(angles).max())
+
+
+def _require_conjugate_geometry(ct_model, parameter, det_rotation=0.0):
+    """Refuse the geometries the conjugate-view method cannot serve, with the reason."""
+    kind = _geometry_kind(ct_model)
+    if kind == 'multiaxis':
+        raise ValueError('The conjugate-view method does not support a multiaxis parallel model yet.')
+    if _is_helical(ct_model):
+        raise ValueError('The conjugate-view method needs an opposite view at the same axial '
+                         'position, which a helical scan does not have.')
+    gaps = _angular_gaps(_view_angles(ct_model))
+    if gaps.max() > max(_CONJUGATE_MAX_GAP_RATIO * np.median(gaps), _CONJUGATE_MAX_GAP):
+        raise ValueError('The conjugate-view method needs views over a full rotation.  The angles '
+                         f'cover {math.degrees(2 * np.pi - gaps.max()):.1f} degrees, with a gap of '
+                         f'{math.degrees(gaps.max()):.1f} degrees between neighboring views.  An '
+                         'automatic estimate for a scan without a full rotation is not available '
+                         'yet, and parameter_sweep reconstructs one slice per candidate value so '
+                         'the value can be chosen by eye.  On a short scan those slices carry '
+                         'limited-angle artifacts at every candidate, because the direct '
+                         'reconstruction applies no short-scan weighting.')
+    if det_rotation != 0.0:
+        _check_det_rotation(det_rotation)
+        if kind == 'cone' and ct_model.get_params('use_curved_detector'):
+            raise ValueError('A det_rotation cannot be applied to a curved detector.  The rotation '
+                             'resamples a flat detector plane.')
+    if parameter == 'det_rotation' and kind == 'cone' and ct_model.get_params('use_curved_detector'):
+        raise ValueError('det_rotation cannot be estimated on a curved detector.  The rotation '
+                         'resamples a flat detector plane.')
+
+
+def _fourier_shift_channels(array, shift, spectrum=None):
+    """Shift every row of ``array`` along its last axis by ``shift`` samples.
+
+    The shift is applied in the Fourier domain, which is exact for a band-limited signal.  It is
+    circular, so the samples that leave one end of a row enter at the other.  Positive shifts move
+    content toward higher channel indices.  A caller that shifts the same array many times passes
+    its precomputed ``spectrum``, the result of ``np.fft.rfft(array, axis=-1)``.
+    """
+    if shift == 0.0 and spectrum is None:
+        return array
+    num_channels = array.shape[-1]
+    if spectrum is None:
+        spectrum = np.fft.rfft(array, axis=-1)
+    phase = np.exp(-2j * np.pi * np.fft.rfftfreq(num_channels) * shift).astype(np.complex64)
+    return np.fft.irfft(spectrum * phase, n=num_channels, axis=-1).astype(np.float32)
+
+
+class _ConjugatePairs:
+    """The data behind a conjugate-view score.
+
+    An instance holds a band of detector rows from every kept view, and, for each kept view and
+    channel, which view holds the opposite ray.  The opposite of the ray at view angle ``beta`` and
+    fan angle ``gamma`` lies at view angle ``beta + pi - 2 * gamma`` and fan angle ``-gamma``, in
+    the sign conventions of ``cone_beam._cone_pixel_xy_mag``.  Parallel beam is the case
+    ``gamma = 0``.  The partner view is interpolated linearly between the two kept views nearest
+    that angle.
+
+    The reference views are every view at the record's view stride, and their partners are drawn
+    from every view.  At stride 1 every view is a reference, so each unordered pair is compared
+    from both sides and the interpolation errors of the two sides cancel.  The fan angle of a
+    channel depends on the channel offset, so the partners are computed once at ``pairing_offset``,
+    and a candidate offset ``d`` channels away moves a channel's partner angle by
+    ``2 d delta / sdd``.
+
+    Args:
+        ct_model: a parallel or cone model.
+        reduction (dict or None): a record from :func:`build_reduced_problem`, whose view stride,
+            bin factor, and row window are used.  None builds a record that keeps every view, bins
+            nothing, and takes a band of rows around the central plane of the scan.
+        num_rows (int or None): the band height when ``reduction`` is None.  None takes the
+            default, reduced for cone beam so that opposite rays through the band land within about
+            one row of each other.
+        pairing_offset (float or None): the channel offset in ALU that the fan angles are computed
+            at.  None is the model's current value.
+    """
+
+    def __init__(self, ct_model, reduction=None, num_rows=None, pairing_offset=None):
+        self.kind = _geometry_kind(ct_model)
+        num_views, num_det_rows, num_det_channels = (int(s) for s in ct_model.get_params('sinogram_shape'))
+        delta_det_channel, delta_det_row, det_channel_offset, det_row_offset = ct_model.get_params(
+            ['delta_det_channel', 'delta_det_row', 'det_channel_offset', 'det_row_offset'])
+        if reduction is None:
+            reduction = self._default_reduction(ct_model, num_rows)
+        elif self.kind == 'cone':
+            # The cone-beam comparison is only sound near the central plane.
+            central_row = (num_det_rows - 1) / 2.0 + det_row_offset / delta_det_row
+            lo, hi = reduction['row_window']
+            if not lo <= central_row < hi:
+                warnings.warn('The reduction\'s row window does not contain the row the central '
+                              'plane reaches, so the cone-beam conjugate comparison is biased '
+                              'by the cone angle.')
+        self.reduction = dict(reduction)
+        stride, bin_factor = int(reduction['view_stride']), int(reduction['bin_factor'])
+        self.delta = bin_factor * float(delta_det_channel)
+        self.num_channels = num_det_channels // bin_factor
+        self.model_offset = float(det_channel_offset)
+        self.pairing_offset = self.model_offset if pairing_offset is None else float(pairing_offset)
+
+        angles = _view_angles(ct_model)
+        self.reference_indices = np.arange(0, num_views, stride)
+        self.num_views = int(self.reference_indices.size)
+        # The record describes the reference views, so that a reduced sinogram and the difference
+        # image of conjugate_difference have the same shape.
+        self.reduction['view_indices'] = self.reference_indices
+        self.reduction['sinogram_shape'] = (self.num_views,) + tuple(self.reduction['sinogram_shape'][1:])
+
+        # These are the opposite ray's view angles, one per reference view and per channel.
+        # A reference ray at fan angle -gamma(u) has its opposite at beta + pi + 2 gamma(u),
+        # where u = (m - c) delta + d for mirrored column m.
+        center_channel = (self.num_channels - 1) / 2.0
+        u = (np.arange(self.num_channels) - center_channel) * self.delta + self.pairing_offset
+        if self.kind == 'cone':
+            source_detector_dist = float(ct_model.get_params('source_detector_dist'))
+            if np.isinf(source_detector_dist):
+                gamma = np.zeros_like(u)
+            elif ct_model.get_params('use_curved_detector'):
+                gamma = u / source_detector_dist
+            else:
+                gamma = np.arctan(u / source_detector_dist)
+        else:
+            gamma = np.zeros_like(u)
+        target = angles[self.reference_indices][:, None] + np.pi - 2.0 * gamma[None, :]
+        low, high, self.partner_weight = self._partners(angles, target)
+        self.partner_indices = np.unique(np.concatenate([low.ravel(), high.ravel()]))
+        self.partner_low = np.searchsorted(self.partner_indices, low)
+        self.partner_high = np.searchsorted(self.partner_indices, high)
+
+    @staticmethod
+    def _default_reduction(ct_model, num_rows):
+        """A reduction record for the band of rows around the scan's central plane."""
+        num_views, num_det_rows, num_det_channels = (int(s) for s in ct_model.get_params('sinogram_shape'))
+        delta_det_row, det_row_offset = ct_model.get_params(['delta_det_row', 'det_row_offset'])
+        if num_rows is None:
+            num_rows = _CONJUGATE_NUM_ROWS
+            if isinstance(ct_model, ConeBeamModel):
+                # Opposite rays through a point off the central plane reach the detector
+                # at different heights.  The band keeps that difference within one row.
+                min_mag, _ = ct_model.pixel_magnification_bounds()
+                source_detector_dist, source_iso_dist = ct_model.get_params(
+                    ['source_detector_dist', 'source_iso_dist'])
+                if not np.isinf(source_detector_dist):
+                    support_radius = source_detector_dist / min_mag - source_iso_dist
+                    half = max(1, math.floor(source_iso_dist / (2.0 * support_radius)))
+                    num_rows = min(num_rows, 2 * half + 1)
+        num_rows = max(1, min(int(num_rows), num_det_rows))
+        # The central plane reaches the row where the detector height v is zero, and
+        # the band is centered there.
+        central_row = (num_det_rows - 1) / 2.0 + det_row_offset / delta_det_row
+        lo = int(round(central_row - (num_rows - 1) / 2.0))
+        lo = max(0, min(lo, num_det_rows - num_rows))
+        stride = _CONJUGATE_VIEW_STRIDE
+        return {'geometry': _geometry_kind(ct_model), 'view_stride': stride, 'bin_factor': 1,
+                'row_window': (lo, lo + num_rows), 'axial_thinning': True,
+                'full_sinogram_shape': (num_views, num_det_rows, num_det_channels),
+                'sinogram_shape': (num_views // stride, num_rows, num_det_channels),
+                'devices': [str(ct_model.torch_device)]}
+
+    @staticmethod
+    def _partners(angles, target):
+        """For each target angle, the two kept views that bracket it on the circle and the weight
+        of the second.  Returns three arrays of the target's shape."""
+        wrapped = np.mod(angles, 2 * np.pi)
+        order = np.argsort(wrapped)
+        sorted_angles = wrapped[order]
+        num_views = angles.size
+        t = np.mod(target, 2 * np.pi)
+        position = np.searchsorted(sorted_angles, t)
+        high = position % num_views
+        low = (position - 1) % num_views
+        gap = np.mod(sorted_angles[high] - sorted_angles[low], 2 * np.pi)
+        gap = np.where(gap == 0.0, 2 * np.pi, gap)
+        weight = np.mod(t - sorted_angles[low], 2 * np.pi) / gap
+        return order[low], order[high], weight.astype(np.float32)
+
+    def read_bands(self, sino, det_rotation=0.0):
+        """The band of the reference views and the band of the partner views."""
+        partner = dict(self.reduction, view_indices=self.partner_indices)
+        return (reduce_sinogram(sino, self.reduction, det_rotation=det_rotation),
+                reduce_sinogram(sino, partner, det_rotation=det_rotation))
+
+    def pairs(self, sino, det_rotation=0.0, bands=None):
+        """The band of every reference view, and the mirrored opposite ray of every element of it.
+
+        Args:
+            sino: the full sinogram, read through :func:`reduce_sinogram` unless ``bands`` is given.
+            det_rotation (float): a rotation applied by :func:`reduce_sinogram`, bilinear.
+            bands (tuple of ndarray, optional): the reference and partner bands already read, as
+                the rotation estimate supplies them.
+
+        Returns:
+            tuple of ndarray: ``(views, opposites)``, each of shape ``(num_reference_views,
+            num_rows, num_channels)`` in float32.  Element ``[i, r, n]`` of ``opposites`` is the
+            measurement of the ray opposite to element ``[i, r, n]`` of ``views``, placed at the
+            mirrored channel.  The two agree up to a shift of twice the channel offset.
+        """
+        views, partners = self.read_bands(sino, det_rotation) if bands is None else bands
+        mirrored = partners[:, :, ::-1]
+        opposites = np.empty_like(views)
+        columns = np.arange(self.num_channels)
+        for i in range(self.num_views):
+            low = mirrored[self.partner_low[i], :, columns]      # (channels, rows)
+            high = mirrored[self.partner_high[i], :, columns]
+            weight = self.partner_weight[i][:, None]
+            opposites[i] = ((1.0 - weight) * low + weight * high).T
+        return views, opposites
+
+    def channel_margin(self, max_abs_offset):
+        """Channels excluded at each edge of the comparison for offsets up to ``max_abs_offset``."""
+        return int(math.ceil(2.0 * abs(max_abs_offset) / self.delta)) + _CONJUGATE_EDGE_MARGIN
+
+    def prepare(self, views, opposites, margin):
+        """What the score needs from a pair set, computed once for every candidate.
+
+        Returns:
+            dict: the interior channel region, the views over it, their per-pair mean square, and
+            the spectrum of the opposites along the channel axis.
+        """
+        region = slice(margin, self.num_channels - margin)
+        if region.stop <= region.start:
+            raise ValueError(f'A margin of {margin} channels at each edge leaves none of the '
+                             f'{self.num_channels} channels to compare.  The margin follows the largest '
+                             'offset the search can reach; narrow the bounds or center them nearer zero.')
+        interior = np.ascontiguousarray(views[:, :, region], dtype=np.float32)
+        energy = np.mean(interior.astype(np.float64) ** 2, axis=(1, 2))
+        if not np.any(energy > 0.0):
+            raise ValueError('The compared band of the sinogram is zero, so no score exists.')
+        return {'region': region, 'views': interior, 'energy': energy,
+                'spectrum': np.fft.rfft(opposites, axis=-1)}
+
+    def per_pair(self, prepared, opposites, det_channel_offset):
+        """The mean squared difference between each view and its shifted opposites, per pair."""
+        shift = 2.0 * float(det_channel_offset) / self.delta
+        shifted = _fourier_shift_channels(opposites, shift, spectrum=prepared['spectrum'])
+        difference = prepared['views'] - shifted[:, :, prepared['region']]
+        return np.mean(difference.astype(np.float64) ** 2, axis=(1, 2))
+
+    def keep_set(self, prepared, opposites, det_channel_offset):
+        """The pairs kept by the trimmed mean: all but the fraction that agree worst at one offset,
+        with each pair's difference measured against its own energy, so that the views with the
+        most object in them are not the ones dropped.  The set is chosen once, so that every
+        candidate is scored on the same pairs."""
+        relative = self.per_pair(prepared, opposites, det_channel_offset) / np.maximum(prepared['energy'], 1e-30)
+        num_kept = max(1, int(round(relative.size * (1.0 - _CONJUGATE_TRIM_FRACTION))))
+        return np.sort(np.argsort(relative)[:num_kept])
+
+    def score(self, prepared, opposites, det_channel_offset, keep):
+        """The conjugate-view score at one channel offset: the mean squared difference over the
+        kept pairs divided by the mean square of their views."""
+        per_pair = self.per_pair(prepared, opposites, det_channel_offset)
+        return float(per_pair[keep].mean() / prepared['energy'][keep].mean())
+
+
+def _search_minimum(score_fn, bounds, num_coarse, tolerance):
+    """Find the minimum of a scalar score over ``bounds``.
+
+    A coarse pass evaluates ``num_coarse`` equally spaced candidates, which shows whether the curve
+    has one minimum.  A golden-section search then narrows the bracket around the coarse minimum
+    until it is shorter than ``tolerance``.  Every evaluation is kept.
+
+    Returns:
+        tuple: ``(best, candidates, scores, notes)``.  ``candidates`` and ``scores`` are sorted by
+        candidate and hold every evaluation.  ``notes`` is a list of strings describing anything the
+        caller should warn about: a coarse minimum at an edge of the bounds, or more than one
+        local minimum on the coarse curve.
+    """
+    lo, hi = float(bounds[0]), float(bounds[1])
+    if not hi > lo:
+        raise ValueError(f'bounds must satisfy lo < hi; got {bounds}.')
+    num_coarse = max(3, int(num_coarse))
+    coarse = np.linspace(lo, hi, num_coarse)
+    evaluated = {float(x): float(score_fn(x)) for x in coarse}
+    coarse_scores = np.array([evaluated[float(x)] for x in coarse])
+    notes = []
+    best = int(np.argmin(coarse_scores))
+    interior = coarse_scores[1:-1]
+    local_minima = int(np.sum((interior < coarse_scores[:-2]) & (interior <= coarse_scores[2:])))
+    if local_minima > 1:
+        notes.append(f'the score curve has {local_minima} local minima on the coarse grid')
+    if best in (0, num_coarse - 1):
+        notes.append('the coarse minimum sits at an edge of the bounds')
+    a = float(coarse[max(best - 1, 0)])
+    b = float(coarse[min(best + 1, num_coarse - 1)])
+
+    # The golden-section search runs on [a, b].  Each step drops the worse end and
+    # keeps one interior point.
+    ratio = (math.sqrt(5.0) - 1.0) / 2.0
+    x1 = b - ratio * (b - a)
+    x2 = a + ratio * (b - a)
+    f1, f2 = float(score_fn(x1)), float(score_fn(x2))
+    evaluated[x1], evaluated[x2] = f1, f2
+    while b - a > tolerance:
+        if f1 < f2:
+            b, x2, f2 = x2, x1, f1
+            x1 = b - ratio * (b - a)
+            f1 = float(score_fn(x1))
+            evaluated[x1] = f1
+        else:
+            a, x1, f1 = x1, x2, f2
+            x2 = a + ratio * (b - a)
+            f2 = float(score_fn(x2))
+            evaluated[x2] = f2
+    candidates = np.array(sorted(evaluated))
+    scores = np.array([evaluated[x] for x in candidates])
+    return float(candidates[int(np.argmin(scores))]), candidates, scores, notes
+
+
+def estimate_det_channel_offset(ct_model, sino, *, method='auto', bounds=None, num_coarse=11,
+                                reduction=None, det_rotation=0.0, num_rows=None):
+    """Estimate ``det_channel_offset`` from the sinogram by comparing each view with its opposite.
+
+    In a scan over a full rotation every ray is measured twice, once from each side.  A voxel at
+    in-plane position x projects to channel ``(x + det_channel_offset) / delta_det_channel`` from
+    the detector center, and after a half rotation it projects to the mirrored position.  A view
+    and its mirrored opposite therefore differ by a shift of twice the offset, and the estimate is
+    the candidate offset at which they agree best.  For cone beam the opposite of a channel lies at
+    a view angle that depends on the fan angle, and the comparison uses a band of rows around the
+    central plane.  On synthetic data at a full fan angle of 20 degrees the bias was 0.02 to 0.03
+    channels.
+
+    The search scores ``num_coarse`` candidates across ``bounds`` and then narrows the bracket by
+    golden section to a hundredth of a channel, and it returns every candidate and score, so a flat
+    or double minimum is visible.  It warns when the coarse curve has more than one minimum or its
+    minimum sits at an edge of the bounds.  A trimmed mean drops the tenth of the view pairs that
+    agree worst, so a few corrupted views do not move the estimate.
+
+    The method needs views over a full rotation and an opposite view at the same axial position, so
+    it refuses a short scan and a helical scan.  A multiaxis parallel model is not supported yet.
+    An offset scan, whose detector is displaced by hundreds of channels, is not served, because the
+    search range is a few channels.  A sinogram in the divided device form is refused.
+
+    Args:
+        ct_model (TomographyModel): a parallel or cone model.  Not modified.
+        sino (ndarray or tensor): the sinogram.  Not modified.
+        method (str, optional): ``'auto'`` or ``'conjugate'``.  Both select the conjugate-view
+            method.  For a scan the method cannot serve, use :func:`parameter_sweep` and choose the
+            value by eye.  Defaults to ``'auto'``.
+        bounds (tuple of float, optional): the search range in ALU.  None (the default) is a window
+            of four channels on each side of the model's current value.  That window moves to
+            center on the edge where the coarse minimum sits, at the same width, up to eight times.
+            A range given here is not moved.
+        num_coarse (int, optional): candidates in the coarse pass.  Defaults to 11.
+        reduction (dict, optional): a record from :func:`build_reduced_problem` whose view stride,
+            bin factor, and row window the comparison uses.  None (the default) keeps every view
+            at full resolution over a band of rows around the central plane.
+        det_rotation (float, optional): a detector rotation in radians applied to the views before
+            the comparison.  Defaults to 0.0.
+        num_rows (int, optional): the band height when ``reduction`` is None.
+
+    Returns:
+        CalibrationResult: ``parameter`` is ``'det_channel_offset'``, ``value`` is the estimate in
+        ALU, and ``method`` is ``'conjugate'``.  ``reduction`` records the rows and views compared,
+        the channels excluded at each edge, the rotation applied, the pairs kept, and the search
+        notes.
+
+    Raises:
+        ValueError: for a multiaxis model, a helical scan, views that do not cover a full
+            rotation, or a rotation on a curved detector.
+    """
+    if method not in ('auto', 'conjugate'):
+        raise ValueError(f"estimate_det_channel_offset supports method 'auto' or 'conjugate'; got "
+                         f"{method!r}.")
+    _require_conjugate_geometry(ct_model, 'det_channel_offset', det_rotation)
+    _sharding.reject_shards('estimate_det_channel_offset', sino=sino)
+    problem = _ConjugatePairs(ct_model, reduction, num_rows)
+    user_bounds = bounds
+    if bounds is None:
+        half_range = _CONJUGATE_OFFSET_HALF_RANGE_CHANNELS * problem.delta
+        bounds = (problem.model_offset - half_range, problem.model_offset + half_range)
+    margin = problem.channel_margin(max(abs(bounds[0]), abs(bounds[1])))
+    tolerance = _CONJUGATE_OFFSET_TOLERANCE_CHANNELS * problem.delta
+
+    def search(problem):
+        """One pass over the current bounds: choose the kept pairs at the best candidate of a
+        coarse grid scored on every pair, then search on that fixed set.  The bands are read per
+        pass, because the set of partner views depends on the pairing offset."""
+        views, opposites = problem.pairs(sino, det_rotation=det_rotation)
+        prepared = problem.prepare(views, opposites, margin)
+        every_pair = np.arange(problem.num_views)
+        coarse = np.linspace(bounds[0], bounds[1], max(3, int(num_coarse)))
+        coarse_best = coarse[int(np.argmin([problem.score(prepared, opposites, x, every_pair)
+                                            for x in coarse]))]
+        keep = problem.keep_set(prepared, opposites, float(coarse_best))
+        return _search_minimum(lambda offset: problem.score(prepared, opposites, offset, keep),
+                               bounds, num_coarse, tolerance) + (keep,)
+
+    # A coarse minimum at an edge of the window means the window is in the wrong place,
+    # so the window moves to center on that edge and the search repeats.
+    best, candidates, scores, notes, keep = search(problem)
+    slides = 0
+    while ('the coarse minimum sits at an edge of the bounds' in notes and user_bounds is None
+           and slides < _CONJUGATE_OFFSET_MAX_SLIDES):
+        half_width = 0.5 * (bounds[1] - bounds[0])
+        moved = (best - half_width, best + half_width)
+        moved_margin = problem.channel_margin(max(abs(moved[0]), abs(moved[1])))
+        if problem.num_channels - 2 * moved_margin < _CONJUGATE_MIN_REGION_FRACTION * problem.num_channels:
+            notes.append('the search window could not move further, because the channels excluded '
+                         'for the circular shift would leave less than a quarter of the detector')
+            break
+        bounds, margin = moved, moved_margin
+        best, candidates, scores, notes, keep = search(problem)
+        slides += 1
+
+    # Cone beam uses two passes.  The partner view of a channel depends on the offset, so the
+    # second pass pairs at the estimate from the first pass.
+    first_pass = best
+    if problem.kind == 'cone' and abs(best - problem.pairing_offset) > tolerance:
+        problem = _ConjugatePairs(ct_model, reduction, num_rows, pairing_offset=best)
+        best, candidates, scores, notes, keep = search(problem)
+    for note in notes:
+        warnings.warn(f'estimate_det_channel_offset: {note}.')
+    record = dict(problem.reduction, num_pairs=problem.num_views, pairs_kept=int(keep.size),
+                  channel_margin=margin, det_rotation=float(det_rotation),
+                  pairing_offset=problem.pairing_offset, first_pass=first_pass,
+                  bounds=(float(bounds[0]), float(bounds[1])), search_notes=notes)
+    return CalibrationResult(parameter='det_channel_offset', value=best,
+                             score=float(scores[np.searchsorted(candidates, best)]),
+                             candidates=candidates, scores=scores, method='conjugate',
+                             reduction=record)
+
+
+# The rotation search stops when its bracket is shorter than the first constant, in radians.
+# The second is an edge displacement in pixels, below which the function warns.
+_CONJUGATE_ROTATION_TOLERANCE = math.radians(0.005)
+_CONJUGATE_MIN_EDGE_DISPLACEMENT = 1.0
+
+
+def _rotated_band(sino, reduction, det_rotation):
+    """The band of rows named by ``reduction``, rotated by ``det_rotation`` about the full
+    detector's center with cubic interpolation.
+
+    The band is read from the sinogram with a margin of rows on each side, so the rotation samples
+    nothing outside the rows it has, and it is cropped afterward.  The cubic kernel is used because
+    the bilinear one smooths the data by an amount that grows with the angle, which biases a search
+    over the angle toward its bounds on cone-beam data.
+    """
+    import cv2
+    num_views, num_rows, num_channels = reduction['full_sinogram_shape']
+    row_lo, row_hi = reduction['row_window']
+    center_row = (num_rows - 1) / 2.0
+    margin = _rotation_row_margin(det_rotation, max(abs(row_lo - center_row), abs(row_hi - 1 - center_row)),
+                                  num_channels)
+    band_lo, band_hi = max(0, row_lo - margin), min(num_rows, row_hi + margin)
+    wide = dict(reduction, row_window=(band_lo, band_hi))
+    wide['sinogram_shape'] = (reduction['sinogram_shape'][0], (band_hi - band_lo) // reduction['bin_factor'],
+                              reduction['sinogram_shape'][2])
+    band = reduce_sinogram(sino, wide)
+    if det_rotation == 0.0:
+        return band[:, row_lo - band_lo:row_hi - band_lo, :]
+    bin_factor = reduction['bin_factor']
+    matrix = cv2.getRotationMatrix2D(((band.shape[2] - 1) / 2.0, (center_row - band_lo) / bin_factor),
+                                     math.degrees(det_rotation), 1.0)
+    out = np.empty((band.shape[0], (row_hi - row_lo) // bin_factor, band.shape[2]), dtype=np.float32)
+    for i in range(band.shape[0]):
+        rotated = cv2.warpAffine(band[i], matrix, (band.shape[2], band.shape[1]), flags=cv2.INTER_CUBIC,
+                                 borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        out[i] = rotated[(row_lo - band_lo) // bin_factor:(row_hi - band_lo) // bin_factor]
+    return out
+
+
+def estimate_det_rotation(ct_model, sino, *, method='auto', bounds=None, num_coarse=11,
+                          reduction=None, det_channel_offset=None, num_rows=None):
+    """Estimate the detector rotation, in radians, by comparing each view with its opposite.
+
+    A detector rotated about the optical axis records every view rotated by that angle, and
+    mirroring a view in channels reverses the sign of that rotation, so a view and its mirrored
+    opposite differ by twice the angle.  Each candidate angle is applied to a band of rows from
+    every kept view by cubic resampling about the detector center, the views are paired with their
+    opposites as in :func:`estimate_det_channel_offset`, and the candidate at which they agree best
+    is returned.  The comparison shifts the opposites by twice the channel offset, which is the
+    model's current value unless ``det_channel_offset`` is given, so estimate the offset first.
+
+    Resampling smooths the band, so an estimate that displaces the edge channels by less than about
+    one pixel is uncertain, and the function warns in that case.  On one real scan the estimate read
+    0.044 degrees where a sweep of far slices put the rotation near 0.15 degrees and the vendor's
+    recorded tilt was 0.167 degrees, so prefer a vendor tilt when the reader supplies one and check
+    the slices far from the central plane before applying an estimate.
+
+    Args:
+        ct_model (TomographyModel): a parallel or flat-detector cone model.  Not modified.
+        sino (ndarray or tensor): the sinogram.  Not modified.
+        method (str, optional): ``'auto'`` or ``'conjugate'``.  Both select the conjugate-view
+            method.  For a scan the method cannot serve, use :func:`parameter_sweep` and choose the
+            value by eye.  Defaults to ``'auto'``.
+        bounds (tuple of float, optional): the search range in radians, within five degrees of
+            zero.  None (the default) is the full five degrees on each side.
+        num_coarse (int, optional): candidates in the coarse pass.  Defaults to 11.
+        reduction (dict, optional): as in :func:`estimate_det_channel_offset`.
+        det_channel_offset (float, optional): the channel offset in ALU used in the comparison.
+            None (the default) is the model's current value.
+        num_rows (int, optional): the band height when ``reduction`` is None.
+
+    Returns:
+        CalibrationResult: ``parameter`` is ``'det_rotation'``, ``value`` is the angle in radians
+        that :func:`apply_calibration` should apply, and ``method`` is ``'conjugate'``.
+
+    Raises:
+        ValueError: for a multiaxis model, a helical scan, a curved detector, views that do not
+            cover a full rotation, or bounds beyond the five degree cap.
+    """
+    if method not in ('auto', 'conjugate'):
+        raise ValueError(f"estimate_det_rotation supports method 'auto' or 'conjugate'; got {method!r}.")
+    _require_conjugate_geometry(ct_model, 'det_rotation')
+    _sharding.reject_shards('estimate_det_rotation', sino=sino)
+    if bounds is None:
+        bounds = (-_MAX_DET_ROTATION, _MAX_DET_ROTATION)
+    _check_det_rotation(max(abs(bounds[0]), abs(bounds[1])))
+    problem = _ConjugatePairs(ct_model, reduction, num_rows, pairing_offset=det_channel_offset)
+    offset = problem.pairing_offset
+    margin = problem.channel_margin(offset)
+
+    def pairs_at(det_rotation):
+        partner = dict(problem.reduction, view_indices=problem.partner_indices)
+        return problem.pairs(sino, bands=(_rotated_band(sino, problem.reduction, float(det_rotation)),
+                                          _rotated_band(sino, partner, float(det_rotation))))
+
+    # The pairs kept by the trimmed mean are chosen with no rotation applied, and every candidate
+    # is scored on that set.
+    views, opposites = pairs_at(0.0)
+    prepared = problem.prepare(views, opposites, margin)
+    keep = problem.keep_set(prepared, opposites, offset)
+
+    def score_at(det_rotation):
+        views, opposites = pairs_at(det_rotation)
+        return problem.score(problem.prepare(views, opposites, margin), opposites, offset, keep)
+
+    best, candidates, scores, notes = _search_minimum(score_at, bounds, num_coarse,
+                                                      _CONJUGATE_ROTATION_TOLERANCE)
+    edge_displacement = abs(best) * problem.num_channels / 2.0
+    if edge_displacement < _CONJUGATE_MIN_EDGE_DISPLACEMENT:
+        notes.append(f'the estimate displaces the edge channels by {edge_displacement:.2f} pixels, '
+                     'below the one pixel at which it is reliable.  Prefer a vendor tilt when the '
+                     'reader supplies one, and check the slices far from the central plane before '
+                     'applying it')
+    for note in notes:
+        warnings.warn(f'estimate_det_rotation: {note}.')
+    record = dict(problem.reduction, num_pairs=problem.num_views, pairs_kept=int(keep.size),
+                  channel_margin=margin, det_channel_offset=offset, search_notes=notes)
+    return CalibrationResult(parameter='det_rotation', value=best,
+                             score=float(scores[np.searchsorted(candidates, best)]),
+                             candidates=candidates, scores=scores, method='conjugate',
+                             reduction=record)
+
+
+def conjugate_difference(ct_model, sino, *, det_channel_offset=None, det_rotation=0.0,
+                         reduction=None, num_rows=None):
+    """The difference between each view and its mirrored opposite, as an image stack for viewing.
+
+    The conjugate-view score is a normalized mean square of this image, so the stack shows what
+    that number summarizes.  A wrong channel offset shows as doubled edges displaced along the
+    channel axis, and a wrong rotation shows as edges displaced vertically, by an amount that grows
+    toward the edge channels.  At the true values the difference holds only noise and the residue
+    of the fan and cone angles.  The shift is circular, so the channels within a few samples of the
+    edges are not meaningful.
+
+    Args:
+        ct_model (TomographyModel): a parallel or cone model.  Not modified.
+        sino (ndarray or tensor): the sinogram.  Not modified.
+        det_channel_offset (float, optional): the offset in ALU to compare at.  None (the default)
+            is the model's current value.
+        det_rotation (float, optional): the rotation in radians applied before the comparison.
+            Defaults to 0.0.
+        reduction (dict, optional): as in :func:`estimate_det_channel_offset`.
+        num_rows (int, optional): the band height when ``reduction`` is None.
+
+    Returns:
+        ndarray: float32 of shape ``(num_kept_views, num_rows, num_channels)``.
+    """
+    _require_conjugate_geometry(ct_model, 'det_channel_offset', det_rotation)
+    _sharding.reject_shards('conjugate_difference', sino=sino)
+    problem = _ConjugatePairs(ct_model, reduction, num_rows, pairing_offset=det_channel_offset)
+    offset = problem.pairing_offset
+    views, opposites = problem.pairs(sino, det_rotation=det_rotation)
+    return views - _fourier_shift_channels(opposites, 2.0 * offset / problem.delta)

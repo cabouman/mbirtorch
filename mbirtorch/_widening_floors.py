@@ -368,6 +368,22 @@ COST_INPUT_METHODS = tuple(name.split('.', 1)[1] for name in _ALL_COST_INPUTS
 #: ``qggmrf.py``, ``translation_model.py``).  Every family was
 #: re-measured rather than carried, which is what makes recording all of
 #: these honest.
+#:
+#: Re-recorded 2026-08-24 for the multiaxis forward kernel's row-bound
+#: change (mg62, mg63 and mg64; multigpu_findings.md section 1.51 in the
+#: plans repository).  NOTHING WAS RE-MEASURED for this one, and the
+#: reason is that the change cannot move a cost at any cell the floors
+#: were measured at.  Two inputs moved.  ``triton_multiaxis.py`` now
+#: passes the padded detector row count as its forward kernel's row-mask
+#: bound; that is a no-op wherever the row count is already a multiple of
+#: 16, which both multiaxis floor cells are (448 rows at 88,080,384
+#: elements and 1,008 at 1,023,934,464), and it was measured as a no-op
+#: at the first of them, 307.0 ms before against 307.1 ms after.  Sizes
+#: whose row count is NOT a multiple of 16 did get faster, by about 3.2,
+#: so a crossover for such a size may have moved; the ladder has never
+#: included one, so no recorded floor describes it either way.
+#: ``_utils.py`` moved for a comment and a docstring, with no executable
+#: line changed.
 BLESSED_COST_HASHES = {
     'TomographyModel._sparse_back_project_sharded':
         'f73fa28f32d2393fac3f06139d8ddeccc55260fceb28bbca7f102334839fb5a4',
@@ -378,7 +394,7 @@ BLESSED_COST_HASHES = {
     '_sharding.py':
         'f7b9cd3b117a880f76415a9923dbdc2171766a922a3fea575934af88dd8fea8c',
     '_utils.py':
-        '7a4e6a2857be395423b04968f0a9cae2837224f6f6869c0a8f95223e13e9a5b9',
+        '33908e7e7bc48741456064e14cb044a163a3ed70f2c4f1c49e9cd38db4f387bb',
     'cone_beam.py':
         'db669d0eeea29b0b0ec06db2d016cad6ff841f02f309d565e48c98b98da6a903',
     'denoising.py':
@@ -396,7 +412,7 @@ BLESSED_COST_HASHES = {
     'triton_cone.py':
         'a4d8350b350cd34a358bb54c33ae3d408f5b1d0131044d0d88b462c5cbaf2dbc',
     'triton_multiaxis.py':
-        '415ac20bd887fefaffb04751c41d99fe6e8853df028e3baea6e0053821018932',
+        'be7ba7dd0291669ec12207a563886acd867edc0a431fca4eb8a0e790a3debbab',
     'triton_parallel.py':
         '79c4aaaa071c03567f505978a65ed9a183908d6c11342b59ac5668fb10ad0d55',
 }
@@ -414,8 +430,7 @@ STALE_SINCE = None
 #: These three move as one unit or not at all -- editing a hash by hand to
 #: green the test leaves this behind, and the test says so.  Recomputed and
 #: printed by ``refresh_widening_floors.py --bless``.
-TABLE_CHECKSUM = \
-    '464d4b66910b3994163ed993385da20e80805a63f3bc2eab94c19d27cf39b08e'
+TABLE_CHECKSUM = 'e564710cec9ba7d789f059de69d700ec0c6d74c8b5525d70c78a0e2a3fbaca32'
 
 
 # ── the env knob ─────────────────────────────────────────────────────────────

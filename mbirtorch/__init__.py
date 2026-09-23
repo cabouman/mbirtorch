@@ -6,25 +6,20 @@ arrays by default; pass ``output_sharded=True`` to get the device tensor
 instead.  All available GPUs are used automatically.
 """
 
-__version__ = "0.0.2"
+__version__ = "0.1.1"
 
-# ── persistent torch.compile cache ────────────────────────────────────────────
-# The inductor cache directory defaults to /tmp/torchinductor_<user>, which the
-# OS may clean; pin it to a stable per-user location so compiled artifacts
-# survive across processes and reboots.  The FX-graph cache is what makes a NEW
-# PROCESS reuse prior compilations; enable it explicitly for torch versions
-# where it is not the default.  setdefault keeps both overridable per-run via
-# the environment.  Both settings take effect only if mbirtorch is imported
-# before torch triggers its first compile, which any import-mbirtorch-first
-# program satisfies.  Dynamo TRACING still runs per process (the cache skips
-# inductor codegen, not tracing), so a cold process keeps a small residual
-# warmup.  ``mbirtorch.clear_cache()`` removes the whole ~/.mbirtorch directory
-# (see utilities.py).
+# The torch.compile caches are pinned under ~/.mbirtorch, so compiled code survives a process.
+# These settings take effect only if mbirtorch is imported before torch compiles anything.
 import os as _os
 
 _os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR",
                        _os.path.expanduser("~/.mbirtorch/torch_cache"))
 _os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
+# Triton caches its kernels separately from inductor, so that cache is pinned too.
+_os.environ.setdefault("TRITON_CACHE_DIR",
+                       _os.path.expanduser("~/.mbirtorch/triton_cache"))
+
+from typing import TYPE_CHECKING
 
 from .parallel_beam import ParallelBeamModel, recon_simple_parallel
 from .cone_beam import ConeBeamModel, recon_simple_cone
@@ -44,7 +39,7 @@ from .utilities import (generate_3d_shepp_logan_low_dynamic_range, clear_cache,
                         makedirs, load_data_hdf5, save_data_hdf5,
                         export_recon_hdf5, import_recon_hdf5,
                         build_model, download_and_extract,
-                        copy_ct_model, stitch_arrays,
+                        copy_ct_model, stitch_arrays, save_volume_as_gif,
                         get_ct_model, generate_demo_data,
                         generate_3d_shepp_logan_reference, gen_cube_phantom,
                         gen_translation_vectors, gen_translation_phantom,
@@ -52,13 +47,8 @@ from .utilities import (generate_3d_shepp_logan_low_dynamic_range, clear_cache,
                         merge_log_files)
 from .memory_stats import get_memory_stats
 
-# __all__ is the DECLARED public surface, and autodoc honors it: every name here is
-# documented by ``automodule:: mbirtorch :members:``.  It is deliberately narrower than
-# the import list above -- the VCD and qGGMRF helpers stay importable as attributes
-# (mbirtorch.gen_full_indices still works, and the tests use that spelling) but are not
-# promised as public API.  The same goes for gen_cube_phantom and
-# get_helical_half_rotation_slice_range: they are importable from the package, and the
-# tests call them there, but the docs do not carry them.
+# __all__ is the declared public surface, and autodoc documents exactly these names.
+# The other imported names remain importable, but they are not promised as public API.
 __all__ = [
     "ParallelBeamModel", "ConeBeamModel", "TranslationModel",
     "MultiAxisParallelModel", "TomographyModel", "QGGMRFDenoiser",
@@ -70,35 +60,25 @@ __all__ = [
     "import_recon_hdf5",
     "generate_3d_shepp_logan_low_dynamic_range", "clear_cache",
     "get_memory_stats", "SliceViewer", "VolumeStack", "slice_viewer",
-    "stitch_arrays", "get_ct_model", "copy_ct_model",
+    "GeometryScene", "GeometryFigure", "geometry_viewer",
+    "stitch_arrays", "get_ct_model", "copy_ct_model", "save_volume_as_gif",
+    "MACE4DModel", "temporal_filter_matrix", "apply_temporal_filter",
     "generate_demo_data", "generate_3d_shepp_logan_reference",
-    # Documented hsnt and vcls names; these resolve lazily through __getattr__.
+    # These hsnt and vcls names resolve lazily through __getattr__.
     "hyper_denoise", "dehydrate", "rehydrate", "estimate_rank", "l2_dehydrate", "l2_hyper_denoise", "import_hsnt_data_hdf5",
     "create_hsnt_metadata", "export_hsnt_data_hdf5", "generate_hyper_data",
     "get_opt_views", "show_image_with_projection_rays",
 ]
 
-# ── lazy exports (PEP 562) ───────────────────────────────────────────────────
-# The viewer names resolve on first attribute access so that a headless
-# `import mbirtorch` never imports matplotlib; most mbirtorch runs (batch
-# recons, tests) never open a viewer.  The preprocess, hsnt, and vcls
-# modules resolve the same way, so `import mbirtorch` never pays for their
-# dependency stacks (preprocess: osqp pulls scipy.sparse, plus cv2 and
-# tifffile; hsnt: scikit-learn and h5py, with matplotlib imported lazily inside
-# its plotting functions; vcls: the model layer and tqdm).  Both spellings keep
-# working -- `mbirtorch.hsnt` resolves here, and
-# `import mbirtorch.hsnt` is an ordinary submodule import -- and the
-# star-exported FUNCTION names (mbirtorch.dehydrate, mbirtorch.get_opt_views,
-# ...) resolve through _LAZY_NAMES, so the public surface is exactly what eager
-# star imports would give; only WHEN each module loads changes.
-_VIEWER_EXPORTS = ("SliceViewer", "VolumeStack", "slice_viewer")
+# Lazy exports (PEP 562) resolve on first attribute access, so importing mbirtorch does
+# not pull in matplotlib or the preprocess, hsnt and vcls dependencies.
+_VIEWER_EXPORTS = ("SliceViewer", "VolumeStack", "slice_viewer",
+                   "GeometryScene", "GeometryFigure", "geometry_viewer")
 
-_LAZY_MODULES = ("preprocess", "hsnt", "vcls")
+_LAZY_MODULES = ("preprocess", "hsnt", "vcls", "mace")
 
-# The names exposed at package level via `from .hsnt import *` and
-# `from .vcls import *`, mapped to their owning module. hsnt is a package with
-# an explicit __all__ (mbirtorch/hsnt/__init__.py); this table lists the subset
-# promoted to the top level, so a new top-level name gets a line here.
+# Each package level name is mapped to the module that defines it.  A new
+# public function in one of those modules needs a line here.
 _LAZY_NAMES = {
     'hyper_denoise': 'hsnt', 'dehydrate': 'hsnt', 'rehydrate': 'hsnt', 'estimate_rank': 'hsnt',
     'l2_dehydrate': 'hsnt', 'l2_hyper_denoise': 'hsnt',
@@ -109,9 +89,36 @@ _LAZY_NAMES = {
     'compute_cov_matrix': 'vcls', 'compute_vcl': 'vcls',
     'compute_opt_angle_subset': 'vcls', 'get_2d_subsampling_indices': 'vcls',
     'show_image_with_projection_rays': 'vcls', 'reorder_by_priority': 'vcls',
-    # The blue-noise pattern (a 382 KB array literal), loaded on first use.
+    # The blue noise pattern is a 382 KB array literal, loaded on first use.
     'bn256': 'bn256',
+    # The one call function mace() is reached as mbirtorch.mace.mace.  It is
+    # not exported at package level.
+    'MACE': 'mace', 'Task': 'mace', 'ForwardProxAgent': 'mace',
+    'QGGMRFDenoiserAgent': 'mace', 'HyperplaneAgent': 'mace',
+    'resolve_device_pool': 'mace',
+    'MACE4DModel': 'mace4d',
+    'temporal_filter_matrix': 'mace4d', 'apply_temporal_filter': 'mace4d',
 }
+
+# Editors and type checkers do not call __getattr__, so the lazy names are listed below as
+# imports that never execute.  tests/test_lazy_exports.py checks them against the tables above.
+if TYPE_CHECKING:
+    from . import preprocess, hsnt, vcls, mace
+    from .view_utils import (SliceViewer, VolumeStack, slice_viewer,
+                             GeometryScene, GeometryFigure, geometry_viewer)
+    from .mace import (MACE, Task, ForwardProxAgent, QGGMRFDenoiserAgent, HyperplaneAgent,
+                       resolve_device_pool)
+    from .mace4d import MACE4DModel, temporal_filter_matrix, apply_temporal_filter
+    from .hsnt import (hyper_denoise, dehydrate, rehydrate, estimate_rank,
+                       l2_dehydrate, l2_hyper_denoise,
+                       import_hsnt_data_hdf5, create_hsnt_metadata,
+                       export_hsnt_data_hdf5, generate_hyper_data)
+    from .vcls import (subsample_R_gamma, max_abs_neighbor_diff, get_opt_views,
+                       compute_view_basis_functions, compute_cov_matrix,
+                       compute_vcl, compute_opt_angle_subset,
+                       get_2d_subsampling_indices,
+                       show_image_with_projection_rays, reorder_by_priority)
+    from .bn256 import bn256
 
 
 def __getattr__(name):
@@ -119,7 +126,7 @@ def __getattr__(name):
     if name in _VIEWER_EXPORTS:
         from . import view_utils
         value = getattr(view_utils, name)
-        globals()[name] = value  # cache: later accesses skip this hook
+        globals()[name] = value  # Later accesses skip this hook.
         return value
     if name in _LAZY_MODULES:
         value = importlib.import_module('.' + name, __name__)

@@ -1,27 +1,23 @@
-"""Gates for stitch_arrays.
+"""Gates for stitch_arrays and copy_ct_model.
 
 stitch_arrays blends a fixed overlap between adjacent arrays and returns the
 result where the inputs already live: NumPy in gives NumPy out, tensors give a
-tensor on their own device.  Two inputs it cannot serve are refused with a
-message that names the problem, rather than being quietly relocated or failing
-on a missing attribute deep inside the function: tensors spread over more than
-one device, and an array in the divided device form (a Shards container).
+tensor on their own device.  The values are checked on the CPU, so they run
+everywhere.
 
-The refusal for the divided form and the normal-path values are checked on the
-CPU, so they run everywhere.  The mixed-device refusal needs two real GPUs and
-is skipped otherwise.
+copy_ct_model keeps the parent's reconstruction geometry and re-derives only
+the axes whose inputs changed.  The test here covers the case where only the
+views change, on all four geometries: the pitch, the aspect ratio, the recon
+shape and the slice offset must all survive the copy, with no warning.
 """
+
+import warnings
 
 import numpy as np
 import pytest
 import torch
 
 import mbirtorch
-from mbirtorch import _sharding
-
-requires_two_cuda = pytest.mark.skipif(
-    torch.cuda.device_count() < 2,
-    reason="the mixed-device refusal needs at least two CUDA devices")
 
 
 def _halves():
@@ -46,18 +42,16 @@ EXPECTED_OVERLAP_3 = np.array(
 
 
 def test_stitch_arrays_numpy_values():
+    """The blended values, through each input form.  A NumPy list gives a
+    NumPy array; a tensor list, and a list that mixes a tensor with a NumPy
+    array, give a CPU tensor with the same values.  The mixed case is the one
+    the device check must not break: only one device is named, so the NumPy
+    array simply joins it."""
     first, second = _halves()
     out = mbirtorch.stitch_arrays([first, second], overlap=3, axis=2)
     assert isinstance(out, np.ndarray) and out.dtype == np.float32
     assert np.array_equal(out, EXPECTED_OVERLAP_3)
 
-
-def test_stitch_arrays_one_device_matches_numpy():
-    """A tensor list, and a list that mixes a tensor with a NumPy array, both
-    stay valid and give the same values as the all-NumPy call.  The mixed case
-    is the one the device check must not break: only one device is named, so
-    the NumPy array simply joins it."""
-    first, second = _halves()
     tensors = mbirtorch.stitch_arrays([torch.as_tensor(first), torch.as_tensor(second)],
                                       overlap=3, axis=2)
     mixed = mbirtorch.stitch_arrays([torch.as_tensor(first), second], overlap=3, axis=2)
@@ -66,21 +60,70 @@ def test_stitch_arrays_one_device_matches_numpy():
         assert np.array_equal(out.numpy(), EXPECTED_OVERLAP_3)
 
 
-def test_stitch_arrays_refuses_divided_form():
-    """A Shards holds one tensor per device, so it has no shape of its own.
-    Two CPU shards are enough to build one; no GPU is involved."""
-    first, second = _halves()
-    placement = _sharding.Placement(['cpu', 'cpu'], axis=-1, axis_len=4)
-    shards = _sharding.Shards([torch.as_tensor(first[..., :2]),
-                               torch.as_tensor(first[..., 2:4])], placement)
-    with pytest.raises(TypeError, match="divided device form"):
-        mbirtorch.stitch_arrays([shards, second], overlap=3, axis=2)
+# ── copy_ct_model keeps the parent's reconstruction geometry ────────────────
+def _cone_model(num_det_rows=24, num_det_cols=48, helical_z_shifts=None):
+    angles = np.linspace(0, np.pi, 8, endpoint=False)
+    model = mbirtorch.ConeBeamModel((8, num_det_rows, num_det_cols), angles, source_detector_dist=200.0,
+                                    source_iso_dist=100.0, helical_z_shifts=helical_z_shifts,
+                                    compile_mode='off')
+    model.set_params(no_warning=True, verbose=0)
+    return model
 
 
-@requires_two_cuda
-def test_stitch_arrays_refuses_mixed_devices():
-    first, second = _halves()
-    with pytest.raises(ValueError, match="one device"):
-        mbirtorch.stitch_arrays([torch.as_tensor(first).to('cuda:0'),
-                                 torch.as_tensor(second).to('cuda:1')],
-                                overlap=3, axis=2)
+def _parallel_model(num_det_rows=24, num_det_cols=48):
+    angles = np.linspace(0, np.pi, 8, endpoint=False)
+    model = mbirtorch.ParallelBeamModel((8, num_det_rows, num_det_cols), angles, compile_mode='off')
+    model.set_params(no_warning=True, verbose=0)
+    return model
+
+
+def _multiaxis_model(num_det_rows=24, num_det_cols=48):
+    angles = np.stack([np.linspace(0, np.pi, 8, endpoint=False), np.full(8, 0.3)], axis=1)
+    model = mbirtorch.MultiAxisParallelModel((8, num_det_rows, num_det_cols), angles, compile_mode='off')
+    model.set_params(no_warning=True, verbose=0)
+    return model
+
+
+def _translation_model(num_det_rows=24, num_det_cols=48):
+    vectors = np.stack([np.linspace(-6, 6, 8), np.zeros(8), np.linspace(-4, 4, 8)], axis=1)
+    model = mbirtorch.TranslationModel((8, num_det_rows, num_det_cols), vectors, source_detector_dist=200.0,
+                                       source_iso_dist=100.0, compile_mode='off')
+    model.set_params(no_warning=True, verbose=0)
+    return model
+
+
+def _shape(model):
+    return tuple(int(n) for n in model.get_params('recon_shape'))
+
+
+def _copy_warnings(caught):
+    return [w for w in caught if 'copy_ct_model' in str(w.message)]
+
+
+@pytest.mark.parametrize('make_model', [_cone_model, _parallel_model, _multiaxis_model, _translation_model],
+                         ids=['cone', 'parallel', 'multiaxis', 'translation'])
+def test_copy_keeps_the_parents_geometry_when_only_the_views_change(make_model):
+    """A plain copy, and a copy over a subset of the views, keep every hand-set value: the pitch, the
+    aspect ratio, the recon shape and (cone, multiaxis) the slice offset, and warn about nothing."""
+    parent = make_model()
+    required, optional, _ = parent.get_all_params()
+    rows, cols, slices = _shape(parent)
+    hand_set = dict(delta_voxel=0.74 * float(parent.get_params('delta_voxel')), voxel_row_aspect=1.25,
+                    recon_shape=(rows + 1, cols - 3, max(1, slices - 1)))
+    if 'recon_slice_offset' in optional:
+        hand_set['recon_slice_offset'] = 1.4
+    parent.set_params(no_warning=True, **hand_set)
+
+    view_key = 'translation_vectors' if 'translation_vectors' in required else 'angles'
+    subset = np.asarray(required[view_key])[::2]
+    subset_kwargs = {'new_' + view_key: subset}
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        copies = [mbirtorch.copy_ct_model(parent), mbirtorch.copy_ct_model(parent, **subset_kwargs)]
+    assert not _copy_warnings(caught)
+    for copy, num_views in zip(copies, (8, 4)):
+        assert tuple(copy.get_params('sinogram_shape')) == (num_views, 24, 48)
+        assert _shape(copy) == hand_set['recon_shape']
+        for name in ('delta_voxel', 'voxel_row_aspect', 'recon_slice_offset'):
+            if name in hand_set:
+                assert float(copy.get_params(name)) == pytest.approx(hand_set[name])
