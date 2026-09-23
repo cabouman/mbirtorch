@@ -49,13 +49,33 @@ def unconstrained_spectra(T, W, H, max_steps=100, cg_max=10, rel_tol=1e-8, w_max
     return Wc, Hu, steps
 
 
-def _fit_free_sets(T, H, idx, valid, w0, steps=8, nonneg=True):
+_FREE_SET_ELEMS = 2 ** 27       # elements of one (pixels, m, bins) block per chunk: 0.5 GB in float32, some eight of them live
+
+
+def _fit_free_sets(T, H, idx, valid, w0, steps=8, nonneg=True, rows=None):
     """Newton fit of every pixel on its own small set of materials, batched over pixels; w >= 0 unless nonneg=False.
 
     idx (P, m) holds material indices (anything where valid is False is padding), w0 (P, m) the start. The per-pixel
     Hessian is the m x m block of the free set, so one Newton step costs a (P, m, K) gather-product whatever R is;
     entries at zero with an outward gradient are frozen (two-metric projection) and the step is the largest feasible
-    one, checked by a per-pixel Armijo test on the float64 row loss. Returns (w, f) with f the per-pixel loss."""
+    one, checked by a per-pixel Armijo test on the float64 row loss. Pixels are processed in chunks sized by
+    _FREE_SET_ELEMS (they are independent), and `rows` names the pixels of T to fit when T is the whole data, so
+    that only a chunk of rows is ever gathered. Returns (w, f) with f the per-pixel loss."""
+    P, m = idx.shape
+    chunk = max(1, _FREE_SET_ELEMS // (m * H.shape[1]))
+    if P <= chunk and rows is None:
+        return _fit_free_sets_block(T, H, idx, valid, w0, steps, nonneg)
+    ws, fs = [], []
+    for s in range(0, P, chunk):
+        e = min(P, s + chunk)
+        Tc = T[s:e] if rows is None else T[rows[s:e]]
+        w, f = _fit_free_sets_block(Tc, H, idx[s:e], valid[s:e], w0[s:e], steps, nonneg)
+        ws.append(w); fs.append(f)
+        del Tc
+    return torch.cat(ws), torch.cat(fs)
+
+
+def _fit_free_sets_block(T, H, idx, valid, w0, steps, nonneg):
     P, m = idx.shape
     dev = T.device
     prep = _nnal_prep(T)
@@ -108,6 +128,17 @@ def _scatter_support(idx, valid, w, R):
     return support, W
 
 
+def _empty_fit_loss(T, prep, chunk=131072):
+    """Per-pixel loss of the empty subset, f_p(0), computed in pixel chunks (a zero X the size of T is never built whole)."""
+    log_T, positive, all_positive, cutoff = prep
+    out = []
+    for s in range(0, T.shape[0], chunk):
+        Tc = T[s:s + chunk]
+        out.append(_nnal_rowwise(torch.zeros_like(Tc), Tc, (log_T[s:s + chunk], positive[s:s + chunk], all_positive, cutoff), 1,
+                                 dtype=torch.float64))
+    return torch.cat(out)
+
+
 def _support_sets(support, W):
     """Padded per-pixel index sets (idx, valid, w0) of a (P, R) bool support, for _fit_free_sets."""
     valid, idx = torch.sort(support, dim=1, descending=True, stable=True)
@@ -136,7 +167,7 @@ def _guard_components(support, W_mle, W0, min_support=None):
     return weak
 
 
-def _select_branch_bound(T, H, dose, lam, f_full, k_top=6, m_max=4, plausible=None):
+def _select_branch_bound(T, H, dose, lam, f_full, k_top=6, m_max=4, plausible=None, prep=None):
     """Per-pixel subset search: exact single-material fits for every material (R batched one-dimensional solves,
     restricted to `plausible` pixels when given), then pairs and triples among each pixel's k_top best singletons for
     the pixels the lower bound leaves open. The pixel loss is monotone in the subset, so the full-model loss f_full
@@ -144,15 +175,15 @@ def _select_branch_bound(T, H, dose, lam, f_full, k_top=6, m_max=4, plausible=No
     dose * (f_best - f_full) > lam * (size - |best|). Returns (idx, valid, w, f) as padded per-pixel sets."""
     P, K = T.shape; R = H.shape[0]; dev = T.device
     k_top = min(k_top, R); m_max = min(m_max, R)
-    prep = _nnal_prep(T)
-    f0 = _nnal_rowwise(torch.zeros_like(T), T, prep, 1, dtype=torch.float64)
+    prep = _nnal_prep(T) if prep is None else prep
+    f0 = _empty_fit_loss(T, prep)
     F1 = torch.full((P, R), float('inf'), device=dev, dtype=torch.float64); W1 = torch.zeros(P, R, device=dev, dtype=T.dtype)
     for r in range(R):
         rows = torch.arange(P, device=dev) if plausible is None else plausible[:, r].nonzero().squeeze(1)
         if rows.numel() == 0:
             continue
         idx1 = torch.full((rows.numel(), 1), r, dtype=torch.long, device=dev); valid1 = torch.ones_like(idx1, dtype=torch.bool)
-        w1, f1 = _fit_free_sets(T[rows], H, idx1, valid1, torch.full((rows.numel(), 1), 0.5, device=dev, dtype=T.dtype))
+        w1, f1 = _fit_free_sets(T, H, idx1, valid1, torch.full((rows.numel(), 1), 0.5, device=dev, dtype=T.dtype), rows=rows)
         F1[rows, r] = f1; W1[rows, r] = w1[:, 0]
     best_f1, r1 = F1.min(1)
     one = best_f1 * dose + lam < f0 * dose                                                  # best singleton beats the empty set
@@ -174,7 +205,7 @@ def _select_branch_bound(T, H, dose, lam, f_full, k_top=6, m_max=4, plausible=No
                 continue
             cq = cp[ok]; idx_c = idx_c[ok]
             valid_c = torch.ones(cq.numel(), size, dtype=torch.bool, device=dev)
-            w_c, f_c = _fit_free_sets(T[cq], H, idx_c, valid_c, (W1[cq[:, None], idx_c] / size).clamp(min=1e-3))
+            w_c, f_c = _fit_free_sets(T, H, idx_c, valid_c, (W1[cq[:, None], idx_c] / size).clamp(min=1e-3), rows=cq)
             better = f_c * dose + lam * size < best_f[cq] * dose + lam * best_valid[cq].sum(1).double()
             bp = cq[better]
             best_idx[bp] = -1; best_valid[bp] = False; best_w[bp] = 0
@@ -182,7 +213,7 @@ def _select_branch_bound(T, H, dose, lam, f_full, k_top=6, m_max=4, plausible=No
     return best_idx, best_valid, best_w, best_f
 
 
-def _select_greedy(T, H, dose, lam, m_max=4, screen=0.2, n_cand=2):
+def _select_greedy(T, H, dose, lam, m_max=4, screen=0.2, n_cand=2, prep=None):
     """Forward selection: each active pixel takes the material with the largest estimated gain (the one-material
     Newton estimate g^2 / 2M from one gradient pass), the n_cand best estimates are fitted exactly on the enlarged
     set, the exact gain must exceed lam, and one backward pass drops members whose removal costs less than lam.
@@ -190,9 +221,9 @@ def _select_greedy(T, H, dose, lam, m_max=4, screen=0.2, n_cand=2):
     exact search on the phantoms). Returns (idx, valid, w, f)."""
     P, K = T.shape; R = H.shape[0]; dev = T.device
     m_max = min(m_max, R)
-    prep = _nnal_prep(T)
+    prep = _nnal_prep(T) if prep is None else prep
     idx = torch.full((P, m_max), -1, dtype=torch.long, device=dev); valid = torch.zeros(P, m_max, dtype=torch.bool, device=dev)
-    w = torch.zeros(P, m_max, device=dev, dtype=T.dtype); f = _nnal_rowwise(torch.zeros_like(T), T, prep, 1, dtype=torch.float64)
+    w = torch.zeros(P, m_max, device=dev, dtype=T.dtype); f = _empty_fit_loss(T, prep)
     H2 = H * H
     for step in range(m_max):
         X = torch.einsum('pm,pmk->pk', w, H[idx.clamp(min=0)] * valid[:, :, None]) if step else torch.zeros_like(T)
@@ -212,7 +243,7 @@ def _select_greedy(T, H, dose, lam, m_max=4, screen=0.2, n_cand=2):
                 break
             idx_c, valid_c, w_c = idx[ap].clone(), valid[ap].clone(), w[ap].clone()
             idx_c[:, step] = cands[ap, c]; valid_c[:, step] = True; w_c[:, step] = (-g[ap, cands[ap, c]] / Md[ap, cands[ap, c]]).clamp(min=0)
-            w_new, f_new = _fit_free_sets(T[ap], H, idx_c, valid_c, w_c)
+            w_new, f_new = _fit_free_sets(T, H, idx_c, valid_c, w_c, rows=ap)
             better = ok & ((f[ap] - f_new) * dose > lam) & (f_new < best_f)
             best_f = torch.where(better, f_new, best_f); best_w[better] = w_new[better]; best_idx[better] = idx_c[better]; best_valid[better] = valid_c[better]
             improved |= better
@@ -222,7 +253,7 @@ def _select_greedy(T, H, dose, lam, m_max=4, screen=0.2, n_cand=2):
         if not bool(cand.any()):
             continue
         cp = cand.nonzero().squeeze(1); valid_c = valid[cp].clone(); valid_c[:, slot] = False
-        w_c, f_c = _fit_free_sets(T[cp], H, idx[cp], valid_c, w[cp])
+        w_c, f_c = _fit_free_sets(T, H, idx[cp], valid_c, w[cp], rows=cp)
         drop = (f_c - f[cp]) * dose < lam; dp = cp[drop]
         valid[dp] = valid_c[drop]; w[dp] = w_c[drop]; f[dp] = f_c[drop]
     return idx, valid, w, f
@@ -277,10 +308,10 @@ def select_supports(T, W, H, dose, penalty=None, method="branch_bound", k_top=6,
     lam = 2.0 * math.log(K) if penalty is None else float(penalty)
     if method == "enumerate":
         return _select_enumerate(T, H, W, dose, lam, w_max_steps, compile_mode)
+    prep = _nnal_prep(T)
     if method == "greedy":
-        idx, valid, w, f = _select_greedy(T, H, dose, lam, m_max=max(m_max, 1))
+        idx, valid, w, f = _select_greedy(T, H, dose, lam, m_max=max(m_max, 1), prep=prep)
     elif method == "branch_bound":
-        prep = _nnal_prep(T)
         X = W @ H
         f_full = _nnal_rowwise(X, T, prep, 1, dtype=torch.float64)
         plausible = None
@@ -288,7 +319,7 @@ def select_supports(T, W, H, dose, penalty=None, method="branch_bound", k_top=6,
             _, Z = stable_nnal_derivatives(X, T, prep)
             wald = 0.5 * dose * (W.double() ** 2) * (Z @ (H * H).T).double()
             plausible = wald > wald_screen * lam
-        idx, valid, w, f = _select_branch_bound(T, H, dose, lam, f_full, k_top=k_top, m_max=m_max, plausible=plausible)
+        idx, valid, w, f = _select_branch_bound(T, H, dose, lam, f_full, k_top=k_top, m_max=m_max, plausible=plausible, prep=prep)
     else:
         raise ValueError(f"method must be 'branch_bound', 'greedy' or 'enumerate', got {method!r}")
     support, W0 = _scatter_support(idx, valid, w, R)
