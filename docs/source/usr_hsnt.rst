@@ -95,8 +95,9 @@ materials among each pixel's six best singletons for the pixels a likelihood low
 is allowed; ``--support-method greedy`` is a faster heuristic and ``enumerate`` the 2^R - 1 reference for rank 8 or
 less; ``--wald-screen`` skips single-material fits far below the penalty in the full fit at the price of
 rare-material recall. ``--support-penalty F`` sets the charge per selected material to F log(bins) nats (default 2,
-which admits essentially no absent material; 0.5 to 1 keeps a faint material in more of its pixels at low dose, at
-the cost of some map fidelity at high dose), and ``--free-refit`` drops the bound on the selected coefficients
+which admits essentially no absent material; 0.5 to 1 keeps a faint material in more of its pixels below about ten
+counts per pixel and bin, at the cost of map noise above about a hundred; ``auto`` moves from 0.5 to 2 with the
+counts of the median pixel), and ``--free-refit`` drops the bound on the selected coefficients
 during the refit (the unconstrained estimator restricted to the supports), which makes a smaller penalty harmless
 for the spectra. A component selected in almost no pixel reverts to the maximum-likelihood treatment, with a
 warning. ``--dry-run`` loads,
