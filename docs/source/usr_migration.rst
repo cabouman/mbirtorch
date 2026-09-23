@@ -117,6 +117,14 @@ Each row below is a change to make in code that calls MBIRJAX.
        The same two arguments are added to ``ConeBeamModel``,
        ``MultiAxisParallelModel``, ``TranslationModel`` and
        ``TomographyModel``.
+   * - ``hsnt.dehydrate(data, num_materials, safety_factor=2)``
+     - ``hsnt.l2_dehydrate(data, num_materials, safety_factor=2)``
+     - Renamed; same arguments and results.  ``hsnt.dehydrate`` now fits
+       the Poisson likelihood of the counts and takes different arguments,
+       described in :ref:`HSNTDocs`.
+   * - ``hsnt.hyper_denoise(data, num_materials, safety_factor=2)``
+     - ``hsnt.l2_hyper_denoise(data, num_materials, safety_factor=2)``
+     - Renamed, as for ``dehydrate``.
 
 These names exist in MBIRJAX and have no counterpart in MBIRTorch:
 ``get_platform``, ``get_device_platform``, ``memory_report``,
