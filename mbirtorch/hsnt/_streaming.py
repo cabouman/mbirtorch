@@ -228,7 +228,7 @@ def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warm
             S_chunks[i] = support.cpu(); W_chunks[i] = W0.cpu(); counts = counts + support.sum(0); P_total += Tc.shape[0]
             del Tc, Wc, support, W0
         if min_support is None:
-            min_support = max(2 * R, P_total // 10000)
+            min_support = max(2 * R, P_total // 1000)
         weak = counts < min_support
         if bool(weak.any()):
             import logging

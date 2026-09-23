@@ -153,12 +153,13 @@ def _solve_W_on_support(T, H, W, support, steps=30, nonneg=True):
 
 
 def _guard_components(support, W_mle, W0, min_support=None):
-    """Components selected in fewer than min_support pixels (default max(2R, P / 10^4)) revert to the MLE's treatment:
+    """Components selected in fewer than min_support pixels (default max(2R, P / 1000)) revert to the MLE's treatment:
     every pixel free for them, W >= 0 alone deciding their zeros. A component the data cannot place is otherwise
-    refit from a handful of pixels, and its spectrum and the gauge of the others with it. Returns the weak mask."""
+    refit from a few hundred pixels, and its spectrum and the gauge of the others with it (at 10^6 pixels a
+    component kept in 0.03 % of them made the refit maps of the other two unusable). Returns the weak mask."""
     P, R = support.shape
     if min_support is None:
-        min_support = max(2 * R, P // 10000)
+        min_support = max(2 * R, P // 1000)
     weak = support.sum(0) < min_support
     if bool(weak.any()):
         log.warning("support selection: component(s) %s selected in fewer than %d pixels; kept free in every pixel",
@@ -368,7 +369,7 @@ def support_selected_spectra(T, W, H, dose, penalty=None, max_steps=300, cg_max=
             kept and the estimator approaches unconstrained_spectra; with the default
             penalty and free_refit=False it is the constrained estimator above.
         min_support: components selected in fewer pixels than this revert to the MLE's
-            treatment (free in every pixel, W >= 0 deciding); default max(2R, P / 10^4).
+            treatment (free in every pixel, W >= 0 deciding); default max(2R, P / 1000).
 
     Returns (W, H, support, steps) with support a bool mask of W's shape (all True in a
     column that reverted).
