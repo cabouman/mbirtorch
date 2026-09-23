@@ -1,0 +1,53 @@
+[workspace]
+name = "mbirtorch"
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-arm64"]
+
+# The torch wheels need macOS 14 on Apple silicon and glibc 2.28 (RHEL 8 or newer) on
+# Linux; pixi assumes older minimums unless told otherwise.
+[system-requirements]
+macos = "14.0"
+libc = { family = "glibc", version = "2.28" }
+
+[dependencies]
+python = ">=3.11,<3.13"
+
+[pypi-dependencies]
+# pyproject.toml stays the single list of dependencies.  pixi reads it through this
+# editable install and the lock file pins what it resolved.
+mbirtorch = { path = ".", editable = true, extras = ["test", "docs"] }
+
+# The default environment takes torch from PyTorch's CPU wheel index, so a CPU machine
+# does not download the CUDA runtime.  The cuda environment takes the CUDA 13 wheels.
+[feature.cpu.pypi-dependencies]
+torch = { version = ">=2.13", index = "https://download.pytorch.org/whl/cpu" }
+
+# The cuda environment is for Linux machines with an NVIDIA driver for CUDA 13.  The feature
+# stays defined on every platform, because pixi builds the editable package's metadata with
+# an interpreter of the machine that writes the lock file; only the torch override is
+# specific to linux-64.
+[feature.cuda]
+system-requirements = { cuda = "13" }
+
+[feature.cuda.target.linux-64.pypi-dependencies]
+torch = { version = ">=2.13", index = "https://download.pytorch.org/whl/cu130" }
+
+# The cuda12 environment is the same for a Linux machine whose NVIDIA driver supports
+# CUDA 12 but not 13.  PyTorch publishes torch 2.14 CUDA 12 wheels on the cu126 index only.
+[feature.cuda12]
+system-requirements = { cuda = "12" }
+
+[feature.cuda12.target.linux-64.pypi-dependencies]
+torch = { version = ">=2.13", index = "https://download.pytorch.org/whl/cu126" }
+
+[environments]
+default = ["cpu"]
+cuda = ["cuda"]
+cuda12 = ["cuda12"]
+
+[tasks]
+smoke = "python -c \"import mbirtorch; print(mbirtorch.__file__)\""
+smoke-torch = "python -c \"import torch; print(torch.__version__, 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu')\""
+test = "pytest tests"
+test-fast = "pytest tests -q -p no:cacheprovider -m 'not performance'"
+docs = "sphinx-build -b html docs/source docs/build/html"
