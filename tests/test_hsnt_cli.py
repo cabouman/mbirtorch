@@ -124,6 +124,17 @@ def test_dehydrate_stream_mode_from_tiffs(stacks, tmp_path):
     assert rep["result"]["mode"] == "stream" and rep["result"]["passes"] >= 1 and rep["dose"] > 0
 
 
+@cuda
+def test_dehydrate_stream_mode_with_support_selection(stacks, tmp_path):
+    out = str(tmp_path / "stream_support")
+    assert main(["dehydrate", stacks["sample"], "--open-beam", stacks["open_beam"], "--rank", str(R), "-o", out, "--mode", "stream",
+                 "--chunk-pixels", "40", "--warmup-pixels", "60", "--max-passes", "2", "--spectra", "support", "--support-penalty", "1",
+                 "--free-refit", "--no-plots", "-q"]) == 0
+    rep = json.load(open(os.path.join(out, "sample_report.json")))
+    assert rep["result"]["mode"] == "stream" and 0 < rep["result"]["mean_support_size"] <= R and rep["result"]["support_refit_passes"] >= 0
+    assert rep["result"]["loss_final"] >= rep["result"]["loss_mle"] * (1 - 1e-6)     # the constrained refit cannot beat the MLE's fit
+
+
 def test_rank_is_estimated_by_default(stacks):
     ds = load_hdf5(stacks["h5"])
     n, note, detail = estimate_rank(ds, "cpu", max_rank=4, pool=0)
