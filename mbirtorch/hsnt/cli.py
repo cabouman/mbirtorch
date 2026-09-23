@@ -622,8 +622,10 @@ def solve(ds: Dataset, args, device):
         rep["mean_support_size"] = support.sum(1).double().mean().item()
         log.info("support selection: mean %.2f materials per pixel, refit %d steps in %.1f s, loss %.6g",
                  rep["mean_support_size"], st, rep["support_seconds"], loss(W, H))
-    elif args.spectra != "mle" and mode == "stream":
-        log.info("stream mode: %s spectra handled inside the polish passes (nonneg_W=%s)", args.spectra, args.spectra != "unconstrained")
+    elif args.spectra == "unconstrained" and mode == "stream":
+        log.info("stream mode: the unconstrained spectra were estimated inside the polish passes (nonneg_W=False)")
+    elif args.spectra == "support" and mode == "stream":
+        log.warning("support selection is not available in stream mode; the maximum-likelihood spectra are kept")
     rep["loss_final"] = loss(W, H)
     rep["W_zero_frac"], rep["H_zero_frac"] = (W == 0).double().mean().item(), (H == 0).double().mean().item()
     if device.startswith("cuda"):

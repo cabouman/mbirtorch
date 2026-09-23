@@ -88,9 +88,10 @@ of them and as attenuation or transmission (``--as-type``), block by block so th
 ``denoise`` does both in one run and writes ``<stem>_denoised.h5`` plus the dehydrated file unless
 ``--no-dehydrated``. The solve runs whole on the device
 when it fits and is streamed by chunks otherwise (``--mode``); ``--spectra unconstrained`` and ``--spectra support``
-select the bias-corrected spectra estimators; support selection searches each pixel's material subset by branch and
-bound (exact single-material fits, then pairs and triples among the best singletons for the pixels a likelihood
-lower bound leaves open), so any rank is allowed; ``--support-method greedy`` is a faster heuristic and
+select the bias-corrected spectra estimators (in stream mode only ``unconstrained`` is available: it runs inside the
+polish passes, whereas support selection needs the whole solve on the device); support selection searches each pixel's material subset by branch and
+bound (exact single-material fits, then subsets of up to four materials among each pixel's six best singletons for
+the pixels a likelihood lower bound leaves open), so any rank is allowed; ``--support-method greedy`` is a faster heuristic and
 ``enumerate`` the 2^R - 1 reference for rank 8 or less; ``--wald-screen`` skips single-material fits far below the
 penalty in the full fit at the price of rare-material recall. ``--dry-run`` loads,
 checks and plans without solving.
