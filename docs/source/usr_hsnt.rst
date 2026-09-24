@@ -10,7 +10,8 @@ X = W H: a nonnegative spectrum per component in H and a map per component in W.
 materials' spectra but need not be the materials themselves.  The module estimates W and H from the counts
 (dehydration), multiplies them back into denoised data (rehydration), estimates the number of components, and
 reads and writes the hsnt HDF5 layout.  See ``demo_13_hsnt.py`` for a worked example, and `Command line`_ for
-running the same steps on files.
+running the same steps on files.  The solvers accumulate in float64, so they run on CUDA or the CPU; on a Mac the
+automatic device choice uses the CPU rather than MPS.
 
 .. currentmodule:: mbirtorch.hsnt
 

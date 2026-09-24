@@ -90,7 +90,8 @@ def test_compiled_matches_eager():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_compiled_and_eager_block_steps_take_the_same_zero_decisions():
-    """Fused rounding in the compiled step once left ulp-sized residues where the eager step lands on zero."""
+    """Fused rounding in the compiled step can leave ulp-sized residues where the eager step lands on zero; the snap
+    to zero makes both steps take the same zero decisions."""
     from mbirtorch.kernel_availability import triton_available
     usable, reason = triton_available()
     if not usable:

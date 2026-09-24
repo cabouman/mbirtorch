@@ -60,7 +60,7 @@ def _fit(T, rank, spectra="mle", dose=None, penalty="auto", free_refit=False, wa
     """Fit T (host numpy, pixels x bins, float32) at the given rank. Returns (W, H, report): numpy factors and a dict
     of what was done (mode, steps or passes, seconds, losses, support size).
 
-    spectra: 'mle', 'unconstrained' or 'support' (needs the dose). penalty: support selection's charge per material,
+    spectra: 'mle', 'unconstrained' or 'support' (needs the dose). penalty: support selection's charge per component,
     'auto' or a multiple of log K. compile_mode applies to the full solve; a streamed solve compiles only with 'on'.
     """
     from ._streaming import _stream_factorization

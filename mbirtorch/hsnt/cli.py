@@ -6,7 +6,9 @@
     rehydrate  multiply a dehydrated file back into hyperspectral data (all bins or a range of them)
     denoise    dehydrate and rehydrate in one run: write the denoised hyperspectral data (and the dehydrated file)
 
-The rank (number of materials) is estimated by likelihood-ratio tests unless --rank gives it.
+The rank (the number of components, about the number of distinct materials) is estimated by likelihood-ratio tests
+unless --rank gives it. The components are a nonnegative basis of the data: a map and a spectrum each, which need not be
+the pure materials.
 
 Inputs are either an HDF5 file in the package layout (``data`` with the spectral axis last, ``dataset_type``,
 optionally inside a group) or a directory of one TIFF image per wavelength bin. A TIFF stack of counts needs an
@@ -278,7 +280,7 @@ def _pipeline(args, denoise):
     _resolve_rank(ds, args, device)
     stem = os.path.splitext(os.path.basename(os.path.normpath(args.input)))[0]
     base = os.path.splitext(_output_path(args.output, stem + ".h5"))[0]
-    names = ((["_dehydrated.h5"] if not (denoise and args.no_dehydrated) else []) + (["_denoised.h5"] if denoise else [])
+    names = (([] if denoise and args.no_dehydrated else ["_dehydrated.h5"]) + (["_denoised.h5"] if denoise else [])
              + ["_report.json"] + ([] if args.no_plots else ["_spectra.png", "_maps.png"]))
     _check_outputs([base + n for n in names], [args.input, *(args.open_beam or [])], args.overwrite)
     if args.dry_run:
@@ -372,7 +374,7 @@ _EXAMPLES = """Examples:
   mbirtorch-hsnt inspect data.h5
   mbirtorch-hsnt inspect sample_tifs/ --open-beam open_beam/ --estimate-rank
   mbirtorch-hsnt convert sample_tifs/ --open-beam open_beam/ --wave-bin 4 -o sample.h5
-  mbirtorch-hsnt dehydrate sample.h5 -o results/                    # number of materials estimated
+  mbirtorch-hsnt dehydrate sample.h5 -o results/                    # number of components estimated
   mbirtorch-hsnt dehydrate sample_tifs/ --open-beam open_beam/ --rank 2 --downsample 2 --wave-bin 4 -v
   mbirtorch-hsnt rehydrate results/sample_dehydrated.h5 --wave-range 100:200 -o results/
   mbirtorch-hsnt denoise sample.h5 -o results/                      # denoised data + dehydrated file
@@ -382,8 +384,8 @@ Each subcommand's -h lists the options most runs need; --help-all lists every op
 
 _SPECTRA_HELP = ("how the material spectra are estimated. mle (default): the spectra that best fit the measured "
                  "counts. unconstrained: removes a bias the best fit has at low dose; worth it from about 100,000 "
-                 "pixels up. support: works out which materials each pixel contains, which removes the same bias "
-                 "and gives cleaner material maps; needs the dose (an open beam or --dose)")
+                 "pixels up. support: works out which components each pixel contains, which removes the same bias "
+                 "and gives cleaner maps; needs the dose (an open beam or --dose)")
 
 
 class _Options:
@@ -433,7 +435,7 @@ class _Options:
     def rank_test(self, sp):
         g = sp.add_argument_group("advanced: rank test")
         self.add(g, "--max-rank", type=_positive_int, default=6, advanced=True,
-                 help="largest number of materials the estimate considers (default 6)")
+                 help="largest number of components the estimate considers (default 6)")
         self.add(g, "--rank-pool", type=_pool_arg, default="auto", metavar="auto|B|0", advanced=True,
                  help="also test on B x B pooled pixels and take the larger rank (default: B chosen so pooled pixels "
                       "hold about 64 counts per bin; 0 disables)")
@@ -451,7 +453,8 @@ class _Options:
         self.add(g, "--overwrite", action="store_true", help="replace outputs that already exist")
         g = sp.add_argument_group("model")
         self.add(g, "--rank", "-r", type=_rank_arg, default="auto", metavar="N",
-                 help="number of materials (default: estimated from the data)")
+                 help="number of components, about the number of distinct materials (default: estimated from the "
+                      "data)")
         self.add(g, "--spectra", choices=("mle", "unconstrained", "support"), default="mle", help=_SPECTRA_HELP)
         self.run(sp, device=True, dry_run=True)
         self.rank_test(sp)
@@ -493,9 +496,9 @@ def build_parser(show_all=False):
 
     s = sub.add_parser("inspect", help="load, check and describe a dataset (no solve)")
     opt.input(s)
-    g = s.add_argument_group("number of materials")
+    g = s.add_argument_group("number of components")
     opt.add(g, "--estimate-rank", action="store_true",
-            help="estimate the number of materials (runs a few small fits)")
+            help="estimate the number of components (runs a few small fits)")
     opt.run(s, device=True)
     opt.rank_test(s)
     s.set_defaults(func=cmd_inspect)
@@ -516,7 +519,7 @@ def build_parser(show_all=False):
             help="threads decoding TIFF images of a block (default: min(8, CPUs))")
     s.set_defaults(func=cmd_convert)
 
-    s = sub.add_parser("dehydrate", help="fit material maps and spectra and write them in the dehydrated layout, with "
+    s = sub.add_parser("dehydrate", help="fit component maps and spectra and write them in the dehydrated layout, with "
                                          "plots and a report")
     opt.input(s)
     opt.solve(s, denoise=False)

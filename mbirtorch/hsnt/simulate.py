@@ -8,6 +8,9 @@ def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector
     """
     Simulate noisy hyperspectral neutron attenuation data for :math:`N_m=3` materials (Ni, Cu, Al) and :math:`N_k` wavelength bins.
 
+    The open beam is noiseless, dosage_rate counts in every pixel and bin; the sample counts are Poisson; the
+    transmission is floored at 1e-30 before the logarithm, so a zero count becomes an attenuation of about 69.
+
     Args:
         material_basis: ndarray of shape :math:`(N_m, N_k)`, where rows are material linear attenuation coefficient spectra.
         num_angles: Number of view angles :math:`(N_v)`. Defaults to 1.
@@ -20,7 +23,8 @@ def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector
 
     Returns:
         A list in the form [noisy_hyper_projection, angles, gt_hyper_projection].
-            - noisy_hyper_projection: Simulated noisy hyperspectral data of shape :math:`(N_v, N_r, N_c, N_k)`.
+            - noisy_hyper_projection: Simulated noisy hyperspectral data of shape :math:`(N_v, N_r, N_c, N_k)`, in
+              the dtype of material_basis.
             - angles: ndarray of view angles in radians.
             - gt_hyper_projection: Ground truth noiseless hyperspectral data of same shape.
 
@@ -72,7 +76,7 @@ def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector
     # The measured counts are Poisson distributed; the open beam is taken as noiseless.
     noisy_object_scan = np.random.poisson(noiseless_object_scan) if noisy else noiseless_object_scan
 
-    ratio = noisy_object_scan / noiseless_open_beam
+    ratio = (noisy_object_scan / noiseless_open_beam).astype(material_basis.dtype)
     ratio[ratio < epsilon] = epsilon
     noisy_hyper_projection = -np.log(ratio)
 

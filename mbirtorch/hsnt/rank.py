@@ -1,4 +1,4 @@
-"""Rank (number of materials) estimation by sequential likelihood-ratio tests on the NNAL factorization."""
+"""Rank (number of components) estimation by sequential likelihood-ratio tests on the NNAL factorization."""
 import math
 import warnings
 

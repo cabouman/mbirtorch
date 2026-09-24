@@ -10,7 +10,7 @@ Features include:
 * 4D reconstruction: a time sequence of volumes from a single continuous scan, using multi-agent consensus equilibrium (MACE).
 * Preprocessing routines for NSI and Zeiss scanners, plus geometry calibration.
 * Utilities for metal artifact reduction and stripe removal.  
-* Hyperspectral neutron data: maximum-likelihood dehydration into material maps and spectra, denoising, and the `mbirtorch-hsnt` command line ([documentation](https://mbirtorch.readthedocs.io/en/latest/usr_hsnt.html)).
+* Hyperspectral neutron data: maximum-likelihood dehydration into component maps and spectra, denoising, and the `mbirtorch-hsnt` command line ([documentation](https://mbirtorch.readthedocs.io/en/latest/usr_hsnt.html)).
 * Interactive slice and geometry viewers.
 * Informative demos and extensive documentation. 
 * Seamless operation on 1 or more GPUs, Mac MPS, or CPU. 
