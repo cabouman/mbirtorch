@@ -17,9 +17,9 @@ only on disk.
 
 The bands are the ones `recon_split_sino` would choose: each extends 5 rows past its seams,
 and the band size comes from the library's memory model for the visible GPUs, with a safety
-margin as a parameter (`--margin`, default 0.3; the library itself uses 0.15).  The output
-equals `recon_split_sino`'s to floating point round-off (3e-7 NRMSE measured on the same
-seed).  A progress file beside the output records each finished band, and `--resume`
+margin as a parameter (`--margin`, default 0.3; the library itself uses 0.15).  The regularization parameters come from a view subsample of the whole sinogram with the
+weights of those views, as in `recon` and `recon_split_sino`.  The output equals
+`recon_split_sino`'s to floating point round-off (3e-7 NRMSE measured on the same seed).  A progress file beside the output records each finished band, and `--resume`
 continues an interrupted run.  The harness uses one private library call,
 `_fits_available_devices`, to size the bands.
 

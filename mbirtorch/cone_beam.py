@@ -1023,9 +1023,10 @@ class ConeBeamModel(TomographyModel):
 
         full_det_center = (full_num_rows - 1) / 2.0
 
-        # The regularization parameters come from the full sinogram.  The halves copy
-        # them and set auto_regularize_flag=False.
-        self.auto_set_regularization_params(sino)
+        # The regularization parameters come from the full sinogram and its weights, the same
+        # inputs recon uses, so the halves get the values recon would set.  The halves copy them
+        # and set auto_regularize_flag=False.
+        self.auto_set_regularization_params(sino, weights=weights)
 
         def _recon_one_half(lo, hi, recon_shape, recon_slice_offset, is_top, half_logfile_path):
             """Reconstruct one detector-row half and return (host_recon,

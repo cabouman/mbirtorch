@@ -12,9 +12,10 @@ The bands and the result are those of ``recon_split_sino``.  The band size comes
 library's memory model for the visible GPUs.  Every band extends ``half_overlap`` rows
 past its seams, so consecutive bands share ``2 * half_overlap`` slices, and the seam is
 blended over those slices with ``stitch_arrays`` and its weights.  The regularization
-parameters are set once from the whole sinogram and copied into every band's model.  With
-the same seed and the same bands, the output equals ``recon_split_sino``'s to floating
-point round-off.
+parameters are set once, from a view subsample of the whole sinogram with the weights of
+those views, exactly as ``recon`` and ``recon_split_sino`` set them, and copied into every
+band's model.  With the same seed and bands, the output equals ``recon_split_sino``'s to
+floating point round-off.
 
     python stream_recon_parallel.py --sino sino.npy --angles angles.npy --weights transmission --output recon.h5
     python stream_recon_parallel.py --sino sino.npy --angles angles.npy --output recon.h5 --resume
@@ -308,13 +309,21 @@ def main():
     weights_supplied = args.weights != 'none'
 
     # The full model carries the geometry and the regularization.  No data of its size is
-    # ever placed on a device: the regularization statistics run on a view subsample, as
-    # they do in recon and in recon_split_sino.
+    # ever placed on a device: the regularization statistics run on the view subsample
+    # recon would take, with the weights of those views, exactly as recon does.
     full = mbirtorch.ParallelBeamModel(source.shape, angles)
     full.set_params(sharpness=args.sharpness, snr_db=args.snr_db,
                     positivity_flag=args.positivity, verbose=1, no_warning=True)
     recon_shape = tuple(int(s) for s in full.get_params('recon_shape'))
-    regularization = full.auto_set_regularization_params(source.view_subsample())
+    sample = source.view_subsample()
+    if weights_source is not None:
+        sample_weights = weights_source.view_subsample()
+    elif weights_supplied:
+        sample_weights = mbirtorch.gen_weights(sample, weight_type=args.weights)
+    else:
+        sample_weights = None
+    regularization = full.auto_set_regularization_params(sample, weights=sample_weights)
+    del sample, sample_weights
     print(f'sinogram {source.shape} ({num_views * num_rows * num_channels * FLOAT_BYTES / GB:.1f} GB), '
           f'volume {recon_shape} ({math.prod(recon_shape) * FLOAT_BYTES / GB:.1f} GB)')
     print('regularization from the whole sinogram: '
