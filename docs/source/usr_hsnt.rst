@@ -4,101 +4,106 @@
 Hyperspectral CT
 ================
 
-These are MBIRTorch functions specific to hyperspectral CT processing, exporting/importing, and generating synthetic data.
+The ``hsnt`` module processes hyperspectral neutron transmission data, which record the transmission of every
+detector pixel in each of many wavelength bins.  A sample made of a few materials has a low-rank attenuation
+X = W H: a map W of how much of each material every pixel crosses, and a spectrum H per material.  The module
+estimates W and H from the counts (dehydration), multiplies them back into denoised data (rehydration), estimates
+the number of materials, and reads and writes the hsnt HDF5 layout.  See ``demo_13_hsnt.py`` for a worked example,
+and `Command line`_ for running the same steps on files.
+
+.. currentmodule:: mbirtorch.hsnt
 
 
-Dehydration/Rehydration
------------------------
+Dehydration and rehydration
+---------------------------
 
-Dehydration is the maximum-likelihood NNAL factorization of the attenuation, X = W H with W, H >= 0, stored as
-the maps (``subspace_data``), the spectra (``subspace_basis``) and the data type; rehydration multiplies them
-back. The rank is the number of materials, estimated by likelihood-ratio tests when not given.
+Dehydration is the maximum-likelihood factorization of the attenuation with W, H >= 0: it minimizes the
+non-negative attenuation (NNAL) loss sum[exp(-X) + T X] of the transmission T, the Poisson negative log-likelihood
+of the counts up to a constant.  The result is stored as the maps (``subspace_data``), the spectra
+(``subspace_basis``) and the data type.  When the number of materials is not given it is estimated by
+likelihood-ratio tests.
 
-.. autofunction:: mbirtorch.hsnt.dehydrate
-.. autofunction:: mbirtorch.hsnt.rehydrate
-.. autofunction:: mbirtorch.hsnt.hyper_denoise
-.. autofunction:: mbirtorch.hsnt.estimate_rank
+.. autofunction:: dehydrate
+.. autofunction:: rehydrate
+.. autofunction:: hyper_denoise
+.. autofunction:: estimate_rank
+.. autofunction:: pool_pixels
 
-The scikit-learn L2 dehydration of Chowdhury et al. (2025) is kept as a baseline for comparison plots:
 
-.. autofunction:: mbirtorch.hsnt.l2_dehydrate
-.. autofunction:: mbirtorch.hsnt.l2_hyper_denoise
+Factorization
+-------------
+
+The solvers behind :func:`dehydrate`, for data held as a (pixels, bins) transmission tensor, and the streamed
+solver for data larger than the device memory.
+
+.. autofunction:: nnal_factorization
+.. autofunction:: stream_factorization
+.. autofunction:: stable_nnal
+
+
+Spectra estimators
+------------------
+
+The maximum-likelihood spectra are biased at low dose by the truncation of the pixel coefficients at zero.  The
+unconstrained estimator removes the bias by dropping the bound while the spectra are estimated, and pays when the
+pixels are many.  Support selection instead identifies the coefficients whose true value is zero, holds them at
+zero, and refits the rest; it needs the dose.
+
+.. autofunction:: unconstrained_spectra
+.. autofunction:: support_selected_spectra
+.. autofunction:: select_supports
+.. autofunction:: auto_penalty
+
+
+L2 baseline
+-----------
+
+The scikit-learn NMF dehydration of Chowdhury et al. (2025), which MBIRJAX calls ``dehydrate`` and
+``hyper_denoise``, is kept as a baseline for comparison.
+
+.. autofunction:: l2_dehydrate
+.. autofunction:: l2_hyper_denoise
 
 
 Import/Export
 -------------
 
-.. autofunction:: mbirtorch.hsnt.import_hsnt_data_hdf5
-.. autofunction:: mbirtorch.hsnt.create_hsnt_metadata
-.. autofunction:: mbirtorch.hsnt.export_hsnt_data_hdf5
+.. autofunction:: import_hsnt_data_hdf5
+.. autofunction:: create_hsnt_metadata
+.. autofunction:: export_hsnt_data_hdf5
 
 
-Generate Synthetic Data
------------------------
+Synthetic data and plots
+------------------------
 
-.. autofunction:: mbirtorch.hsnt.generate_hyper_data
+.. autofunction:: generate_hyper_data
+.. autofunction:: generate_sphere_data
+.. autofunction:: load_material_basis
+.. autofunction:: material_basis_wavelengths
+.. autofunction:: compare_spectra
+
 
 Command line
 ------------
 
-``mbirtorch-hsnt`` (also ``python -m mbirtorch.hsnt``) runs the NNAL factorization, and the denoising built on
-it, from the shell on an HDF5 dataset in the package layout or on a directory of TIFF images, one per wavelength
-bin. A stack of counts is
-normalised by an open-beam stack (``--open-beam``, a directory of observations is averaged); transmissions or
-attenuations are used as they are, with the type inferred from the values unless ``--input-type`` is given.
-Every subcommand loads the data, runs the checks (non-finite values, negatives, zero counts, dead pixels and
-bins, dose, memory) and logs what the solver will see; ``--strict`` stops on a failed check, ``-vv`` shows
-per-file detail.
+``mbirtorch-hsnt`` (also ``python -m mbirtorch.hsnt``) runs the dehydration on an HDF5 file in the hsnt layout or
+on a directory of TIFF images, one per wavelength bin.  A stack of counts is normalized by an open-beam stack
+(``--open-beam``; a directory of observations is averaged); transmissions and attenuations are used as they are.
+Every subcommand runs the data checks (non-finite values, negatives, zero counts, dead pixels and bins, dose) and
+logs them; ``--strict`` stops on a failed one.
 
 .. code-block:: bash
 
-   mbirtorch-hsnt inspect data.h5 --estimate-rank                  # checks, statistics, an upper bound on the rank
-   mbirtorch-hsnt inspect sample_tifs/ --open-beam open_beam/
-   mbirtorch-hsnt convert sample_tifs/ --open-beam open_beam/ --wave-bin 4 -o sample.h5     # read the TIFFs once, streamed
+   mbirtorch-hsnt inspect data.h5 --estimate-rank                  # checks, statistics and the rank estimate
+   mbirtorch-hsnt convert sample_tifs/ --open-beam open_beam/ --wave-bin 4 -o sample.h5
    mbirtorch-hsnt dehydrate sample.h5 -o results/                  # rank estimated from the data
-   mbirtorch-hsnt dehydrate sample_tifs/ --open-beam open_beam/ --rank 2 --downsample 2
    mbirtorch-hsnt rehydrate results/sample_dehydrated.h5 --wave-range 100:200 -o results/
    mbirtorch-hsnt denoise sample.h5 -o results/                    # denoised data, plus the dehydrated file
 
-The rank is estimated by default when ``--rank`` is not given: ranks 1 to ``--max-rank`` are fitted on a pixel
-subsample and each added component is kept while the log-likelihood it gains exceeds twice the noise floor (a
-noise-only component gains about half its parameter count), with the dose calibrated from the residual of the
-most flexible fit so a nominal open-beam dose does not matter. The log prints the gain of every component and
-the threshold, and the report stores them; ``--rank N`` overrides. Because every component gets a free
-coefficient per pixel, the noise floor grows with the pixel count as fast as a faint material's evidence does, so
-the test is also run on spatially pooled pixels (``--rank-pool``, blocks chosen so the pooled count is about half
-the bin count) where the floor is far lower, and the larger rank is taken; this recovers a faint material at low
-dose that the full-resolution test misses. After the solve the log reports the
-reduced chi-square of the fit against Poisson noise when the dose is known: near 1 the residual is at the noise
-level, well above 1 the rank is too small or the model misspecified, well below 1 the fit follows the noise.
-
-``convert`` streams: it reads the input in blocks of bins (TIFF images decoded in parallel, the open-beam
-observations averaged block by block), normalises, checks and writes each block into the output, so its memory is
-the ``--memory-budget`` (256 MiB by default; ``--block-bins`` fixes the block) whatever the size of the stack, and
-the next block is read while the current one is processed, and its output is chunked in 16-bin slabs along the spectral axis. The data checks run as accumulations over the blocks
-and are stored in the file's ``checks`` attribute. ``convert`` also takes an HDF5 file, to downsample, bin or
-re-type an existing dataset.
-
-``dehydrate`` writes ``<stem>_dehydrated.h5`` in the dehydrated layout (``subspace_data`` holds the material maps,
-``subspace_basis`` the spectra; :func:`~mbirtorch.hsnt.import_hsnt_data_hdf5` reads it), ``<stem>_report.json``
-with the checks, parameters, timings, loss and memory, and PNG plots of the maps and spectra; ``--rehydrate``
-also writes the denoised data. ``rehydrate`` takes such a file and writes ``<stem>_rehydrated.h5`` in the
-hyperspectral layout (``data`` with the spectral axis last, ``dataset_type``), for all bins or a ``--wave-range``
-of them and as attenuation or transmission (``--as-type``), block by block so the array is never held twice.
-``denoise`` does both in one run and writes ``<stem>_denoised.h5`` plus the dehydrated file unless
-``--no-dehydrated``. The solve runs whole on the device
-when it fits and is streamed by chunks otherwise (``--mode``); ``--spectra unconstrained`` and ``--spectra support``
-select the bias-corrected spectra estimators, in both modes (streamed, support selection adds one selection pass
-and a second round of polish passes with the pixel coefficients confined to their supports). Support selection
-searches each pixel's material subset by branch and bound (exact single-material fits, then subsets of up to four
-materials among each pixel's six best singletons for the pixels a likelihood lower bound leaves open), so any rank
-is allowed; ``--support-method greedy`` is a faster heuristic and ``enumerate`` the 2^R - 1 reference for rank 8 or
-less; ``--wald-screen`` skips single-material fits far below the penalty in the full fit at the price of
-rare-material recall. ``--support-penalty F`` sets the charge per selected material to F log(bins) nats (default 2,
-which admits essentially no absent material; 0.5 to 1 keeps a faint material in more of its pixels below about ten
-counts per pixel and bin, at the cost of map noise above about a hundred; ``auto`` moves from 0.5 to 2 with the
-counts of the median pixel), and ``--free-refit`` drops the bound on the selected coefficients
-during the refit (the unconstrained estimator restricted to the supports), which makes a smaller penalty harmless
-for the spectra. A component selected in almost no pixel reverts to the maximum-likelihood treatment, with a
-warning. ``--dry-run`` loads,
-checks and plans without solving.
+``convert`` reads the input in blocks of bins, so its memory stays near ``--memory-budget`` whatever the size of the
+stack, and writes the hsnt layout.  ``dehydrate`` writes ``<stem>_dehydrated.h5``, which
+:func:`import_hsnt_data_hdf5` reads, a JSON report of the checks, parameters, timings and losses, and plots of the
+maps and spectra.  ``rehydrate`` writes the product back as hyperspectral data, for all bins or a
+``--wave-range``.  ``denoise`` does both.  The solve runs whole on the device when it fits and is streamed by chunks
+of pixels otherwise.  ``--spectra unconstrained`` and ``--spectra support`` select the spectra estimators above.
+Run any subcommand with ``-h`` for all options.

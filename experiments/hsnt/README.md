@@ -1,6 +1,9 @@
 # hsnt experiments
 
-`binaries/material_basis.npy`: the three-material phantom's linear attenuation spectra (Ni, Cu, Al; shape (3, 1200),
-float32) used by `demo/demo_10_hsnt.py` and `mbirtorch.hsnt.generate_hyper_data` / `generate_sphere_data`. The file
-carries no wavelength axis; `mbirtorch.hsnt.simulate.material_basis_wavelengths(1200)` gives the calibrated one
-(1.5099 + 0.0025196 * bin Angstrom, from the nickel edges).
+`compare_solvers.py`: the NNAL solvers (joint Newton, multiplicative, block Newton) against the L2 baseline on one
+low-dose projection of the three-material phantom, with each fit's NNAL and L2 losses and the recovered spectra and
+maps. The public-API example is `demo/demo_13_hsnt.py`.
+
+The phantom's linear attenuation spectra (Ni, Cu, Al; shape (3, 1200), float32) ship with the package:
+`mbirtorch.hsnt.load_material_basis()` returns them with their calibrated wavelength axis (1.5099 + 0.0025196 * bin
+Angstrom, from the nickel edges).
