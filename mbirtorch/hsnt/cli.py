@@ -14,7 +14,8 @@ open-beam stack (``--open-beam``) to become a transmission ratio; a stack that a
 attenuations is used as is, and the type is inferred from the values unless ``--input-type`` says otherwise.
 
 The dehydrated layout (``subspace_data`` = maps, ``subspace_basis`` = spectra, ``dataset_type``) is the one
-``import_hsnt_data_hdf5`` reads and ``rehydrate`` reconstructs from. Run any subcommand with ``-h`` for the options.
+``import_hsnt_data_hdf5`` reads and ``rehydrate`` reconstructs from. Run any subcommand with ``-h`` for the options
+most runs need, or ``--help-all`` for every option.
 """
 import argparse
 import json
@@ -334,10 +335,10 @@ def _pipeline(args, denoise):
     rep["components"] = component_check(W, H)
     _log_fit(rep, args)
     R, out_type, outputs = H.shape[0], _out_type(ds, args), []
-    if not args.no_dehydrated:
+    if not (denoise and args.no_dehydrated):
         outputs.append(write_dehydrated(base + "_dehydrated.h5", W.reshape(*ds.spatial_shape, R), H, out_type,
                                         ds.bin_indices, _run_attrs(ds, rep, args, rank=R, loss=rep["loss_final"])))
-    if args.rehydrate:
+    if denoise:
         outputs.append(write_denoised(base + "_denoised.h5", ds.spatial_shape, W, H, out_type, ds.bin_indices,
                                       _run_attrs(ds, rep, args, loss=rep["loss_final"])))
     if not args.no_plots:
@@ -411,159 +412,188 @@ _EXAMPLES = """Examples:
   mbirtorch-hsnt inspect data.h5
   mbirtorch-hsnt inspect sample_tifs/ --open-beam open_beam/ --estimate-rank
   mbirtorch-hsnt convert sample_tifs/ --open-beam open_beam/ --wave-bin 4 -o sample.h5
-  mbirtorch-hsnt dehydrate sample.h5 -o results/                    # rank estimated
+  mbirtorch-hsnt dehydrate sample.h5 -o results/                    # number of materials estimated
   mbirtorch-hsnt dehydrate sample_tifs/ --open-beam open_beam/ --rank 2 --downsample 2 --wave-bin 4 -v
   mbirtorch-hsnt rehydrate results/sample_dehydrated.h5 --wave-range 100:200 -o results/
   mbirtorch-hsnt denoise sample.h5 -o results/                      # denoised data + dehydrated file
+
+Each subcommand's -h lists the options most runs need; --help-all lists every option.
 """
 
-
-def _add_logging(g):
-    g.add_argument("-v", "--verbose", action="count", default=0, help="-v for INFO (default), -vv for DEBUG")
-    g.add_argument("-q", "--quiet", action="store_true", help="warnings and errors only")
-    g.add_argument("--log-file", help="also write the log here")
-
-
-def _add_input(sp):
-    sp.add_argument("input", help="HDF5 file (package layout) or a directory with one TIFF per wavelength bin")
-    g = sp.add_argument_group("input interpretation")
-    g.add_argument("--open-beam", nargs="+", metavar="DIR", help="open-beam TIFF stack(s) for a stack of counts; a "
-                   "directory of observation subdirectories is averaged over them")
-    g.add_argument("--input-type", choices=("auto",) + INPUT_TYPES, default="auto",
-                   help="what the values are (default: infer)")
-    g.add_argument("--dataset", help="HDF5 group holding 'data' (default: the root, or the only group that has one)")
-    g.add_argument("--dose", type=float,
-                   help="open-beam counts per pixel and bin, when the input is not counts with an open beam")
-    g = sp.add_argument_group("selection")
-    g.add_argument("--views", help="view slice START:STOP for 4-D HDF5 data (default: all)")
-    g.add_argument("--wave-range", help="spectral slice START:STOP over the source bins (default: all)")
-    g.add_argument("--wave-bin", type=int, default=1, metavar="N",
-                   help="group N adjacent bins (sum counts / average transmissions)")
-    g.add_argument("--downsample", type=int, default=1, metavar="S", help="keep every S-th row and column")
-    g = sp.add_argument_group("checks and logging")
-    g.add_argument("--strict", action="store_true", help="stop if any data check reports an error")
-    _add_logging(g)
+_SPECTRA_HELP = ("how the material spectra are estimated. mle (default): the spectra that best fit the measured "
+                 "counts. unconstrained: removes a bias the best fit has at low dose; worth it from about 100,000 "
+                 "pixels up. support: works out which materials each pixel contains, which removes the same bias "
+                 "and gives cleaner material maps; needs the dose (an open beam or --dose)")
 
 
-def _add_rank(g):
-    g.add_argument("--max-rank", type=int, default=6, help="largest rank the estimate considers (default 6)")
-    g.add_argument("--rank-pool", type=_pool_arg, default="auto", metavar="auto|B|0",
-                   help="also test on B x B pooled pixels and take the larger rank (default: B chosen so pooled pixels "
-                        "hold about 64 counts per bin; 0 disables)")
+class _Options:
+    """Adds arguments to a parser, hiding the advanced ones from -h unless the full help was asked for."""
+
+    def __init__(self, show_all):
+        self.show_all = show_all
+
+    def add(self, group, *flags, advanced=False, **kw):
+        if advanced and not self.show_all:
+            kw["help"] = argparse.SUPPRESS
+        group.add_argument(*flags, **kw)
+
+    def input(self, sp):
+        sp.add_argument("input", help="HDF5 file (hsnt layout) or a directory with one TIFF per wavelength bin")
+        g = sp.add_argument_group("input")
+        self.add(g, "--open-beam", nargs="+", metavar="DIR", help="open-beam TIFF stack(s), needed when the TIFFs "
+                 "hold counts; a directory of observation subdirectories is averaged over them")
+        self.add(g, "--dose", type=float, metavar="D",
+                 help="open-beam counts per pixel and bin, when no open beam gives it")
+        self.add(g, "--input-type", choices=("auto",) + INPUT_TYPES, default="auto",
+                 help="what the values are (default: inferred)")
+        self.add(g, "--dataset", metavar="GROUP", help="HDF5 group holding 'data' (default: found automatically)")
+        g = sp.add_argument_group("selection")
+        self.add(g, "--views", metavar="A:B", help="views of 4-D HDF5 data (default: all)")
+        self.add(g, "--wave-range", metavar="A:B", help="source wavelength bins (default: all)")
+        self.add(g, "--wave-bin", type=int, default=1, metavar="N",
+                 help="group N adjacent bins (counts are summed, transmissions averaged)")
+        self.add(g, "--downsample", type=int, default=1, metavar="S", help="keep every S-th row and column")
+
+    def run(self, sp, device=False, dry_run=False):
+        g = sp.add_argument_group("run")
+        if device:
+            self.add(g, "--device", default="auto", metavar="auto|cpu|cuda|cuda:N",
+                     help="compute device (default: cuda if available)")
+        if dry_run:
+            self.add(g, "--dry-run", action="store_true", help="load, check and plan, then stop")
+        self.add(g, "-v", "--verbose", action="count", default=0, help="-v for INFO (default), -vv for DEBUG")
+        self.add(g, "-q", "--quiet", action="store_true", help="warnings and errors only")
+        self.add(g, "--help-all", action="store_true", help="show every option, including solver, memory, "
+                 "rank-test and support-selection settings")
+        g = sp.add_argument_group("advanced: checks and logging")
+        self.add(g, "--strict", action="store_true", advanced=True,
+                 help="stop if any data check reports an error")
+        self.add(g, "--log-file", advanced=True, help="also write the log here")
+
+    def rank_test(self, sp):
+        g = sp.add_argument_group("advanced: rank test")
+        self.add(g, "--max-rank", type=int, default=6, advanced=True,
+                 help="largest number of materials the estimate considers (default 6)")
+        self.add(g, "--rank-pool", type=_pool_arg, default="auto", metavar="auto|B|0", advanced=True,
+                 help="also test on B x B pooled pixels and take the larger rank (default: B chosen so pooled pixels "
+                      "hold about 64 counts per bin; 0 disables)")
+
+    def solve(self, sp, denoise):
+        g = sp.add_argument_group("output")
+        self.add(g, "-o", "--output", metavar="PATH", help="output directory (created if needed; default: current "
+                 "directory), or a .h5 path whose stem names the files")
+        self.add(g, "--as-type", choices=("attenuation", "transmission"),
+                 help="quantity stored in the outputs (default: the input's)")
+        if denoise:
+            self.add(g, "--no-dehydrated", action="store_true",
+                     help="write only the denoised data, not the dehydrated file")
+        self.add(g, "--no-plots", action="store_true", help="skip the PNG plots of the maps and spectra")
+        g = sp.add_argument_group("model")
+        self.add(g, "--rank", "-r", type=_rank_arg, default="auto", metavar="N",
+                 help="number of materials (default: estimated from the data)")
+        self.add(g, "--spectra", choices=("mle", "unconstrained", "support"), default="mle", help=_SPECTRA_HELP)
+        self.run(sp, device=True, dry_run=True)
+        self.rank_test(sp)
+        g = sp.add_argument_group("advanced: support selection")
+        self.add(g, "--support-method", choices=("branch_bound", "greedy", "enumerate"), default="branch_bound",
+                 advanced=True, help="subset search: branch and bound (any rank, default), greedy (fastest, "
+                 "heuristic), or the 2^R - 1 enumeration (rank <= 8)")
+        self.add(g, "--support-penalty", default="2", metavar="F|auto", advanced=True,
+                 help="penalty per selected material, F x log(bins) nats (default 2: essentially no false "
+                      "admissions; 0.5-1 keeps a faint material in more of its pixels below about 10 counts per bin "
+                      "at the cost of map noise above about 100) or 'auto', which moves from 0.5 to 2 with the "
+                      "counts per pixel and bin")
+        self.add(g, "--free-refit", action="store_true", advanced=True,
+                 help="drop the bound on the selected coefficients during the refit, then re-solve W >= 0 on the "
+                      "supports")
+        self.add(g, "--wald-screen", type=float, default=0.0, metavar="F", advanced=True,
+                 help="skip single-material fits below F x penalty of Wald statistic in the full fit (0 = off; "
+                      "trades rare-material recall for time)")
+        g = sp.add_argument_group("advanced: solver")
+        self.add(g, "--method", choices=("joint_newton", "block_newton", "multiplicative", "lbfgsb"),
+                 default="joint_newton", advanced=True, help="solver (default joint_newton, the fastest)")
+        self.add(g, "--max-steps", type=int, default=300, advanced=True,
+                 help="largest number of solver steps in a full solve (default 300)")
+        self.add(g, "--rel-tol", type=float, default=1e-6, advanced=True,
+                 help="relative loss change per step at which to stop (default 1e-6)")
+        g = sp.add_argument_group("advanced: memory")
+        self.add(g, "--mode", choices=("auto", "full", "stream"), default="auto", advanced=True,
+                 help="full solve on the device or streamed by chunks of pixels (default: by available memory)")
+        self.add(g, "--chunk-pixels", type=int, advanced=True,
+                 help="pixels per chunk in stream mode (default: from available memory)")
+        self.add(g, "--max-passes", type=int, default=5, advanced=True,
+                 help="stream mode: polish passes over the data (default 5)")
+        self.add(g, "--warmup-pixels", type=int, default=16384, advanced=True,
+                 help="stream mode: pixels for the initial spectra fit (default 16384)")
 
 
-def _add_device(g):
-    g.add_argument("--device", default="auto", metavar="auto|cpu|cuda|cuda:N",
-                   help="compute device (default: cuda if available)")
-
-
-def _add_solve(sp, denoise):
-    g = sp.add_argument_group("model")
-    g.add_argument("--rank", "-r", type=_rank_arg, default="auto", metavar="N|auto",
-                   help="number of materials; by default estimated by likelihood-ratio tests on a pixel subsample")
-    _add_rank(g)
-    g.add_argument("--method", choices=("joint_newton", "block_newton", "multiplicative", "lbfgsb"),
-                   default="joint_newton")
-    g.add_argument("--max-steps", type=int, default=300, help="full mode: largest number of solver steps")
-    g.add_argument("--rel-tol", type=float, default=1e-6, help="relative loss change per step at which to stop")
-    g.add_argument("--spectra", choices=("mle", "unconstrained", "support"), default="mle",
-                   help="spectra estimator: maximum likelihood, the unconstrained-W re-estimate (pays above about "
-                        "1e5 pixels), or per-pixel support selection (needs the dose)")
-    g.add_argument("--support-method", choices=("branch_bound", "greedy", "enumerate"), default="branch_bound",
-                   help="subset search of support selection: branch and bound (any rank, default), greedy (fastest, "
-                        "heuristic), or the 2^R - 1 enumeration (rank <= 8)")
-    g.add_argument("--support-penalty", default="2", metavar="F|auto",
-                   help="penalty per selected material, F x log(bins) nats (default 2: essentially no false "
-                        "admissions; 0.5-1 keeps a faint material in more of its pixels below about 10 counts per bin "
-                        "at the cost of map noise above about 100) or 'auto', which moves from 0.5 to 2 with the "
-                        "counts per pixel and bin")
-    g.add_argument("--free-refit", action="store_true",
-                   help="with --spectra support: drop the bound on the selected coefficients during the refit (as the "
-                        "unconstrained estimator does for all of them), then re-solve W >= 0 on the supports")
-    g.add_argument("--wald-screen", type=float, default=0.0, metavar="F",
-                   help="skip single-material fits below F x penalty of Wald statistic in the full fit (0 = off; "
-                        "trades rare-material recall for time)")
-    g = sp.add_argument_group("compute")
-    _add_device(g)
-    g.add_argument("--mode", choices=("auto", "full", "stream"), default="auto",
-                   help="full solve on the device or streamed by chunks (default: by available memory)")
-    g.add_argument("--chunk-pixels", type=int, help="pixels per chunk in stream mode (default: from available memory)")
-    g.add_argument("--max-passes", type=int, default=5, help="stream mode: polish passes over the data")
-    g.add_argument("--warmup-pixels", type=int, default=16384, help="stream mode: pixels for the initial spectra fit")
-    g.add_argument("--dry-run", action="store_true", help="load, check and plan, then stop")
-    g = sp.add_argument_group("output")
-    g.add_argument("-o", "--output", help="output directory (created if needed; default: current directory), or a .h5 "
-                   "path whose stem names the files")
-    g.add_argument("--as-type", choices=("attenuation", "transmission"),
-                   help="quantity stored in the outputs (default: the input's)")
-    if denoise:
-        g.add_argument("--no-dehydrated", action="store_true",
-                       help="write only the denoised data, not the dehydrated file")
-    else:
-        g.add_argument("--rehydrate", action="store_true",
-                       help="also write the rehydrated (denoised) data, as large as the input")
-    g.add_argument("--no-plots", action="store_true")
-
-
-def build_parser():
+def build_parser(show_all=False):
+    """The command-line parser; show_all=True puts the advanced options in the help as well."""
+    opt = _Options(show_all)
     p = argparse.ArgumentParser(prog="mbirtorch-hsnt", description=__doc__.split("\n\n")[0],
                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog=_EXAMPLES)
     sub = p.add_subparsers(dest="command", required=True)
 
     s = sub.add_parser("inspect", help="load, check and describe a dataset (no solve)")
-    _add_input(s)
-    g = s.add_argument_group("rank")
-    g.add_argument("--estimate-rank", action="store_true",
-                   help="choose the rank by likelihood-ratio tests on a pixel subsample (runs solves)")
-    _add_rank(g)
-    _add_device(g)
+    opt.input(s)
+    g = s.add_argument_group("number of materials")
+    opt.add(g, "--estimate-rank", action="store_true",
+            help="estimate the number of materials (runs a few small fits)")
+    opt.run(s, device=True)
+    opt.rank_test(s)
     s.set_defaults(func=cmd_inspect)
 
     s = sub.add_parser("convert", help="write a TIFF stack (and open beam) or an HDF5 dataset as an HDF5 dataset in "
-                                       "the package layout, streamed in blocks of bins")
-    _add_input(s)
-    s.add_argument("-o", "--output", help="output .h5 (default: <input>.h5)")
-    s.add_argument("--as-type", choices=("attenuation", "transmission"), default="attenuation",
-                   help="stored quantity (default attenuation)")
-    g = s.add_argument_group("streaming")
-    g.add_argument("--block-bins", type=int, metavar="N", help="bins per block (default: from --memory-budget)")
-    g.add_argument("--memory-budget", type=float, default=256, metavar="MiB",
-                   help="working memory for the blocks (default 256 MiB; smaller blocks overlap reading and writing "
-                        "better)")
-    g.add_argument("--workers", type=int, metavar="N",
-                   help="threads decoding TIFF images of a block (default: min(8, CPUs))")
+                                       "the hsnt layout, streamed in blocks of bins")
+    opt.input(s)
+    g = s.add_argument_group("output")
+    opt.add(g, "-o", "--output", metavar="PATH", help="output .h5 (default: <input>.h5)")
+    opt.add(g, "--as-type", choices=("attenuation", "transmission"), default="attenuation",
+            help="stored quantity (default attenuation)")
+    opt.run(s)
+    g = s.add_argument_group("advanced: streaming")
+    opt.add(g, "--block-bins", type=int, metavar="N", advanced=True,
+            help="bins per block (default: from --memory-budget)")
+    opt.add(g, "--memory-budget", type=float, default=256, metavar="MiB", advanced=True,
+            help="working memory for the blocks (default 256 MiB)")
+    opt.add(g, "--workers", type=int, metavar="N", advanced=True,
+            help="threads decoding TIFF images of a block (default: min(8, CPUs))")
     s.set_defaults(func=cmd_convert)
 
-    s = sub.add_parser("dehydrate", help="fit the NNAL factorization and write it in the dehydrated layout, with plots "
-                                         "and a report")
-    _add_input(s)
-    _add_solve(s, denoise=False)
-    s.set_defaults(func=cmd_dehydrate, no_dehydrated=False)
+    s = sub.add_parser("dehydrate", help="fit material maps and spectra and write them in the dehydrated layout, with "
+                                         "plots and a report")
+    opt.input(s)
+    opt.solve(s, denoise=False)
+    s.set_defaults(func=cmd_dehydrate)
 
     s = sub.add_parser("rehydrate",
                        help="multiply a dehydrated file back into hyperspectral data (all bins or a range)")
     s.add_argument("input", help="a dehydrated .h5 (subspace_data, subspace_basis, dataset_type), as written by "
                                  "dehydrate")
-    s.add_argument("-o", "--output", help="output directory (default: current directory), or a .h5 path; default name "
-                                          "<stem>_rehydrated.h5")
-    s.add_argument("--wave-range", help="spectral slice START:STOP of the dehydrated file's bins to rehydrate "
-                                        "(default: all)")
-    s.add_argument("--views", help="view slice START:STOP (default: all)")
-    s.add_argument("--as-type", choices=("attenuation", "transmission"),
-                   help="quantity to write (default: the file's dataset_type)")
-    _add_logging(s.add_argument_group("logging"))
+    g = s.add_argument_group("selection")
+    opt.add(g, "--wave-range", metavar="A:B", help="bins of the dehydrated file to rehydrate (default: all)")
+    opt.add(g, "--views", metavar="A:B", help="views to rehydrate (default: all)")
+    g = s.add_argument_group("output")
+    opt.add(g, "-o", "--output", metavar="PATH", help="output directory (default: current directory), or a .h5 "
+                                                     "path; default name <stem>_rehydrated.h5")
+    opt.add(g, "--as-type", choices=("attenuation", "transmission"),
+            help="quantity to write (default: the file's dataset_type)")
+    opt.run(s)
     s.set_defaults(func=cmd_rehydrate)
 
-    s = sub.add_parser("denoise", help="dehydrate and rehydrate: write the denoised hyperspectral data in the "
-                                       "package's HDF5 layout")
-    _add_input(s)
-    _add_solve(s, denoise=True)
-    s.set_defaults(func=cmd_denoise, rehydrate=True)
+    s = sub.add_parser("denoise", help="dehydrate and rehydrate: write the denoised hyperspectral data in the hsnt "
+                                       "HDF5 layout")
+    opt.input(s)
+    opt.solve(s, denoise=True)
+    s.set_defaults(func=cmd_denoise)
     return p
 
 
 def main(argv=None):
     """Run the command line. Errors in the data or the options exit with their message (the traceback with -vv)."""
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if "--help-all" in argv:                    # the full help: every option shown, printed by argparse's -h
+        build_parser(show_all=True).parse_args([a if a != "--help-all" else "-h" for a in argv])
     args = build_parser().parse_args(argv)
     level = logging.WARNING if args.quiet else (logging.DEBUG if args.verbose >= 2 else logging.INFO)
     handlers = [logging.StreamHandler(sys.stderr)] + ([logging.FileHandler(args.log_file)] if args.log_file else [])

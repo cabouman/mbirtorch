@@ -106,4 +106,5 @@ stack, and writes the hsnt layout.  ``dehydrate`` writes ``<stem>_dehydrated.h5`
 maps and spectra.  ``rehydrate`` writes the product back as hyperspectral data, for all bins or a
 ``--wave-range``.  ``denoise`` does both.  The solve runs whole on the device when it fits and is streamed by chunks
 of pixels otherwise.  ``--spectra unconstrained`` and ``--spectra support`` select the spectra estimators above.
-Run any subcommand with ``-h`` for all options.
+Run any subcommand with ``-h`` for the options most runs need, and with ``--help-all`` for every option,
+including the solver, memory, rank-test and support-selection settings.

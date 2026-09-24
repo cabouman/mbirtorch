@@ -314,3 +314,15 @@ def test_strict_stops_on_a_failed_check(stacks, tmp_path):
     assert main(["inspect", bad, "-q"]) == 0                             # reported, not fatal
     with pytest.raises(SystemExit, match="check"):
         main(["inspect", bad, "--strict", "-q"])
+
+
+def test_help_lists_data_options_and_help_all_lists_every_option(capsys):
+    with pytest.raises(SystemExit):
+        main(["dehydrate", "-h"])
+    short = capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        main(["dehydrate", "--help-all"])
+    full = capsys.readouterr().out
+    assert "--open-beam" in short and "--spectra" in short and "--help-all" in short
+    assert "--method" not in short and "--chunk-pixels" not in short and "--rehydrate" not in short
+    assert "--method" in full and "--support-penalty" in full and "--chunk-pixels" in full
