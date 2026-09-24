@@ -21,30 +21,18 @@ def _randomized_svd(X, n_components, n_oversamples=10, n_iter=4, seed=0):
     return Q @ U, singular_values, Vh
 
 
-def nndsvda(X, n_components, fill='sqrt', fill_scale=1.0):
+def nndsvda(X, n_components):
     """NNDSVD initialization for X ~= W @ H, with zeros filled.
 
-    Every component after the first is one sign-half of a singular vector pair,
-    so roughly half its entries are zero. Zeros are poison for multiplicative
-    updates, which can never move an entry off zero, so they are filled.
-
-    The fill value is chosen at the scale of a FACTOR entry, not of X. Each factor
-    carries sqrt(s_k), so a typical W or H entry is of order sqrt(mean X), and a
-    fill of f in both factors contributes f^2 to the product where both were
-    filled. The default fill c * sqrt(mean X) with c = 1 therefore adds a fixed
-    fraction c^2 of a typical entry whatever the scale of X: dimensionally right
-    and scale-free. The classic mean fill matches the data only when mean X ~ 1,
-    and a fill far below factor scale is frozen at zero by block_newton's
-    two-metric projection, which then converges in a reduced subspace. c = 1 was
-    chosen by measurement; its price is an initial X up to 2x the data where fills
-    coincide, which no solver minds.
+    Every component after the first is one sign-half of a singular vector pair, so roughly half its entries are zero.
+    Zeros are poison for multiplicative updates, which can never move an entry off zero, so they are filled with
+    sqrt(mean X): each factor carries sqrt(s_k), so that is the scale of a factor entry, and the fill adds a fixed
+    fraction of a typical entry to the product whatever the scale of X. A fill far below factor scale would be frozen
+    at zero by block_newton's two-metric projection.
 
     Args:
         X: Nonnegative array of shape (n_samples, n_features).
         n_components: Factorization rank.
-        fill: 'sqrt' (default) fills zeros with fill_scale * sqrt(mean X);
-            'mean' is classic NNDSVDA; 'small' is mean X / 100.
-        fill_scale: multiplier for the 'sqrt' fill. Defaults to 1.0.
 
     Returns:
         W: Shape (n_samples, n_components).
@@ -101,13 +89,7 @@ def nndsvda(X, n_components, fill='sqrt', fill_scale=1.0):
         W[:, component] = scale * selected_u
         H[component, :] = scale * selected_v
 
-    mean = torch.mean(X)
-    if fill == 'mean':
-        fill_value = mean
-    elif fill == 'small':
-        fill_value = mean * 1e-2
-    else:
-        fill_value = fill_scale * torch.sqrt(mean.clamp_min(0))
+    fill_value = torch.sqrt(torch.mean(X).clamp_min(0))
     W = torch.where(W == 0, fill_value, W)
     H = torch.where(H == 0, fill_value, H)
 
@@ -132,12 +114,8 @@ def _batched_spd_solve(M, g, jitter_rel=1e-9):
     d = torch.cholesky_solve(g.unsqueeze(-1), L).squeeze(-1)
     diag_A = torch.diagonal(A, dim1=-2, dim2=-1).clamp_min(torch.finfo(M.dtype).tiny)
     d = torch.where(failed[:, :, 0], g / diag_A, d)
-    # A row carrying no curvature at all -- Z underflowed to zero across the whole
-    # row, which happens in float32 once the attenuation exceeds ~88 -- leaves the
-    # damping underflowed too, so the fallback divides by `tiny` and overflows.
-    # There is no second-order information to act on there, so take no step and
-    # let the gradient-driven steps of later iterations bring the iterate back
-    # into range.
+    # A row with no curvature (Z underflows in float32 above an attenuation of about 88) makes the fallback divide by
+    # `tiny` and overflow; take no step there and let later gradient-driven steps bring the iterate back into range.
     return torch.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0)
 
 

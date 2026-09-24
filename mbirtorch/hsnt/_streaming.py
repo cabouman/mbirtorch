@@ -2,13 +2,11 @@ import torch
 
 from . import _newton
 from ._loss import _nnal_prep
+from ._device import _default_device
 from ._newton import _kernels, solve_W
 from .factorization import nnal_factorization
 
 
-# -----------------------------------------------------------------------
-# Streaming factorization for data that does not fit in memory
-# -----------------------------------------------------------------------
 def _h_stats_accumulate(W, H, T, prep, rows, cols, deriv, rowwise):
     """Per-chunk sufficient statistics for one Newton step on H.
 
@@ -33,92 +31,75 @@ def _h_direction(H, grad, flat, rows, cols, jitter_rel=1e-9):
 
 
 def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warmup_pixels=16384,
-                         w_rel_tol=1e-8, w_max_steps=300, ls_trials=4, device='cuda',
-                         compile_mode=None, random_state=0, verbose=False, polish_dtype=None,
+                         w_rel_tol=1e-8, w_max_steps=300, ls_trials=4, device=None,
+                         compile_mode=None, verbose=0, polish_dtype=None,
                          kkt_tol=None, stats=None, nonneg_W=True, support_selection=None):
-    """Factorize a dataset too large for device memory, one chunk at a time.
+    """Factorize a dataset too large for device memory, one chunk of pixels at a time.
+
+    W is separable over pixels, so it is solved chunk by chunk and never held whole on the device. H holds only R * K
+    values, and its Newton step needs only sums over pixels (gradient, per-bin R x R Hessian, per-bin loss), which
+    accumulate across chunks: one pass over the data gives one exact Newton step on H, and a second pass evaluates
+    its line search at a few step lengths at once. H starts from a joint-Newton fit on a subsample, so a handful of
+    passes polish it. The joint Newton solver is not streamed: each of its CG iterations would be a full pass.
 
     Args:
-        chunks: A sequence of CPU tensors, each (pixels, bins), together making
-            up T. Any indexable sequence works, so chunks may be lazily loaded
-            (e.g. views into a memory-mapped array or an HDF5 dataset).
-        num_materials: Factorization rank R.
-        max_passes: Full passes over the data for polishing H. 0 stops after
-            the subsample fit, which is the existing batched path.
-        rel_tol: Stop polishing when a pass changes the total loss by less than
-            this, relatively (float64 sum).
-        warmup_pixels: Pixels drawn from the leading chunks to fit H initially.
-        polish_dtype: If set (e.g. torch.float64), the polish passes run in that
-            dtype -- chunks, W and H are cast on the way in -- while the warm-up
-            stays in the chunks' native dtype. Insurance against a float32
-            elementwise ceiling on H at very large P; the accumulated statistics
-            are float64 regardless.
-        kkt_tol: If set, also stop once the relative KKT residual of H,
-            ||P(grad_H L)||_F / ||W^T T||_F with P the projection onto the
-            feasible directions, falls below it. The residual is scale-free and
-            independent of the initialization. rel_tol alone can stop inside a
-            precision plateau, where the line search cannot accept an improvement
-            below its noise floor while H is still measurably non-stationary; the
-            residual tells the two apart, and the run says so when it stops that
-            way.
-        stats: Optional dict; receives 'loss' and 'kkt' lists, one entry per pass.
-        nonneg_W: False estimates H with the bound on the pixel coefficients dropped
-            during the polish passes (see unconstrained_spectra: it removes the
-            truncation bias of the ML spectra), then re-solves W >= 0 for every
-            chunk in one final pass. The warm-up fit stays constrained, since it
-            finds the basin.
-        support_selection: If given, a dict of keyword arguments for
-            `support_selected_spectra` applied after the passes above: 'dose'
-            (required), and optionally 'penalty', 'method', 'k_top', 'm_max',
-            'wald_screen', 'free_refit', 'min_support' and 'max_passes' (the
-            refit's own pass budget, default max_passes). One pass selects each
-            chunk's supports given the polished H; the polish loop then runs again
-            with W solved on the supports (with the bound dropped if free_refit),
-            and a last pass re-solves W >= 0 on the supports when free_refit. The
-            supports are returned in stats['support_chunks'] (CPU bool tensors
-            aligned with `chunks`), the refit's loss and KKT lists under
-            stats['loss_refit'] / stats['kkt_refit'].
+        chunks (sequence of torch.Tensor): Chunks of the transmission ratio, each (pixels, bins), together making
+            up T; any indexable sequence works, so chunks may be loaded lazily.
+        num_materials (int): Rank R.
+        max_passes (int, optional): Polish passes over the data; 0 keeps the subsample fit. Defaults to 5.
+        rel_tol (float, optional): Stop when a pass changes the total loss by less than this, relatively.
+            Defaults to 1e-6.
+        warmup_pixels (int, optional): Pixels from the leading chunks for the initial fit. Defaults to 16384.
+        w_rel_tol (float, optional): Stopping tolerance of each chunk's W solve. Defaults to 1e-8.
+        w_max_steps (int, optional): Iteration cap of each chunk's W solve. Defaults to 300.
+        ls_trials (int, optional): Step lengths tried per H line search. Defaults to 4.
+        device (str, optional): Torch device. Defaults to None, meaning CUDA if available, else CPU.
+        compile_mode (str, optional): See :func:`~mbirtorch.hsnt.nnal_factorization`. Defaults to None.
+        verbose (int, optional): 1 prints the loss and KKT residual of every pass. Defaults to 0.
+        polish_dtype (torch.dtype, optional): Run the polish passes in this dtype (e.g. torch.float64); the
+            accumulated statistics are float64 regardless. Defaults to None, the chunks' dtype.
+        kkt_tol (float, optional): Also stop when the relative KKT residual of H, ||P(grad_H L)|| / ||W^T T||,
+            falls below this; it distinguishes convergence from a line search stalled at its precision floor.
+            Defaults to None.
+        stats (dict, optional): Receives 'loss' and 'kkt' lists, one entry per pass. Defaults to None.
+        nonneg_W (bool, optional): False estimates H with the bound on W dropped during the polish passes (the
+            unconstrained spectra), then re-solves W >= 0 for every chunk. Defaults to True.
+        support_selection (dict, optional): Keyword arguments for support selection after the passes: 'dose'
+            (required) and optionally 'penalty', 'method', 'k_top', 'm_max', 'wald_screen', 'free_refit',
+            'min_support' and 'max_passes' (the refit's pass budget). One pass selects each chunk's supports; the
+            polish loop then runs again with W confined to them. The supports are returned in
+            stats['support_chunks'], the refit's losses in stats['loss_refit'] and stats['kkt_refit'].
+            Defaults to None.
 
     Returns:
-        (W_chunks, H, passes): W as a list of CPU tensors aligned with `chunks`.
-
-    The two factors are asymmetric in a way that makes this work. W is per-pixel
-    and separable: with H fixed each pixel's problem is independent, so W is
-    solved chunk by chunk and never held whole on the device. H is shared by
-    every pixel but holds only R * K values, and its Newton step needs only sums
-    over pixels -- gradient, R x R Hessian per bin, per-bin loss -- which
-    accumulate across chunks. One full pass therefore delivers one exact
-    block-Newton step on H from all the data; a second pass evaluates the line
-    search at a few trial step lengths at once. H starts from a joint_newton
-    fit on a subsample, which is already within a few hundredths of a percent
-    of the full-data optimum, so a handful of passes polish it.
-
-    joint_newton is deliberately not streamed: each of its CG iterations would
-    be a full pass, and at 10 or more per step that is hundreds of passes.
+        (W_chunks, H, passes): W as a list of CPU tensors aligned with the chunks, H, and the polish passes made.
     """
-    nnal_fn, deriv, rowwise, _ = _kernels(compile_mode)
+    _, deriv, rowwise, _ = _kernels(compile_mode)
+    device = _default_device(device)
     R = num_materials
-    rows, cols = None, None
     W_chunks = [None] * len(chunks)
 
-    # ---- H from a subsample of the leading chunks
+    # H from a subsample of the leading chunks.
     parts, n = [], 0
     for c in chunks:
-        parts.append(c[: warmup_pixels - n]); n += parts[-1].shape[0]
+        parts.append(c[: warmup_pixels - n])
+        n += parts[-1].shape[0]
         if n >= warmup_pixels:
             break
     T_sub = torch.cat(parts, 0).to(device)
     _, H, _ = nnal_factorization(T_sub, method='joint_newton', num_materials=R, max_steps=300,
-                                 rel_tol=1e-6, compile_mode=compile_mode, random_state=random_state)
+                                 rel_tol=1e-6, compile_mode=compile_mode)
     del T_sub
     if polish_dtype is not None:
         H = H.to(polish_dtype)
     rows, cols = torch.triu_indices(R, R, device=H.device)
-    prev_loss = None
-    passes = 0
+    pin = torch.device(device).type == 'cuda'
 
     def to_device(c):
-        c = c.pin_memory().to(device, non_blocking=True) if c.device.type == 'cpu' else c
+        if c.device.type == 'cpu' and pin:
+            c = c.pin_memory().to(device, non_blocking=True)
+        else:
+            c = c.to(device)
         return c if polish_dtype is None else c.to(polish_dtype)
 
     def polish(solve_chunk, passes_max, tag):
@@ -128,10 +109,8 @@ def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warm
         prev_loss = None
         passes = 0
         for p in range(passes_max + 1):
-            # ---- pass A: solve W per chunk with H fixed, accumulate H statistics
-            # Accumulate across chunks in float64 whatever the working dtype: these are
-            # sums over every pixel, and the per-bin loss in particular must resolve
-            # H improvements far smaller than the float32 ulp of a sum near 1e8.
+            # Pass A: W per chunk with H fixed; H's statistics summed over chunks in float64, since the per-bin
+            # loss must resolve improvements far below the float32 ulp of a sum near 1e8.
             grad = torch.zeros(H.shape, dtype=torch.float64, device=H.device)
             flat = torch.zeros(rows.numel(), H.shape[1], dtype=torch.float64, device=H.device)
             base = torch.zeros(H.shape[1], dtype=torch.float64, device=H.device)
@@ -146,14 +125,18 @@ def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warm
                 W = solve_chunk(Tc, W0, i)
                 W_chunks[i] = W.cpu()
                 g_c, f_c, b_c = _h_stats_accumulate(W, H, Tc, prep, rows, cols, deriv, rowwise)
-                grad += g_c; flat += f_c; base += b_c; scale += (W.T @ Tc).to(torch.float64)
+                grad += g_c
+                flat += f_c
+                base += b_c
+                scale += (W.T @ Tc).to(torch.float64)
                 del Tc, W
             loss = base.sum(dtype=torch.float64)
             # Projected gradient: where H is zero only a negative gradient (a wish to grow) counts.
             pg = torch.where(H > 0, grad, grad.clamp(max=0))
             kkt = (pg.norm() / scale.norm()).item()
             if stats is not None:
-                stats.setdefault('loss' + tag, []).append(loss.item()); stats.setdefault('kkt' + tag, []).append(kkt)
+                stats.setdefault('loss' + tag, []).append(loss.item())
+                stats.setdefault('kkt' + tag, []).append(kkt)
             if verbose:
                 print(f'  pass {p}{tag}: full-data loss {loss.item():.6e}  KKT residual {kkt:.2e}', flush=True)
             if kkt_tol is not None and kkt <= kkt_tol:
@@ -169,11 +152,11 @@ def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warm
             if p == passes_max:
                 break
 
-            # ---- one exact Newton step on H from the accumulated statistics
+            # One exact Newton step on H from the accumulated statistics.
             d, slope, alpha_max = _h_direction(H, grad.to(H.dtype), flat.to(H.dtype), rows, cols)
             alphas = alpha_max[None, :] * (0.5 ** torch.arange(ls_trials, dtype=H.dtype, device=H.device))[:, None]
 
-            # ---- pass B: per-bin loss at every trial step, accumulated over chunks
+            # Pass B: the per-bin loss at every trial step, summed over chunks.
             trial = torch.zeros(ls_trials, H.shape[1], dtype=torch.float64, device=H.device)
             nxt = to_device(chunks[0])
             for i in range(len(chunks)):
@@ -190,9 +173,11 @@ def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warm
             # Same floor as block_newton_step (see _ARMIJO_FLOOR): the float32 sums are
             # gone, but elements whose step falls below ulp(X) still do not move.
             noise = _newton._ARMIJO_FLOOR * torch.finfo(H.dtype).eps * base.abs()
-            ok = trial <= base[None, :] - 1e-4 * alphas.double() * slope.double()[None, :] + noise[None, :]   # Armijo, per bin and trial
+            # Armijo, per bin and trial
+            ok = trial <= base[None, :] - 1e-4 * alphas.double() * slope.double()[None, :] + noise[None, :]
             # largest accepted trial per bin, else zero
-            accepted = torch.where(ok.any(0), alphas.gather(0, ok.float().argmax(0, keepdim=True)).squeeze(0), torch.zeros_like(alpha_max))
+            accepted = torch.where(ok.any(0), alphas.gather(0, ok.float().argmax(0, keepdim=True)).squeeze(0),
+                                   torch.zeros_like(alpha_max))
             Ht = (H.T - accepted[:, None] * d).clamp_(min=0)
             # Same epsilon-active snap as block_newton_step: a bin component at the
             # bound with an outward gradient becomes exactly zero, not a residue.
@@ -216,31 +201,35 @@ def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warm
             del Tc, W
 
     if support_selection is not None:
-        from .spectra import _solve_W_on_support, _warn_collinear_rows, select_supports
+        from .spectra import _solve_W_on_support, _warn_collinear_rows, _weak_components, select_supports
         opt = dict(support_selection)
-        dose = opt.pop('dose'); free = bool(opt.pop('free_refit', False))
-        refit_passes = opt.pop('max_passes', max_passes); min_support = opt.pop('min_support', None)
-        # ---- one pass: each chunk's supports given the polished H (the MLE W kept for the component guard)
-        S_chunks = [None] * len(chunks); W_mle = list(W_chunks); counts = 0; P_total = 0
+        dose = opt.pop('dose')
+        free = bool(opt.pop('free_refit', False))
+        refit_passes = opt.pop('max_passes', max_passes)
+        min_support = opt.pop('min_support', None)
+        # One pass: each chunk's supports given the polished H (the MLE W is kept for the component guard).
+        S_chunks = [None] * len(chunks)
+        W_mle = list(W_chunks)
+        counts = 0
+        P_total = 0
         for i in range(len(chunks)):
-            Tc = to_device(chunks[i]); Wc = W_chunks[i].to(device=device, dtype=H.dtype)
+            Tc = to_device(chunks[i])
+            Wc = W_chunks[i].to(device=device, dtype=H.dtype)
             support, W0, _ = select_supports(Tc, Wc, H, dose, **opt)
-            S_chunks[i] = support.cpu(); W_chunks[i] = W0.cpu(); counts = counts + support.sum(0); P_total += Tc.shape[0]
+            S_chunks[i] = support.cpu()
+            W_chunks[i] = W0.cpu()
+            counts = counts + support.sum(0)
+            P_total += Tc.shape[0]
             del Tc, Wc, support, W0
-        if min_support is None:
-            min_support = max(2 * R, P_total // 1000)
-        weak = counts < min_support
+        weak = _weak_components(counts, P_total, min_support)
         if bool(weak.any()):
-            import logging
-            logging.getLogger("mbirtorch.hsnt").warning(
-                "support selection: component(s) %s selected in fewer than %d pixels; kept free in every pixel",
-                weak.nonzero().flatten().tolist(), min_support)
             weak_cpu = weak.cpu()
             for i in range(len(chunks)):
-                S_chunks[i][:, weak_cpu] = True; W_chunks[i][:, weak_cpu] = W_mle[i][:, weak_cpu]
+                S_chunks[i][:, weak_cpu] = True
+                W_chunks[i][:, weak_cpu] = W_mle[i][:, weak_cpu]
         del W_mle
 
-        # ---- the polish loop again, W confined to the supports (free-signed there if free_refit)
+        # The polish loop again, W confined to the supports (free-signed there if free_refit).
         def solve_masked(Tc, W0, i):
             return _solve_W_on_support(Tc, H, W0, S_chunks[i].to(device), nonneg=not free)
 
@@ -248,9 +237,11 @@ def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warm
         if free:
             for i in range(len(chunks)):
                 Tc = to_device(chunks[i])
-                W_chunks[i] = _solve_W_on_support(Tc, H, W_chunks[i].to(device=device, dtype=H.dtype), S_chunks[i].to(device)).cpu()
+                W_c = W_chunks[i].to(device=device, dtype=H.dtype)
+                W_chunks[i] = _solve_W_on_support(Tc, H, W_c, S_chunks[i].to(device)).cpu()
                 del Tc
         _warn_collinear_rows(H)
         if stats is not None:
-            stats['support_chunks'] = S_chunks; stats['refit_passes'] = refit_passes
+            stats['support_chunks'] = S_chunks
+            stats['refit_passes'] = refit_passes
     return W_chunks, H, passes

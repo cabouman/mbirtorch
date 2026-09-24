@@ -1,14 +1,13 @@
 """All-at-once L-BFGS-B on (W, H) >= 0: the generic bound-constrained baseline for the NNAL factorization."""
 import numpy as np
 import torch
-from scipy.optimize import Bounds, minimize
 
 from ._loss import _nnal_prep, stable_nnal, stable_nnal_derivatives
 
 
 def lbfgsb_optimize(T, num_materials, max_steps, rel_tol, update_H=True, W_init=None, H_init=None,
-                    memory=20, max_evals=None, convergence_check_interval=1, compile_mode=None, verbose=False):
-    """Minimise the NNAL over both factors at once with L-BFGS-B under the bounds W, H >= 0.
+                    memory=20, max_evals=None, verbose=False):
+    """Minimize the NNAL over both factors at once with L-BFGS-B under the bounds W, H >= 0.
 
     This is the generic solver for a bound-constrained low-rank likelihood, the
     one generalized CP decomposition uses for the same Poisson log-link loss
@@ -24,14 +23,13 @@ def lbfgsb_optimize(T, num_materials, max_steps, rel_tol, update_H=True, W_init=
     other method here. max_steps maps onto maxiter; the projected-gradient test is
     disabled so ftol decides. Near the float32 noise floor of the loss the Fortran
     line search can fail to find a decrease and stop early; the message is printed
-    when verbose. memory is the number of correction pairs: with scipy's default
-    of 10 the method stalled 6e-4 above the joint-Newton optimum at dose 3 on the
-    4k phantom, the relative-decrease test firing on a slow crawl, while 20 pairs
-    reached it (1152 iterations against joint Newton's 45 steps, about 9x the
-    wall clock). Not batchable, and update_H=False is not supported.
+    when verbose. memory is the number of correction pairs; with scipy's default of
+    10 the relative-decrease test can fire on a slow crawl short of the optimum.
+    update_H=False is not supported.
 
     Returns (W, H, iterations).
     """
+    from scipy.optimize import Bounds, minimize
     if not update_H:
         raise NotImplementedError("lbfgsb_optimize updates both factors; use solve_W for a fixed H")
     if W_init is None or H_init is None:

@@ -42,9 +42,10 @@ def _nnal_elementwise(X, T, prep):
 
 
 def stable_nnal(X, T, prep=None, dtype=None):
-    """
-    Compute a shifted form of the non-negative attenuation loss
-    that is much more numerically stable
+    """The non-negative attenuation loss sum[exp(-X) + T X], shifted by a term that depends only on T.
+
+    Each term is written T phi(X + log T) with phi(u) = exp(-u) - 1 + u, so it is nonnegative and zero where
+    X = -log T, which keeps the sum accurate in float32; the shift does not change the minimizer.
 
     Args:
         X: Attenuation estimate, broadcastable against T.
@@ -56,6 +57,9 @@ def stable_nnal(X, T, prep=None, dtype=None):
             loss near 3e6 has a resolution of 0.25, so two consecutive losses that
             differ by less than that compare equal and a relative-change test
             fires spuriously.
+
+    Returns:
+        torch.Tensor: The loss summed over the last two axes.
     """
     loss = _nnal_elementwise(X, T, _nnal_prep(T) if prep is None else prep)
     return torch.sum(loss, dim=(-2, -1), dtype=dtype)

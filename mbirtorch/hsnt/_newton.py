@@ -6,45 +6,26 @@ from ._multiplicative import _reseed_dead
 
 
 _COMPILED_KERNELS = {}
-# Armijo noise floor, as a multiple of eps32 * |row loss|. A smaller decrease is
-# not trusted: elements whose step alpha*B falls below ulp(X) do not move in
-# float32, so the measured decrease is a biased truncation, linear in the row
-# length (not a random walk). c <= 2 backtracks spuriously; 4 is the smallest
-# safe value once the row sums are float64.
+# Armijo noise floor, in units of eps * |row loss|: a smaller decrease is float32 truncation, which grows with the
+# row length, and is not trusted. 4 is the smallest value that does not backtrack spuriously.
 _ARMIJO_FLOOR = 4.0
-# Trust-region floor as a fraction of the mean row scale (0 -> machine epsilon).
-# Without it a row pinned near zero grows by at most 16x per step and the
-# loss-based stopping rule fires during the crawl.
+# Trust-region floor as a fraction of the mean row scale; without it a row pinned near zero crawls.
 _TRUST_FLOOR = 1e-3
-# epsilon-active set (Bertsekas): a component within this fraction of the mean row
-# scale of zero, with a gradient pushing it out, is treated as AT the bound and
-# snapped to exactly zero. Otherwise a tiny residue left at the feasibility limit
-# is formally free, the row's shared step length min(V/d) is ~0, and the row
-# freezes at a non-stationary point.
+# epsilon-active set (Bertsekas): a component this close to zero with an outward gradient is snapped to zero, so a
+# tiny residue at the feasibility limit cannot freeze its row at a non-stationary point.
 _ACTIVE_TOL = 1e-6
 
 
 def _kernels(compile_mode):
     """The four hot kernels, eager or compiled: (nnal, derivatives, rowwise, block step).
 
-    compile_mode=None returns the plain functions. Any other value compiles them
-    once and caches the result; the value itself is otherwise ignored. The Newton
-    solvers spend their time in elementwise passes over P x K -- the loss, its
-    derivatives, the per-row loss of the line search -- and torch.compile fuses
-    each of those into one kernel. The GEMM-bound CG inner iteration does not
-    benefit and is left eager.
-
-    Compiling is a one-off cost of seconds, and recompiles whenever P, K, R, dtype
-    or the presence of zero counts changes, so it pays for repeated solves -- the
-    batched path, many datasets, a service -- and not for one short solve; the
-    default is therefore off. Compiled and eager agree bit-for-bit over short
-    runs, but the fused reductions round differently and a long block_newton run
-    can eventually flip an active-set decision, so do not expect such runs to be
-    reproducible across the compiled/eager boundary. Compiling costs a one-off
-    few seconds and saves a fraction of each step, so it pays only for repeated
-    or long solves.
+    compile_mode None or 'off' returns the plain functions; any other value compiles them once with torch.compile
+    and caches the result. The Newton solvers spend their time in elementwise passes over the P x K data, which
+    compiling fuses; the GEMM-bound CG iteration is left eager. Compiling costs seconds and recompiles when P, K, R,
+    the dtype or the presence of zero counts changes, so it pays for repeated or long solves, not for one. The fused
+    reductions round differently, so a long block_newton run may take a different active-set decision compiled.
     """
-    if compile_mode is None:
+    if compile_mode in (None, 'off'):
         return stable_nnal, stable_nnal_derivatives, _nnal_rowwise, block_newton_step
     if compile_mode not in _COMPILED_KERNELS:
         import torch._dynamo
@@ -103,8 +84,7 @@ def _two_metric_direction(V, grad, flat, rows, cols, jitter_rel=1e-9, nonneg=Tru
     return d, slope, alpha, bound, projected_gnorm2
 
 
-def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9, nonneg=True,
-                      rowwise=None, deriv=None):
+def block_newton_step(V, other, X, T, prep, axis, jitter_rel=1e-9, nonneg=True):
     """One exact projected-Newton step on a single factor.
 
     The NNAL is convex in X and X = W @ H is linear in each factor, so each block
@@ -126,10 +106,7 @@ def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9, non
         (V_new, X_new, (num_backtracks, projected_gradient_norm_squared)). The
         gradient norm is measured at the incoming iterate, before the step.
     """
-    rowwise = _nnal_rowwise if rowwise is None else rowwise
-    deriv = stable_nnal_derivatives if deriv is None else deriv
-    log_T, positive, all_positive, taylor_cutoff = prep
-    G, Z = deriv(X, T, prep)
+    G, Z = stable_nnal_derivatives(X, T, prep)
 
     if axis == 0:
         rank = V.shape[1]
@@ -145,29 +122,25 @@ def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9, non
 
     d, slope, alpha, bound, projected_gnorm2 = _two_metric_direction(V, grad, flat, rows, cols, jitter_rel, nonneg)
 
-    # X(alpha) along the step is exactly X - alpha * B, so the line search is
-    # elementwise: no candidate factors and no extra matmuls are materialised.
+    # X(alpha) along the step is exactly X - alpha * B, so the line search needs no extra matmul.
     if axis == 0:
         B = d @ other
-        base = rowwise(X, T, prep, 1, dtype=torch.float64)
+        base = _nnal_rowwise(X, T, prep, 1, dtype=torch.float64)
         expand = lambda a: a[:, None]
     else:
         B = other @ d.T
-        base = rowwise(X, T, prep, 0, dtype=torch.float64)
+        base = _nnal_rowwise(X, T, prep, 0, dtype=torch.float64)
         expand = lambda a: a[None, :]
 
     accepted = torch.zeros_like(alpha)
     done = torch.zeros_like(alpha, dtype=torch.bool)
     num_backtracks = 0
-    for _ in range(ls_max):
+    for _ in range(8):
         trial = torch.where(done, torch.zeros_like(alpha), alpha)
         dim = 1 if axis == 0 else 0
-        # The Armijo decrease can fall below what the float32 elementwise terms
-        # resolve, which makes the test fail spuriously and backtrack to the cap.
-        # Accept anything that is not measurably worse than the target; the size
-        # of "measurably" is set by _ARMIJO_FLOOR.
+        # Accept a step that is not measurably worse than the Armijo target (see _ARMIJO_FLOOR).
         noise = _ARMIJO_FLOOR * torch.finfo(V.dtype).eps * base.abs()
-        ok = (rowwise(X - expand(trial) * B, T, prep, dim, dtype=torch.float64)
+        ok = (_nnal_rowwise(X - expand(trial) * B, T, prep, dim, dtype=torch.float64)
               <= base - 1e-4 * trial * slope + noise) | (trial == 0)
         accepted = torch.where(ok & ~done, trial, accepted)
         done = done | ok
@@ -186,9 +159,8 @@ def block_newton_step(V, other, X, T, prep, axis, ls_max=8, jitter_rel=1e-9, non
     return V_new, X_new, (num_backtracks, projected_gnorm2)
 
 
-def block_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True,
-                          convergence_check_interval=1, W_init=None, H_init=None,
-                          jitter_rel=1e-9, compile_mode=None, nonneg_W=True):
+def block_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True, W_init=None, H_init=None,
+                          compile_mode=None, nonneg_W=True):
     """Alternating exact projected-Newton minimization of the NNAL."""
     _, _, rowwise, step_fn = _kernels(compile_mode)
     prep = _nnal_prep(T)
@@ -199,26 +171,17 @@ def block_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True,
     num_steps = 0
     for step in range(max_steps):
         X = W @ H                      # resynchronize against incremental drift
-        W, X, info_W = step_fn(W, H, X, T, prep, 0, jitter_rel=jitter_rel, nonneg=nonneg_W)
+        W, X, info_W = step_fn(W, H, X, T, prep, 0, nonneg=nonneg_W)
         gnorm2 = info_W[1]
         if update_H:
-            H, X, info_H = step_fn(H, W, X, T, prep, 1, jitter_rel=jitter_rel)
+            H, X, info_H = step_fn(H, W, X, T, prep, 1)
             gnorm2 = gnorm2 + info_H[1]
-            # A component dead in BOTH factors has a zero Hessian block and zero
-            # gradient in either step -- no Newton or gradient move reaches it.
-            # Same remedy as the multiplicative update: re-seed it.
+            # A component dead in both factors has zero gradient and Hessian: no step reaches it, so re-seed it.
             W, H = _reseed_dead(W, H)
         num_steps = step + 1
-        if rel_tol > 0 and num_steps % convergence_check_interval == 0:
-            # rel_tol is the relative change in the loss between checks, the same
-            # meaning it has for every other method; the sum is accumulated in
-            # float64 so the test cannot fire on float32 quantization noise. The
-            # projected-gradient (KKT) test is kept as a fallback for data a
-            # rank-`num_materials` model fits exactly -- the shifted loss then goes
-            # to zero and its relative change stays O(1) forever, while the
-            # gradient still vanishes. A KKT test alone is not enough because it is
-            # relative to the gradient at the START, so a better initialization
-            # makes the same rel_tol a stricter target.
+        if rel_tol > 0:
+            # The relative loss change per step, summed in float64; the projected-gradient (KKT) test catches data
+            # the model fits exactly, whose loss goes to zero and whose relative change never becomes small.
             loss = rowwise(X, T, prep, 1, dtype=torch.float64).sum()
             gnorm = gnorm2.sqrt()
             if gnorm0 is None:
@@ -232,19 +195,16 @@ def block_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True,
 
 
 def solve_W(T, H, W_init=None, max_steps=100, rel_tol=1e-12, nonneg=True, compile_mode=None):
-    """The pixel coefficients for a fixed H: independent convex problems per pixel,
-    solved by block-Newton W steps from W_init (or a clamped least-squares warm
-    start, the initialization optimize() uses). The single home of the "re-solve
-    W given H" call; callers pass the tolerances they need."""
+    """The pixel coefficients for a fixed H: independent convex problems per pixel, solved by block-Newton W steps
+    from W_init (default: a clamped least-squares start). W >= 0 unless nonneg=False."""
     if W_init is None:
         W_init = torch.linalg.lstsq(H.T, T.T)[0].T.clamp(min=0)
     W, _, _ = block_newton_optimize(T, H.shape[0], max_steps, rel_tol, update_H=False, W_init=W_init, H_init=H,
                                     compile_mode=compile_mode, nonneg_W=nonneg)
     return W
 
-def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, damping=1e-12,
-                     precond_jitter=1e-8, prep=None, verbose=False, nnal=None, deriv=None, tilt_H=None,
-                     nonneg_W=True, w_mask=None):
+def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, nnal=None, deriv=None,
+                      nonneg_W=True, w_mask=None):
     """Joint truncated-Newton solve on (W, H) by preconditioned CG, from a warm start.
 
     Each step forms the projected gradient (entries at zero with an outward
@@ -266,20 +226,17 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, damping=1e-
     w -- so H can be estimated without the truncation bias the bound induces
     (unconstrained_spectra). w_mask (bool, W's shape) holds coefficients outside
     the mask at their current value, zero for a selected support
-    (support_selected_spectra). tilt_H adds the linear term <tilt_H, H> to the
-    objective: its gradient enters gH and the line search, its Hessian is zero
-    (bias_corrected_spectra).
+    (support_selected_spectra).
     """
-    def tilt(Hx):
-        return 0.0 if tilt_H is None else (tilt_H * Hx).sum(dtype=torch.float64)
     nnal = stable_nnal if nnal is None else nnal
     deriv = stable_nnal_derivatives if deriv is None else deriv
     prep = _nnal_prep(T) if prep is None else prep
-    W = W.clone(); H = H.clone()
+    W = W.clone()
+    H = H.clone()
     rank = W.shape[1]
     rows, cols = torch.triu_indices(rank, rank, device=W.device)
-    loss = nnal(W @ H, T, prep, dtype=torch.float64) + tilt(H)
-    lam = damping
+    loss = nnal(W @ H, T, prep, dtype=torch.float64)
+    lam = 1e-12
     total_cg = 0
     step = 0
     gnorm0 = None
@@ -287,8 +244,6 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, damping=1e-
         X = W @ H
         G, Z = deriv(X, T, prep)
         gW, gH = G @ H.T, W.T @ G
-        if tilt_H is not None:
-            gH = gH + tilt_H
         fW = ~((W <= 0) & (gW > 0)) if nonneg_W else torch.ones_like(W, dtype=torch.bool)
         if w_mask is not None:
             fW = fW & w_mask
@@ -297,22 +252,17 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, damping=1e-
         gnorm2 = _joint_dot(gW, gW, gH, gH)
         if not torch.isfinite(gnorm2) or gnorm2 == 0:
             break
-        # KKT fallback: for data a rank-`num_materials` model fits exactly, the
-        # shifted loss goes to zero and its relative change stays O(1) forever, but
-        # the projected gradient still vanishes. The primary test is on the loss,
-        # below, because this one is relative to the gradient at the start and so
-        # tightens with a better initialization. Since this test only ever fires in
-        # the loss -> 0 regime, it is set tight there: in a quadratic basin
-        # loss ~ g^2, so a gradient ratio of rel_tol is a loss ratio of only
-        # rel_tol^2, and machine precision needs a gradient ratio of a few tens of eps.
+        # KKT fallback for data the model fits exactly, where the shifted loss goes to zero and its relative change
+        # stays O(1). It fires only as loss -> 0, where loss ~ g^2, so a gradient ratio of rel_tol is a loss ratio of
+        # rel_tol^2; machine precision needs a gradient ratio of a few tens of eps. The loss test below is primary.
         gnorm = gnorm2.sqrt()
         if gnorm0 is None:
             gnorm0 = gnorm
         elif rel_tol > 0 and gnorm <= max(rel_tol ** 2, 100 * torch.finfo(T.dtype).eps) * gnorm0:
             break
 
-        LW = _joint_blocks(Z @ (H[rows] * H[cols]).T, rows, cols, rank, fW, precond_jitter)
-        LH = _joint_blocks(((W[:, rows] * W[:, cols]).T @ Z).T, rows, cols, rank, fH.T, precond_jitter)
+        LW = _joint_blocks(Z @ (H[rows] * H[cols]).T, rows, cols, rank, fW, 1e-8)
+        LH = _joint_blocks(((W[:, rows] * W[:, cols]).T @ Z).T, rows, cols, rank, fH.T, 1e-8)
 
         def precond(rW, rH):
             zW = torch.cholesky_solve(rW.unsqueeze(-1), LW).squeeze(-1) * fW
@@ -331,7 +281,8 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, damping=1e-
             return ((ZdX @ H.T + G @ dH.T) * fW + lam * dW,
                     (W.T @ ZdX + dW.T @ G) * fH + lam * dH)
 
-        xW = torch.zeros_like(gW); xH = torch.zeros_like(gH)
+        xW = torch.zeros_like(gW)
+        xH = torch.zeros_like(gH)
         rW, rH = -gW, -gH
         zW, zH = precond(rW, rH)
         pW, pH = zW.clone(), zH.clone()
@@ -346,14 +297,17 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, damping=1e-
                 if ncg == 1: xW, xH = zW, zH
                 break
             a = rz / pAp
-            xW = xW + a * pW; xH = xH + a * pH
-            rW = rW - a * ApW; rH = rH - a * ApH
+            xW = xW + a * pW
+            xH = xH + a * pH
+            rW = rW - a * ApW
+            rH = rH - a * ApH
             if _joint_dot(rW, rW, rH, rH) <= tol2:
                 break
             zW, zH = precond(rW, rH)
             rz_new = _joint_dot(rW, zW, rH, zH)
             b = rz_new / rz
-            pW = zW + b * pW; pH = zH + b * pH
+            pW = zW + b * pW
+            pH = zH + b * pH
             rz = rz_new
         total_cg += ncg
 
@@ -365,32 +319,26 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, damping=1e-
         for _ in range(30):
             Wn = (W + a * xW).clamp_(min=0) if nonneg_W else W + a * xW
             Hn = (H + a * xH).clamp_(min=0)
-            new_loss = nnal(Wn @ Hn, T, prep, dtype=torch.float64) + tilt(Hn)
+            new_loss = nnal(Wn @ Hn, T, prep, dtype=torch.float64)
             if torch.isfinite(new_loss) and new_loss <= loss + 1e-4 * a * slope:
-                accepted = True; break
+                accepted = True
+                break
             a *= 0.5
         if not accepted:
             lam = lam * 10.0 if lam > 0 else 1e-12
             if lam > 1e6: break
             continue
         lam = max(lam * 0.3, 1e-14)
-        # No stagnation heuristic here either. At the precision floor the line
-        # search stops finding an acceptable step, which escalates the damping and
-        # terminates through the lam > 1e6 path above -- a real signal rather than
-        # a threshold on a quantity too noisy to threshold.
-        # rel_tol is the relative change in the loss per accepted step, summed in
-        # float64, the same meaning it has for every other method.
+        # At the precision floor no step is accepted, the damping escalates, and the lam > 1e6 test above ends
+        # the solve; rel_tol is the relative loss change per accepted step.
         rel_change = torch.abs(loss - new_loss) / torch.abs(new_loss).clamp_min(torch.finfo(torch.float64).tiny)
         W, H, loss = Wn, Hn, new_loss
         if rel_tol > 0 and bool(rel_change <= rel_tol):
             break
-        if verbose:
-            print(f'  step {step:3d} cg {ncg:3d} a {a:.3g} loss {loss.item():.6e}', flush=True)
     return W, H, step, total_cg
 
 
-def joint_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True,
-                          convergence_check_interval=1, W_init=None, H_init=None,
+def joint_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True, W_init=None, H_init=None,
                           warmup_steps=5, cg_max=10, compile_mode=None):
     """Block-Newton warm-up followed by a joint (W,H) preconditioned Newton solve.
 
@@ -401,24 +349,19 @@ def joint_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True,
     alternating method is still the right way to get into the basin, so it runs
     first.
 
-    update_H=False is not supported here (the joint step updates both factors);
-    it falls back to block-Newton alone.
-
-    warmup_steps=5 and cg_max=10 were chosen by interleaved A/B at equal converged
-    quality: a block warm-up step costs more than a one-CG-iteration joint step,
-    and past a handful of them the joint solver makes better use of the time.
+    With update_H=False only W is solved, by block Newton (the joint step needs both factors free). A block
+    warm-up step costs more than a joint step with one CG iteration, so a few warm-up steps are enough.
     """
+    if not update_H:
+        return block_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=False, W_init=W_init,
+                                     H_init=H_init, compile_mode=compile_mode)
     nnal_fn, deriv_fn, _, step_fn = _kernels(compile_mode)
     prep = _nnal_prep(T)
     W, H = W_init, H_init
-    X = W @ H
     for _ in range(min(warmup_steps, max_steps)):
         X = W @ H
         W, X, _ = step_fn(W, H, X, T, prep, 0)
-        if update_H:
-            H, X, _ = step_fn(H, W, X, T, prep, 1)
-    if not update_H:
-        return W, H, min(warmup_steps, max_steps)
+        H, X, _ = step_fn(H, W, X, T, prep, 1)
     remaining = max(0, max_steps - warmup_steps)
     if remaining == 0:
         return W, H, min(warmup_steps, max_steps)
