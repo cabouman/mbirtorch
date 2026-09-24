@@ -28,7 +28,7 @@ import warnings
 import numpy as np
 
 from ..utilities import makedirs
-from .loading import INPUT_TYPES, convert_to_hdf5, load_dataset
+from .loading import INPUT_TYPES, _converted_path, convert_to_hdf5, load_dataset
 from .outputs import component_check, fit_quality, write_dehydrated, write_denoised
 from .rank import estimate_rank
 
@@ -131,6 +131,17 @@ def _output_path(output, default_name):
     return path
 
 
+def _check_outputs(paths, inputs, overwrite):
+    """Refuse an output that is an input of the run, and an existing output unless --overwrite."""
+    existing = [p for p in paths if os.path.exists(p)]
+    for p in existing:
+        if any(i and os.path.exists(i) and os.path.samefile(p, i) for i in inputs):
+            raise FileExistsError(f"the output {p} is an input of this run; choose another output")
+    if existing and not overwrite:
+        raise FileExistsError(f"{', '.join(existing)} already exist{'s' if len(existing) == 1 else ''}; pass "
+                              "--overwrite to replace")
+
+
 def _out_type(ds, args):
     if args.as_type:
         return args.as_type
@@ -210,7 +221,9 @@ def cmd_inspect(args):
 
 
 def cmd_convert(args):
-    out, checks, _ = convert_to_hdf5(args.input, output=args.output, open_beam=args.open_beam,
+    out = args.output or _converted_path(args.input)
+    _check_outputs([out], [args.input, *(args.open_beam or [])], args.overwrite)
+    out, checks, _ = convert_to_hdf5(args.input, output=out, open_beam=args.open_beam,
                                      input_type=args.input_type, dataset=args.dataset, dose=args.dose,
                                      views=_parse_slice(args.views, "views"),
                                      wave_range=_parse_slice(args.wave_range, "wave-range"), wave_bin=args.wave_bin,
@@ -241,6 +254,9 @@ def _pipeline(args, denoise):
     _resolve_rank(ds, args, device)
     stem = os.path.splitext(os.path.basename(os.path.normpath(args.input)))[0]
     base = os.path.splitext(_output_path(args.output, stem + ".h5"))[0]
+    names = ((["_dehydrated.h5"] if not (denoise and args.no_dehydrated) else []) + (["_denoised.h5"] if denoise else [])
+             + ["_report.json"] + ([] if args.no_plots else ["_spectra.png", "_maps.png"]))
+    _check_outputs([base + n for n in names], [args.input, *(args.open_beam or [])], args.overwrite)
     if args.dry_run:
         plan_memory(ds, device, args.mode, args.chunk_pixels, args.spectra)
         print(f"dry run: data loaded and checked, {args.rank_note}; no solve. Output base: {base}")
@@ -315,6 +331,7 @@ def cmd_rehydrate(args):
              H.shape[1], K_file, out_type)
     stem = re.sub(r"_dehydrated$", "", os.path.splitext(os.path.basename(args.input))[0])
     path = _output_path(args.output, stem + "_rehydrated.h5")
+    _check_outputs([path], [args.input], args.overwrite)
     attrs = {k: v for k, v in attrs.items() if k not in ("rank", "rehydrated")}
     attrs.update(dehydrated_source=os.path.abspath(args.input), rehydrated_bins=f"{bin_indices[0]}..{bin_indices[-1]}")
     write_denoised(path, (V, rows, cols), W4.reshape(-1, R).astype(np.float32), H.astype(np.float32), out_type,
@@ -358,7 +375,7 @@ class _Options:
         self.add(g, "--open-beam", nargs="+", metavar="DIR", help="open-beam TIFF stack(s), needed when the TIFFs "
                  "hold counts; a directory of observation subdirectories is averaged over them")
         self.add(g, "--dose", type=float, metavar="D",
-                 help="open-beam counts per pixel and bin, when no open beam gives it")
+                 help="open-beam counts per pixel and source bin, when no open beam or converted file gives it")
         self.add(g, "--input-type", choices=("auto",) + INPUT_TYPES, default="auto",
                  help="what the values are (default: inferred)")
         self.add(g, "--dataset", metavar="GROUP", help="HDF5 group holding 'data' (default: found automatically)")
@@ -403,6 +420,7 @@ class _Options:
             self.add(g, "--no-dehydrated", action="store_true",
                      help="write only the denoised data, not the dehydrated file")
         self.add(g, "--no-plots", action="store_true", help="skip the PNG plots of the maps and spectra")
+        self.add(g, "--overwrite", action="store_true", help="replace outputs that already exist")
         g = sp.add_argument_group("model")
         self.add(g, "--rank", "-r", type=_rank_arg, default="auto", metavar="N",
                  help="number of materials (default: estimated from the data)")
@@ -458,9 +476,10 @@ def build_parser(show_all=False):
                                        "the hsnt layout, streamed in blocks of bins")
     opt.input(s)
     g = s.add_argument_group("output")
-    opt.add(g, "-o", "--output", metavar="PATH", help="output .h5 (default: <input>.h5)")
+    opt.add(g, "-o", "--output", metavar="PATH", help="output .h5 (default: <input>_converted.h5)")
     opt.add(g, "--as-type", choices=("attenuation", "transmission"), default="attenuation",
             help="stored quantity (default attenuation)")
+    opt.add(g, "--overwrite", action="store_true", help="replace the output if it already exists")
     opt.run(s)
     g = s.add_argument_group("advanced: streaming")
     opt.add(g, "--memory-budget", type=float, default=256, metavar="MiB", advanced=True,
@@ -487,6 +506,7 @@ def build_parser(show_all=False):
                                                      "path; default name <stem>_rehydrated.h5")
     opt.add(g, "--as-type", choices=("attenuation", "transmission"),
             help="quantity to write (default: the file's dataset_type)")
+    opt.add(g, "--overwrite", action="store_true", help="replace the output if it already exists")
     opt.run(s)
     s.set_defaults(func=cmd_rehydrate)
 

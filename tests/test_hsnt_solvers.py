@@ -162,6 +162,19 @@ def test_streamed_unconstrained_spectra_return_nonnegative_maps(dev):
     assert abs(_loss(W, H, T) - _loss(Wu, Hu, T)) <= 1e-2 * _loss(Wu, Hu, T)
 
 
+def test_rank_one_below_max_rank_is_found(dev):
+    """With the true rank one below max_rank a real component is among the last three gains; it must not raise the
+    noise floor and collapse the estimate."""
+    rng = np.random.default_rng(0)
+    P, K, R = 2000, 300, 5
+    x = np.linspace(0, 1, K)
+    H = np.stack([0.1 + 0.9 * np.exp(-((x - (r + 0.5) / R) / (0.6 / R)) ** 2) for r in range(R)])
+    W = rng.dirichlet(np.full(R, 0.5), P) * rng.uniform(0.3, 2.0, (P, 1))
+    T = (rng.poisson(50.0 * np.exp(-W @ H)) / 50.0).astype(np.float32)
+    rank, _, detail = hsnt.estimate_rank(T, device=dev, max_rank=6)
+    assert rank == R and detail["full"]["noise_tail"]
+
+
 def test_packaged_material_basis_loads():
     basis, wavelengths = hsnt.load_material_basis()
     assert basis.shape == (3, 1200) and wavelengths.shape == (1200,) and basis.min() >= 0
@@ -241,16 +254,19 @@ def test_free_refit_keeps_the_supports_and_w_nonnegative(dev):
     assert support_z.sum() >= support.sum() and abs(_loss(Wz, Hz, T) - _loss(Wu, Hu, T)) <= 2e-3 * _loss(Wu, Hu, T)
 
 
-def test_free_sign_pixel_fits_are_stationary(dev):
+def test_pixel_fits_meet_the_kkt_conditions(dev):
+    """From a uniform start, where the coupled Newton step pushes entries at zero outward, every pixel's w >= 0 fit
+    reaches its KKT point; the free-sign fit reaches a zero gradient with some coefficients negative."""
     T, _, Ht = _problem(dev, P=512)
     H = Ht.float()
     idx = torch.arange(3, device=dev).expand(512, 3).contiguous()
     valid = torch.ones_like(idx, dtype=torch.bool)
+    w, _ = _fit_free_sets(T, H, idx, valid, torch.full((512, 3), 0.5, device=dev), steps=8)
+    g = stable_nnal_derivatives(w @ H, T, _nnal_prep(T))[0] @ H.T / T.shape[1]
+    assert w.min() >= 0 and torch.where(w > 0, g.abs(), (-g).clamp(min=0)).max() < 1e-6
     w, _ = _fit_free_sets(T, H, idx, valid, torch.zeros(512, 3, device=dev), steps=40, nonneg=False)
-    G, _ = stable_nnal_derivatives(w @ H, T, _nnal_prep(T))
-    g = G @ H.T                                                     # per-pixel gradient, all coefficients free
-    assert (g.norm(dim=1) / (T.shape[1] ** 0.5)).max() < 1e-3
-    assert bool((w < 0).any())                                      # some coefficients go negative: the bound is off
+    g = stable_nnal_derivatives(w @ H, T, _nnal_prep(T))[0] @ H.T / T.shape[1]
+    assert g.abs().max() < 1e-3 and bool((w < 0).any())            # the bound is off
 
 
 def test_component_guard_reverts_an_empty_component(dev):

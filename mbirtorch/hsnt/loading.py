@@ -66,17 +66,28 @@ def _stats(a):
                 nonfinite=_frac(~np.isfinite(s)), negative=_frac(s < 0), zero=_frac(s == 0), sampled=s.size < a.size)
 
 
-def infer_input_type(a):
-    """Guess whether an array holds counts, transmissions or attenuations from its values. Returns (type, reason)."""
-    st = _stats(a)
-    s = a.reshape(-1)[:: max(1, a.size // 200_000)]
+def infer_input_type(a, source_dtype=None):
+    """Guess whether an array holds counts, transmissions or attenuations from its values. Returns (type, reason).
+
+    Integer data (an integer source dtype, or integer values) are counts; data with negative values are attenuations,
+    since a transmission cannot be negative; nonnegative values up to 1.05 are transmissions. Nonnegative
+    non-integer data with larger values could be noisy transmissions or attenuations, and raise ValueError.
+    """
+    s = np.asarray(a).reshape(-1)[:: max(1, a.size // 200_000)]
     s = s[np.isfinite(s)]
-    if st["min"] >= 0 and st["max"] <= 1.05:
-        return "transmission", f"values in [{st['min']:.3g}, {st['max']:.3g}] look like transmission ratios"
-    integral = np.allclose(s, np.round(s), atol=1e-6)
-    if st["min"] >= 0 and st["max"] > 5 and (integral or st["median"] > 3):
-        return "counts", f"nonnegative with max {st['max']:.3g}" + (", integer-valued" if integral else "") + ": counts"
-    return "attenuation", f"min {st['min']:.3g} max {st['max']:.3g} (negatives {st['negative']:.1%}): attenuation"
+    if s.size == 0:
+        raise ValueError("the data have no finite values to infer the input type from; pass --input-type")
+    lo, hi, med = float(s.min()), float(s.max()), float(np.median(s))
+    if source_dtype is not None and np.dtype(source_dtype).kind in "iu":
+        return "counts", f"integer source dtype {source_dtype}: counts"
+    if lo >= 0 and np.array_equal(s, np.round(s)):
+        return "counts", f"nonnegative integer values up to {hi:.3g}: counts"
+    if lo < 0:
+        return "attenuation", f"negative values (min {lo:.3g}): attenuation"
+    if hi <= 1.05:
+        return "transmission", f"values in [{lo:.3g}, {hi:.3g}]: transmission ratios"
+    raise ValueError(f"cannot tell whether the values (min {lo:.3g}, median {med:.3g}, max {hi:.3g}) are "
+                     "transmissions or attenuations: pass --input-type transmission or --input-type attenuation")
 
 
 def _summary_from_T(T, dose):
@@ -188,7 +199,8 @@ class _TiffBlocks:
         self.downsample, self.workers, self.desc = downsample, workers, desc
         self.rows, self.cols = np.empty(self.full_shape, dtype=bool)[::downsample, ::downsample].shape
         self.views = 1
-        self.file_type = None
+        self.file_type, self.file_dose = None, None
+        self.source_bins = self.first_index + np.arange(len(self.files))
         self.metadata = dict(files=len(self.files), first_file=os.path.basename(self.files[0]),
                              last_file=os.path.basename(self.files[-1]))
 
@@ -225,6 +237,10 @@ class _Hdf5Blocks:
         self.source_dtype = str(d.dtype)
         ks = range(d.shape[-1])[slice(*wave_range)] if wave_range else range(d.shape[-1])
         self.first_index, self.bins = (ks[0], len(ks)) if len(ks) else (0, 0)
+        columns = g["bin_indices"][()] if "bin_indices" in g and g["bin_indices"].shape == (d.shape[-1],) else None
+        self.source_bins = (np.arange(d.shape[-1]) if columns is None else np.asarray(columns))[list(ks)]
+        dose = g.attrs.get("dose", self.f.attrs.get("dose"))                  # per file column; -1 when unknown
+        self.file_dose = float(dose) if dose is not None and float(dose) > 0 else None
         self.desc = f"{path}:{self.gname}"
         scalars = {k: g[k][()] for k in g if isinstance(g[k], h5py.Dataset) and k not in ("data", "dataset_type")
                    and g[k].ndim == 0}
@@ -299,8 +315,10 @@ def _resolve_input_type(input_type, src, probe, open_beam):
         itype, why = input_type, "given"
     elif src.file_type in ("attenuation", "transmission"):
         itype, why = src.file_type, "from the file's dataset_type"
+    elif open_beam and isinstance(src, _TiffBlocks):
+        itype, why = "counts", "an open beam was given"
     else:
-        itype, why = infer_input_type(probe)
+        itype, why = infer_input_type(probe, src.source_dtype)
     if itype == "counts" and not (isinstance(src, _TiffBlocks) and open_beam):
         raise ValueError(f"the input holds counts ({why}) but no open beam was given: pass --open-beam DIR, or "
                          "--input-type transmission/attenuation if the values are already normalized")
@@ -371,10 +389,12 @@ def _check_host_memory(n_bytes, what):
         warnings.warn(f"{what} needs {n_bytes / 2**30:.1f} GiB of the {avail / 2**30:.1f} GiB of host memory available")
 
 
-def _merge_dose(dose, estimate):
-    """The dose to use: the given one, checked against the open-beam estimate, else the estimate."""
+def _merge_dose(dose, estimate, src, wave_bin):
+    """The dose per grouped bin: the given one (per source bin, so times wave_bin), checked against the open-beam
+    estimate, else the estimate, else the dose an HDF5 input records (per file column, times wave_bin)."""
     if dose is None:
-        return estimate
+        return estimate if estimate is not None or src.file_dose is None else src.file_dose * wave_bin
+    dose = dose * wave_bin
     if estimate is not None and abs(dose - estimate) / estimate > 0.5:
         warnings.warn(f"the given dose {dose:.3g} differs from the open-beam estimate {estimate:.3g} by more than 50%")
     return dose
@@ -391,7 +411,8 @@ def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=Non
         input_type (str, optional): 'counts', 'transmission', 'attenuation' or 'auto' (the file's dataset_type, else
             inferred from the values). Defaults to 'auto'.
         dataset (str, optional): HDF5 group holding 'data'. Defaults to None: the root, or the only group with one.
-        dose (float, optional): Open-beam counts per pixel and bin, overriding the open-beam estimate. Defaults to None.
+        dose (float, optional): Open-beam counts per pixel and source bin, overriding the open-beam estimate and the
+            dose an HDF5 input records; the loaded dose is per grouped bin, wave_bin times this. Defaults to None.
         views (tuple, optional): (start, stop) of the views of 4-D HDF5 data. Defaults to None, all views.
         wave_range (tuple, optional): (start, stop) over the source bins. Defaults to None, all bins.
         wave_bin (int, optional): Group this many adjacent bins. Defaults to 1.
@@ -421,10 +442,10 @@ def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=Non
         if itype == "counts":
             info["open_beam_observations"] = n_obs
         info.update(src.metadata, load_seconds=round(time.perf_counter() - t0, 2))
-        bin_indices = src.first_index + np.arange(0, T.shape[1] * wave_bin, wave_bin)
+        bin_indices = src.source_bins[:T.shape[1] * wave_bin:wave_bin]
         ds = Dataset(T=T, dataset_type=itype, spatial_shape=(V, rows, cols), bin_indices=bin_indices,
-                     dose=_merge_dose(dose, dose_estimate), source=path if isinstance(src, _TiffBlocks) else src.desc,
-                     info=info)
+                     dose=_merge_dose(dose, dose_estimate, src, wave_bin),
+                     source=path if isinstance(src, _TiffBlocks) else src.desc, info=info)
     finally:
         src.close()
     sm = _summary_from_T(ds.T, ds.dose)
@@ -449,6 +470,11 @@ def _block_bins(sample, n_obs, wave_bin, budget_mib, requested):
     return min(block, sample.bins // wave_bin * wave_bin) or wave_bin
 
 
+def _converted_path(path):
+    """The default output of convert: <input stem>_converted.h5 beside the input, so it never replaces the input."""
+    return os.path.splitext(os.path.normpath(path))[0] + "_converted.h5"
+
+
 def convert_to_hdf5(path, output=None, open_beam=None, input_type="auto", dataset=None, dose=None, views=None,
                     wave_range=None, wave_bin=1, downsample=1, as_type="attenuation", block_bins=None,
                     memory_budget_mib=256, workers=None, strict=False, progress=False):
@@ -457,7 +483,8 @@ def convert_to_hdf5(path, output=None, open_beam=None, input_type="auto", datase
     Memory holds a few blocks, not the stack. The arguments of :func:`load_dataset` select and interpret the input.
 
     Args:
-        output (str, optional): Output path. Defaults to None, the input's name with .h5.
+        output (str, optional): Output path, which must not be the input. Defaults to None,
+            <input stem>_converted.h5.
         as_type (str, optional): Quantity stored, 'attenuation' or 'transmission'. Defaults to 'attenuation'.
         block_bins (int, optional): Bins per block. Defaults to None, from memory_budget_mib.
         memory_budget_mib (float, optional): Working memory for the blocks in MiB. Defaults to 256.
@@ -473,10 +500,10 @@ def convert_to_hdf5(path, output=None, open_beam=None, input_type="auto", datase
     src = _open_source(path, dataset, views, wave_range, downsample, workers, open_beam)
     V, rows, cols, nb = src.views, src.rows, src.cols, src.bins
     P = V * rows * cols
-    probe = src.read(0, min(nb, max(8, wave_bin)))
+    probe = np.concatenate([src.read(k, k + 1) for k in np.unique(np.linspace(0, nb - 1, 16).astype(int))], axis=-1)
     itype, why = _resolve_input_type(input_type, src, probe, open_beam)
     log.info("input type: %s (%s)", itype, why if input_type != "auto" or src.file_type else
-             f"{why}, from the first {probe.shape[-1]} bins")
+             f"{why}, from {probe.shape[-1]} bins across the range")
     del probe
     obs = _open_beam_blocks(open_beam, wave_range, downsample, workers, src) if itype == "counts" else []
     wave_bin = max(1, wave_bin)
@@ -484,7 +511,9 @@ def convert_to_hdf5(path, output=None, open_beam=None, input_type="auto", datase
     if K == 0:
         raise ValueError(f"a wave bin of {wave_bin} exceeds the {nb} selected bins")
     block = _block_bins(src, len(obs), wave_bin, memory_budget_mib, block_bins)
-    out = output or (os.path.splitext(os.path.normpath(path))[0] + ".h5")
+    out = output or _converted_path(path)
+    if os.path.exists(out) and any(os.path.exists(p) and os.path.samefile(out, p) for p in [path, *(open_beam or [])]):
+        raise ValueError(f"the output {out} is an input of the conversion; choose another output")
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     log.info("streaming %d bins per block (%d blocks), %d TIFF reader threads -> %s (%s, %.2f GiB)", block,
              -(-nb // block), workers, out, as_type, P * K * 4 / 2**30)
@@ -541,7 +570,7 @@ def convert_to_hdf5(path, output=None, open_beam=None, input_type="auto", datase
             if dose_blocks:
                 vals, w = np.array([v for v, _ in dose_blocks]), np.array([n for _, n in dose_blocks])
                 dose_estimate = float(np.median(np.repeat(vals, w)))
-            dose = _merge_dose(dose, dose_estimate)
+            dose = _merge_dose(dose, dose_estimate, src, wave_bin)
             _warn_conversion(dict(open_beam_zero_frac=ob_zero / K, attenuation_nonfinite_frac=nonfinite_in / K))
             if tot["inf_out"]:
                 warnings.warn(f"{tot['inf_out']} zero-transmission entries are inf in the attenuation output; the "
@@ -553,7 +582,7 @@ def convert_to_hdf5(path, output=None, open_beam=None, input_type="auto", datase
                       dead_px=_frac(pos_px == 0), dead_bins=dead_bins,
                       const_bins=int((bin_max == bin_min).sum()) - dead_bins, dose=dose)
             checks = _checks_from_summary(sm, (V, rows, cols), strict)
-            f.create_dataset("bin_indices", data=np.arange(src.first_index, src.first_index + K * wave_bin, wave_bin))
+            f.create_dataset("bin_indices", data=src.source_bins[:K * wave_bin:wave_bin])
             attrs = dict(source=path if isinstance(src, _TiffBlocks) else src.desc, input_type=itype,
                          downsample=downsample, wave_bin=wave_bin, block_bins=block, mbirtorch_hsnt_cli="1",
                          checks=json.dumps([dict(level=c.level, message=c.message) for c in checks]))

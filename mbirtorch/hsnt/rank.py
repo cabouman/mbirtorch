@@ -1,4 +1,5 @@
 """Rank (number of materials) estimation by sequential likelihood-ratio tests on the NNAL factorization."""
+import math
 import warnings
 
 import numpy as np
@@ -21,9 +22,11 @@ def _lrt_rank(T, max_rank, label, verbose=0):
         Td = T.double()
         losses.append(stable_nnal(Xd, Td).item())
         resid.append((((Td - Th) ** 2) / Th.clamp_min(1e-12)).mean().item())
-    dose_eff = 1.0 / resid[-1]
+    dose_eff = 1.0 / max(resid[-1], np.finfo(np.float64).tiny)
     gains = [dose_eff * (losses[i - 1] - losses[i]) for i in range(1, len(losses))]     # gains[i - 1]: component i + 1
-    floor = max(0.5 * (P + K), float(np.median(gains[-3:])))
+    edge = 0.5 * (math.sqrt(P) + math.sqrt(K)) ** 2          # the gain of a component fitted to noise alone
+    quiet = [g for g in gains[-3:] if g < 2.0 * edge]
+    floor = max(0.5 * (P + K), float(np.median(quiet))) if quiet else edge
     threshold = 2.0 * floor
     rank = 1
     for r, g in zip(range(2, max_rank + 1), gains):
@@ -36,7 +39,7 @@ def _lrt_rank(T, max_rank, label, verbose=0):
         print(f"rank search ({label}, {P:,} pixels x {K} bins): effective dose {dose_eff:.3g}; log-likelihood gain of "
               f"component {table}; noise floor {floor:.0f}, threshold {threshold:.0f} -> rank {rank}")
     return rank, dict(pixels=P, losses=losses, gains=gains, effective_dose=dose_eff, noise_floor=floor,
-                      threshold=threshold)
+                      threshold=threshold, noise_tail=bool(quiet) or max_rank == 1)
 
 
 def _pool_pixels(T, spatial_shape, block):
@@ -65,9 +68,11 @@ def estimate_rank(T, spatial_shape=None, device=None, max_rank=6, subsample=1638
 
     Ranks 1 to max_rank are fitted in turn. The loss gain of each added component is converted to log-likelihood
     units with a dose calibrated from the residual of the most flexible fit (the mean of (T - e^-X)^2 / e^-X is
-    1 / dose for Poisson noise), so the nominal dose does not matter. A component that fits only noise gains about
-    (P + K) / 2, its parameter count; the noise floor is the larger of that and the median gain of the last three
-    ranks, and a component is accepted while its gain exceeds twice the floor.
+    1 / dose for Poisson noise), so the nominal dose does not matter. A component that fits only noise gains at most
+    about 0.5 (sqrt(P) + sqrt(K))^2, the top of the noise's singular spectrum. The noise floor is the median gain of
+    those of the last three ranks that stay below twice that, and at least (P + K) / 2; a component is accepted
+    while its gain exceeds twice the floor. When none of the last three gains is that small, the search is capped
+    and a warning says to raise max_rank.
 
     That floor grows with the pixel count as fast as a faint material's evidence, so at low dose the full-resolution
     test misses weak materials. Pooling blocks of neighboring pixels keeps the evidence (summed counts stay Poisson)
@@ -80,7 +85,7 @@ def estimate_rank(T, spatial_shape=None, device=None, max_rank=6, subsample=1638
             which disables pooling.
         device (str, optional): Torch device for the solves. Defaults to None, meaning CUDA if available, else CPU.
         max_rank (int, optional): Largest rank considered. Defaults to 6.
-        subsample (int, optional): Pixels used at full resolution (every n-th pixel). Defaults to 16384.
+        subsample (int, optional): Pixels used at full resolution, a seeded random subset. Defaults to 16384.
         pool (str or int, optional): Pooling block size. 'auto' (default) chooses the block from the calibrated dose so
             that pooled pixels hold about 64 counts per bin, with at least about K / 2 pooled pixels and no pooling
             above 64 counts per bin (pooled mixed pixels are not exactly low rank and would add spurious rank at high
@@ -95,8 +100,9 @@ def estimate_rank(T, spatial_shape=None, device=None, max_rank=6, subsample=1638
     device = _default_device(device)
     T_np = T.detach().cpu().numpy() if torch.is_tensor(T) else np.asarray(T)
     pixels, K = T_np.shape
-    stride = max(1, pixels // subsample)
-    Tt = torch.from_numpy(np.ascontiguousarray(T_np[::stride], dtype=np.float32)).to(device)
+    pick = (np.sort(np.random.default_rng(0).choice(pixels, subsample, replace=False)) if pixels > subsample
+            else slice(None))
+    Tt = torch.from_numpy(np.ascontiguousarray(T_np[pick], dtype=np.float32)).to(device)
     rank_full, d_full = _lrt_rank(Tt, max_rank, "full resolution", verbose)
     block = 0
     if spatial_shape is not None and pool:
@@ -116,9 +122,10 @@ def estimate_rank(T, spatial_shape=None, device=None, max_rank=6, subsample=1638
         detail.update(pooled=d_pool, rank_pooled=rank_pool)
         rank = max(rank_full, rank_pool)
         parts.append(f"pooled {block}x{block} ({d_pool['pixels']:,} pixels) gave {rank_pool}")
-    if rank == max_rank:
-        warnings.warn(f"every rank up to max_rank {max_rank} was accepted; the search may be capped, raise max_rank")
-    note = f"rank {rank} estimated by likelihood-ratio tests ({'; '.join(parts)})"
     decisive = detail.get("pooled") or d_full
+    if rank == max_rank or not decisive["noise_tail"]:
+        warnings.warn(f"the largest ranks tried still gain more than noise does; the rank may exceed max_rank "
+                      f"{max_rank}, raise max_rank")
+    note = f"rank {rank} estimated by likelihood-ratio tests ({'; '.join(parts)})"
     detail.update(gains=decisive["gains"], effective_dose=d_full["effective_dose"], threshold=decisive["threshold"])
     return rank, note, detail

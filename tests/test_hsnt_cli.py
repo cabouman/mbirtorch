@@ -68,9 +68,14 @@ def stacks(tmp_path_factory):
 
 
 def test_infer_input_type():
-    assert infer_input_type(np.random.default_rng(0).uniform(0, 1, 1000))[0] == "transmission"
-    assert infer_input_type(np.random.default_rng(0).poisson(30, 1000).astype(np.float32))[0] == "counts"
-    assert infer_input_type(np.random.default_rng(0).normal(0.5, 0.4, 1000))[0] == "attenuation"
+    rng = np.random.default_rng(0)
+    assert infer_input_type(rng.uniform(0, 1, 1000))[0] == "transmission"
+    assert infer_input_type(rng.poisson(30, 1000).astype(np.float32))[0] == "counts"
+    assert infer_input_type(rng.poisson(1.0, 1000).astype(np.float32))[0] == "counts"      # low-dose counts
+    assert infer_input_type(rng.uniform(0, 1, 1000), source_dtype="uint16")[0] == "counts"
+    assert infer_input_type(rng.normal(0.5, 0.4, 1000))[0] == "attenuation"
+    with pytest.raises(ValueError, match="--input-type"):
+        infer_input_type(rng.poisson(1.0, 1000) / 1.0 + rng.uniform(0, 1e-3, 1000))        # noisy transmission or not
     assert _parse_slice("10:20", "x") == (10, 20) and _parse_slice(":5", "x") == (None, 5)
 
 
@@ -236,6 +241,27 @@ def test_rehydrate_command_reconstructs_from_the_dehydrated_file(stacks, tmp_pat
         main(["rehydrate", stacks["h5"], "-o", out, "-q"])               # hyperspectral input is refused
 
 
+def test_outputs_never_replace_the_input_and_existing_ones_need_overwrite(stacks, tmp_path):
+    out = str(tmp_path / "ow")
+    run = ["dehydrate", stacks["h5"], "-o", out, "--rank", str(R), "--max-steps", "50", "--no-plots", "-q"]
+    assert main(run) == 0
+    with pytest.raises(SystemExit, match="--overwrite"):
+        main(run)
+    assert main(run + ["--overwrite"]) == 0
+    deh = os.path.join(out, "processed_dehydrated.h5")
+    with pytest.raises(SystemExit, match="is an input"):
+        main(["rehydrate", deh, "-o", deh, "--overwrite", "-q"])
+    with h5py.File(deh) as f:
+        assert "subspace_basis" in f                                     # the dehydrated file is intact
+    src = str(tmp_path / "copy.h5")
+    with open(stacks["h5"], "rb") as fi, open(src, "wb") as fo:
+        fo.write(fi.read())
+    assert main(["convert", src, "-q"]) == 0                             # the default output is beside the input
+    assert os.path.exists(str(tmp_path / "copy_converted.h5"))
+    with pytest.raises(SystemExit, match="is an input"):
+        main(["convert", src, "-o", src, "--overwrite", "-q"])
+
+
 def test_library_dehydrate_and_hyper_denoise(stacks):
     with h5py.File(stacks["h5"]) as f:
         A = f["sample_dataset/data"][()]                                 # (1, ROWS, COLS, K) attenuation
@@ -274,6 +300,22 @@ def test_convert_streams_in_small_blocks_and_matches_the_direct_load(stacks, tmp
         assert abs(f.attrs["dose"] - ds.dose) / ds.dose < 0.05
         checks = json.loads(f.attrs["checks"])
         assert any("dose" in c["message"] for c in checks) and all(c["level"] != "error" for c in checks)
+
+
+def test_a_converted_file_carries_its_dose_and_source_bins(stacks, tmp_path):
+    out = str(tmp_path / "given_dose.h5")
+    assert main(["convert", stacks["h5"], "-o", out, "--dose", str(DOSE), "--wave-bin", "2", "--wave-range", "4:40",
+                 "-q"]) == 0
+    ds = load_dataset(out)
+    assert ds.dose == pytest.approx(2 * DOSE)                            # counts per grouped bin
+    assert ds.bin_indices.tolist() == list(range(4, 40, 2))              # source bins, not file columns
+    assert load_dataset(out, wave_bin=3).dose == pytest.approx(6 * DOSE)
+    assert load_dataset(stacks["h5"], dose=DOSE, wave_bin=2).dose == pytest.approx(2 * DOSE)
+    res = str(tmp_path / "from_converted")                               # support selection needs no --dose now
+    assert main(["dehydrate", out, "-o", res, "--rank", str(R), "--spectra", "support", "--max-steps", "100",
+                 "--no-plots", "-q"]) == 0
+    with h5py.File(os.path.join(res, "given_dose_dehydrated.h5")) as f:
+        assert f["bin_indices"][()].tolist() == list(range(4, 40, 2))
 
 
 def test_convert_hdf5_to_hdf5_streams(stacks, tmp_path):

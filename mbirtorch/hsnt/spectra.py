@@ -46,8 +46,8 @@ def _fit_free_sets(T, H, idx, valid, w0, steps=8, nonneg=True, rows=None):
 
     idx (P, m) holds material indices (anything where valid is False is padding), w0 (P, m) the start. The per-pixel
     Hessian is the m x m block of the free set, so one Newton step costs a (P, m, K) gather-product whatever R is;
-    entries at zero with an outward gradient are frozen (two-metric projection) and the step is the largest feasible
-    one, checked by a per-pixel Armijo test on the float64 row loss. Pixels are processed in chunks sized by
+    entries at zero with an outward gradient are frozen (two-metric projection), the step is projected onto w >= 0,
+    and a per-pixel Armijo test on the float64 row loss checks the projected point. Pixels are processed in chunks sized by
     _FREE_SET_ELEMS (they are independent), and `rows` names the pixels of T to fit when T is the whole data, so
     that only a chunk of rows is ever gathered. Returns (w, f) with f the per-pixel loss."""
     P, m = idx.shape
@@ -85,20 +85,18 @@ def _fit_free_sets_block(T, H, idx, valid, w0, steps, nonneg):
         d = (torch.linalg.pinv(Hs) @ rhs.unsqueeze(-1)).squeeze(-1) * free
         slope = (g * d).sum(1)
         d = torch.where((slope <= 0)[:, None], rhs / Hs.diagonal(dim1=1, dim2=2).clamp(min=1e-12), d)
-        if nonneg:
-            ratio = torch.where(d > 0, w / d.clamp(min=1e-30), torch.full_like(d, float('inf')))
-            alpha = ratio.amin(1).clamp(max=1.0)
-        else:
-            alpha = torch.ones_like(slope)
+        # No cap at the largest feasible step: a free entry at zero that the coupled step pushes outward would make
+        # it zero for the whole pixel. The projection clips it instead.
+        alpha = torch.ones_like(slope)
         accepted = torch.zeros_like(alpha)
         done = torch.zeros_like(alpha, dtype=torch.bool)
-        slope = (g * d).sum(1).clamp(min=0)
         for _ in range(8):
             trial = torch.where(done, torch.zeros_like(alpha), alpha)
             wt = (w - trial[:, None] * d)
             wt = (wt.clamp(min=0) if nonneg else wt) * valid
+            decrease = (g * (w - wt)).sum(1).clamp(min=0)              # first-order decrease along the projected step
             ft = _nnal_rowwise(torch.einsum('pm,pmk->pk', wt, Hf), T, prep, 1, dtype=torch.float64)
-            ok = (ft <= f - 1e-4 * trial * slope + _ARMIJO_FLOOR * torch.finfo(T.dtype).eps * f.abs()) | (trial == 0)
+            ok = (ft <= f - 1e-4 * decrease + _ARMIJO_FLOOR * torch.finfo(T.dtype).eps * f.abs()) | (trial == 0)
             accepted = torch.where(ok & ~done, trial, accepted)
             done |= ok
             if bool(done.all()):
