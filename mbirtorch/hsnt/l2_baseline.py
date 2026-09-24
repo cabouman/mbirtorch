@@ -4,13 +4,11 @@ Kept only as a baseline for comparison plots. The package's ``dehydrate``, ``hyp
 use the NNAL factorization (``mbirtorch.hsnt.denoise``); the functions here are exported as ``l2_dehydrate``,
 ``l2_hyper_denoise`` and ``_estimate_subspace_dimension`` (the singular-value rank estimate, which is unreliable as
 a rank chooser: 1 at dose 3 and 161 at dose 30 on the three-material phantom). Not maintained beyond keeping the
-golden parity test (tests/test_hsnt_vcls.py) green.
+behavior test in tests/test_hsnt_solvers.py passing.
 """
 import warnings
 
 import numpy as np
-from sklearn.decomposition import non_negative_factorization as nmf
-from sklearn.utils.extmath import randomized_svd
 
 from .denoise import rehydrate
 
@@ -107,6 +105,7 @@ def l2_dehydrate(data, dataset_type='attenuation', num_materials=None, safety_fa
         >>> data.shape, subspace_data.shape, subspace_basis.shape
         ((N_x, N_y, N_z, ..., N_k), (N_x, N_y, N_z, ..., 10), (10, N_k))
     """
+    from sklearn.decomposition import non_negative_factorization as nmf
     epsilon = 1e-3
 
     if dataset_type not in ('attenuation', 'transmission'):
@@ -249,6 +248,7 @@ def _estimate_subspace_dimension(data, safety_factor=2, noise_fit_window=[25.0, 
     Returns:
         Estimated dimension of the signal subspace (positive integer).
     """
+    from sklearn.utils.extmath import randomized_svd
     if data.ndim != 2:
         raise ValueError("`data` must be a 2D array shaped (samples, N_k).")
 
