@@ -125,9 +125,10 @@ def _scatter_support(idx, valid, w, R):
     return support, W
 
 
-def _empty_fit_loss(T, prep, chunk=131072):
+def _empty_fit_loss(T, prep):
     """Per-pixel loss of the empty subset, f_p(0), in pixel chunks, so a zero X the size of T is never built whole."""
     log_T, positive, all_positive, cutoff = prep
+    chunk = max(1, 2 ** 23 // T.shape[1])
     out = []
     for s in range(0, T.shape[0], chunk):
         Tc = T[s:s + chunk]

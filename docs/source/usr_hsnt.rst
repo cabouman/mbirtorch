@@ -73,12 +73,14 @@ logs them; ``--strict`` stops on a failed one.
 
 ``convert`` reads the input in blocks of bins, so its memory stays near ``--memory-budget`` whatever the size of the
 stack, and writes the hsnt layout, by default to ``<stem>_converted.h5``; the converted file keeps the dose and the
-source bin indices.  ``dehydrate`` writes ``<stem>_dehydrated.h5``, which
-:func:`import_hsnt_data_hdf5` reads, a JSON report of the checks, parameters, timings and losses, and plots of the
-maps and spectra.  ``rehydrate`` writes the product back as hyperspectral data, for all bins or a
-``--wave-range``.  ``denoise`` does both.  The solve runs whole on the device when it fits and is streamed by chunks
-of pixels otherwise.  ``--spectra unconstrained`` and ``--spectra support`` select the spectra estimators described
-above.  An output is never one of the inputs, and an existing output is replaced only with ``--overwrite``.
-``--dose`` is the open-beam count per pixel and source bin, before any ``--wave-bin`` grouping.  Run any subcommand
-with ``-h`` for the options most runs need, and with ``--help-all`` for every option, including the solver, memory,
-rank-test and support-selection settings.
+source bin indices.  ``dehydrate`` writes ``<stem>_dehydrated.h5``, which :func:`import_hsnt_data_hdf5` reads, a JSON
+report of the checks, parameters, timings and losses, and plots of the maps and spectra.  ``rehydrate`` writes the
+product back as hyperspectral data, for all bins or a ``--wave-range``.  ``denoise`` does both.  The solve runs whole
+on the device when it fits and is streamed by chunks of pixels otherwise.  ``--spectra unconstrained`` and
+``--spectra support`` select the spectra estimators described above.  An output is never one of the inputs, an
+existing output is replaced only with ``--overwrite``, and a run that fails leaves no partial file.  The outputs keep
+the input's angles, wavelengths and geometry entries, matched to the selected views and bins.  ``--wave-range``
+counts source bins in every subcommand, also on a converted or dehydrated file, and ``--dose`` is the open-beam count
+per pixel and source bin, before any ``--wave-bin`` grouping.  Run any subcommand with ``-h`` for the options most
+runs need, and with ``--help-all`` for every option, including the solver, memory, rank-test and support-selection
+settings.

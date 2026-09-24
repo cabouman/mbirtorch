@@ -364,6 +364,68 @@ def test_strict_stops_on_a_failed_check(stacks, tmp_path):
         main(["inspect", bad, "--strict", "-q"])
 
 
+def test_bad_values_are_refused_and_a_failed_run_leaves_no_output(stacks, tmp_path):
+    for bad in (["--wave-bin", "0"], ["--dose", "-1"], ["--max-rank", "0"], ["--rel-tol", "x"]):
+        with pytest.raises(SystemExit):
+            main(["dehydrate", stacks["h5"], "-o", str(tmp_path), "-q"] + bad)      # argparse refuses them
+    bad = str(tmp_path / "negative.h5")
+    W, H = _truth()
+    T = np.exp(-W @ H).reshape(1, ROWS, COLS, K).astype(np.float32)
+    T[:, :, :, 3] = -0.5                                                 # a failed check at the end of the conversion
+    with h5py.File(bad, "w") as f:
+        f.create_dataset("data", data=T)
+        f.create_dataset("dataset_type", data=np.bytes_("transmission"))
+    out = str(tmp_path / "strict.h5")
+    with pytest.raises(SystemExit, match="check"):
+        main(["convert", bad, "-o", out, "--strict", "-q"])
+    assert not [f for f in os.listdir(tmp_path) if f.startswith("strict")]         # neither the file nor a .partial
+
+
+def test_metadata_and_source_bins_follow_the_selection(tmp_path):
+    W, H = _truth()
+    A = np.stack([(W @ H).reshape(ROWS, COLS, K)] * 3).astype(np.float32)          # three views
+    src = str(tmp_path / "meta.h5")
+    hsnt.export_hsnt_data_hdf5(src, A, hsnt.create_hsnt_metadata(
+        dataset_type="attenuation", wavelengths=np.linspace(1.0, 4.9, K), angles=np.array([0.0, 60.0, 120.0]),
+        alu_unit="mm", delta_det_row=0.1))
+    conv = str(tmp_path / "conv.h5")
+    assert main(["convert", src, "-o", conv, "--views", "1:3", "--wave-range", "4:40", "--wave-bin", "2",
+                 "--downsample", "2", "-q"]) == 0
+    _, meta = hsnt.import_hsnt_data_hdf5(conv)
+    lam = np.linspace(1.0, 4.9, K)[4:40].reshape(-1, 2).mean(1)
+    assert np.allclose(meta["angles"], [60.0, 120.0]) and np.allclose(meta["wavelengths"], lam)
+    assert meta["alu_unit"] == "mm" and meta["delta_det_row"] == pytest.approx(0.2)
+    out = str(tmp_path / "res")
+    assert main(["dehydrate", conv, "-o", out, "--rank", str(R), "--max-steps", "50", "--no-plots", "-q"]) == 0
+    deh = os.path.join(out, "conv_dehydrated.h5")
+    assert np.allclose(hsnt.import_hsnt_data_hdf5(deh)[1]["wavelengths"], lam)
+    part = str(tmp_path / "part.h5")                                     # --wave-range in source bins, not columns
+    assert main(["rehydrate", deh, "-o", part, "--wave-range", "10:20", "-q"]) == 0
+    data, meta = hsnt.import_hsnt_data_hdf5(part)
+    assert data.shape[-1] == 5 and np.allclose(meta["wavelengths"], lam[3:8])
+    with h5py.File(part) as f:
+        assert f["bin_indices"][()].tolist() == [10, 12, 14, 16, 18]
+
+
+def test_tiff_stacks_are_read_in_natural_order(tmp_path):
+    from mbirtorch.hsnt.loading import _tif_names
+    for name in ("img_10.TIF", "img_2.tif", "img_1.tiff"):
+        (tmp_path / name).write_bytes(b"")
+    assert [os.path.basename(f) for f in _tif_names(str(tmp_path))] == ["img_1.tiff", "img_2.tif", "img_10.TIF"]
+
+
+def test_chi_square_counts_the_noise_of_a_measured_open_beam():
+    from mbirtorch.hsnt.outputs import fit_quality
+    rng = np.random.default_rng(1)
+    W, H = _truth()
+    flux = np.linspace(20.0, 80.0, K)                                    # an open beam that varies over the bins
+    ob = rng.poisson(np.tile(flux, (W.shape[0], 1)), size=(2, W.shape[0], K)).mean(0)      # two observations
+    T = (rng.poisson(flux * np.exp(-W @ H)) / np.maximum(ob, 1)).astype(np.float32)
+    exact = fit_quality(T, W, H, dose=50.0, dose_per_bin=flux, open_beam_observations=2)["reduced_chi2"]
+    naive = fit_quality(T, W, H, dose=50.0)["reduced_chi2"]
+    assert abs(exact - 1) < 0.05 and naive > 1.2
+
+
 def test_help_lists_data_options_and_help_all_lists_every_option(capsys):
     with pytest.raises(SystemExit):
         main(["dehydrate", "-h"])

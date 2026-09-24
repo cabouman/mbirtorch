@@ -1,3 +1,5 @@
+import contextlib
+import os
 import warnings
 
 import h5py
@@ -192,6 +194,27 @@ def export_hsnt_data_hdf5(filename, data, metadata=None):
                 group.create_dataset(key, data=np.bytes_(value))
             else:
                 group.create_dataset(key, data=value)
+
+
+@contextlib.contextmanager
+def _written_atomically(path):
+    """Yield a temporary path beside `path`, moved into place only when the block completes, so that a failed or
+    interrupted write leaves no file that reads back as complete. The extension is kept for writers that go by it."""
+    root, ext = os.path.splitext(path)
+    tmp = f"{root}.partial{ext}"
+    try:
+        yield tmp
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def _write_metadata(group, metadata):
+    """Write hsnt metadata entries the group does not hold yet (strings as bytes, None skipped)."""
+    for key, value in metadata.items():
+        if value is not None and key not in group:
+            group.create_dataset(key, data=np.bytes_(value) if isinstance(value, str) else value)
 
 
 def _decode(value):

@@ -41,10 +41,12 @@ def _plan(P, K, device, spectra="mle", mode="auto", chunk_pixels=None):
     return mode, chunk_pixels, note
 
 
-def _loss(W, H, T_host, device, chunk=65536):
+def _loss(W, H, T_host, device):
     """The float64 NNAL loss of W @ H against the host data, in pixel chunks so no P x K float64 array is formed."""
     from ._loss import stable_nnal
+    from .outputs import _CHUNK_ELEMENTS
     Hd = H.to(device).double()
+    chunk = max(1, _CHUNK_ELEMENTS // T_host.shape[1])
     total = 0.0
     for i in range(0, T_host.shape[0], chunk):
         Tc = torch.from_numpy(T_host[i:i + chunk]).to(device).double()

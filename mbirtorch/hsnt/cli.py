@@ -28,12 +28,15 @@ import warnings
 import numpy as np
 
 from ..utilities import makedirs
-from .loading import INPUT_TYPES, _converted_path, convert_to_hdf5, load_dataset
+from .io import _written_atomically
+from .loading import (INPUT_TYPES, InputError, _columns_in_range, _converted_path, _file_source_bins,
+                      _selected_metadata, convert_to_hdf5, load_dataset)
 from .outputs import component_check, fit_quality, write_dehydrated, write_denoised
 from .rank import estimate_rank
 
 log = logging.getLogger("mbirtorch.hsnt")
 
+_MAX_PLOTTED_VIEWS = 4
 
 
 def _parse_slice(text, name):
@@ -42,7 +45,7 @@ def _parse_slice(text, name):
         return None
     m = re.fullmatch(r"(-?\d*):(-?\d*)", text.strip())
     if not m:
-        raise ValueError(f"--{name} expects START:STOP (Python slice), got {text!r}")
+        raise InputError(f"--{name} expects START:STOP (Python slice), got {text!r}")
     return (int(m.group(1)) if m.group(1) else None, int(m.group(2)) if m.group(2) else None)
 
 
@@ -54,6 +57,25 @@ def _rank_arg(text):
     return int(text)
 
 
+def _number_arg(kind, low, inclusive):
+    """An argparse type: a number of the given kind above low (at or above it when inclusive)."""
+    def parse(text):
+        try:
+            value = kind(text)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"expected {'an integer' if kind is int else 'a number'}, got "
+                                             f"{text!r}") from None
+        if not (value >= low if inclusive else value > low):
+            raise argparse.ArgumentTypeError(f"expected a value {'>=' if inclusive else '>'} {low}, got {text!r}")
+        return value
+    return parse
+
+
+_positive_int = _number_arg(int, 0, inclusive=False)
+_positive_float = _number_arg(float, 0.0, inclusive=False)
+_nonneg_float = _number_arg(float, 0.0, inclusive=True)
+
+
 def _pool_arg(text):
     if text.lower() == "auto":
         return "auto"
@@ -62,14 +84,14 @@ def _pool_arg(text):
     return int(text)
 
 
-def _load(args):
-    """load_dataset with the command's input options, logging the checks."""
+def _load(args, log_checks=True):
+    """load_dataset with the command's input options, logging the checks unless the caller prints them."""
     ds = load_dataset(args.input, open_beam=args.open_beam, input_type=args.input_type, dataset=args.dataset,
                       dose=args.dose, views=_parse_slice(args.views, "views"),
                       wave_range=_parse_slice(args.wave_range, "wave-range"), wave_bin=args.wave_bin,
                       downsample=args.downsample, strict=args.strict)
     log.info("loaded in %.1f s", ds.info["load_seconds"])
-    for c in ds.checks:
+    for c in ds.checks if log_checks else []:
         getattr(log, {"ok": "info", "warn": "warning", "error": "error"}[c.level])("check: %s", c.message)
     return ds
 
@@ -80,9 +102,9 @@ def _device(name):
     from ._device import _default_device
     m = re.fullmatch(r"auto|cpu|cuda(?::(\d+))?", name)
     if not m:
-        raise ValueError(f"--device {name}: expected auto, cpu, cuda or cuda:N")
+        raise InputError(f"--device {name}: expected auto, cpu, cuda or cuda:N")
     if name.startswith("cuda") and int(m.group(1) or 0) >= torch.cuda.device_count():
-        raise ValueError(f"--device {name}: {torch.cuda.device_count()} CUDA device(s) available")
+        raise InputError(f"--device {name}: {torch.cuda.device_count()} CUDA device(s) available")
     name = _default_device(name)
     if name == "cpu":
         log.warning("running on the CPU: expect one to two orders of magnitude longer than a GPU")
@@ -111,8 +133,10 @@ def solve(ds, args, device):
     """Run the factorization and the requested spectra estimator. Returns (W, H, report) with W and H numpy."""
     from ._fit import _fit
     if args.spectra == "support" and ds.dose is None:
-        raise ValueError("support selection needs the dose (open-beam counts per pixel and bin): pass --dose, or "
+        raise InputError("support selection needs the dose (open-beam counts per pixel and bin): pass --dose, or "
                          "give --open-beam with a TIFF stack of counts")
+    if args.rank_value > min(ds.pixels, ds.bins):
+        raise InputError(f"--rank {args.rank_value} exceeds min(pixels, bins) = {min(ds.pixels, ds.bins)}")
     W, H, rep = _fit(ds.T, args.rank_value, spectra=args.spectra, dose=ds.dose, penalty=args.support_penalty,
                      free_refit=args.free_refit, wald_screen=args.wald_screen, device=device, mode=args.mode,
                      chunk_pixels=args.chunk_pixels, max_steps=args.max_steps, rel_tol=args.rel_tol,
@@ -162,7 +186,7 @@ def write_report(base, ds, rep, args, outputs):
                   bins=ds.bins, dose=ds.dose, args={k: v for k, v in vars(args).items() if k != "func"},
                   checks=[dict(level=c.level, message=c.message) for c in ds.checks], info=ds.info, result=rep,
                   outputs=outputs)
-    with open(path, "w", encoding="utf-8") as f:
+    with _written_atomically(path) as tmp, open(tmp, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=1, default=str)
     log.info("wrote %s", path)
     return report
@@ -198,7 +222,7 @@ def _log_fit(rep, args):
 
 def cmd_inspect(args):
     import torch
-    ds = _load(args)
+    ds = _load(args, log_checks=False)
     st = ds.info["T_stats"]
     V, rows, cols = ds.spatial_shape
     print(f"\n{ds.source}\n  type {ds.dataset_type}; {V} view(s) x {rows} x {cols} pixels x {ds.bins} bins (source "
@@ -262,21 +286,24 @@ def _pipeline(args, denoise):
         print(f"dry run: data loaded and checked, {args.rank_note}; no solve. Output base: {base}")
         return 0
     W, H, rep = solve(ds, args, device)
-    rep["fit"] = fit_quality(ds.T, W, H, ds.dose, device)
+    R, out_type, outputs = H.shape[0], _out_type(ds, args), []
+    if not (denoise and args.no_dehydrated):          # the result is on disk before any diagnostic runs
+        outputs.append(write_dehydrated(base + "_dehydrated.h5", W.reshape(*ds.spatial_shape, R), H, out_type,
+                                        ds.bin_indices, _run_attrs(ds, rep, args, rank=R, loss=rep["loss_final"]),
+                                        ds.metadata))
+    rep["fit"] = fit_quality(ds.T, W, H, ds.dose, device, ds.dose_per_bin, ds.open_beam_observations)
     rep["components"] = component_check(W, H)
     _log_fit(rep, args)
-    R, out_type, outputs = H.shape[0], _out_type(ds, args), []
-    if not (denoise and args.no_dehydrated):
-        outputs.append(write_dehydrated(base + "_dehydrated.h5", W.reshape(*ds.spatial_shape, R), H, out_type,
-                                        ds.bin_indices, _run_attrs(ds, rep, args, rank=R, loss=rep["loss_final"])))
     if denoise:
         outputs.append(write_denoised(base + "_denoised.h5", ds.spatial_shape, W, H, out_type, ds.bin_indices,
-                                      _run_attrs(ds, rep, args, loss=rep["loss_final"])))
+                                      _run_attrs(ds, rep, args, loss=rep["loss_final"]), ds.metadata))
+    write_report(base, ds, rep, args, outputs)
     if not args.no_plots:
         from .plots import plot_factorization
-        outputs += plot_factorization(base, ds.source, W.reshape(*ds.spatial_shape, R), H, ds.bin_indices)
+        outputs += plot_factorization(base, ds.source, W.reshape(*ds.spatial_shape, R), H, ds.bin_indices,
+                                      max_views=_MAX_PLOTTED_VIEWS)
         log.info("wrote %s and %s", *outputs[-2:])
-    write_report(base, ds, rep, args, outputs)
+        write_report(base, ds, rep, args, outputs)
     n_err = sum(c.level == "error" for c in ds.checks)
     chi2 = rep["fit"].get("reduced_chi2")
     print(f"done: rank {R} ({'estimated' if args.rank_detail else 'given'}), {ds.pixels:,} pixels x {ds.bins} bins, "
@@ -300,31 +327,31 @@ def cmd_rehydrate(args):
     from .io import import_hsnt_data_hdf5
     if not os.path.isfile(args.input):
         raise FileNotFoundError(f"input not found: {args.input}")
-    data, _ = import_hsnt_data_hdf5(args.input)
+    data, meta = import_hsnt_data_hdf5(args.input)
     if not isinstance(data, list):
-        raise ValueError(f"{args.input}: not a dehydrated file (needs subspace_data, subspace_basis and "
+        raise InputError(f"{args.input}: not a dehydrated file (needs subspace_data, subspace_basis and "
                          "dataset_type); run `mbirtorch-hsnt dehydrate` first")
     W4, H, dtype = data
     K_file = H.shape[1]
     if W4.ndim == 3:
         W4 = W4[None]
     if W4.ndim != 4:
-        raise ValueError(f"subspace_data has shape {W4.shape}; expected (views, rows, cols, rank) or (rows, cols, "
+        raise InputError(f"subspace_data has shape {W4.shape}; expected (views, rows, cols, rank) or (rows, cols, "
                          "rank)")
     if W4.shape[-1] != H.shape[0]:
-        raise ValueError(f"rank mismatch: subspace_data has {W4.shape[-1]} components, subspace_basis {H.shape[0]} "
+        raise InputError(f"rank mismatch: subspace_data has {W4.shape[-1]} components, subspace_basis {H.shape[0]} "
                          "rows")
     with h5py.File(args.input, "r") as f:
         attrs = {k: (v.item() if hasattr(v, "item") else v) for k, v in f.attrs.items()}
-        bin_indices = f["bin_indices"][()] if "bin_indices" in f else np.arange(K_file)
+        file_bins = _file_source_bins(f, K_file)
     views = _parse_slice(args.views, "views")
     if views:
         W4 = W4[slice(*views)]
-    wave = _parse_slice(args.wave_range, "wave-range")
-    if wave:
-        H, bin_indices = H[:, slice(*wave)], bin_indices[slice(*wave)]
-        if H.shape[1] == 0:
-            raise ValueError(f"--wave-range {args.wave_range} selects no bins of the {K_file} in the file")
+    kept = _columns_in_range(file_bins, _parse_slice(args.wave_range, "wave-range"))
+    H, bin_indices = H[:, kept.start:kept.stop], file_bins[kept.start:kept.stop]
+    if H.shape[1] == 0:
+        raise InputError(f"--wave-range {args.wave_range} selects none of the file's source bins "
+                         f"{file_bins[0]}..{file_bins[-1]}")
     V, rows, cols, R = W4.shape
     out_type = args.as_type or dtype
     log.info("%s: %d component(s), %d view(s) x %d x %d pixels, %d of %d bins -> %s", args.input, R, V, rows, cols,
@@ -334,8 +361,9 @@ def cmd_rehydrate(args):
     _check_outputs([path], [args.input], args.overwrite)
     attrs = {k: v for k, v in attrs.items() if k not in ("rank", "rehydrated")}
     attrs.update(dehydrated_source=os.path.abspath(args.input), rehydrated_bins=f"{bin_indices[0]}..{bin_indices[-1]}")
+    meta = {k: v for k, v in meta.items() if v is not None and k not in ("dataset_type", "dataset_modality")}
     write_denoised(path, (V, rows, cols), W4.reshape(-1, R).astype(np.float32), H.astype(np.float32), out_type,
-                   bin_indices, attrs)
+                   bin_indices, attrs, _selected_metadata(meta, views, kept, 1, 1))
     print(path)
     return 0
 
@@ -374,7 +402,7 @@ class _Options:
         g = sp.add_argument_group("input")
         self.add(g, "--open-beam", nargs="+", metavar="DIR", help="open-beam TIFF stack(s), needed when the TIFFs "
                  "hold counts; a directory of observation subdirectories is averaged over them")
-        self.add(g, "--dose", type=float, metavar="D",
+        self.add(g, "--dose", type=_positive_float, metavar="D",
                  help="open-beam counts per pixel and source bin, when no open beam or converted file gives it")
         self.add(g, "--input-type", choices=("auto",) + INPUT_TYPES, default="auto",
                  help="what the values are (default: inferred)")
@@ -382,9 +410,9 @@ class _Options:
         g = sp.add_argument_group("selection")
         self.add(g, "--views", metavar="A:B", help="views of 4-D HDF5 data (default: all)")
         self.add(g, "--wave-range", metavar="A:B", help="source wavelength bins (default: all)")
-        self.add(g, "--wave-bin", type=int, default=1, metavar="N",
+        self.add(g, "--wave-bin", type=_positive_int, default=1, metavar="N",
                  help="group N adjacent bins (counts are summed, transmissions averaged)")
-        self.add(g, "--downsample", type=int, default=1, metavar="S", help="keep every S-th row and column")
+        self.add(g, "--downsample", type=_positive_int, default=1, metavar="S", help="keep every S-th row and column")
 
     def run(self, sp, device=False, dry_run=False):
         g = sp.add_argument_group("run")
@@ -404,7 +432,7 @@ class _Options:
 
     def rank_test(self, sp):
         g = sp.add_argument_group("advanced: rank test")
-        self.add(g, "--max-rank", type=int, default=6, advanced=True,
+        self.add(g, "--max-rank", type=_positive_int, default=6, advanced=True,
                  help="largest number of materials the estimate considers (default 6)")
         self.add(g, "--rank-pool", type=_pool_arg, default="auto", metavar="auto|B|0", advanced=True,
                  help="also test on B x B pooled pixels and take the larger rank (default: B chosen so pooled pixels "
@@ -435,13 +463,13 @@ class _Options:
         self.add(g, "--free-refit", action="store_true", advanced=True,
                  help="drop the bound on the selected coefficients during the refit, then re-solve W >= 0 on the "
                       "supports")
-        self.add(g, "--wald-screen", type=float, default=0.0, metavar="F", advanced=True,
+        self.add(g, "--wald-screen", type=_nonneg_float, default=0.0, metavar="F", advanced=True,
                  help="skip single-material fits below F x penalty of Wald statistic in the full fit (0 = off; "
                       "trades rare-material recall for time)")
         g = sp.add_argument_group("advanced: solver")
-        self.add(g, "--max-steps", type=int, default=1000, advanced=True,
+        self.add(g, "--max-steps", type=_positive_int, default=1000, advanced=True,
                  help="largest number of solver steps in a full solve (default 1000)")
-        self.add(g, "--rel-tol", type=float, default=1e-8, advanced=True,
+        self.add(g, "--rel-tol", type=_nonneg_float, default=1e-8, advanced=True,
                  help="relative loss change per step; the solve stops after five steps in a row below it "
                       "(default 1e-8)")
         self.add(g, "--compile", choices=("auto", "on", "off"), default="auto", advanced=True,
@@ -450,9 +478,9 @@ class _Options:
         g = sp.add_argument_group("advanced: memory")
         self.add(g, "--mode", choices=("auto", "full", "stream"), default="auto", advanced=True,
                  help="full solve on the device or streamed by chunks of pixels (default: by available memory)")
-        self.add(g, "--chunk-pixels", type=int, advanced=True,
+        self.add(g, "--chunk-pixels", type=_positive_int, advanced=True,
                  help="pixels per chunk in stream mode (default: from available memory)")
-        self.add(g, "--max-passes", type=int, default=5, advanced=True,
+        self.add(g, "--max-passes", type=_positive_int, default=5, advanced=True,
                  help="stream mode: polish passes over the data (default 5)")
 
 
@@ -482,9 +510,9 @@ def build_parser(show_all=False):
     opt.add(g, "--overwrite", action="store_true", help="replace the output if it already exists")
     opt.run(s)
     g = s.add_argument_group("advanced: streaming")
-    opt.add(g, "--memory-budget", type=float, default=256, metavar="MiB", advanced=True,
+    opt.add(g, "--memory-budget", type=_positive_float, default=256, metavar="MiB", advanced=True,
             help="working memory for the blocks (default 256 MiB)")
-    opt.add(g, "--workers", type=int, metavar="N", advanced=True,
+    opt.add(g, "--workers", type=_positive_int, metavar="N", advanced=True,
             help="threads decoding TIFF images of a block (default: min(8, CPUs))")
     s.set_defaults(func=cmd_convert)
 
@@ -499,7 +527,7 @@ def build_parser(show_all=False):
     s.add_argument("input", help="a dehydrated .h5 (subspace_data, subspace_basis, dataset_type), as written by "
                                  "dehydrate")
     g = s.add_argument_group("selection")
-    opt.add(g, "--wave-range", metavar="A:B", help="bins of the dehydrated file to rehydrate (default: all)")
+    opt.add(g, "--wave-range", metavar="A:B", help="source wavelength bins to rehydrate (default: all)")
     opt.add(g, "--views", metavar="A:B", help="views to rehydrate (default: all)")
     g = s.add_argument_group("output")
     opt.add(g, "-o", "--output", metavar="PATH", help="output directory (default: current directory), or a .h5 "
@@ -516,6 +544,11 @@ def build_parser(show_all=False):
     opt.solve(s, denoise=True)
     s.set_defaults(func=cmd_denoise)
     return p
+
+
+def _is_out_of_memory(e):
+    torch = sys.modules.get("torch")
+    return isinstance(e, MemoryError) or (torch is not None and isinstance(e, torch.cuda.OutOfMemoryError))
 
 
 def main(argv=None):
@@ -539,11 +572,16 @@ def main(argv=None):
     except KeyboardInterrupt:
         log.error("interrupted")
         return 130
-    except (ValueError, KeyError, OSError, MemoryError) as e:
+    except Exception as e:          # input and resource errors become one line; anything else is a bug and tracebacks
         if level <= logging.DEBUG:
             raise
-        message = e.args[0] if isinstance(e, KeyError) and e.args else str(e)
-        raise SystemExit(f"error: {message}") from None
+        if _is_out_of_memory(e):
+            raise SystemExit(f"error: out of memory ({str(e).splitlines()[0] if str(e) else type(e).__name__}): "
+                             "try --mode stream or a smaller --chunk-pixels, --downsample or --wave-bin, or --device "
+                             "cpu") from None
+        if isinstance(e, (InputError, OSError)):
+            raise SystemExit(f"error: {e}") from None
+        raise
     finally:
         log.setLevel(saved[0])
         log.propagate = saved[1]

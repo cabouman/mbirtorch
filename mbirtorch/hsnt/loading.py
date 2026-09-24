@@ -17,11 +17,16 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .io import _create_hyperspectral, _data_selection, _decode, _find_data_group
+from .io import (ALLOWED_KEYS, _create_hyperspectral, _data_selection, _decode, _find_data_group, _write_metadata,
+                 _written_atomically)
 
 log = logging.getLogger(__name__)
 
 INPUT_TYPES = ("counts", "transmission", "attenuation")
+
+
+class InputError(ValueError):
+    """A problem with the input data or the options, which the command line reports as a one-line message."""
 
 
 @dataclass
@@ -41,6 +46,9 @@ class Dataset:
     source: str
     checks: list = field(default_factory=list)
     info: dict = field(default_factory=dict)
+    dose_per_bin: np.ndarray | None = None      # the open beam's median count in each bin, when it was measured
+    open_beam_observations: int = 0             # observations averaged into the open beam (0: none measured)
+    metadata: dict = field(default_factory=dict)    # hsnt metadata of an HDF5 input, matched to the selection
 
     @property
     def pixels(self):
@@ -76,7 +84,7 @@ def infer_input_type(a, source_dtype=None):
     s = np.asarray(a).reshape(-1)[:: max(1, a.size // 200_000)]
     s = s[np.isfinite(s)]
     if s.size == 0:
-        raise ValueError("the data have no finite values to infer the input type from; pass --input-type")
+        raise InputError("the data have no finite values to infer the input type from; pass --input-type")
     lo, hi, med = float(s.min()), float(s.max()), float(np.median(s))
     if source_dtype is not None and np.dtype(source_dtype).kind in "iu":
         return "counts", f"integer source dtype {source_dtype}: counts"
@@ -86,7 +94,7 @@ def infer_input_type(a, source_dtype=None):
         return "attenuation", f"negative values (min {lo:.3g}): attenuation"
     if hi <= 1.05:
         return "transmission", f"values in [{lo:.3g}, {hi:.3g}]: transmission ratios"
-    raise ValueError(f"cannot tell whether the values (min {lo:.3g}, median {med:.3g}, max {hi:.3g}) are "
+    raise InputError(f"cannot tell whether the values (min {lo:.3g}, median {med:.3g}, max {hi:.3g}) are "
                      "transmissions or attenuations: pass --input-type transmission or --input-type attenuation")
 
 
@@ -141,25 +149,32 @@ def _checks_from_summary(sm, spatial_shape, strict=False):
                                "--downsample less or --wave-bin more"))
     errors = [x for x in c if x.level == "error"]
     if errors and strict:
-        raise ValueError(f"{len(errors)} data check(s) failed: " + "; ".join(x.message for x in errors))
+        raise InputError(f"{len(errors)} data check(s) failed: " + "; ".join(x.message for x in errors))
     return c
 
 
+def _natural_key(name):
+    """Sort key that orders the digit runs of a name by value, so img_2 precedes img_19."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", name)]
+
+
 def _tif_names(directory):
-    """Sorted .tif/.tiff paths in a directory, in any letter case (a glob for *.tif misses .TIF on Linux)."""
-    return sorted(os.path.join(directory, f) for f in os.listdir(directory) if f.lower().endswith((".tif", ".tiff")))
+    """.tif/.tiff paths in a directory in natural order, in any letter case (a glob for *.tif misses .TIF on Linux)."""
+    names = [f for f in os.listdir(directory) if f.lower().endswith((".tif", ".tiff"))]
+    return [os.path.join(directory, f) for f in sorted(names, key=_natural_key)]
 
 
 def _tif_files(directory):
     """(files, None) for a directory of TIFFs, or (None, subdirectories) for a directory of TIFF directories."""
     files = _tif_names(directory)
     if not files:
-        subdirs = sorted(os.path.join(directory, d) for d in os.listdir(directory)
-                         if os.path.isdir(os.path.join(directory, d)) and _tif_names(os.path.join(directory, d)))
+        subdirs = [os.path.join(directory, d) for d in sorted(os.listdir(directory), key=_natural_key)
+                   if os.path.isdir(os.path.join(directory, d)) and _tif_names(os.path.join(directory, d))]
         if subdirs:
             return None, subdirs
         raise FileNotFoundError(f"no .tif/.tiff files in {directory}")
-    idx = [int(m.group(1)) if (m := re.search(r"(\d+)\.tiff?$", os.path.basename(f))) else None for f in files]
+    idx = [int(m.group(1)) if (m := re.search(r"(\d+)\.tiff?$", os.path.basename(f), re.IGNORECASE)) else None
+           for f in files]
     if all(i is not None for i in idx):
         gaps = [(a, b) for a, b in zip(idx, idx[1:]) if b != a + 1]
         if gaps:
@@ -185,22 +200,23 @@ class _TiffBlocks:
         import tifffile
         files, subdirs = _tif_files(directory)
         if files is None:
-            raise ValueError(f"{directory} holds only subdirectories ({len(subdirs)}); pass one of them, or pass the "
+            raise InputError(f"{directory} holds only subdirectories ({len(subdirs)}); pass one of them, or pass the "
                              "parent as the open beam to average them")
         self.files = files[slice(*wave_range)] if wave_range else files
         if not self.files:
-            raise ValueError(f"the wave range selects no files of the {len(files)} in {directory}")
+            raise InputError(f"the wave range selects no files of the {len(files)} in {directory}")
         self.first_index = files.index(self.files[0])
         with tifffile.TiffFile(self.files[0]) as t:
             page = t.pages[0]
             self.full_shape, self.source_dtype = tuple(page.shape), str(page.dtype)
         if len(self.full_shape) != 2:
-            raise ValueError(f"{self.files[0]}: expected a 2-D image per wavelength bin, got shape {self.full_shape}")
+            raise InputError(f"{self.files[0]}: expected a 2-D image per wavelength bin, got shape {self.full_shape}")
         self.downsample, self.workers, self.desc = downsample, workers, desc
         self.rows, self.cols = np.empty(self.full_shape, dtype=bool)[::downsample, ::downsample].shape
         self.views = 1
-        self.file_type, self.file_dose = None, None
+        self.file_type, self.file_dose, self.file_dose_per_bin, self.file_observations = None, None, None, 0
         self.source_bins = self.first_index + np.arange(len(self.files))
+        self.file_metadata = {}
         self.metadata = dict(files=len(self.files), first_file=os.path.basename(self.files[0]),
                              last_file=os.path.basename(self.files[-1]))
 
@@ -214,7 +230,7 @@ class _TiffBlocks:
         arr = tifffile.imread(sel[0])[None] if len(sel) == 1 else tifffile.imread(sel, ioworkers=self.workers,
                                                                                    maxworkers=1)
         if arr.ndim != 3 or tuple(arr.shape[1:]) != self.full_shape:
-            raise ValueError(f"{self.desc}: images {k0}..{k1 - 1} have shape {arr.shape[1:]}, the first image "
+            raise InputError(f"{self.desc}: images {k0}..{k1 - 1} have shape {arr.shape[1:]}, the first image "
                              f"{self.full_shape}")
         arr = arr[:, ::self.downsample, ::self.downsample]
         return np.ascontiguousarray(np.moveaxis(arr, 0, -1), dtype=np.float32)[None]
@@ -229,18 +245,29 @@ class _Hdf5Blocks:
     def __init__(self, path, dataset, views, wave_range, downsample):
         import h5py
         self.f = h5py.File(path, "r")
-        g, self.gname = _find_data_group(self.f, dataset)
+        try:
+            g, self.gname = _find_data_group(self.f, dataset)
+        except (KeyError, ValueError) as e:
+            self.f.close()
+            raise InputError(f"{path}: {e.args[0]}") from None
         self.d = d = g["data"]
         self.file_type = _decode(g["dataset_type"][()]) if "dataset_type" in g else None
         self.sel, (self.views, self.rows, self.cols) = _data_selection(d.shape, views, downsample)
         self.full_shape = tuple(d.shape[1:3]) if d.ndim == 4 else tuple(d.shape[:2]) if d.ndim == 3 else (d.shape[0], 1)
         self.source_dtype = str(d.dtype)
-        ks = range(d.shape[-1])[slice(*wave_range)] if wave_range else range(d.shape[-1])
-        self.first_index, self.bins = (ks[0], len(ks)) if len(ks) else (0, 0)
-        columns = g["bin_indices"][()] if "bin_indices" in g and g["bin_indices"].shape == (d.shape[-1],) else None
-        self.source_bins = (np.arange(d.shape[-1]) if columns is None else np.asarray(columns))[list(ks)]
-        dose = g.attrs.get("dose", self.f.attrs.get("dose"))                  # per file column; -1 when unknown
+        source = _file_source_bins(g, d.shape[-1])
+        ks = _columns_in_range(source, wave_range)
+        self.first_index, self.bins = (ks.start, len(ks)) if len(ks) else (0, 0)
+        self.source_bins = source[ks.start:ks.stop]
+        attrs = dict(self.f.attrs, **g.attrs)
+        dose = attrs.get("dose")                                               # per file column; -1 when unknown
         self.file_dose = float(dose) if dose is not None and float(dose) > 0 else None
+        per_bin = g["open_beam_dose"][()] if "open_beam_dose" in g and g["open_beam_dose"].shape == source.shape \
+            else None
+        self.file_dose_per_bin = None if per_bin is None else np.asarray(per_bin, dtype=np.float64)[ks.start:ks.stop]
+        self.file_observations = int(attrs.get("open_beam_observations", 0))
+        self.file_metadata = {k: g[k][()] for k in ALLOWED_KEYS
+                              if k in g and k not in ("dataset_type", "dataset_modality")}
         self.desc = f"{path}:{self.gname}"
         scalars = {k: g[k][()] for k in g if isinstance(g[k], h5py.Dataset) and k not in ("data", "dataset_type")
                    and g[k].ndim == 0}
@@ -260,6 +287,44 @@ class _Hdf5Blocks:
         self.f.close()
 
 
+def _file_source_bins(g, n_columns):
+    """The source bin of each column of an HDF5 dataset: its bin_indices when increasing, else the column index."""
+    if "bin_indices" in g and g["bin_indices"].shape == (n_columns,):
+        b = np.asarray(g["bin_indices"][()], dtype=np.int64)
+        if n_columns < 2 or bool(np.all(np.diff(b) > 0)):
+            return b
+        warnings.warn("bin_indices are not increasing; --wave-range indexes the file's columns")
+    return np.arange(n_columns)
+
+
+def _columns_in_range(source_bins, wave_range):
+    """The contiguous range of columns whose source bin lies in wave_range, a (start, stop) slice over the source bins
+    0 .. max(source_bins); None selects every column."""
+    if not wave_range:
+        return range(len(source_bins))
+    lo, hi, _ = slice(*wave_range).indices(int(source_bins[-1]) + 1 if len(source_bins) else 0)
+    return range(int(np.searchsorted(source_bins, lo)), int(np.searchsorted(source_bins, max(lo, hi))))
+
+
+def _selected_metadata(meta, views, wave_cols, wave_bin, downsample):
+    """hsnt metadata matched to a selection: angles by view, wavelengths by column (averaged over each bin group),
+    and the detector spacings times the downsampling."""
+    out = {}
+    for k, v in meta.items():
+        v = _decode(v)
+        if isinstance(v, np.ndarray) and v.shape == ():
+            v = v.item()
+        if k == "angles" and isinstance(v, np.ndarray) and v.ndim == 1:
+            v = v[slice(*views)] if views else v
+        elif k == "wavelengths" and isinstance(v, np.ndarray) and v.ndim == 1:
+            v = v[wave_cols.start:wave_cols.stop] if wave_cols is not None else v
+            v = _bin_spectral(v.astype(np.float64), wave_bin, "mean")
+        elif k in ("delta_det_channel", "delta_det_row") and isinstance(v, (int, float)):
+            v = v * downsample
+        out[k] = v
+    return out
+
+
 def _open_source(path, dataset, views, wave_range, downsample, workers, open_beam):
     """The block reader for an input path (a TIFF directory or an HDF5 file)."""
     if not os.path.exists(path):
@@ -272,9 +337,9 @@ def _open_source(path, dataset, views, wave_range, downsample, workers, open_bea
         src = _Hdf5Blocks(path, dataset, views, wave_range, downsample)
         if src.bins == 0:
             src.close()
-            raise ValueError("the wave range selects no bins")
+            raise InputError("the wave range selects no bins")
     else:
-        raise ValueError(f"{path}: not a directory of TIFFs and not an .h5/.hdf5 file")
+        raise InputError(f"{path}: not a directory of TIFFs and not an .h5/.hdf5 file")
     log.info("%s: %d view(s) x %d x %d pixels%s x %d bins, source dtype %s", src.desc, src.views, src.rows, src.cols,
              f" (every {downsample}th row and column of {src.full_shape[0]} x {src.full_shape[1]})" if downsample > 1
              else "", src.bins, src.source_dtype)
@@ -287,7 +352,7 @@ def _open_beam_blocks(paths, wave_range, downsample, workers, sample):
            for d in _open_beam_dirs(paths)]
     for o in obs:
         if (o.bins, o.rows, o.cols) != (sample.bins, sample.rows, sample.cols):
-            raise ValueError(f"{o.desc} has {o.bins} bins of {o.full_shape}, the sample {sample.bins} of "
+            raise InputError(f"{o.desc} has {o.bins} bins of {o.full_shape}, the sample {sample.bins} of "
                              f"{sample.full_shape}")
     return obs
 
@@ -319,8 +384,12 @@ def _resolve_input_type(input_type, src, probe, open_beam):
         itype, why = "counts", "an open beam was given"
     else:
         itype, why = infer_input_type(probe, src.source_dtype)
-    if itype == "counts" and not (isinstance(src, _TiffBlocks) and open_beam):
-        raise ValueError(f"the input holds counts ({why}) but no open beam was given: pass --open-beam DIR, or "
+    if itype == "counts" and not isinstance(src, _TiffBlocks):
+        raise InputError(f"the HDF5 input holds counts ({why}); an open beam is read only for TIFF stacks, so store "
+                         "the transmission (counts / open beam) or its attenuation, or pass --input-type if the "
+                         "values are already normalized")
+    if itype == "counts" and not open_beam:
+        raise InputError(f"the input holds counts ({why}) but no open beam was given: pass --open-beam DIR, or "
                          "--input-type transmission/attenuation if the values are already normalized")
     if open_beam and itype != "counts" and isinstance(src, _TiffBlocks):
         warnings.warn(f"the open beam is ignored: the input type is {itype}, not counts")
@@ -355,6 +424,7 @@ def _stack_to_transmission(a, input_type, open_beam=None, wave_bin=1):
             ob = np.where(bad, med[None, :], ob)
         T = counts / ob
         dose = float(np.median(ob.reshape(-1)[:: max(1, ob.size // 1_000_000)]))
+        info["dose_per_bin"] = np.median(ob[:: max(1, ob.shape[0] // 8192)], axis=0).astype(np.float64)
     elif input_type == "transmission":
         T, dose = _bin_spectral(a, wave_bin, "mean"), None
     elif input_type == "attenuation":
@@ -363,7 +433,7 @@ def _stack_to_transmission(a, input_type, open_beam=None, wave_bin=1):
             info["attenuation_nonfinite_frac"] = _frac(nonfinite)
         T, dose = _bin_spectral(np.exp(-np.where(nonfinite, np.inf, a)), wave_bin, "mean"), None
     else:
-        raise ValueError(f"unknown input type {input_type!r}")
+        raise InputError(f"unknown input type {input_type!r}")
     T = np.nan_to_num(T.astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
     return T, dose, info
 
@@ -398,6 +468,15 @@ def _merge_dose(dose, estimate, src, wave_bin):
     if estimate is not None and abs(dose - estimate) / estimate > 0.5:
         warnings.warn(f"the given dose {dose:.3g} differs from the open-beam estimate {estimate:.3g} by more than 50%")
     return dose
+
+
+def _dose_per_bin(dose, estimate, src, wave_bin):
+    """The open beam's count in each grouped bin: measured here, or recorded by convert; None when a dose is given."""
+    if dose is not None:
+        return None
+    if estimate is not None:
+        return estimate
+    return None if src.file_dose_per_bin is None else _bin_spectral(src.file_dose_per_bin, wave_bin, "sum")
 
 
 def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=None, views=None, wave_range=None,
@@ -439,13 +518,17 @@ def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=Non
         T, dose_estimate, info = _stack_to_transmission(a, itype, open_beam=ob, wave_bin=wave_bin)
         del a, ob
         _warn_conversion(info)
+        per_bin = _dose_per_bin(dose, info.pop("dose_per_bin", None), src, wave_bin)
         if itype == "counts":
             info["open_beam_observations"] = n_obs
         info.update(src.metadata, load_seconds=round(time.perf_counter() - t0, 2))
         bin_indices = src.source_bins[:T.shape[1] * wave_bin:wave_bin]
         ds = Dataset(T=T, dataset_type=itype, spatial_shape=(V, rows, cols), bin_indices=bin_indices,
                      dose=_merge_dose(dose, dose_estimate, src, wave_bin),
-                     source=path if isinstance(src, _TiffBlocks) else src.desc, info=info)
+                     source=path if isinstance(src, _TiffBlocks) else src.desc, info=info, dose_per_bin=per_bin,
+                     open_beam_observations=n_obs if itype == "counts" else src.file_observations,
+                     metadata=_selected_metadata(src.file_metadata, views, range(src.first_index,
+                                                 src.first_index + nb), wave_bin, downsample))
     finally:
         src.close()
     sm = _summary_from_T(ds.T, ds.dose)
@@ -509,11 +592,11 @@ def convert_to_hdf5(path, output=None, open_beam=None, input_type="auto", datase
     wave_bin = max(1, wave_bin)
     K = nb // wave_bin
     if K == 0:
-        raise ValueError(f"a wave bin of {wave_bin} exceeds the {nb} selected bins")
+        raise InputError(f"a wave bin of {wave_bin} exceeds the {nb} selected bins")
     block = _block_bins(src, len(obs), wave_bin, memory_budget_mib, block_bins)
     out = output or _converted_path(path)
     if os.path.exists(out) and any(os.path.exists(p) and os.path.samefile(out, p) for p in [path, *(open_beam or [])]):
-        raise ValueError(f"the output {out} is an input of the conversion; choose another output")
+        raise InputError(f"the output {out} is an input of the conversion; choose another output")
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     log.info("streaming %d bins per block (%d blocks), %d TIFF reader threads -> %s (%s, %.2f GiB)", block,
              -(-nb // block), workers, out, as_type, P * K * 4 / 2**30)
@@ -525,6 +608,7 @@ def convert_to_hdf5(path, output=None, open_beam=None, input_type="auto", datase
     stride = max(1, -(-P * K // 4_000_000))
     sample = np.empty((-(-P // stride), K), dtype=np.float32)
     dose_blocks, ob_zero, nonfinite_in = [], 0.0, 0.0
+    ob_per_bin = np.zeros(K) if itype == "counts" else None
     starts = [k0 for k0 in range(0, nb - nb % wave_bin, block) if min(k0 + block, nb) // wave_bin * wave_bin > k0]
 
     def read_block(k0):
@@ -535,7 +619,7 @@ def convert_to_hdf5(path, output=None, open_beam=None, input_type="auto", datase
     pool = ThreadPoolExecutor(1)                                    # the next block is read while this one is processed
     pending = pool.submit(read_block, starts[0]) if starts else None
     try:
-        with h5py.File(out, "w") as f:
+        with _written_atomically(out) as tmp, h5py.File(tmp, "w") as f:
             d = _create_hyperspectral(f, (V, rows, cols, K), as_type, chunks=(1, min(rows, 128), cols, min(16, K)))
             for n_blk, k0 in enumerate(tqdm(starts, desc="convert", unit="block", disable=not progress, leave=False)):
                 k1, a, ob = pending.result()
@@ -545,6 +629,7 @@ def convert_to_hdf5(path, output=None, open_beam=None, input_type="auto", datase
                 j0, j1 = k0 // wave_bin, k1 // wave_bin
                 if dose_b is not None:
                     dose_blocks.append((dose_b, j1 - j0))
+                    ob_per_bin[j0:j1] = info_b["dose_per_bin"]
                 ob_zero += info_b.get("open_beam_zero_frac", 0.0) * (j1 - j0)
                 nonfinite_in += info_b.get("attenuation_nonfinite_frac", 0.0) * (j1 - j0)
                 tot["n"] += T.size
@@ -570,7 +655,7 @@ def convert_to_hdf5(path, output=None, open_beam=None, input_type="auto", datase
             if dose_blocks:
                 vals, w = np.array([v for v, _ in dose_blocks]), np.array([n for _, n in dose_blocks])
                 dose_estimate = float(np.median(np.repeat(vals, w)))
-            dose = _merge_dose(dose, dose_estimate, src, wave_bin)
+            given_dose, dose = dose, _merge_dose(dose, dose_estimate, src, wave_bin)
             _warn_conversion(dict(open_beam_zero_frac=ob_zero / K, attenuation_nonfinite_frac=nonfinite_in / K))
             if tot["inf_out"]:
                 warnings.warn(f"{tot['inf_out']} zero-transmission entries are inf in the attenuation output; the "
@@ -583,13 +668,18 @@ def convert_to_hdf5(path, output=None, open_beam=None, input_type="auto", datase
                       const_bins=int((bin_max == bin_min).sum()) - dead_bins, dose=dose)
             checks = _checks_from_summary(sm, (V, rows, cols), strict)
             f.create_dataset("bin_indices", data=src.source_bins[:K * wave_bin:wave_bin])
+            per_bin = _dose_per_bin(given_dose, ob_per_bin, src, wave_bin)
+            if per_bin is not None:
+                f.create_dataset("open_beam_dose", data=per_bin)
+            columns = range(src.first_index, src.first_index + nb)
+            _write_metadata(f, _selected_metadata(src.file_metadata, views, columns, wave_bin, downsample))
             attrs = dict(source=path if isinstance(src, _TiffBlocks) else src.desc, input_type=itype,
                          downsample=downsample, wave_bin=wave_bin, block_bins=block, mbirtorch_hsnt_cli="1",
                          checks=json.dumps([dict(level=c.level, message=c.message) for c in checks]))
             if dose is not None:
                 attrs["dose"] = float(dose)
-            if obs:
-                attrs["open_beam_observations"] = len(obs)
+            if obs or src.file_observations:
+                attrs["open_beam_observations"] = len(obs) or src.file_observations
             f.attrs.update(attrs)
     finally:
         pool.shutdown(wait=True)

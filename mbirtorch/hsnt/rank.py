@@ -63,6 +63,12 @@ def _pool_pixels(T, spatial_shape, block):
     return X.reshape(-1, X.shape[-1])
 
 
+def _subsample(T, n):
+    """At most n rows of T, a seeded random subset in their original order, as contiguous float32."""
+    rows = np.sort(np.random.default_rng(0).choice(T.shape[0], n, replace=False)) if T.shape[0] > n else slice(None)
+    return np.ascontiguousarray(T[rows], dtype=np.float32)
+
+
 def estimate_rank(T, spatial_shape=None, device=None, max_rank=6, subsample=16384, pool="auto", verbose=0):
     """Choose the rank by sequential likelihood-ratio tests, at full resolution and on spatially pooled pixels.
 
@@ -85,7 +91,8 @@ def estimate_rank(T, spatial_shape=None, device=None, max_rank=6, subsample=1638
             which disables pooling.
         device (str, optional): Torch device for the solves. Defaults to None, meaning CUDA if available, else CPU.
         max_rank (int, optional): Largest rank considered. Defaults to 6.
-        subsample (int, optional): Pixels used at full resolution, a seeded random subset. Defaults to 16384.
+        subsample (int, optional): Pixels used by each test, a seeded random subset, at full resolution and after
+            pooling. Defaults to 16384.
         pool (str or int, optional): Pooling block size. 'auto' (default) chooses the block from the calibrated dose so
             that pooled pixels hold about 64 counts per bin, with at least about K / 2 pooled pixels and no pooling
             above 64 counts per bin (pooled mixed pixels are not exactly low rank and would add spurious rank at high
@@ -100,9 +107,7 @@ def estimate_rank(T, spatial_shape=None, device=None, max_rank=6, subsample=1638
     device = _default_device(device)
     T_np = T.detach().cpu().numpy() if torch.is_tensor(T) else np.asarray(T)
     pixels, K = T_np.shape
-    pick = (np.sort(np.random.default_rng(0).choice(pixels, subsample, replace=False)) if pixels > subsample
-            else slice(None))
-    Tt = torch.from_numpy(np.ascontiguousarray(T_np[pick], dtype=np.float32)).to(device)
+    Tt = torch.from_numpy(_subsample(T_np, subsample)).to(device)
     rank_full, d_full = _lrt_rank(Tt, max_rank, "full resolution", verbose)
     block = 0
     if spatial_shape is not None and pool:
@@ -116,8 +121,7 @@ def estimate_rank(T, spatial_shape=None, device=None, max_rank=6, subsample=1638
     rank = rank_full
     parts = [f"full resolution gave {rank_full}"]
     if block > 1:
-        pooled = np.ascontiguousarray(_pool_pixels(T_np, spatial_shape, block), dtype=np.float32)
-        Tp = torch.from_numpy(pooled).to(device)
+        Tp = torch.from_numpy(_subsample(_pool_pixels(T_np, spatial_shape, block), subsample)).to(device)
         rank_pool, d_pool = _lrt_rank(Tp, max_rank, f"pooled {block}x{block}", verbose)
         detail.update(pooled=d_pool, rank_pooled=rank_pool)
         rank = max(rank_full, rank_pool)
