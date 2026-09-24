@@ -3,6 +3,7 @@ import json
 import time
 from pathlib import Path
 import numpy as np
+import mbirtorch
 import mbirtorch.preprocess as mtp
 
 
@@ -35,7 +36,8 @@ def get_sino_and_model(dataset_dir, downsample_factor=(1, 1), subsample_view_fac
         tuple: ``(sino, model)`` (or ``(sino, model, geometry)``); ``sino`` is (num_views, rows, channels) float32.
 
     Example:
-        sino, model = VoluMax.get_sino_and_model(dataset_dir, downsample_factor=(2, 2))
+        from mbirtorch.preprocess import volumax
+        sino, model = volumax.get_sino_and_model(dataset_dir, downsample_factor=(2, 2))
         weights = mbirtorch.gen_weights(sino, weight_type='transmission_root')
         recon, recon_dict = model.recon(sino, weights=weights)
     """
@@ -44,25 +46,16 @@ def get_sino_and_model(dataset_dir, downsample_factor=(1, 1), subsample_view_fac
         crop_pixels_sides=crop_pixels_sides, crop_pixels_top=crop_pixels_top, crop_pixels_bottom=crop_pixels_bottom,
         verbose=verbose, min_transmission=min_transmission, background_offset=background_offset, sinogram_path=sinogram_path, num_workers=num_workers, batch_size=batch_size)
     sino, model = mtp.finalize_model(sino, required, optional, auto_crop=auto_crop)
-    # build_model's auto_set_recon_geometry centres the slab on the source plane (recon_slice_offset = 0);
-    # re-apply -det_row_offset / M so the slab is centred on what the detector actually sees (verified by
-    # forward projection: the centre slice then maps onto the panel centre row).
-    if 'recon_slice_offset' in optional and not auto_crop:
-        model.set_params(recon_slice_offset=float(optional['recon_slice_offset']), no_warning=True)
     if verbose > 0:
         print('\n########## mbirtorch model parameters')
-        try:
-            model.print_params()
-        except AttributeError:
-            print(model.get_params(['sinogram_shape', 'recon_shape', 'delta_voxel', 'det_channel_offset',
-                                    'det_row_offset', 'recon_slice_offset']))
+        model.print_params()
     return (sino, model, geom) if return_geometry else (sino, model)
 
 
 def _compute_sino_and_params(dataset_dir, downsample_factor=(1, 1), subsample_view_factor=1, crop_pixels_sides=0,
                              crop_pixels_top=0, crop_pixels_bottom=0, verbose=1, min_transmission=1e-4,
                              background_offset='per_view', sinogram_path=None, num_workers=8, batch_size=90):
-    """Load the scan, calibrate the geometry, compute the sinogram; returns ``(sino, required, optional)``."""
+    """Load the scan, calibrate the geometry, compute the sinogram; returns ``(sino, required, optional, geom)``."""
     if verbose > 0:
         print('\n########## Loading VoluMax transmission images and geometry')
     load_scans = sinogram_path is None
@@ -123,11 +116,18 @@ def compute_geometry(params, *, calibration_row_band=None, calibration_view_step
         calibration_view_step (int): use every k-th view in the calibration.
     """
     r_a, r_n, r_h, r_v, r_s, r_d = (params[k] for k in ('r_a', 'r_n', 'r_h', 'r_v', 'r_s', 'r_d'))
-    sdd, sid, mag, det_rotation = calc_source_detector_params(r_a, r_n, r_h, r_s, r_d)
-    det_row_offset = calc_det_row_offset(r_n, r_h, r_s, r_d)
-    det_channel_offset_meta = calc_det_channel_offset_metadata(r_a, r_n, r_h, r_s, r_d, mag)
     pitch_c, pitch_r = params['delta_det_channel'], params['delta_det_row']
     n_rows, n_cols = params['num_det_rows'], params['num_det_channels']
+    # NSI's helpers take the first-pixel centre r_r; the panel centre r_d is passed with a 1 x 1 panel, so the
+    # half-panel shifts back to the centre are exactly zero.
+    sdd, sid, mag, det_rotation = (float(x) for x in mtp.nsi.calc_source_detector_params(r_a, r_n, r_h, r_s, r_d))
+    # det_row_offset: row component of the source's perpendicular foot relative to the panel centre (positive
+    # below it). det_channel_offset_meta takes objectPosition as a point on the rotation axis; on the VoluMax
+    # export that is about 0.5 mm off the axis, so it is only an uncalibrated reference.
+    # calc_row_channel_params only normalises r_h, so r_h is first made orthogonal to r_n.
+    r_h_in_panel = r_h - mtp.project_vector_to_vector(r_h, mtp.unit_vector(r_n))
+    det_channel_offset_meta, det_row_offset = (float(x) for x in mtp.nsi.calc_row_channel_params(
+        r_a, r_n, r_h_in_panel, r_s, r_d, pitch_c, pitch_r, 1, 1, mag))
     center_col, center_row = (n_cols - 1) / 2.0, (n_rows - 1) / 2.0
     iso_row_full = center_row + det_row_offset / pitch_r
     geom = dict(source_detector_dist=sdd, source_iso_dist=sid, magnification=mag,
@@ -147,7 +147,7 @@ def compute_geometry(params, *, calibration_row_band=None, calibration_view_step
     acq_dir = params['acq_dir']
     angles_all = params.get('angles_deg_all')
     if angles_all is None:
-        angles_all = read_metadata(acq_dir, verbose=0)['angles_deg']
+        angles_all = read_volumax_metadata(acq_dir, verbose=0)['angles_deg']
     band = calibration_row_band or (max(0, int(round(iso_row_full)) - 40), min(n_rows, int(round(iso_row_full)) + 40))
     if verbose > 0:
         print('\n########## Data calibration: rotation direction and centre column (opposite-ray consistency)')
@@ -196,9 +196,6 @@ def convert_volumax_to_mbirtorch_params(params, geom, downsample_factor=(1, 1), 
     (first, in raw pixels), for the detector rotation applied to the sinogram (offsets rotated exactly into the
     corrected frame) and for down-sampling.
     """
-    import mbirtorch
-    import mbirtorch.preprocess as mtp
-
     num_det_rows, num_det_channels = params['num_det_rows'], params['num_det_channels']
     delta_det_row, delta_det_channel = geom['delta_det_row'], geom['delta_det_channel']
     det_row_offset, det_channel_offset = geom['det_row_offset'], geom['det_channel_offset']
@@ -254,7 +251,7 @@ def _vec3(d):
     return np.array([d['x'], d['y'], d['z']], dtype=np.float64)
 
 
-def read_metadata(acq_dir, verbose=1):
+def read_volumax_metadata(acq_dir, verbose=1):
     """Read AcquisitionParameters.json and every Projections/Metadata/Projection_%05d.json.
 
     Returns:
@@ -362,7 +359,7 @@ def load_scans_and_params(dataset_dir, view_id_start=0, view_id_end=None, subsam
         and detector numbers (see :func:`volumax_vectors`).
     """
     acq_dir = find_acquisition_dir(dataset_dir)
-    meta = read_metadata(acq_dir, verbose=verbose)
+    meta = read_volumax_metadata(acq_dir, verbose=verbose)
     num_rows, num_cols = meta['num_det_rows'], meta['num_det_channels']
     if view_id_end is None:
         view_id_end = meta['num_views']
@@ -389,12 +386,12 @@ def load_scans_and_params(dataset_dir, view_id_start=0, view_id_end=None, subsam
         obj_scan[0] = first
         t0 = time.time()
 
-        def work(k):
+        def read_view_into_stack(k):
             obj_scan[k] = read_projection(acq_dir, view_ids[k], num_rows, num_cols, row_slice, col_slice,
                                           downsample_factor, min_transmission)
 
         with cf.ThreadPoolExecutor(max_workers=num_workers) as ex:
-            list(ex.map(work, range(1, len(view_ids))))
+            list(ex.map(read_view_into_stack, range(1, len(view_ids))))
         if verbose > 0:
             print(f'Loaded {len(view_ids)} transmission images -> {obj_scan.shape} ({obj_scan.nbytes / 1e9:.2f} GB) '
                   f'in {time.time() - t0:.1f} s; min {obj_scan.min():.4g}, max {obj_scan.max():.4g}')
@@ -408,7 +405,8 @@ def volumax_vectors(meta, view_ids=None, axis_vector=(0.0, 0.0, -1.0)):
     r_n: detector normal (source -> detector), r_h: row direction (increasing channel), r_v = r_n x r_h:
     column direction (increasing row, downward), r_a: rotation axis pointing down, r_s / r_d: source and
     detector-centre positions relative to the origin (objectPosition). Also returns the raw detector size /
-    pitch, the objectAngle array and the position jitter over the views.
+    pitch, the objectAngle array for the selected views (``angles_deg``) and for all views (``angles_deg_all``,
+    used by the calibration) and the position jitter over the views.
     """
     sel = np.arange(meta['num_views']) if view_ids is None else np.asarray(view_ids)
     S = np.nanmean(meta['source'], axis=0)
@@ -416,15 +414,13 @@ def volumax_vectors(meta, view_ids=None, axis_vector=(0.0, 0.0, -1.0)):
     O = np.nanmean(meta['object'], axis=0)
     U = np.nanmean(meta['span_u'], axis=0)
     V = np.nanmean(meta['span_v'], axis=0)
-    r_h = U / np.linalg.norm(U)                       # increasing channel index
-    v_hat = V / np.linalg.norm(V)                     # increasing row index (downward for this scanner)
-    r_n = np.cross(r_h, v_hat)
-    r_n /= np.linalg.norm(r_n)
+    r_h = mtp.unit_vector(U)                          # increasing channel index
+    v_hat = mtp.unit_vector(V)                        # increasing row index (downward for this scanner)
+    r_n = mtp.unit_vector(np.cross(r_h, v_hat))
     if np.dot(r_n, D - S) < 0:
         r_n = -r_n
     r_v = np.cross(r_n, r_h)                          # equals v_hat up to numerical noise
-    r_a = np.asarray(axis_vector, dtype=np.float64)
-    r_a /= np.linalg.norm(r_a)
+    r_a = mtp.unit_vector(np.asarray(axis_vector, dtype=np.float64))
     if np.dot(r_a, r_v) < 0:                          # the axis vector points down (along increasing rows)
         r_a = -r_a
     jitter = {k: float(np.nanmax(np.linalg.norm(meta[k] - meta[k].mean(axis=0), axis=1)))
@@ -435,68 +431,9 @@ def volumax_vectors(meta, view_ids=None, axis_vector=(0.0, 0.0, -1.0)):
         span_pitch_u=float(np.linalg.norm(U)), span_pitch_v=float(np.linalg.norm(V)),
         delta_det_channel=meta['delta_det_channel'], delta_det_row=meta['delta_det_row'],
         num_det_rows=meta['num_det_rows'], num_det_channels=meta['num_det_channels'],
-        angles_deg=np.asarray(meta['angles_deg'])[sel], position_jitter_mm=jitter, num_views_total=meta['num_views'],
+        angles_deg=np.asarray(meta['angles_deg'])[sel], angles_deg_all=np.array(meta['angles_deg']),
+        position_jitter_mm=jitter, num_views_total=meta['num_views'],
     )
-
-
-# ---------------------------------------------------------------------------------------------------------------------
-# Geometry from the metadata
-# ---------------------------------------------------------------------------------------------------------------------
-def unit_vector(v):
-    v = np.asarray(v, dtype=np.float64)
-    return v / np.linalg.norm(v)
-
-
-def project_vector_to_vector(u1, u2):
-    u2 = unit_vector(u2)
-    return np.dot(u1, u2) * u2
-
-
-def calc_det_rotation(r_a, r_n, r_h, r_v):
-    """Tilt between the rotation axis projected onto the detector plane and the detector columns, in radians."""
-    r_a_p = unit_vector(r_a - project_vector_to_vector(r_a, r_n))
-    return float(-np.arctan(np.dot(r_a_p, r_h) / np.dot(r_a_p, r_v)))
-
-
-def calc_source_detector_params(r_a, r_n, r_h, r_s, r_d):
-    """source_detector_dist, source_iso_dist (both along the detector normal), magnification, det_rotation."""
-    r_n = unit_vector(r_n)
-    r_v = np.cross(r_n, r_h)
-    source_iso_dist = float(np.linalg.norm(project_vector_to_vector(-r_s, r_n)))
-    source_detector_dist = float(np.linalg.norm(project_vector_to_vector(r_d - r_s, r_n)))
-    magnification = source_detector_dist / source_iso_dist
-    det_rotation = calc_det_rotation(r_a, r_n, r_h, r_v)
-    return source_detector_dist, source_iso_dist, magnification, det_rotation
-
-
-def calc_det_channel_offset_metadata(r_a, r_n, r_h, r_s, r_d, magnification):
-    """
-    Channel offset in mm from the metadata alone, for reference: the foot term (F - D).r_h plus the
-    source's lateral distance from the plane through the origin (objectPosition) and the normal, times the
-    magnification, i.e. the NSI-style formula with objectPosition taken as a point on the rotation axis.
-    On the VoluMax export objectPosition is about 0.5 mm off the axis, so this value is printed as the
-    "uncalibrated" reference and the offset used comes from the projections.
-    """
-    r_n = unit_vector(r_n)
-    r_h = unit_vector(r_h - project_vector_to_vector(r_h, r_n))
-    r_s_d = r_d - r_s
-    r_delta = r_s_d - project_vector_to_vector(r_s_d, r_n)
-    foot = float(-np.dot(r_delta, r_h))
-    lateral = float(np.dot(r_s, np.cross(r_n, unit_vector(r_a))))
-    return foot + lateral * magnification
-
-
-def calc_det_row_offset(r_n, r_h, r_s, r_d):
-    """
-    det_row_offset in mm: row component of F - D, where D is the panel centre (``r_d``) and F the perpendicular
-    foot of the source on the panel (F = S + SDD * r_n). Positive when F lies below D (higher row index).
-    """
-    r_n = unit_vector(r_n)
-    r_h = unit_vector(r_h - project_vector_to_vector(r_h, r_n))
-    r_v = np.cross(r_n, r_h)
-    r_s_d = r_d - r_s
-    r_delta = r_s_d - project_vector_to_vector(r_s_d, r_n)          # D - F, in the panel plane
-    return float(-np.dot(r_delta, r_v))
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -505,12 +442,12 @@ def calc_det_row_offset(r_n, r_h, r_s, r_d):
 def _load_band_sinogram(acq_dir, view_ids, num_rows, num_cols, row_band, num_workers=8):
     r0, r1 = row_band
 
-    def work(i):
+    def read_band_profile(i):
         img = read_projection(acq_dir, int(i), num_rows, num_cols, slice(r0, r1), None, (1, 1), 1e-4)
         return -np.log(img).mean(axis=0)
 
     with cf.ThreadPoolExecutor(max_workers=num_workers) as ex:
-        sino = np.array(list(ex.map(work, view_ids)), dtype=np.float32)
+        sino = np.array(list(ex.map(read_band_profile, view_ids)), dtype=np.float32)
     sino[sino < 0] = 0.0
     return sino
 

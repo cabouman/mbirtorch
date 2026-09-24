@@ -10,7 +10,7 @@ from mbirtorch.preprocess import volumax
 # ----------------------------------------------------------------------------------------------
 # Parameters
 # ----------------------------------------------------------------------------------------------
-dataset_dir = '/depot/bouman/users/lin1311/volumemax/Hexagonal_volumax'
+dataset_dir = '/depot/bouman/data/ORNL/volumax/Hexagonal_volumax'
 downsample_factor = (2, 2)        # detector (rows, channels) binning -> 1512 x 1512
 subsample_view_factor = 1         # keep every k-th view (1 = all 2000 views)
 sharpness = 1.0
