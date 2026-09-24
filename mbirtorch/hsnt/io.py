@@ -4,12 +4,7 @@ import h5py
 import numpy as np
 
 
-# -----------------------------------------------------------------------
-# HDF5 Import/Export Utilities for Hyperspectral Neutron Data/Metadata
-# -----------------------------------------------------------------------
-
-
-# Description of the allowed keys
+# The allowed metadata keys and what each one holds.
 KEY_DESCRIPTIONS = {
     "dataset_name": "Character string with the name of the dataset.",
     "dataset_type": "'attenuation' or 'transmission'.",
@@ -26,26 +21,27 @@ KEY_DESCRIPTIONS = {
     "source_iso_dist": "Distance from source to iso in ALU."
 }
 
-# Acceptable input options for certain keys
+# The values each of these keys accepts.
 VALIDATION_RULES = {
     "dataset_type": (None, "attenuation", "transmission"),
     "dataset_modality": (None, "hyperspectral neutron"),
     "dataset_geometry": (None, "parallel", "cone"),
 }
 
-# Allowed keys derived from the KEY_DESCRIPTIONS
 ALLOWED_KEYS = list(KEY_DESCRIPTIONS.keys())
 
 
 def _validate_key(key, value):
-    """Validate categorical keys according to VALIDATION_RULES."""
+    """Warn when a key listed in VALIDATION_RULES has a value that is not
+    allowed."""
     if key in VALIDATION_RULES and value not in VALIDATION_RULES[key]:
         valid_options = [v for v in VALIDATION_RULES[key] if v is not None]
         warnings.warn(f"Invalid '{key}': should be one of {valid_options}.")
 
 
 def _with_key_docstring(style):
-    """Function to insert key descriptions into docstrings."""
+    """Return a decorator that replaces ``{_KEY_DOCS}`` in a docstring with
+    the key descriptions."""
     indent = "\t- " if style == "dict" else "\t"
     text = "\n".join(f"{indent}{k}: {v}" for k, v in KEY_DESCRIPTIONS.items())
 
@@ -80,10 +76,8 @@ def import_hsnt_data_hdf5(filename):
         with h5py.File(filename, "r") as f:
             group = f
 
-            # Check if data is dehydrated/compressed
             dehydrated = all(k in group for k in ["subspace_data", "subspace_basis", "dataset_type"])
 
-            # Importing data
             if dehydrated:
                 dataset_type = group["dataset_type"][()]
                 if isinstance(dataset_type, (bytes, np.bytes_)):
@@ -96,7 +90,6 @@ def import_hsnt_data_hdf5(filename):
             else:
                 warnings.warn(f"No HSNT data found in HDF5 file '{filename}'. Returning data=None.")
 
-            # Importing metadata
             for key in ALLOWED_KEYS:
                 if key in group:
                     value = group[key][()]
@@ -109,7 +102,6 @@ def import_hsnt_data_hdf5(filename):
         warnings.warn(f"Could not import HSNT data from HDF5 file '{filename}': {error}. Returning data=None.")
         data = None
 
-    # Validate categorical keys
     for key, value in metadata.items():
         _validate_key(key, value)
 
@@ -141,14 +133,12 @@ def create_hsnt_metadata(**kwargs):
         >>> print(metadata["dataset_name"])
         sample1
     """
-    # Warn for unexpected keyword arguments
     for key in kwargs.keys():
         if key not in ALLOWED_KEYS:
             warnings.warn(f"Ignoring invalid key '{key}' in arguments.")
 
     metadata = {k: kwargs.get(k, None) for k in ALLOWED_KEYS}
 
-    # Validation
     for key, value in metadata.items():
         _validate_key(key, value)
 
@@ -174,20 +164,17 @@ def export_hsnt_data_hdf5(filename, data, metadata=None):
     if metadata is None:
         metadata = {}
 
-    # Check if data is dehydrated/compressed
     dehydrated = (isinstance(data, list)
                   and len(data) == 3
                   and isinstance(data[2], str)
                   and data[2] in VALIDATION_RULES["dataset_type"][1:])
 
-    # Validate categorical keys before writing
     for key, value in metadata.items():
         _validate_key(key, value)
 
     with h5py.File(filename, "w") as f:
         group = f
 
-        # Exporting data
         if dehydrated:
             group.create_dataset("subspace_data", data=data[0])
             group.create_dataset("subspace_basis", data=data[1])
@@ -195,7 +182,6 @@ def export_hsnt_data_hdf5(filename, data, metadata=None):
         else:
             group.create_dataset("data", data=data)
 
-        # Exporting metadata
         for key, value in metadata.items():
             if key not in ALLOWED_KEYS:
                 warnings.warn(f"Ignoring invalid key '{key}' in metadata.")

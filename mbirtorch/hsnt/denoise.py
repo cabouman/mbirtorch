@@ -130,15 +130,14 @@ def rehydrate(dehydrated_data, hyperspectral_idx=None):
         >>> subspace_data.shape, subspace_basis.shape, hyper_data.shape
         ((N_x, N_y, N_z, ..., N_s), (N_s, N_k), (N_x, N_y, N_z, ..., 3))
     """
-    [subspace_data, subspace_basis, dataset_type] = dehydrated_data  # Unpack data
+    [subspace_data, subspace_basis, dataset_type] = dehydrated_data
 
-    # Retrieve original data dimensions
     if hyperspectral_idx is None:
         rehydrated_data = subspace_data @ subspace_basis
     else:
         rehydrated_data = subspace_data @ subspace_basis[:, hyperspectral_idx]
 
     if dataset_type == 'transmission':
-        rehydrated_data = np.exp(-rehydrated_data)  # Convert to transmission
+        rehydrated_data = np.exp(-rehydrated_data)
 
     return rehydrated_data
