@@ -38,7 +38,8 @@ dependencies = [
     "h5py",
     # The preprocess package needs scipy (filters, fitting), tifffile (scan
     # readers), tqdm (batch progress), and pywavelets (wavelet-FFT stripe
-    # removal).
+    # removal).  hsnt uses scipy.optimize for its L-BFGS-B solver, tifffile
+    # for TIFF stacks, and tqdm for conversion progress.
     "scipy",
     "tifffile",
     "tqdm",
@@ -51,9 +52,10 @@ dependencies = [
     # Google Drive-hosted demo datasets in download_and_extract.
     "olefile",
     "gdown",
-    # hsnt hyperspectral denoising: NMF and randomized SVD.
+    # The hsnt L2 baseline (l2_dehydrate): NMF and randomized SVD.
     "scikit-learn",
-    # get_memory_stats reads host RSS/USS via psutil.
+    # get_memory_stats reads host RSS/USS via psutil; the hsnt loaders check
+    # available host memory with it.
     "psutil",
 ]
 
@@ -90,6 +92,10 @@ version = {attr = "mbirtorch.__version__"}
 # defaults to namespaces=true, which would sweep __init__.py-less top-level dirs into the
 # wheel).
 find = {include = ["mbirtorch*"]}
+
+[tool.setuptools.package-data]
+# The spectra of the hsnt phantom, read by mbirtorch.hsnt.load_material_basis.
+"mbirtorch.hsnt" = ["data/*.npy"]
 
 [project.urls]
 source = "https://github.com/cabouman/mbirtorch"

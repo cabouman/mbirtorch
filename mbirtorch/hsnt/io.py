@@ -192,3 +192,54 @@ def export_hsnt_data_hdf5(filename, data, metadata=None):
                 group.create_dataset(key, data=np.bytes_(value))
             else:
                 group.create_dataset(key, data=value)
+
+
+def _decode(value):
+    """A string from an HDF5 scalar that may be stored as bytes."""
+    return value.decode() if isinstance(value, (bytes, np.bytes_)) else value
+
+
+def _find_data_group(f, dataset=None):
+    """The group holding the hyperspectral 'data' dataset: the named group, else the root, else the only root group
+    that has one. Returns (group, name); raises KeyError when there is none and ValueError when the file holds
+    dehydrated data or the choice is ambiguous."""
+    if dataset:
+        if dataset not in f:
+            groups = [k for k, v in f.items() if isinstance(v, h5py.Group)]
+            raise KeyError(f"group {dataset!r} not found; groups at the root: {groups}")
+        return f[dataset], dataset
+    if "data" in f:
+        return f, "/"
+    if all(k in f for k in ("subspace_data", "subspace_basis")):
+        raise ValueError("this file holds dehydrated data (subspace_data, subspace_basis), not hyperspectral data")
+    candidates = [k for k, v in f.items() if isinstance(v, h5py.Group) and "data" in v]
+    if len(candidates) == 1:
+        return f[candidates[0]], candidates[0]
+    if not candidates:
+        raise KeyError(f"no 'data' dataset at the root or in a root group; root members: {list(f.keys())}")
+    raise ValueError(f"several groups hold a 'data' dataset: {candidates}; choose one")
+
+
+def _data_selection(shape, views=None, downsample=1):
+    """The index over the spatial axes of a 2-, 3- or 4-D 'data' dataset (spectral axis last) that selects the views
+    and every downsample-th row and column, and the (views, rows, cols) it gives. A 2-D dataset is (pixels, bins)."""
+    ndim = len(shape)
+    step = slice(None, None, downsample)
+    if ndim == 2:
+        return (slice(None),), (1, shape[0], 1)
+    if ndim == 3:
+        return (step, step), (1,) + np.empty(shape[:2], dtype=bool)[step, step].shape
+    if ndim == 4:
+        sel = (slice(*views) if views else slice(None), step, step)
+        return sel, np.empty(shape[:3], dtype=bool)[sel].shape
+    raise ValueError(f"data has {ndim} dimensions; expected (views, rows, cols, bins), (rows, cols, bins) or "
+                     "(pixels, bins)")
+
+
+def _create_hyperspectral(f, shape, dataset_type, chunks):
+    """Create the 'data' dataset of the hsnt layout, float32 of shape (views, rows, cols, bins), with its
+    dataset_type and dataset_modality entries. Returns the dataset, to be filled in blocks."""
+    d = f.create_dataset("data", shape=shape, dtype=np.float32, chunks=chunks)
+    f.create_dataset("dataset_type", data=np.bytes_(dataset_type))
+    f.create_dataset("dataset_modality", data=np.bytes_("hyperspectral neutron"))
+    return d
