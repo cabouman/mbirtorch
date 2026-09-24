@@ -5,7 +5,6 @@ from ._loss import _nnal_prep, _nnal_rowwise, stable_nnal, stable_nnal_derivativ
 from ._multiplicative import _reseed_dead
 
 
-_COMPILED_KERNELS = {}
 # Armijo noise floor, in units of eps * |row loss|: a smaller decrease is float32 truncation, which grows with the
 # row length, and is not trusted. 4 is the smallest value that does not backtrack spuriously.
 _ARMIJO_FLOOR = 4.0
@@ -14,26 +13,44 @@ _TRUST_FLOOR = 1e-3
 # epsilon-active set (Bertsekas): a component this close to zero with an outward gradient is snapped to zero, so a
 # tiny residue at the feasibility limit cannot freeze its row at a non-stationary point.
 _ACTIVE_TOL = 1e-6
+# A block step that drives an entry to within this many ulps of zero sets it to exactly zero, so that fused (compiled)
+# and separate rounding take the same active-set decision.
+_SNAP_ULPS = 8.0
+# The joint solve stops after this many consecutive accepted steps below rel_tol: its tail is slow and erratic, and a
+# single quiet step is followed by larger decreases often enough to make a one-step stop irreproducible.
+_PATIENCE = 5
+# 'auto' compiles from this many data entries on CUDA (about 400k pixels at 1200 bins), where one solve repays a cold
+# compile; the rank search and smaller solves run faster uncompiled.
+_COMPILE_MIN_ELEMENTS = 5e8
+
+
+def _resolve_compile(compile_mode, T, device=None):
+    """'auto', 'on' or 'off' (None is 'off') as 'on' or 'off' for the data T solved on `device` (default: T's). 'auto'
+    compiles on CUDA with a working Triton when T has at least _COMPILE_MIN_ELEMENTS entries."""
+    if compile_mode is None or compile_mode == 'off':
+        return 'off'
+    if compile_mode not in ('auto', 'on'):
+        raise ValueError(f"compile_mode must be 'auto', 'on' or 'off', got {compile_mode!r}")
+    if compile_mode == 'on':
+        return 'on'
+    if torch.device(device or T.device).type != 'cuda' or T.numel() < _COMPILE_MIN_ELEMENTS:
+        return 'off'
+    from ..kernel_availability import triton_available
+    return 'on' if triton_available()[0] else 'off'
 
 
 def _kernels(compile_mode):
-    """The four hot kernels, eager or compiled: (nnal, derivatives, rowwise, block step).
+    """The four hot kernels (nnal, derivatives, rowwise, block step), compiled when compile_mode is 'on'.
 
-    compile_mode None or 'off' returns the plain functions; any other value compiles them once with torch.compile
-    and caches the result. The Newton solvers spend their time in elementwise passes over the P x K data, which
-    compiling fuses; the GEMM-bound CG iteration is left eager. Compiling costs seconds and recompiles when P, K, R,
-    the dtype or the presence of zero counts changes, so it pays for repeated or long solves, not for one. The fused
-    reductions round differently, so a long block_newton run may take a different active-set decision compiled.
+    compile_mode is a resolved mode (see _resolve_compile). Compiling fuses the elementwise passes over the P x K data
+    that dominate the Newton solvers; the GEMM-bound CG iteration stays eager. A kernel recompiles when P, K, R, the
+    dtype or the presence of zero counts changes, and falls back to eager if the compile backend fails.
     """
-    if compile_mode in (None, 'off'):
+    if compile_mode != 'on':
         return stable_nnal, stable_nnal_derivatives, _nnal_rowwise, block_newton_step
-    if compile_mode not in _COMPILED_KERNELS:
-        import torch._dynamo
-        torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
-        compiled = lambda f: torch.compile(f, mode=None, dynamic=False)
-        _COMPILED_KERNELS[compile_mode] = (compiled(stable_nnal), compiled(stable_nnal_derivatives),
-                                           compiled(_nnal_rowwise), compiled(block_newton_step))
-    return _COMPILED_KERNELS[compile_mode]
+    from ..projectors import maybe_compile
+    return tuple(maybe_compile(f, True) for f in (stable_nnal, stable_nnal_derivatives, _nnal_rowwise,
+                                                  block_newton_step))
 
 
 def _two_metric_direction(V, grad, flat, rows, cols, jitter_rel=1e-9, nonneg=True):
@@ -149,9 +166,11 @@ def block_newton_step(V, other, X, T, prep, axis, jitter_rel=1e-9, nonneg=True):
         alpha = alpha * 0.5
         num_backtracks += 1
 
-    V_new = V - accepted[:, None] * d
+    step = accepted[:, None] * d
+    V_new = V - step
     if nonneg:
-        V_new = V_new.clamp_(min=0.0)
+        reach = (d > 0) & (step >= V * (1.0 - _SNAP_ULPS * torch.finfo(V.dtype).eps))    # see _SNAP_ULPS
+        V_new = torch.where(reach, torch.zeros_like(V_new), V_new).clamp_(min=0.0)
         V_new = torch.where(bound, torch.zeros_like(V_new), V_new)
     X_new = X - expand(accepted) * B
     if axis == 1:
@@ -204,7 +223,7 @@ def solve_W(T, H, W_init=None, max_steps=100, rel_tol=1e-12, nonneg=True, compil
     return W
 
 def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, nnal=None, deriv=None,
-                      nonneg_W=True, w_mask=None):
+                      nonneg_W=True, w_mask=None, patience=1):
     """Joint truncated-Newton solve on (W, H) by preconditioned CG, from a warm start.
 
     Each step forms the projected gradient (entries at zero with an outward
@@ -217,9 +236,10 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, 
     residual reduced by min(sqrt(|g|), 0.5). A backtracking Armijo search on the
     float64 loss, clamping to the feasible set, accepts the step; a failed search
     multiplies lam by 10 and retries, an accepted one shrinks it. The solve stops
-    when the relative loss change per accepted step is below rel_tol, on the KKT
-    fallback below (for data the model fits exactly), or when lam runs away, which
-    is what the precision floor looks like from here. Returns (W, H, steps, total_cg).
+    after `patience` consecutive accepted steps whose relative loss change is at
+    most rel_tol, on the KKT fallback below (for data the model fits exactly), or
+    when lam runs away, which is what the precision floor looks like from here.
+    Returns (W, H, steps, total_cg).
 
     Hooks: nonneg_W=False drops W >= 0 -- every coefficient is free and the line
     search does not clamp W; the pixel problem stays strictly convex for any real
@@ -240,6 +260,7 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, 
     total_cg = 0
     step = 0
     gnorm0 = None
+    quiet = 0
     for step in range(1, max_steps + 1):
         X = W @ H
         G, Z = deriv(X, T, prep)
@@ -333,7 +354,8 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, 
         # the solve; rel_tol is the relative loss change per accepted step.
         rel_change = torch.abs(loss - new_loss) / torch.abs(new_loss).clamp_min(torch.finfo(torch.float64).tiny)
         W, H, loss = Wn, Hn, new_loss
-        if rel_tol > 0 and bool(rel_change <= rel_tol):
+        quiet = quiet + 1 if bool(rel_change <= rel_tol) else 0
+        if rel_tol > 0 and quiet >= patience:
             break
     return W, H, step, total_cg
 
@@ -365,6 +387,6 @@ def joint_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True, W
     remaining = max(0, max_steps - warmup_steps)
     if remaining == 0:
         return W, H, min(warmup_steps, max_steps)
-    W, H, steps, _ = _joint_newton_pcg(T, W, H, max_steps=remaining, cg_max=cg_max,
-                                       rel_tol=rel_tol, prep=prep, nnal=nnal_fn, deriv=deriv_fn)
+    W, H, steps, _ = _joint_newton_pcg(T, W, H, max_steps=remaining, cg_max=cg_max, rel_tol=rel_tol, prep=prep,
+                                       nnal=nnal_fn, deriv=deriv_fn, patience=_PATIENCE)
     return W, H, warmup_steps + steps

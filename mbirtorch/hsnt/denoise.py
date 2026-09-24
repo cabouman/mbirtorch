@@ -45,8 +45,8 @@ def _to_transmission(data, dataset_type):
     return np.ascontiguousarray(T, dtype=np.float32), shape
 
 
-def dehydrate(data, dataset_type="attenuation", num_materials=None, method="joint_newton", max_steps=300, rel_tol=1e-6,
-              max_rank=6, device=None, verbose=1, **kwargs):
+def dehydrate(data, dataset_type="attenuation", num_materials=None, method="joint_newton", max_steps=1000, rel_tol=1e-8,
+              max_rank=6, device=None, compile_mode="auto", verbose=1, **kwargs):
     """Dehydrate a hyperspectral dataset by the maximum-likelihood factorization X = W H of its attenuation.
 
     The spectral axis must be the last axis; the leading axes are kept. The fit minimizes the non-negative
@@ -62,10 +62,13 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, method="join
             Defaults to 'attenuation'.
         num_materials (int, optional): Rank of the factorization :math:`N_m`. Defaults to None, which estimates it.
         method (str, optional): Solver, see :func:`~mbirtorch.hsnt.nnal_factorization`. Defaults to 'joint_newton'.
-        max_steps (int, optional): Solver iteration cap. Defaults to 300.
-        rel_tol (float, optional): Relative loss change per step at which the solver stops. Defaults to 1e-6.
+        max_steps (int, optional): Solver iteration cap. Defaults to 1000.
+        rel_tol (float, optional): Relative loss change per step at which the solver stops, see
+            :func:`~mbirtorch.hsnt.nnal_factorization`. Defaults to 1e-8.
         max_rank (int, optional): Largest rank the estimate considers. Defaults to 6.
         device (str, optional): Torch device. Defaults to None, meaning CUDA if available, else CPU.
+        compile_mode (str, optional): 'auto', 'on' or 'off', see :func:`~mbirtorch.hsnt.nnal_factorization`; the rank
+            estimate always runs uncompiled. Defaults to 'auto'.
         verbose (int, optional): 0 prints nothing; 1 prints a summary; 2 also prints the rank search. Defaults to 1.
 
     Returns:
@@ -93,7 +96,7 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, method="join
                                                verbose=max(0, verbose - 1))
     Tt = torch.from_numpy(T).to(device)
     W, H, steps = nnal_factorization(Tt, method=method, num_materials=int(num_materials), max_steps=max_steps,
-                                     rel_tol=rel_tol)
+                                     rel_tol=rel_tol, compile_mode=compile_mode)
     subspace_data = W.cpu().numpy().astype(np.float32).reshape(*lead, int(num_materials))
     subspace_basis = H.cpu().numpy().astype(np.float32)
     if verbose >= 1:

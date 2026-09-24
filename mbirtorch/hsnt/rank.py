@@ -14,7 +14,9 @@ def _lrt_rank(T, max_rank, label, verbose=0):
     P, K = T.shape
     losses, resid = [], []
     for r in range(1, max_rank + 1):
-        W, H, _ = nnal_factorization(T, method="joint_newton", num_materials=r, max_steps=200, rel_tol=1e-6)
+        # uncompiled: the search solves small problems at six ranks, and each new shape would recompile
+        W, H, _ = nnal_factorization(T, method="joint_newton", num_materials=r, max_steps=200, rel_tol=1e-6,
+                                     compile_mode="off")
         Xd = W.double() @ H.double()
         Th = torch.exp(-Xd)
         Td = T.double()

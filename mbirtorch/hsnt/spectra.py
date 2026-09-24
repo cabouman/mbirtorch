@@ -6,10 +6,10 @@ import warnings
 import torch
 
 from ._loss import _nnal_prep, _nnal_rowwise, stable_nnal_derivatives
-from ._newton import _ARMIJO_FLOOR, _joint_newton_pcg, _kernels, solve_W
+from ._newton import _ARMIJO_FLOOR, _joint_newton_pcg, _kernels, _resolve_compile, solve_W
 
 
-def unconstrained_spectra(T, W, H, max_steps=100, cg_max=10, rel_tol=1e-8, w_max_steps=100, compile_mode=None):
+def unconstrained_spectra(T, W, H, max_steps=100, cg_max=10, rel_tol=1e-8, w_max_steps=100, compile_mode='auto'):
     """Re-estimate the spectra with the bound on the pixel coefficients dropped, then re-solve W >= 0.
 
     The maximum-likelihood spectra are biased by the truncation of pixel coefficients at zero: a coefficient whose
@@ -28,11 +28,12 @@ def unconstrained_spectra(T, W, H, max_steps=100, cg_max=10, rel_tol=1e-8, w_max
         cg_max (int, optional): Conjugate-gradient iterations per Newton step. Defaults to 10.
         rel_tol (float, optional): Relative loss change per step at which to stop. Defaults to 1e-8.
         w_max_steps (int, optional): Iteration cap of the final W >= 0 solve. Defaults to 100.
-        compile_mode (str, optional): See :func:`~mbirtorch.hsnt.nnal_factorization`. Defaults to None.
+        compile_mode (str, optional): See :func:`~mbirtorch.hsnt.nnal_factorization`. Defaults to 'auto'.
 
     Returns:
         (W, H, steps): W >= 0 re-solved for the returned H, and the steps of the free-W solve.
     """
+    compile_mode = _resolve_compile(compile_mode, T)
     nnal_fn, deriv, _, _ = _kernels(compile_mode)
     prep = _nnal_prep(T)
     _, Hu, steps, _ = _joint_newton_pcg(T, W, H, max_steps=max_steps, cg_max=cg_max, rel_tol=rel_tol,
@@ -363,7 +364,7 @@ def auto_penalty(T, dose, K=None):
 
 
 def select_supports(T, W, H, dose, penalty=None, method="branch_bound", k_top=6, m_max=4, wald_screen=0.0,
-                    w_max_steps=100, compile_mode=None):
+                    w_max_steps=100, compile_mode='auto'):
     """Choose each pixel's material subset S by penalized likelihood: minimize dose * f_p(S) + penalty * size(S).
 
     Args:
@@ -384,11 +385,12 @@ def select_supports(T, W, H, dose, penalty=None, method="branch_bound", k_top=6,
             full-fit Wald statistic is below wald_screen times the penalty; faster for sparse supports, but a faint
             material the full fit truncated to zero is then never considered. Defaults to 0.
         w_max_steps (int, optional): Iteration cap of the enumeration's solves. Defaults to 100.
-        compile_mode (str, optional): See :func:`~mbirtorch.hsnt.nnal_factorization`. Defaults to None.
+        compile_mode (str, optional): See :func:`~mbirtorch.hsnt.nnal_factorization`. Defaults to 'auto'.
 
     Returns:
         (support, W0, f): the (pixels, R) bool support, the coefficients on it, and the per-pixel loss.
     """
+    compile_mode = _resolve_compile(compile_mode, T)
     R, K = H.shape
     if penalty is None:
         lam = 2.0 * math.log(K)
@@ -430,7 +432,7 @@ def _warn_collinear_rows(H, cosine=0.999):
 
 
 def support_selected_spectra(T, W, H, dose, penalty=None, max_steps=300, cg_max=10, rel_tol=1e-10,
-                             w_max_steps=100, compile_mode=None, verbose=0, method="branch_bound", k_top=6, m_max=4,
+                             w_max_steps=100, compile_mode='auto', verbose=0, method="branch_bound", k_top=6, m_max=4,
                              wald_screen=0.0, free_refit=False, min_support=None):
     """Choose each pixel's material subset by penalized likelihood, then refit with the other coefficients held at 0.
 
@@ -452,7 +454,7 @@ def support_selected_spectra(T, W, H, dose, penalty=None, max_steps=300, cg_max=
         cg_max (int, optional): Conjugate-gradient iterations per refit step. Defaults to 10.
         rel_tol (float, optional): Relative loss change per step at which the refit stops. Defaults to 1e-10.
         w_max_steps (int, optional): See select_supports. Defaults to 100.
-        compile_mode (str, optional): See :func:`~mbirtorch.hsnt.nnal_factorization`. Defaults to None.
+        compile_mode (str, optional): See :func:`~mbirtorch.hsnt.nnal_factorization`. Defaults to 'auto'.
         verbose (int, optional): 1 prints the mean support size and the refit's steps. Defaults to 0.
         method, k_top, m_max, wald_screen: The subset search, see select_supports.
         free_refit (bool, optional): Drop the bound on the selected coefficients during the refit, then re-solve
@@ -465,6 +467,7 @@ def support_selected_spectra(T, W, H, dose, penalty=None, max_steps=300, cg_max=
         (W, H, support, steps): the refit factors, the (pixels, R) bool support (all True in a column that
         reverted), and the refit's steps.
     """
+    compile_mode = _resolve_compile(compile_mode, T)
     nnal_fn, deriv, _, _ = _kernels(compile_mode)
     prep = _nnal_prep(T)
     support, W0, _ = select_supports(T, W, H, dose, penalty=penalty, method=method, k_top=k_top, m_max=m_max,

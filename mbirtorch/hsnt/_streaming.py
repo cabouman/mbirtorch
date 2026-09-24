@@ -3,7 +3,7 @@ import torch
 from . import _newton
 from ._loss import _nnal_prep
 from ._device import _default_device
-from ._newton import _kernels, solve_W
+from ._newton import _kernels, _resolve_compile, solve_W
 from .factorization import nnal_factorization
 
 
@@ -32,7 +32,7 @@ def _h_direction(H, grad, flat, rows, cols, jitter_rel=1e-9):
 
 def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warmup_pixels=16384,
                          w_rel_tol=1e-8, w_max_steps=300, ls_trials=4, device=None,
-                         compile_mode=None, verbose=0, polish_dtype=None,
+                         compile_mode='off', verbose=0, polish_dtype=None,
                          kkt_tol=None, stats=None, nonneg_W=True, support_selection=None):
     """Factorize a dataset too large for device memory, one chunk of pixels at a time.
 
@@ -54,7 +54,8 @@ def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warm
         w_max_steps (int, optional): Iteration cap of each chunk's W solve. Defaults to 300.
         ls_trials (int, optional): Step lengths tried per H line search. Defaults to 4.
         device (str, optional): Torch device. Defaults to None, meaning CUDA if available, else CPU.
-        compile_mode (str, optional): See :func:`~mbirtorch.hsnt.nnal_factorization`. Defaults to None.
+        compile_mode (str, optional): 'auto', 'on' or 'off', as in :func:`~mbirtorch.hsnt.nnal_factorization`, judged
+            on one chunk. Defaults to 'off'.
         verbose (int, optional): 1 prints the loss and KKT residual of every pass. Defaults to 0.
         polish_dtype (torch.dtype, optional): Run the polish passes in this dtype (e.g. torch.float64); the
             accumulated statistics are float64 regardless. Defaults to None, the chunks' dtype.
@@ -74,8 +75,9 @@ def stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warm
     Returns:
         (W_chunks, H, passes): W as a list of CPU tensors aligned with the chunks, H, and the polish passes made.
     """
-    _, deriv, rowwise, _ = _kernels(compile_mode)
     device = _default_device(device)
+    compile_mode = _resolve_compile(compile_mode, chunks[0], device)
+    _, deriv, rowwise, _ = _kernels(compile_mode)
     R = num_materials
     W_chunks = [None] * len(chunks)
 

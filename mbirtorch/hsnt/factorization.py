@@ -3,7 +3,7 @@ import torch
 from ._linalg import nndsvda
 from ._loss import _nnal_prep, stable_nnal
 from ._multiplicative import multiplicative_update
-from ._newton import block_newton_optimize, joint_newton_optimize
+from ._newton import _resolve_compile, block_newton_optimize, joint_newton_optimize
 from ._lbfgsb import lbfgsb_optimize
 
 
@@ -97,7 +97,7 @@ def optimize(T, update, num_materials, max_steps, rel_tol, update_H=True, W_init
     return W, H, num_steps
 
 
-def nnal_factorization(T, method='joint_newton', num_materials=3, max_steps=1000, rel_tol=1e-10, compile_mode=None,
+def nnal_factorization(T, method='joint_newton', num_materials=3, max_steps=1000, rel_tol=1e-8, compile_mode='auto',
                        **kwargs):
     """Factorize the transmission ratio T ~= exp(-W @ H), W, H >= 0, by minimizing the non-negative attenuation loss.
 
@@ -113,13 +113,13 @@ def nnal_factorization(T, method='joint_newton', num_materials=3, max_steps=1000
             Nesterov extrapolation (sublinear). 'lbfgsb': scipy's L-BFGS-B over both factors, a generic baseline.
         num_materials (int): Rank of the factorization. Defaults to 3.
         max_steps (int): Iteration cap. Defaults to 1000.
-        rel_tol (float): Relative change in the float64 loss per step at which to stop. Defaults to 1e-10.
-            joint_newton is close to its optimum at 1e-6; block_newton and multiplicative converge more slowly and
-            need 1e-8 or tighter for the same quality. On data the model fits exactly a projected-gradient test takes
-            over and runs to machine precision.
-        compile_mode (str or None): None or 'off' runs eagerly (default). Any other value, e.g. 'default' or
-            'max-autotune', compiles the elementwise kernels of the Newton methods, or the multiplicative update,
-            with torch.compile: a one-off cost that pays for repeated or long solves. Ignored by lbfgsb.
+        rel_tol (float): Relative change in the float64 loss per step at which to stop. joint_newton stops after
+            five consecutive steps below it, which makes the result reproducible across starts and compilation at
+            1e-8; the other methods stop at the first such step. Defaults to 1e-8. On data the model fits exactly a
+            projected-gradient test takes over and runs to machine precision.
+        compile_mode (str): 'auto' (default) compiles the hot kernels with torch.compile on CUDA with a working
+            Triton when T has at least 5e8 entries (about 400k pixels at 1200 bins), where one solve repays the
+            compile; 'on' always compiles; 'off' never does. Ignored by lbfgsb.
         **kwargs: W_init and H_init (start from given factors); extrapolate for the multiplicative method.
 
     Returns:
@@ -139,7 +139,8 @@ def nnal_factorization(T, method='joint_newton', num_materials=3, max_steps=1000
     else:
         raise ValueError("Invalid method. Choose 'joint_newton', 'block_newton', 'multiplicative' or 'lbfgsb'.")
 
-    if update is multiplicative_update and compile_mode not in (None, 'off'):
-        update = torch.compile(update, options={"triton.cudagraphs": False,
-                                                "max_autotune": compile_mode == "max-autotune"})
+    compile_mode = _resolve_compile(compile_mode, T)
+    if update is multiplicative_update and compile_mode == 'on':
+        from ..projectors import maybe_compile
+        update = maybe_compile(update, True)
     return optimize(T, update, num_materials, max_steps, rel_tol, compile_mode=compile_mode, **kwargs)

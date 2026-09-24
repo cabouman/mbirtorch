@@ -9,6 +9,7 @@ import pytest
 import torch
 
 import mbirtorch.hsnt as hsnt
+from mbirtorch.hsnt import _newton
 from mbirtorch.hsnt._loss import _nnal_prep, stable_nnal_derivatives
 from mbirtorch.hsnt.factorization import _initial_factors
 from mbirtorch.hsnt.spectra import _fit_free_sets, _guard_components, auto_penalty, select_supports
@@ -78,8 +79,57 @@ def test_compiled_matches_eager(method):
     T, _, _ = _problem("cuda")
     W1, H1, _ = hsnt.nnal_factorization(T, method=method, num_materials=3, max_steps=200, rel_tol=1e-8)
     W2, H2, _ = hsnt.nnal_factorization(T, method=method, num_materials=3, max_steps=200, rel_tol=1e-8,
-                                        compile_mode="default")
+                                        compile_mode="on")
     assert abs(_loss(W1, H1, T) - _loss(W2, H2, T)) <= 1e-6 * _loss(W1, H1, T)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_compiled_and_eager_block_steps_take_the_same_zero_decisions():
+    """Fused rounding in the compiled step once left ulp-sized residues where the eager step lands on zero."""
+    from mbirtorch.kernel_availability import triton_available
+    usable, reason = triton_available()
+    if not usable:
+        pytest.skip(f"torch.compile needs Triton on CUDA: {reason}")
+    T, _, _ = _problem("cuda", dose=3.0)
+    prep = _nnal_prep(T)
+    W, H = _initial_factors(T, 3)
+    eager, compiled = _newton._kernels("off")[3], _newton._kernels("on")[3]
+    for _ in range(3):
+        X = W @ H
+        We, _, _ = eager(W, H, X, T, prep, 0)
+        Wc, _, _ = compiled(W, H, X, T, prep, 0)
+        assert torch.equal(We == 0, Wc == 0)
+        W = We
+        H, _, _ = eager(H, W, W @ H, T, prep, 1)
+
+
+def test_solves_from_nearby_starts_stop_at_the_same_point(dev):
+    """The joint solve stops after several quiet steps in a row: from starts 1e-7 apart it ends at the same loss
+    (a one-step stop spread these by about 1e-6 on this problem)."""
+    basis, _ = hsnt.load_material_basis()
+    _, _, _, maps = hsnt.generate_sphere_data(np.ones((3, 1), np.float32), num_angles=4, detector_rows=32,
+                                              detector_columns=32, dosage_rate=1.0,
+                                              material_density={"Ni": 0.25, "Cu": 0.25, "Al": 0.75}, noisy=False,
+                                              verbose=0)
+    B = torch.tensor(basis[:, ::4].copy(), device=dev)
+    g = torch.Generator(device=dev).manual_seed(7)
+    T = torch.poisson(100.0 * torch.exp(-(torch.tensor(maps.reshape(-1, 3), device=dev) @ B)), generator=g) / 100.0
+    W0, H0 = _initial_factors(T, 3)
+    rng = torch.Generator(device=dev).manual_seed(0)
+    losses = []
+    for k in range(3):
+        eps = 0.0 if k == 0 else 1e-7
+        W, H, _ = hsnt.nnal_factorization(T, num_materials=3, compile_mode="off",
+                                          W_init=W0 * (1 + eps * torch.randn(W0.shape, generator=rng, device=dev)),
+                                          H_init=H0 * (1 + eps * torch.randn(H0.shape, generator=rng, device=dev)))
+        losses.append(_loss(W, H, T))
+    assert (max(losses) - min(losses)) / min(losses) < 1e-7
+
+
+def test_compile_mode_is_validated():
+    T, _, _ = _problem("cpu", P=64, K=20)
+    with pytest.raises(ValueError, match="compile_mode"):
+        hsnt.nnal_factorization(T, num_materials=3, compile_mode="default")
 
 
 def test_spectra_estimators_keep_w_nonnegative_and_off_support_zero(dev):

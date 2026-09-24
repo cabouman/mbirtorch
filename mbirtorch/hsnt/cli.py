@@ -146,7 +146,7 @@ def solve(ds, args, device):
     if mode == "full":
         T = torch.from_numpy(ds.T).to(device)
         W, H, steps = nnal_factorization(T, method=args.method, num_materials=rank, max_steps=args.max_steps,
-                                         rel_tol=args.rel_tol)
+                                         rel_tol=args.rel_tol, compile_mode=args.compile)
         rep["steps"] = int(steps)
     else:
         if args.method != "joint_newton":
@@ -159,7 +159,8 @@ def solve(ds, args, device):
                                                    warmup_pixels=min(args.warmup_pixels, ds.pixels), device=device,
                                                    verbose=int(log.isEnabledFor(logging.DEBUG)), stats=stats,
                                                    nonneg_W=(args.spectra != "unconstrained"),
-                                                   support_selection=support)
+                                                   support_selection=support,
+                                                   compile_mode='off' if args.compile == 'auto' else args.compile)
         W = torch.cat([w.to(device) for w in W_chunks])
         rep.update(passes=int(passes), loss_per_pass=stats.get("loss"), kkt_per_pass=stats.get("kkt"))
         T = None
@@ -184,11 +185,11 @@ def solve(ds, args, device):
 
     if args.spectra == "unconstrained" and mode == "full":
         t1 = time.perf_counter()
-        W, H, st = unconstrained_spectra(T, W, H)
+        W, H, st = unconstrained_spectra(T, W, H, compile_mode=args.compile)
         rep["unconstrained_steps"], rep["unconstrained_seconds"] = int(st), round(time.perf_counter() - t1, 2)
     elif args.spectra == "support" and mode == "full":
         t1 = time.perf_counter()
-        W, H, S, st = support_selected_spectra(T, W, H, ds.dose, **support_kw)
+        W, H, S, st = support_selected_spectra(T, W, H, ds.dose, compile_mode=args.compile, **support_kw)
         rep["support_steps"], rep["support_seconds"] = int(st), round(time.perf_counter() - t1, 2)
         rep["mean_support_size"] = S.sum(1).double().mean().item()
     elif args.spectra == "support":
@@ -512,10 +513,14 @@ class _Options:
         g = sp.add_argument_group("advanced: solver")
         self.add(g, "--method", choices=("joint_newton", "block_newton", "multiplicative", "lbfgsb"),
                  default="joint_newton", advanced=True, help="solver (default joint_newton, the fastest)")
-        self.add(g, "--max-steps", type=int, default=300, advanced=True,
-                 help="largest number of solver steps in a full solve (default 300)")
-        self.add(g, "--rel-tol", type=float, default=1e-6, advanced=True,
-                 help="relative loss change per step at which to stop (default 1e-6)")
+        self.add(g, "--max-steps", type=int, default=1000, advanced=True,
+                 help="largest number of solver steps in a full solve (default 1000)")
+        self.add(g, "--rel-tol", type=float, default=1e-8, advanced=True,
+                 help="relative loss change per step; the solve stops after five steps in a row below it "
+                      "(default 1e-8)")
+        self.add(g, "--compile", choices=("auto", "on", "off"), default="auto", advanced=True,
+                 help="compile the solver kernels: auto (default) on CUDA for data of 5e8 entries or more, where it "
+                      "pays; stream mode compiles only with 'on', and the rank estimate always runs uncompiled")
         g = sp.add_argument_group("advanced: memory")
         self.add(g, "--mode", choices=("auto", "full", "stream"), default="auto", advanced=True,
                  help="full solve on the device or streamed by chunks of pixels (default: by available memory)")
