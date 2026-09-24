@@ -118,13 +118,23 @@ Each row below is a change to make in code that calls MBIRJAX.
        ``MultiAxisParallelModel``, ``TranslationModel`` and
        ``TomographyModel``.
    * - ``hsnt.dehydrate(data, num_materials=3, safety_factor=2)``
-     - ``hsnt.l2_dehydrate(data, num_materials=3, safety_factor=2)``
-     - Renamed; same arguments and results.  ``hsnt.dehydrate`` now fits
-       the Poisson likelihood of the counts and takes different arguments,
-       described in :ref:`HSNTDocs`.
+     - ``hsnt.dehydrate(data, num_materials=3)``
+     - ``dehydrate`` now fits the Poisson likelihood of the counts, with a
+       basis of rank ``num_materials`` rather than
+       ``safety_factor * num_materials``, and estimates the rank when it is
+       not given.  The scikit-learn NMF has no counterpart in MBIRTorch; its
+       keywords (``safety_factor``, ``beta_loss``, ``max_iter``,
+       ``tolerance``, ``batch_size``, ``subspace_basis``, ``random_state``)
+       raise a ``TypeError``.  The same holds for ``mbirtorch.dehydrate``.
+       See :ref:`HSNTDocs`.
    * - ``hsnt.hyper_denoise(data, num_materials=3, safety_factor=2)``
-     - ``hsnt.l2_hyper_denoise(data, num_materials=3, safety_factor=2)``
-     - Renamed, as for ``dehydrate``.
+     - ``hsnt.hyper_denoise(data, num_materials=3)``
+     - As for ``dehydrate``.
+   * - ``hsnt.generate_hyper_data(material_basis, ...)``
+     - ``hsnt.generate_hyper_data(material_basis, ..., noisy=True)``
+     - The open beam is noiseless and the transmission is floored at 1e-30
+       rather than 1e-8, so a seed gives different data.  ``noisy=False``
+       returns the noiseless data.
 
 These names exist in MBIRJAX and have no counterpart in MBIRTorch:
 ``get_platform``, ``get_device_platform``, ``memory_report``,
@@ -196,7 +206,8 @@ in MBIRJAX exists only as the 4D reconstruction model ``MACE4DModel``.  The prep
 subpackage adds ``preprocess.geometry_calibration`` for estimating detector offset and
 detector rotation from the data.  ``QGGMRFDenoiser`` adds ``denoise_stack`` for denoising a
 stack of volumes in batches, and ``TomographyModel`` adds ``project_points``, ``recon_slice_z``
-and ``nearest_recon_slice``.  Finally, the compiled projector kernels are cached under
-``~/.mbirtorch``, so compiled code is reused by later runs, and ``clear_cache`` empties that
-cache.  Both packages can spread one reconstruction across several GPUs, and
+and ``nearest_recon_slice``.  The ``hsnt`` module adds ``estimate_rank``,
+``load_material_basis`` and the ``mbirtorch-hsnt`` command line.  Finally, the compiled
+projector kernels are cached under ``~/.mbirtorch``, so compiled code is reused by later runs,
+and ``clear_cache`` empties that cache.  Both packages can spread one reconstruction across several GPUs, and
 :ref:`usr_multi_gpu` describes how MBIRTorch chooses the number of devices.

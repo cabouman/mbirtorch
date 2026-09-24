@@ -9,14 +9,13 @@ from ._device import _default_device
 
 def _lrt_rank(T, max_rank, label, verbose=0):
     """Sequential likelihood-ratio rank test on the pixels of T, a tensor on the device. Returns (rank, detail)."""
-    from .factorization import nnal_factorization
+    from .factorization import _nnal_factorization
     from ._loss import stable_nnal
     P, K = T.shape
     losses, resid = [], []
     for r in range(1, max_rank + 1):
         # uncompiled: the search solves small problems at six ranks, and each new shape would recompile
-        W, H, _ = nnal_factorization(T, method="joint_newton", num_materials=r, max_steps=200, rel_tol=1e-6,
-                                     compile_mode="off")
+        W, H, _ = _nnal_factorization(T, r, max_steps=200, rel_tol=1e-6, compile_mode="off")
         Xd = W.double() @ H.double()
         Th = torch.exp(-Xd)
         Td = T.double()
@@ -40,7 +39,7 @@ def _lrt_rank(T, max_rank, label, verbose=0):
                       threshold=threshold)
 
 
-def pool_pixels(T, spatial_shape, block):
+def _pool_pixels(T, spatial_shape, block):
     """Block-average a (pixels, bins) array over block x block detector pixels within each view.
 
     Rows and columns are cropped to multiples of the block. The averaged transmission is the summed count over the
@@ -111,7 +110,7 @@ def estimate_rank(T, spatial_shape=None, device=None, max_rank=6, subsample=1638
     rank = rank_full
     parts = [f"full resolution gave {rank_full}"]
     if block > 1:
-        pooled = np.ascontiguousarray(pool_pixels(T_np, spatial_shape, block), dtype=np.float32)
+        pooled = np.ascontiguousarray(_pool_pixels(T_np, spatial_shape, block), dtype=np.float32)
         Tp = torch.from_numpy(pooled).to(device)
         rank_pool, d_pool = _lrt_rank(Tp, max_rank, f"pooled {block}x{block}", verbose)
         detail.update(pooled=d_pool, rank_pooled=rank_pool)

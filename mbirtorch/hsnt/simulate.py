@@ -94,92 +94,7 @@ def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector
     return [noisy_hyper_projection, angles, gt_hyper_projection]
 
 
-def generate_sphere_data(material_basis, num_angles=4, detector_rows=64, detector_columns=64, dosage_rate=300,
-                         material_density=None, sphere_radius=None, triangle_radius=None, angles=None, noisy=True,
-                         verbose=1):
-    """
-    Simulate hyperspectral neutron data for three solid spheres (Ni, Cu, Al) whose centers form an equilateral
-    triangle, viewed by a parallel beam from directions within the plane of the triangle.
-
-    The rotation axis is the detector-row axis, perpendicular to the triangle; the detector columns span the plane.
-    Because every view lies in the plane, the spheres overlap in projection at most angles (fully for one pair at
-    angle 0), so the phantom has mixed pixels as well as pure ones, unlike the slab phantom of
-    :func:`generate_hyper_data`, whose pixels are all pure. Each pixel's areal density of a material is its volume
-    fraction times the chord length through that sphere, with the sphere diameter scaled to the same 10 thickness
-    units as the slabs' maximum, so attenuations are comparable between the two phantoms.
-
-    Args:
-        material_basis: ndarray of shape :math:`(3, N_k)`, rows Ni, Cu, Al linear attenuation spectra.
-        num_angles: Number of views :math:`N_v`, equally spaced over :math:`[0, \\pi)` unless ``angles`` is given.
-        detector_rows, detector_columns: Detector size; the spheres sit in the middle rows.
-        dosage_rate: Open-beam counts per pixel and wavelength bin.
-        material_density: Volume fractions for Ni, Cu, Al. Defaults to {"Ni": 0.2, "Cu": 0.2, "Al": 1.0}.
-        sphere_radius: Sphere radius in pixels. Default 0.19 of the detector width.
-        triangle_radius: Circumradius of the triangle of centers in pixels. Default 0.23 of the detector width, which
-            keeps the spheres from intersecting in 3-D (side 0.4 of the width against a diameter of 0.38).
-        angles: Optional array of view angles in radians, overriding ``num_angles``.
-        noisy: Draw Poisson counts; otherwise return the noiseless data as the measurement.
-        verbose: 0 silent, 1 prints shapes and the per-view overlap statistics.
-
-    Returns:
-        [noisy_hyper_projection, angles, gt_hyper_projection, material_projection]: the measured attenuation
-        :math:`(N_v, N_r, N_c, N_k)`, the angles, the noiseless attenuation, and the ground-truth areal densities
-        :math:`(N_v, N_r, N_c, 3)` (Ni, Cu, Al).
-    """
-    if material_basis.shape[0] != 3:
-        raise ValueError("material_basis must have exactly 3 rows (Ni, Cu, Al).")
-    if np.any(material_basis < 0):
-        raise ValueError("material_basis should be non-negative attenuation coefficients.")
-    if dosage_rate <= 0:
-        raise ValueError("dosage_rate must be positive.")
-    if material_density is None:
-        material_density = {"Ni": 0.2, "Cu": 0.2, "Al": 1.0}
-    missing = {"Ni", "Cu", "Al"} - set(material_density)
-    if missing:
-        raise KeyError(f"material_density missing keys: {sorted(missing)}")
-    r = detector_columns * 0.19 if sphere_radius is None else float(sphere_radius)
-    rho = detector_columns * 0.23 if triangle_radius is None else float(triangle_radius)
-    if rho * np.sqrt(3) < 2 * r and verbose:
-        print(f"generate_sphere_data(): spheres intersect in 3-D (side {rho * np.sqrt(3):.1f} < diameter {2 * r:.1f}); "
-              "overlapping regions carry both materials")
-    angles = np.linspace(0, np.pi, num_angles, endpoint=False) if angles is None else np.asarray(angles, dtype=float)
-    # centers of the equilateral triangle in the plane (x, z), Ni at the top
-    phis = np.deg2rad([90.0, 210.0, 330.0])
-    centers = rho * np.stack([np.cos(phis), np.sin(phis)], 1)
-    densities = np.array([material_density["Ni"], material_density["Cu"], material_density["Al"]], dtype=float)
-    v = np.arange(detector_rows) - (detector_rows - 1) / 2.0            # along the rotation axis
-    u = np.arange(detector_columns) - (detector_columns - 1) / 2.0      # in-plane detector coordinate
-    material_projection = np.zeros((len(angles), detector_rows, detector_columns, 3), dtype=material_basis.dtype)
-    for a, th in enumerate(angles):
-        p = np.array([-np.sin(th), np.cos(th)])                         # in-plane unit vector across the beam
-        for m in range(3):
-            du = u[None, :] - centers[m] @ p
-            chord2 = r * r - du ** 2 - v[:, None] ** 2
-            thickness = 10.0 * np.sqrt(np.clip(chord2, 0, None)) / r          # 10 units across a diameter, as the slabs
-            material_projection[a, :, :, m] = densities[m] * thickness
-    gt_hyper_projection = rehydrate([material_projection, material_basis, 'attenuation'])
-    noiseless_counts = np.nan_to_num(dosage_rate * np.exp(-gt_hyper_projection), nan=0, posinf=0, neginf=0)
-    counts = np.random.poisson(noiseless_counts) if noisy else noiseless_counts
-    ratio = counts / dosage_rate
-    ratio[ratio < 1e-30] = 1e-30
-    noisy_hyper_projection = -np.log(ratio)
-    if verbose >= 1:
-        print("generate_sphere_data(): ")
-        print(f"   -sphere radius {r:.1f} px, triangle circumradius {rho:.1f} px, side {rho * np.sqrt(3):.1f} px, "
-              f"{len(angles)} views at {np.round(np.rad2deg(angles), 1).tolist()} deg")
-        print("   -Shape of material_projection (areal density of Ni, Cu, Al):", material_projection.shape)
-        print("   -Shape of hyperspectral data: ", noisy_hyper_projection.shape)
-        present = material_projection > 0
-        for a in range(len(angles)):
-            n = present[a].sum(-1)
-            mat = n > 0
-            print(f"   -view {a} ({np.rad2deg(angles[a]):5.1f} deg): {mat.mean():.1%} of pixels hold material; of "
-                  f"those {(n[mat] == 1).mean():.0%} pure, {(n[mat] == 2).mean():.0%} two materials, "
-                  f"{(n[mat] == 3).mean():.0%} three")
-    return [noisy_hyper_projection, angles, gt_hyper_projection, material_projection]
-
-
-def material_basis_wavelengths(num_bins, lam0=1.5099, step=0.0025196):
+def _material_basis_wavelengths(num_bins, lam0=1.5099, step=0.0025196):
     """Wavelength in Angstrom of each bin of the packaged phantom basis, which stores spectra without an axis.
 
     The axis is linear, calibrated from the nickel row's Bragg edges (fcc, a = 3.5231 A), which it places to 1.3 mA
@@ -201,9 +116,9 @@ def load_material_basis():
 
     Returns:
         (basis, wavelengths): basis of shape (3, 1200), float32, the linear attenuation per unit density of Ni, Cu and
-        Al (the rows generate_hyper_data and generate_sphere_data expect), and the wavelength of each bin in Angstrom.
+        Al (the rows generate_hyper_data expects), and the wavelength of each bin in Angstrom.
     """
     from importlib.resources import files
     with files("mbirtorch.hsnt").joinpath("data", "material_basis.npy").open("rb") as f:
         basis = np.load(f).astype(np.float32)
-    return basis, material_basis_wavelengths(basis.shape[1])
+    return basis, _material_basis_wavelengths(basis.shape[1])

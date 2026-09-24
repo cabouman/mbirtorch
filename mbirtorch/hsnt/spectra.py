@@ -9,36 +9,32 @@ from ._loss import _nnal_prep, _nnal_rowwise, stable_nnal_derivatives
 from ._newton import _ARMIJO_FLOOR, _joint_newton_pcg, _kernels, _resolve_compile, solve_W
 
 
-def unconstrained_spectra(T, W, H, max_steps=100, cg_max=10, rel_tol=1e-8, w_max_steps=100, compile_mode='auto'):
+# The unconstrained re-estimate stops at a relative loss change of 1e-8 within 100 steps: with W free the loss is flat
+# along the mixing gauge, and a longer solve only wanders along it.
+_UNC_MAX_STEPS, _UNC_REL_TOL = 100, 1e-8
+# The joint refit on the supports, and the W >= 0 re-solves.
+_REFIT_MAX_STEPS, _REFIT_REL_TOL, _W_MAX_STEPS, _CG_MAX = 300, 1e-10, 100, 10
+# Branch and bound: candidate materials per pixel and the largest support searched (at 6 candidates it matches an
+# exhaustive search).
+_K_TOP, _M_MAX = 6, 4
+
+
+def _unconstrained_spectra(T, W, H, compile_mode='auto'):
     """Re-estimate the spectra with the bound on the pixel coefficients dropped, then re-solve W >= 0.
 
     The maximum-likelihood spectra are biased by the truncation of pixel coefficients at zero: a coefficient whose
     true value is zero is estimated positive half the time and clipped the other half, and the spectra, shared by
     every pixel, absorb that excess. Dropping the bound while H is estimated removes the bias, at the price of the
     variance the bound suppresses, so this pays when the pixels are many (above about 10^5 at a dose of 3 counts per
-    bin) and loses a little below that. With W free the loss is also flat along the mixing (W A^-1, A H) for any A
-    with A H >= 0, and after convergence the iterate would only wander along it; the default stop (rel_tol 1e-8
-    within 100 steps) ends the solve before that.
-
-    Args:
-        T (torch.Tensor): Transmission ratio, (pixels, bins).
-        W (torch.Tensor): Starting pixel coefficients, (pixels, R), typically the maximum-likelihood fit.
-        H (torch.Tensor): Starting spectra, (R, bins).
-        max_steps (int, optional): Iteration cap of the free-W solve. Defaults to 100.
-        cg_max (int, optional): Conjugate-gradient iterations per Newton step. Defaults to 10.
-        rel_tol (float, optional): Relative loss change per step at which to stop. Defaults to 1e-8.
-        w_max_steps (int, optional): Iteration cap of the final W >= 0 solve. Defaults to 100.
-        compile_mode (str, optional): See :func:`~mbirtorch.hsnt.nnal_factorization`. Defaults to 'auto'.
-
-    Returns:
-        (W, H, steps): W >= 0 re-solved for the returned H, and the steps of the free-W solve.
+    bin) and loses a little below that. Returns (W, H, steps): W >= 0 re-solved for the returned H, and the steps of
+    the free-W solve.
     """
     compile_mode = _resolve_compile(compile_mode, T)
     nnal_fn, deriv, _, _ = _kernels(compile_mode)
     prep = _nnal_prep(T)
-    _, Hu, steps, _ = _joint_newton_pcg(T, W, H, max_steps=max_steps, cg_max=cg_max, rel_tol=rel_tol,
+    _, Hu, steps, _ = _joint_newton_pcg(T, W, H, max_steps=_UNC_MAX_STEPS, cg_max=_CG_MAX, rel_tol=_UNC_REL_TOL,
                                         prep=prep, nnal=nnal_fn, deriv=deriv, nonneg_W=False)
-    Wc = solve_W(T, Hu, W, w_max_steps, 1e-12, compile_mode=compile_mode)
+    Wc = solve_W(T, Hu, W, _W_MAX_STEPS, 1e-12, compile_mode=compile_mode)
     return Wc, Hu, steps
 
 
@@ -243,180 +239,54 @@ def _select_branch_bound(T, H, dose, lam, f_full, k_top=6, m_max=4, plausible=No
     return best_idx, best_valid, best_w, best_f
 
 
-def _select_greedy(T, H, dose, lam, m_max=4, prep=None):
-    """Forward selection: each active pixel takes the material with the largest estimated gain (the one-material
-    Newton estimate g^2 / 2M from one gradient pass), the two best estimates are fitted exactly on the enlarged set,
-    the exact gain must exceed lam, and one backward pass drops members whose removal costs less than lam. Pixels
-    whose best estimate is below a fifth of lam stop.
-    Its cost is a few gradient passes whatever R is; it is a heuristic that misses weak or rare materials the
-    exact search finds. Returns (idx, valid, w, f)."""
-    screen, n_cand = 0.2, 2
-    P = T.shape[0]
-    R = H.shape[0]
-    dev = T.device
-    m_max = min(m_max, R)
-    prep = _nnal_prep(T) if prep is None else prep
-    idx = torch.full((P, m_max), -1, dtype=torch.long, device=dev)
-    valid = torch.zeros(P, m_max, dtype=torch.bool, device=dev)
-    w = torch.zeros(P, m_max, device=dev, dtype=T.dtype)
-    f = _empty_fit_loss(T, prep)
-    H2 = H * H
-    for step in range(m_max):
-        X = torch.einsum('pm,pmk->pk', w, H[idx.clamp(min=0)] * valid[:, :, None]) if step else torch.zeros_like(T)
-        G, Z = stable_nnal_derivatives(X, T, prep)
-        g = G @ H.T
-        Md = (Z @ H2.T).clamp(min=1e-12)
-        in_set = _scatter_support(idx, valid, w, R)[0]
-        gain_est = torch.where((g < 0) & ~in_set, 0.5 * g * g / Md, torch.zeros_like(g)) * dose
-        est, cands = gain_est.topk(min(n_cand, R), dim=1)
-        active = est[:, 0] > screen * lam
-        if not bool(active.any()):
-            break
-        ap = active.nonzero().squeeze(1)
-        best_f, best_w, best_idx, best_valid = f[ap].clone(), w[ap].clone(), idx[ap].clone(), valid[ap].clone()
-        improved = torch.zeros(ap.numel(), dtype=torch.bool, device=dev)
-        for c in range(cands.shape[1]):
-            ok = est[ap, c] > screen * lam
-            if not bool(ok.any()):
-                break
-            idx_c, valid_c, w_c = idx[ap].clone(), valid[ap].clone(), w[ap].clone()
-            idx_c[:, step] = cands[ap, c]
-            valid_c[:, step] = True
-            w_c[:, step] = (-g[ap, cands[ap, c]] / Md[ap, cands[ap, c]]).clamp(min=0)
-            w_new, f_new = _fit_free_sets(T, H, idx_c, valid_c, w_c, rows=ap)
-            better = ok & ((f[ap] - f_new) * dose > lam) & (f_new < best_f)
-            best_f = torch.where(better, f_new, best_f)
-            best_w[better] = w_new[better]
-            best_idx[better] = idx_c[better]
-            best_valid[better] = valid_c[better]
-            improved |= better
-        acc = ap[improved]
-        idx[acc] = best_idx[improved]
-        valid[acc] = best_valid[improved]
-        w[acc] = best_w[improved]
-        f[acc] = best_f[improved]
-    for slot in range(1, m_max):                                                           # backward pass
-        cand = (valid.sum(1) >= 2) & valid[:, slot]
-        if not bool(cand.any()):
-            continue
-        cp = cand.nonzero().squeeze(1)
-        valid_c = valid[cp].clone()
-        valid_c[:, slot] = False
-        w_c, f_c = _fit_free_sets(T, H, idx[cp], valid_c, w[cp], rows=cp)
-        drop = (f_c - f[cp]) * dose < lam
-        dp = cp[drop]
-        valid[dp] = valid_c[drop]
-        w[dp] = w_c[drop]
-        f[dp] = f_c[drop]
-    return idx, valid, w, f
-
-
-def _select_enumerate(T, H, W, dose, lam, w_max_steps, compile_mode):
-    """Every nonempty subset as one batched constrained solve (2^R - 1 solves): the reference search, R <= 8."""
-    R = H.shape[0]
-    if R > 8:
-        raise ValueError("enumeration of 2^R - 1 subsets is limited to R <= 8; use method='branch_bound'")
-    _, _, rowwise, _ = _kernels(compile_mode)
-    prep = _nnal_prep(T)
-    subsets = [list(c) for r in range(1, R + 1) for c in itertools.combinations(range(R), r)]
-    f0 = _empty_fit_loss(T, prep)
-    crit = [f0 * dose]
-    fits = [f0]
-    W_sub = []
-    for S in subsets:
-        idx = torch.tensor(S, device=T.device)
-        Ws = solve_W(T, H[idx].contiguous(), W[:, idx].contiguous(), w_max_steps, 1e-12, compile_mode=compile_mode)
-        f = rowwise(Ws @ H[idx], T, prep, 1, dtype=torch.float64)
-        crit.append(f * dose + lam * len(S))
-        fits.append(f)
-        W_sub.append(Ws)
-    C = torch.stack(crit, 1)
-    best = C.argmin(1)
-    F = torch.stack(fits, 1)
-    W0 = torch.zeros_like(W)
-    for j, S in enumerate(subsets):
-        m = best == j + 1
-        if m.any():
-            W0[m.nonzero().squeeze(1)[:, None], torch.tensor(S, device=T.device)[None, :]] = W_sub[j][m]
-    return W0 > 0, W0, F.gather(1, best[:, None]).squeeze(1)
-
-
-def auto_penalty(T, dose, K=None):
-    """Penalty per selected material, in nats, from the counts of the median pixel: 0.5 log K below 10 counts per bin,
-    2 log K above 100, log-linear in between.
+def _auto_penalty(pixel_means, dose):
+    """The automatic charge per selected material, as a multiple of log K, from the counts of the median pixel (dose
+    times its mean transmission): 0.5 below 10 counts per bin, 2 above 100, log-linear in between.
 
     At few counts the larger charge drops a weak material from most of the pixels that hold it, keeping the dense
     ones, and the refit inherits that selection bias; at many counts every material clears either charge, and the
     admissions a small charge lets through are misfit rather than material and add noise to the maps.
-
-    Args:
-        T (torch.Tensor): Transmission ratio, (pixels, bins).
-        dose (float): Open-beam counts per pixel and bin.
-        K (int, optional): Number of bins. Defaults to T's.
-
-    Returns:
-        float: The penalty in nats.
     """
-    K = T.shape[1] if K is None else K
-    counts = float(dose) * torch.median(T.float().mean(1)).item()
+    counts = float(dose) * torch.median(pixel_means.float()).item()
     frac = min(1.0, max(0.0, (math.log10(max(counts, 1e-12)) - 1.0)))          # 0 at 10 counts, 1 at 100
-    return (0.5 * 4 ** frac) * math.log(K)                                        # 0.5 log K -> 2 log K
+    return 0.5 * 4 ** frac
 
 
-def select_supports(T, W, H, dose, penalty=None, method="branch_bound", k_top=6, m_max=4, wald_screen=0.0,
-                    w_max_steps=100, compile_mode='auto'):
-    """Choose each pixel's material subset S by penalized likelihood: minimize dose * f_p(S) + penalty * size(S).
-
-    Args:
-        T (torch.Tensor): Transmission ratio, (pixels, bins).
-        W (torch.Tensor): Pixel coefficients of the full model, (pixels, R).
-        H (torch.Tensor): Spectra, (R, bins).
-        dose (float): Open-beam counts per pixel and bin, which converts the loss to log-likelihood units.
-        penalty (float or str, optional): Charge per selected material in nats; 'auto' uses
-            :func:`~mbirtorch.hsnt.auto_penalty`. Defaults to None, meaning 2 log K.
-        method (str, optional): The subset search. 'branch_bound' (default, any R): exact single-material fits, then
-            subsets of 2 to m_max materials among each pixel's k_top best singletons, pruned by the full-model lower
-            bound; it presumes distinct spectra and supports of at most m_max materials. 'greedy': forward selection
-            on gradient-based gain estimates, faster but it misses rare materials. 'enumerate': all 2^R - 1 subsets,
-            the reference, R <= 8.
-        k_top (int, optional): Candidate materials per pixel for branch and bound. Defaults to 6.
-        m_max (int, optional): Largest support searched. Defaults to 4.
-        wald_screen (float, optional): If positive, skip the single-material fit of material r in the pixels whose
-            full-fit Wald statistic is below wald_screen times the penalty; faster for sparse supports, but a faint
-            material the full fit truncated to zero is then never considered. Defaults to 0.
-        w_max_steps (int, optional): Iteration cap of the enumeration's solves. Defaults to 100.
-        compile_mode (str, optional): See :func:`~mbirtorch.hsnt.nnal_factorization`. Defaults to 'auto'.
-
-    Returns:
-        (support, W0, f): the (pixels, R) bool support, the coefficients on it, and the per-pixel loss.
-    """
-    compile_mode = _resolve_compile(compile_mode, T)
-    R, K = H.shape
-    if penalty is None:
-        lam = 2.0 * math.log(K)
-    elif isinstance(penalty, str):
+def _penalty_nats(penalty, T, dose):
+    """The charge per selected material in nats: penalty is 'auto' or a multiple of log K."""
+    K = T.shape[1]
+    if isinstance(penalty, str):
         if penalty != "auto":
-            raise ValueError(f"penalty must be a number of nats or 'auto', got {penalty!r}")
-        lam = auto_penalty(T, dose, K)
-    else:
-        lam = float(penalty)
-    if method == "enumerate":
-        return _select_enumerate(T, H, W, dose, lam, w_max_steps, compile_mode)
+            raise ValueError(f"penalty must be a multiple of log K or 'auto', got {penalty!r}")
+        return _auto_penalty(T.mean(1), dose) * math.log(K)
+    if not float(penalty) >= 0:
+        raise ValueError(f"penalty must be nonnegative, got {penalty!r}")
+    return float(penalty) * math.log(K)
+
+
+def _select_supports(T, W, H, dose, penalty='auto', wald_screen=0.0):
+    """Each pixel's material subset S by penalized likelihood: minimize dose * f_p(S) + lam * size(S), lam the charge
+    in nats (see _penalty_nats), by branch and bound (_select_branch_bound).
+
+    wald_screen > 0 skips the single-material fit of material r in the pixels whose full-fit Wald statistic is below
+    wald_screen times the charge: faster for sparse supports, but a faint material the full fit truncated to zero is
+    then never considered. Returns (support, W0, f): the (pixels, R) bool support, the coefficients on it, and the
+    per-pixel loss.
+    """
+    if not dose > 0:
+        raise ValueError(f"support selection needs a positive dose, got {dose!r}")
+    R = H.shape[0]
+    lam = _penalty_nats(penalty, T, dose)
     prep = _nnal_prep(T)
-    if method == "greedy":
-        idx, valid, w, f = _select_greedy(T, H, dose, lam, m_max=max(m_max, 1), prep=prep)
-    elif method == "branch_bound":
-        X = W @ H
-        f_full = _nnal_rowwise(X, T, prep, 1, dtype=torch.float64)
-        plausible = None
-        if wald_screen > 0:
-            _, Z = stable_nnal_derivatives(X, T, prep)
-            wald = 0.5 * dose * (W.double() ** 2) * (Z @ (H * H).T).double()
-            plausible = wald > wald_screen * lam
-        idx, valid, w, f = _select_branch_bound(T, H, dose, lam, f_full, k_top=k_top, m_max=m_max, plausible=plausible,
-                                                prep=prep)
-    else:
-        raise ValueError(f"method must be 'branch_bound', 'greedy' or 'enumerate', got {method!r}")
+    X = W @ H
+    f_full = _nnal_rowwise(X, T, prep, 1, dtype=torch.float64)
+    plausible = None
+    if wald_screen > 0:
+        _, Z = stable_nnal_derivatives(X, T, prep)
+        wald = 0.5 * dose * (W.double() ** 2) * (Z @ (H * H).T).double()
+        plausible = wald > wald_screen * lam
+    idx, valid, w, f = _select_branch_bound(T, H, dose, lam, f_full, k_top=_K_TOP, m_max=_M_MAX, plausible=plausible,
+                                            prep=prep)
     support, W0 = _scatter_support(idx, valid, w, R)
     return support, W0, f
 
@@ -431,54 +301,29 @@ def _warn_collinear_rows(H, cosine=0.999):
                       "are not separately identified; consider a smaller rank")
 
 
-def support_selected_spectra(T, W, H, dose, penalty=None, max_steps=300, cg_max=10, rel_tol=1e-10,
-                             w_max_steps=100, compile_mode='auto', verbose=0, method="branch_bound", k_top=6, m_max=4,
-                             wald_screen=0.0, free_refit=False, min_support=None):
+def _support_selected_spectra(T, W, H, dose, penalty='auto', wald_screen=0.0, free_refit=False, compile_mode='auto'):
     """Choose each pixel's material subset by penalized likelihood, then refit with the other coefficients held at 0.
 
-    The truncation bias of the maximum-likelihood spectra (see :func:`~mbirtorch.hsnt.unconstrained_spectra`) comes
-    from coefficients whose true value is zero. Once those are identified and held at zero, the remaining ones sit in
-    the interior and W >= 0, with the variance reduction it brings, is kept. Each pixel takes the subset minimizing
-    dose * loss + penalty * (subset size), the empty subset included (:func:`~mbirtorch.hsnt.select_supports`), and W on
-    the supports and H are then refit jointly. One selection round is used: re-selecting from refit spectra
-    compounds the selection errors.
+    The truncation bias of the maximum-likelihood spectra comes from coefficients whose true value is zero. Once those
+    are identified and held at zero, the remaining ones sit in the interior and W >= 0, with the variance reduction it
+    brings, is kept. Each pixel takes the subset minimizing dose * loss + charge * (subset size), the empty subset
+    included (_select_supports), and W on the supports and H are then refit jointly. One selection round is used:
+    re-selecting from refit spectra compounds the selection errors. With free_refit the selected coefficients are free
+    during the refit and W >= 0 is re-solved on the supports afterwards, so a falsely admitted coefficient adds
+    zero-mean noise rather than bias. A component selected in almost no pixel reverts to the maximum-likelihood
+    treatment (_guard_components).
 
-    Args:
-        T (torch.Tensor): Transmission ratio, (pixels, bins).
-        W (torch.Tensor): Pixel coefficients of the full model, (pixels, R), typically the maximum-likelihood fit.
-        H (torch.Tensor): Spectra, (R, bins).
-        dose (float): Open-beam counts per pixel and bin.
-        penalty (float or str, optional): See select_supports; 'auto' is the recommended choice. Defaults to None,
-            meaning 2 log K.
-        max_steps (int, optional): Iteration cap of the joint refit. Defaults to 300.
-        cg_max (int, optional): Conjugate-gradient iterations per refit step. Defaults to 10.
-        rel_tol (float, optional): Relative loss change per step at which the refit stops. Defaults to 1e-10.
-        w_max_steps (int, optional): See select_supports. Defaults to 100.
-        compile_mode (str, optional): See :func:`~mbirtorch.hsnt.nnal_factorization`. Defaults to 'auto'.
-        verbose (int, optional): 1 prints the mean support size and the refit's steps. Defaults to 0.
-        method, k_top, m_max, wald_screen: The subset search, see select_supports.
-        free_refit (bool, optional): Drop the bound on the selected coefficients during the refit, then re-solve
-            W >= 0 on the supports. A falsely admitted coefficient then adds zero-mean noise rather than bias.
-            Defaults to False.
-        min_support (int, optional): Components selected in fewer pixels revert to the maximum-likelihood treatment.
-            Defaults to None, meaning max(2R, P / 1000).
-
-    Returns:
-        (W, H, support, steps): the refit factors, the (pixels, R) bool support (all True in a column that
-        reverted), and the refit's steps.
+    Returns (W, H, support, steps): the refit factors, the (pixels, R) bool support (all True in a column that
+    reverted), and the refit's steps.
     """
     compile_mode = _resolve_compile(compile_mode, T)
     nnal_fn, deriv, _, _ = _kernels(compile_mode)
     prep = _nnal_prep(T)
-    support, W0, _ = select_supports(T, W, H, dose, penalty=penalty, method=method, k_top=k_top, m_max=m_max,
-                                     wald_screen=wald_screen, w_max_steps=w_max_steps, compile_mode=compile_mode)
-    _guard_components(support, W, W0, min_support)
-    Wn, Hn, steps, _ = _joint_newton_pcg(T, W0, H, max_steps=max_steps, cg_max=cg_max, rel_tol=rel_tol,
+    support, W0, _ = _select_supports(T, W, H, dose, penalty=penalty, wald_screen=wald_screen)
+    _guard_components(support, W, W0)
+    Wn, Hn, steps, _ = _joint_newton_pcg(T, W0, H, max_steps=_REFIT_MAX_STEPS, cg_max=_CG_MAX, rel_tol=_REFIT_REL_TOL,
                                          prep=prep, nnal=nnal_fn, deriv=deriv, w_mask=support, nonneg_W=not free_refit)
     if free_refit:
         Wn = _solve_W_on_support(T, Hn, Wn, support)
     _warn_collinear_rows(Hn)
-    if verbose >= 1:
-        print(f"  supports ({method}): mean size {support.sum(1).double().mean().item():.2f}; "
-              f"joint refit {steps} steps", flush=True)
     return Wn, Hn, support, steps

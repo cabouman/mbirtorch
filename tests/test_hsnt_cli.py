@@ -13,7 +13,7 @@ import mbirtorch.hsnt as hsnt
 from mbirtorch.hsnt.cli import _parse_slice, main
 from mbirtorch.hsnt.loading import infer_input_type, load_dataset
 from mbirtorch.hsnt.outputs import component_check, mean_pixel_spectrum
-from mbirtorch.hsnt.rank import pool_pixels
+from mbirtorch.hsnt.rank import _pool_pixels
 
 ROWS, COLS, K, R, DOSE = 12, 10, 40, 2, 50.0
 
@@ -136,7 +136,7 @@ def test_dehydrate_writes_readable_output(stacks, tmp_path):
 def test_dehydrate_stream_mode_from_tiffs(stacks, tmp_path):
     out = str(tmp_path / "stream")
     assert main(["dehydrate", stacks["sample"], "--open-beam", stacks["open_beam"], "--rank", str(R), "-o", out,
-                 "--mode", "stream", "--chunk-pixels", "40", "--warmup-pixels", "60", "--max-passes", "2",
+                 "--mode", "stream", "--chunk-pixels", "40", "--max-passes", "2",
                  "--no-plots", "-q"]) == 0
     rep = _report(out, "sample")
     assert rep["result"]["mode"] == "stream" and rep["result"]["passes"] >= 1 and rep["dose"] > 0
@@ -145,7 +145,7 @@ def test_dehydrate_stream_mode_from_tiffs(stacks, tmp_path):
 def test_dehydrate_stream_mode_with_support_selection(stacks, tmp_path):
     out = str(tmp_path / "stream_support")
     assert main(["dehydrate", stacks["sample"], "--open-beam", stacks["open_beam"], "--rank", str(R), "-o", out,
-                 "--mode", "stream", "--chunk-pixels", "40", "--warmup-pixels", "60", "--max-passes", "2",
+                 "--mode", "stream", "--chunk-pixels", "40", "--max-passes", "2",
                  "--spectra", "support", "--support-penalty", "1", "--free-refit", "--no-plots", "-q"]) == 0
     rep = _report(out, "sample")["result"]
     assert rep["mode"] == "stream" and 0 < rep["mean_support_size"] <= R and rep["support_refit_passes"] >= 0
@@ -164,7 +164,7 @@ def test_estimate_rank_finds_the_rank_with_and_without_pooling(stacks):
 
 def test_pool_pixels_averages_blocks():
     T = np.arange(2 * 6 * 4 * 3, dtype=np.float32).reshape(2 * 6 * 4, 3)             # 2 views, 6 x 4 pixels, 3 bins
-    Tp = pool_pixels(T, (2, 6, 4), 2)
+    Tp = _pool_pixels(T, (2, 6, 4), 2)
     assert Tp.shape == (2 * 3 * 2, 3)
     block = T.reshape(2, 6, 4, 3)[0, :2, :2].mean(axis=(0, 1))
     assert np.allclose(Tp[0], block)
@@ -250,13 +250,19 @@ def test_library_dehydrate_and_hyper_denoise(stacks):
     assert est[0].shape == (ROWS, COLS, R)
     den_t = hsnt.hyper_denoise(np.exp(-A), "transmission", num_materials=R, verbose=0)    # transmission in and out
     assert den_t.shape == A.shape and 0 < den_t.min() and _relative_error(-np.log(den_t), X) < 0.35
+    sup = hsnt.dehydrate(A, num_materials=R, spectra="support", dose=DOSE, verbose=0)
+    assert sup[0].shape == sub_data.shape and sup[0].min() >= 0
+    with pytest.raises(ValueError, match="dose"):
+        hsnt.dehydrate(A, num_materials=R, spectra="support", verbose=0)
+    with pytest.raises(TypeError, match="MBIRJAX"):
+        hsnt.hyper_denoise(A, num_materials=R, safety_factor=2, verbose=0)          # the NMF's keywords are refused
 
 
 def test_convert_streams_in_small_blocks_and_matches_the_direct_load(stacks, tmp_path):
     out = str(tmp_path / "blocks.h5")
-    # a block of 7 bins becomes 4, a multiple of --wave-bin
+    # a budget below one --wave-bin group of bins still converts, one group per block
     assert main(["convert", stacks["sample"], "--open-beam", stacks["open_beam"], "-o", out, "--as-type",
-                 "transmission", "--wave-bin", "4", "--downsample", "2", "--block-bins", "7", "-q"]) == 0
+                 "transmission", "--wave-bin", "4", "--downsample", "2", "--memory-budget", "0.01", "-q"]) == 0
     data, meta = hsnt.import_hsnt_data_hdf5(out)
     ds = load_dataset(stacks["sample"], open_beam=[stacks["open_beam"]], wave_bin=4, downsample=2)
     assert data.shape == (1,) + tuple(ds.spatial_shape[1:]) + (K // 4,)
@@ -272,8 +278,8 @@ def test_convert_streams_in_small_blocks_and_matches_the_direct_load(stacks, tmp
 
 def test_convert_hdf5_to_hdf5_streams(stacks, tmp_path):
     out = str(tmp_path / "h5h5.h5")                                      # attenuation in and out
-    assert main(["convert", stacks["h5"], "-o", out, "--wave-bin", "2", "--downsample", "2", "--block-bins", "6",
-                 "-q"]) == 0
+    assert main(["convert", stacks["h5"], "-o", out, "--wave-bin", "2", "--downsample", "2", "--memory-budget",
+                 "0.01", "-q"]) == 0
     data, meta = hsnt.import_hsnt_data_hdf5(out)
     ds = load_dataset(stacks["h5"], wave_bin=2, downsample=2)
     assert meta["dataset_type"] == "attenuation" and data.shape == (1,) + tuple(ds.spatial_shape[1:]) + (K // 2,)
@@ -289,8 +295,8 @@ def test_dehydrate_post_estimators_and_their_options(stacks, tmp_path):
     rep = _report(out, "processed")["result"]
     assert rep["unconstrained_steps"] > 0 and rep["W_zero_frac"] < 1 and rep["loss_final"] > 0
     out = str(tmp_path / "sup")
-    assert main(base + ["-o", out, "--spectra", "support", "--support-method", "greedy", "--support-penalty", "auto",
-                        "--wald-screen", "0.5"]) == 0
+    assert main(base + ["-o", out, "--spectra", "support", "--support-penalty", "auto", "--wald-screen",
+                        "0.5"]) == 0
     rep = _report(out, "processed")["result"]
     assert 0 < rep["mean_support_size"] <= R and rep["loss_final"] >= rep["loss_mle"] * (1 - 1e-9)
 
@@ -324,5 +330,5 @@ def test_help_lists_data_options_and_help_all_lists_every_option(capsys):
         main(["dehydrate", "--help-all"])
     full = capsys.readouterr().out
     assert "--open-beam" in short and "--spectra" in short and "--help-all" in short
-    assert "--method" not in short and "--chunk-pixels" not in short and "--rehydrate" not in short
-    assert "--method" in full and "--support-penalty" in full and "--chunk-pixels" in full
+    assert "--compile" not in short and "--chunk-pixels" not in short and "--rehydrate" not in short
+    assert "--compile" in full and "--support-penalty" in full and "--chunk-pixels" in full

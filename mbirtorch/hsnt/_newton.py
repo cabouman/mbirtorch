@@ -1,8 +1,8 @@
 import torch
 
-from ._linalg import _batched_spd_solve, _joint_blocks, _joint_dot
+from ._linalg import (_attenuation_for_start, _batched_spd_solve, _joint_blocks, _joint_dot,
+                      _nonneg_least_squares_start, _reseed_dead)
 from ._loss import _nnal_prep, _nnal_rowwise, stable_nnal, stable_nnal_derivatives
-from ._multiplicative import _reseed_dead
 
 
 # Armijo noise floor, in units of eps * |row loss|: a smaller decrease is float32 truncation, which grows with the
@@ -215,9 +215,9 @@ def block_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True, W
 
 def solve_W(T, H, W_init=None, max_steps=100, rel_tol=1e-12, nonneg=True, compile_mode=None):
     """The pixel coefficients for a fixed H: independent convex problems per pixel, solved by block-Newton W steps
-    from W_init (default: a clamped least-squares start). W >= 0 unless nonneg=False."""
+    from W_init (default: a nonnegative least-squares fit of the attenuation). W >= 0 unless nonneg=False."""
     if W_init is None:
-        W_init = torch.linalg.lstsq(H.T, T.T)[0].T.clamp(min=0)
+        W_init = _nonneg_least_squares_start(_attenuation_for_start(T), H)
     W, _, _ = block_newton_optimize(T, H.shape[0], max_steps, rel_tol, update_H=False, W_init=W_init, H_init=H,
                                     compile_mode=compile_mode, nonneg_W=nonneg)
     return W
@@ -244,9 +244,9 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, 
     Hooks: nonneg_W=False drops W >= 0 -- every coefficient is free and the line
     search does not clamp W; the pixel problem stays strictly convex for any real
     w -- so H can be estimated without the truncation bias the bound induces
-    (unconstrained_spectra). w_mask (bool, W's shape) holds coefficients outside
+    (_unconstrained_spectra). w_mask (bool, W's shape) holds coefficients outside
     the mask at their current value, zero for a selected support
-    (support_selected_spectra).
+    (_support_selected_spectra).
     """
     nnal = stable_nnal if nnal is None else nnal
     deriv = stable_nnal_derivatives if deriv is None else deriv

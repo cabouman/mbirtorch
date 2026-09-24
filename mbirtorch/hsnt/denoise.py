@@ -1,24 +1,26 @@
-"""Dehydration and rehydration of hyperspectral neutron data with the NNAL factorization.
+"""Dehydration and rehydration of hyperspectral neutron data with the maximum-likelihood NNAL factorization.
 
-``dehydrate`` fits the maximum-likelihood factorization X = W H of the attenuation and returns the package's
-dehydrated form ``[subspace_data, subspace_basis, dataset_type]``; ``rehydrate`` multiplies it back and
-``hyper_denoise`` chains the two. The scikit-learn L2 dehydration is in ``l2_baseline``.
+``dehydrate`` fits the factorization X = W H of the attenuation and returns the package's dehydrated form
+``[subspace_data, subspace_basis, dataset_type]``; ``rehydrate`` multiplies it back and ``hyper_denoise`` chains the
+two.
 """
+import warnings
+
 import numpy as np
 
 from ..utilities import _to_host
 
-# The keywords of the scikit-learn dehydrate that this one does not take.
+# The keywords of MBIRJAX's scikit-learn dehydrate, which this package does not include.
 _L2_KEYWORDS = ("safety_factor", "beta_loss", "max_iter", "tolerance", "batch_size", "subspace_basis", "random_state")
 
 
-def _reject_l2_keywords(name, kwargs):
+def _reject_unknown_keywords(name, kwargs):
     if not kwargs:
         return
     legacy = sorted(set(kwargs) & set(_L2_KEYWORDS))
     if legacy:
-        raise TypeError(f"{name}() fits the Poisson likelihood and does not take {', '.join(legacy)}; "
-                        f"l2_{name}() is the scikit-learn NMF version that does")
+        raise TypeError(f"{name}() fits the Poisson likelihood and does not take {', '.join(legacy)}, which belong to "
+                        "MBIRJAX's scikit-learn NMF dehydrate; MBIRTorch does not include that method")
     raise TypeError(f"{name}() got unexpected keyword argument(s) {', '.join(sorted(kwargs))}")
 
 
@@ -40,35 +42,49 @@ def _to_transmission(data, dataset_type):
             T = np.exp(-a)
     else:
         T = a.copy()
-    T = np.nan_to_num(T, nan=0.0, posinf=0.0, neginf=0.0)
+    bad = ~np.isfinite(T)
+    if bad.any():
+        warnings.warn(f"{100 * bad.mean():.3g}% of the data are NaN or infinite; treated as zero counts")
+        T[bad] = 0.0
     np.maximum(T, 0.0, out=T)
     return np.ascontiguousarray(T, dtype=np.float32), shape
 
 
-def dehydrate(data, dataset_type="attenuation", num_materials=None, method="joint_newton", max_steps=1000, rel_tol=1e-8,
-              max_rank=6, device=None, compile_mode="auto", verbose=1, **kwargs):
+def dehydrate(data, dataset_type="attenuation", num_materials=None, *, spectra="mle", dose=None, penalty="auto",
+              free_refit=False, max_steps=1000, rel_tol=1e-8, max_rank=6, device=None, compile_mode="auto", verbose=1,
+              **kwargs):
     """Dehydrate a hyperspectral dataset by the maximum-likelihood factorization X = W H of its attenuation.
 
     The spectral axis must be the last axis; the leading axes are kept. The fit minimizes the non-negative
-    attenuation loss sum[exp(-X) + T X] of the transmission T = exp(-attenuation), the Poisson log-likelihood of the
-    counts up to a constant, with W >= 0 and H >= 0. The rank is the number of materials; when it is not given it
-    is estimated by likelihood-ratio tests (:func:`~mbirtorch.hsnt.estimate_rank`), which also pool pixels
-    spatially when the leading axes are (views, rows, cols) or (rows, cols).
+    attenuation loss sum[exp(-X) + T X] of the transmission T = exp(-attenuation), with W >= 0 and H >= 0. It is the
+    Poisson log-likelihood of the counts, up to a constant, when the open beam is the same in every pixel and bin. The
+    rank is the number of components; when it is not given it is estimated by likelihood-ratio tests
+    (:func:`~mbirtorch.hsnt.estimate_rank`), which also pool pixels spatially when the leading axes are
+    (views, rows, cols) or (rows, cols). The components are a nonnegative basis of the data, not necessarily the
+    pure materials. Data that do not fit the device are factorized by chunks of pixels.
 
     Args:
         data (numpy.ndarray or torch.Tensor): Hyperspectral data with any leading axes and the spectral axis of
-            length :math:`N_k` last.
+            length :math:`N_k` last. NaN and infinite values are treated as zero counts, with a warning.
         dataset_type (str, optional): 'attenuation' or 'transmission', where attenuation = -log(transmission).
             Defaults to 'attenuation'.
         num_materials (int, optional): Rank of the factorization :math:`N_m`. Defaults to None, which estimates it.
-        method (str, optional): Solver, see :func:`~mbirtorch.hsnt.nnal_factorization`. Defaults to 'joint_newton'.
+        spectra (str, optional): 'mle', the maximum-likelihood spectra; 'unconstrained', a re-estimate without the
+            bias the nonnegativity of W gives the spectra at low dose, which pays from about 10^5 pixels; 'support',
+            which decides the components present in each pixel and refits, and needs the dose. Defaults to 'mle'.
+        dose (float, optional): Open-beam counts per pixel and bin, for spectra='support'. Defaults to None.
+        penalty (str or float, optional): Support selection's charge per component, as a multiple of log(N_k), or
+            'auto', which moves from 0.5 to 2 with the counts per pixel and bin. Defaults to 'auto'.
+        free_refit (bool, optional): With spectra='support', leave the selected coefficients free of sign during the
+            refit, then re-solve W >= 0 on the supports. Defaults to False.
         max_steps (int, optional): Solver iteration cap. Defaults to 1000.
-        rel_tol (float, optional): Relative loss change per step at which the solver stops, see
-            :func:`~mbirtorch.hsnt.nnal_factorization`. Defaults to 1e-8.
+        rel_tol (float, optional): The solver stops after five consecutive steps whose relative loss change is at most
+            this. Defaults to 1e-8.
         max_rank (int, optional): Largest rank the estimate considers. Defaults to 6.
         device (str, optional): Torch device. Defaults to None, meaning CUDA if available, else CPU.
-        compile_mode (str, optional): 'auto', 'on' or 'off', see :func:`~mbirtorch.hsnt.nnal_factorization`; the rank
-            estimate always runs uncompiled. Defaults to 'auto'.
+        compile_mode (str, optional): 'auto' compiles the solver with torch.compile on CUDA for data of at least 5e8
+            entries, where it pays; 'on' always; 'off' never. The rank estimate always runs uncompiled. Defaults to
+            'auto'.
         verbose (int, optional): 0 prints nothing; 1 prints a summary; 2 also prints the rank search. Defaults to 1.
 
     Returns:
@@ -81,11 +97,10 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, method="join
         >>> data.shape, subspace_data.shape, subspace_basis.shape
         ((N_x, N_y, N_z, ..., N_k), (N_x, N_y, N_z, ..., 3), (3, N_k))
     """
-    import torch
     from ._device import _default_device
-    from .factorization import nnal_factorization
+    from ._fit import _fit
     from .rank import estimate_rank
-    _reject_l2_keywords("dehydrate", kwargs)
+    _reject_unknown_keywords("dehydrate", kwargs)
     T, shape = _to_transmission(data, dataset_type)
     device = _default_device(device)
     lead = shape[:-1]
@@ -94,16 +109,15 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, method="join
     if num_materials is None:
         num_materials, note, _ = estimate_rank(T, spatial_shape=spatial, device=device, max_rank=max_rank,
                                                verbose=max(0, verbose - 1))
-    Tt = torch.from_numpy(T).to(device)
-    W, H, steps = nnal_factorization(Tt, method=method, num_materials=int(num_materials), max_steps=max_steps,
-                                     rel_tol=rel_tol, compile_mode=compile_mode)
-    subspace_data = W.cpu().numpy().astype(np.float32).reshape(*lead, int(num_materials))
-    subspace_basis = H.cpu().numpy().astype(np.float32)
+    W, H, rep = _fit(T, int(num_materials), spectra=spectra, dose=dose, penalty=penalty, free_refit=free_refit,
+                     device=device, max_steps=max_steps, rel_tol=rel_tol, compile_mode=compile_mode)
+    subspace_data = W.reshape(*lead, int(num_materials))
     if verbose >= 1:
+        solve = f"{rep['steps']} steps" if "steps" in rep else f"streamed, {rep['passes']} polish passes"
         print("dehydrate(): ")
         print("   -Spectral dimension: ", shape[-1], " -> rank: ", int(num_materials), f"({note})")
-        print("   -Pixels: ", T.shape[0], "; solver: ", method, f"({steps} steps)")
-    return [subspace_data, subspace_basis, dataset_type]
+        print("   -Pixels: ", T.shape[0], f"; spectra: {spectra} ({solve})")
+    return [subspace_data, H, dataset_type]
 
 
 def hyper_denoise(data, dataset_type="attenuation", num_materials=None, **kwargs):
@@ -116,10 +130,9 @@ def hyper_denoise(data, dataset_type="attenuation", num_materials=None, **kwargs
         **kwargs: The other arguments of :func:`~mbirtorch.hsnt.dehydrate`.
 
     Returns:
-        numpy.ndarray: The rank-:math:`N_m` maximum-likelihood fit, with the shape and type of the input.
+        numpy.ndarray: The rank-:math:`N_m` fit, with the shape of the input and the input's dataset_type, float32.
     """
-    legacy = {k: v for k, v in kwargs.items() if k in _L2_KEYWORDS}
-    _reject_l2_keywords("hyper_denoise", legacy)
+    _reject_unknown_keywords("hyper_denoise", {k: v for k, v in kwargs.items() if k in _L2_KEYWORDS})
     return rehydrate(dehydrate(data, dataset_type=dataset_type, num_materials=num_materials, **kwargs))
 
 

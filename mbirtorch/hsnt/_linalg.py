@@ -25,10 +25,9 @@ def nndsvda(X, n_components):
     """NNDSVD initialization for X ~= W @ H, with zeros filled.
 
     Every component after the first is one sign-half of a singular vector pair, so roughly half its entries are zero.
-    Zeros are poison for multiplicative updates, which can never move an entry off zero, so they are filled with
-    sqrt(mean X): each factor carries sqrt(s_k), so that is the scale of a factor entry, and the fill adds a fixed
-    fraction of a typical entry to the product whatever the scale of X. A fill far below factor scale would be frozen
-    at zero by block_newton's two-metric projection.
+    They are filled with sqrt(mean X): each factor carries sqrt(s_k), so that is the scale of a factor entry, and the
+    fill adds a fixed fraction of a typical entry to the product whatever the scale of X. A fill far below factor
+    scale would be frozen at zero by the two-metric projection of block_newton_step.
 
     Args:
         X: Nonnegative array of shape (n_samples, n_features).
@@ -134,3 +133,48 @@ def _joint_blocks(flat, rows, cols, rank, free, jitter):
     M = M + (jitter * scale)[:, None, None] * eye
     L, info = torch.linalg.cholesky_ex(M)
     return torch.where((info > 0)[:, None, None], eye.expand_as(L), L)
+
+
+def _reseed_dead(W, H, rel_tol=1e-6):
+    """Re-seed any component that is zero in both factors, with small random values from a fixed generator.
+
+    Its gradient is zero in both factors, so no Newton step can revive it; it is a degenerate stationary point. A
+    random rather than constant seed keeps the revived spectrum from being flat.
+    """
+    w = W.norm(dim=0)
+    h = H.norm(dim=1)
+    dead = (w <= rel_tol * w.max()) & (h <= rel_tol * h.max())
+    n_dead = int(dead.sum())
+    if n_dead == 0:
+        return W, H
+    live = ~dead
+    W = W.clone()
+    H = H.clone()
+    w_ref = W[:, live].mean() if bool(live.any()) else W.new_tensor(1.0)
+    h_ref = H[live].mean() if bool(live.any()) else H.new_tensor(1.0)
+    g = torch.Generator(device=W.device).manual_seed(0)
+    W[:, dead] = 1e-2 * w_ref * torch.rand(W.shape[0], n_dead, generator=g, dtype=W.dtype, device=W.device)
+    H[dead] = 1e-2 * h_ref * torch.rand(n_dead, H.shape[1], generator=g, dtype=H.dtype, device=H.device)
+    return W, H
+
+
+def _attenuation_for_start(T):
+    """-log T with zero counts floored at half the smallest positive transmission (the model is X = W H, X = -log T);
+    transmissions below 1e-12 count as zero counts."""
+    real = T > 1e-12
+    if bool(real.any()) and not bool(real.all()):
+        T = torch.where(real, T, 0.5 * T[real].min())
+    else:
+        T = T.clamp_min(torch.finfo(T.dtype).tiny)
+    return -torch.log(T)
+
+
+def _nonneg_least_squares_start(A, H, ridge=1e-6):
+    """W >= 0 approximately minimizing ||A - W H||, from the R x R normal equations with a relative ridge, solved by
+    Cholesky in float64 so that a rank-deficient H gives finite values on every device."""
+    Hd = H.double()
+    G = Hd @ Hd.T
+    G = G + ridge * torch.diagonal(G).mean().clamp_min(torch.finfo(torch.float64).tiny) * torch.eye(
+        G.shape[0], dtype=G.dtype, device=G.device)
+    W = torch.cholesky_solve((A.double() @ Hd.T).T, torch.linalg.cholesky(G)).T
+    return W.clamp_(min=0).to(A.dtype)

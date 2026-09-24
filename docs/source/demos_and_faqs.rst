@@ -40,7 +40,7 @@ Each is short and self-contained; adjust the parameters near the top and rerun t
    * - ``demo_11_geometry_viewer.py``
      - The geometry viewer: the scan geometry drawn from the model, with a sinogram and a phantom overlaid and a second geometry compared.
    * - ``demo_13_hsnt.py``
-     - Dehydrating a low-dose hyperspectral neutron projection by maximum likelihood, against the L2 baseline.
+     - Dehydrating a low-dose hyperspectral neutron projection by maximum likelihood and rehydrating it into denoised data.
 
 
 Data Generation

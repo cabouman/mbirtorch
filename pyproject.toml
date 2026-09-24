@@ -38,8 +38,8 @@ dependencies = [
     "h5py",
     # The preprocess package needs scipy (filters, fitting), tifffile (scan
     # readers), tqdm (batch progress), and pywavelets (wavelet-FFT stripe
-    # removal).  hsnt uses scipy.optimize for its L-BFGS-B solver, tifffile
-    # for TIFF stacks, and tqdm for conversion progress.
+    # removal).  hsnt uses tifffile for TIFF stacks and tqdm for conversion
+    # progress.
     "scipy",
     "tifffile",
     "tqdm",
@@ -52,8 +52,6 @@ dependencies = [
     # Google Drive-hosted demo datasets in download_and_extract.
     "olefile",
     "gdown",
-    # The hsnt L2 baseline (l2_dehydrate): NMF and randomized SVD.
-    "scikit-learn",
     # get_memory_stats reads host RSS/USS via psutil; the hsnt loaders check
     # available host memory with it.
     "psutil",

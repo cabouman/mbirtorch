@@ -4,17 +4,19 @@ Self-contained: a small random nonnegative factorization stands in for the mater
 file is needed. Each test runs on every device of the repository's ``device`` fixture except MPS, which lacks the
 float64 the solvers accumulate in.
 """
+import itertools
+
 import numpy as np
 import pytest
 import torch
 
 import mbirtorch.hsnt as hsnt
 from mbirtorch.hsnt import _newton
-from mbirtorch.hsnt._loss import _nnal_prep, stable_nnal_derivatives
-from mbirtorch.hsnt.factorization import _initial_factors
-from mbirtorch.hsnt.spectra import _fit_free_sets, _guard_components, auto_penalty, select_supports
-
-LBFGSB_GAP = 1e-3        # relative loss gap L-BFGS-B may leave against joint Newton on _problem()
+from mbirtorch.hsnt._loss import _nnal_prep, stable_nnal, stable_nnal_derivatives
+from mbirtorch.hsnt._streaming import _stream_factorization
+from mbirtorch.hsnt.factorization import _initial_factors, _nnal_factorization
+from mbirtorch.hsnt.spectra import (_auto_penalty, _empty_fit_loss, _fit_free_sets, _guard_components, _select_supports,
+                                    _support_selected_spectra, _unconstrained_spectra)
 
 
 @pytest.fixture
@@ -38,29 +40,34 @@ def _problem(device, P=2048, K=200, R=3, dose=10.0, seed=0, noisy=True, dtype=to
             torch.tensor(H, dtype=torch.float64, device=device))
 
 
+def _sphere_problem(device, n=64, K=300, dose=100.0, seed=7):
+    """Three overlapping spheres seen along one axis, with the packaged spectra: most pixels mix two materials."""
+    basis, _ = hsnt.load_material_basis()
+    yy, xx = np.mgrid[:n, :n] + 0.5
+    maps = []
+    for (cy, cx), density in zip(((0.38, 0.38), (0.38, 0.62), (0.6, 0.5)), (0.25, 0.25, 0.75)):
+        d2 = ((yy - cy * n) ** 2 + (xx - cx * n) ** 2) / (0.22 * n) ** 2
+        maps.append(10.0 * density * np.sqrt(np.clip(1.0 - d2, 0.0, None)))       # a chord of a diameter-10 sphere
+    X = torch.tensor(np.stack(maps, -1).reshape(-1, 3), dtype=torch.float32, device=device) @ torch.tensor(
+        basis[:, ::basis.shape[1] // K].copy(), device=device)
+    g = torch.Generator(device=device).manual_seed(seed)
+    return torch.poisson(dose * torch.exp(-X), generator=g) / dose
+
+
 def _loss(W, H, T):
-    return hsnt.stable_nnal(W.double() @ H.double(), T.double()).item()
+    return stable_nnal(W.double() @ H.double(), T.double()).item()
 
 
 def _mle(T, max_steps=200, rel_tol=1e-8):
-    return hsnt.nnal_factorization(T, method="joint_newton", num_materials=3, max_steps=max_steps, rel_tol=rel_tol)
+    return _nnal_factorization(T, 3, max_steps=max_steps, rel_tol=rel_tol, compile_mode="off")
 
 
-@pytest.mark.parametrize("method", ["joint_newton", "block_newton", "multiplicative", "lbfgsb"])
-def test_every_method_decreases_the_loss_and_stays_nonnegative(dev, method):
+def test_mle_decreases_the_loss_and_stays_nonnegative(dev):
     T, _, _ = _problem(dev)
-    W, H, steps = hsnt.nnal_factorization(T, method=method, num_materials=3, max_steps=300, rel_tol=1e-6)
+    W, H, steps = _mle(T, max_steps=300, rel_tol=1e-6)
     assert steps > 0 and W.min() >= 0 and H.min() >= 0
     W0, H0 = _initial_factors(T, 3)
     assert _loss(W, H, T) < _loss(W0, H0, T)
-
-
-def test_lbfgsb_converges_to_the_joint_newton_loss(dev):
-    T, _, _ = _problem(dev)
-    Wj, Hj, _ = _mle(T, max_steps=300)
-    Wl, Hl, it = hsnt.nnal_factorization(T, method="lbfgsb", num_materials=3, max_steps=3000, rel_tol=1e-9)
-    assert it > 10 and Wl.min() >= 0 and Hl.min() >= 0
-    assert _loss(Wl, Hl, T) <= (1 + LBFGSB_GAP) * _loss(Wj, Hj, T)
 
 
 def test_joint_newton_reaches_machine_precision_on_exact_data(dev):
@@ -70,16 +77,14 @@ def test_joint_newton_reaches_machine_precision_on_exact_data(dev):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-@pytest.mark.parametrize("method", ["joint_newton", "block_newton", "multiplicative"])
-def test_compiled_matches_eager(method):
+def test_compiled_matches_eager():
     from mbirtorch.kernel_availability import triton_available
     usable, reason = triton_available()
     if not usable:
         pytest.skip(f"torch.compile needs Triton on CUDA: {reason}")
     T, _, _ = _problem("cuda")
-    W1, H1, _ = hsnt.nnal_factorization(T, method=method, num_materials=3, max_steps=200, rel_tol=1e-8)
-    W2, H2, _ = hsnt.nnal_factorization(T, method=method, num_materials=3, max_steps=200, rel_tol=1e-8,
-                                        compile_mode="on")
+    W1, H1, _ = _nnal_factorization(T, 3, max_steps=200, rel_tol=1e-8, compile_mode="off")
+    W2, H2, _ = _nnal_factorization(T, 3, max_steps=200, rel_tol=1e-8, compile_mode="on")
     assert abs(_loss(W1, H1, T) - _loss(W2, H2, T)) <= 1e-6 * _loss(W1, H1, T)
 
 
@@ -105,49 +110,40 @@ def test_compiled_and_eager_block_steps_take_the_same_zero_decisions():
 
 def test_solves_from_nearby_starts_stop_at_the_same_point(dev):
     """The joint solve stops after several quiet steps in a row: from starts 1e-7 apart it ends at the same loss
-    (a one-step stop spread these by about 1e-6 on this problem)."""
-    basis, _ = hsnt.load_material_basis()
-    _, _, _, maps = hsnt.generate_sphere_data(np.ones((3, 1), np.float32), num_angles=4, detector_rows=32,
-                                              detector_columns=32, dosage_rate=1.0,
-                                              material_density={"Ni": 0.25, "Cu": 0.25, "Al": 0.75}, noisy=False,
-                                              verbose=0)
-    B = torch.tensor(basis[:, ::4].copy(), device=dev)
-    g = torch.Generator(device=dev).manual_seed(7)
-    T = torch.poisson(100.0 * torch.exp(-(torch.tensor(maps.reshape(-1, 3), device=dev) @ B)), generator=g) / 100.0
+    (stopping at the first quiet step spreads these by 2e-8 on the CPU and 4e-7 on CUDA on this problem)."""
+    T = _sphere_problem(dev)
     W0, H0 = _initial_factors(T, 3)
     rng = torch.Generator(device=dev).manual_seed(0)
     losses = []
     for k in range(3):
         eps = 0.0 if k == 0 else 1e-7
-        W, H, _ = hsnt.nnal_factorization(T, num_materials=3, compile_mode="off",
-                                          W_init=W0 * (1 + eps * torch.randn(W0.shape, generator=rng, device=dev)),
-                                          H_init=H0 * (1 + eps * torch.randn(H0.shape, generator=rng, device=dev)))
+        W, H, _ = _nnal_factorization(T, 3, compile_mode="off",
+                                      W_init=W0 * (1 + eps * torch.randn(W0.shape, generator=rng, device=dev)),
+                                      H_init=H0 * (1 + eps * torch.randn(H0.shape, generator=rng, device=dev)))
         losses.append(_loss(W, H, T))
-    assert (max(losses) - min(losses)) / min(losses) < 1e-7
+    assert (max(losses) - min(losses)) / min(losses) < 1e-8
 
 
 def test_compile_mode_is_validated():
     T, _, _ = _problem("cpu", P=64, K=20)
     with pytest.raises(ValueError, match="compile_mode"):
-        hsnt.nnal_factorization(T, num_materials=3, compile_mode="default")
+        _nnal_factorization(T, 3, compile_mode="default")
 
 
 def test_spectra_estimators_keep_w_nonnegative_and_off_support_zero(dev):
     T, _, _ = _problem(dev)
     W, H, _ = _mle(T)
-    Wu, Hu, _ = hsnt.unconstrained_spectra(T, W, H)
+    Wu, Hu, _ = _unconstrained_spectra(T, W, H)
     assert Wu.min() >= 0 and Hu.shape == H.shape
-    for method in ("branch_bound", "greedy"):
-        Ws, Hs, support, _ = hsnt.support_selected_spectra(T, W, H, dose=10.0, method=method)
-        assert Ws.min() >= 0 and support.dtype == torch.bool and support.shape == W.shape
-        assert bool((Ws[~support] == 0).all())                                      # off-support coefficients stay zero
+    Ws, Hs, support, _ = _support_selected_spectra(T, W, H, dose=10.0)
+    assert Ws.min() >= 0 and support.dtype == torch.bool and support.shape == W.shape
+    assert bool((Ws[~support] == 0).all())                                          # off-support coefficients stay zero
 
 
 def test_streaming_matches_the_monolithic_loss_within_one_percent(dev):
     T, _, _ = _problem(dev, P=4096)
     tiles = [T[i:i + 1024].cpu() for i in range(0, 4096, 1024)]
-    W_chunks, H, passes = hsnt.stream_factorization(tiles, 3, max_passes=3, rel_tol=1e-8, warmup_pixels=1024,
-                                                    device=dev)
+    W_chunks, H, passes = _stream_factorization(tiles, 3, max_passes=3, rel_tol=1e-8, warmup_pixels=1024, device=dev)
     assert passes >= 1 and all(w.min() >= 0 for w in W_chunks)
     W = torch.cat([w.to(dev) for w in W_chunks])
     Wm, Hm, _ = _mle(T)
@@ -157,32 +153,13 @@ def test_streaming_matches_the_monolithic_loss_within_one_percent(dev):
 def test_streamed_unconstrained_spectra_return_nonnegative_maps(dev):
     T, _, _ = _problem(dev, P=4096)
     tiles = [T[i:i + 1024].cpu() for i in range(0, 4096, 1024)]
-    W_chunks, H, _ = hsnt.stream_factorization(tiles, 3, max_passes=3, rel_tol=1e-8, warmup_pixels=1024, device=dev,
-                                               nonneg_W=False)
+    W_chunks, H, _ = _stream_factorization(tiles, 3, max_passes=3, rel_tol=1e-8, warmup_pixels=1024, device=dev,
+                                           nonneg_W=False)
     W = torch.cat([w.to(dev) for w in W_chunks])
     Wm, Hm, _ = _mle(T)
-    Wu, Hu, _ = hsnt.unconstrained_spectra(T, Wm, Hm)
+    Wu, Hu, _ = _unconstrained_spectra(T, Wm, Hm)
     assert W.min() >= 0 and H.shape == Hu.shape
     assert abs(_loss(W, H, T) - _loss(Wu, Hu, T)) <= 1e-2 * _loss(Wu, Hu, T)
-
-
-def test_sphere_phantom_geometry():
-    """Chord lengths, the 10-unit diameter, in-plane overlaps, and the noiseless data equal to W @ H."""
-    rng = np.random.default_rng(0)
-    basis = rng.uniform(0.05, 1.0, size=(3, 50))
-    noisy, angles, gt, maps = hsnt.generate_sphere_data(basis, num_angles=4, detector_rows=64, detector_columns=64,
-                                                        material_density={"Ni": 1.0, "Cu": 1.0, "Al": 1.0},
-                                                        noisy=False, verbose=0)
-    assert noisy.shape == (4, 64, 64, 50) and maps.shape == (4, 64, 64, 3) and len(angles) == 4
-    assert abs(maps.max() - 10.0) < 0.05                                            # a diameter is 10 thickness units
-    assert np.allclose(gt.reshape(-1, 50), maps.reshape(-1, 3) @ basis, atol=1e-5)  # the data are exactly rank 3
-    assert np.allclose(noisy, gt, atol=1e-6)
-    n = (maps > 0).sum(-1)
-    # view 0: Cu and Al coincide; triple overlaps only where their disc grazes Ni's
-    assert (n[0] == 2).sum() > 100 and (n == 3).sum() < 0.01 * (n > 0).sum()
-    for a in range(4):
-        for m in range(3):
-            assert (maps[a, :, :, m] > 0).any()                          # every material visible in every view
 
 
 def test_packaged_material_basis_loads():
@@ -191,64 +168,76 @@ def test_packaged_material_basis_loads():
     assert np.all(np.diff(wavelengths) > 0)
 
 
-def test_support_search_methods_agree_and_scale(dev):
-    """Branch and bound reproduces the enumeration's supports on nearly every pixel of the test problem at the same
-    criterion; the greedy search runs; both run at a rank the enumeration cannot (12)."""
+def _enumerated_supports(T, W, H, dose, lam):
+    """The reference search: every subset of the R materials, fitted by a constrained W solve."""
+    R = H.shape[0]
+    prep = _nnal_prep(T)
+    rowwise = _newton._kernels("off")[2]
+    subsets = [list(c) for r in range(1, R + 1) for c in itertools.combinations(range(R), r)]
+    f0 = _empty_fit_loss(T, prep)
+    crit, fits, W_sub = [f0 * dose], [f0], []
+    for S in subsets:
+        Ws = _newton.solve_W(T, H[S].contiguous(), W[:, S].contiguous(), 100, 1e-12)
+        f = rowwise(Ws @ H[S], T, prep, 1, dtype=torch.float64)
+        crit.append(f * dose + lam * len(S))
+        fits.append(f)
+        W_sub.append(Ws)
+    best = torch.stack(crit, 1).argmin(1)
+    W0 = torch.zeros_like(W)
+    for j, S in enumerate(subsets):
+        m = (best == j + 1).nonzero().squeeze(1)
+        W0[m[:, None], torch.tensor(S, device=T.device)[None, :]] = W_sub[j][m]
+    return W0 > 0, torch.stack(fits, 1).gather(1, best[:, None]).squeeze(1)
+
+
+def test_branch_and_bound_matches_the_enumeration_and_scales(dev):
+    """Branch and bound reproduces the exhaustive search's supports on nearly every pixel of the test problem at the
+    same criterion, and runs at a rank the enumeration cannot reach (12)."""
     T, _, _ = _problem(dev, dose=10.0)
     W, H, _ = _mle(T)
-    s_enum, W_enum, f_enum = select_supports(T, W, H, dose=10.0, method="enumerate")
-    s_bb, W_bb, f_bb = select_supports(T, W, H, dose=10.0, method="branch_bound")
-    s_gr, W_gr, f_gr = select_supports(T, W, H, dose=10.0, method="greedy")
     lam = 2 * np.log(T.shape[1])
+    s_enum, f_enum = _enumerated_supports(T, W, H, 10.0, lam)
+    s_bb, W_bb, f_bb = _select_supports(T, W, H, dose=10.0, penalty=2.0)
 
     def criterion(s, f):
         return (10.0 * f + lam * s.sum(1)).sum().item()
 
     assert (s_bb == s_enum).all(1).double().mean() > 0.95
     assert criterion(s_bb, f_bb) <= criterion(s_enum, f_enum) * (1 + 2e-3)
-    assert (s_gr == s_enum).all(1).double().mean() > 0.8
-    assert criterion(s_gr, f_gr) <= criterion(s_enum, f_enum) * (1 + 2e-2)
-    for s, W0 in ((s_bb, W_bb), (s_gr, W_gr)):
-        assert W0.min() >= 0 and bool((W0[~s] == 0).all()) and s.dtype == torch.bool
-    with pytest.raises(ValueError, match="R <= 8"):
-        select_supports(T, torch.zeros(T.shape[0], 12, device=dev), torch.rand(12, T.shape[1], device=dev), dose=10.0,
-                        method="enumerate")
+    assert W_bb.min() >= 0 and bool((W_bb[~s_bb] == 0).all()) and s_bb.dtype == torch.bool
     rng = np.random.default_rng(5)
     H12 = torch.tensor(rng.uniform(0.05, 1.0, (12, T.shape[1])), dtype=torch.float32, device=dev)
-    W12 = torch.zeros(T.shape[0], 12, device=dev)
-    for method in ("branch_bound", "greedy"):
-        s12, W0, f12 = select_supports(T, W12, H12, dose=10.0, method=method)   # rank 12: no enumeration possible
-        assert s12.shape == (T.shape[0], 12) and s12.sum(1).max() <= 4 and torch.isfinite(f12).all()
+    s12, _, f12 = _select_supports(T, torch.zeros(T.shape[0], 12, device=dev), H12, dose=10.0, penalty=2.0)
+    assert s12.shape == (T.shape[0], 12) and s12.sum(1).max() <= 4 and torch.isfinite(f12).all()
 
 
 def test_auto_penalty_moves_from_half_to_twice_log_k_with_the_counts(dev):
-    K = 200
-    low = torch.full((64, K), 0.5, device=dev)
-    assert auto_penalty(low, dose=2.0) == pytest.approx(0.5 * np.log(K))           # 1 count per bin
-    assert auto_penalty(low, dose=1000.0) == pytest.approx(2 * np.log(K))          # 500 counts per bin
-    mid = auto_penalty(low, dose=60.0)
-    assert 0.5 * np.log(K) < mid < 2 * np.log(K)
+    means = torch.full((64,), 0.5, device=dev)
+    assert _auto_penalty(means, dose=2.0) == pytest.approx(0.5)                     # 1 count per bin
+    assert _auto_penalty(means, dose=1000.0) == pytest.approx(2.0)                  # 500 counts per bin
+    assert 0.5 < _auto_penalty(means, dose=60.0) < 2.0
     T, _, _ = _problem(dev)
     W, H, _ = _mle(T)
-    s_auto = select_supports(T, W, H, dose=10.0, penalty="auto")[0]
-    s_fixed = select_supports(T, W, H, dose=10.0, penalty=auto_penalty(T, 10.0))[0]
+    s_auto = _select_supports(T, W, H, dose=10.0, penalty="auto")[0]
+    s_fixed = _select_supports(T, W, H, dose=10.0, penalty=_auto_penalty(T.mean(1), 10.0))[0]
     assert torch.equal(s_auto, s_fixed)
-    with pytest.raises(ValueError):
-        select_supports(T, W, H, dose=10.0, penalty="strong")
+    for bad in ("strong", -1.0):
+        with pytest.raises(ValueError):
+            _select_supports(T, W, H, dose=10.0, penalty=bad)
 
 
 def test_free_refit_keeps_the_supports_and_w_nonnegative(dev):
     T, _, _ = _problem(dev)
     W, H, _ = _mle(T)
-    Ws, Hs, support, _ = hsnt.support_selected_spectra(T, W, H, dose=10.0)
-    Wf, Hf, support_f, _ = hsnt.support_selected_spectra(T, W, H, dose=10.0, free_refit=True)
+    Ws, Hs, support, _ = _support_selected_spectra(T, W, H, dose=10.0)
+    Wf, Hf, support_f, _ = _support_selected_spectra(T, W, H, dose=10.0, free_refit=True)
     assert bool((support_f == support).all())                                       # same selection, different refit
     assert Wf.min() >= 0 and bool((Wf[~support_f] == 0).all()) and Hf.min() >= 0
     assert abs(_loss(Wf, Hf, T) - _loss(Ws, Hs, T)) <= 1e-3 * _loss(Ws, Hs, T)     # the two refits fit the data alike
     # with no penalty the selection keeps every material the constrained pixel fit uses, and the free refit then fits
     # the data about as well as the unconstrained estimator (whose W is free everywhere)
-    Wz, Hz, support_z, _ = hsnt.support_selected_spectra(T, W, H, dose=10.0, penalty=0.0, free_refit=True)
-    Wu, Hu, _ = hsnt.unconstrained_spectra(T, W, H)
+    Wz, Hz, support_z, _ = _support_selected_spectra(T, W, H, dose=10.0, penalty=0.0, free_refit=True)
+    Wu, Hu, _ = _unconstrained_spectra(T, W, H)
     assert support_z.sum() >= support.sum() and abs(_loss(Wz, Hz, T) - _loss(Wu, Hu, T)) <= 2e-3 * _loss(Wu, Hu, T)
 
 
@@ -283,26 +272,11 @@ def test_streamed_support_selection_matches_the_monolithic_estimator(dev):
     Wm, Hm, _ = _mle(T)
     for free in (False, True):
         stats = {}
-        W_chunks, H, _ = hsnt.stream_factorization(tiles, 3, max_passes=3, rel_tol=1e-8, warmup_pixels=1024,
-                                                   device=dev, stats=stats,
-                                                   support_selection=dict(dose=10.0, free_refit=free))
+        W_chunks, H, _ = _stream_factorization(tiles, 3, max_passes=3, rel_tol=1e-8, warmup_pixels=1024, device=dev,
+                                               stats=stats, support_selection=dict(dose=10.0, free_refit=free))
         W = torch.cat([w.to(dev) for w in W_chunks])
         S = torch.cat(stats["support_chunks"]).to(dev)
         assert S.shape == W.shape and bool((W[~S] == 0).all()) and W.min() >= 0 and "loss_refit" in stats
-        Ws, Hs, Sm, _ = hsnt.support_selected_spectra(T, Wm, Hm, dose=10.0, free_refit=free)
+        Ws, Hs, Sm, _ = _support_selected_spectra(T, Wm, Hm, dose=10.0, free_refit=free)
         assert abs(S.sum(1).double().mean().item() - Sm.sum(1).double().mean().item()) < 0.1
         assert _loss(W, H, T) <= 1.01 * _loss(Ws, Hs, T)
-
-
-def test_l2_baseline_reproduces_exactly_low_rank_data():
-    """The scikit-learn NMF baseline: on noiseless rank-3 attenuation its subspace has safety_factor x 3 dimensions and
-    the rehydrated data match the input."""
-    rng = np.random.default_rng(0)
-    W = rng.uniform(0.0, 1.0, (16, 16, 3))
-    H = rng.uniform(0.05, 1.0, (3, 60))
-    A = (W @ H).astype(np.float32)
-    sub, basis, dtype = hsnt.l2_dehydrate(A, num_materials=3, safety_factor=2, random_state=0, verbose=0)
-    assert sub.shape == (16, 16, 6) and basis.shape == (6, 60) and dtype == "attenuation"
-    assert sub.min() >= 0 and basis.min() >= 0
-    den = hsnt.l2_hyper_denoise(A, num_materials=3, random_state=0, verbose=0)
-    assert den.shape == A.shape and np.linalg.norm(den - A) / np.linalg.norm(A) < 1e-2

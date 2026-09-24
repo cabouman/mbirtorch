@@ -20,11 +20,9 @@ most runs need, or ``--help-all`` for every option.
 import argparse
 import json
 import logging
-import math
 import os
 import re
 import sys
-import time
 import warnings
 
 import numpy as np
@@ -36,8 +34,6 @@ from .rank import estimate_rank
 
 log = logging.getLogger("mbirtorch.hsnt")
 
-_BYTES_PER_ELEMENT_FULL = 48        # joint_newton's working set: about 12 float32 arrays of T's shape
-_BYTES_PER_ELEMENT_STREAM = 24      # solve_W on one chunk plus the accumulators
 
 
 def _parse_slice(text, name):
@@ -93,118 +89,36 @@ def _device(name):
     return name
 
 
-def plan_memory(ds, device, mode, chunk_pixels):
-    """Decide a full or streamed solve from the memory available on the device. Returns (mode, chunk_pixels, note)."""
-    import torch
-    from .._memory_ledger import device_budget_bytes
-    P, K = ds.T.shape
-    need_full = P * K * _BYTES_PER_ELEMENT_FULL
-    if device.startswith("cuda"):
-        free, total = device_budget_bytes(device), torch.cuda.get_device_properties(device).total_memory
-        name = torch.cuda.get_device_name(device)
-    else:
-        import psutil
-        free = total = psutil.virtual_memory().available
-        name = "cpu"
-    note = (f"{name}: {free / 2**30:.1f} GiB available of {total / 2**30:.1f}; a full solve needs about "
-            f"{need_full / 2**30:.1f} GiB")
-    if mode == "auto":
-        mode = "full" if need_full < 0.7 * free else "stream"
-    if mode == "stream":
-        if chunk_pixels is None:
-            chunk_pixels = int(0.4 * free / (K * _BYTES_PER_ELEMENT_STREAM)) // 1024 * 1024
-            chunk_pixels = max(1024, min(chunk_pixels, P))
-        note += f"; streaming in chunks of {chunk_pixels:,} pixels ({-(-P // chunk_pixels)} chunks)"
-    log.info("plan: %s solve. %s", mode, note)
-    return mode, chunk_pixels, note
+def plan_memory(ds, device, mode, chunk_pixels, spectra="mle"):
+    """A full or streamed solve for the loaded data on `device`. Returns (mode, chunk_pixels, note)."""
+    from ._fit import _plan
+    return _plan(ds.pixels, ds.bins, device, spectra, mode, chunk_pixels)
 
 
-def _support_options(args, K):
-    return dict(method=args.support_method, wald_screen=args.wald_screen, free_refit=args.free_refit,
-                penalty="auto" if args.support_penalty == "auto" else float(args.support_penalty) * math.log(K))
+def _penalty_arg(text):
+    if text.lower() == "auto":
+        return "auto"
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected 'auto' or a multiple of log(bins), got {text!r}") from None
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"the penalty must be nonnegative, got {text!r}")
+    return value
 
 
 def solve(ds, args, device):
-    """Run the factorization and the requested post-estimator. Returns (W, H, report) with W and H numpy."""
-    import torch
-    from ._loss import stable_nnal
-    from ._streaming import stream_factorization
-    from .factorization import nnal_factorization
-    from .spectra import support_selected_spectra, unconstrained_spectra
+    """Run the factorization and the requested spectra estimator. Returns (W, H, report) with W and H numpy."""
+    from ._fit import _fit
     if args.spectra == "support" and ds.dose is None:
         raise ValueError("support selection needs the dose (open-beam counts per pixel and bin): pass --dose, or "
                          "give --open-beam with a TIFF stack of counts")
-    if args.spectra == "support" and args.support_method == "enumerate" and args.rank_value > 8:
-        raise ValueError("--support-method enumerate solves all 2^R - 1 subsets and is limited to rank 8; use "
-                         "branch_bound")
-    rank = args.rank_value
-    support_kw = _support_options(args, ds.bins)
-    rep = dict(rank=rank, rank_note=args.rank_note, rank_search=args.rank_detail)
-    mode, chunk, rep["memory_plan"] = plan_memory(ds, device, args.mode, args.chunk_pixels)
-    rep["mode"] = mode
-    t0 = time.perf_counter()
-    if mode == "full":
-        T = torch.from_numpy(ds.T).to(device)
-        W, H, steps = nnal_factorization(T, method=args.method, num_materials=rank, max_steps=args.max_steps,
-                                         rel_tol=args.rel_tol, compile_mode=args.compile)
-        rep["steps"] = int(steps)
-    else:
-        if args.method != "joint_newton":
-            log.warning("stream mode always uses joint_newton for the warm-up and block Newton for the polish; "
-                        "--method %s ignored", args.method)
-        chunks = [torch.from_numpy(ds.T[i:i + chunk]) for i in range(0, ds.pixels, chunk)]
-        stats = {}
-        support = dict(support_kw, dose=ds.dose) if args.spectra == "support" else None
-        W_chunks, H, passes = stream_factorization(chunks, rank, max_passes=args.max_passes, rel_tol=args.rel_tol,
-                                                   warmup_pixels=min(args.warmup_pixels, ds.pixels), device=device,
-                                                   verbose=int(log.isEnabledFor(logging.DEBUG)), stats=stats,
-                                                   nonneg_W=(args.spectra != "unconstrained"),
-                                                   support_selection=support,
-                                                   compile_mode='off' if args.compile == 'auto' else args.compile)
-        W = torch.cat([w.to(device) for w in W_chunks])
-        rep.update(passes=int(passes), loss_per_pass=stats.get("loss"), kkt_per_pass=stats.get("kkt"))
-        T = None
-    if device.startswith("cuda"):
-        torch.cuda.synchronize(device)
-    rep["solve_seconds"] = round(time.perf_counter() - t0, 2)
-
-    def loss(Wx, Hx):
-        if T is not None:
-            return stable_nnal(Wx.double() @ Hx.double(), T.double()).item()
-        return float(sum(stable_nnal(Wx[i:i + chunk].double() @ Hx.double(),
-                                     torch.from_numpy(ds.T[i:i + chunk]).to(device).double()).item()
-                         for i in range(0, ds.pixels, chunk)))
-
-    if mode == "full":
-        rep["loss_mle"] = loss(W, H)
-    else:           # the last polish pass's loss is at the final W and H; with free-signed W it is not the MLE's
-        rep["loss_mle"] = stats["loss"][-1] if args.spectra != "unconstrained" else None
-    steps_text = f"{rep['steps']} steps" if "steps" in rep else f"{rep['passes']} polish passes"
-    log.info("factorization: %s, %s in %.1f s, loss %s", mode, steps_text, rep["solve_seconds"],
-             "n/a" if rep["loss_mle"] is None else f"{rep['loss_mle']:.6g}")
-
-    if args.spectra == "unconstrained" and mode == "full":
-        t1 = time.perf_counter()
-        W, H, st = unconstrained_spectra(T, W, H, compile_mode=args.compile)
-        rep["unconstrained_steps"], rep["unconstrained_seconds"] = int(st), round(time.perf_counter() - t1, 2)
-    elif args.spectra == "support" and mode == "full":
-        t1 = time.perf_counter()
-        W, H, S, st = support_selected_spectra(T, W, H, ds.dose, compile_mode=args.compile, **support_kw)
-        rep["support_steps"], rep["support_seconds"] = int(st), round(time.perf_counter() - t1, 2)
-        rep["mean_support_size"] = S.sum(1).double().mean().item()
-    elif args.spectra == "support":
-        S = torch.cat(stats["support_chunks"])
-        rep["mean_support_size"] = S.sum(1).double().mean().item()
-        rep["support_refit_passes"], rep["loss_per_pass_refit"] = int(stats["refit_passes"]), stats.get("loss_refit")
-    rep["loss_final"] = rep["loss_mle"] if args.spectra == "mle" else loss(W, H)
-    if args.spectra != "mle":
-        support_text = (f", mean {rep['mean_support_size']:.2f} materials per pixel" if "mean_support_size" in rep
-                        else "")
-        log.info("%s spectra%s: loss %.6g", args.spectra, support_text, rep["loss_final"])
-    rep["W_zero_frac"], rep["H_zero_frac"] = (W == 0).double().mean().item(), (H == 0).double().mean().item()
-    if device.startswith("cuda"):
-        rep["gpu_peak_gib"] = round(torch.cuda.max_memory_allocated(device) / 2**30, 2)
-    return W.cpu().numpy(), H.cpu().numpy(), rep
+    W, H, rep = _fit(ds.T, args.rank_value, spectra=args.spectra, dose=ds.dose, penalty=args.support_penalty,
+                     free_refit=args.free_refit, wald_screen=args.wald_screen, device=device, mode=args.mode,
+                     chunk_pixels=args.chunk_pixels, max_steps=args.max_steps, rel_tol=args.rel_tol,
+                     max_passes=args.max_passes, compile_mode=args.compile)
+    rep.update(rank=args.rank_value, rank_note=args.rank_note, rank_search=args.rank_detail)
+    return W, H, rep
 
 
 def _output_path(output, default_name):
@@ -225,7 +139,7 @@ def _out_type(ds, args):
 
 def _run_attrs(ds, rep, args, **extra):
     """Provenance written as HDF5 attributes: where the data came from and how the solve was set up."""
-    return dict(source=ds.source, input_type=ds.dataset_type, method=args.method, mode=rep["mode"],
+    return dict(source=ds.source, input_type=ds.dataset_type, mode=rep["mode"],
                 spectra=args.spectra, support_penalty=str(args.support_penalty), free_refit=bool(args.free_refit),
                 downsample=args.downsample, wave_bin=args.wave_bin, dose=-1.0 if ds.dose is None else float(ds.dose),
                 mbirtorch_hsnt_cli="1", **extra)
@@ -300,7 +214,7 @@ def cmd_convert(args):
                                      input_type=args.input_type, dataset=args.dataset, dose=args.dose,
                                      views=_parse_slice(args.views, "views"),
                                      wave_range=_parse_slice(args.wave_range, "wave-range"), wave_bin=args.wave_bin,
-                                     downsample=args.downsample, as_type=args.as_type, block_bins=args.block_bins,
+                                     downsample=args.downsample, as_type=args.as_type,
                                      memory_budget_mib=args.memory_budget, workers=args.workers, strict=args.strict,
                                      progress=not args.quiet)
     for c in checks:
@@ -328,7 +242,7 @@ def _pipeline(args, denoise):
     stem = os.path.splitext(os.path.basename(os.path.normpath(args.input)))[0]
     base = os.path.splitext(_output_path(args.output, stem + ".h5"))[0]
     if args.dry_run:
-        plan_memory(ds, device, args.mode, args.chunk_pixels)
+        plan_memory(ds, device, args.mode, args.chunk_pixels, args.spectra)
         print(f"dry run: data loaded and checked, {args.rank_note}; no solve. Output base: {base}")
         return 0
     W, H, rep = solve(ds, args, device)
@@ -496,14 +410,10 @@ class _Options:
         self.run(sp, device=True, dry_run=True)
         self.rank_test(sp)
         g = sp.add_argument_group("advanced: support selection")
-        self.add(g, "--support-method", choices=("branch_bound", "greedy", "enumerate"), default="branch_bound",
-                 advanced=True, help="subset search: branch and bound (any rank, default), greedy (fastest, "
-                 "heuristic), or the 2^R - 1 enumeration (rank <= 8)")
-        self.add(g, "--support-penalty", default="2", metavar="F|auto", advanced=True,
-                 help="penalty per selected material, F x log(bins) nats (default 2: essentially no false "
-                      "admissions; 0.5-1 keeps a faint material in more of its pixels below about 10 counts per bin "
-                      "at the cost of map noise above about 100) or 'auto', which moves from 0.5 to 2 with the "
-                      "counts per pixel and bin")
+        self.add(g, "--support-penalty", type=_penalty_arg, default="auto", metavar="auto|F", advanced=True,
+                 help="charge per selected material, F x log(bins) nats, or 'auto' (default), which moves from 0.5 "
+                      "to 2 with the counts per pixel and bin: 2 admits essentially no absent material, 0.5 keeps "
+                      "a faint material in more of its pixels at low counts")
         self.add(g, "--free-refit", action="store_true", advanced=True,
                  help="drop the bound on the selected coefficients during the refit, then re-solve W >= 0 on the "
                       "supports")
@@ -511,8 +421,6 @@ class _Options:
                  help="skip single-material fits below F x penalty of Wald statistic in the full fit (0 = off; "
                       "trades rare-material recall for time)")
         g = sp.add_argument_group("advanced: solver")
-        self.add(g, "--method", choices=("joint_newton", "block_newton", "multiplicative", "lbfgsb"),
-                 default="joint_newton", advanced=True, help="solver (default joint_newton, the fastest)")
         self.add(g, "--max-steps", type=int, default=1000, advanced=True,
                  help="largest number of solver steps in a full solve (default 1000)")
         self.add(g, "--rel-tol", type=float, default=1e-8, advanced=True,
@@ -528,8 +436,6 @@ class _Options:
                  help="pixels per chunk in stream mode (default: from available memory)")
         self.add(g, "--max-passes", type=int, default=5, advanced=True,
                  help="stream mode: polish passes over the data (default 5)")
-        self.add(g, "--warmup-pixels", type=int, default=16384, advanced=True,
-                 help="stream mode: pixels for the initial spectra fit (default 16384)")
 
 
 def build_parser(show_all=False):
@@ -557,8 +463,6 @@ def build_parser(show_all=False):
             help="stored quantity (default attenuation)")
     opt.run(s)
     g = s.add_argument_group("advanced: streaming")
-    opt.add(g, "--block-bins", type=int, metavar="N", advanced=True,
-            help="bins per block (default: from --memory-budget)")
     opt.add(g, "--memory-budget", type=float, default=256, metavar="MiB", advanced=True,
             help="working memory for the blocks (default 256 MiB)")
     opt.add(g, "--workers", type=int, metavar="N", advanced=True,
