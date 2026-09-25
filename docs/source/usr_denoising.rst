@@ -34,6 +34,10 @@ Denoise
 
 .. automethod:: mbirtorch.QGGMRFDenoiser.denoise
 
+.. automethod:: mbirtorch.QGGMRFDenoiser.denoise_stack
+
+.. automethod:: mbirtorch.QGGMRFDenoiser.initialize_denoiser
+
 
 +++++++++++++
 Median Filter
