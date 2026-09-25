@@ -51,13 +51,16 @@ def rotation_axis(ax, cx, cy, height=1.2, label='view angles'):
     ax.text(cx + 0.35, top - 0.05, label, fontsize=FONT_SIZE)
 
 
-def panel(ax, x, cy, half_height=1.6, depth=0.9, tilt=0.0):
+def panel(ax, x, cy, half_height=1.6, depth=0.9, tilt=0.0, curved=False,
+          label='Detector'):
     """Draw the detector panel and return its four corners.
 
     The panel's left edge is at x; the right edge is nearer the viewer, so it
     is drawn taller and displaced by ``depth``.  ``tilt`` rotates the panel
-    about its center, in radians.  Corners are returned in the order
-    left-bottom, left-top, right-top, right-bottom.
+    about its center, in radians.  ``curved`` bows the top and bottom edges
+    away from the source, as a cylindrical detector looks from the side.
+    Corners are returned in the order left-bottom, left-top, right-top,
+    right-bottom.
     """
     up = np.array([-np.sin(tilt), np.cos(tilt)])
     c = np.array([x, cy])
@@ -66,9 +69,19 @@ def panel(ax, x, cy, half_height=1.6, depth=0.9, tilt=0.0):
                         c + half_height * up,
                         c + (half_height + 0.3) * up + d,
                         c - (half_height + 0.3) * up + d])
-    ax.add_patch(Polygon(corners, closed=True, facecolor=PANEL_FILL,
+    if curved:
+        bow = np.array([0.55, 0.0])
+        t = np.linspace(0.0, 1.0, 40)[:, None]
+        top = ((1 - t) ** 2 * corners[1] + 2 * (1 - t) * t * ((corners[1] + corners[2]) / 2 + bow)
+               + t ** 2 * corners[2])
+        bottom = ((1 - t) ** 2 * corners[3] + 2 * (1 - t) * t * ((corners[3] + corners[0]) / 2 + bow)
+                  + t ** 2 * corners[0])
+        outline = np.vstack([top, bottom])
+    else:
+        outline = corners[[1, 2, 3, 0]]
+    ax.add_patch(Polygon(outline, closed=True, facecolor=PANEL_FILL,
                          edgecolor='k', lw=1.4))
-    ax.text(corners[3, 0] - 0.3, corners[3, 1] - 0.15, 'Detector',
+    ax.text(corners[3, 0] - 0.3, corners[3, 1] - 0.15, label,
             fontsize=FONT_SIZE, va='top', ha='right')
     return corners
 

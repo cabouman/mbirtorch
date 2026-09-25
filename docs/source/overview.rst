@@ -20,7 +20,7 @@ class.
 
 * **Parallel beam** (:class:`~mbirtorch.ParallelBeamModel`): parallel rays from a source at infinity.
 * **Cone beam** (:class:`~mbirtorch.ConeBeamModel`): rays from a point source to a flat or curved detector, in a circular or helical scan.
-* **Multi-axis parallel** (:class:`~mbirtorch.MultiAxisParallelModel`): parallel rays at a per-view elevation angle to the rotation axis, including laminography.
+* **Multi-axis parallel (laminography)** (:class:`~mbirtorch.MultiAxisParallelModel`): parallel rays at a per-view elevation angle to the rotation axis.
 * **4D reconstruction** (:class:`~mbirtorch.MACE4DModel`): one continuous scan of a moving object, reconstructed as one volume per time frame.
 
 .. list-table::
@@ -37,11 +37,23 @@ class.
 
            Cone-beam geometry
 
+    * - .. plot:: figs/geom_helical.py
+           :align: center
+           :width: 100%
+
+           Helical cone-beam geometry
+
+      - .. plot:: figs/geom_curved.py
+           :align: center
+           :width: 100%
+
+           Cone-beam geometry with a curved detector
+
     * - .. plot:: figs/geom_multiaxis.py
            :align: center
            :width: 100%
 
-           Multi-axis parallel geometry
+           Multi-axis parallel geometry (laminography)
 
       - .. plot:: figs/recon_4d.py
            :align: center
