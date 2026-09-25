@@ -243,3 +243,21 @@ In general, FBP and FDK work well when the number of views is large (at least as
 detector) and the sinograms have little noise.  Iterative reconstruction typically works better when there are
 relatively few views and/or the sinograms are noisy.  Iterative reconstruction takes more time and memory than
 FBP/FDK but can produce significantly better reconstructions when the collected data is less than ideal.
+
+
+Q: What does the warning about torch running host operations on one thread mean?
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+A: Torch runs its host (CPU) tensor operations on a pool of threads, and it takes the size of
+that pool from the environment variables ``OMP_NUM_THREADS`` and ``MKL_NUM_THREADS`` when Python
+starts, honoring the smaller of the two.  Some shells and cluster modules set both to one.  Every
+host-side step in MBIRTorch then runs on one core, however many the machine or the job allocation
+holds: the consensus update of a MACE reconstruction, CPU reconstructions, the denoiser statistics,
+the preprocessing, and the host side of every copy from a device.  A 4D MACE reconstruction has
+run 2.6 times slower for this reason alone.
+
+MBIRTorch warns at import when torch has one thread and more cores are available.  To fix it,
+unset the two variables before starting Python, or call ``torch.set_num_threads(n)`` with the
+number of cores you want to use, before the reconstruction.  If you set the variables to one on
+purpose, for instance to run several processes on one node, the warning can be ignored or
+silenced with the ``warnings`` module.

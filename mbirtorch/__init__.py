@@ -19,6 +19,11 @@ _os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
 _os.environ.setdefault("TRITON_CACHE_DIR",
                        _os.path.expanduser("~/.mbirtorch/triton_cache"))
 
+# A warning when torch has one host thread on a machine with more cores, which a shell
+# variable set to one causes and which slows every host-side operation of the package.
+from ._host_threads import warn_if_threads_unused as _warn_if_threads_unused
+_warn_if_threads_unused()
+
 from typing import TYPE_CHECKING
 
 from .parallel_beam import ParallelBeamModel, recon_simple_parallel
