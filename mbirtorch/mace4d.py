@@ -29,8 +29,6 @@ from .parameter_handler import ParameterHandler
 from .utilities import construct_time_frame_models
 from .vcd_utils import gen_set_of_pixel_partitions, named_rng, named_seed
 
-# Iterations of the per-frame reconstruction that initializes the 4D image.
-_INIT_ITERATIONS = 15
 # Iterations and stop threshold of each denoiser sweep.  The threshold is tighter
 # than the 0.2 percent a standalone denoise uses.
 _DENOISE_MAX_ITERATIONS = 15
@@ -419,9 +417,9 @@ class MACE4DModel(ParameterHandler):
                 to 0.5.
             prox_num_iterations (int): iterations of each data-fit call.
                 Defaults to 3.
-            prox_stop_threshold (float): the stop threshold, in percent, of
-                the per-frame reconstruction that initializes the run.
-                Defaults to 0.02.
+            prox_stop_threshold (float): has no effect.  It is accepted so
+                that existing scripts that set it still run.  Defaults to
+                0.02.
             prox_partition_advance (float): how many entries of the partition
                 sequence each data-fit call moves forward per iteration.
                 Defaults to 1.0.
@@ -530,7 +528,8 @@ class MACE4DModel(ParameterHandler):
             init_recon (numpy, optional): the initial 4D image, of shape
                 ``(num_frames,) + recon_shape``.  Defaults to None.  The
                 image is then read from ``init_dir`` when one is there, and
-                is otherwise computed by reconstructing each frame alone.
+                is otherwise computed by a direct reconstruction of each
+                frame alone (FDK for cone beam, FBP for parallel beam).
             max_iterations (int, optional): consensus iterations.  Defaults
                 to 10.
             stop_threshold_change_pct (float, optional): stop when the percent
@@ -641,8 +640,7 @@ class MACE4DModel(ParameterHandler):
                 init_source = f"cached ({os.path.join(init_dir, 'init_recon.npy')})"
             else:
                 init_recon = self._compute_init_recon(frame_agents, pool, init_dir)
-                init_source = (f'computed ({num_frames} frames, {_INIT_ITERATIONS} '
-                               'iterations each)')
+                init_source = f'computed ({num_frames} frames, direct reconstruction)'
         x0 = torch.as_tensor(init_recon, dtype=torch.float32).contiguous()
 
         given_sigma = self.get_params('sigma_noise')
@@ -885,10 +883,10 @@ class MACE4DModel(ParameterHandler):
         return float(denoiser.estimate_image_noise_std(image_3d))
 
     def _compute_init_recon(self, frame_agents, pool, init_dir):
-        """Reconstruct each frame alone, on the frame's device, with the
-        sinograms the frame agents already placed, and cache the result."""
+        """Reconstruct each frame alone with a direct reconstruction, on the
+        frame's device, with the sinograms the frame agents already placed,
+        and cache the result.  The weights are not used."""
         verbose = self.get_params('verbose')
-        stop_threshold = self.get_params('prox_stop_threshold')
         if verbose:
             self.logger.info(f'[MACE] Computing the initial reconstruction on {len(pool)} worker(s)...')
         t0 = time.perf_counter()
@@ -897,10 +895,7 @@ class MACE4DModel(ParameterHandler):
         def reconstruct(frames):
             for t in frames:
                 agent = frame_agents[t]
-                volume, _ = agent.model.recon(
-                    agent.sinogram, weights=agent.weights, max_iterations=_INIT_ITERATIONS,
-                    stop_threshold_change_pct=stop_threshold, logfile_path=None,
-                    print_logs=False, rng=agent.rng_for('initial image'))
+                volume = agent.model.recon_direct(agent.sinogram)
                 volumes[t] = np.asarray(volume, dtype=np.float32)
 
         # Frames are grouped by pool entry, as the loop's workers are, so
@@ -985,7 +980,6 @@ class MACE4DModel(ParameterHandler):
             'max_iterations': max_iterations,
             'stop_threshold_change_pct': stop_threshold_change_pct,
             'prox_num_iterations': self.get_params('prox_num_iterations'),
-            'prox_stop_threshold': self.get_params('prox_stop_threshold'),
             'prox_partition_advance': self.get_params('prox_partition_advance'),
             'prox_warm_start': self.get_params('prox_warm_start'),
             'denoiser_warm_start': self.get_params('denoiser_warm_start'),

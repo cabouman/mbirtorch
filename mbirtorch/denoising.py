@@ -1066,7 +1066,7 @@ class QGGMRFDenoiser(TomographyModel):
         The parameters are set once for the whole stack.  ``sigma_noise`` is
         shared by every volume, and ``sigma_y`` is kept equal to it.  When
         auto-regularization is on, the regularization parameters are set by
-        :meth:`auto_set_regularization_params_from_stack` from a subsample of
+        `auto_set_regularization_params_from_stack` from a subsample of
         about 20 whole volumes, evenly spaced, with the neighbor differences
         taken between adjacent frames.  This differs from :meth:`denoise`,
         which reads a row subsample of a single image.  One pixel partition is
@@ -1102,7 +1102,7 @@ class QGGMRFDenoiser(TomographyModel):
                 100 * ||delta||_1 / ||volume||_1 drops below this.  0 runs
                 every volume for exactly max_iterations.
             batch_size (int, optional): volumes swept at once.  None chooses
-                the size with :meth:`auto_batch_size`, which is the whole stack
+                the size with `auto_batch_size`, which is the whole stack
                 on a device without a readable memory budget.
             overwrite_input (bool, optional): let the sweep write ``stack``
                 and ``init_stack`` in place when they are float32 tensors
