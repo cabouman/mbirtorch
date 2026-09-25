@@ -517,9 +517,10 @@ class ParallelBeamModel(TomographyModel):
             part_ranges.append((start, stop))
             start = stop
 
-        # The regularization parameters come from the full sinogram.  The parts copy
-        # them and set auto_regularize_flag=False.
-        self.auto_set_regularization_params(sino)
+        # The regularization parameters come from the full sinogram and its weights, the same
+        # inputs recon uses, so the parts get the values recon would set.  The parts copy them
+        # and set auto_regularize_flag=False.
+        self.auto_set_regularization_params(sino, weights=weights)
 
         def _recon_one_part(model_lo, model_hi, part_logfile_path):
             """Reconstruct one band of detector rows and return (host_recon,

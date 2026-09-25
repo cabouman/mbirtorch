@@ -40,6 +40,35 @@ repository root::
 
     pip install .
 
+**Optional Pixi development environment**
+
+For contributors who use `Pixi <https://pixi.sh>`__, ``MBIRTorch`` also provides an
+optional reproducible development environment, defined by ``pixi.toml`` and pinned by
+``pixi.lock`` at the repository root.  This does not replace the conda installation
+workflow above.
+
+For the default CPU environment on Linux or Apple Silicon macOS::
+
+    pixi run smoke
+    pixi run test-fast
+
+For a CUDA-enabled Linux system::
+
+    pixi run -e cuda smoke-torch
+    pixi run -e cuda test-fast
+
+The ``cuda`` environment uses the CUDA 13 build of torch, which needs an NVIDIA driver
+that supports CUDA 13.  On a machine whose driver supports only CUDA 12, use the
+``cuda12`` environment instead::
+
+    pixi run -e cuda12 smoke-torch
+    pixi run -e cuda12 test-fast
+
+Additional useful tasks include::
+
+    pixi run test
+    pixi run docs
+
 **Verifying the installation**
 
 The tests are not part of the installed package, so run them from a source

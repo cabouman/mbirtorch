@@ -26,3 +26,6 @@ dev_scripts/_widening_floor_runs/
 # macOS Finder metadata
 .DS_Store
 ._*
+
+# pixi environments
+.pixi/

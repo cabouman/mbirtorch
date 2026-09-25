@@ -33,6 +33,7 @@ from ._memory_ledger import (DEVICE_COUNT_ENV_VAR, ELL1_CHUNK_BYTES, ELL1_MAX_CH
                              pinned_device_count)
 from .denoising import QGGMRFDenoiser
 from .tomography_model import cpu_devices, default_devices, gpu_devices
+from .vcd_utils import named_rng
 
 
 def _canonical_device(device):
@@ -656,6 +657,11 @@ class ForwardProxAgent:
     across the loop.  The model's prox initialization runs at iteration 0
     only.  Use one agent per model, and a model on one device.
 
+    With a seed, every random draw the agent makes comes from a generator
+    named by the seed and what the draw is for, so a run makes the same draws
+    whatever thread runs it and in whatever order.  Without one the draws come
+    from the global np.random state.
+
     Args:
         model (TomographyModel): the projection model, configured on one
             device.
@@ -677,10 +683,13 @@ class ForwardProxAgent:
             previous output when True, and from the input when False.  The
             warm start keeps one volume and saves inner iterations.  Defaults
             to True.
+        seed (int, optional): the seed every draw of this agent is derived
+            from.  None draws from the global np.random state.
     """
 
     def __init__(self, model, sinogram, weights=None, sigma_prox=None, inner_iterations=3,
-                 init_recon=None, device=None, partition_advance=1.0, use_warm_start=True):
+                 init_recon=None, device=None, partition_advance=1.0, use_warm_start=True,
+                 seed=None):
         self.model = model
         self.device = None if device is None else torch.device(device)
         if self.device is not None:
@@ -696,7 +705,13 @@ class ForwardProxAgent:
         self.inner_iterations = int(inner_iterations)
         self.partition_advance = float(partition_advance)
         self.use_warm_start = bool(use_warm_start)
+        self.seed = None if seed is None else int(seed)
         self._previous_output = init_recon
+
+    def rng_for(self, name):
+        """Return the generator of one named draw of this agent, or None when
+        the agent has no seed."""
+        return named_rng(self.seed, name)
 
     def __call__(self, w, iteration=0):
         first = int(math.floor(iteration * self.partition_advance))
@@ -704,12 +719,24 @@ class ForwardProxAgent:
             init_recon = self._previous_output
         else:
             init_recon = w
+        do_initialization = iteration == 0
+        if self.seed is not None:
+            # The initialization draws its partitions here rather than inside
+            # the sweep, so that they do not depend on which worker runs the
+            # first iteration.
+            do_initialization = False
+            if self.model.prox_data is None:
+                self.model.initialize_prox(
+                    self.sinogram, weights=self.weights, init_recon=init_recon,
+                    max_iterations=first + self.inner_iterations,
+                    first_iteration=first, logfile_path=None, print_logs=False,
+                    rng=self.rng_for('init'))
         output, _ = self.model.prox_map(
             w, self.sinogram, sigma_prox=self.sigma_prox, weights=self.weights,
-            init_recon=init_recon, do_initialization=(iteration == 0),
+            init_recon=init_recon, do_initialization=do_initialization,
             max_iterations=first + self.inner_iterations, first_iteration=first,
             stop_threshold_change_pct=0.0, logfile_path=None, print_logs=False,
-            output_sharded=True)
+            output_sharded=True, rng=self.rng_for(iteration))
         _reject_divided_output(output, 'ForwardProxAgent')
         if self.use_warm_start:
             self._previous_output = output
@@ -717,11 +744,16 @@ class ForwardProxAgent:
 
     def state_dict(self):
         return {'previous_output': None if not self.use_warm_start or self._previous_output is None
-                else torch.as_tensor(self._previous_output).clone()}
+                else torch.as_tensor(self._previous_output).clone(),
+                'seed': self.seed}
 
     def load_state_dict(self, state):
         if state.get('previous_output') is not None:
             self._previous_output = state['previous_output']
+        # The 4D data-fit agent installs a warm start with a dict that holds
+        # that key alone, so the seed is restored only when it is there.
+        if 'seed' in state:
+            self.seed = state['seed']
 
 
 class QGGMRFDenoiserAgent:
@@ -730,7 +762,11 @@ class QGGMRFDenoiserAgent:
 
     The prior parameters are pinned at construction and auto-regularization
     is turned off, so the agent is the same operator on every call and
-    ``sigma_noise`` is its one strength.
+    ``sigma_noise`` is its one strength.  The pixel partition is settled on
+    the first call and reused, which makes the agent a fixed operator down to
+    its pixel grouping; with a seed that partition is drawn from a generator
+    named by the seed rather than from the global state, so it does not depend
+    on which worker makes the first call.
 
     Args:
         image_shape (tuple of int): the volume shape.
@@ -748,10 +784,13 @@ class QGGMRFDenoiserAgent:
         use_warm_start (bool, optional): start each call from the agent's own
             previous output when True, and from the input when False.
             Defaults to True.
+        seed (int, optional): the seed the pixel partition is derived from.
+            None draws it from the global np.random state.
     """
 
     def __init__(self, image_shape, sigma_noise, pinned_params=None, inner_iterations=8,
-                 like_model=None, use_ror_mask=False, device=None, use_warm_start=True):
+                 like_model=None, use_ror_mask=False, device=None, use_warm_start=True,
+                 seed=None):
         self.model = QGGMRFDenoiser(tuple(int(n) for n in image_shape))
         self.device = None if device is None else torch.device(device)
         if self.device is not None:
@@ -762,19 +801,26 @@ class QGGMRFDenoiserAgent:
         if pinned_params:
             self.model.set_params(no_warning=True, **pinned_params)
         self.model.set_params(no_warning=True, auto_regularize_flag=False)
+        # The mask is set here, so that the partition settled on the first
+        # call is drawn over the pixels every call updates.
+        self.model.set_params(no_warning=True, use_ror_mask=use_ror_mask)
         self.sigma_noise = float(sigma_noise)
         self.inner_iterations = int(inner_iterations)
         self.use_ror_mask = use_ror_mask
         self.use_warm_start = bool(use_warm_start)
+        self.seed = None if seed is None else int(seed)
         self._previous_output = None
 
     def __call__(self, w, iteration=0):
         init_image = self._previous_output if self.use_warm_start else None
+        if self.model.denoise_data is None:
+            self.model.initialize_denoiser(image=w, sigma_noise=self.sigma_noise,
+                                           rng=named_rng(self.seed, 'denoiser'))
         output, _ = self.model.denoise(
             w, sigma_noise=self.sigma_noise, use_ror_mask=self.use_ror_mask,
             init_image=init_image, max_iterations=self.inner_iterations,
             stop_threshold_change_pct=0.0, logfile_path=None, print_logs=False,
-            output_sharded=True)
+            output_sharded=True, do_initialization=False)
         _reject_divided_output(output, 'QGGMRFDenoiserAgent')
         if self.use_warm_start:
             self._previous_output = output

@@ -40,7 +40,7 @@ def test_split_approximates_full_recon():
     model, sino, weights = _small_cone_case(delta_voxel_scale=0.8)
     pitch = float(model.get_params('delta_voxel'))
     np.random.seed(0)
-    full, _ = model.recon(sino, weights=weights, max_iterations=8)
+    full, full_dict = model.recon(sino, weights=weights, max_iterations=8)
     np.random.seed(0)
     split, split_dict = model.recon_split_sino(sino, weights=weights, half_overlap=4,
                                                max_iterations=8)
@@ -48,8 +48,45 @@ def test_split_approximates_full_recon():
     nrmse = float(np.linalg.norm(split - full) / np.linalg.norm(full))
     print(f"split vs full NRMSE = {nrmse:.4f}")
     assert nrmse < 0.1
+    # The halves take their regularization from the whole sinogram and its weights, so it
+    # equals what recon set from the same inputs.
+    expected = full_dict['recon_params']['regularization_params']
+    for key in ('recon_params_top', 'recon_params_bottom'):
+        assert split_dict[key]['regularization_params'] == pytest.approx(expected)
     for key in ('model_params_top', 'model_params_bottom'):
         assert float(split_dict[key]['delta_voxel']) == pytest.approx(pitch)
     sp = split_dict['split_params']
     assert sp['half_overlap_sino'] >= 4 and sp['half_overlap_recon'] > sp['half_overlap_sino'] // 2
     assert 'recon_params_top' in split_dict and 'recon_params_bottom' in split_dict
+
+
+def _small_parallel_case():
+    cell = (48, 24, 32)  # views, detector rows (which are slices), channels
+    angles = np.linspace(0, np.pi, cell[0], endpoint=False)
+    model = mbirtorch.ParallelBeamModel(cell, angles)
+    model.configure_devices(devices=['cpu'])
+    model.set_params(no_warning=True, verbose=0)
+    rshape = tuple(model.get_params('recon_shape'))
+    phantom = mbirtorch.generate_3d_shepp_logan_low_dynamic_range(rshape)
+    sino = model.forward_project(phantom)
+    weights = mbirtorch.gen_weights(sino / sino.max(), weight_type='transmission_root')
+    return model, sino, weights
+
+
+def test_parallel_split_matches_recon_regularization():
+    """A parallel-beam split with weights sets the regularization recon sets on the same
+    inputs, and its reconstruction approximates recon's."""
+    model, sino, weights = _small_parallel_case()
+    np.random.seed(0)
+    full, full_dict = model.recon(sino, weights=weights, max_iterations=8)
+    np.random.seed(0)
+    split, split_dict = model.recon_split_sino(sino, weights=weights, half_overlap=4,
+                                               slices_per_part=10, max_iterations=8)
+    assert split.shape == full.shape
+    assert split_dict['split_params']['num_parts'] == 3
+    expected = full_dict['recon_params']['regularization_params']
+    for part in split_dict['recon_params_parts']:
+        assert part['regularization_params'] == pytest.approx(expected)
+    nrmse = float(np.linalg.norm(split - full) / np.linalg.norm(full))
+    print(f"parallel split vs full NRMSE = {nrmse:.4f}")
+    assert nrmse < 0.1
