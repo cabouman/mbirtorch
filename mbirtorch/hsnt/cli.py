@@ -385,7 +385,7 @@ Each subcommand's -h lists the options most runs need; --help-all lists every op
 _SPECTRA_HELP = ("how the material spectra are estimated. mle (default): the spectra that best fit the measured "
                  "counts. unconstrained: removes a bias the best fit has at low dose; worth it from about 100,000 "
                  "pixels up. support: works out which components each pixel contains, which removes the same bias "
-                 "and gives cleaner maps; needs the dose (an open beam or --dose)")
+                 "and zeroes the background of the maps; needs the dose (an open beam or --dose)")
 
 
 class _Options:

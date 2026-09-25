@@ -71,7 +71,9 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, spectra="
         num_materials (int, optional): Rank of the factorization :math:`N_m`. Defaults to None, which estimates it.
         spectra (str, optional): 'mle', the maximum-likelihood spectra; 'unconstrained', a re-estimate without the
             bias the nonnegativity of W gives the spectra at low dose, which pays from about 10^5 pixels; 'support',
-            which decides the components present in each pixel and refits, and needs the dose. Defaults to 'mle'.
+            which decides the components present in each pixel and refits, and needs the dose: it corrects the same
+            bias, and in the maps mostly zeroes the background, since a pixel of one material usually needs several
+            of the fitted components. Defaults to 'mle'.
         dose (float, optional): Open-beam counts per pixel and bin, for spectra='support'. Defaults to None.
         penalty (str or float, optional): Support selection's charge per component, as a multiple of log(N_k), or
             'auto', which moves from 0.5 to 2 with the counts per pixel and bin. Defaults to 'auto'.

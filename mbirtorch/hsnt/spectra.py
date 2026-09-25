@@ -47,9 +47,9 @@ def _fit_free_sets(T, H, idx, valid, w0, steps=8, nonneg=True, rows=None):
     idx (P, m) holds material indices (anything where valid is False is padding), w0 (P, m) the start. The per-pixel
     Hessian is the m x m block of the free set, so one Newton step costs a (P, m, K) gather-product whatever R is;
     entries at zero with an outward gradient are frozen (two-metric projection), the step is projected onto w >= 0,
-    and a per-pixel Armijo test on the float64 row loss checks the projected point. Pixels are processed in chunks sized by
-    _FREE_SET_ELEMS (they are independent), and `rows` names the pixels of T to fit when T is the whole data, so
-    that only a chunk of rows is ever gathered. Returns (w, f) with f the per-pixel loss."""
+    and a per-pixel Armijo test on the float64 row loss checks the projected point. Pixels are processed in chunks
+    sized by _FREE_SET_ELEMS (they are independent), and `rows` names the pixels of T to fit when T is the whole data,
+    so that only a chunk of rows is ever gathered. Returns (w, f) with f the per-pixel loss."""
     P, m = idx.shape
     chunk = max(1, _FREE_SET_ELEMS // (m * H.shape[1]))
     if P <= chunk and rows is None:
@@ -310,7 +310,9 @@ def _support_selected_spectra(T, W, H, dose, penalty='auto', wald_screen=0.0, fr
     re-selecting from refit spectra compounds the selection errors. With free_refit the selected coefficients are free
     during the refit and W >= 0 is re-solved on the supports afterwards, so a falsely admitted coefficient adds
     zero-mean noise rather than bias. A component selected in almost no pixel reverts to the maximum-likelihood
-    treatment (_guard_components).
+    treatment (_guard_components). The selection works in the basis W and H are in: where the components are strongly
+    mixed combinations of the materials, a pixel of one material needs several of them, and the supports mostly
+    separate the sample from the background.
 
     Returns (W, H, support, steps): the refit factors, the (pixels, R) bool support (all True in a column that
     reverted), and the refit's steps.

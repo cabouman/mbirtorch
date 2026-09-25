@@ -29,7 +29,10 @@ chunks of pixels.
 The maximum-likelihood spectra are biased at low dose by the truncation of the pixel coefficients at zero.
 ``dehydrate`` offers two other estimators through ``spectra``.  ``'unconstrained'`` removes the bias by dropping
 the bound while the spectra are estimated, and pays when the pixels are many.  ``'support'`` instead identifies
-the coefficients whose true value is zero, holds them at zero, and refits the rest; it needs the dose.
+the coefficients whose true value is zero, holds them at zero, and refits the rest; it needs the dose.  It decides
+in the basis the maximum-likelihood fit ends in, which is some mixture of the materials: where the components are
+far from the pure materials, a pixel of one material needs several of them, and the selection mostly separates the
+sample from the background.  Its gain is therefore in the spectra at low dose rather than in the maps.
 
 MBIRJAX's ``dehydrate`` is a scikit-learn NMF of the attenuation, which MBIRTorch does not include; its keywords
 raise a ``TypeError`` here.
