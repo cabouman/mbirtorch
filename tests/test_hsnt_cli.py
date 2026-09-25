@@ -146,6 +146,7 @@ def test_a_converted_file_keeps_its_dose_source_bins_and_metadata(tmp_path):
     ds = load_dataset(conv)
     assert ds.dose == pytest.approx(2 * DOSE) and ds.bin_indices.tolist() == list(range(4, 40, 2))
     assert load_dataset(conv, wave_bin=3).dose == pytest.approx(6 * DOSE)
+    assert load_dataset(conv, dose=DOSE).dose == pytest.approx(2 * DOSE)            # a given dose is per source bin
     out = str(tmp_path / "res")                                          # support selection finds the dose itself
     assert main(["dehydrate", conv, "-o", out, "--rank", str(R), "--spectra", "support", "--max-steps", "50",
                  "--no-plots", "-q"]) == 0
@@ -261,7 +262,8 @@ def test_bad_values_are_refused_and_a_failed_run_leaves_no_output(stacks, tmp_pa
 
 def test_fit_diagnostics():
     """The chi-square sits at 1 with the open beam's count in each bin and the noise of its two observations; the
-    component check flags proportional maps; the mean-pixel spectrum is the sum of the components' shares."""
+    component check flags proportional spectra, not proportional maps (which a mixed basis has); the mean-pixel
+    spectrum is the sum of the components' shares."""
     rng = np.random.default_rng(1)
     W, H = _truth()
     flux = np.linspace(20.0, 80.0, K)                                    # an open beam that varies over the bins
@@ -273,5 +275,6 @@ def test_fit_diagnostics():
     W2 = np.stack([W[:, 0], W[:, 0] * (1 + 0.05 * rng.standard_normal(W.shape[0]))], 1)    # a split material
     H2 = np.stack([H[0] * 0.5, H[0] * 0.5])
     assert component_check(W2, H2)["proportional_pairs"][0][:2] == (0, 1)
+    assert component_check(W2, H)["proportional_pairs"] == []            # proportional maps, distinct spectra: a mix
     total, contrib, n = mean_pixel_spectrum(W2, H2)
     assert total.shape == (K,) and n > 0 and np.allclose(total, contrib.sum(0))

@@ -24,6 +24,11 @@ def _reject_unknown_keywords(name, kwargs):
     raise TypeError(f"{name}() got unexpected keyword argument(s) {', '.join(sorted(kwargs))}")
 
 
+def _spatial_shape(lead):
+    """(views, rows, cols) for leading axes of that form or (rows, cols); None for anything else (no pooling)."""
+    return tuple(lead) if len(lead) == 3 else (1,) + tuple(lead) if len(lead) == 2 else None
+
+
 def _to_transmission(data, dataset_type):
     """(pixels, bins) float32 transmission ratio from an array with any leading axes, and the input shape.
 
@@ -47,6 +52,8 @@ def _to_transmission(data, dataset_type):
         warnings.warn(f"{100 * bad.mean():.3g}% of the data are NaN or infinite; treated as zero counts")
         T[bad] = 0.0
     np.maximum(T, 0.0, out=T)
+    if not bool((T > 0).any()):
+        raise ValueError("the data hold no counts: the transmission is zero everywhere")
     return np.ascontiguousarray(T, dtype=np.float32), shape
 
 
@@ -61,7 +68,8 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, spectra="
     rank is the number of components; when it is not given it is estimated by likelihood-ratio tests
     (:func:`~mbirtorch.hsnt.estimate_rank`), which also pool pixels spatially when the leading axes are
     (views, rows, cols) or (rows, cols). The components are a nonnegative basis of the data, not necessarily the
-    pure materials. Data that do not fit the device are factorized by chunks of pixels.
+    pure materials. Data that do not fit the device are factorized by chunks of pixels; rel_tol is then the relative
+    loss change per pass over the chunks, max_steps does not apply, and compile_mode compiles only when 'on'.
 
     Args:
         data (numpy.ndarray or torch.Tensor): Hyperspectral data with any leading axes and the spectral axis of
@@ -101,16 +109,15 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, spectra="
     """
     from ._device import _default_device
     from ._fit import _fit
-    from .rank import estimate_rank
+    from .rank import _estimate_rank
     _reject_unknown_keywords("dehydrate", kwargs)
     T, shape = _to_transmission(data, dataset_type)
     device = _default_device(device)
     lead = shape[:-1]
-    spatial = (tuple(lead) if len(lead) == 3 else (1,) + tuple(lead) if len(lead) == 2 else None)
     note = f"rank {num_materials} given"
     if num_materials is None:
-        num_materials, note, _ = estimate_rank(T, spatial_shape=spatial, device=device, max_rank=max_rank,
-                                               verbose=max(0, verbose - 1))
+        num_materials, note, _ = _estimate_rank(T, spatial_shape=_spatial_shape(lead), device=device, max_rank=max_rank,
+                                                verbose=max(0, verbose - 1))
     W, H, rep = _fit(T, int(num_materials), spectra=spectra, dose=dose, penalty=penalty, free_refit=free_refit,
                      device=device, max_steps=max_steps, rel_tol=rel_tol, compile_mode=compile_mode)
     subspace_data = W.reshape(*lead, int(num_materials))

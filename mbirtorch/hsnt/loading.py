@@ -215,6 +215,7 @@ class _TiffBlocks:
         self.rows, self.cols = np.empty(self.full_shape, dtype=bool)[::downsample, ::downsample].shape
         self.views = 1
         self.file_type, self.file_dose, self.file_dose_per_bin, self.file_observations = None, None, None, 0
+        self.file_wave_bin = 1
         self.source_bins = self.first_index + np.arange(len(self.files))
         self.file_metadata = {}
         self.metadata = dict(files=len(self.files), first_file=os.path.basename(self.files[0]),
@@ -266,6 +267,7 @@ class _Hdf5Blocks:
             else None
         self.file_dose_per_bin = None if per_bin is None else np.asarray(per_bin, dtype=np.float64)[ks.start:ks.stop]
         self.file_observations = int(attrs.get("open_beam_observations", 0))
+        self.file_wave_bin = max(1, int(attrs.get("wave_bin", 1)))                 # source bins per column
         self.file_metadata = {k: g[k][()] for k in ALLOWED_KEYS
                               if k in g and k not in ("dataset_type", "dataset_modality")}
         self.desc = f"{path}:{self.gname}"
@@ -460,11 +462,12 @@ def _check_host_memory(n_bytes, what):
 
 
 def _merge_dose(dose, estimate, src, wave_bin):
-    """The dose per grouped bin: the given one (per source bin, so times wave_bin), checked against the open-beam
-    estimate, else the estimate, else the dose an HDF5 input records (per file column, times wave_bin)."""
+    """The dose per grouped bin: the given one (per source bin, so times the source bins in a grouped bin: wave_bin
+    times those in a column of a converted file), checked against the open-beam estimate, else the estimate, else the
+    dose an HDF5 input records (per file column, times wave_bin)."""
     if dose is None:
         return estimate if estimate is not None or src.file_dose is None else src.file_dose * wave_bin
-    dose = dose * wave_bin
+    dose = dose * wave_bin * src.file_wave_bin
     if estimate is not None and abs(dose - estimate) / estimate > 0.5:
         warnings.warn(f"the given dose {dose:.3g} differs from the open-beam estimate {estimate:.3g} by more than 50%")
     return dose

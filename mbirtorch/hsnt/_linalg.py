@@ -141,7 +141,8 @@ def _reseed_dead(W, H, rel_tol=1e-6):
 
     With its spectrum at zero the map gets no gradient, and a spectrum whose every bin has an outward gradient stays at
     zero, so the component contributes nothing from then on: a degenerate stationary point, which the first projected
-    step can reach from an ordinary start. A random rather than constant seed keeps the revived spectrum from being flat.
+    step can reach from an ordinary start. A random rather than constant seed keeps the revived spectrum from being
+    flat.
     """
     w = W.norm(dim=0)
     h = H.norm(dim=1)

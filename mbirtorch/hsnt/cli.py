@@ -34,7 +34,7 @@ from .io import _written_atomically
 from .loading import (INPUT_TYPES, InputError, _columns_in_range, _converted_path, _file_source_bins,
                       _selected_metadata, convert_to_hdf5, load_dataset)
 from .outputs import component_check, fit_quality, write_dehydrated, write_denoised
-from .rank import estimate_rank
+from .rank import _estimate_rank
 
 log = logging.getLogger("mbirtorch.hsnt")
 
@@ -197,13 +197,13 @@ def write_report(base, ds, rep, args, outputs):
 def _log_fit(rep, args):
     comp = rep["components"]
     if comp["proportional_pairs"]:
-        i, j, corr = max(comp["proportional_pairs"], key=lambda p: p[2])
-        log.warning("components %d and %d have nearly proportional maps (correlation %.2f; %d such pair(s)): the data "
-                    "cannot tell their spectra apart, so each row of H is an arbitrary noisy slice of their sum. The "
-                    "rank is probably above the number of distinct materials; %s. The mean-pixel spectrum in the "
-                    "outputs is unaffected.", i, j, corr, len(comp["proportional_pairs"]),
-                    "the estimate chose it" if args.rank_detail else "run without --rank to estimate it")
-    log.info("components: max map correlation %.2f; per-row noise (relative to level) %s", comp["max_map_correlation"],
+        i, j, cos = max(comp["proportional_pairs"], key=lambda p: p[2])
+        log.warning("components %d and %d have nearly proportional spectra (cosine %.4f; %d such pair(s)): the data "
+                    "do not fix how that spectral shape is split between their maps, so a smaller rank describes the "
+                    "data as well%s. The mean-pixel spectrum in the outputs is unaffected.", i, j, cos,
+                    len(comp["proportional_pairs"]), "" if args.rank_detail else "; run without --rank to estimate it")
+    log.info("components: max spectral cosine %.3f, max map correlation %.2f; per-row noise (relative to level) %s",
+             comp["max_spectral_cosine"], comp["max_map_correlation"],
              ", ".join(f"{x:.3f}" for x in comp["row_noise_rel"]))
     q = rep["fit"]
     if "reduced_chi2" not in q:
@@ -235,8 +235,8 @@ def cmd_inspect(args):
     for c in ds.checks:
         print(f"  [{c.level:5s}] {c.message}")
     if args.estimate_rank:
-        _, note, d = estimate_rank(ds.T, ds.spatial_shape, _device(args.device), max_rank=args.max_rank,
-                                   pool=args.rank_pool)
+        _, note, d = _estimate_rank(ds.T, ds.spatial_shape, _device(args.device), max_rank=args.max_rank,
+                                    pool=args.rank_pool)
         gains = ", ".join(f"{r}: {g:,.0f}" for r, g in zip(range(2, d["max_rank"] + 1), d["gains"]))
         print(f"  {note}; effective dose {d['effective_dose']:.3g}; gains by component (deciding test): {gains}; "
               f"threshold {d['threshold']:,.0f}")
@@ -266,8 +266,8 @@ def cmd_convert(args):
 def _resolve_rank(ds, args, device):
     """Set args.rank_value, args.rank_note and args.rank_detail from --rank N or the likelihood-ratio estimate."""
     if args.rank == "auto":
-        args.rank_value, args.rank_note, args.rank_detail = estimate_rank(ds.T, ds.spatial_shape, device,
-                                                                          max_rank=args.max_rank, pool=args.rank_pool)
+        args.rank_value, args.rank_note, args.rank_detail = _estimate_rank(ds.T, ds.spatial_shape, device,
+                                                                           max_rank=args.max_rank, pool=args.rank_pool)
         log.info("%s; pass --rank N to override", args.rank_note)
     else:
         args.rank_value, args.rank_note, args.rank_detail = args.rank, f"rank {args.rank} given", None
@@ -277,12 +277,12 @@ def _pipeline(args, denoise):
     """load, checks, rank, solve, fit quality and outputs, for dehydrate and denoise."""
     ds = _load(args)
     device = _device(args.device)
-    _resolve_rank(ds, args, device)
     stem = os.path.splitext(os.path.basename(os.path.normpath(args.input)))[0]
     base = os.path.splitext(_output_path(args.output, stem + ".h5"))[0]
     names = (([] if denoise and args.no_dehydrated else ["_dehydrated.h5"]) + (["_denoised.h5"] if denoise else [])
              + ["_report.json"] + ([] if args.no_plots else ["_spectra.png", "_maps.png"]))
     _check_outputs([base + n for n in names], [args.input, *(args.open_beam or [])], args.overwrite)
+    _resolve_rank(ds, args, device)
     if args.dry_run:
         plan_memory(ds, device, args.mode, args.chunk_pixels, args.spectra)
         print(f"dry run: data loaded and checked, {args.rank_note}; no solve. Output base: {base}")
@@ -382,7 +382,7 @@ _EXAMPLES = """Examples:
 Each subcommand's -h lists the options most runs need; --help-all lists every option.
 """
 
-_SPECTRA_HELP = ("how the material spectra are estimated. mle (default): the spectra that best fit the measured "
+_SPECTRA_HELP = ("how the component spectra are estimated. mle (default): the spectra that best fit the measured "
                  "counts. unconstrained: removes a bias the best fit has at low dose; worth it from about 100,000 "
                  "pixels up. support: works out which components each pixel contains, which removes the same bias "
                  "and zeroes the background of the maps; needs the dose (an open beam or --dose)")
@@ -460,15 +460,15 @@ class _Options:
         self.rank_test(sp)
         g = sp.add_argument_group("advanced: support selection")
         self.add(g, "--support-penalty", type=_penalty_arg, default="auto", metavar="auto|F", advanced=True,
-                 help="charge per selected material, F x log(bins) nats, or 'auto' (default), which moves from 0.5 "
-                      "to 2 with the counts per pixel and bin: 2 admits essentially no absent material, 0.5 keeps "
-                      "a faint material in more of its pixels at low counts")
+                 help="charge per selected component, F x log(bins) nats, or 'auto' (default), which moves from 0.5 "
+                      "to 2 with the counts per pixel and bin: 2 admits essentially no absent component, 0.5 keeps "
+                      "a faint component in more of its pixels at low counts")
         self.add(g, "--free-refit", action="store_true", advanced=True,
                  help="drop the bound on the selected coefficients during the refit, then re-solve W >= 0 on the "
                       "supports")
         self.add(g, "--wald-screen", type=_nonneg_float, default=0.0, metavar="F", advanced=True,
-                 help="skip single-material fits below F x penalty of Wald statistic in the full fit (0 = off; "
-                      "trades rare-material recall for time)")
+                 help="skip single-component fits below F x penalty of Wald statistic in the full fit (0 = off; "
+                      "trades rare-component recall for time)")
         g = sp.add_argument_group("advanced: solver")
         self.add(g, "--max-steps", type=_positive_int, default=1000, advanced=True,
                  help="largest number of solver steps in a full solve (default 1000)")
@@ -549,9 +549,9 @@ def build_parser(show_all=False):
     return p
 
 
-def _is_out_of_memory(e):
+def _is_device_out_of_memory(e):
     torch = sys.modules.get("torch")
-    return isinstance(e, MemoryError) or (torch is not None and isinstance(e, torch.cuda.OutOfMemoryError))
+    return torch is not None and isinstance(e, torch.cuda.OutOfMemoryError)
 
 
 def main(argv=None):
@@ -578,11 +578,10 @@ def main(argv=None):
     except Exception as e:          # input and resource errors become one line; anything else is a bug and tracebacks
         if level <= logging.DEBUG:
             raise
-        if _is_out_of_memory(e):
-            raise SystemExit(f"error: out of memory ({str(e).splitlines()[0] if str(e) else type(e).__name__}): "
-                             "try --mode stream or a smaller --chunk-pixels, --downsample or --wave-bin, or --device "
-                             "cpu") from None
-        if isinstance(e, (InputError, OSError)):
+        if _is_device_out_of_memory(e):
+            raise SystemExit(f"error: the device ran out of memory ({str(e).splitlines()[0]}): try --mode stream or a "
+                             "smaller --chunk-pixels, --downsample or --wave-bin, or --device cpu") from None
+        if isinstance(e, (InputError, OSError, MemoryError)):
             raise SystemExit(f"error: {e}") from None
         raise
     finally:

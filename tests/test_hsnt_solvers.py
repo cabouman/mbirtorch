@@ -146,17 +146,20 @@ def test_solves_from_nearby_starts_stop_at_the_same_point(dev):
 
 
 def test_rank_estimate_finds_the_rank_with_pooling_and_near_max_rank(dev):
-    """The sphere phantom has rank 3 at full resolution and pooled; with the true rank one below max_rank a real
-    component is among the last three gains, and it must not raise the noise floor and collapse the estimate."""
-    n, _, detail = hsnt.estimate_rank(_sphere_problem(dev), (1, 48, 48), dev, max_rank=5, pool=2)
+    """The sphere phantom has rank 3 at full resolution and pooled, given as transmission or as attenuation; with the
+    true rank one below max_rank a real component is among the last three gains, and it must not raise the noise floor
+    and collapse the estimate."""
+    T = _sphere_problem(dev).reshape(48, 48, -1)
+    n, _, detail = hsnt.estimate_rank(T, "transmission", max_rank=5, device=dev, pool=2)
     assert n == 3 and detail["rank_full"] == 3 and detail["pool_block"] == 2 and detail["pooled"]["pixels"] == 24 * 24
+    assert hsnt.estimate_rank(-torch.log(T), max_rank=5, device=dev, pool=2)[0] == 3             # attenuation
     rng = np.random.default_rng(0)
     P, K, R = 2000, 300, 5
     x = np.linspace(0, 1, K)
     H = np.stack([0.1 + 0.9 * np.exp(-((x - (r + 0.5) / R) / (0.6 / R)) ** 2) for r in range(R)])
     W = rng.dirichlet(np.full(R, 0.5), P) * rng.uniform(0.3, 2.0, (P, 1))
     T = (rng.poisson(50.0 * np.exp(-W @ H)) / 50.0).astype(np.float32)
-    rank, _, detail = hsnt.estimate_rank(T, device=dev, max_rank=6)
+    rank, _, detail = hsnt.estimate_rank(T, "transmission", max_rank=6, device=dev)
     assert rank == R and detail["full"]["noise_tail"]
 
 

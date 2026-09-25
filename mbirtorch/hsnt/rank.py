@@ -69,8 +69,12 @@ def _subsample(T, n):
     return np.ascontiguousarray(T[rows], dtype=np.float32)
 
 
-def estimate_rank(T, spatial_shape=None, device=None, max_rank=6, subsample=16384, pool="auto", verbose=0):
-    """Choose the rank by sequential likelihood-ratio tests, at full resolution and on spatially pooled pixels.
+def estimate_rank(data, dataset_type="attenuation", max_rank=6, device=None, pool="auto", verbose=0):
+    """Estimate the number of components of a hyperspectral dataset, the rank dehydrate uses when num_materials is
+    not given, by sequential likelihood-ratio tests at full resolution and on spatially pooled pixels.
+
+    The data are taken as :func:`~mbirtorch.hsnt.dehydrate` takes them: the spectral axis last and any leading axes;
+    when those are (views, rows, cols) or (rows, cols), blocks of neighboring pixels are also pooled.
 
     Ranks 1 to max_rank are fitted in turn. The loss gain of each added component is converted to log-likelihood
     units with a dose calibrated from the residual of the most flexible fit (the mean of (T - e^-X)^2 / e^-X is
@@ -86,17 +90,15 @@ def estimate_rank(T, spatial_shape=None, device=None, max_rank=6, subsample=1638
     returned: over-estimating the rank costs little, under-estimating it caps the fit.
 
     Args:
-        T (numpy.ndarray or torch.Tensor): Transmission ratio, shape (pixels, bins).
-        spatial_shape (tuple, optional): (views, rows, cols) of the pixels, needed for pooling. Defaults to None,
-            which disables pooling.
-        device (str, optional): Torch device for the solves. Defaults to None, meaning CUDA if available, else CPU.
+        data (numpy.ndarray or torch.Tensor): Hyperspectral data with any leading axes and the spectral axis last.
+        dataset_type (str, optional): 'attenuation' or 'transmission'. Defaults to 'attenuation'.
         max_rank (int, optional): Largest rank considered. Defaults to 6.
-        subsample (int, optional): Pixels used by each test, a seeded random subset, at full resolution and after
-            pooling. Defaults to 16384.
+        device (str, optional): Torch device for the solves. Defaults to None, meaning CUDA if available, else CPU.
         pool (str or int, optional): Pooling block size. 'auto' (default) chooses the block from the calibrated dose so
-            that pooled pixels hold about 64 counts per bin, with at least about K / 2 pooled pixels and no pooling
-            above 64 counts per bin (pooled mixed pixels are not exactly low rank and would add spurious rank at high
-            dose). An integer fixes the block; 0 disables pooling.
+            that pooled pixels hold about 64 counts per bin, with blocks of at most ceil(sqrt(2 P / K)) pixels a side
+            (so about K / 2 pooled pixels, somewhat fewer after the rounding) and no pooling above 64 counts per bin
+            (pooled mixed pixels are not exactly low rank and would add spurious rank at high dose). An integer fixes
+            the block; 0 disables pooling.
         verbose (int, optional): 1 prints each search's gains and decision. Defaults to 0.
 
     Returns:
@@ -104,8 +106,18 @@ def estimate_rank(T, spatial_shape=None, device=None, max_rank=6, subsample=1638
         numbers ('full', and 'pooled' when pooling ran, each with gains, effective_dose and threshold; 'pool_block';
         'rank_full'; 'rank_pooled').
     """
+    from .denoise import _spatial_shape, _to_transmission
+    T, shape = _to_transmission(data, dataset_type)
+    return _estimate_rank(T, _spatial_shape(shape[:-1]), device, max_rank, pool=pool, verbose=verbose)
+
+
+def _estimate_rank(T, spatial_shape=None, device=None, max_rank=6, subsample=16384, pool="auto", verbose=0):
+    """estimate_rank on a (pixels, bins) transmission ratio whose pixels are in (views, rows, cols) order when
+    spatial_shape is given; subsample caps the pixels each test uses (a seeded random subset)."""
     device = _default_device(device)
     T_np = T.detach().cpu().numpy() if torch.is_tensor(T) else np.asarray(T)
+    if not bool((T_np > 0).any()):
+        raise ValueError("the data hold no counts: the transmission is zero everywhere")
     pixels, K = T_np.shape
     Tt = torch.from_numpy(_subsample(T_np, subsample)).to(device)
     rank_full, d_full = _lrt_rank(Tt, max_rank, "full resolution", verbose)

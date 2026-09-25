@@ -59,20 +59,21 @@ def fit_quality(T, W, H, dose=None, device="cpu", dose_per_bin=None, open_beam_o
     return out
 
 
-def component_check(W, H, corr_warn=0.8):
-    """Whether the components are distinguishable, from the correlation of their maps.
+def component_check(W, H, cos_warn=0.99):
+    """Whether the components are distinguishable, from the angle between their spectra.
 
-    When two maps are nearly proportional the data determine only the weighted sum of their spectra, so each row of H
-    is an arbitrary, noisy slice of it; on a one-material sample every extra component behaves so.
+    Two nearly proportional spectra split one spectral shape between two maps in a proportion the data do not fix; on a
+    one-material sample fitted at rank 2 the spectra reach a cosine of 0.996. The maps of a correctly ranked, mixed
+    basis can correlate at 0.99 (the sphere phantom at rank 3), so the map correlation is reported but not used.
 
     Returns:
-        dict: 'max_map_correlation', 'proportional_pairs' (i, j, correlation) above corr_warn, and 'row_noise_rel',
-        each row's noise level from second differences relative to its median.
+        dict: 'max_map_correlation', 'max_spectral_cosine', 'proportional_pairs' (i, j, cosine) above cos_warn, and
+        'row_noise_rel', each row's noise level from second differences relative to its median.
     """
     W = np.asarray(W, dtype=np.float64)
     H = np.asarray(H, dtype=np.float64)
     R = H.shape[0]
-    out = dict(max_map_correlation=0.0, proportional_pairs=[], row_noise_rel=[])
+    out = dict(max_map_correlation=0.0, max_spectral_cosine=0.0, proportional_pairs=[], row_noise_rel=[])
     for h in H:
         level = float(np.median(h)) if np.median(h) > 0 else float(h.max()) or 1.0
         out["row_noise_rel"].append(float(np.std(np.diff(h, 2)) / np.sqrt(6) / level) if h.size > 3 else 0.0)
@@ -80,9 +81,12 @@ def component_check(W, H, corr_warn=0.8):
         return out
     C = np.nan_to_num(np.corrcoef(W.T))
     np.fill_diagonal(C, 0.0)
-    out["max_map_correlation"] = float(C.max())
-    out["proportional_pairs"] = [(i, j, round(float(C[i, j]), 3)) for i in range(R) for j in range(i + 1, R)
-                                 if C[i, j] > corr_warn]
+    Hn = H / np.maximum(np.linalg.norm(H, axis=1, keepdims=True), 1e-300)
+    S = Hn @ Hn.T
+    np.fill_diagonal(S, 0.0)
+    out["max_map_correlation"], out["max_spectral_cosine"] = float(C.max()), float(S.max())
+    out["proportional_pairs"] = [(i, j, round(float(S[i, j]), 4)) for i in range(R) for j in range(i + 1, R)
+                                 if S[i, j] > cos_warn]
     return out
 
 
