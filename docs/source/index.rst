@@ -13,7 +13,7 @@ MBIRTorch: High-performance tomographic reconstruction
 * Vectorized Coordinate Descent algorithm for fast, robust convergence :cite:`2024CV4SciencePoster`.
 * Automatic parameter selection, with fine-tuning using intuitive meta-parameters.
 * Support for Plug-and-Play prior models that can dramatically improve image quality :cite:`venkatakrishnan2013plug` :cite:`sreehari2016plug`.
-* 4D reconstruction of a moving object from a single continuous scan, using multi-agent consensus equilibrium (MACE) :cite:`mace4d` --- see :ref:`MACE4DDocs`.
+* 4D reconstruction of a moving object from a single continuous scan :cite:`mace4d`.
 * Modular, extensible, easy-to-use, object-oriented Python interface.
 * Fast, portable, seamless use on CPUs or GPUs through the use of PyTorch_.
 

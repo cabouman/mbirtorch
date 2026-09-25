@@ -55,8 +55,17 @@ extensions = [
     'sphinx.ext.viewcode',
     'sphinx_design',
     'sphinx_copybutton',
-    'sphinxext.opengraph'
+    'sphinxext.opengraph',
+    'matplotlib.sphinxext.plot_directive',
 ]
+
+# The geometry figures are drawn at build time by the scripts in figs/, so no
+# image files are stored.  Only the picture is shown: no source, no links.
+plot_include_source = False
+plot_html_show_source_link = False
+plot_html_show_formats = False
+plot_formats = [('png', 150)]
+plot_rcparams = {'savefig.bbox': 'tight'}
 
 
 # Warn on every cross-reference that fails to resolve.  Unresolved references otherwise
