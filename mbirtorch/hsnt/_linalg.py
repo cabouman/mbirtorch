@@ -136,17 +136,19 @@ def _joint_blocks(flat, rows, cols, rank, free, jitter):
 
 
 def _reseed_dead(W, H, rel_tol=1e-6):
-    """Re-seed any component that is zero in both factors, with small random values from a fixed generator.
+    """Re-seed any component whose map or spectrum is zero, both factors, with small random values from a fixed
+    generator. Returns (W, H, number re-seeded).
 
-    Its gradient is zero in both factors, so no Newton step can revive it; it is a degenerate stationary point. A
-    random rather than constant seed keeps the revived spectrum from being flat.
+    With its spectrum at zero the map gets no gradient, and a spectrum whose every bin has an outward gradient stays at
+    zero, so the component contributes nothing from then on: a degenerate stationary point, which the first projected
+    step can reach from an ordinary start. A random rather than constant seed keeps the revived spectrum from being flat.
     """
     w = W.norm(dim=0)
     h = H.norm(dim=1)
-    dead = (w <= rel_tol * w.max()) & (h <= rel_tol * h.max())
+    dead = (w <= rel_tol * w.max()) | (h <= rel_tol * h.max())
     n_dead = int(dead.sum())
     if n_dead == 0:
-        return W, H
+        return W, H, 0
     live = ~dead
     W = W.clone()
     H = H.clone()
@@ -155,7 +157,7 @@ def _reseed_dead(W, H, rel_tol=1e-6):
     g = torch.Generator(device=W.device).manual_seed(0)
     W[:, dead] = 1e-2 * w_ref * torch.rand(W.shape[0], n_dead, generator=g, dtype=W.dtype, device=W.device)
     H[dead] = 1e-2 * h_ref * torch.rand(n_dead, H.shape[1], generator=g, dtype=H.dtype, device=H.device)
-    return W, H
+    return W, H, n_dead
 
 
 def _attenuation_for_start(T):

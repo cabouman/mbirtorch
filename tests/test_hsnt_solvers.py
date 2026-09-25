@@ -11,7 +11,7 @@ import pytest
 import torch
 
 import mbirtorch.hsnt as hsnt
-from mbirtorch.hsnt import _newton
+from mbirtorch.hsnt import _linalg, _newton
 from mbirtorch.hsnt._loss import _nnal_prep, stable_nnal, stable_nnal_derivatives
 from mbirtorch.hsnt._streaming import _stream_factorization
 from mbirtorch.hsnt.factorization import _initial_factors, _nnal_factorization
@@ -89,6 +89,22 @@ def test_mle_fits_noisy_data_and_reaches_machine_precision_on_exact_data(dev):
     assert _loss(W, H, T) < 1e-8 * T.numel()
     with pytest.raises(ValueError, match="compile_mode"):
         _nnal_factorization(T, 3, compile_mode="default")
+
+
+def test_a_dead_component_is_revived(dev):
+    """A component whose spectrum or map is zero gets no gradient and would stay out of the fit; the solve re-seeds
+    it and reaches the loss of an ordinary start."""
+    T, _, _ = _problem(dev)
+    W0, H0 = _initial_factors(T, 3)
+    W_ref, H_ref, _ = _mle(T)
+    W0[:, 2] = 0
+    H0[2] = 0                                                                       # dead in both factors
+    W, H, _ = _nnal_factorization(T, 3, max_steps=200, rel_tol=1e-8, compile_mode="off", W_init=W0, H_init=H0)
+    assert H[2].norm() > 0 and abs(_loss(W, H, T) - _loss(W_ref, H_ref, T)) <= 1e-6 * _loss(W_ref, H_ref, T)
+    Wd, Hd = W_ref.clone(), H_ref.clone()
+    Hd[1] = 0                                                                       # only the spectrum dead
+    Wn, Hn, n = _linalg._reseed_dead(Wd, Hd)
+    assert n == 1 and Hn[1].min() > 0 and Wn[:, 1].min() > 0 and torch.equal(Hn[0], Hd[0])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
