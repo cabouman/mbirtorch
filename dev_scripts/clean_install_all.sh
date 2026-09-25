@@ -26,6 +26,11 @@ cd dev_scripts
 /bin/rm -rf "${TORCHINDUCTOR_CACHE_DIR:-$HOME/.mbirtorch/torch_cache}" &> /dev/null
 /bin/rm -rf "${TMPDIR:-/tmp}/torchinductor_$USER" "/tmp/torchinductor_$USER" &> /dev/null
 
+# Load conda's shell commands (conda activate / conda deactivate).  A
+# script runs in a new shell that `conda init` never set up, so these
+# functions are otherwise undefined.
+source "$(conda info --base)/etc/profile.d/conda.sh"
+
 # Create and activate new conda environment
 # First check if the target environment is active and deactivate if so
 
