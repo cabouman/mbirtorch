@@ -117,6 +117,43 @@ Each row below is a change to make in code that calls MBIRJAX.
        The same two arguments are added to ``ConeBeamModel``,
        ``MultiAxisParallelModel``, ``TranslationModel`` and
        ``TomographyModel``.
+   * - ``hsnt.dehydrate(data, num_materials=3, safety_factor=2)``
+     - ``hsnt.dehydrate(data, num_materials=3)``
+     - ``dehydrate`` now fits the Poisson likelihood of the counts, with a
+       basis of rank ``num_materials`` rather than
+       ``safety_factor * num_materials``, and estimates the rank when it is
+       not given.  The scikit-learn NMF has no counterpart in MBIRTorch; its
+       keywords (``safety_factor``, ``beta_loss``, ``max_iter``,
+       ``tolerance``, ``batch_size``, ``random_state``) raise a
+       ``TypeError``.  The arguments after ``num_materials`` are keyword
+       only.  ``mode`` and ``chunk_pixels`` bound the memory, as
+       ``batch_size`` did, ``max_passes`` sets the streamed solve's polish
+       passes, and ``verbose=2`` prints the rank search rather than plotting
+       it.  ``subspace_basis`` keeps its meaning: only
+       the maps are fitted, for the given spectra, which are always held
+       fixed (MBIRJAX refitted them for data of up to 2**27 entries).  The
+       rank is the basis's number of rows, so leave out ``num_materials`` (a
+       different value raises a ``ValueError``).  The same holds for
+       ``mbirtorch.dehydrate``.  See :ref:`HSNTDocs`.
+   * - ``hsnt.hyper_denoise(data, num_materials=3, safety_factor=2)``
+     - ``hsnt.hyper_denoise(data, num_materials=3)``
+     - As for ``dehydrate``; a fourth positional argument (MBIRJAX's
+       ``safety_factor``) raises a ``TypeError``.
+   * - ``hsnt.generate_hyper_data(material_basis, ...)``
+     - ``hsnt.generate_hyper_data(material_basis, ..., noisy=True)``
+     - The open beam is noiseless and the transmission is floored at 1e-30
+       rather than 1e-8, so a seed gives different data.  ``noisy=False``
+       (keyword only) returns the noiseless data.
+   * - ``hsnt.generate_hyper_data(material_basis, detector_rows, detector_columns, dosage_rate, material_thickness)``
+       (MBIRJAX 0.6.11 to 0.6.15)
+     - ``hsnt.generate_hyper_data(material_basis, num_angles, detector_rows, detector_columns, dosage_rate, material_density)``
+     - ``material_thickness`` is gone and ``num_angles`` comes second.
+       ``material_density`` is a volume fraction that scales a rounded bar
+       about 10 thick at its center, not a thickness, so thickness values do
+       not carry over (the defaults 2, 2, 10 became 0.2, 0.2, 1).  The result
+       is ``[noisy, angles, truth]`` of shape (views, rows, columns, bins),
+       not ``[noisy, truth]`` of shape (rows, columns, bins), as in MBIRJAX
+       from 0.6.16.
 
 These names exist in MBIRJAX and have no counterpart in MBIRTorch:
 ``get_platform``, ``get_device_platform``, ``memory_report``,
@@ -188,7 +225,8 @@ in MBIRJAX exists only as the 4D reconstruction model ``MACE4DModel``.  The prep
 subpackage adds ``preprocess.geometry_calibration`` for estimating detector offset and
 detector rotation from the data.  ``QGGMRFDenoiser`` adds ``denoise_stack`` for denoising a
 stack of volumes in batches, and ``TomographyModel`` adds ``project_points``, ``recon_slice_z``
-and ``nearest_recon_slice``.  Finally, the compiled projector kernels are cached under
-``~/.mbirtorch``, so compiled code is reused by later runs, and ``clear_cache`` empties that
-cache.  Both packages can spread one reconstruction across several GPUs, and
+and ``nearest_recon_slice``.  The ``hsnt`` module adds ``estimate_rank``,
+``load_material_basis`` and the ``mbirtorch-hsnt`` command line.  Finally, the compiled
+projector kernels are cached under ``~/.mbirtorch``, so compiled code is reused by later runs,
+and ``clear_cache`` empties that cache.  Both packages can spread one reconstruction across several GPUs, and
 :ref:`usr_multi_gpu` describes how MBIRTorch chooses the number of devices.
