@@ -249,13 +249,20 @@ def test_pixel_fits_meet_the_kkt_conditions(dev):
 
 def test_streaming_matches_the_full_solve(dev):
     """Streamed by chunks of pixels, the MLE, the unconstrained estimate and support selection (with either refit)
-    land within 1% of the loss of the solve held whole, and keep W >= 0."""
+    land within 1% of the loss of the solve held whole, and keep W >= 0. The MLE starts from pixels drawn across all
+    the chunks, so a leading chunk free of the sample does not keep it from the full solve's loss."""
     T, _, _ = _problem(dev, P=4096)
     tiles = [T[i:i + 1024].cpu() for i in range(0, 4096, 1024)]
     Wm, Hm, _ = _mle(T)
     W_chunks, H, passes = _stream_factorization(tiles, 3, max_passes=3, rel_tol=1e-8, warmup_pixels=1024, device=dev)
     W = torch.cat([w.to(dev) for w in W_chunks])
     assert passes >= 1 and W.min() >= 0 and _loss(W, H, T) <= 1.01 * _loss(Wm, Hm, T)
+    open_beam = torch.tensor(np.random.default_rng(5).poisson(10.0, (1024, T.shape[1])) / 10.0, dtype=T.dtype)
+    T2 = torch.cat([open_beam.to(dev), T])
+    W_chunks, H, _ = _stream_factorization([open_beam] + tiles, 3, max_passes=3, rel_tol=1e-8, warmup_pixels=1024,
+                                           device=dev)
+    Wm2, Hm2, _ = _mle(T2)
+    assert _loss(torch.cat([w.to(dev) for w in W_chunks]), H, T2) <= (1 + 1e-4) * _loss(Wm2, Hm2, T2)
     W_chunks, H, _ = _stream_factorization(tiles, 3, max_passes=3, rel_tol=1e-8, warmup_pixels=1024, device=dev,
                                            nonneg_W=False)
     W = torch.cat([w.to(dev) for w in W_chunks])

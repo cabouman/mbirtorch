@@ -120,7 +120,8 @@ def _fit(T, rank, spectra="mle", dose=None, penalty="auto", free_refit=False, wa
                                                     warmup_pixels=min(warmup_pixels, P), device=device,
                                                     verbose=int(log.isEnabledFor(logging.DEBUG)), stats=stats,
                                                     nonneg_W=(spectra != "unconstrained"), support_selection=support,
-                                                    compile_mode="on" if compile_mode == "on" else "off")
+                                                    compile_mode="on" if compile_mode == "on" else "off",
+                                                    chunk_sizes=[c.shape[0] for c in chunks])
         W = torch.cat(W_chunks)
         rep.update(passes=int(passes), loss_per_pass=stats.get("loss"), kkt_per_pass=stats.get("kkt"))
         Td = None

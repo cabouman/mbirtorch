@@ -394,7 +394,7 @@ def _pipeline(args, denoise):
     if not args.no_plots:
         from .plots import plot_factorization
         outputs += plot_factorization(base, ds.source, W.reshape(*ds.spatial_shape, R), H, ds.bin_indices,
-                                      max_views=_MAX_PLOTTED_VIEWS)
+                                      max_views=_MAX_PLOTTED_VIEWS, wavelengths=ds.metadata.get("wavelengths"))
         log.info("wrote %s and %s", *outputs[-2:])
         write_report(base, ds, rep, args, outputs)
     n_err = sum(c.level == "error" for c in ds.checks)
@@ -492,17 +492,20 @@ class _Options:
         group.add_argument(*flags, **kw)
 
     def input(self, sp):
-        sp.add_argument("input", help="HDF5 file (hsnt layout) or a directory with one TIFF per wavelength bin")
+        sp.add_argument("input", help="HDF5 file (hsnt layout), a directory with one TIFF per wavelength bin, or a "
+                        "directory of such directories, one per view")
         g = sp.add_argument_group("input")
         self.add(g, "--open-beam", nargs="+", metavar="DIR", help="open-beam TIFF stack(s), needed when the TIFFs "
-                 "hold counts; a directory of observation subdirectories is averaged over them")
+                 "hold counts, and shared by all views; a directory of observation subdirectories is averaged over "
+                 "them")
         self.add(g, "--dose", type=_positive_float, metavar="D",
                  help="open-beam counts per pixel and source bin, when no open beam or converted file gives it")
         self.add(g, "--input-type", choices=("auto",) + INPUT_TYPES, default="auto",
                  help="what the values are (default: inferred)")
         self.add(g, "--dataset", metavar="GROUP", help="HDF5 group holding 'data' (default: found automatically)")
         g = sp.add_argument_group("selection")
-        self.add(g, "--views", metavar="A:B", help="views of 4-D HDF5 data (default: all)")
+        self.add(g, "--views", metavar="A:B", help="views of 4-D HDF5 data or of a directory of view directories "
+                 "(default: all)")
         self.add(g, "--wave-range", metavar="A:B", help="source wavelength bins (default: all)")
         self.add(g, "--wave-bin", type=_positive_int, default=1, metavar="N",
                  help="group N adjacent bins (counts are summed, transmissions averaged)")

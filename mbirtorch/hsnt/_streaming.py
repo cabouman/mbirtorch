@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 
 from . import _newton
@@ -35,14 +36,16 @@ _W_REL_TOL, _W_MAX_STEPS, _LS_TRIALS = 1e-8, 300, 4
 
 
 def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warmup_pixels=16384, device=None,
-                          compile_mode='off', verbose=0, stats=None, nonneg_W=True, support_selection=None):
+                          compile_mode='off', verbose=0, stats=None, nonneg_W=True, support_selection=None,
+                          chunk_sizes=None):
     """Factorize a dataset too large for device memory, one chunk of pixels at a time.
 
     W is separable over pixels, so it is solved chunk by chunk and never held whole on the device. H holds only R * K
     values, and its Newton step needs only sums over pixels (gradient, per-bin R x R Hessian, per-bin loss), which
     accumulate across chunks: one pass over the data gives one exact Newton step on H, and a second pass evaluates
-    its line search at a few step lengths at once. H starts from a joint-Newton fit on a subsample, so a handful of
-    passes polish it. The joint Newton solver is not streamed: each of its CG iterations would be a full pass.
+    its line search at a few step lengths at once. H starts from a joint-Newton fit on a random subsample of the
+    pixels, so a handful of passes polish it. The joint Newton solver is not streamed: each of its CG iterations would
+    be a full pass.
 
     Args:
         chunks (sequence of torch.Tensor): Chunks of the transmission ratio, each (pixels, bins), together making
@@ -51,7 +54,8 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
         max_passes (int, optional): Polish passes over the data; 0 keeps the subsample fit. Defaults to 5.
         rel_tol (float, optional): Stop when a pass changes the total loss by less than this, relatively.
             Defaults to 1e-6.
-        warmup_pixels (int, optional): Pixels from the leading chunks for the initial fit. Defaults to 16384.
+        warmup_pixels (int, optional): Pixels for the initial fit, a seeded random subset of all the chunks (each
+            chunk holding one is read for it). Defaults to 16384.
         device (str, optional): Torch device. Defaults to None, meaning CUDA if available, else CPU.
         compile_mode (str, optional): 'auto', 'on' or 'off', as for the in-memory solver, judged on one chunk.
             Defaults to 'off'.
@@ -66,6 +70,8 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
             polish loop then runs again with W confined to them. The supports are returned in
             stats['support_chunks'], the refit's losses in stats['loss_refit'] and stats['kkt_refit'].
             Defaults to None.
+        chunk_sizes (sequence of int, optional): The chunks' pixel counts, so that lazily loaded chunks need not be
+            read for them. Defaults to None, from the chunks.
 
     Returns:
         (W_chunks, H, passes): W as a list of CPU tensors aligned with the chunks, H, and the polish passes made.
@@ -76,13 +82,15 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
     R = num_materials
     W_chunks = [None] * len(chunks)
 
-    # H from a subsample of the leading chunks.
-    parts, n = [], 0
-    for c in chunks:
-        parts.append(c[: warmup_pixels - n])
-        n += parts[-1].shape[0]
-        if n >= warmup_pixels:
-            break
+    # H from a seeded random subsample spread over all the chunks: leading pixels alone can miss the sample.
+    sizes = np.array(chunk_sizes if chunk_sizes is not None else [c.shape[0] for c in chunks])
+    offsets = np.concatenate([[0], np.cumsum(sizes)])
+    picks = np.sort(np.random.default_rng(0).choice(offsets[-1], min(warmup_pixels, offsets[-1]), replace=False))
+    parts = []
+    for i, c in enumerate(chunks):
+        local = picks[(picks >= offsets[i]) & (picks < offsets[i + 1])] - offsets[i]
+        if local.size:
+            parts.append(c[torch.from_numpy(local).to(c.device)])
     T_sub = torch.cat(parts, 0).to(device)
     _, H, _ = _nnal_factorization(T_sub, R, max_steps=300, rel_tol=1e-6, compile_mode=compile_mode)
     del T_sub

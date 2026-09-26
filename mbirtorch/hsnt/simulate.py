@@ -4,7 +4,7 @@ from .denoise import rehydrate
 
 
 def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector_columns=64, dosage_rate=300,
-                        material_density=None, noisy=True, verbose=1):
+                        material_density=None, verbose=1, *, noisy=True):
     """
     Simulate noisy hyperspectral neutron attenuation data for :math:`N_m=3` materials (Ni, Cu, Al) and :math:`N_k` wavelength bins.
 
@@ -18,8 +18,8 @@ def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector
         detector_columns: Number of columns in the detector :math:`(N_c)`. Defaults to 64.
         dosage_rate: Neutron dosage rate during hyperspectral data collection. Defaults to 300.
         material_density: Material density (vol. fraction) for Ni, Cu, and Al. Defaults to {"Ni": 0.2, "Cu": 0.2, "Al": 1.0}.
-        noisy: Whether to generate noisy data. Defaults to True.
         verbose: Verbosity level. If 0, prints nothing; if 1, prints details; if >1, also generates plots. Defaults to 1.
+        noisy: Whether to generate noisy data (keyword only). Defaults to True.
 
     Returns:
         A list in the form [noisy_hyper_projection, angles, gt_hyper_projection].

@@ -1,12 +1,13 @@
 """Reading hyperspectral neutron data: TIFF stacks (with open beam) and hsnt HDF5 files, the data checks, and the
 streamed conversion to the hsnt HDF5 layout.
 
-A TIFF stack is a directory of one image per wavelength bin. A stack of counts needs an open-beam stack to become a
-transmission ratio; a stack or file that already holds transmissions or attenuations is used as is, and the type is
-inferred from the values unless given. Both formats are read through block readers that return bins k0:k1 as
-(views, rows, cols, bins) float32, and both the in-memory load and the conversion go a block of bins at a time. Two
-optional corrections apply per block: a smoothing of the open beam, and a background calibration that divides each
-detector tile's transmission by that of boxes free of the sample.
+A TIFF stack is a directory of one image per wavelength bin, or a directory of such directories, one per view. A stack
+of counts needs an open-beam stack, shared by the views, to become a transmission ratio; a stack or file that already
+holds transmissions or attenuations is used as is, and the type is inferred from the values unless given. Both
+formats are read through block readers that return bins k0:k1 as (views, rows, cols, bins) float32, and both the
+in-memory load and the conversion go a block of bins at a time. Two optional corrections apply per block: a smoothing
+of the open beam, and a background calibration that divides each detector tile's transmission by that of boxes free
+of the sample.
 """
 import json
 import logging
@@ -162,8 +163,16 @@ def _checks_from_summary(sm, spatial_shape, strict=False):
         c.append(Check("ok", f"background {'calibrated at conversion' if bg.get('recorded') else 'boxes'} "
                              f"({bg['name']}, {len(bg['boxes'])} box(es), {bg['tiles'][0]} x {bg['tiles'][1]} tile(s)) "
                              f"read T = {bg['factor_median']:.4f} (tiles "
-                             f"{', '.join(f'{x:.4f}' for x in bg['tile_medians'])}): each tile's data are divided by "
-                             "it, per bin, and the dose is the sample's"))
+                             f"{', '.join(f'{x:.4f}' for x in bg['tile_medians'])}"
+                             + (f"; views {min(bg['view_medians']):.4f} to {max(bg['view_medians']):.4f}"
+                                if bg.get("view_medians") else "")
+                             + "): each tile's data are divided by it, per view and bin, and the dose is the "
+                             + ("median view's" if bg.get("view_medians") else "sample's")))
+        spread = bg.get("view_medians")
+        if spread and max(spread) > 1.05 * min(spread):
+            c.append(Check("warn", f"the views' exposures differ ({min(spread):.3f} to {max(spread):.3f} of the open "
+                                   "beam's); each view is calibrated, but the dose, the chi-square and support "
+                                   "selection use the median view's"))
     elif bright > 1 + tol:
         c.append(Check("warn", f"the most transparent regions read T = {bright:.3f} (noise allows 1 +- {tol:.3f}): the "
                                "sample run and the open beam differ in exposure (or the open beam is low); calibrate "
@@ -256,18 +265,29 @@ def _open_beam_dirs(paths):
 
 
 class _TiffBlocks:
-    """Bins k0:k1 of a TIFF stack (one image per bin) as (1, rows, cols, k1 - k0) float32, decoded in parallel."""
+    """Bins k0:k1 of a TIFF stack (one image per bin) as (views, rows, cols, k1 - k0) float32, decoded in parallel. With
+    multi_view, a directory of view subdirectories, each such a stack with the same images, is read as the views (views
+    selects a range of them); otherwise one directory is one view."""
 
-    def __init__(self, directory, wave_range, downsample, workers, desc):
+    def __init__(self, directory, wave_range, downsample, workers, desc, views=None, multi_view=False):
         import tifffile
         files, subdirs = _tif_files(directory)
-        if files is None:
+        if files is None and not multi_view:
             raise InputError(f"{directory} holds only subdirectories ({len(subdirs)}); pass one of them, or pass the "
                              "parent as the open beam to average them")
-        self.files = files[slice(*wave_range)] if wave_range else files
+        dirs = [directory] if files is not None else subdirs
+        chosen = dirs[slice(*views)] if views else dirs
+        if not chosen:
+            raise InputError(f"--views {views[0]}:{views[1]} selects none of the {len(dirs)} view(s) in {directory}")
+        per_view = [files] if files is not None else [_tif_files(d)[0] for d in chosen]
+        counts = sorted({len(f) for f in per_view})
+        if len(counts) > 1:
+            raise InputError(f"the view directories of {directory} hold different numbers of images ({counts})")
+        self.view_files = [f[slice(*wave_range)] if wave_range else f for f in per_view]
+        self.files = self.view_files[0]
         if not self.files:
-            raise InputError(f"the wave range selects no files of the {len(files)} in {directory}")
-        self.first_index = files.index(self.files[0])
+            raise InputError(f"the wave range selects no files of the {counts[0]} in {directory}")
+        self.first_index = per_view[0].index(self.files[0])
         with tifffile.TiffFile(self.files[0]) as t:
             page = t.pages[0]
             self.full_shape, self.source_dtype = tuple(page.shape), str(page.dtype)
@@ -275,32 +295,38 @@ class _TiffBlocks:
             raise InputError(f"{self.files[0]}: expected a 2-D image per wavelength bin, got shape {self.full_shape}")
         self.downsample, self.workers, self.desc = downsample, workers, desc
         self.rows, self.cols = np.empty(self.full_shape, dtype=bool)[::downsample, ::downsample].shape
-        self.views = 1
+        self.views = len(self.view_files)
         self.file_type, self.file_dose, self.file_dose_per_bin, self.file_observations = None, None, None, 0
         self.file_wave_bin, self.file_background, self.file_smoothing = 1, None, None
         self.source_bins = self.first_index + np.arange(len(self.files))
         self.file_metadata = {}
         self.metadata = dict(files=len(self.files), first_file=os.path.basename(self.files[0]),
                              last_file=os.path.basename(self.files[-1]))
+        if files is None:
+            self.metadata["view_directories"] = [os.path.basename(d) for d in chosen]
 
     @property
     def bins(self):
         return len(self.files)
 
     def read(self, k0, k1, full=False):
-        """Bins k0:k1 as (1, rows, cols, bins) float32 at the sampled pixels, or with full at full resolution and not
-        copied into that order (the images stay contiguous)."""
+        """Bins k0:k1 as (views, rows, cols, bins) float32 at the sampled pixels, or with full at full resolution and
+        not copied into that order (the images stay contiguous)."""
         import tifffile
-        sel = self.files[k0:k1]
-        arr = tifffile.imread(sel[0])[None] if len(sel) == 1 else tifffile.imread(sel, ioworkers=self.workers,
-                                                                                   maxworkers=1)
-        if arr.ndim != 3 or tuple(arr.shape[1:]) != self.full_shape:
-            raise InputError(f"{self.desc}: images {k0}..{k1 - 1} have shape {arr.shape[1:]}, the first image "
-                             f"{self.full_shape}")
+        stack = []
+        for files in self.view_files:
+            sel = files[k0:k1]
+            arr = tifffile.imread(sel[0])[None] if len(sel) == 1 else tifffile.imread(sel, ioworkers=self.workers,
+                                                                                       maxworkers=1)
+            if arr.ndim != 3 or tuple(arr.shape[1:]) != self.full_shape:
+                raise InputError(f"{self.desc}: images {k0}..{k1 - 1} have shape {arr.shape[1:]}, the first image "
+                                 f"{self.full_shape}")
+            stack.append(arr)
+        arr = stack[0][None] if len(stack) == 1 else np.stack(stack)                  # (views, bins, rows, cols)
         if full:
-            return np.moveaxis(arr.astype(np.float32, copy=False), 0, -1)[None]
-        arr = arr[:, ::self.downsample, ::self.downsample]
-        return np.ascontiguousarray(np.moveaxis(arr, 0, -1), dtype=np.float32)[None]
+            return np.moveaxis(arr.astype(np.float32, copy=False), 1, -1)
+        arr = arr[:, :, ::self.downsample, ::self.downsample]
+        return np.ascontiguousarray(np.moveaxis(arr, 1, -1), dtype=np.float32)
 
     def close(self):
         pass
@@ -411,7 +437,7 @@ def _open_source(path, dataset, views, wave_range, downsample, workers, open_bea
     if not os.path.exists(path):
         raise FileNotFoundError(f"input not found: {path}")
     if os.path.isdir(path):
-        src = _TiffBlocks(path, wave_range, downsample, workers, desc="sample")
+        src = _TiffBlocks(path, wave_range, downsample, workers, desc="sample", views=views, multi_view=True)
     elif path.lower().endswith((".h5", ".hdf5", ".hdf")):
         if open_beam:
             warnings.warn("the open beam is ignored for HDF5 input")
@@ -580,9 +606,9 @@ def _read_block(src, obs, itype, k0, k1, downsample, smoothing, background):
     if not obs:
         return a, None, box_a, None, None
     if not smoothing and background is None:
-        return a, _open_beam_mean(obs, k0, k1), box_a, None, None
+        return a, _for_views(_open_beam_mean(obs, k0, k1), src.views), box_a, None, None
     ob, first = None, []
-    n_var = min(k1 - k0, max(1, 2**18 // (src.views * int(np.prod(src.full_shape)))))   # bins measured per block
+    n_var = min(k1 - k0, max(1, 2**18 // int(np.prod(src.full_shape))))         # bins measured per block
     for o in obs:
         blk = o.read(k0, k1, full=True)
         if smoothing and len(obs) > 1:
@@ -593,7 +619,13 @@ def _read_block(src, obs, itype, k0, k1, downsample, smoothing, background):
         ob = _smooth_open_beam(ob, smoothing)
     box_ob = None if background is None else _box_sums(ob, background.boxes)
     variances = _smoothing_variances(np.stack(first), smoothing) if first else None
-    return a, np.ascontiguousarray(ob[:, ::downsample, ::downsample]).reshape(P, k1 - k0), box_a, box_ob, variances
+    ob = _for_views(np.ascontiguousarray(ob[:, ::downsample, ::downsample]).reshape(-1, k1 - k0), src.views)
+    return a, ob, box_a, box_ob, variances
+
+
+def _for_views(ob, views):
+    """The open beam of one view (pixels, bins) repeated for every view of the sample, which share it."""
+    return ob if views == 1 else np.tile(ob, (views, 1))
 
 
 def _tile_factors(box_a, box_ob, itype, wave_bin, background):
@@ -669,10 +701,13 @@ def _check_smoothing(width, obs):
 
 def _background_summary(background, factors, mean_factor):
     """What the calibration found, for the checks, the report and the converted file's attributes."""
-    return dict(name=background.name, boxes=[list(b) for b in background.boxes], tiles=list(background.tiles),
-                factor_median=float(np.median(mean_factor)),
-                tile_medians=[float(np.median(factors[:, t])) for t in range(factors.shape[1])],
-                factor_range=[float(factors.min()), float(factors.max())])
+    out = dict(name=background.name, boxes=[list(b) for b in background.boxes], tiles=list(background.tiles),
+               factor_median=float(np.median(mean_factor)),
+               tile_medians=[float(np.median(factors[:, t])) for t in range(factors.shape[1])],
+               factor_range=[float(factors.min()), float(factors.max())])
+    if factors.shape[0] > 1:
+        out["view_medians"] = [float(np.median(f)) for f in factors]
+    return out
 
 
 def _resolve_input_type(input_type, src, probe, open_beam):
@@ -842,7 +877,8 @@ def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=Non
     The stack is read in blocks of bins; memory holds the result and about memory_budget_mib of working set.
 
     Args:
-        path (str): A directory of one TIFF per wavelength bin, or an HDF5 file in the hsnt layout.
+        path (str): A directory of one TIFF per wavelength bin (or of such directories, one per view), or an HDF5
+            file in the hsnt layout.
         open_beam (list of str, optional): Open-beam TIFF stack(s) for a stack of counts; a directory of observation
             subdirectories is averaged over them. Defaults to None.
         input_type (str, optional): 'counts', 'transmission', 'attenuation' or 'auto' (the file's dataset_type, else
@@ -850,7 +886,8 @@ def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=Non
         dataset (str, optional): HDF5 group holding 'data'. Defaults to None: the root, or the only group with one.
         dose (float, optional): Open-beam counts per pixel and source bin, overriding the open-beam estimate and the
             dose an HDF5 input records; the loaded dose is per grouped bin, wave_bin times this. Defaults to None.
-        views (tuple, optional): (start, stop) of the views of 4-D HDF5 data. Defaults to None, all views.
+        views (tuple, optional): (start, stop) of the views of 4-D HDF5 data or of a directory of view directories.
+            Defaults to None, all views.
         wave_range (tuple, optional): (start, stop) over the source bins. Defaults to None, all bins.
         wave_bin (int, optional): Group this many adjacent bins. Defaults to 1.
         downsample (int, optional): Keep every n-th row and column. Defaults to 1.
@@ -952,11 +989,15 @@ def _bytes_per_bin(sample, n_obs, full=False):
 
 
 def _block_bins(sample, n_obs, wave_bin, budget_mib, requested, full=False):
-    """Bins per block: the largest multiple of wave_bin whose working set fits the budget."""
+    """Bins per block: the largest multiple of wave_bin whose working set fits the budget, and at least one group."""
     if requested:
         block = max(wave_bin, requested // wave_bin * wave_bin)
     else:
         per_bin = _bytes_per_bin(sample, n_obs, full)
+        if per_bin * wave_bin > budget_mib * 2**20:
+            warnings.warn(f"one group of {wave_bin} bin(s) of the {sample.views} view(s) needs about "
+                          f"{per_bin * wave_bin / 2**20:,.0f} MiB of working memory, more than the budget of "
+                          f"{budget_mib:g} MiB; use --views ranges or --downsample to stay within it")
         block = max(wave_bin, int(budget_mib * 2**20 // per_bin) // wave_bin * wave_bin)
     return min(block, sample.bins // wave_bin * wave_bin) or wave_bin
 

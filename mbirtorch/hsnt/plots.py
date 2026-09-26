@@ -11,17 +11,20 @@ def _short(source, n=60):
     """The basename of a source label ('path' or 'path:group'), keeping the group; a drive letter's colon is left
     alone because what follows it is a path."""
     head, sep, tail = source.rpartition(":")
-    if sep and tail and not any(c in tail for c in "/\\") and os.path.exists(head):
-        s = os.path.basename(head) + ":" + tail
+    if sep and tail.strip("/") and not any(c in tail.strip("/") for c in "/\\") and os.path.exists(head):
+        s = os.path.basename(head) + ":" + tail.strip("/")
+    elif sep and not tail.strip("/") and os.path.exists(head):
+        s = os.path.basename(head)                                  # the root group
     else:
         s = os.path.basename(source)
     return s if len(s) <= n else "..." + s[-n:]
 
 
-def plot_factorization(base, source, W4, H, bin_indices, max_views=4):
+def plot_factorization(base, source, W4, H, bin_indices, max_views=4, wavelengths=None):
     """Write <base>_spectra.png (the rows of H and the mean-pixel spectrum) and <base>_maps.png (the maps of at most
-    max_views views, evenly spaced). Uses matplotlib's object interface, so the caller's pyplot state and backend are
-    untouched.
+    max_views views, evenly spaced). The spectra are drawn against the wavelengths (Angstrom) when they are given as
+    one finite, increasing value per column of H, else against the source bin indices. Uses matplotlib's object
+    interface, so the caller's pyplot state and backend are untouched.
 
     Returns:
         list: the two paths.
@@ -32,22 +35,25 @@ def plot_factorization(base, source, W4, H, bin_indices, max_views=4):
     from .outputs import mean_pixel_spectrum
     R = H.shape[0]
     total, contrib, n_mat = mean_pixel_spectrum(W4.reshape(-1, R), H)
+    lam = None if wavelengths is None else np.asarray(wavelengths, dtype=np.float64)
+    use_lam = (lam is not None and lam.shape == (H.shape[1],) and bool(np.isfinite(lam).all())
+               and (lam.size < 2 or bool(np.all(np.diff(lam) > 0))))
+    x = lam if use_lam else bin_indices
     ncol = 2 if R > 5 else 1
     fig = Figure(figsize=(10, 8), layout="constrained")
     FigureCanvasAgg(fig)
     ax, ax2 = fig.subplots(2, 1, sharex=True)
     for r in range(R):
-        ax.plot(bin_indices, H[r], color=_COLORS[r % len(_COLORS)], lw=1.2, label=f"component {r}")
+        ax.plot(x, H[r], color=_COLORS[r % len(_COLORS)], lw=1.2, label=f"component {r}")
     ax.set_ylabel("attenuation per unit map value")
     ax.grid(alpha=0.3)
     ax.legend(fontsize=9, ncol=ncol)
     ax.set_title(f"rows of H, rank {R}: {_short(source)}\n(when maps are proportional, the split among rows is "
                  "arbitrary)", fontsize=11)
-    ax2.plot(bin_indices, total, color="black", lw=1.6, label=f"total, average of {n_mat:,} material pixels")
+    ax2.plot(x, total, color="black", lw=1.6, label=f"total, average of {n_mat:,} material pixels")
     for r in range(R):
-        ax2.plot(bin_indices, contrib[r], color=_COLORS[r % len(_COLORS)], lw=1.0, alpha=0.9,
-                 label=f"component {r} share")
-    ax2.set_xlabel("source wavelength index")
+        ax2.plot(x, contrib[r], color=_COLORS[r % len(_COLORS)], lw=1.0, alpha=0.9, label=f"component {r} share")
+    ax2.set_xlabel("wavelength (Angstrom)" if use_lam else "source wavelength index")
     ax2.set_ylabel("attenuation of the average material pixel")
     ax2.grid(alpha=0.3)
     ax2.legend(fontsize=9, ncol=ncol)

@@ -99,7 +99,8 @@ def test_input_types_are_inferred_and_tiffs_read_in_natural_order(stacks, tmp_pa
 
 def test_conversion_matches_the_direct_load(stacks, tmp_path, capsys):
     """TIFF counts with an open beam and HDF5 attenuation, converted in blocks below one --wave-bin group (one group
-    per block), give what load_dataset gives; the dose, source bins and open-beam observations are recorded."""
+    per block), give what load_dataset gives; the dose, source bins and open-beam observations are recorded. A
+    directory of view directories is read as the views, which share the open beam."""
     assert main(["inspect", stacks["sample"], "--open-beam", stacks["open_beam"], "-q"]) == 0
     out = capsys.readouterr().out
     assert "type counts" in out and f"x {K} bins" in out and "unknown" not in out.split("dose:")[1].split("\n")[0]
@@ -118,6 +119,21 @@ def test_conversion_matches_the_direct_load(stacks, tmp_path, capsys):
     back = load_dataset(conv)                                            # read back from the converted file
     assert back.dose == pytest.approx(recorded) and back.open_beam_observations == 2
     assert back.bin_indices.tolist() == list(range(0, K, 4)) and back.dose_per_bin.shape == (K // 4,)
+    views = tmp_path / "views"                                           # a directory of view directories
+    for v, counts in enumerate((stacks["counts"], stacks["counts"][::-1])):
+        (views / f"view_{v}").mkdir(parents=True)
+        for k in range(K):
+            tifffile.imwrite(views / f"view_{v}" / f"wave_idx_{k:05d}.tif", counts[:, :, k])
+    both = load_dataset(str(views), open_beam=[stacks["open_beam"]])
+    second = load_dataset(str(views / "view_1"), open_beam=[stacks["open_beam"]])
+    assert both.spatial_shape == (2, ROWS, COLS) and both.info["view_directories"] == ["view_0", "view_1"]
+    assert np.array_equal(both.T, np.concatenate([load_dataset(stacks["sample"], open_beam=[stacks["open_beam"]]).T,
+                                                  second.T]))
+    assert np.array_equal(load_dataset(str(views), open_beam=[stacks["open_beam"]], views=(1, 2)).T, second.T)
+    conv = str(tmp_path / "views.h5")
+    assert main(["convert", str(views), "--open-beam", stacks["open_beam"], "-o", conv, "--memory-budget", "0.01",
+                 "-q"]) == 0
+    assert hsnt.import_hsnt_data_hdf5(conv)[0].shape == (2, ROWS, COLS, K)
     conv = str(tmp_path / "h5h5.h5")                                     # attenuation in and out
     assert main(["convert", stacks["h5"], "-o", conv, "--wave-bin", "2", "--downsample", "2", "--memory-budget",
                  "0.01", "-q"]) == 0
@@ -293,7 +309,7 @@ def test_stream_mode_and_the_spectra_estimators_on_the_command_line(stacks, tmp_
     assert 0 < rep["mean_support_size"] <= R and rep["loss_final"] >= rep["loss_mle"] * (1 - 1e-9)
 
 
-def test_library_dehydrate_and_hyper_denoise(stacks):
+def test_library_dehydrate_and_hyper_denoise(stacks, capsys):
     with h5py.File(stacks["h5"]) as f:
         A = f["sample_dataset/data"][()]                                 # (1, ROWS, COLS, K) attenuation
     sub_data, basis, dtype = hsnt.dehydrate(A, "attenuation", num_materials=R, verbose=0)
@@ -311,8 +327,19 @@ def test_library_dehydrate_and_hyper_denoise(stacks):
     assert sup[0].shape == sub_data.shape and sup[0].min() >= 0
     with pytest.raises(ValueError, match="dose"):
         hsnt.dehydrate(A, num_materials=R, spectra="support", verbose=0)
+    capsys.readouterr()
+    streamed = hsnt.dehydrate(A, num_materials=R, mode="stream", chunk_pixels=40, max_passes=2, verbose=1)
+    assert "streamed, " in capsys.readouterr().out and streamed[0].shape == sub_data.shape
+    assert streamed[0].min() >= 0 and _relative_error(hsnt.rehydrate(streamed), X) < 0.35
+    with pytest.raises(ValueError, match="chunk_pixels"):
+        hsnt.dehydrate(A, num_materials=R, chunk_pixels=0, verbose=0)
+    phantom, _ = hsnt.load_material_basis()
+    noisy, _, truth = hsnt.generate_hyper_data(phantom, 1, 8, 8, 300, None, 0)     # the 7th argument is verbose
+    assert noisy.shape == truth.shape == (1, 8, 8, phantom.shape[1]) and np.abs(noisy - truth).max() > 1e-2
     maps, same, _ = hsnt.dehydrate(A, subspace_basis=basis, verbose=0)  # the maps of a given basis
     assert np.array_equal(same, basis) and np.abs(maps - sub_data).max() < 1e-3 * sub_data.max()
+    chunked = hsnt.dehydrate(A, subspace_basis=basis, mode="stream", chunk_pixels=40, verbose=1)[0]
+    assert "3 chunk(s)" in capsys.readouterr().out and np.abs(chunked - maps).max() < 1e-4 * maps.max()
     for bad in (dict(num_materials=R + 1), dict(spectra="support", dose=DOSE)):
         with pytest.raises(ValueError, match="subspace_basis"):
             hsnt.dehydrate(A, subspace_basis=basis, verbose=0, **bad)

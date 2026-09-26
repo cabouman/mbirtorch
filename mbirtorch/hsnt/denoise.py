@@ -59,8 +59,12 @@ def _to_transmission(data, dataset_type):
 
 def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_basis=None, spectra="mle", dose=None,
               penalty="auto", free_refit=False, max_steps=1000, rel_tol=1e-8, max_rank=6, device=None,
-              compile_mode="auto", verbose=1, **kwargs):
+              compile_mode="auto", mode="auto", chunk_pixels=None, max_passes=5, verbose=1, **kwargs):
     """Dehydrate a hyperspectral dataset by the maximum-likelihood factorization X = W H of its attenuation.
+
+    The dehydrated form [subspace_data, subspace_basis, dataset_type] and the dehydrate-and-rehydrate approach are
+    those of Chowdhury et al. (see :func:`~mbirtorch.hsnt.rehydrate`); the estimator here is the maximum-likelihood fit
+    of the counts rather than a least-squares NMF of the attenuation.
 
     The spectral axis must be the last axis; the leading axes are kept. The fit minimizes the non-negative
     attenuation loss sum[exp(-X) + T X] of the transmission T = exp(-attenuation), with W >= 0 and H >= 0. It is the
@@ -68,8 +72,9 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
     rank is the number of components; when it is not given it is estimated by likelihood-ratio tests
     (:func:`~mbirtorch.hsnt.estimate_rank`), which also pool pixels spatially when the leading axes are
     (views, rows, cols) or (rows, cols). The components are a nonnegative basis of the data, not necessarily the
-    pure materials. Data that do not fit the device are factorized by chunks of pixels; rel_tol is then the relative
-    loss change per pass over the chunks, max_steps does not apply, and compile_mode compiles only when 'on'.
+    pure materials. Data that do not fit the device (or with mode='stream') are factorized by chunks of pixels; rel_tol
+    is then the relative loss change per pass over the chunks, max_steps does not apply, and compile_mode compiles
+    only when 'on'.
 
     Given a subspace_basis, only the maps are fitted: each pixel's maximum-likelihood coefficients W >= 0 for those
     spectra, by chunks of pixels when the data do not fit the device; max_steps and rel_tol then apply to each chunk's
@@ -104,6 +109,11 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
         compile_mode (str, optional): 'auto' compiles the solver with torch.compile on CUDA for data of at least 5e8
             entries, where it pays; 'on' always; 'off' never. The rank estimate always runs uncompiled. Defaults to
             'auto'.
+        mode (str, optional): 'full' solves on the device at once, 'stream' by chunks of pixels, and 'auto' picks
+            from the memory the device has available. Defaults to 'auto'.
+        chunk_pixels (int, optional): Pixels per chunk when streamed. Defaults to None, from the available memory.
+        max_passes (int, optional): Polish passes over the data when streamed, after an initial fit on a random
+            subsample of the pixels; 0 keeps that fit. Defaults to 5.
         verbose (int, optional): 0 prints nothing; 1 prints a summary; 2 also prints the rank search. Defaults to 1.
 
     Returns:
@@ -120,14 +130,20 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
     from ._fit import _fit
     from .rank import _estimate_rank
     _reject_unknown_keywords("dehydrate", kwargs)
+    if mode not in ("auto", "full", "stream"):
+        raise ValueError(f"mode must be 'auto', 'full' or 'stream', got {mode!r}")
+    if chunk_pixels is not None and int(chunk_pixels) < 1:
+        raise ValueError(f"chunk_pixels must be a positive number of pixels, got {chunk_pixels}")
+    if int(max_passes) < 0:
+        raise ValueError(f"max_passes must be at least 0, got {max_passes}")
     T, shape = _to_transmission(data, dataset_type)
     device = _default_device(device)
     lead = shape[:-1]
     if subspace_basis is not None:
         from ._fit import _fit_fixed_basis
         H = _check_basis(subspace_basis, shape[-1], num_materials, spectra)
-        W, H, rep = _fit_fixed_basis(T, H, device=device, max_steps=max_steps, rel_tol=rel_tol,
-                                     compile_mode=compile_mode)
+        W, H, rep = _fit_fixed_basis(T, H, device=device, mode=mode, chunk_pixels=chunk_pixels, max_steps=max_steps,
+                                     rel_tol=rel_tol, compile_mode=compile_mode)
         if verbose >= 1:
             print("dehydrate(): ")
             print("   -Spectral dimension: ", shape[-1], " -> rank: ", H.shape[0], "(the given subspace_basis)")
@@ -138,7 +154,8 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
         num_materials, note, _ = _estimate_rank(T, spatial_shape=_spatial_shape(lead), device=device, max_rank=max_rank,
                                                 verbose=max(0, verbose - 1))
     W, H, rep = _fit(T, int(num_materials), spectra=spectra, dose=dose, penalty=penalty, free_refit=free_refit,
-                     device=device, max_steps=max_steps, rel_tol=rel_tol, compile_mode=compile_mode)
+                     device=device, mode=mode, chunk_pixels=chunk_pixels, max_steps=max_steps, rel_tol=rel_tol,
+                     max_passes=int(max_passes), compile_mode=compile_mode)
     subspace_data = W.reshape(*lead, int(num_materials))
     if verbose >= 1:
         solve = f"{rep['steps']} steps" if "steps" in rep else f"streamed, {rep['passes']} polish passes"
@@ -163,16 +180,26 @@ def _check_basis(subspace_basis, bins, num_materials, spectra):
 
 
 def hyper_denoise(data, dataset_type="attenuation", num_materials=None, **kwargs):
-    """Denoise a hyperspectral dataset by dehydration and rehydration.
+    """Denoise a hyperspectral dataset by dehydration and rehydration, the approach of Chowdhury et al. (see
+    :func:`~mbirtorch.hsnt.rehydrate`), with the maximum-likelihood fit of :func:`~mbirtorch.hsnt.dehydrate`.
 
     Args:
         data (numpy.ndarray or torch.Tensor): Hyperspectral data with the spectral axis last.
         dataset_type (str, optional): 'attenuation' or 'transmission'. Defaults to 'attenuation'.
         num_materials (int, optional): Rank of the factorization. Defaults to None, which estimates it.
-        **kwargs: The other arguments of :func:`~mbirtorch.hsnt.dehydrate`.
+        **kwargs: The keyword arguments of :func:`~mbirtorch.hsnt.dehydrate`, which it documents: subspace_basis,
+            spectra, dose, penalty, free_refit, max_steps, rel_tol, max_rank, device, compile_mode, mode,
+            chunk_pixels, max_passes and verbose.
 
     Returns:
         numpy.ndarray: The rank-:math:`N_m` fit, with the shape of the input and the input's dataset_type, float32.
+
+    Example:
+        >>> denoised = hyper_denoise(data, dataset_type="transmission")            # rank estimated
+        >>> denoised = hyper_denoise(data, dataset_type="transmission", num_materials=3, spectra="unconstrained",
+        ...                          verbose=0)
+        >>> denoised.shape == data.shape
+        True
     """
     _reject_unknown_keywords("hyper_denoise", {k: v for k, v in kwargs.items() if k in _L2_KEYWORDS})
     return rehydrate(dehydrate(data, dataset_type=dataset_type, num_materials=num_materials, **kwargs))
