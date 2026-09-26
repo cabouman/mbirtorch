@@ -12,7 +12,7 @@ import torch
 
 import mbirtorch.hsnt as hsnt
 from mbirtorch.hsnt.cli import main
-from mbirtorch.hsnt.loading import _tif_names, infer_input_type, load_dataset
+from mbirtorch.hsnt.loading import _smoothing_kernel, _tif_names, infer_input_type, load_dataset
 from mbirtorch.hsnt.outputs import component_check, fit_quality, mean_pixel_spectrum
 
 ROWS, COLS, K, R, DOSE = 12, 10, 40, 2, 50.0
@@ -110,6 +110,7 @@ def test_conversion_matches_the_direct_load(stacks, tmp_path, capsys):
     ds = load_dataset(stacks["sample"], open_beam=[stacks["open_beam"]], wave_bin=4, downsample=2)
     assert ds.T.shape == ((ROWS + 1) // 2 * ((COLS + 1) // 2), K // 4) and ds.open_beam_observations == 2
     assert meta["dataset_type"] == "transmission" and np.allclose(data.reshape(-1, K // 4), ds.T, atol=1e-6)
+    assert not any("--background-boxes" in c.message for c in ds.checks)          # matched exposures raise no alarm
     with h5py.File(conv) as f:
         assert f.attrs["block_bins"] == 4 and f["bin_indices"][()].tolist() == list(range(0, K, 4))
         assert f.attrs["open_beam_observations"] == 2 and abs(f.attrs["dose"] - ds.dose) / ds.dose < 0.05
@@ -160,6 +161,68 @@ def test_a_converted_file_keeps_its_dose_source_bins_and_metadata(tmp_path):
         assert f["bin_indices"][()].tolist() == [10, 12, 14, 16, 18]
 
 
+def test_background_boxes_calibrate_each_tile_and_the_open_beam_can_be_smoothed(tmp_path):
+    """A sample run whose exposure differs from the open beam's by tile reads T = 1 in every sample-free corner after
+    the calibration, and the dose becomes the sample's; transmission and attenuation files of several views, binned
+    and downsampled, are calibrated per view to their true transmission; the smoothed open beam is the Hamming-window
+    filter of the earlier preprocessing and counts as the observations over its variance reduction."""
+    from scipy.signal import convolve2d
+    rng = np.random.default_rng(3)
+    n, k, dose, exposure = 16, 12, 200.0, np.array([[1.15, 0.9], [1.1, 1.2]])
+    X = np.zeros((n, n, k))
+    X[4:12, 4:12] = rng.uniform(0.2, 1.0, (8, 8, k))                     # the sample, clear of the corners
+    f = np.kron(exposure, np.ones((n // 2, n // 2)))[:, :, None]
+    stacks = {"sample": rng.poisson(dose * f * np.exp(-X)), "ob/observation_01": rng.poisson(np.full(X.shape, dose)),
+              "ob/observation_02": rng.poisson(np.full(X.shape, dose))}
+    for name, counts in stacks.items():
+        (tmp_path / name).mkdir(parents=True)
+        for j, img in enumerate(np.moveaxis(counts.astype(np.float32), -1, 0)):
+            tifffile.imwrite(tmp_path / name / f"wave_idx_{j:05d}.tif", img)
+    sample, ob = str(tmp_path / "sample"), [str(tmp_path / "ob")]
+    boxes = [(0, 3, 0, 3), (0, 3, 13, 16), (13, 16, 0, 3), (13, 16, 13, 16)]
+    corners = [(slice(0, 3), slice(0, 3)), (slice(0, 3), slice(13, 16)), (slice(13, 16), slice(0, 3)),
+               (slice(13, 16), slice(13, 16))]
+    plain = load_dataset(sample, open_beam=ob)
+    ds = load_dataset(sample, open_beam=ob, background_boxes=boxes, background_tiles=(2, 2))
+    for c, e in zip(corners, exposure.ravel()):
+        assert abs(ds.T.reshape(n, n, k)[c].mean() - 1) < 0.02 and abs(plain.T.reshape(n, n, k)[c].mean() - e) < 0.04
+    assert any(c.level == "warn" and "--background-boxes" in c.message for c in plain.checks)
+    assert not any("--background-boxes" in c.message for c in ds.checks)
+    factor = ds.info["background"]["factor_median"]
+    assert ds.dose == pytest.approx(plain.dose * factor) and factor == pytest.approx(exposure.mean(), abs=0.02)
+    per_bin, (lo, hi) = ds.dose_per_bin / plain.dose_per_bin, ds.info["background"]["factor_range"]
+    assert abs(per_bin.mean() - exposure.mean()) < 0.02 and np.all((per_bin >= lo) & (per_bin <= hi))
+    assert ds.open_beam_observations == pytest.approx(2 / factor)       # dose x observations: the open beam's count
+    views = np.stack([np.exp(-X), np.exp(-X[::-1])]) * np.stack([f, f[::-1, ::-1] * 0.9])[..., None][..., 0]
+    truth = np.stack([np.exp(-X), np.exp(-X[::-1])])[:, ::2, ::2].reshape(2, n // 2, n // 2, k // 2, 2).mean(-1)
+    for kind, data in (("transmission", views), ("attenuation", -np.log(views))):
+        path = str(tmp_path / f"{kind}.h5")
+        hsnt.export_hsnt_data_hdf5(path, data.astype(np.float32), hsnt.create_hsnt_metadata(dataset_type=kind))
+        cal = load_dataset(path, background_boxes=boxes, background_tiles=(2, 2), wave_bin=2, downsample=2)
+        assert np.allclose(cal.T, truth.reshape(-1, k // 2), atol=1e-5)
+    smooth = load_dataset(sample, open_beam=ob, open_beam_smoothing=3)
+    h = np.sqrt(np.outer(np.hamming(3), np.hamming(3)))
+    mean_ob = (stacks["ob/observation_01"] + stacks["ob/observation_02"]) / 2
+    ref = np.stack([convolve2d(np.pad(mean_ob[:, :, j], 1, mode="reflect"), h / h.sum(), mode="valid")
+                    for j in range(k)], -1)
+    assert np.allclose(smooth.T, (stacks["sample"] / ref).reshape(-1, k), rtol=1e-5)
+    assert smooth.open_beam_observations == pytest.approx(2 / (_smoothing_kernel(3) ** 2).sum(), rel=0.2)
+    conv = str(tmp_path / "cal.h5")
+    assert main(["convert", sample, "--open-beam", *ob, "-o", conv, "--as-type", "transmission", "--background-boxes",
+                 *[f"{y0}:{y1},{x0}:{x1}" for y0, y1, x0, x1 in boxes], "--background-tiles", "2x2",
+                 "--open-beam-smoothing", "3", "--memory-budget", "0.01", "-q"]) == 0
+    both = load_dataset(sample, open_beam=ob, background_boxes=boxes, background_tiles=(2, 2), open_beam_smoothing=3)
+    back = load_dataset(conv)
+    assert np.allclose(back.T, both.T, atol=1e-6) and back.dose == pytest.approx(both.dose, rel=0.01)
+    assert back.open_beam_observations == pytest.approx(both.open_beam_observations, rel=0.2)
+    assert back.info["background"]["recorded"] and not any("--background-boxes" in c.message for c in back.checks)
+    for bad, match in ((["--background-boxes", "ornl-snap"], "512 x 512"),
+                       (["--background-boxes", "0:3,0:3", "--background-tiles", "2x2"], "hold no box"),
+                       (["--background-tiles", "2x2"], "need background"), (["--open-beam-smoothing", "4"], "odd")):
+        with pytest.raises(SystemExit, match=match):
+            main(["inspect", sample, "--open-beam", *ob, "-q"] + bad)
+
+
 def test_dehydrate_rehydrate_and_denoise_write_readable_outputs(stacks, tmp_path, capsys):
     out = str(tmp_path / "res")
     assert main(["dehydrate", stacks["h5"], "-o", out, "--dry-run", "-q"]) == 0          # a dry run writes nothing
@@ -185,6 +248,15 @@ def test_dehydrate_rehydrate_and_denoise_write_readable_outputs(stacks, tmp_path
     assert main(["rehydrate", deh, "-o", sub, "--wave-range", "5:15", "--as-type", "transmission", "-q"]) == 0
     part, meta = hsnt.import_hsnt_data_hdf5(sub)
     assert meta["dataset_type"] == "transmission" and np.allclose(part, np.exp(-(W4 @ H4[:, 5:15])), atol=1e-5)
+    fixed = str(tmp_path / "fixed")                                      # maps for the spectra of a fitted file
+    assert main(["dehydrate", stacks["h5"], "-o", fixed, "--basis", deh, "--dose", str(DOSE), "--no-plots", "-q"]) == 0
+    (W5, H5, _), _ = hsnt.import_hsnt_data_hdf5(os.path.join(fixed, "processed_dehydrated.h5"))
+    assert np.array_equal(H5, H4) and np.abs(W5 - W4).max() < 1e-3 * W4.max()
+    assert "from the basis" in _report(fixed, "processed")["result"]["rank_note"]
+    with pytest.raises(SystemExit, match="source bins"):
+        main(["dehydrate", stacks["h5"], "-o", fixed, "--basis", deh, "--wave-range", "0:20", "--overwrite", "-q"])
+    with pytest.raises(SystemExit, match="is an input"):                 # the basis is never replaced
+        main(["dehydrate", stacks["h5"], "-o", out, "--basis", deh, "--overwrite", "-q"])
     with pytest.raises(SystemExit, match="is an input"):
         main(["rehydrate", deh, "-o", deh, "--overwrite", "-q"])
     with pytest.raises(SystemExit, match="not a dehydrated file"):
@@ -239,6 +311,11 @@ def test_library_dehydrate_and_hyper_denoise(stacks):
     assert sup[0].shape == sub_data.shape and sup[0].min() >= 0
     with pytest.raises(ValueError, match="dose"):
         hsnt.dehydrate(A, num_materials=R, spectra="support", verbose=0)
+    maps, same, _ = hsnt.dehydrate(A, subspace_basis=basis, verbose=0)  # the maps of a given basis
+    assert np.array_equal(same, basis) and np.abs(maps - sub_data).max() < 1e-3 * sub_data.max()
+    for bad in (dict(num_materials=R + 1), dict(spectra="support", dose=DOSE)):
+        with pytest.raises(ValueError, match="subspace_basis"):
+            hsnt.dehydrate(A, subspace_basis=basis, verbose=0, **bad)
     with pytest.raises(TypeError, match="MBIRJAX"):
         hsnt.hyper_denoise(A, num_materials=R, safety_factor=2, verbose=0)          # the NMF's keywords are refused
 

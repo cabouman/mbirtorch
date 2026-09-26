@@ -124,9 +124,13 @@ Each row below is a change to make in code that calls MBIRJAX.
        ``safety_factor * num_materials``, and estimates the rank when it is
        not given.  The scikit-learn NMF has no counterpart in MBIRTorch; its
        keywords (``safety_factor``, ``beta_loss``, ``max_iter``,
-       ``tolerance``, ``batch_size``, ``subspace_basis``, ``random_state``)
-       raise a ``TypeError``.  The same holds for ``mbirtorch.dehydrate``.
-       See :ref:`HSNTDocs`.
+       ``tolerance``, ``batch_size``, ``random_state``) raise a
+       ``TypeError``.  ``subspace_basis`` keeps its meaning: only the maps
+       are fitted, for the given spectra, which are always held fixed (MBIRJAX
+       refitted them for data of up to 2**27 entries).  The rank is the
+       basis's number of rows, so leave out ``num_materials`` (a different
+       value raises a ``ValueError``).  The same holds for ``mbirtorch.dehydrate``.  See
+       :ref:`HSNTDocs`.
    * - ``hsnt.hyper_denoise(data, num_materials=3, safety_factor=2)``
      - ``hsnt.hyper_denoise(data, num_materials=3)``
      - As for ``dehydrate``.

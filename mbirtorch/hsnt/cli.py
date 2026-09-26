@@ -51,6 +51,33 @@ def _parse_slice(text, name):
     return (int(m.group(1)) if m.group(1) else None, int(m.group(2)) if m.group(2) else None)
 
 
+def _box_arg(text):
+    """One word of --background-boxes: a box 'Y0:Y1,X0:X1' in full-resolution pixels, or a preset name."""
+    if re.fullmatch(r"[a-z][a-z0-9-]*", text):
+        return text
+    m = re.fullmatch(r"(\d+):(\d+),(\d+):(\d+)", text.strip())
+    if not m:
+        raise argparse.ArgumentTypeError(f"expected a box Y0:Y1,X0:X1 or a preset name, got {text!r}")
+    return tuple(int(v) for v in m.groups())
+
+
+def _background_spec(words):
+    """The background_boxes argument from the words of --background-boxes: one preset name, or boxes."""
+    if not words:
+        return None
+    names = [w for w in words if isinstance(w, str)]
+    if names and len(words) > 1:
+        raise InputError(f"--background-boxes takes one preset name ({names[0]}) or boxes, not both")
+    return names[0] if names else list(words)
+
+
+def _tiles_arg(text):
+    m = re.fullmatch(r"(\d+)x(\d+)", text.strip().lower())
+    if not m or int(m.group(1)) < 1 or int(m.group(2)) < 1:
+        raise argparse.ArgumentTypeError(f"expected ROWSxCOLS, e.g. 2x2, got {text!r}")
+    return int(m.group(1)), int(m.group(2))
+
+
 def _rank_arg(text):
     if text.lower() == "auto":
         return "auto"
@@ -91,7 +118,9 @@ def _load(args, log_checks=True):
     ds = load_dataset(args.input, open_beam=args.open_beam, input_type=args.input_type, dataset=args.dataset,
                       dose=args.dose, views=_parse_slice(args.views, "views"),
                       wave_range=_parse_slice(args.wave_range, "wave-range"), wave_bin=args.wave_bin,
-                      downsample=args.downsample, strict=args.strict)
+                      downsample=args.downsample, strict=args.strict,
+                      background_boxes=_background_spec(args.background_boxes),
+                      background_tiles=args.background_tiles, open_beam_smoothing=args.open_beam_smoothing)
     log.info("loaded in %.1f s", ds.info["load_seconds"])
     for c in ds.checks if log_checks else []:
         getattr(log, {"ok": "info", "warn": "warning", "error": "error"}[c.level])("check: %s", c.message)
@@ -131,9 +160,52 @@ def _penalty_arg(text):
     return value
 
 
+def _load_basis(path, ds):
+    """The subspace_basis of a dehydrated file, checked like dehydrate's and against the loaded data's source bins and
+    background calibration."""
+    import h5py
+    from .denoise import _check_basis
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"--basis: file not found: {path}")
+    with h5py.File(path, "r") as f:
+        if not all(k in f for k in ("subspace_data", "subspace_basis", "dataset_type")):
+            raise InputError(f"--basis {path}: not a dehydrated file (needs subspace_data, subspace_basis and "
+                             "dataset_type)")
+        H = f["subspace_basis"][()]
+        has_bins = "bin_indices" in f
+        bins = _file_source_bins(f, H.shape[-1]) if H.ndim == 2 else None
+        background = f.attrs.get("background")
+    if has_bins and bins is not None and not np.array_equal(bins, ds.bin_indices):
+        raise InputError(f"--basis {path}: its spectra cover source bins {bins[0]}..{bins[-1]} ({len(bins)}), the "
+                         f"data {ds.bin_indices[0]}..{ds.bin_indices[-1]} ({ds.bins}); load the data with the same "
+                         "--wave-range and --wave-bin")
+    try:
+        H = _check_basis(H, ds.bins, None, "mle")
+    except ValueError as e:
+        raise InputError(f"--basis {path}: {e}") from None
+    if not has_bins:
+        warnings.warn(f"--basis {path} records no source bins; only its number of bins ({H.shape[1]}) is checked")
+
+    def calibration(bg):
+        return None if bg is None else (bg["name"], [list(b) for b in bg["boxes"]], list(bg["tiles"]))
+
+    fitted = calibration(json.loads(background)) if background is not None else None
+    here = calibration(ds.info.get("background"))
+    if fitted != here:
+        warnings.warn(f"--basis {path} was fitted on data with another background calibration (there: "
+                      f"{fitted[0] if fitted else 'none'}; here: {here[0] if here else 'none'}): a per-bin factor "
+                      "between the two biases the maps")
+    return H
+
+
 def solve(ds, args, device):
     """Run the factorization and the requested spectra estimator. Returns (W, H, report) with W and H numpy."""
-    from ._fit import _fit
+    from ._fit import _fit, _fit_fixed_basis
+    if args.basis:
+        W, H, rep = _fit_fixed_basis(ds.T, args.basis_H, device=device, mode=args.mode, chunk_pixels=args.chunk_pixels,
+                                     max_steps=args.max_steps, rel_tol=args.rel_tol, compile_mode=args.compile)
+        rep.update(rank=args.rank_value, rank_note=args.rank_note, rank_search=None, basis=os.path.abspath(args.basis))
+        return W, H, rep
     if args.spectra == "support" and ds.dose is None:
         raise InputError("support selection needs the dose (open-beam counts per pixel and bin): pass --dose, or "
                          "give --open-beam with a TIFF stack of counts")
@@ -177,15 +249,21 @@ def _out_type(ds, args):
 def _run_attrs(ds, rep, args, **extra):
     """Provenance written as HDF5 attributes: where the data came from and how the solve was set up."""
     return dict(source=ds.source, input_type=ds.dataset_type, mode=rep["mode"],
-                spectra=args.spectra, support_penalty=str(args.support_penalty), free_refit=bool(args.free_refit),
+                spectra="given basis" if args.basis else args.spectra, support_penalty=str(args.support_penalty),
+                free_refit=bool(args.free_refit),
                 downsample=args.downsample, wave_bin=args.wave_bin, dose=-1.0 if ds.dose is None else float(ds.dose),
-                mbirtorch_hsnt_cli="1", **extra)
+                mbirtorch_hsnt_cli="1", **({"basis": os.path.abspath(args.basis)} if args.basis else {}),
+                **({"background": json.dumps(ds.info["background"])} if "background" in ds.info else {}),
+                **({"open_beam_smoothing": json.dumps(ds.info["open_beam_smoothing"])}
+                   if "open_beam_smoothing" in ds.info else {}),
+                **extra)
 
 
 def write_report(base, ds, rep, args, outputs):
     path = base + "_report.json"
     report = dict(input=ds.source, input_type=ds.dataset_type, spatial_shape=list(ds.spatial_shape), pixels=ds.pixels,
-                  bins=ds.bins, dose=ds.dose, args={k: v for k, v in vars(args).items() if k != "func"},
+                  bins=ds.bins, dose=ds.dose,
+                  args={k: v for k, v in vars(args).items() if k not in ("func", "basis_H")},
                   checks=[dict(level=c.level, message=c.message) for c in ds.checks], info=ds.info, result=rep,
                   outputs=outputs)
     with _written_atomically(path) as tmp, open(tmp, "w", encoding="utf-8") as f:
@@ -201,7 +279,8 @@ def _log_fit(rep, args):
         log.warning("components %d and %d have nearly proportional spectra (cosine %.4f; %d such pair(s)): the data "
                     "do not fix how that spectral shape is split between their maps, so a smaller rank describes the "
                     "data as well%s. The mean-pixel spectrum in the outputs is unaffected.", i, j, cos,
-                    len(comp["proportional_pairs"]), "" if args.rank_detail else "; run without --rank to estimate it")
+                    len(comp["proportional_pairs"]), "; refit the basis at a smaller rank" if args.basis else
+                    "" if args.rank_detail else "; run without --rank to estimate it")
     log.info("components: max spectral cosine %.3f, max map correlation %.2f; per-row noise (relative to level) %s",
              comp["max_spectral_cosine"], comp["max_map_correlation"],
              ", ".join(f"{x:.3f}" for x in comp["row_noise_rel"]))
@@ -255,7 +334,10 @@ def cmd_convert(args):
                                      wave_range=_parse_slice(args.wave_range, "wave-range"), wave_bin=args.wave_bin,
                                      downsample=args.downsample, as_type=args.as_type,
                                      memory_budget_mib=args.memory_budget, workers=args.workers, strict=args.strict,
-                                     progress=not args.quiet)
+                                     progress=not args.quiet,
+                                     background_boxes=_background_spec(args.background_boxes),
+                                     background_tiles=args.background_tiles,
+                                     open_beam_smoothing=args.open_beam_smoothing)
     for c in checks:
         getattr(log, {"ok": "info", "warn": "warning", "error": "error"}[c.level])("check: %s", c.message)
     n_err = sum(c.level == "error" for c in checks)
@@ -264,8 +346,17 @@ def cmd_convert(args):
 
 
 def _resolve_rank(ds, args, device):
-    """Set args.rank_value, args.rank_note and args.rank_detail from --rank N or the likelihood-ratio estimate."""
-    if args.rank == "auto":
+    """Set args.rank_value, args.rank_note and args.rank_detail from --basis, --rank N or the likelihood-ratio
+    estimate."""
+    if args.basis:
+        args.basis_H = _load_basis(args.basis, ds)
+        R = args.basis_H.shape[0]
+        if args.rank not in ("auto", R):
+            raise InputError(f"--rank {args.rank} disagrees with the {R} spectra of --basis {args.basis}")
+        if args.spectra != "mle":
+            raise InputError(f"--spectra {args.spectra} re-estimates the spectra, which --basis holds fixed")
+        args.rank_value, args.rank_note, args.rank_detail = R, f"rank {R} from the basis in {args.basis}", None
+    elif args.rank == "auto":
         args.rank_value, args.rank_note, args.rank_detail = _estimate_rank(ds.T, ds.spatial_shape, device,
                                                                            max_rank=args.max_rank, pool=args.rank_pool)
         log.info("%s; pass --rank N to override", args.rank_note)
@@ -281,10 +372,10 @@ def _pipeline(args, denoise):
     base = os.path.splitext(_output_path(args.output, stem + ".h5"))[0]
     names = (([] if denoise and args.no_dehydrated else ["_dehydrated.h5"]) + (["_denoised.h5"] if denoise else [])
              + ["_report.json"] + ([] if args.no_plots else ["_spectra.png", "_maps.png"]))
-    _check_outputs([base + n for n in names], [args.input, *(args.open_beam or [])], args.overwrite)
+    _check_outputs([base + n for n in names], [args.input, args.basis, *(args.open_beam or [])], args.overwrite)
     _resolve_rank(ds, args, device)
     if args.dry_run:
-        plan_memory(ds, device, args.mode, args.chunk_pixels, args.spectra)
+        plan_memory(ds, device, args.mode, args.chunk_pixels, "basis" if args.basis else args.spectra)
         print(f"dry run: data loaded and checked, {args.rank_note}; no solve. Output base: {base}")
         return 0
     W, H, rep = solve(ds, args, device)
@@ -308,7 +399,8 @@ def _pipeline(args, denoise):
         write_report(base, ds, rep, args, outputs)
     n_err = sum(c.level == "error" for c in ds.checks)
     chi2 = rep["fit"].get("reduced_chi2")
-    print(f"done: rank {R} ({'estimated' if args.rank_detail else 'given'}), {ds.pixels:,} pixels x {ds.bins} bins, "
+    how = "from --basis" if args.basis else "estimated" if args.rank_detail else "given"
+    print(f"done: rank {R} ({how}), {ds.pixels:,} pixels x {ds.bins} bins, "
           f"{rep['mode']} solve in {rep['solve_seconds']} s, loss {rep['loss_final']:.6g}"
           + (f", reduced chi-square {chi2:.2f}" if chi2 is not None else "") + f"; outputs at {base}_*"
           + (f"; {n_err} data check(s) had errors" if n_err else ""))
@@ -415,6 +507,18 @@ class _Options:
         self.add(g, "--wave-bin", type=_positive_int, default=1, metavar="N",
                  help="group N adjacent bins (counts are summed, transmissions averaged)")
         self.add(g, "--downsample", type=_positive_int, default=1, metavar="S", help="keep every S-th row and column")
+        g = sp.add_argument_group("calibration")
+        self.add(g, "--background-boxes", type=_box_arg, nargs="+", metavar="BOX",
+                 help="boxes free of the sample, each Y0:Y1,X0:X1 in full-resolution pixels: in each bin, each "
+                      "detector tile's transmission is divided by its boxes', which corrects a sample run and an open "
+                      "beam of different exposure. Or an instrument preset: ornl-snap (ORNL SNAP only: the corner box "
+                      "of each 256 x 256 chip)")
+        self.add(g, "--background-tiles", type=_tiles_arg, metavar="RxC", advanced=True,
+                 help="detector tiles calibrated separately, each by the boxes whose centers it holds (default: the "
+                      "preset's, else 1x1)")
+        self.add(g, "--open-beam-smoothing", type=int, default=0, metavar="W",
+                 help="smooth the averaged open beam with a W x W Hamming window in each bin, W odd and at least 3 "
+                      "(default 0, none; the ORNL SNAP preprocessing used 3)")
 
     def run(self, sp, device=False, dry_run=False):
         g = sp.add_argument_group("run")
@@ -456,6 +560,8 @@ class _Options:
                  help="number of components, about the number of distinct materials (default: estimated from the "
                       "data)")
         self.add(g, "--spectra", choices=("mle", "unconstrained", "support"), default="mle", help=_SPECTRA_HELP)
+        self.add(g, "--basis", metavar="FILE", help="fit only the maps, for the spectra (subspace_basis) of this "
+                 "dehydrated file, e.g. one fitted on a few views of the same scan; the bins must match")
         self.run(sp, device=True, dry_run=True)
         self.rank_test(sp)
         g = sp.add_argument_group("advanced: support selection")

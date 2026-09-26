@@ -9,8 +9,9 @@ import torch
 log = logging.getLogger("mbirtorch.hsnt")
 
 # Device working set of a full solve, in bytes per data entry (measured on the H100: the joint-Newton MLE 49.5, the
-# unconstrained re-estimate 50.5, support selection 67.7), and of a streamed one (a chunk's W solve plus the sums).
-_BYTES_PER_ELEMENT = dict(mle=50, unconstrained=52, support=70)
+# unconstrained re-estimate 50.5, support selection 67.7; a W solve against a fixed basis as a streamed chunk's), and
+# of a streamed one (a chunk's W solve plus the sums).
+_BYTES_PER_ELEMENT = dict(mle=50, unconstrained=52, support=70, basis=24)
 _BYTES_PER_ELEMENT_STREAM = 24
 SPECTRA = ("mle", "unconstrained", "support")
 
@@ -52,6 +53,38 @@ def _loss(W, H, T_host, device):
         Tc = torch.from_numpy(T_host[i:i + chunk]).to(device).double()
         total += stable_nnal(W[i:i + chunk].to(device).double() @ Hd, Tc).item()
     return total
+
+
+def _fit_fixed_basis(T, H, device="cpu", mode="auto", chunk_pixels=None, max_steps=1000, rel_tol=1e-8,
+                     compile_mode="auto"):
+    """The maps for a given basis: every pixel's maximum-likelihood W >= 0 with H fixed, independent problems solved
+    by block Newton in chunks of pixels from the memory plan. Returns (W, H, report) as _fit does."""
+    from ._newton import _resolve_compile, solve_W
+    P, K = T.shape
+    Hd = torch.as_tensor(np.ascontiguousarray(H, dtype=np.float32), device=device)
+    mode, chunk, note = _plan(P, K, device, "basis", mode, chunk_pixels)
+    chunk = P if mode == "full" else chunk
+    rep = dict(mode=mode, memory_plan=note, spectra="given basis", chunks=-(-P // chunk))
+    if mode != "full":                                  # as a streamed fit: chunks compile only when asked
+        compile_mode = "on" if compile_mode == "on" else "off"
+    t0 = time.perf_counter()
+    parts = []
+    for i in range(0, P, chunk):
+        Tc = torch.from_numpy(T[i:i + chunk]).to(device)
+        parts.append(solve_W(Tc, Hd, max_steps=max_steps, rel_tol=rel_tol,
+                             compile_mode=_resolve_compile(compile_mode, Tc)).cpu())
+        del Tc
+    W = torch.cat(parts)
+    if device.startswith("cuda"):
+        torch.cuda.synchronize(device)
+    rep["solve_seconds"] = round(time.perf_counter() - t0, 2)
+    rep["loss_mle"] = rep["loss_final"] = _loss(W, Hd, T, device)
+    log.info("maps for the given basis: %s, %d chunk(s) in %.1f s, loss %.6g", mode, rep["chunks"],
+             rep["solve_seconds"], rep["loss_final"])
+    rep["W_zero_frac"], rep["H_zero_frac"] = (W == 0).double().mean().item(), (Hd == 0).double().mean().item()
+    if device.startswith("cuda"):
+        rep["gpu_peak_gib"] = round(torch.cuda.max_memory_allocated(device) / 2**30, 2)
+    return W.numpy().astype(np.float32), np.asarray(H, dtype=np.float32), rep
 
 
 def _fit(T, rank, spectra="mle", dose=None, penalty="auto", free_refit=False, wald_screen=0.0, device="cpu",

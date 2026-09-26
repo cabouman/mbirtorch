@@ -10,8 +10,8 @@ import numpy as np
 
 from ..utilities import _to_host
 
-# The keywords of MBIRJAX's scikit-learn dehydrate, which this package does not include.
-_L2_KEYWORDS = ("safety_factor", "beta_loss", "max_iter", "tolerance", "batch_size", "subspace_basis", "random_state")
+# The keywords of MBIRJAX's scikit-learn dehydrate that this package does not take.
+_L2_KEYWORDS = ("safety_factor", "beta_loss", "max_iter", "tolerance", "batch_size", "random_state")
 
 
 def _reject_unknown_keywords(name, kwargs):
@@ -57,9 +57,9 @@ def _to_transmission(data, dataset_type):
     return np.ascontiguousarray(T, dtype=np.float32), shape
 
 
-def dehydrate(data, dataset_type="attenuation", num_materials=None, *, spectra="mle", dose=None, penalty="auto",
-              free_refit=False, max_steps=1000, rel_tol=1e-8, max_rank=6, device=None, compile_mode="auto", verbose=1,
-              **kwargs):
+def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_basis=None, spectra="mle", dose=None,
+              penalty="auto", free_refit=False, max_steps=1000, rel_tol=1e-8, max_rank=6, device=None,
+              compile_mode="auto", verbose=1, **kwargs):
     """Dehydrate a hyperspectral dataset by the maximum-likelihood factorization X = W H of its attenuation.
 
     The spectral axis must be the last axis; the leading axes are kept. The fit minimizes the non-negative
@@ -71,12 +71,21 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, spectra="
     pure materials. Data that do not fit the device are factorized by chunks of pixels; rel_tol is then the relative
     loss change per pass over the chunks, max_steps does not apply, and compile_mode compiles only when 'on'.
 
+    Given a subspace_basis, only the maps are fitted: each pixel's maximum-likelihood coefficients W >= 0 for those
+    spectra, by chunks of pixels when the data do not fit the device; max_steps and rel_tol then apply to each chunk's
+    solve, and compile_mode compiles a chunked solve only when 'on'. Data too large to hold at once can be dehydrated
+    piece by piece (for example view by view) against a basis fitted on part of them.
+
     Args:
         data (numpy.ndarray or torch.Tensor): Hyperspectral data with any leading axes and the spectral axis of
             length :math:`N_k` last. NaN and infinite values are treated as zero counts, with a warning.
         dataset_type (str, optional): 'attenuation' or 'transmission', where attenuation = -log(transmission).
             Defaults to 'attenuation'.
-        num_materials (int, optional): Rank of the factorization :math:`N_m`. Defaults to None, which estimates it.
+        num_materials (int, optional): Rank of the factorization :math:`N_m`. Defaults to None, which estimates it
+            (or takes the rank of subspace_basis).
+        subspace_basis (numpy.ndarray or torch.Tensor, optional): Spectra to hold fixed, shape :math:`(N_m, N_k)`,
+            nonnegative, for example the subspace_basis of another dehydration of the same bins; spectra must then be
+            'mle'. Defaults to None, which fits the spectra too.
         spectra (str, optional): 'mle', the maximum-likelihood spectra; 'unconstrained', a re-estimate without the
             bias the nonnegativity of W gives the spectra at low dose, which pays from about 10^5 pixels; 'support',
             which decides the components present in each pixel and refits, and needs the dose: it corrects the same
@@ -114,6 +123,16 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, spectra="
     T, shape = _to_transmission(data, dataset_type)
     device = _default_device(device)
     lead = shape[:-1]
+    if subspace_basis is not None:
+        from ._fit import _fit_fixed_basis
+        H = _check_basis(subspace_basis, shape[-1], num_materials, spectra)
+        W, H, rep = _fit_fixed_basis(T, H, device=device, max_steps=max_steps, rel_tol=rel_tol,
+                                     compile_mode=compile_mode)
+        if verbose >= 1:
+            print("dehydrate(): ")
+            print("   -Spectral dimension: ", shape[-1], " -> rank: ", H.shape[0], "(the given subspace_basis)")
+            print("   -Pixels: ", T.shape[0], f"; maps for the given basis ({rep['chunks']} chunk(s))")
+        return [W.reshape(*lead, H.shape[0]), H, dataset_type]
     note = f"rank {num_materials} given"
     if num_materials is None:
         num_materials, note, _ = _estimate_rank(T, spatial_shape=_spatial_shape(lead), device=device, max_rank=max_rank,
@@ -127,6 +146,20 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, spectra="
         print("   -Spectral dimension: ", shape[-1], " -> rank: ", int(num_materials), f"({note})")
         print("   -Pixels: ", T.shape[0], f"; spectra: {spectra} ({solve})")
     return [subspace_data, H, dataset_type]
+
+
+def _check_basis(subspace_basis, bins, num_materials, spectra):
+    """A given subspace_basis as float32 (rank, bins), checked against the data and the other arguments."""
+    H = np.asarray(_to_host(subspace_basis), dtype=np.float32)
+    if H.ndim != 2 or H.shape[1] != bins:
+        raise ValueError(f"subspace_basis must have shape (rank, {bins}) for data with {bins} bins; got {H.shape}")
+    if not np.isfinite(H).all() or (H < 0).any():
+        raise ValueError("subspace_basis must be finite and nonnegative")
+    if num_materials is not None and int(num_materials) != H.shape[0]:
+        raise ValueError(f"num_materials={num_materials} disagrees with the {H.shape[0]} rows of subspace_basis")
+    if spectra != "mle":
+        raise ValueError(f"spectra={spectra!r} re-estimates the spectra, which a given subspace_basis holds fixed")
+    return H
 
 
 def hyper_denoise(data, dataset_type="attenuation", num_materials=None, **kwargs):

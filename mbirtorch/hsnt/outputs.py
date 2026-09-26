@@ -28,7 +28,7 @@ def fit_quality(T, W, H, dose=None, device="cpu", dose_per_bin=None, open_beam_o
         device (str, optional): Torch device for the products. Defaults to 'cpu'.
         dose_per_bin (numpy.ndarray, optional): The open beam's count in each bin, used instead of the scalar dose.
             Defaults to None.
-        open_beam_observations (int, optional): Observations averaged into a measured open beam; 0 treats the open
+        open_beam_observations (float, optional): Effective observations in a measured open beam; 0 treats the open
             beam as exact. Defaults to 0.
 
     Returns:

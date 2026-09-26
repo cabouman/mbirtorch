@@ -34,6 +34,10 @@ in the basis the maximum-likelihood fit ends in, which is some mixture of the ma
 far from the pure materials, a pixel of one material needs several of them, and the selection mostly separates the
 sample from the background.  Its gain is therefore in the spectra at low dose rather than in the maps.
 
+Given a ``subspace_basis``, ``dehydrate`` fits only the maps: each pixel's maximum-likelihood coefficients for those
+spectra.  Data too large to hold at once, such as the many views of a scan, can then be dehydrated piece by piece
+against spectra fitted on part of them.
+
 MBIRJAX's ``dehydrate`` is a scikit-learn NMF of the attenuation, which MBIRTorch does not include; its keywords
 raise a ``TypeError`` here.
 
@@ -74,10 +78,12 @@ logs them; ``--strict`` stops on a failed one.
    mbirtorch-hsnt dehydrate sample.h5 -o results/                  # rank estimated from the data
    mbirtorch-hsnt rehydrate results/sample_dehydrated.h5 --wave-range 100:200 -o results/
    mbirtorch-hsnt denoise sample.h5 -o results/                    # denoised data, plus the dehydrated file
+   mbirtorch-hsnt dehydrate scan.h5 --views 0:4 -o fit/            # spectra from a few views of a scan ...
+   mbirtorch-hsnt dehydrate scan.h5 --basis fit/scan_dehydrated.h5 -o all/     # ... and the maps of every view
 
 ``convert`` reads the input in blocks of bins, so its memory stays near ``--memory-budget`` whatever the size of the
 stack, and writes the hsnt layout, by default to ``<stem>_converted.h5``; the converted file keeps the dose and the
-source bin indices.  ``dehydrate`` writes ``<stem>_dehydrated.h5``, which :func:`import_hsnt_data_hdf5` reads, a JSON
+source bin indices, and stores a zero transmission (a bin with no counts) as an infinite attenuation.  ``dehydrate`` writes ``<stem>_dehydrated.h5``, which :func:`import_hsnt_data_hdf5` reads, a JSON
 report of the checks, parameters, timings and losses, and plots of the maps and spectra.  ``rehydrate`` writes the
 product back as hyperspectral data, for all bins or a ``--wave-range``.  ``denoise`` does both.  The solve runs whole
 on the device when it fits and is streamed by chunks of pixels otherwise.  ``--spectra unconstrained`` and
@@ -88,3 +94,30 @@ counts source bins in every subcommand, also on a converted or dehydrated file, 
 per pixel and source bin, before any ``--wave-bin`` grouping.  Run any subcommand with ``-h`` for the options most
 runs need, and with ``--help-all`` for every option, including the solver, memory, rank-test and support-selection
 settings.
+
+Two input options correct the data before the fit.  ``--background-boxes`` names boxes free of the sample, each as
+``Y0:Y1,X0:X1`` in full-resolution pixels, separated by spaces.  In each bin, each detector tile's transmission is
+divided by that of its boxes (for counts, their summed counts over their summed open beam).  This corrects a sample
+run and an open beam of different exposure, and the dose becomes the sample's.  ``--background-tiles RxC`` splits the
+detector into tiles calibrated separately, each by the boxes whose centers it holds; the default is a preset's tiles,
+else one tile.  Without calibration, a data check warns when the most transparent regions read a transmission farther
+from 1 than their noise allows.
+``--open-beam-smoothing W`` smooths the averaged open beam with a W x W Hamming window in each bin, at full
+resolution, before the division.  The noise model then counts the open beam as more observations, by the reduction of
+its variance measured across the observations; the check reports it.
+
+Instrument-specific settings
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+These settings apply to ORNL SNAP data only.  The ``ornl-snap`` preset of ``--background-boxes`` is for its
+512 x 512 detector of four 256 x 256 chips: it calibrates each chip by the 100 x 100 box in the chip's outer corner,
+as the MBIRJAX hsnt preprocessing for SNAP data does, which assumes a sample clear of the corners.  That preprocessing
+also smoothed the open beam with a 3 x 3 window and kept the source bins 100 to 2599 of a 2782-bin stack, since the
+first bins lie on the rising edge of the flux and the last hold few counts.  The detector's noise is correlated between
+neighboring pixels (correlation about 0.6 at one pixel, gone by five), so the 3 x 3 window reduces the open beam's
+variance to about 0.64 rather than the 0.22 of independent pixels:
+
+.. code-block:: bash
+
+   mbirtorch-hsnt convert Ni_cylinder_projections/ --open-beam open_beam/ --wave-range 100:2600 \
+       --background-boxes ornl-snap --open-beam-smoothing 3 -o Ni_cylinder.h5
