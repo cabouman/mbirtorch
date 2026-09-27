@@ -101,6 +101,7 @@ def _number_arg(kind, low, inclusive):
 
 
 _positive_int = _number_arg(int, 0, inclusive=False)
+_nonneg_int = _number_arg(int, 0, inclusive=True)
 _positive_float = _number_arg(float, 0.0, inclusive=False)
 _nonneg_float = _number_arg(float, 0.0, inclusive=True)
 
@@ -138,7 +139,7 @@ def _device(name):
         raise InputError(f"--device {name}: {torch.cuda.device_count()} CUDA device(s) available")
     name = _default_device(name)
     if name == "cpu":
-        log.warning("running on the CPU: expect one to two orders of magnitude longer than a GPU")
+        log.warning("running on the CPU: a large solve takes much longer than on a GPU")
     return name
 
 
@@ -309,7 +310,7 @@ def cmd_inspect(args):
     print(f"\n{ds.source}\n  type {ds.dataset_type}; {V} view(s) x {rows} x {cols} pixels x {ds.bins} bins (source "
           f"bins {ds.bin_indices[0]}..{ds.bin_indices[-1]}); {ds.T.nbytes / 2**30:.2f} GiB as float32")
     print(f"  T: min {st['min']:.4g}  median {st['median']:.4g}  mean {st['mean']:.4g}  max {st['max']:.4g}; zeros "
-          f"{st['zero']:.2%}, above 1: {float(np.mean(ds.T > 1)):.2%}" + ("  (sampled)" if st["sampled"] else ""))
+          f"{st['zero']:.2%}, above 1: {ds.info['above_one']:.2%}" + ("  (sampled)" if st["sampled"] else ""))
     print(f"  dose: {'unknown' if ds.dose is None else f'{ds.dose:.4g} counts per pixel and bin'}")
     for c in ds.checks:
         print(f"  [{c.level:5s}] {c.message}")
@@ -520,10 +521,11 @@ class _Options:
                  help="detector tiles calibrated separately, each by the boxes whose centers it holds (default: the "
                       "preset's, else 1x1)")
         self.add(g, "--open-beam-smoothing", type=int, default=0, metavar="W",
-                 help="smooth the averaged open beam with a W x W Hamming window in each bin, W odd and at least 3 "
-                      "(default 0, none; the ORNL SNAP preprocessing used 3)")
+                 help="smooth the averaged open beam in each bin with a W x W window (the square root of the outer "
+                      "product of two Hamming windows, normalized), W odd and at least 3 (default 0, none; the ORNL "
+                      "SNAP preprocessing used 3)")
 
-    def run(self, sp, device=False, dry_run=False):
+    def run(self, sp, device=False, dry_run=False, checks=True):
         g = sp.add_argument_group("run")
         if device:
             self.add(g, "--device", default="auto", metavar="auto|cpu|cuda|cuda:N",
@@ -534,9 +536,10 @@ class _Options:
         self.add(g, "-q", "--quiet", action="store_true", help="warnings and errors only")
         self.add(g, "--help-all", action="store_true", help="show every option, including solver, memory, "
                  "rank-test and support-selection settings")
-        g = sp.add_argument_group("advanced: checks and logging")
-        self.add(g, "--strict", action="store_true", advanced=True,
-                 help="stop if any data check reports an error")
+        g = sp.add_argument_group("advanced: checks and logging" if checks else "advanced: logging")
+        if checks:
+            self.add(g, "--strict", action="store_true", advanced=True,
+                     help="stop if any data check reports an error")
         self.add(g, "--log-file", advanced=True, help="also write the log here")
 
     def rank_test(self, sp):
@@ -592,8 +595,9 @@ class _Options:
                  help="full solve on the device or streamed by chunks of pixels (default: by available memory)")
         self.add(g, "--chunk-pixels", type=_positive_int, advanced=True,
                  help="pixels per chunk in stream mode (default: from available memory)")
-        self.add(g, "--max-passes", type=_positive_int, default=5, advanced=True,
-                 help="stream mode: polish passes over the data (default 5)")
+        self.add(g, "--max-passes", type=_nonneg_int, default=5, advanced=True,
+                 help="stream mode: polish passes over the data after the fit on a pixel subsample; 0 keeps that "
+                      "fit (default 5)")
 
 
 def build_parser(show_all=False):
@@ -647,7 +651,7 @@ def build_parser(show_all=False):
     opt.add(g, "--as-type", choices=("attenuation", "transmission"),
             help="quantity to write (default: the file's dataset_type)")
     opt.add(g, "--overwrite", action="store_true", help="replace the output if it already exists")
-    opt.run(s)
+    opt.run(s, checks=False)                           # rehydrate reads a dehydrated file, not data to check
     s.set_defaults(func=cmd_rehydrate)
 
     s = sub.add_parser("denoise", help="dehydrate and rehydrate: write the denoised hyperspectral data in the hsnt "

@@ -110,7 +110,8 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
             entries, where it pays; 'on' always; 'off' never. The rank estimate always runs uncompiled. Defaults to
             'auto'.
         mode (str, optional): 'full' solves on the device at once, 'stream' by chunks of pixels, and 'auto' picks
-            from the memory the device has available. Defaults to 'auto'.
+            from the memory the device has available. Streamed, spectra='unconstrained' and 'support' keep only part
+            of their gain over the maximum-likelihood spectra. Defaults to 'auto'.
         chunk_pixels (int, optional): Pixels per chunk when streamed. Defaults to None, from the available memory.
         max_passes (int, optional): Polish passes over the data when streamed, after an initial fit on a random
             subsample of the pixels; 0 keeps that fit. Defaults to 5.

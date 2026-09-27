@@ -232,6 +232,7 @@ def test_background_boxes_calibrate_each_tile_and_the_open_beam_can_be_smoothed(
     assert np.allclose(back.T, both.T, atol=1e-6) and back.dose == pytest.approx(both.dose, rel=0.01)
     assert back.open_beam_observations == pytest.approx(both.open_beam_observations, rel=0.2)
     assert back.info["background"]["recorded"] and not any("--background-boxes" in c.message for c in back.checks)
+    assert load_dataset(conv, dose=100.0).dose == pytest.approx(100.0 * back.info["background"]["factor_median"])
     for bad, match in ((["--background-boxes", "ornl-snap"], "512 x 512"),
                        (["--background-boxes", "0:3,0:3", "--background-tiles", "2x2"], "hold no box"),
                        (["--background-tiles", "2x2"], "need background"), (["--open-beam-smoothing", "4"], "odd")):

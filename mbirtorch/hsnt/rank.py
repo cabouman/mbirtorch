@@ -58,9 +58,13 @@ def _pool_pixels(T, spatial_shape, block):
     """
     V, rows, cols = spatial_shape
     r, c = rows // block * block, cols // block * block
-    X = np.asarray(T).reshape(V, rows, cols, -1)[:, :r, :c]
-    X = X.reshape(V, r // block, block, c // block, block, -1).mean(axis=(2, 4))
-    return X.reshape(-1, X.shape[-1])
+    X = np.asarray(T).reshape(V, rows, cols, -1)
+    out = np.empty((V, r // block, c // block, X.shape[-1]), dtype=X.dtype)
+    for v in range(V):                                  # one band of block rows at a time: no copy of the whole array
+        for i in range(r // block):
+            band = X[v, i * block:(i + 1) * block, :c]
+            out[v, i] = band.reshape(block, c // block, block, -1).mean(axis=(0, 2))
+    return out.reshape(-1, out.shape[-1])
 
 
 def _subsample(T, n):
@@ -116,9 +120,10 @@ def _estimate_rank(T, spatial_shape=None, device=None, max_rank=6, subsample=163
     spatial_shape is given; subsample caps the pixels each test uses (a seeded random subset)."""
     device = _default_device(device)
     T_np = T.detach().cpu().numpy() if torch.is_tensor(T) else np.asarray(T)
-    if not bool((T_np > 0).any()):
-        raise ValueError("the data hold no counts: the transmission is zero everywhere")
     pixels, K = T_np.shape
+    rows_per = max(1, 2**24 // max(K, 1))
+    if not any(bool((T_np[i:i + rows_per] > 0).any()) for i in range(0, pixels, rows_per)):
+        raise ValueError("the data hold no counts: the transmission is zero everywhere")
     Tt = torch.from_numpy(_subsample(T_np, subsample)).to(device)
     rank_full, d_full = _lrt_rank(Tt, max_rank, "full resolution", verbose)
     block = 0

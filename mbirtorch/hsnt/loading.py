@@ -111,16 +111,28 @@ def infer_input_type(a, source_dtype=None):
                      "transmissions or attenuations: pass --input-type transmission or --input-type attenuation")
 
 
-def _summary_from_T(T, dose, spatial_shape, background=None, n_obs=0):
-    """The quantities the data checks need, from a transmission matrix held in memory."""
+def _summary_from_T(T, dose, spatial_shape, background=None, n_obs=0, chunk_elems=2**24):
+    """The quantities the data checks need, from a transmission matrix held in memory. The per-pixel and per-bin
+    reductions run by blocks of rows, so their working set stays small next to T."""
     st = _stats(T)
     P, K = T.shape
     above = _frac(T > 1) if T.size <= 4_000_000 else _frac(T.reshape(-1)[:: max(1, T.size // 2_000_000)] > 1)
-    pos = T > 0
-    dead_bins = int((pos.sum(0) == 0).sum())
-    return dict(pixels=P, bins=K, nbytes=T.nbytes, stats=st, above_one=above, dead_px=_frac(pos.sum(1) == 0),
-                dead_bins=dead_bins, const_bins=int((T.std(0) == 0).sum()) - dead_bins, dose=dose,
-                bright=_bright_level(T.mean(1), spatial_shape, T[:: max(1, P // 20000)], dose, n_obs),
+    rows = max(1, chunk_elems // max(K, 1))
+    pos_px, mean_px = np.empty(P, dtype=np.int64), np.empty(P, dtype=np.float64)
+    pos_bin = np.zeros(K, dtype=np.int64)
+    bin_min, bin_max = np.full(K, np.inf, dtype=T.dtype), np.full(K, -np.inf, dtype=T.dtype)
+    for i in range(0, P, rows):
+        block = T[i:i + rows]
+        pos = block > 0
+        pos_px[i:i + rows] = pos.sum(1)
+        pos_bin += pos.sum(0)
+        np.minimum(bin_min, block.min(0), out=bin_min)
+        np.maximum(bin_max, block.max(0), out=bin_max)
+        mean_px[i:i + rows] = block.mean(1, dtype=np.float64)
+    dead_bins = int((pos_bin == 0).sum())
+    return dict(pixels=P, bins=K, nbytes=T.nbytes, stats=st, above_one=above, dead_px=_frac(pos_px == 0),
+                dead_bins=dead_bins, const_bins=int((bin_max == bin_min).sum()) - dead_bins, dose=dose,
+                bright=_bright_level(mean_px, spatial_shape, T[:: max(1, P // 20000)], dose, n_obs),
                 background=background)
 
 
@@ -885,7 +897,9 @@ def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=Non
             inferred from the values). Defaults to 'auto'.
         dataset (str, optional): HDF5 group holding 'data'. Defaults to None: the root, or the only group with one.
         dose (float, optional): Open-beam counts per pixel and source bin, overriding the open-beam estimate and the
-            dose an HDF5 input records; the loaded dose is per grouped bin, wave_bin times this. Defaults to None.
+            dose an HDF5 input records. The loaded dose is per grouped bin: this times wave_bin and times the source
+            bins in a column of a converted file, and with a background calibration (here or recorded at conversion)
+            scaled to the sample run's exposure. Defaults to None.
         views (tuple, optional): (start, stop) of the views of 4-D HDF5 data or of a directory of view directories.
             Defaults to None, all views.
         wave_range (tuple, optional): (start, stop) over the source bins. Defaults to None, all bins.
@@ -900,10 +914,10 @@ def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=Non
             becomes the sample's. Defaults to None, no calibration.
         background_tiles (tuple, optional): (rows, cols) of detector tiles calibrated separately, each by the boxes
             whose centers it holds. Defaults to None: the preset's, else (1, 1).
-        open_beam_smoothing (int, optional): Smooth the averaged open beam with a normalized width x width Hamming
-            window per bin, at full resolution (odd, at least 3); the noise model counts the smoothed open beam as
-            more observations, by the variance reduction measured across the observations (with one observation,
-            that of independent pixels). Defaults to 0, none.
+        open_beam_smoothing (int, optional): Smooth the averaged open beam per bin, at full resolution, with a
+            width x width window (odd, at least 3), the normalized square root of the outer product of two Hamming
+            windows; the noise model counts the smoothed open beam as more observations, by the variance reduction
+            measured across the observations (with one observation, that of independent pixels). Defaults to 0, none.
         memory_budget_mib (float, optional): Working memory for the blocks of bins, in MiB. Defaults to 512.
 
     Returns:
@@ -952,6 +966,8 @@ def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=Non
         merged = _merge_dose(dose, _block_dose(dose_blocks), src, wave_bin)
         n_eff, sm_note = _effective_observations(len(obs), smoothing, _sum_variances(variances))
         bg, merged, per_bin, n_eff = _calibrated(merged, per_bin, n_eff, background, factor_parts, mean_factor)
+        if dose is not None and merged is not None and src.file_background is not None:
+            merged *= src.file_background["factor_median"]          # a given dose, to the exposure the file records
         if bg is not None:
             info["background"] = bg
         elif src.file_background is not None:
@@ -973,7 +989,7 @@ def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=Non
         src.close()
     sm = dict(_summary_from_T(ds.T, ds.dose, ds.spatial_shape, bg, ds.open_beam_observations),
               smoothing=ds.info.get("open_beam_smoothing"))
-    ds.info["T_stats"] = sm["stats"]
+    ds.info["T_stats"], ds.info["above_one"] = sm["stats"], sm["above_one"]
     ds.checks = _checks_from_summary(sm, ds.spatial_shape, strict)
     return ds
 
@@ -1104,6 +1120,8 @@ def convert_to_hdf5(path, output=None, open_beam=None, input_type="auto", datase
             n_eff, sm_note = _effective_observations(len(obs), smoothing, _sum_variances(variances))
             bg, dose, per_bin, n_eff = _calibrated(dose, per_bin, n_eff, background, factor_parts, mean_factor)
             n_eff = n_eff or src.file_observations
+            if given_dose is not None and dose is not None and src.file_background is not None:
+                dose *= src.file_background["factor_median"]            # a given dose, to the exposure the file records
             if bg is None and src.file_background is not None:
                 bg = dict(src.file_background, recorded=True)
             if sm_note is None and src.file_smoothing is not None:

@@ -68,9 +68,9 @@ Command line
 ``mbirtorch-hsnt`` (also ``python -m mbirtorch.hsnt``) runs the dehydration on an HDF5 file in the hsnt layout, on
 a directory of TIFF images, one per wavelength bin, or on a directory of such directories, one per view.  A stack of
 counts is normalized by an open-beam stack (``--open-beam``; a directory of observations is averaged), which all the
-views share; transmissions and attenuations are used as they are.
-Every subcommand runs the data checks (non-finite values, negatives, zero counts, dead pixels and bins, dose) and
-logs them; ``--strict`` stops on a failed one.
+views share; transmissions and attenuations are used as they are.  ``inspect``, ``convert``, ``dehydrate`` and
+``denoise`` run the data checks (non-finite values, negatives, zero counts, dead pixels and bins, dose) and log them;
+``--strict`` stops on a failed one.
 
 .. code-block:: bash
 
@@ -82,18 +82,20 @@ logs them; ``--strict`` stops on a failed one.
 
 ``convert`` reads the input in blocks of bins, so its memory stays near ``--memory-budget`` whatever the size of the
 stack (or one bin of every selected view, when that is larger), and writes the hsnt layout, by default to
-``<stem>_converted.h5``; the converted file keeps the dose and the
-source bin indices, and stores a zero transmission (a bin with no counts) as an infinite attenuation.  ``dehydrate`` writes ``<stem>_dehydrated.h5``, which :func:`import_hsnt_data_hdf5` reads, a JSON
-report of the checks, parameters, timings and losses, and plots of the maps and spectra.  ``rehydrate`` writes the
-product back as hyperspectral data, for all bins or a ``--wave-range``.  ``denoise`` does both.  The solve runs whole
-on the device when it fits and is streamed by chunks of pixels otherwise.  ``--spectra unconstrained`` and
-``--spectra support`` select the spectra estimators described above.  An output is never one of the inputs, an
-existing output is replaced only with ``--overwrite``, and a run that fails leaves no partial file.  The outputs keep
-the input's angles, wavelengths and geometry entries, matched to the selected views and bins.  ``--wave-range``
-counts source bins in every subcommand, also on a converted or dehydrated file, and ``--dose`` is the open-beam count
-per pixel and source bin, before any ``--wave-bin`` grouping.  Run any subcommand with ``-h`` for the options most
-runs need, and with ``--help-all`` for every option, including the solver, memory, rank-test and support-selection
-settings.
+``<stem>_converted.h5``; the converted file keeps the dose and the source bin indices, and stores a zero transmission
+(a bin with no counts) as an infinite attenuation.  ``dehydrate`` writes ``<stem>_dehydrated.h5``, which
+:func:`import_hsnt_data_hdf5` reads, a JSON report of the checks, parameters, timings and losses, and plots of the
+maps and spectra.  ``rehydrate`` writes the product back as hyperspectral data, for all bins or a ``--wave-range``.
+``denoise`` does both, and writes the report too.  The solve runs whole on the device when it fits and is streamed by
+chunks of pixels otherwise.  ``--spectra unconstrained`` and ``--spectra support`` select the spectra estimators
+described above; streamed, they keep only part of their gain (on the 1M-pixel sphere phantom at dose 3, 1 to 3 dB over
+the maximum-likelihood spectra instead of 7 to 12 dB solved whole), so give them a device that holds the data when the
+spectra matter.  An output is never one of the inputs, an existing output is replaced only with ``--overwrite``, and a
+run that fails leaves no partial file.  The outputs keep the input's angles, wavelengths and geometry entries, matched
+to the selected views and bins.  ``--wave-range`` counts source bins in every subcommand, also on a converted or
+dehydrated file, and ``--dose`` is the open-beam count per pixel and source bin, before any ``--wave-bin`` grouping.
+Run any subcommand with ``-h`` for the options most runs need, and with ``--help-all`` for every option, including the
+solver, memory, rank-test and support-selection settings.
 
 Two input options correct the data before the fit.  ``--background-boxes`` names boxes free of the sample, each as
 ``Y0:Y1,X0:X1`` in full-resolution pixels, separated by spaces.  In each bin, each detector tile's transmission is
@@ -101,10 +103,10 @@ divided by that of its boxes (for counts, their summed counts over their summed 
 run and an open beam of different exposure, and the dose becomes the sample's.  ``--background-tiles RxC`` splits the
 detector into tiles calibrated separately, each by the boxes whose centers it holds; the default is a preset's tiles,
 else one tile.  Without calibration, a data check warns when the most transparent regions read a transmission farther
-from 1 than their noise allows.
-``--open-beam-smoothing W`` smooths the averaged open beam with a W x W Hamming window in each bin, at full
-resolution, before the division.  The noise model then counts the open beam as more observations, by the reduction of
-its variance measured across the observations; the check reports it.
+from 1 than a 3% margin plus their noise and the ratio bias allow.  ``--open-beam-smoothing W`` smooths the averaged
+open beam in each bin, at full resolution, before the division, with a W x W window: the normalized square root of the
+outer product of two Hamming windows.  The noise model then counts the open beam as more observations, by the
+reduction of its variance measured across the observations; the check reports it.
 
 Multi-view data
 ^^^^^^^^^^^^^^^
@@ -148,7 +150,7 @@ as the MBIRJAX hsnt preprocessing for SNAP data does, which assumes a sample cle
 also smoothed the open beam with a 3 x 3 window and kept the source bins 100 to 2599 of a 2782-bin stack, since the
 first bins lie on the rising edge of the flux and the last hold few counts.  The detector's noise is correlated between
 neighboring pixels (correlation about 0.6 at one pixel, gone by five), so the 3 x 3 window reduces the open beam's
-variance to about 0.64 rather than the 0.22 of independent pixels:
+variance to about 0.65 rather than the 0.22 of independent pixels:
 
 .. code-block:: bash
 
