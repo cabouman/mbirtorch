@@ -76,15 +76,19 @@ def _frac(mask):
     return float(np.mean(mask))
 
 
-def _stats(a):
-    """Value statistics on a strided sample of a large array; exact on a small one."""
-    s = a if a.size <= 4_000_000 else a.reshape(-1)[:: max(1, a.size // 2_000_000)]
-    finite = s[np.isfinite(s)]
+def _sample_stride(P, K):
+    """The row stride of the checks' value sample of a (P, K) matrix: about 4e6 entries of whole rows, so every bin
+    is seen."""
+    return max(1, -(-P * K // 4_000_000))
+
+
+def _stats(s):
+    """The range, mean and median of the finite values of s (in the checks, a row sample of T)."""
+    finite = s if np.isfinite(s).all() else s[np.isfinite(s)]
     have = finite.size > 0
     return dict(min=float(finite.min()) if have else float("nan"), max=float(finite.max()) if have else float("nan"),
-                mean=float(finite.mean()) if have else float("nan"),
-                median=float(np.median(finite)) if have else float("nan"),
-                nonfinite=_frac(~np.isfinite(s)), negative=_frac(s < 0), zero=_frac(s == 0), sampled=s.size < a.size)
+                mean=float(finite.mean(dtype=np.float64)) if have else float("nan"),
+                median=float(np.median(finite)) if have else float("nan"))
 
 
 def infer_input_type(a, source_dtype=None):
@@ -111,51 +115,89 @@ def infer_input_type(a, source_dtype=None):
                      "transmissions or attenuations: pass --input-type transmission or --input-type attenuation")
 
 
-def _summary_from_T(T, dose, spatial_shape, background=None, n_obs=0, chunk_elems=2**24):
+def _summary_from_T(T, dose, spatial_shape, background=None, n_obs=0, chunk_elems=2**24, dose_per_bin=None):
     """The quantities the data checks need, from a transmission matrix held in memory. The per-pixel and per-bin
-    reductions run by blocks of rows, so their working set stays small next to T."""
-    st = _stats(T)
+    reductions, and the fractions of non-finite, negative, zero and above-one entries, run exactly by blocks of rows,
+    so their working set stays small next to T; the range, mean and median come from a sample of whole rows."""
     P, K = T.shape
-    above = _frac(T > 1) if T.size <= 4_000_000 else _frac(T.reshape(-1)[:: max(1, T.size // 2_000_000)] > 1)
     rows = max(1, chunk_elems // max(K, 1))
     pos_px, mean_px = np.empty(P, dtype=np.int64), np.empty(P, dtype=np.float64)
     pos_bin = np.zeros(K, dtype=np.int64)
     bin_min, bin_max = np.full(K, np.inf, dtype=T.dtype), np.full(K, -np.inf, dtype=T.dtype)
+    nonfinite = negative = zero = above = 0
     for i in range(0, P, rows):
         block = T[i:i + rows]
+        nonfinite += block.size - np.count_nonzero(np.isfinite(block))
+        negative += np.count_nonzero(block < 0)
+        zero += np.count_nonzero(block == 0)
+        above += np.count_nonzero(block > 1)
         pos = block > 0
         pos_px[i:i + rows] = pos.sum(1)
         pos_bin += pos.sum(0)
         np.minimum(bin_min, block.min(0), out=bin_min)
         np.maximum(bin_max, block.max(0), out=bin_max)
         mean_px[i:i + rows] = block.mean(1, dtype=np.float64)
+    n, stride = max(T.size, 1), _sample_stride(P, K)
+    st = dict(_stats(T[::stride]), nonfinite=nonfinite / n, negative=negative / n, zero=zero / n, sampled=stride > 1)
     dead_bins = int((pos_bin == 0).sum())
-    return dict(pixels=P, bins=K, nbytes=T.nbytes, stats=st, above_one=above, dead_px=_frac(pos_px == 0),
+    return dict(pixels=P, bins=K, nbytes=T.nbytes, stats=st, above_one=above / n, dead_px=_frac(pos_px == 0),
                 dead_bins=dead_bins, const_bins=int((bin_max == bin_min).sum()) - dead_bins, dose=dose,
-                bright=_bright_level(mean_px, spatial_shape, T[:: max(1, P // 20000)], dose, n_obs),
+                bright=_bright_level(mean_px, spatial_shape, T[:: max(1, P // 20000)], dose, n_obs, dose_per_bin),
                 background=background)
 
 
-def _bright_level(pixel_means, spatial_shape, sub, dose=None, n_obs=0):
-    """(level, tolerance): the transmission of the most transparent regions, the 95th percentile of the per-pixel
-    means pooled over b x b blocks (b = 4 when the image allows), and how far a sample-free region may read from 1
-    through noise and bias: 0.03, plus five times the noise of a block mean (from the bin-to-bin differences of the
-    most transparent tenth of the pixel subsample sub), plus the bias of a ratio of counts to a noisy open beam,
-    1 / (n_obs * dose)."""
+def _ratio_expectation(mu):
+    """E[mu / S'] for S ~ Poisson(mu), where S' is S, or the median of S given S > 0 when S = 0: the mean ratio of an
+    open beam's expected count to the loader's open beam, whose zero entries take the bin's median positive value.
+    Exact to 1e-12 up to mu = 400 (the sum over S > 0 is mu e^-mu (Ei(mu) - gamma - ln mu)), and the asymptotic
+    series 1 + 1/mu + 2/mu^2 + 6/mu^3, exact to 1e-9, above."""
+    from scipy.special import expi
+    mu = np.maximum(np.asarray(mu, dtype=np.float64), 1e-3)
+    out = (1 + 1 / mu + 2 / mu ** 2 + 6 / mu ** 3).reshape(-1)
+    m = mu.reshape(-1)
+    exact, few = m <= 400, m < 40                   # from 40 counts a zero has probability below 5e-18
+    out[exact] = m[exact] * np.exp(-m[exact]) * (expi(m[exact]) - np.euler_gamma - np.log(m[exact]))
+    p0 = np.exp(-m[few])
+    cdf = p0[:, None] * (1 + np.cumsum(np.cumprod(m[few, None] / np.arange(1, 81), axis=1), axis=1))
+    median = 1 + np.argmax(cdf >= (1 + p0[:, None]) / 2, axis=1)                  # of S given S > 0
+    out[few] += p0 * m[few] / median
+    return out.reshape(mu.shape)
+
+
+def _expected_ratio(dose_per_bin, n_obs):
+    """(low, high): the range of the transmission a sample-free region reads at matched exposure through the ratio
+    of counts to the loader's open beam, the mean of n_obs observations (see _ratio_expectation, averaged over bins).
+    The open beam's expected summed count in a bin is known only through its median, n_obs * dose_per_bin, which after
+    the zero replacement lies within one count of it; the range covers the counts within one of the median. (1, 1)
+    for an exact open beam (no observations) or an unknown dose."""
+    if not n_obs or dose_per_bin is None:
+        return 1.0, 1.0
+    medians, weight = np.unique(n_obs * np.asarray(dose_per_bin, dtype=np.float64).ravel(), return_counts=True)
+    e = _ratio_expectation(medians[:, None] + np.linspace(-1, 1, 9))
+    return float(np.average(e.min(1), weights=weight)), float(np.average(e.max(1), weights=weight))
+
+
+def _bright_level(pixel_means, spatial_shape, sub, dose=None, n_obs=0, dose_per_bin=None):
+    """(level, low, high): the transmission of the most transparent regions, the 95th percentile of the per-pixel
+    means pooled over b x b blocks (b = 4 when the image allows), and the range a sample-free region reads at matched
+    exposure: the loader's expected ratio of counts to a noisy open beam (see _expected_ratio, from the dose per bin,
+    else the dose), widened by a margin of 0.03 plus five times the noise of a block mean (from the bin-to-bin
+    differences of the most transparent tenth of the pixel subsample sub), and by at least 0.05 below."""
     V, rows, cols = spatial_shape
     b = 4 if rows >= 16 and cols >= 16 else 1
     m = pixel_means.reshape(V, rows, cols)[:, :rows // b * b, :cols // b * b]
     m = m.reshape(V, rows // b, b, cols // b, b).mean((2, 4)).ravel()
     if not m.size:
-        return float("nan"), float("nan")
+        return float("nan"), float("nan"), float("nan")
     level, noise = float(np.percentile(m, 95)), 0.0
     if sub.shape[0] and sub.shape[1] > 1:
         means = sub.mean(1)
         top = sub[means >= np.quantile(means, 0.9)]
         sigma = np.sqrt(np.median(np.mean(np.diff(top.astype(np.float64), axis=1) ** 2, axis=1)) / 2)
         noise = float(sigma / np.sqrt(sub.shape[1] * b * b))
-    bias = 1.0 / (n_obs * dose) if n_obs and dose else 0.0
-    return level, 0.03 + 5 * noise + bias
+    lo, hi = _expected_ratio(dose_per_bin if dose_per_bin is not None or dose is None else [dose], n_obs)
+    margin = 0.03 + 5 * noise
+    return level, lo - max(0.05, margin), hi + margin
 
 
 def _checks_from_summary(sm, spatial_shape, strict=False):
@@ -170,7 +212,7 @@ def _checks_from_summary(sm, spatial_shape, strict=False):
     if st["negative"] > 0:
         c.append(Check("error", f"{st['negative']:.2%} of T is negative: a transmission ratio cannot be"))
     above, bg = sm["above_one"], sm.get("background")
-    bright, tol = sm.get("bright", (float("nan"), float("nan")))
+    bright, low, high = sm.get("bright", (float("nan"),) * 3)
     if bg is not None:
         c.append(Check("ok", f"background {'calibrated at conversion' if bg.get('recorded') else 'boxes'} "
                              f"({bg['name']}, {len(bg['boxes'])} box(es), {bg['tiles'][0]} x {bg['tiles'][1]} tile(s)) "
@@ -179,19 +221,20 @@ def _checks_from_summary(sm, spatial_shape, strict=False):
                              + (f"; views {min(bg['view_medians']):.4f} to {max(bg['view_medians']):.4f}"
                                 if bg.get("view_medians") else "")
                              + "): each tile's data are divided by it, per view and bin, and the dose is the "
-                             + ("median view's" if bg.get("view_medians") else "sample's")))
+                             + ("views' mean" if bg.get("view_medians") else "sample's")))
         spread = bg.get("view_medians")
         if spread and max(spread) > 1.05 * min(spread):
             c.append(Check("warn", f"the views' exposures differ ({min(spread):.3f} to {max(spread):.3f} of the open "
                                    "beam's); each view is calibrated, but the dose, the chi-square and support "
-                                   "selection use the median view's"))
-    elif bright > 1 + tol:
-        c.append(Check("warn", f"the most transparent regions read T = {bright:.3f} (noise allows 1 +- {tol:.3f}): the "
-                               "sample run and the open beam differ in exposure (or the open beam is low); calibrate "
-                               "with --background-boxes"))
-    elif bright < 1 - max(0.05, tol):
-        c.append(Check("warn", f"the most transparent regions read T = {bright:.3f}: if any pixels are free of the "
-                               "sample, the sample run and the open beam differ in exposure; calibrate with "
+                                   "selection use the views' mean"))
+    elif bright > high:
+        c.append(Check("warn", f"the most transparent regions read T = {bright:.3f}, above the {high:.3f} a matched "
+                               "exposure reaches with this noise and open beam: the sample run and the open beam "
+                               "differ in exposure (or the open beam is low); calibrate with --background-boxes"))
+    elif bright < low:
+        c.append(Check("warn", f"the most transparent regions read T = {bright:.3f}, below the {low:.3f} a matched "
+                               "exposure reaches with this noise and open beam: if any pixels are free of the sample, "
+                               "the sample run and the open beam differ in exposure; calibrate with "
                                "--background-boxes"))
     smooth = sm.get("smoothing")
     if smooth is not None:
@@ -987,7 +1030,8 @@ def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=Non
         if blocks is not None:
             blocks.close()                                  # stops the prefetch before the source closes
         src.close()
-    sm = dict(_summary_from_T(ds.T, ds.dose, ds.spatial_shape, bg, ds.open_beam_observations),
+    sm = dict(_summary_from_T(ds.T, ds.dose, ds.spatial_shape, bg, ds.open_beam_observations,
+                              dose_per_bin=ds.dose_per_bin),
               smoothing=ds.info.get("open_beam_smoothing"))
     ds.info["T_stats"], ds.info["above_one"] = sm["stats"], sm["above_one"]
     ds.checks = _checks_from_summary(sm, ds.spatial_shape, strict)
@@ -1074,7 +1118,7 @@ def convert_to_hdf5(path, output=None, open_beam=None, input_type="auto", datase
         pos_bin = np.zeros(K, dtype=np.int64)
         bin_min = np.full(K, np.inf, dtype=np.float32)
         bin_max = np.full(K, -np.inf, dtype=np.float32)
-        stride = max(1, -(-P * K // 4_000_000))
+        stride = _sample_stride(P, K)
         sample = np.empty((-(-P // stride), K), dtype=np.float32)
         dose_blocks, ob_zero, nonfinite_in, factor_parts, variances = [], 0.0, 0.0, [], []
         ob_per_bin = np.zeros(K) if itype == "counts" else None
@@ -1136,8 +1180,8 @@ def convert_to_hdf5(path, output=None, open_beam=None, input_type="auto", datase
             sm = dict(pixels=P, bins=K, nbytes=P * K * 4, stats=st, above_one=tot["above"] / tot["n"],
                       dead_px=_frac(pos_px == 0), dead_bins=dead_bins,
                       const_bins=int((bin_max == bin_min).sum()) - dead_bins, dose=dose,
-                      bright=_bright_level(sum_px / K, (V, rows, cols), sample, dose, n_eff), background=bg,
-                      smoothing=sm_note)
+                      bright=_bright_level(sum_px / K, (V, rows, cols), sample, dose, n_eff, per_bin),
+                      background=bg, smoothing=sm_note)
             checks = _checks_from_summary(sm, (V, rows, cols), strict)
             f.create_dataset("bin_indices", data=src.source_bins[:K * wave_bin:wave_bin])
             if per_bin is not None:
