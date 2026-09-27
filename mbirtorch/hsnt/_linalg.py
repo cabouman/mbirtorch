@@ -98,22 +98,23 @@ def nndsvda(X, n_components):
 def _batched_spd_solve(M, g, jitter_rel=1e-9):
     """Solve M[b] d[b] = g[b] for a batch of small SPD matrices.
 
-    Tikhonov damping scaled to each matrix keeps the factorization well posed when
-    Z is near zero (heavily attenuated pixels), and the fallback is branch-free so
-    no host synchronization is introduced inside the iteration.
+    The system is solved in Jacobi scaling, D^-1/2 M D^-1/2 with D = diag(M), so the Tikhonov damping is relative to
+    each diagonal entry: a component whose curvature is orders of magnitude below another's (a skewed gauge, or a
+    component next to a huge one) keeps its Newton step, and rescaling a component leaves the solve equivariant. The
+    damping keeps the factorization well posed when Z is near zero (heavily attenuated pixels), and the fallback is
+    branch-free so no host synchronization is introduced inside the iteration.
     """
     rank = M.shape[-1]
     eye = torch.eye(rank, dtype=M.dtype, device=M.device)
-    diag = torch.diagonal(M, dim1=-2, dim2=-1)
-    lam = jitter_rel * diag.amax(-1).clamp_min(torch.finfo(M.dtype).tiny)
-    A = M + lam[:, None, None] * eye
+    s = torch.diagonal(M, dim1=-2, dim2=-1).clamp_min(torch.finfo(M.dtype).tiny).sqrt()
+    A = M / (s[:, :, None] * s[:, None, :]) + jitter_rel * eye
     L, info = torch.linalg.cholesky_ex(A)
     failed = (info > 0)[:, None, None]
     L = torch.where(failed, eye.expand_as(L), L)
-    d = torch.cholesky_solve(g.unsqueeze(-1), L).squeeze(-1)
-    diag_A = torch.diagonal(A, dim1=-2, dim2=-1).clamp_min(torch.finfo(M.dtype).tiny)
-    d = torch.where(failed[:, :, 0], g / diag_A, d)
-    # A row with no curvature (Z underflows in float32 above an attenuation of about 88) makes the fallback divide by
+    gs = g / s
+    d = torch.cholesky_solve(gs.unsqueeze(-1), L).squeeze(-1)
+    d = torch.where(failed[:, :, 0], gs / torch.diagonal(A, dim1=-2, dim2=-1), d) / s
+    # A row with no curvature (Z underflows in float32 above an attenuation of about 88) makes the scaling divide by
     # `tiny` and overflow; take no step there and let later gradient-driven steps bring the iterate back into range.
     return torch.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -129,25 +130,25 @@ def _joint_blocks(flat, rows, cols, rank, free, jitter):
     M[:, cols, rows] = flat
     eye = torch.eye(rank, dtype=M.dtype, device=M.device)
     M = torch.where(free[:, :, None] & free[:, None, :], M, eye.expand_as(M))
-    scale = torch.diagonal(M, dim1=-2, dim2=-1).amax(-1).clamp_min(torch.finfo(M.dtype).tiny)
-    M = M + (jitter * scale)[:, None, None] * eye
+    # Damping relative to each diagonal entry (Jacobi), so that one component's curvature does not set another's.
+    M = M + torch.diag_embed(jitter * torch.diagonal(M, dim1=-2, dim2=-1).clamp_min(torch.finfo(M.dtype).tiny))
     L, info = torch.linalg.cholesky_ex(M)
     return torch.where((info > 0)[:, None, None], eye.expand_as(L), L)
 
 
-def _reseed_dead(W, H):
-    """Re-seed any component whose map or spectrum is zero, both factors, with small random values from a fixed
-    generator. Returns (W, H, number re-seeded).
+def _reseed_dead(W, H, T=None, seed=0):
+    """Re-seed any component whose map or spectrum is zero, both factors, with small random values. Returns (W, H,
+    number re-seeded).
 
     With its spectrum at zero the map gets no gradient, and a spectrum whose every bin has an outward gradient stays at
     zero, so the component contributes nothing from then on: a degenerate stationary point, which the first projected
     step can reach from an ordinary start. The projected steps set a dying factor exactly to zero, and the test is for
     exact zeros rather than for a norm small next to the other components': how a component's scale splits between
     its map and its spectrum is arbitrary, and at low dose the fit can send one component to a huge scale on the zero
-    counts, next to which a live component looks dead. For the same reason both factors of the seed take one scale,
-    the median over the live components of the geometric mean of their mean map and mean spectrum entries, which
-    that split does not change and one huge component does not set. A random rather than constant seed keeps the
-    revived spectrum from being flat.
+    counts, next to which a live component looks dead. For the same reasons the seed's scale comes from the data,
+    sqrt(mean attenuation / R) in both factors (given T; otherwise the median over the live components of the
+    geometric mean of their mean map and spectrum entries). The generator is seeded with `seed`, so repeated re-seeds
+    of a component can differ, and a random rather than constant seed keeps the revived spectrum from being flat.
     """
     dead = (W.amax(0) <= 0) | (H.amax(1) <= 0)
     n_dead = int(dead.sum())
@@ -156,11 +157,31 @@ def _reseed_dead(W, H):
     live = ~dead
     W = W.clone()
     H = H.clone()
-    scale = float((W[:, live].mean(0).double() * H[live].mean(1).double()).sqrt().median()) if bool(live.any()) else 1.0
-    g = torch.Generator(device=W.device).manual_seed(0)
+    if T is not None:
+        scale = _attenuation_scale(T, W.shape[1])
+    elif bool(live.any()):
+        scale = float((W[:, live].mean(0).double() * H[live].mean(1).double()).sqrt().median())
+    else:
+        scale = 1.0
+    g = torch.Generator(device=W.device).manual_seed(int(seed))
     W[:, dead] = 1e-2 * scale * torch.rand(W.shape[0], n_dead, generator=g, dtype=W.dtype, device=W.device)
     H[dead] = 1e-2 * scale * torch.rand(n_dead, H.shape[1], generator=g, dtype=H.dtype, device=H.device)
     return W, H, n_dead
+
+
+def _attenuation_scale(T, rank, chunk=2 ** 23):
+    """sqrt(mean attenuation / rank) over the entries with counts, in float64 and by blocks of rows: the scale of one
+    factor entry of a component carrying 1/rank of a typical attenuation."""
+    rows = max(1, chunk // max(T.shape[1], 1))
+    total = torch.zeros((), dtype=torch.float64, device=T.device)
+    count = 0
+    for i in range(0, T.shape[0], rows):
+        t = T[i:i + rows]
+        real = t > 1e-12
+        total = total + torch.where(real, -torch.log(t.clamp_min(1e-12)), 0).sum(dtype=torch.float64)
+        count += int(real.sum())
+    mean = float(total) / count if count else 1.0
+    return max(mean, 0.0) ** 0.5 / max(rank, 1) ** 0.5
 
 
 def _attenuation_for_start(T):
@@ -175,11 +196,13 @@ def _attenuation_for_start(T):
 
 
 def _nonneg_least_squares_start(A, H, ridge=1e-6):
-    """W >= 0 approximately minimizing ||A - W H||, from the R x R normal equations with a relative ridge, solved by
-    Cholesky in float64 so that a rank-deficient H gives finite values on every device."""
+    """W >= 0 approximately minimizing ||A - W H||, from the R x R normal equations with a ridge relative to each
+    diagonal entry (so rescaling a row of H rescales its coefficient and nothing else), solved by Cholesky in float64
+    so that a rank-deficient H gives finite values on every device."""
     Hd = H.double()
     G = Hd @ Hd.T
-    G = G + ridge * torch.diagonal(G).mean().clamp_min(torch.finfo(torch.float64).tiny) * torch.eye(
-        G.shape[0], dtype=G.dtype, device=G.device)
+    diag = torch.diagonal(G)
+    floor = 1e-12 * diag.mean().clamp_min(torch.finfo(torch.float64).tiny)     # a zero row of H: keep G definite
+    G = G + ridge * torch.diag_embed(torch.maximum(diag, floor))
     W = torch.cholesky_solve((A.double() @ Hd.T).T, torch.linalg.cholesky(G)).T
     return W.clamp_(min=0).to(A.dtype)

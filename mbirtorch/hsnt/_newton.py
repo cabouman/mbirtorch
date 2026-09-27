@@ -10,8 +10,9 @@ from ._loss import _nnal_prep, _nnal_rowwise, stable_nnal, stable_nnal_derivativ
 _ARMIJO_FLOOR = 4.0
 # Trust-region floor as a fraction of the mean row scale; without it a row pinned near zero crawls.
 _TRUST_FLOOR = 1e-3
-# epsilon-active set (Bertsekas): a component this close to zero with an outward gradient is snapped to zero, so a
-# tiny residue at the feasibility limit cannot freeze its row at a non-stationary point.
+# epsilon-active set (Bertsekas): an entry within this fraction of its component's mean positive entry of zero, with
+# an outward gradient, is frozen and snapped to zero, so a tiny residue at the feasibility limit cannot freeze its row
+# at a non-stationary point.
 _ACTIVE_TOL = 1e-6
 # A block step that drives an entry to within this many ulps of zero sets it to exactly zero, so that fused (compiled)
 # and separate rounding take the same active-set decision.
@@ -19,8 +20,9 @@ _SNAP_ULPS = 8.0
 # The joint solve stops after this many consecutive accepted steps below rel_tol: its tail is slow and erratic, and a
 # single quiet step is followed by larger decreases often enough to make a one-step stop irreproducible.
 _PATIENCE = 5
-# 'auto' compiles from this many data entries on CUDA (about 400k pixels at 1200 bins), where one solve repays a cold
-# compile; the rank search and smaller solves run faster uncompiled.
+# 'auto' compiles from this many data entries on CUDA (about 417k pixels at 1200 bins). At 1M pixels a compiled step
+# takes about a third of the eager time; below the threshold solves run eager, since the break-even against a first
+# compile has not been measured. The rank search always runs eager.
 _COMPILE_MIN_ELEMENTS = 5e8
 # Re-seeds of a dead component after the joint solve; a component that dies again each time has no support in the
 # data, and the solve returns it dead, as it does when the solve after a re-seed ends no lower.
@@ -63,10 +65,13 @@ def _two_metric_direction(V, grad, flat, rows, cols, jitter_rel=1e-9, nonneg=Tru
     (Q = rank (rank + 1) / 2, indexed by `rows`, `cols`). Two-metric projection
     (Bertsekas): variables within an epsilon of the bound with an outward
     gradient are frozen and snapped to zero, the rest take the Newton step; a
-    bound-adjacent entry with an inward gradient gets the scaled gradient so one
-    pinned entry cannot zero the step for its whole row; a per-row trust region
-    bounds directions from rows without curvature; a non-descent direction falls
-    back to the scaled gradient; alpha is the largest step keeping V >= 0. With
+    bound-adjacent entry with an inward gradient gets the scaled gradient, and is
+    kept out of the Newton system so that its partners' moves do not assume a
+    step it does not take; a per-row trust region bounds directions from rows
+    without curvature; a non-descent direction falls back to the scaled gradient;
+    alpha is the largest step keeping V >= 0. The epsilon and the trust region are
+    per component, in units of each component's mean positive entry, so rescaling a component
+    (a gauge change of X = W H) rescales its direction and nothing else. With
     nonneg=False there is no active set, no feasibility limit and alpha = 1. The
     constants are documented where they are defined (_ARMIJO_FLOOR, _TRUST_FLOOR
     and _ACTIVE_TOL).
@@ -74,27 +79,35 @@ def _two_metric_direction(V, grad, flat, rows, cols, jitter_rel=1e-9, nonneg=Tru
     Returns (d, slope, alpha, bound, projected_gnorm2): d is the descent
     direction (V decreases along +d), slope = <grad, d> per row, alpha the
     per-row feasible step, bound the frozen mask, and the squared norm of the
-    projected gradient (the KKT residual at the incoming iterate).
+    projected gradient per component (rank,), the KKT residual at the incoming
+    iterate.
     """
     rank = V.shape[1]
     M = flat.new_zeros(flat.shape[0], rank, rank)
     M[:, rows, cols] = flat
     M[:, cols, rows] = flat
-    eps_active = _ACTIVE_TOL * V.abs().amax(-1, keepdim=True).mean()
+    # Each component's scale is its mean positive entry: equivariant under rescaling the component, and, unlike the
+    # mean over all rows, not shrunk by sparsity (a material in a few percent of the pixels), which would let
+    # residues just above the epsilon stall their rows.
+    pos = V > 0
+    unit = torch.where(pos, V, torch.zeros_like(V)).sum(0, keepdim=True) / pos.sum(0, keepdim=True).clamp_min(1)
+    eps_active = _ACTIVE_TOL * unit
+    unit = torch.where(unit > 0, unit, torch.ones_like(unit))
     bound = ((V <= eps_active) & (grad > 0)) if nonneg else torch.zeros_like(grad, dtype=torch.bool)
     free = ~bound
-    projected_gnorm2 = ((grad * free) ** 2).sum()
+    projected_gnorm2 = ((grad * free) ** 2).sum(0)
     eye = torch.eye(rank, dtype=V.dtype, device=V.device)
-    M = torch.where(free[:, :, None] & free[:, None, :], M, eye.expand_as(M))
-    rhs = torch.where(free, grad, torch.zeros_like(grad))
-    d = _batched_spd_solve(M, rhs, jitter_rel)
-    d = torch.where(free, d, torch.zeros_like(d))
-    diag_M = torch.diagonal(M, dim1=-2, dim2=-1).clamp_min(torch.finfo(V.dtype).tiny)
     inward = ((V <= eps_active) & (grad < 0)) if nonneg else torch.zeros_like(grad, dtype=torch.bool)
+    newton = free & ~inward
+    diag_M = torch.diagonal(M, dim1=-2, dim2=-1).clamp_min(torch.finfo(V.dtype).tiny)
+    M = torch.where(newton[:, :, None] & newton[:, None, :], M, eye.expand_as(M))
+    d = _batched_spd_solve(M, torch.where(newton, grad, torch.zeros_like(grad)), jitter_rel)
+    d = torch.where(newton, d, torch.zeros_like(d))
     d = torch.where(inward, grad / diag_M, d)
-    row_max = V.abs().amax(-1, keepdim=True)
+    rhs = torch.where(free, grad, torch.zeros_like(grad))
+    row_max = (V.abs() / unit).amax(-1, keepdim=True)
     floor = torch.clamp(_TRUST_FLOOR * row_max.mean(), min=torch.finfo(V.dtype).eps)
-    limit = 16.0 * torch.maximum(row_max, floor)
+    limit = 16.0 * torch.maximum(row_max, floor) * unit
     d = torch.clamp(d, min=-limit, max=limit)
     slope = (grad * d).sum(-1)
     d = torch.where((slope <= 0)[:, None], torch.clamp(rhs / diag_M, min=-limit, max=limit), d)
@@ -124,7 +137,8 @@ def block_newton_step(V, other, X, T, prep, axis, jitter_rel=1e-9, nonneg=True):
 
     Returns:
         (V_new, X_new, (num_backtracks, projected_gradient_norm_squared)). The
-        gradient norm is measured at the incoming iterate, before the step.
+        squared gradient norm is per component and measured at the incoming
+        iterate, before the step.
     """
     G, Z = stable_nnal_derivatives(X, T, prep)
 
@@ -155,9 +169,9 @@ def block_newton_step(V, other, X, T, prep, axis, jitter_rel=1e-9, nonneg=True):
     accepted = torch.zeros_like(alpha)
     done = torch.zeros_like(alpha, dtype=torch.bool)
     num_backtracks = 0
+    dim = 1 if axis == 0 else 0
     for _ in range(8):
         trial = torch.where(done, torch.zeros_like(alpha), alpha)
-        dim = 1 if axis == 0 else 0
         # Accept a step that is not measurably worse than the Armijo target (see _ARMIJO_FLOOR).
         noise = _ARMIJO_FLOOR * torch.finfo(V.dtype).eps * base.abs()
         ok = (_nnal_rowwise(X - expand(trial) * B, T, prep, dim, dtype=torch.float64)
@@ -171,11 +185,22 @@ def block_newton_step(V, other, X, T, prep, axis, jitter_rel=1e-9, nonneg=True):
 
     step = accepted[:, None] * d
     V_new = V - step
+    X_new = X - expand(accepted) * B
     if nonneg:
         reach = (d > 0) & (step >= V * (1.0 - _SNAP_ULPS * torch.finfo(V.dtype).eps))    # see _SNAP_ULPS
         V_new = torch.where(reach, torch.zeros_like(V_new), V_new).clamp_(min=0.0)
-        V_new = torch.where(bound, torch.zeros_like(V_new), V_new)
-    X_new = X - expand(accepted) * B
+        # Snap the frozen entries to zero, but only in rows whose loss the snap does not raise: the line search has
+        # not seen it, and a small entry times a large partner row can be a large change of X (at low dose, next to a
+        # huge zero-count component). X is updated with the snap where it applies.
+        snap = bound & (V_new > 0)
+        if bool(snap.any()):
+            dV = torch.where(snap, V_new, torch.zeros_like(V_new))
+            X_try = X_new - (dV @ other if axis == 0 else other @ dV.T)
+            l_plain = _nnal_rowwise(X_new, T, prep, dim, dtype=torch.float64)
+            l_try = _nnal_rowwise(X_try, T, prep, dim, dtype=torch.float64)
+            keep = l_try <= l_plain + _ARMIJO_FLOOR * torch.finfo(V.dtype).eps * l_plain.abs()
+            V_new = torch.where(keep[:, None], V_new - dV, V_new)
+            X_new = torch.where(expand(keep), X_try, X_new)
     if axis == 1:
         V_new = V_new.T.contiguous()
     return V_new, X_new, (num_backtracks, projected_gnorm2)
@@ -193,18 +218,18 @@ def block_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True, W
     num_steps = 0
     for step in range(max_steps):
         X = W @ H                      # resynchronize against incremental drift
+        W_in, H_in = W, H
         W, X, info_W = step_fn(W, H, X, T, prep, 0, nonneg=nonneg_W)
-        gnorm2 = info_W[1]
+        gnorm = _stationarity(info_W[1], W_in, 0)
         if update_H:
             H, X, info_H = step_fn(H, W, X, T, prep, 1)
-            gnorm2 = gnorm2 + info_H[1]
-            W, H, _ = _reseed_dead(W, H)
+            gnorm = gnorm + _stationarity(info_H[1], H_in, 1)
+            W, H, _ = _reseed_dead(W, H, T, seed=step + 1)
         num_steps = step + 1
         if rel_tol > 0:
             # The relative loss change per step, summed in float64; the projected-gradient (KKT) test catches data
             # the model fits exactly, whose loss goes to zero and whose relative change never becomes small.
             loss = rowwise(X, T, prep, 1, dtype=torch.float64).sum()
-            gnorm = gnorm2.sqrt()
             if gnorm0 is None:
                 gnorm0 = gnorm
             if (bool(torch.abs(loss - prev_loss) <= rel_tol * torch.abs(loss))
@@ -212,6 +237,14 @@ def block_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True, W
                 break
             prev_loss = loss
     return W, H, num_steps
+
+
+def _stationarity(projected_gnorm2, V, axis):
+    """Sum over components of |projected gradient of the factor| x |factor|: the KKT measure of the stops, which
+    rescaling a component leaves unchanged (its gradient scales inversely to it), unlike a plain gradient norm, which a
+    component in a large gauge dominates. projected_gnorm2 is per component; V is W (axis 0) or H (axis 1)."""
+    norms = V.norm(dim=0) if axis == 0 else V.norm(dim=1)
+    return (projected_gnorm2.clamp_min(0).sqrt() * norms).sum()
 
 
 
@@ -276,9 +309,10 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, 
         if not torch.isfinite(gnorm2) or gnorm2 == 0:
             break
         # KKT fallback for data the model fits exactly, where the shifted loss goes to zero and its relative change
-        # stays O(1). It fires only as loss -> 0, where loss ~ g^2, so a gradient ratio of rel_tol is a loss ratio of
-        # rel_tol^2; machine precision needs a gradient ratio of a few tens of eps. The loss test below is primary.
-        gnorm = gnorm2.sqrt()
+        # stays O(1). There loss ~ g^2, so a gradient ratio of rel_tol is a loss ratio of rel_tol^2, and machine
+        # precision needs a gradient ratio of a few tens of eps. The loss test below is primary. The measure is
+        # invariant to rescaling a component (_stationarity), so a start in a skewed gauge does not set it.
+        gnorm = (gW.norm(dim=0) * W.norm(dim=0)).sum() + (gH.norm(dim=1) * H.norm(dim=1)).sum()
         if gnorm0 is None:
             gnorm0 = gnorm
         elif rel_tol > 0 and gnorm <= max(rel_tol ** 2, 100 * torch.finfo(T.dtype).eps) * gnorm0:
@@ -391,7 +425,7 @@ def joint_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True, W
         W, X, _ = step_fn(W, H, X, T, prep, 0)
         H, X, _ = step_fn(H, W, X, T, prep, 1)
         if i + 1 < max_steps:                             # re-seed only when a step follows
-            W, H, _ = _reseed_dead(W, H)
+            W, H, _ = _reseed_dead(W, H, T, seed=i + 1)
     before = None                                         # (W, H, loss) before the last end-of-solve re-seed
     for attempt in range(_MAX_RESEEDS + 1):
         if steps >= max_steps:
@@ -404,7 +438,7 @@ def joint_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True, W
             break
         if attempt == _MAX_RESEEDS or steps >= max_steps:
             break
-        W_new, H_new, n_dead = _reseed_dead(W, H)
+        W_new, H_new, n_dead = _reseed_dead(W, H, T, seed=100 + attempt)
         if n_dead == 0:
             break
         before = (W, H, nnal_fn(W @ H, T, prep, dtype=torch.float64))

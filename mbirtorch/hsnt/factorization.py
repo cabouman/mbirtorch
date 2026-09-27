@@ -1,5 +1,7 @@
 """The maximum-likelihood NNAL factorization of a transmission tensor, the solver behind dehydrate."""
 
+import torch
+
 from ._linalg import _attenuation_for_start, _nonneg_least_squares_start, nndsvda
 from ._newton import _resolve_compile, joint_newton_optimize
 
@@ -20,8 +22,12 @@ def _nnal_factorization(T, num_materials, max_steps=1000, rel_tol=1e-8, compile_
 
     The loss sum[exp(-X) + T X], X = W @ H, is the Poisson negative log-likelihood of the counts up to a constant
     and a factor of the dose. The solver runs a few block-Newton steps, then a matrix-free truncated Newton solve on
-    (W, H) jointly, and stops after five consecutive steps whose relative loss change is at most rel_tol; at 1e-8
-    the result is reproducible across starts and compilation.
+    (W, H) jointly, and stops after five consecutive steps whose relative loss change is at most rel_tol. At 1e-8 the
+    stop is insensitive to rounding: compiled and eager solves, and solves from nearby starts, end within about 5e-7
+    of each other in loss (1M pixels; 3e-10 for compiled against eager at dose 3). The factors can still differ where
+    the loss is flat, and the problem is not convex, so a start far from the NNDSVDa one can reach another local
+    optimum. At a few counts per bin the loss can also keep falling without limit along a component that grows on
+    zero counts (_zero_count_divergence reports it); the factors then depend on max_steps.
 
     Args:
         T (torch.Tensor): Transmission ratio, (pixels, bins): counts divided by the open-beam counts, zero counts
@@ -50,3 +56,23 @@ def _nnal_factorization(T, num_materials, max_steps=1000, rel_tol=1e-8, compile_
         H_init = _nonneg_least_squares_start(_attenuation_for_start(T).T, W_init.T).T
     return joint_newton_optimize(T, num_materials, max_steps, rel_tol, W_init=W_init, H_init=H_init,
                                  compile_mode=compile_mode)
+
+
+# An attenuation above this on an entry with no counts is not constrained by the data (exp(-50) is 2e-22 of one count).
+_ZERO_COUNT_BOUND = 50.0
+
+
+def _zero_count_divergence(W, H, T, chunk=2 ** 23):
+    """(largest fitted attenuation on a zero-count entry, number of zero-count entries above _ZERO_COUNT_BOUND), by
+    blocks of rows. The loss exp(-X) of a zero count has no minimum: at a few counts per bin the fit can grow a
+    component on the zero counts for as long as it runs, and these numbers show it."""
+    rows = max(1, chunk // max(T.shape[1], 1))
+    x_max, n_above = 0.0, 0
+    for i in range(0, T.shape[0], rows):
+        zero = T[i:i + rows] <= 1e-12
+        if not bool(zero.any()):
+            continue
+        X = W[i:i + rows] @ H
+        x_max = max(x_max, float(torch.where(zero, X, torch.zeros_like(X)).max()))
+        n_above += int((zero & (X > _ZERO_COUNT_BOUND)).sum())
+    return x_max, n_above

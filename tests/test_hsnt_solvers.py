@@ -14,7 +14,7 @@ import mbirtorch.hsnt as hsnt
 from mbirtorch.hsnt import _linalg, _newton
 from mbirtorch.hsnt._loss import _nnal_prep, stable_nnal, stable_nnal_derivatives
 from mbirtorch.hsnt._streaming import _stream_factorization
-from mbirtorch.hsnt.factorization import _initial_factors, _nnal_factorization
+from mbirtorch.hsnt.factorization import _initial_factors, _nnal_factorization, _zero_count_divergence
 from mbirtorch.hsnt.spectra import (_auto_penalty, _empty_fit_loss, _fit_free_sets, _guard_components, _select_supports,
                                     _support_selected_spectra, _unconstrained_spectra)
 
@@ -112,6 +112,11 @@ def test_a_dead_component_is_revived(dev):
     Wn, Hn, n = _linalg._reseed_dead(Wg, Hg)
     seed = Wn[:, 1].double().mean() * Hn[1].double().mean()
     assert n == 1 and 1e-6 * seed_ref(W_ref, H_ref) < seed < 1e-2 * seed_ref(W_ref, H_ref)
+    Wb, Hb = W_ref * 1e3, H_ref * 1e3                                              # one live component, far too large
+    Wb[:, 1:], Hb[1:] = 0, 0
+    Wn, Hn, n = _linalg._reseed_dead(Wb, Hb, T)                                   # the seed's scale from the data
+    scale = _linalg._attenuation_scale(T, 3)
+    assert n == 2 and Wn[:, 1:].max() <= 1e-2 * scale and Hn[1:].max() <= 1e-2 * scale
 
 
 def seed_ref(W, H):
@@ -126,7 +131,7 @@ def test_a_reseed_that_ends_no_lower_is_undone(dev, monkeypatch):
     W0, H0 = _initial_factors(T, 3)
     calls = []
 
-    def harmful(W, H):                          # after the warm-up, re-seed component 0 at a scale no solve recovers
+    def harmful(W, H, T=None, seed=0):          # after the warm-up, re-seed component 0 at a scale no solve recovers
         calls.append(1)
         if len(calls) <= 5:
             return W, H, 0
@@ -137,6 +142,52 @@ def test_a_reseed_that_ends_no_lower_is_undone(dev, monkeypatch):
     monkeypatch.setattr(_newton, "_reseed_dead", harmful)
     W, H, _ = _nnal_factorization(T, 3, max_steps=200, rel_tol=1e-8, compile_mode="off", W_init=W0, H_init=H0)
     assert len(calls) > 5 and torch.equal(W, W_ref) and torch.equal(H, H_ref)       # the state before the re-seed
+
+
+def test_the_block_step_is_gauge_equivariant(dev):
+    """Rescaling one component (map / c, spectrum x c) leaves W H and the loss unchanged, and the block solves with
+    it: the fixed-spectra W solve ends at the same loss, and a block H step from the rescaled MLE snaps no entry of
+    the other components and does not raise the loss."""
+    T, _, _ = _problem(dev)
+    W, H, _ = _mle(T)
+    L = _loss(_newton.solve_W(T, H), H, T)
+    prep = _nnal_prep(T)
+    _, _, _, step = _newton._kernels("off")
+    for c in (1e-6, 1e6):
+        D = torch.tensor([c, 1.0, 1.0], dtype=H.dtype, device=dev)
+        assert abs(_loss(_newton.solve_W(T, H * D[:, None]), H * D[:, None], T) - L) <= 1e-9 * L
+        Wc, Hc = W / D, H * D[:, None]
+        Hn, _, _ = step(Hc, Wc, Wc @ Hc, T, prep, 1)
+        assert torch.equal(Hn[1:] > 0, Hc[1:] > 0) and _loss(Wc, Hn, T) <= _loss(Wc, Hc, T) * (1 + 1e-9)
+
+
+def test_the_w_solve_reaches_stationarity_next_to_an_inward_entry(dev):
+    """A bound entry with an inward gradient takes a scaled-gradient step outside the Newton system, so its partners'
+    Newton moves do not assume a step it does not take: the W solve reaches a small projected gradient on data with
+    nearly collinear spectra, where such pixels used to stall."""
+    basis, _ = hsnt.load_material_basis()
+    rng = np.random.default_rng(1)
+    Hn = basis[:3, ::4][:, :300].astype(np.float64)
+    W = np.zeros((4096, 3))
+    W[np.arange(4096), rng.integers(0, 3, 4096)] = rng.uniform(0.5, 3.0, 4096) * 3.0
+    W[:512] = 0
+    T = torch.tensor(rng.poisson(3.0 * np.exp(-(W @ Hn))) / 3.0, dtype=torch.float32, device=dev)
+    H = torch.tensor(Hn, dtype=torch.float32, device=dev)
+    Ws = _newton.solve_W(T, H, max_steps=1000, rel_tol=1e-8)
+    G, _ = stable_nnal_derivatives(Ws @ H, T, _nnal_prep(T))
+    g = G @ H.T
+    pg = torch.where(Ws > 0, g, g.clamp(max=0))
+    assert (pg.double().norm() / (T.double() @ H.T.double()).norm()).item() < 1e-6
+
+
+def test_the_zero_count_divergence_is_reported(dev):
+    """At about one count per bin the loss keeps falling along a component that grows on the zero counts, and
+    _zero_count_divergence reports it; at dose 100 it reports nothing."""
+    for dose, diverges in ((1.0, True), (100.0, False)):
+        T = _sphere_problem(dev, dose=dose)
+        W, H, _ = _nnal_factorization(T, 3, max_steps=300, compile_mode="off")
+        x_max, n_above = _zero_count_divergence(W, H, T)
+        assert (n_above > 0) == diverges and (x_max > 50) == diverges
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
