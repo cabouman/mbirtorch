@@ -481,9 +481,10 @@ Each subcommand's -h lists the options most runs need; --help-all lists every op
 """
 
 _SPECTRA_HELP = ("how the component spectra are estimated. mle (default): the spectra that best fit the measured "
-                 "counts. unconstrained: removes a bias the best fit has at low dose; worth it from about 100,000 "
-                 "pixels up. support: works out which components each pixel contains, which removes the same bias "
-                 "and zeroes the background of the maps; needs the dose (an open beam or --dose)")
+                 "counts. unconstrained: removes a bias the best fit has at low dose; worth it with many pixels (on "
+                 "a test phantom 7-12 dB at a million pixels, about nothing at 40,000). support: works out which "
+                 "components each pixel contains, which removes the same bias and zeroes the background of the maps; "
+                 "needs the dose (an open beam or --dose)")
 
 
 class _Options:
@@ -593,8 +594,9 @@ class _Options:
                  help="relative loss change per step; the solve stops after five steps in a row below it "
                       "(default 1e-8)")
         self.add(g, "--compile", choices=("auto", "on", "off"), default="auto", advanced=True,
-                 help="compile the solver kernels: auto (default) on CUDA for data of 5e8 entries or more, where it "
-                      "pays; stream mode compiles only with 'on', and the rank estimate always runs uncompiled")
+                 help="compile the solver kernels: auto (default) on CUDA for data of 5e8 entries or more (about "
+                      "400k pixels at 1200 bins); stream mode compiles only with 'on', and the rank estimate always "
+                      "runs uncompiled")
         g = sp.add_argument_group("advanced: memory")
         self.add(g, "--mode", choices=("auto", "full", "stream"), default="auto", advanced=True,
                  help="full solve on the device or streamed by chunks of pixels (default: full when its estimated "

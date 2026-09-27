@@ -27,9 +27,10 @@ def _unconstrained_spectra(T, W, H, compile_mode='auto'):
     The maximum-likelihood spectra are biased by the truncation of pixel coefficients at zero: a coefficient whose
     true value is zero is estimated positive half the time and clipped the other half, and the spectra, shared by
     every pixel, absorb that excess. Dropping the bound while H is estimated removes the bias, at the price of the
-    variance the bound suppresses, so this pays when the pixels are many (above about 10^5 at a dose of 3 counts per
-    bin) and loses a little below that. Returns (W, H, steps): W >= 0 re-solved for the returned H, and the steps of
-    the free-W solve.
+    variance the bound suppresses, so it gains when the pixels are many: on a sphere phantom at 3 counts per bin, 7 to
+    12 dB on the spectra at 10^6 pixels (0.11 nats per pixel above the maximum-likelihood loss), and about nothing at
+    4 x 10^4 to 6.5 x 10^4 pixels. Returns (W, H, steps): W >= 0 re-solved for the returned H, and the steps of the
+    free-W solve.
     """
     compile_mode = _resolve_compile(compile_mode, T)
     nnal_fn, deriv, _, _ = _kernels(compile_mode)

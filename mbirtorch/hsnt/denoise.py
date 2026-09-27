@@ -92,7 +92,8 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
             nonnegative, for example the subspace_basis of another dehydration of the same bins; spectra must then be
             'mle'. Defaults to None, which fits the spectra too.
         spectra (str, optional): 'mle', the maximum-likelihood spectra; 'unconstrained', a re-estimate without the
-            bias the nonnegativity of W gives the spectra at low dose, which pays from about 10^5 pixels; 'support',
+            bias the nonnegativity of W gives the spectra at low dose, which gains with many pixels (on a sphere
+            phantom at 3 counts per bin, 7 to 12 dB at 10^6 pixels, about nothing at 4 x 10^4); 'support',
             which decides the components present in each pixel and refits, and needs the dose: it corrects the same
             bias, and in the maps mostly zeroes the background, since a pixel of one material usually needs several
             of the fitted components. Defaults to 'mle'.
@@ -107,8 +108,8 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
         max_rank (int, optional): Largest rank the estimate considers. Defaults to 6.
         device (str, optional): Torch device. Defaults to None, meaning CUDA if available, else CPU.
         compile_mode (str, optional): 'auto' compiles the solver with torch.compile on CUDA for data of at least 5e8
-            entries, where it pays; 'on' always; 'off' never. The rank estimate always runs uncompiled. Defaults to
-            'auto'.
+            entries (at 1M pixels a compiled step takes about a third of the eager time); 'on' always; 'off' never.
+            The rank estimate always runs uncompiled. Defaults to 'auto'.
         mode (str, optional): 'full' solves on the device at once, 'stream' by chunks of pixels, and 'auto' picks
             from the memory the device has available and whether the solve compiles. Streamed, spectra='unconstrained'
             and 'support' keep only part of their gain. On a 1M-pixel sphere phantom at dose 3 (one seed), against the

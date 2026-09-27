@@ -36,8 +36,9 @@ def _nnal_factorization(T, num_materials, max_steps=1000, rel_tol=1e-8, compile_
         max_steps (int, optional): Iteration cap. Defaults to 1000.
         rel_tol (float, optional): Relative change in the float64 loss per step at which to stop. Defaults to 1e-8.
         compile_mode (str, optional): 'auto' compiles the hot kernels with torch.compile on CUDA with a working
-            Triton when T has at least 5e8 entries (about 400k pixels at 1200 bins), where one solve repays the
-            compile; 'on' always compiles; 'off' never does. Defaults to 'auto'.
+            Triton when T has at least 5e8 entries (about 417k pixels at 1200 bins; at 1M pixels a compiled step
+            takes about a third of the eager time, and the break-even against a first compile is not measured);
+            'on' always compiles; 'off' never does. Defaults to 'auto'.
         W_init, H_init (torch.Tensor, optional): A start; the missing factor is fitted to the attenuation by
             nonnegative least squares. Defaults to None: an NNDSVDa start.
 
