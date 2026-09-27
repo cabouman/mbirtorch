@@ -74,6 +74,9 @@ def _zero_count_divergence(W, H, T, chunk=2 ** 23):
         if not bool(zero.any()):
             continue
         X = W[i:i + rows] @ H
-        x_max = max(x_max, float(torch.where(zero, X, torch.zeros_like(X)).max()))
-        n_above += int((zero & (X > _ZERO_COUNT_BOUND)).sum())
+        if bool((zero & ~torch.isfinite(X)).any()):          # a fit gone non-finite counts as diverged
+            x_max = float('inf')
+        else:
+            x_max = max(x_max, float(torch.where(zero, X, torch.zeros_like(X)).max()))
+        n_above += int((zero & ~(X <= _ZERO_COUNT_BOUND)).sum())
     return x_max, n_above

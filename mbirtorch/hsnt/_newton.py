@@ -434,13 +434,13 @@ def joint_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True, W
                                            prep=prep, nnal=nnal_fn, deriv=deriv_fn, patience=_PATIENCE)
         steps += taken
         if before is not None and bool(nnal_fn(W @ H, T, prep, dtype=torch.float64) >= before[2]):
-            W, H = before[0], before[1]
+            W, H, steps = before[0], before[1], before[3]           # the kept state, and the steps that reached it
             break
         if attempt == _MAX_RESEEDS or steps >= max_steps:
             break
         W_new, H_new, n_dead = _reseed_dead(W, H, T, seed=100 + attempt)
         if n_dead == 0:
             break
-        before = (W, H, nnal_fn(W @ H, T, prep, dtype=torch.float64))
+        before = (W, H, nnal_fn(W @ H, T, prep, dtype=torch.float64), steps)
         W, H = W_new, H_new
     return W, H, steps

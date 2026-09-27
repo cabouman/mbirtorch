@@ -118,7 +118,13 @@ def test_a_dead_component_is_revived(dev):
     Wb[:, 1:], Hb[1:] = 0, 0
     Wn, Hn, n = _linalg._reseed_dead(Wb, Hb, T)                                   # the seed's scale from the data
     scale = _linalg._attenuation_scale(T, 3)
-    assert n == 2 and Wn[:, 1:].max() <= 1e-2 * scale and Hn[1:].max() <= 1e-2 * scale
+    assert n == 2 and 0 < Wn[:, 1:].min() and Wn[:, 1:].max() <= 1e-2 * scale and Hn[1:].max() <= 1e-2 * scale
+    T1, _, _ = _problem(dev, dose=1.0)                                            # one count per bin: T >= 1 where
+    W1, H1, _ = _mle(T1)                                                          # there are counts
+    W0, H0 = _initial_factors(T1, 3)
+    W0[:, 2], H0[2] = 0, 0
+    W, H, _ = _nnal_factorization(T1, 3, max_steps=200, rel_tol=1e-8, compile_mode="off", W_init=W0, H_init=H0)
+    assert H[2].norm() > 0 and abs(_loss(W, H, T1) - _loss(W1, H1, T1)) <= 1e-6 * _loss(W1, H1, T1)
 
 
 def seed_ref(W, H):
@@ -213,6 +219,17 @@ def test_the_zero_count_divergence_is_reported(dev):
         Wn, _, _ = step(W, H, W @ H, T, prep, 0)
         Hn, _, _ = step(H, W, W @ H, T, prep, 1)
         assert _loss(Wn, H, T) <= _loss(W, H, T) * (1 + 1e-9) and _loss(W, Hn, T) <= _loss(W, H, T) * (1 + 1e-9)
+
+
+def test_a_streamed_fit_at_one_count_per_bin_stays_finite_and_descends():
+    """At one count per bin the streamed polish neither raises its loss (its snap of frozen spectrum entries is kept
+    only where it does not raise a bin's loss) nor follows the zero-count direction until float32 overflows."""
+    from mbirtorch.hsnt._fit import _fit
+    T = _sphere_problem("cpu", n=32, K=100, dose=1.0).numpy()
+    W, H, rep = _fit(T, 3, device="cpu", mode="stream", chunk_pixels=512, max_passes=10, compile_mode="off")
+    losses = rep["loss_per_pass"]
+    assert np.isfinite(W).all() and np.isfinite(H).all() and len(losses) >= 8
+    assert all(b <= a * (1 + 1e-9) for a, b in zip(losses, losses[1:]))
 
 
 def test_a_fit_reports_the_zero_count_divergence(caplog):

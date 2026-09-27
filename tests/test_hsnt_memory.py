@@ -76,7 +76,7 @@ def test_a_1m_pixel_fit_is_solved_whole_on_an_80_gb_gpu_when_it_compiles(monkeyp
     _fake_cuda(monkeypatch, total=79.2, free=78.6, triton=False)
     for spectra in ("mle", "unconstrained", "support"):
         mode, chunk, warmup, note = _plan(P, K, "cuda", spectra)
-        assert (mode, chunk, warmup) == ("stream", 658_432, 16384) and "eager" in note and "(2 chunks)" in note
+        assert (mode, chunk, warmup) == ("stream", 585_728, 16384) and "eager" in note and "(2 chunks)" in note
     assert _plan(P, K, "cuda", "mle", compile_mode="off")[0] == "stream"                 # compile_mode is heeded
     assert _plan(P, K, "cuda", "mle", mode="full")[0] == "full"                            # and a mode given
 
@@ -86,7 +86,7 @@ def test_a_laptop_gpu_streams_and_caps_the_warm_up(monkeypatch):
     entry, and fits its warm-up on fewer than 16,384 pixels, which would need more than that share."""
     _fake_cuda(monkeypatch, total=4.0, free=3.2)
     mode, chunk, warmup, note = _plan(262_144, 2500, "cuda", "mle")
-    assert (mode, chunk, warmup) == ("stream", 12_288, 13_312) and "(22 chunks)" in note
+    assert (mode, chunk, warmup) == ("stream", 11_264, 13_312) and "(24 chunks)" in note
     assert "warm-up fits 13,312 pixels, not 16,384" in note
     assert _plan(262_144, 2500, "cuda", "basis")[2] is None                   # a given basis has no warm-up
     _fake_cuda(monkeypatch, total=4.0, free=0.1)

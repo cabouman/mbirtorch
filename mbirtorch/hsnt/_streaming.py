@@ -29,10 +29,11 @@ def _h_stats_accumulate(W, H, T, prep, rows, cols, deriv, rowwise):
 
 def _h_direction(H, grad, flat, rows, cols, jitter_rel=1e-9):
     """Projected-Newton direction on H from accumulated statistics: the H axis of
-    block_newton_step on the (K, R) transpose. Returns (d, slope, alpha_max) with
-    one row/entry per bin; see _newton._two_metric_direction."""
-    d, slope, alpha, _, _ = _newton._two_metric_direction(H.T, grad.T, flat.T, rows, cols, jitter_rel)
-    return d, slope, alpha
+    block_newton_step on the (K, R) transpose. Returns (d, slope, alpha_max, bound)
+    with one row/entry per bin, bound the entries frozen at the bound; see
+    _newton._two_metric_direction."""
+    d, slope, alpha, bound, _ = _newton._two_metric_direction(H.T, grad.T, flat.T, rows, cols, jitter_rel)
+    return d, slope, alpha, bound
 
 
 # Each chunk's W solve (block Newton, stopping tolerance and cap), and the step lengths tried per H line search.
@@ -115,6 +116,7 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
         nonlocal H
         prev_loss = None
         passes = 0
+        last = None                                   # the last pass's (W chunks, H), consistent with each other
         for p in range(passes_max + 1):
             # Pass A: W per chunk with H fixed; H's statistics summed over chunks in float64, since the per-bin
             # loss must resolve improvements far below the float32 ulp of a sum near 1e8.
@@ -138,6 +140,16 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
                 scale += (W.T @ Tc).to(torch.float64)
                 del Tc, W
             loss = base.sum(dtype=torch.float64)
+            finite = all(bool(torch.isfinite(x).all()) for x in (loss, grad, flat))
+            if not finite:
+                # A component growing on the zero counts overflowed the float32 statistics: keep the last pass.
+                log.warning("streamed fit: the %s statistics are not finite at pass %d (a component growing on the "
+                            "zero counts overflows); the fit keeps the last finite pass",
+                            "support refit" if tag else "polish", p)
+                if last is not None:
+                    W_chunks[:], H = last
+                break
+            last = (list(W_chunks), H)
             # Projected gradient: where H is zero only a negative gradient (a wish to grow) counts.
             pg = torch.where(H > 0, grad, grad.clamp(max=0))
             kkt = (pg.norm() / scale.norm()).item()
@@ -158,11 +170,16 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
             prev_loss = loss
 
             # One exact Newton step on H from the accumulated statistics.
-            d, slope, alpha_max = _h_direction(H, grad.to(H.dtype), flat.to(H.dtype), rows, cols)
+            d, slope, alpha_max, bound = _h_direction(H, grad.to(H.dtype), flat.to(H.dtype), rows, cols)
             alphas = alpha_max[None, :] * (0.5 ** torch.arange(_LS_TRIALS, dtype=H.dtype, device=H.device))[:, None]
+            # The epsilon-active snap, as in block_newton_step: the frozen entries (their step is zero) are set to zero,
+            # but only in bins whose loss the snap does not raise, so pass B also scores every trial with the snap.
+            snap = torch.where(bound & (H.T > 0), H.T, torch.zeros_like(H.T))
+            with_snap = bool((snap > 0).any())
 
-            # Pass B: the per-bin loss at every trial step, summed over chunks.
+            # Pass B: the per-bin loss at every trial step, with and without the snap, summed over chunks.
             trial = torch.zeros(_LS_TRIALS, H.shape[1], dtype=torch.float64, device=H.device)
+            trial_snap = torch.zeros_like(trial) if with_snap else None
             nxt = to_device(chunks[0])
             for i in range(len(chunks)):
                 Tc = nxt
@@ -172,26 +189,29 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
                 W = W_chunks[i].to(device)
                 X = W @ H
                 B = W @ d.T
+                Bs = W @ snap.T if with_snap else None
                 for t in range(_LS_TRIALS):
-                    trial[t] += rowwise(X - alphas[t][None, :] * B, Tc, prep, 0, dtype=torch.float64)
-                del Tc, W, X, B
+                    Xt = X - alphas[t][None, :] * B
+                    trial[t] += rowwise(Xt, Tc, prep, 0, dtype=torch.float64)
+                    if with_snap:
+                        trial_snap[t] += rowwise(Xt - Bs, Tc, prep, 0, dtype=torch.float64)
+                del Tc, W, X, B, Bs
             # Same floor as block_newton_step (see _ARMIJO_FLOOR): the float32 sums are
             # gone, but elements whose step falls below ulp(X) still do not move.
             noise = _newton._ARMIJO_FLOOR * torch.finfo(H.dtype).eps * base.abs()
             # Armijo, per bin and trial
             ok = trial <= base[None, :] - 1e-4 * alphas.double() * slope.double()[None, :] + noise[None, :]
             # largest accepted trial per bin, else zero
-            accepted = torch.where(ok.any(0), alphas.gather(0, ok.float().argmax(0, keepdim=True)).squeeze(0),
-                                   torch.zeros_like(alpha_max))
-            Ht = (H.T - accepted[:, None] * d).clamp_(min=0)
-            # Same epsilon-active snap as block_newton_step: a bin component at the bound with an outward gradient
-            # becomes exactly zero, not a residue. The epsilon is per component (its mean positive entry), so a
-            # snapped entry is at most 1e-6 of that component's scale; no other component sets it.
-            pos = Ht > 0
-            unit = (torch.where(pos, Ht, torch.zeros_like(Ht)).sum(0, keepdim=True)
-                    / pos.sum(0, keepdim=True).clamp_min(1))
-            eps_active = _newton._ACTIVE_TOL * unit
-            Ht = torch.where((Ht <= eps_active) & (grad.T.to(Ht.dtype) > 0), torch.zeros_like(Ht), Ht)
+            first = ok.float().argmax(0, keepdim=True)
+            accepted = torch.where(ok.any(0), alphas.gather(0, first).squeeze(0), torch.zeros_like(alpha_max))
+            step = accepted[:, None] * d
+            Ht = H.T - step
+            reach = (d > 0) & (step >= H.T * (1.0 - _newton._SNAP_ULPS * torch.finfo(H.dtype).eps))  # see _SNAP_ULPS
+            Ht = torch.where(reach, torch.zeros_like(Ht), Ht).clamp_(min=0)
+            if with_snap:
+                chosen = trial.gather(0, first).squeeze(0)
+                keep = ok.any(0) & (trial_snap.gather(0, first).squeeze(0) <= chosen + noise)
+                Ht = torch.where(keep[:, None] & (snap > 0), torch.zeros_like(Ht), Ht)
             H = Ht.T.contiguous()
             passes = p + 1
         return passes

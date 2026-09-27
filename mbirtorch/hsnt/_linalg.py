@@ -1,3 +1,5 @@
+import math
+
 import torch
 
 
@@ -140,15 +142,16 @@ def _reseed_dead(W, H, T=None, seed=0):
     """Re-seed any component whose map or spectrum is zero, both factors, with small random values. Returns (W, H,
     number re-seeded).
 
-    With its spectrum at zero the map gets no gradient, and a spectrum whose every bin has an outward gradient stays at
-    zero, so the component contributes nothing from then on: a degenerate stationary point, which the first projected
-    step can reach from an ordinary start. The projected steps set a dying factor exactly to zero, and the test is for
-    exact zeros rather than for a norm small next to the other components': how a component's scale splits between
-    its map and its spectrum is arbitrary, and at low dose the fit can send one component to a huge scale on the zero
-    counts, next to which a live component looks dead. For the same reasons the seed's scale comes from the data,
-    sqrt(mean attenuation / R) in both factors (given T; otherwise the median over the live components of the
-    geometric mean of their mean map and spectrum entries). The generator is seeded with `seed`, so repeated re-seeds
-    of a component can differ, and a random rather than constant seed keeps the revived spectrum from being flat.
+    With its spectrum at zero the map gets no gradient, and a spectrum whose every bin has an outward gradient stays
+    at zero, so the component contributes nothing from then on: a degenerate stationary point, which the first
+    projected step can reach from an ordinary start. The projected steps set a dying factor exactly to zero, and the
+    test is for exact zeros rather than for a norm small next to the other components': how a component's scale
+    splits between its map and its spectrum is arbitrary, and at low dose the fit can send one component to a huge
+    scale on the zero counts, next to which a live component looks dead. For the same reasons the seed's scale comes
+    from the data, sqrt(-log(mean T) / R) in both factors (given T whose mean is below 1; otherwise the median over
+    the live components of the geometric mean of their mean map and spectrum entries). The generator is seeded with
+    `seed`, so repeated re-seeds of a component can differ, and a random rather than constant seed keeps the revived
+    spectrum from being flat.
     """
     dead = (W.amax(0) <= 0) | (H.amax(1) <= 0)
     n_dead = int(dead.sum())
@@ -157,12 +160,10 @@ def _reseed_dead(W, H, T=None, seed=0):
     live = ~dead
     W = W.clone()
     H = H.clone()
-    if T is not None:
-        scale = _attenuation_scale(T, W.shape[1])
-    elif bool(live.any()):
-        scale = float((W[:, live].mean(0).double() * H[live].mean(1).double()).sqrt().median())
-    else:
-        scale = 1.0
+    scale = _attenuation_scale(T, W.shape[1]) if T is not None else 0.0
+    if not scale > 0:
+        scale = (float((W[:, live].mean(0).double() * H[live].mean(1).double()).sqrt().median())
+                 if bool(live.any()) else 1.0)
     g = torch.Generator(device=W.device).manual_seed(int(seed))
     W[:, dead] = 1e-2 * scale * torch.rand(W.shape[0], n_dead, generator=g, dtype=W.dtype, device=W.device)
     H[dead] = 1e-2 * scale * torch.rand(n_dead, H.shape[1], generator=g, dtype=H.dtype, device=H.device)
@@ -170,18 +171,18 @@ def _reseed_dead(W, H, T=None, seed=0):
 
 
 def _attenuation_scale(T, rank, chunk=2 ** 23):
-    """sqrt(mean attenuation / rank) over the entries with counts, in float64 and by blocks of rows: the scale of one
-    factor entry of a component carrying 1/rank of a typical attenuation."""
+    """sqrt(-log(mean T) / rank), the mean over every entry (zero counts included) taken in float64 by blocks of rows:
+    the scale of one factor entry of a component carrying 1/rank of a typical attenuation; 0 when the mean
+    transmission is not below 1. (The mean attenuation of the entries with counts will not do: at one count per bin
+    those are T >= 1, attenuation <= 0.)"""
     rows = max(1, chunk // max(T.shape[1], 1))
     total = torch.zeros((), dtype=torch.float64, device=T.device)
-    count = 0
     for i in range(0, T.shape[0], rows):
-        t = T[i:i + rows]
-        real = t > 1e-12
-        total = total + torch.where(real, -torch.log(t.clamp_min(1e-12)), 0).sum(dtype=torch.float64)
-        count += int(real.sum())
-    mean = float(total) / count if count else 1.0
-    return max(mean, 0.0) ** 0.5 / max(rank, 1) ** 0.5
+        total = total + T[i:i + rows].sum(dtype=torch.float64)
+    mean_T = float(total) / max(T.numel(), 1)
+    if not 0 < mean_T < 1:
+        return 0.0
+    return (-math.log(mean_T) / max(rank, 1)) ** 0.5
 
 
 def _attenuation_for_start(T):

@@ -17,9 +17,10 @@ _BYTES_PER_ENTRY = dict(compiled=dict(mle=41, unconstrained=42, support=42, basi
 # Support selection adds its free-set blocks: 29.3 bytes per entry of one block on the CPU (a block holds at most
 # spectra._FREE_SET_ELEMS entries), while the selection's own 37 bytes per data entry stay below the solve's.
 _BYTES_PER_BLOCK_ENTRY = 32
-# A streamed chunk's working set per chunk entry (52.5 to 58.1 bytes beyond the chunk on the CPU, and on CUDA the chunk
-# and its prefetch); the streamed warm-up is a full eager MLE fit of its subsample.
-_BYTES_PER_CHUNK_ENTRY = 64
+# A streamed chunk's working set per chunk entry, about 10% above the measured (52.5 to 58.1 bytes beyond the chunk on
+# the CPU, 63 for a chunk's support selection, and on CUDA the chunk and its prefetched successor, 8 more); the
+# streamed warm-up is a full eager MLE fit of its subsample.
+_BYTES_PER_CHUNK_ENTRY = 72
 # Held at any size: the float64 blocks of the loss and of the fit quality (outputs._CHUNK_ELEMENTS entries each).
 _FIXED_BYTES = 2**29
 # A full solve is planned when its estimate is within the first share of the budget; stream chunks and the streamed
@@ -64,6 +65,9 @@ def _plan(P, K, device, spectra="mle", mode="auto", chunk_pixels=None, compile_m
     from ._newton import _resolve_compile
     budget, total, name, remark = _device_memory(device)
     compiled = _resolve_compile(compile_mode, torch.empty(P, K, device="meta"), device) == "on"
+    if compiled and torch.device(device).type == "cuda":     # 'on' without a working Triton runs eager
+        from ..kernel_availability import triton_available
+        compiled = triton_available()[0]
     need_full = P * K * _BYTES_PER_ENTRY["compiled" if compiled else "eager"][spectra] + _FIXED_BYTES
     if spectra == "support":
         from .spectra import _FREE_SET_ELEMS
@@ -218,10 +222,8 @@ def _fit(T, rank, spectra="mle", dose=None, penalty="auto", free_refit=False, wa
              "n/a" if rep["loss_mle"] is None else f"{rep['loss_mle']:.6g}")
     if mode == "full":
         rep["mle_hit_max_steps"] = rep["steps"] >= max_steps
-        if rep["mle_hit_max_steps"]:
+        if rep["mle_hit_max_steps"] and rel_tol > 0:
             log.warning("the maximum-likelihood fit stopped at max_steps (%d) before its rel_tol stop", max_steps)
-    if mode == "full" or spectra != "unconstrained":  # the maximum-likelihood fit (a streamed free-signed W is not)
-        _report_zero_counts(rep, W, H, Td if mode == "full" else T, device, P if mode == "full" else chunk)
     if spectra == "unconstrained" and mode == "full":
         t1 = time.perf_counter()
         W, H, st = _unconstrained_spectra(Td, W, H, compile_mode=compile_mode)
@@ -241,6 +243,10 @@ def _fit(T, rank, spectra="mle", dose=None, penalty="auto", free_refit=False, wa
         support_text = (f", mean {rep['mean_support_size']:.2f} materials per pixel" if "mean_support_size" in rep
                         else "")
         log.info("%s spectra%s: loss %.6g", spectra, support_text, rep["loss_final"])
+    # On the factors returned, in every mode: the maximum-likelihood fit, or the spectra estimator's with W >= 0.
+    _report_zero_counts(rep, W, H, Td if mode == "full" else T, device, P if mode == "full" else chunk)
+    if not (bool(torch.isfinite(W).all()) and bool(torch.isfinite(H).all())):
+        log.warning("the fit's factors are not finite")
     rep["W_zero_frac"], rep["H_zero_frac"] = (W == 0).double().mean().item(), (H == 0).double().mean().item()
     if device.startswith("cuda"):
         rep["gpu_peak_gib"] = round(torch.cuda.max_memory_allocated(device) / 2**30, 2)

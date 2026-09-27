@@ -208,6 +208,7 @@ def solve(ds, args, device):
                                      max_steps=args.max_steps, rel_tol=args.rel_tol, compile_mode=args.compile,
                                      report=args.fit_report)
         rep.update(rank=args.rank_value, rank_note=args.rank_note, rank_search=None, basis=os.path.abspath(args.basis))
+        args.fit_report = {"solved": True}
         return W, H, rep
     if args.spectra == "support" and ds.dose is None:
         raise InputError("support selection needs the dose (open-beam counts per pixel and bin): pass --dose, or "
@@ -219,6 +220,7 @@ def solve(ds, args, device):
                      chunk_pixels=args.chunk_pixels, max_steps=args.max_steps, rel_tol=args.rel_tol,
                      max_passes=args.max_passes, compile_mode=args.compile, report=args.fit_report)
     rep.update(rank=args.rank_value, rank_note=args.rank_note, rank_search=args.rank_detail)
+    args.fit_report = {"solved": True}                  # a later device failure is not the solve's
     return W, H, rep
 
 
@@ -675,8 +677,10 @@ def build_parser(show_all=False):
 
 # Errors of cuBLAS, cuSOLVER and the CUDA runtime that an oversubscribed device raises in place of the allocator's
 # out-of-memory error (seen on a WSL2 laptop GPU, whose driver pages device memory instead of refusing it).
-_DEVICE_MEMORY_FAILURES = ("CUBLAS_STATUS_EXECUTION_FAILED", "CUBLAS_STATUS_ALLOC_FAILED", "CUSOLVER",
-                           "CUDA error: out of memory")
+_DEVICE_MEMORY_FAILURES = ("CUBLAS_STATUS_EXECUTION_FAILED", "CUBLAS_STATUS_ALLOC_FAILED",
+                           "CUBLAS_STATUS_NOT_INITIALIZED", "CUSOLVER_STATUS_ALLOC_FAILED",
+                           "CUSOLVER_STATUS_EXECUTION_FAILED", "CUSOLVER_STATUS_INTERNAL_ERROR",
+                           "CUSOLVER_STATUS_NOT_INITIALIZED", "CUDA error: out of memory")
 
 
 def _is_device_out_of_memory(e):
@@ -695,6 +699,8 @@ def _out_of_memory_message(e, rep):
     what = ("ran out of memory" if torch is not None and isinstance(e, torch.cuda.OutOfMemoryError)
             else "failed, most likely out of memory")
     text = f"error: the device {what} ({lines[0] if lines else type(e).__name__})"
+    if rep.get("solved"):
+        return text + " after the solve, in the diagnostics: try --device cpu"
     if not rep.get("memory_plan"):
         return text + ": try --mode stream or a smaller --chunk-pixels, --downsample or --wave-bin, or --device cpu"
     text += f" in a {rep['mode']} solve; plan: {rep['memory_plan']}"
