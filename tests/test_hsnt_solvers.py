@@ -5,13 +5,14 @@ Self-contained: small random nonnegative factorizations with mixed pixels stand 
 every device of the repository's ``device`` fixture except MPS, which lacks the float64 the solvers accumulate in.
 """
 import itertools
+import warnings
 
 import numpy as np
 import pytest
 import torch
 
 import mbirtorch.hsnt as hsnt
-from mbirtorch.hsnt import _linalg, _newton
+from mbirtorch.hsnt import _linalg, _newton, spectra
 from mbirtorch.hsnt._loss import _nnal_prep, stable_nnal, stable_nnal_derivatives
 from mbirtorch.hsnt._streaming import _stream_factorization
 from mbirtorch.hsnt.factorization import _initial_factors, _nnal_factorization, _zero_count_divergence
@@ -35,14 +36,15 @@ def dev(device):
     return device
 
 
-def _problem(device, P=2048, K=200, R=3, dose=10.0, seed=0, noisy=True, dtype=torch.float32):
+def _problem(device, P=2048, K=200, R=3, dose=10.0, seed=0, noisy=True, dtype=torch.float32, alpha=0.5, absent=0.4):
     """T = counts / dose for X = W_true @ H_true: background pixels, pure pixels, and pixels mixing two or three
-    materials, as at the boundaries of a real sample."""
+    materials, as at the boundaries of a real sample. alpha (the Dirichlet concentration of the mixtures) and absent
+    (the chance a material is missing from a pixel) set how dense the mixtures are."""
     rng = np.random.default_rng(seed)
     H = rng.uniform(0.05, 1.0, size=(R, K))
     H[:, K // 3:] *= 0.5                                                            # rough edge structure
-    W = rng.dirichlet(np.full(R, 0.5), P) * rng.uniform(0.2, 2.0, (P, 1))
-    W[rng.uniform(size=(P, R)) < 0.4] = 0.0                                         # absent materials
+    W = rng.dirichlet(np.full(R, alpha), P) * rng.uniform(0.2, 2.0, (P, 1))
+    W[rng.uniform(size=(P, R)) < absent] = 0.0                                      # absent materials
     W[: P // 8] = 0                                                                 # background pixels
     X = W @ H
     T = rng.poisson(dose * np.exp(-X)) / dose if noisy else np.exp(-X)
@@ -313,6 +315,45 @@ def test_branch_and_bound_matches_the_enumeration_and_scales(dev):
     assert s12.shape == (T.shape[0], 12) and s12.sum(1).max() <= 4 and torch.isfinite(f12).all()
     s_auto = _select_supports(T, W, H, dose=10.0, penalty="auto")[0]
     assert torch.equal(s_auto, _select_supports(T, W, H, dose=10.0, penalty=_auto_penalty(T.mean(1), 10.0))[0])
+
+
+def _dense_rank5(dev, dose=1000.0):
+    """Rank 5 at high dose, every material in every sample pixel; the enumeration's criterion and supports."""
+    T, _, _ = _problem(dev, P=512, K=100, R=5, dose=dose, alpha=1.0, absent=0.0)
+    W, H, _ = _nnal_factorization(T, 5, max_steps=200, rel_tol=1e-8, compile_mode="off")
+    lam = 2 * np.log(T.shape[1])
+    s_enum, f_enum = _enumerated_supports(T, W, H, dose, lam)
+    return T, W, H, (dose * f_enum + lam * s_enum.sum(1)).sum().item(), s_enum
+
+
+def test_branch_and_bound_selects_the_full_set_at_rank_5(dev):
+    """At rank 5 the search is exhaustive: on dense mixtures it matches the enumeration, a third of the pixels keep all
+    five components, and the refit on the supports ends within 1 nat per pixel of the maximum-likelihood loss (supports
+    of at most four components end it about 2.3 nats per pixel higher)."""
+    T, W, H, crit_enum, s_enum = _dense_rank5(dev)
+    s, _, f = _select_supports(T, W, H, dose=1000.0, penalty=2.0)
+    assert (s.sum(1) == 5).double().mean() > 0.2 and (s == s_enum).all(1).double().mean() > 0.95
+    assert (1000.0 * f + 2 * np.log(T.shape[1]) * s.sum(1)).sum().item() <= crit_enum * (1 + 1e-4)
+    Ws, Hs, _, _ = _support_selected_spectra(T, W, H, dose=1000.0)
+    assert 1000.0 * (_loss(Ws, Hs, T) - _loss(W, H, T)) / T.shape[0] < 1.0
+
+
+def test_branch_and_bound_short_of_the_full_set(dev, monkeypatch):
+    """A search whose subsets stop short of the full set still compares it, at the loss of the full fit: one size
+    short, the search stays exhaustive and silent; two short, the pixels at its largest subset are reported."""
+    T, W, H, crit_enum, _ = _dense_rank5(dev)
+    lam = 2 * np.log(T.shape[1])
+    monkeypatch.setattr(spectra, "_M_MAX", 4)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        s, W0, f = _select_supports(T, W, H, dose=1000.0, penalty=2.0)
+    full = s.sum(1) == 5
+    assert full.double().mean() > 0.2 and torch.equal(W0[full], W[full])
+    assert (1000.0 * f + lam * s.sum(1)).sum().item() <= crit_enum * (1 + 1e-4)
+    monkeypatch.setattr(spectra, "_M_MAX", 3)
+    with pytest.warns(UserWarning, match="select 3 of the 5 components"):
+        s3, _, _ = _select_supports(T, W, H, dose=1000.0, penalty=2.0)
+    assert (s3.sum(1) == 5).double().mean() > 0.2 and not bool((s3.sum(1) == 4).any())
 
 
 def test_pixel_fits_meet_the_kkt_conditions(dev):

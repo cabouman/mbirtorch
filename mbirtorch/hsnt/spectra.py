@@ -14,9 +14,11 @@ from ._newton import _ARMIJO_FLOOR, _joint_newton_pcg, _kernels, _resolve_compil
 _UNC_MAX_STEPS, _UNC_REL_TOL = 100, 1e-8
 # The joint refit on the supports, and the W >= 0 re-solves.
 _REFIT_MAX_STEPS, _REFIT_REL_TOL, _W_MAX_STEPS, _CG_MAX = 300, 1e-10, 100, 10
-# Branch and bound: candidate materials per pixel and the largest support searched (at 6 candidates it matches an
-# exhaustive search).
-_K_TOP, _M_MAX = 6, 4
+# Branch and bound: candidate materials per pixel, and the largest subset of them searched. Up to rank 6 the search is
+# exhaustive; above, it covers every subset of a pixel's six best single materials, and the full set.
+_K_TOP, _M_MAX = 6, 6
+# The share of pixels at the largest subset searched, short of the full set, above which the cap is reported.
+_CAP_WARN_FRAC = 0.05
 
 
 def _unconstrained_spectra(T, W, H, compile_mode='auto'):
@@ -176,17 +178,20 @@ def _guard_components(support, W_mle, W0, min_support=None):
     return weak
 
 
-def _select_branch_bound(T, H, dose, lam, f_full, k_top=6, m_max=4, plausible=None, prep=None):
+def _select_branch_bound(T, W, H, dose, lam, f_full, k_top=_K_TOP, m_max=_M_MAX, plausible=None, prep=None):
     """Per-pixel subset search: exact single-material fits for every material (R batched one-dimensional solves,
     restricted to `plausible` pixels when given), then subsets of 2 to m_max materials among each pixel's k_top best
-    singletons for the pixels the lower bound leaves open. The pixel loss is monotone in the subset, so the full-model
-    loss f_full bounds every subset from below: a set of `size` materials can beat the current best only if
-    dose * (f_best - f_full) > lam * (size - size(best)). Returns (idx, valid, w, f) as padded per-pixel sets."""
+    singletons for the pixels the lower bound leaves open, then the full set. W is the full-model fit and f_full its
+    per-pixel loss. The pixel loss is monotone in the subset, so f_full bounds every subset from below: a set of `size`
+    materials can beat the current best only if dose * (f_best - f_full) > lam * (size - size(best)). When the subsets
+    stop short of the full set (m_max < R), the full set enters as the fit W, with no further fit, and a warning reports
+    more than _CAP_WARN_FRAC of the pixels at m_max when sizes between m_max and R go unsearched. Returns (idx, valid,
+    w, f) as padded per-pixel sets of width R."""
     P = T.shape[0]
     R = H.shape[0]
     dev = T.device
     k_top = min(k_top, R)
-    m_max = min(m_max, R)
+    m_max = min(m_max, k_top)
     prep = _nnal_prep(T) if prep is None else prep
     f0 = _empty_fit_loss(T, prep)
     F1 = torch.full((P, R), float('inf'), device=dev, dtype=torch.float64)
@@ -203,9 +208,9 @@ def _select_branch_bound(T, H, dose, lam, f_full, k_top=6, m_max=4, plausible=No
         W1[rows, r] = w1[:, 0]
     best_f1, r1 = F1.min(1)
     one = best_f1 * dose + lam < f0 * dose                          # best singleton beats the empty set
-    best_idx = torch.full((P, m_max), -1, dtype=torch.long, device=dev)
-    best_valid = torch.zeros(P, m_max, dtype=torch.bool, device=dev)
-    best_w = torch.zeros(P, m_max, device=dev, dtype=T.dtype)
+    best_idx = torch.full((P, R), -1, dtype=torch.long, device=dev)
+    best_valid = torch.zeros(P, R, dtype=torch.bool, device=dev)
+    best_w = torch.zeros(P, R, device=dev, dtype=T.dtype)
     best_idx[one, 0] = r1[one]
     best_valid[one, 0] = True
     best_w[one, 0] = W1[one, r1[one]]
@@ -235,6 +240,18 @@ def _select_branch_bound(T, H, dose, lam, f_full, k_top=6, m_max=4, plausible=No
             best_valid[bp, :size] = True
             best_w[bp, :size] = w_c[better]
             best_f[bp] = f_c[better]
+    if m_max < R:                                                   # the full set: the fit W, its loss f_full
+        full = f_full * dose + lam * R < best_f * dose + lam * best_valid.sum(1).double()
+        best_idx[full] = torch.arange(R, device=dev)
+        best_valid[full] = True
+        best_w[full] = W[full].to(best_w.dtype)
+        best_f = torch.where(full, f_full, best_f)
+    if m_max < R - 1:                                               # sizes m_max + 1 to R - 1 were not searched
+        capped = (best_valid.sum(1) == m_max).double().mean().item()
+        if capped > _CAP_WARN_FRAC:
+            warnings.warn(f"support selection: {100 * capped:.3g}% of the pixels select {m_max} of the {R} components, "
+                          f"the most the search tries short of all {R}; their best support may be larger (the search "
+                          f"is exhaustive up to rank {min(k_top, m_max + 1)})")
     return best_idx, best_valid, best_w, best_f
 
 
@@ -284,8 +301,8 @@ def _select_supports(T, W, H, dose, penalty='auto', wald_screen=0.0):
         _, Z = stable_nnal_derivatives(X, T, prep)
         wald = 0.5 * dose * (W.double() ** 2) * (Z @ (H * H).T).double()
         plausible = wald > wald_screen * lam
-    idx, valid, w, f = _select_branch_bound(T, H, dose, lam, f_full, k_top=_K_TOP, m_max=_M_MAX, plausible=plausible,
-                                            prep=prep)
+    idx, valid, w, f = _select_branch_bound(T, W, H, dose, lam, f_full, k_top=_K_TOP, m_max=_M_MAX,
+                                            plausible=plausible, prep=prep)
     support, W0 = _scatter_support(idx, valid, w, R)
     return support, W0, f
 
