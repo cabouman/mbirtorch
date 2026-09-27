@@ -105,6 +105,38 @@ def test_a_dead_component_is_revived(dev):
     Hd[1] = 0                                                                       # only the spectrum dead
     Wn, Hn, n = _linalg._reseed_dead(Wd, Hd)
     assert n == 1 and Hn[1].min() > 0 and Wn[:, 1].min() > 0 and torch.equal(Hn[0], Hd[0])
+    c = torch.tensor([1e8, 1.0, 1.0], dtype=W_ref.dtype, device=dev)            # the same fit, with component 0's
+    Wg, Hg = W_ref * c, H_ref / c[:, None]                                       # scale moved into its map
+    assert _linalg._reseed_dead(Wg, Hg)[2] == 0                                  # small next to the others: alive
+    Hg[1] = 0
+    Wn, Hn, n = _linalg._reseed_dead(Wg, Hg)
+    seed = Wn[:, 1].double().mean() * Hn[1].double().mean()
+    assert n == 1 and 1e-6 * seed_ref(W_ref, H_ref) < seed < 1e-2 * seed_ref(W_ref, H_ref)
+
+
+def seed_ref(W, H):
+    """The product of the mean map and mean spectrum entries of a component, the median over components."""
+    return (W.double().mean(0) * H.double().mean(1)).median()
+
+
+def test_a_reseed_that_ends_no_lower_is_undone(dev, monkeypatch):
+    """A re-seed after the joint solve whose continued solve ends above the state before it leaves that state."""
+    T, _, _ = _problem(dev)
+    W_ref, H_ref, _ = _mle(T)
+    W0, H0 = _initial_factors(T, 3)
+    calls = []
+
+    def harmful(W, H):                          # after the warm-up, re-seed component 0 at a scale no solve recovers
+        calls.append(1)
+        if len(calls) <= 5:
+            return W, H, 0
+        W, H = W.clone(), H.clone()
+        W[:, 0], H[0] = 1e3, 1e3
+        return W, H, 1
+
+    monkeypatch.setattr(_newton, "_reseed_dead", harmful)
+    W, H, _ = _nnal_factorization(T, 3, max_steps=200, rel_tol=1e-8, compile_mode="off", W_init=W0, H_init=H0)
+    assert len(calls) > 5 and torch.equal(W, W_ref) and torch.equal(H, H_ref)       # the state before the re-seed
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")

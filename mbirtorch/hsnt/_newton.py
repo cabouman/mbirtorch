@@ -23,7 +23,7 @@ _PATIENCE = 5
 # compile; the rank search and smaller solves run faster uncompiled.
 _COMPILE_MIN_ELEMENTS = 5e8
 # Re-seeds of a dead component after the joint solve; a component that dies again each time has no support in the
-# data, and the solve returns it dead.
+# data, and the solve returns it dead, as it does when the solve after a re-seed ends no lower.
 _MAX_RESEEDS = 2
 
 
@@ -376,7 +376,8 @@ def joint_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True, W
     With update_H=False only W is solved, by block Newton (the joint step needs both factors free). A block
     warm-up step costs more than a joint step with one CG iteration, so a few warm-up steps are enough. A component
     whose map or spectrum dies is re-seeded after every warm-up step and, up to _MAX_RESEEDS times, at the end of the
-    joint solve, which then continues (_reseed_dead).
+    joint solve, which then continues (_reseed_dead); a continued solve that ends no lower than the state before its
+    re-seed is undone.
     """
     if not update_H:
         return block_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=False, W_init=W_init,
@@ -391,15 +392,21 @@ def joint_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True, W
         H, X, _ = step_fn(H, W, X, T, prep, 1)
         if i + 1 < max_steps:                             # re-seed only when a step follows
             W, H, _ = _reseed_dead(W, H)
+    before = None                                         # (W, H, loss) before the last end-of-solve re-seed
     for attempt in range(_MAX_RESEEDS + 1):
         if steps >= max_steps:
             break
         W, H, taken, _ = _joint_newton_pcg(T, W, H, max_steps=max_steps - steps, cg_max=cg_max, rel_tol=rel_tol,
                                            prep=prep, nnal=nnal_fn, deriv=deriv_fn, patience=_PATIENCE)
         steps += taken
+        if before is not None and bool(nnal_fn(W @ H, T, prep, dtype=torch.float64) >= before[2]):
+            W, H = before[0], before[1]
+            break
         if attempt == _MAX_RESEEDS or steps >= max_steps:
             break
-        W, H, n_dead = _reseed_dead(W, H)
+        W_new, H_new, n_dead = _reseed_dead(W, H)
         if n_dead == 0:
             break
+        before = (W, H, nnal_fn(W @ H, T, prep, dtype=torch.float64))
+        W, H = W_new, H_new
     return W, H, steps

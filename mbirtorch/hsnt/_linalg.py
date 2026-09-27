@@ -135,29 +135,31 @@ def _joint_blocks(flat, rows, cols, rank, free, jitter):
     return torch.where((info > 0)[:, None, None], eye.expand_as(L), L)
 
 
-def _reseed_dead(W, H, rel_tol=1e-6):
+def _reseed_dead(W, H):
     """Re-seed any component whose map or spectrum is zero, both factors, with small random values from a fixed
     generator. Returns (W, H, number re-seeded).
 
     With its spectrum at zero the map gets no gradient, and a spectrum whose every bin has an outward gradient stays at
     zero, so the component contributes nothing from then on: a degenerate stationary point, which the first projected
-    step can reach from an ordinary start. A random rather than constant seed keeps the revived spectrum from being
-    flat.
+    step can reach from an ordinary start. The projected steps set a dying factor exactly to zero, and the test is for
+    exact zeros rather than for a norm small next to the other components': how a component's scale splits between
+    its map and its spectrum is arbitrary, and at low dose the fit can send one component to a huge scale on the zero
+    counts, next to which a live component looks dead. For the same reason both factors of the seed take one scale,
+    the median over the live components of the geometric mean of their mean map and mean spectrum entries, which
+    that split does not change and one huge component does not set. A random rather than constant seed keeps the
+    revived spectrum from being flat.
     """
-    w = W.norm(dim=0)
-    h = H.norm(dim=1)
-    dead = (w <= rel_tol * w.max()) | (h <= rel_tol * h.max())
+    dead = (W.amax(0) <= 0) | (H.amax(1) <= 0)
     n_dead = int(dead.sum())
     if n_dead == 0:
         return W, H, 0
     live = ~dead
     W = W.clone()
     H = H.clone()
-    w_ref = W[:, live].mean() if bool(live.any()) else W.new_tensor(1.0)
-    h_ref = H[live].mean() if bool(live.any()) else H.new_tensor(1.0)
+    scale = float((W[:, live].mean(0).double() * H[live].mean(1).double()).sqrt().median()) if bool(live.any()) else 1.0
     g = torch.Generator(device=W.device).manual_seed(0)
-    W[:, dead] = 1e-2 * w_ref * torch.rand(W.shape[0], n_dead, generator=g, dtype=W.dtype, device=W.device)
-    H[dead] = 1e-2 * h_ref * torch.rand(n_dead, H.shape[1], generator=g, dtype=H.dtype, device=H.device)
+    W[:, dead] = 1e-2 * scale * torch.rand(W.shape[0], n_dead, generator=g, dtype=W.dtype, device=W.device)
+    H[dead] = 1e-2 * scale * torch.rand(n_dead, H.shape[1], generator=g, dtype=H.dtype, device=H.device)
     return W, H, n_dead
 
 
