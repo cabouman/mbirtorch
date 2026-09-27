@@ -122,10 +122,10 @@ Each row below is a change to make in code that calls MBIRJAX.
      - ``dehydrate`` now fits the Poisson likelihood of the counts, with a
        basis of rank ``num_materials`` rather than
        ``safety_factor * num_materials``, and estimates the rank when it is
-       not given.  The scikit-learn NMF has no counterpart in MBIRTorch; its
-       keywords (``safety_factor``, ``beta_loss``, ``max_iter``,
-       ``tolerance``, ``batch_size``, ``random_state``) raise a
-       ``TypeError``.  The arguments after ``num_materials`` are keyword
+       not given.  The scikit-learn NMF that the old ``dehydrate`` called has
+       no counterpart in MBIRTorch; that ``dehydrate``'s keywords
+       (``safety_factor``, ``beta_loss``, ``max_iter``, ``tolerance``,
+       ``batch_size``, ``random_state``) raise a ``TypeError``.  The arguments after ``num_materials`` are keyword
        only.  ``mode`` and ``chunk_pixels`` bound the memory, as
        ``batch_size`` did, ``max_passes`` sets the streamed solve's polish
        passes, and ``verbose=2`` prints the rank search rather than plotting
