@@ -184,6 +184,9 @@ def _fit(T, rank, spectra="mle", dose=None, penalty="auto", free_refit=False, wa
     rep.update(mode=mode, memory_plan=note, spectra=spectra)
     if mode == "stream":
         rep["chunk_pixels"] = chunk
+        if str(device).startswith("cuda"):           # each chunk and its successor are pinned host copies
+            from .loading import _check_host_memory
+            _check_host_memory(2 * min(chunk, P) * K * T.dtype.itemsize, "the stream's pinned chunk copies")
     t0 = time.perf_counter()
     stats = {}
     if mode == "full":
@@ -213,8 +216,10 @@ def _fit(T, rank, spectra="mle", dose=None, penalty="auto", free_refit=False, wa
     steps_text = f"{rep['steps']} steps" if "steps" in rep else f"{rep['passes']} polish passes"
     log.info("factorization: %s, %s in %.1f s, loss %s", mode, steps_text, rep["solve_seconds"],
              "n/a" if rep["loss_mle"] is None else f"{rep['loss_mle']:.6g}")
-    if mode == "full" and rep["steps"] >= max_steps:
-        log.warning("the maximum-likelihood fit stopped at max_steps (%d) before its rel_tol stop", max_steps)
+    if mode == "full":
+        rep["mle_hit_max_steps"] = rep["steps"] >= max_steps
+        if rep["mle_hit_max_steps"]:
+            log.warning("the maximum-likelihood fit stopped at max_steps (%d) before its rel_tol stop", max_steps)
     if mode == "full" or spectra != "unconstrained":  # the maximum-likelihood fit (a streamed free-signed W is not)
         _report_zero_counts(rep, W, H, Td if mode == "full" else T, device, P if mode == "full" else chunk)
     if spectra == "unconstrained" and mode == "full":

@@ -161,6 +161,22 @@ def test_the_block_step_is_gauge_equivariant(dev):
         Wc, Hc = W / D, H * D[:, None]
         Hn, _, _ = step(Hc, Wc, Wc @ Hc, T, prep, 1)
         assert torch.equal(Hn[1:] > 0, Hc[1:] > 0) and _loss(Wc, Hn, T) <= _loss(Wc, Hc, T) * (1 + 1e-9)
+        Wn, _, _ = step(Wc, Hc, Wc @ Hc, T, prep, 0)
+        assert _loss(Wn, Hc, T) <= _loss(Wc, Hc, T) * (1 + 1e-9)
+        for X in (Wc @ Hn, Wn @ Hc):                                                 # the MLE stays a fixed point
+            assert ((X - W @ H).norm() / (W @ H).norm()).item() < 1e-4
+
+
+def test_a_start_in_a_skewed_gauge_stops_where_the_balanced_start_does(dev):
+    """The KKT stop measures each component's gradient against its factor, so a start with one component rescaled by
+    1e6 (the same X) stops at the same loss in about as many steps; a plain gradient norm, dominated by the rescaled
+    component, stopped it 0.036 nats high after 527 steps."""
+    T, _, _ = _problem(dev)
+    W0, H0 = _initial_factors(T, 3)
+    W1, H1, s1 = _nnal_factorization(T, 3, compile_mode="off", W_init=W0, H_init=H0)
+    D = torch.tensor([1e6, 1.0, 1.0], dtype=W0.dtype, device=dev)
+    W2, H2, s2 = _nnal_factorization(T, 3, compile_mode="off", W_init=W0 / D, H_init=H0 * D[:, None])
+    assert abs(_loss(W2, H2, T) - _loss(W1, H1, T)) <= 1e-8 * _loss(W1, H1, T) and s2 <= 2 * s1
 
 
 def test_the_w_solve_reaches_stationarity_next_to_an_inward_entry(dev):
@@ -190,6 +206,13 @@ def test_the_zero_count_divergence_is_reported(dev):
         W, H, _ = _nnal_factorization(T, 3, max_steps=150, compile_mode="off")
         x_max, n_above = _zero_count_divergence(W, H, T)
         assert (n_above > 0) == diverges and (x_max > 50) == diverges
+        # Next to the component grown on the zero counts, the block steps' snap of frozen entries is checked against
+        # the row loss, so a step from the fit does not raise the loss.
+        prep = _nnal_prep(T)
+        _, _, _, step = _newton._kernels("off")
+        Wn, _, _ = step(W, H, W @ H, T, prep, 0)
+        Hn, _, _ = step(H, W, W @ H, T, prep, 1)
+        assert _loss(Wn, H, T) <= _loss(W, H, T) * (1 + 1e-9) and _loss(W, Hn, T) <= _loss(W, H, T) * (1 + 1e-9)
 
 
 def test_a_fit_reports_the_zero_count_divergence(caplog):
@@ -204,6 +227,8 @@ def test_a_fit_reports_the_zero_count_divergence(caplog):
                              compile_mode="off")
         diverges = rep["zero_count_entries_above_bound"] > 0
         assert diverges == (dose == 1.0) and diverges == ("zero-count entries" in caplog.text)
+        if mode == "full":
+            assert rep["mle_hit_max_steps"] == (dose == 1.0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")

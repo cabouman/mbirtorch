@@ -1001,7 +1001,8 @@ def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=Non
         open_beam_smoothing (int, optional): Smooth the averaged open beam per bin, at full resolution, with a
             width x width window (odd, at least 3), the normalized square root of the outer product of two Hamming
             windows; the noise model counts the smoothed open beam as more observations, by the variance reduction
-            measured across the observations (with one observation, that of independent pixels). Defaults to 0, none.
+            measured across the observations; with one observation it is taken as that of independent pixels, which
+            overstates the observations on a detector with correlated noise (SNAP's is). Defaults to 0, none.
         memory_budget_mib (float, optional): Working memory for the blocks of bins and of the checks, in MiB.
             Defaults to 512.
 

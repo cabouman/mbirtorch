@@ -22,14 +22,16 @@ fragmentation.
 Dehydration and rehydration
 ---------------------------
 
-Dehydration is the maximum-likelihood factorization of the attenuation with W, H >= 0: it minimizes the
-non-negative attenuation (NNAL) loss sum[exp(-X) + T X] of the transmission T, the Poisson negative log-likelihood
-of the counts up to a constant when the open beam is the same in every pixel and bin.  The result is stored as the
-maps (``subspace_data``), the spectra (``subspace_basis``) and the data type.  When the number of components is
-not given it is estimated by likelihood-ratio tests, run on at most 16,384 random pixels at full resolution and on
-pooled pixels; each compares a component's gain in likelihood with a noise floor taken from the smallest gains of the
-search, so a weak component within a few ranks of ``max_rank`` can be missed: raise ``max_rank`` when the last gains
-are not flat.  Data that do not fit in the device memory are factorized by chunks of pixels.
+Dehydration is the maximum-likelihood factorization of the attenuation with W, H >= 0: it minimizes the non-negative
+attenuation (NNAL) loss sum[exp(-X) + T X] of the transmission T, the Poisson negative log-likelihood of the counts up
+to a constant when the open beam is the same in every pixel and bin.  The result is stored as the maps
+(``subspace_data``), the spectra (``subspace_basis``) and the data type.  When the number of components is not given
+it is estimated by likelihood-ratio tests, run on at most 16,384 random pixels at full resolution and on pooled
+pixels; each compares a component's gain in likelihood with a noise floor taken from the smallest gains of the same
+search.  When the true rank is near ``max_rank`` those gains include real components, the floor is set too high and
+the rank too low (a rank-6 test problem at 3 counts per bin returned rank 1), and the answer can change with
+``max_rank``: raise it when the gains do not level off.  Data that do not fit in the device memory are factorized by
+chunks of pixels.
 
 At a few counts per bin the likelihood can keep rising along a component that grows on the zero counts, so the fit
 has no maximum: it ends at ``max_steps`` with attenuations of 10^10 or more on some zero-count entries, and the maps
@@ -37,14 +39,15 @@ and spectra depend on ``max_steps``.  The fit warns when that happens, and the c
 largest attenuation put on a zero count.
 
 The maximum-likelihood spectra are biased at low dose by the truncation of the pixel coefficients at zero.
-``dehydrate`` offers two other estimators through ``spectra``.  ``'unconstrained'`` removes the bias by dropping
-the bound while the spectra are estimated, and gains when the pixels are many (on a sphere phantom at 3 counts
-per bin, 7 to 12 dB at 10^6 pixels, about nothing at 4 x 10^4).  ``'support'`` instead identifies
-the coefficients whose true value is zero, holds them at zero, and refits the rest; it needs the dose.  It decides
-in the basis the maximum-likelihood fit ends in, which is some mixture of the materials: where the components are
-far from the pure materials, a pixel of one material needs several of them, and the selection mostly separates the
-sample from the background (on the 1M-pixel sphere phantom from 3 counts per bin up, its maps are exactly zero on
-98.6 to 100% of the background pixels).  Its gain is therefore in the spectra at low dose rather than in the maps.
+``dehydrate`` offers two other estimators through ``spectra``.  ``'unconstrained'`` removes the bias by dropping the
+bound while the spectra are estimated, and gains when the pixels are many (on a sphere phantom at 3 counts per bin, 7
+to 12 dB at 10^6 pixels, about nothing at 4 x 10^4, scored after the best linear mixing of the fitted spectra onto the
+true ones).  ``'support'`` instead identifies the coefficients whose true value is zero, holds them at zero, and
+refits the rest; it needs the dose.  It decides in the basis the maximum-likelihood fit ends in, which is some mixture
+of the materials: where the components are far from the pure materials, a pixel of one material needs several of them,
+and the selection mostly separates the sample from the background (on the 1M-pixel sphere phantom from 3 counts per
+bin up, its maps are exactly zero on 98.6 to 100% of the background pixels).  Its gain is therefore in the spectra at
+low dose rather than in the maps.
 
 Given a ``subspace_basis``, ``dehydrate`` fits only the maps: each pixel's maximum-likelihood coefficients for those
 spectra.  Data too large to hold at once, such as the many views of a scan, can then be dehydrated piece by piece
@@ -95,32 +98,35 @@ views share; transmissions and attenuations are used as they are.  ``inspect``, 
 ``convert`` reads the input in blocks of bins, so its memory stays near ``--memory-budget`` whatever the size of the
 stack (or one bin of every selected view, when that is larger), and writes the hsnt layout, by default to
 ``<stem>_converted.h5``; the converted file keeps the dose and the source bin indices, and stores a zero transmission
-(a bin with no counts) as an infinite attenuation. ``dehydrate`` writes ``<stem>_dehydrated.h5``, which
+(a bin with no counts) as an infinite attenuation.  ``dehydrate`` writes ``<stem>_dehydrated.h5``, which
 :func:`import_hsnt_data_hdf5` reads, a JSON report of the checks, parameters, timings and losses, and plots of the
-maps and spectra. ``rehydrate`` writes the product back as hyperspectral data, for all bins or a ``--wave-range``.
-``denoise`` does both, and writes the report too. The solve runs whole on the device when it fits and is streamed by
-chunks of pixels otherwise. ``--spectra unconstrained`` and ``--spectra support`` select the spectra estimators
+maps and spectra.  ``rehydrate`` writes the product back as hyperspectral data, for all bins or a ``--wave-range``.
+``denoise`` does both, and writes the report too.  The solve runs whole on the device when it fits and is streamed by
+chunks of pixels otherwise.  ``--spectra unconstrained`` and ``--spectra support`` select the spectra estimators
 described above; streamed, they keep only part of their gain: on the 1M-pixel sphere phantom at dose 3, over the
 streamed maximum-likelihood spectra, streamed ``unconstrained`` gained 0.7 to 3.3 dB (0.017 nats per pixel above its
-loss) and streamed ``support`` 3.1 to 7.2 dB (0.47), against 7.2 to 12.8 dB solved whole (0.11 and 0.46). The memory
-plan solves whole when the device holds the data; ``--mode full`` insists on it. An output is never one of the inputs,
-an existing output is replaced only with ``--overwrite``, and a run that fails leaves no partial file. The outputs
-keep the input's angles, wavelengths and geometry entries, matched to the selected views and bins. ``--wave-range``
-counts source bins in every subcommand, also on a converted or dehydrated file, and ``--dose`` is the open-beam count
-per pixel and source bin, before any ``--wave-bin`` grouping. Run any subcommand with ``-h`` for the options most runs
-need, and with ``--help-all`` for every option, including the solver, memory, rank-test and support-selection
-settings.
+loss) and streamed ``support`` 3.1 to 7.2 dB (0.47), against 7.2 to 12.8 dB solved whole (0.11 and 0.46).  The memory
+plan solves whole when the device holds the data; ``--mode full`` insists on it.  A streamed fit starts from spectra
+fitted on a random subsample of the pixels (16,384, or fewer when memory is short), and its polish passes refine them:
+a material with no pixels in the subsample is not found, and the gap to the fit solved whole grows with the number of
+pixels over the subsample size (the passes stop at ``--max-passes``, with a warning).  An output is never one of the
+inputs, an existing output is replaced only with ``--overwrite``, and a run that fails leaves no partial file.  The
+outputs keep the input's angles, wavelengths and geometry entries, matched to the selected views and bins.
+``--wave-range`` counts source bins in every subcommand, also on a converted or dehydrated file, and ``--dose`` is the
+open-beam count per pixel and source bin, before any ``--wave-bin`` grouping.  Run any subcommand with ``-h`` for the
+options most runs need, and with ``--help-all`` for every option, including the solver, memory, rank-test and
+support-selection settings.
 
-Two input options correct the data before the fit. ``--background-boxes`` names boxes free of the sample, each as
-``Y0:Y1,X0:X1`` in full-resolution pixels, separated by spaces. In each bin, each detector tile's transmission is
-divided by that of its boxes (for counts, their summed counts over their summed open beam). This corrects a sample run
-and an open beam of different exposure, and the dose becomes the sample's. ``--background-tiles RxC`` splits the
+Two input options correct the data before the fit.  ``--background-boxes`` names boxes free of the sample, each as
+``Y0:Y1,X0:X1`` in full-resolution pixels, separated by spaces.  In each bin, each detector tile's transmission is
+divided by that of its boxes (for counts, their summed counts over their summed open beam).  This corrects a sample
+run and an open beam of different exposure, and the dose becomes the sample's.  ``--background-tiles RxC`` splits the
 detector into tiles calibrated separately, each by the boxes whose centers it holds; the default is a preset's tiles,
-else one tile. Without calibration, a data check warns when the most transparent regions read a transmission outside
+else one tile.  Without calibration, a data check warns when the most transparent regions read a transmission outside
 what a matched exposure gives: the ratio bias the loader expects at the open beam's counts, plus a 3% margin and their
-noise (at least 5% on the low side). ``--open-beam-smoothing W`` smooths the averaged open beam in each bin, at full
+noise (at least 5% on the low side).  ``--open-beam-smoothing W`` smooths the averaged open beam in each bin, at full
 resolution, before the division, with a W x W window: the normalized square root of the outer product of two Hamming
-windows. The noise model then counts the open beam as more observations, by the reduction of its variance measured
+windows.  The noise model then counts the open beam as more observations, by the reduction of its variance measured
 across the observations; the check reports it.
 
 Multi-view data

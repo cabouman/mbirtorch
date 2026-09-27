@@ -529,7 +529,8 @@ class _Options:
         self.add(g, "--open-beam-smoothing", type=int, default=0, metavar="W",
                  help="smooth the averaged open beam in each bin with a W x W window (the square root of the outer "
                       "product of two Hamming windows, normalized), W odd and at least 3 (default 0, none; the ORNL "
-                      "SNAP preprocessing used 3)")
+                      "SNAP preprocessing used 3); with one open-beam observation the variance reduction is assumed, "
+                      "not measured")
 
     def run(self, sp, device=False, dry_run=False, checks=True):
         g = sp.add_argument_group("run")
@@ -595,7 +596,7 @@ class _Options:
                       "(default 1e-8)")
         self.add(g, "--compile", choices=("auto", "on", "off"), default="auto", advanced=True,
                  help="compile the solver kernels: auto (default) on CUDA for data of 5e8 entries or more (about "
-                      "400k pixels at 1200 bins); stream mode compiles only with 'on', and the rank estimate always "
+                      "417k pixels at 1200 bins); stream mode compiles only with 'on', and the rank estimate always "
                       "runs uncompiled")
         g = sp.add_argument_group("advanced: memory")
         self.add(g, "--mode", choices=("auto", "full", "stream"), default="auto", advanced=True,

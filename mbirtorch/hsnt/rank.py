@@ -100,7 +100,10 @@ def estimate_rank(data, dataset_type="attenuation", max_rank=6, device=None, poo
     about 0.5 (sqrt(P) + sqrt(K))^2, the top of the noise's singular spectrum. The noise floor is the median gain of
     those of the last three ranks that stay below twice that, and at least (P + K) / 2; a component is accepted
     while its gain exceeds twice the floor. When none of the last three gains is that small, the search is capped
-    and a warning says to raise max_rank.
+    and a warning says to raise max_rank. The floor is taken from gains of the same search, which can include real
+    components when the true rank is near max_rank: then the floor is set too high and the rank too low (a rank-6
+    test problem at 3 counts per bin returned rank 1), and the answer can change with max_rank. Compare the gains,
+    which verbose prints, and raise max_rank when they do not level off.
 
     That floor grows with the pixel count as fast as a faint material's evidence, so at low dose the full-resolution
     test misses weak materials. Pooling blocks of neighboring pixels keeps the evidence (summed counts stay Poisson)

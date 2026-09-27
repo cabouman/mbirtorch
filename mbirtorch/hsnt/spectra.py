@@ -29,8 +29,8 @@ def _unconstrained_spectra(T, W, H, compile_mode='auto'):
     every pixel, absorb that excess. Dropping the bound while H is estimated removes the bias, at the price of the
     variance the bound suppresses, so it gains when the pixels are many: on a sphere phantom at 3 counts per bin, 7 to
     12 dB on the spectra at 10^6 pixels (0.11 nats per pixel above the maximum-likelihood loss), and about nothing at
-    4 x 10^4 to 6.5 x 10^4 pixels. Returns (W, H, steps): W >= 0 re-solved for the returned H, and the steps of the
-    free-W solve.
+    4 x 10^4 to 6.5 x 10^4 pixels, scored after the best linear mixing of the fitted spectra onto the true ones.
+    Returns (W, H, steps): W >= 0 re-solved for the returned H, and the steps of the free-W solve.
     """
     compile_mode = _resolve_compile(compile_mode, T)
     nnal_fn, deriv, _, _ = _kernels(compile_mode)
