@@ -3,6 +3,7 @@ bright-region check against the loader's expected ratio, the calibration's view 
 converted file and the check of a given dose, the smoothing of a low-count open beam, and the working set of
 load_dataset."""
 import json
+import tracemalloc
 import warnings
 
 import h5py
@@ -161,3 +162,28 @@ def test_smoothing_one_observation_warns_that_its_variance_reduction_is_assumed(
     two = load_dataset(sample, open_beam=[str(tmp_path / "ob")], open_beam_smoothing=3)
     [c1], [c2] = ([c for c in ds.checks if "smoothed" in c.message] for ds in (one, two))
     assert c1.level == "warn" and "overstates" in c1.message and c2.level == "ok"
+
+
+def test_load_dataset_stays_within_its_memory_budget(tmp_path):
+    """Transmissions of (64, 64, 64, 100), and a (39999, 400) table whose bright-level check takes every row, load
+    within 1.5 x 16 MiB + 8 MiB of traced memory beyond T at a 16 MiB budget, and within the default budget of
+    512 MiB, with the same T and checks at both budgets."""
+    MiB = 2**20
+    for shape in ((64, 64, 64, 100), (39_999, 400)):
+        path = str(tmp_path / f"T{len(shape)}.h5")
+        with h5py.File(path, "w") as f:
+            f.create_dataset("data", data=np.random.default_rng(6).random(shape, dtype=np.float32) * 1.2)
+            f.create_dataset("dataset_type", data=np.bytes_("transmission"))
+        loads = []
+        for budget in (16, 512):
+            tracemalloc.start()
+            try:
+                ds = load_dataset(path, memory_budget_mib=budget)
+                excess = tracemalloc.get_traced_memory()[1] - ds.T.nbytes
+            finally:
+                tracemalloc.stop()
+            assert excess <= (1.5 * budget + 8) * MiB if budget == 16 else excess <= budget * MiB, (shape, budget)
+            loads.append(ds)
+        assert np.array_equal(loads[0].T, loads[1].T) and [c.message for c in loads[0].checks] == \
+            [c.message for c in loads[1].checks]
+        del ds, loads

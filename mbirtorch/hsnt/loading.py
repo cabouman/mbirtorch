@@ -115,10 +115,17 @@ def infer_input_type(a, source_dtype=None):
                      "transmissions or attenuations: pass --input-type transmission or --input-type attenuation")
 
 
+def _check_elems(budget_mib):
+    """Entries per block of the data checks within a working-memory budget in MiB: a quarter of its bytes, since a
+    block's boolean masks take a byte per entry, and at least 2^20."""
+    return max(2**20, int(budget_mib * 2**20) // 4)
+
+
 def _summary_from_T(T, dose, spatial_shape, background=None, n_obs=0, chunk_elems=2**24, dose_per_bin=None):
     """The quantities the data checks need, from a transmission matrix held in memory. The per-pixel and per-bin
-    reductions, and the fractions of non-finite, negative, zero and above-one entries, run exactly by blocks of rows,
-    so their working set stays small next to T; the range, mean and median come from a sample of whole rows."""
+    reductions, and the fractions of non-finite, negative, zero and above-one entries, run exactly by blocks of rows
+    of about chunk_elems entries, so their working set stays small next to T; the range, mean and median come from a
+    sample of whole rows."""
     P, K = T.shape
     rows = max(1, chunk_elems // max(K, 1))
     pos_px, mean_px = np.empty(P, dtype=np.int64), np.empty(P, dtype=np.float64)
@@ -142,8 +149,8 @@ def _summary_from_T(T, dose, spatial_shape, background=None, n_obs=0, chunk_elem
     dead_bins = int((pos_bin == 0).sum())
     return dict(pixels=P, bins=K, nbytes=T.nbytes, stats=st, above_one=above / n, dead_px=_frac(pos_px == 0),
                 dead_bins=dead_bins, const_bins=int((bin_max == bin_min).sum()) - dead_bins, dose=dose,
-                bright=_bright_level(mean_px, spatial_shape, T[:: max(1, P // 20000)], dose, n_obs, dose_per_bin),
-                background=background)
+                bright=_bright_level(mean_px, spatial_shape, T[:: max(1, P // 20000)], dose, n_obs, dose_per_bin,
+                                     chunk_elems), background=background)
 
 
 def _ratio_expectation(mu):
@@ -177,12 +184,13 @@ def _expected_ratio(dose_per_bin, n_obs):
     return float(np.average(e.min(1), weights=weight)), float(np.average(e.max(1), weights=weight))
 
 
-def _bright_level(pixel_means, spatial_shape, sub, dose=None, n_obs=0, dose_per_bin=None):
+def _bright_level(pixel_means, spatial_shape, sub, dose=None, n_obs=0, dose_per_bin=None, chunk_elems=2**24):
     """(level, low, high): the transmission of the most transparent regions, the 95th percentile of the per-pixel
     means pooled over b x b blocks (b = 4 when the image allows), and the range a sample-free region reads at matched
     exposure: the loader's expected ratio of counts to a noisy open beam (see _expected_ratio, from the dose per bin,
     else the dose), widened by a margin of 0.03 plus five times the noise of a block mean (from the bin-to-bin
-    differences of the most transparent tenth of the pixel subsample sub), and by at least 0.05 below."""
+    differences of the most transparent tenth of the pixel subsample sub, in blocks of rows whose float64 values
+    number about chunk_elems / 8), and by at least 0.05 below."""
     V, rows, cols = spatial_shape
     b = 4 if rows >= 16 and cols >= 16 else 1
     m = pixel_means.reshape(V, rows, cols)[:, :rows // b * b, :cols // b * b]
@@ -192,8 +200,13 @@ def _bright_level(pixel_means, spatial_shape, sub, dose=None, n_obs=0, dose_per_
     level, noise = float(np.percentile(m, 95)), 0.0
     if sub.shape[0] and sub.shape[1] > 1:
         means = sub.mean(1)
-        top = sub[means >= np.quantile(means, 0.9)]
-        sigma = np.sqrt(np.median(np.mean(np.diff(top.astype(np.float64), axis=1) ** 2, axis=1)) / 2)
+        top = np.flatnonzero(means >= np.quantile(means, 0.9))
+        step = max(1, chunk_elems // (8 * sub.shape[1]))
+        per_row = []
+        for i in range(0, top.size, step):
+            d = np.diff(sub[top[i:i + step]].astype(np.float64), axis=1)
+            per_row.append(np.mean(np.square(d, out=d), axis=1))
+        sigma = np.sqrt(np.median(np.concatenate(per_row)) / 2)
         noise = float(sigma / np.sqrt(sub.shape[1] * b * b))
     lo, hi = _expected_ratio(dose_per_bin if dose_per_bin is not None or dose is None else [dose], n_obs)
     margin = 0.03 + 5 * noise
@@ -956,7 +969,8 @@ def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=Non
                  open_beam_smoothing=0, memory_budget_mib=512):
     """Load a TIFF stack or an hsnt HDF5 file as a transmission ratio, with the data checks.
 
-    The stack is read in blocks of bins; memory holds the result and about memory_budget_mib of working set.
+    The stack is read in blocks of bins and checked in blocks of pixels; memory holds the result and about
+    memory_budget_mib of working set.
 
     Args:
         path (str): A directory of one TIFF per wavelength bin (or of such directories, one per view), or an HDF5
@@ -988,7 +1002,8 @@ def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=Non
             width x width window (odd, at least 3), the normalized square root of the outer product of two Hamming
             windows; the noise model counts the smoothed open beam as more observations, by the variance reduction
             measured across the observations (with one observation, that of independent pixels). Defaults to 0, none.
-        memory_budget_mib (float, optional): Working memory for the blocks of bins, in MiB. Defaults to 512.
+        memory_budget_mib (float, optional): Working memory for the blocks of bins and of the checks, in MiB.
+            Defaults to 512.
 
     Returns:
         Dataset: the transmission ratio (pixels, bins) with its geometry, dose, checks and load information.
@@ -1058,7 +1073,7 @@ def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=Non
             blocks.close()                                  # stops the prefetch before the source closes
         src.close()
     sm = dict(_summary_from_T(ds.T, ds.dose, ds.spatial_shape, bg, ds.open_beam_observations,
-                              dose_per_bin=ds.dose_per_bin),
+                              chunk_elems=_check_elems(memory_budget_mib), dose_per_bin=ds.dose_per_bin),
               smoothing=ds.info.get("open_beam_smoothing"))
     ds.info["T_stats"], ds.info["above_one"] = sm["stats"], sm["above_one"]
     ds.checks = _checks_from_summary(sm, ds.spatial_shape, strict)
@@ -1207,7 +1222,8 @@ def convert_to_hdf5(path, output=None, open_beam=None, input_type="auto", datase
             sm = dict(pixels=P, bins=K, nbytes=P * K * 4, stats=st, above_one=tot["above"] / tot["n"],
                       dead_px=_frac(pos_px == 0), dead_bins=dead_bins,
                       const_bins=int((bin_max == bin_min).sum()) - dead_bins, dose=dose,
-                      bright=_bright_level(sum_px / K, (V, rows, cols), sample, dose, n_eff, per_bin),
+                      bright=_bright_level(sum_px / K, (V, rows, cols), sample, dose, n_eff, per_bin,
+                                           _check_elems(memory_budget_mib)),
                       background=bg, smoothing=sm_note)
             checks = _checks_from_summary(sm, (V, rows, cols), strict)
             f.create_dataset("bin_indices", data=src.source_bins[:K * wave_bin:wave_bin])
