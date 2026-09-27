@@ -259,9 +259,12 @@ def _auto_penalty(pixel_means, dose):
     """The automatic charge per selected material, as a multiple of log K, from the counts of the median pixel (dose
     times its mean transmission): 0.5 below 10 counts per bin, 2 above 100, log-linear in between.
 
-    At few counts the larger charge drops a weak material from most of the pixels that hold it, keeping the dense
-    ones, and the refit inherits that selection bias; at many counts every material clears either charge, and the
-    admissions a small charge lets through are misfit rather than material and add noise to the maps.
+    The rule is tuned on one phantom (three spheres, 10^6 pixels, the median pixel background, so its counts are the
+    dose), where it is the minimax choice against a constant 2. At 1 to 2.4 counts, 2 falls up to 8.6 dB short of 0.5
+    on one spectrum, the component guard reverting a column in most fits, and 0.5 up to 3.4 dB short of 2 on another
+    (losses above the maximum-likelihood fit's: 0.75 to 0.93 nats per pixel for 0.5, 0.48 to 0.55 for 2). Between 3
+    and 10 counts, where the rule still charges 0.5, 2 is as good or up to 1.5 dB better on the spectra (losses 0.47
+    to 0.58 for 2, 0.41 to 0.46 for 0.5).
     """
     counts = float(dose) * torch.median(pixel_means.float()).item()
     frac = min(1.0, max(0.0, (math.log10(max(counts, 1e-12)) - 1.0)))          # 0 at 10 counts, 1 at 100

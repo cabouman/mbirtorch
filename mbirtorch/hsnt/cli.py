@@ -572,9 +572,9 @@ class _Options:
         self.rank_test(sp)
         g = sp.add_argument_group("advanced: support selection")
         self.add(g, "--support-penalty", type=_penalty_arg, default="auto", metavar="auto|F", advanced=True,
-                 help="charge per selected component, F x log(bins) nats, or 'auto' (default), which moves from 0.5 "
-                      "to 2 with the counts per pixel and bin: 2 admits essentially no absent component, 0.5 keeps "
-                      "a faint component in more of its pixels at low counts")
+                 help="charge per selected component, F x log(bins) nats, or 'auto' (default): 0.5 up to 10 counts "
+                      "per bin in the median pixel, rising to 2 at 100. On a test phantom 2 did as well or slightly "
+                      "better at 3 to 10 counts, and much worse below 3")
         self.add(g, "--free-refit", action="store_true", advanced=True,
                  help="drop the bound on the selected coefficients during the refit, then re-solve W >= 0 on the "
                       "supports")
