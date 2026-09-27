@@ -158,6 +158,24 @@ def test_reconstructions_run_end_to_end_with_and_without_the_filter(device):
     assert on_dict['recon_params']['denoiser sigma_x'] != off_dict['recon_params']['denoiser sigma_x']
 
 
+def test_computed_init_is_the_direct_reconstruction_of_each_frame(device, tmp_path):
+    """With no initial image, recon caches the stack of each frame's direct
+    reconstruction in init_dir, and records the init as computed."""
+    np.random.seed(0)
+    mace = MACE4DModel(_small_model(), num_frames=3)
+    mace.set_params(verbose=0, dejitter=False)
+    mace.set_device_pool([device])
+    sinogram = _smooth_sino()
+    _, recon_dict = mace.recon(sinogram, max_iterations=1, stop_threshold_change_pct=0,
+                               init_dir=str(tmp_path))
+    cached = np.load(tmp_path / 'init_recon.npy')
+    expected = np.stack([model.recon_direct(sinogram[views])
+                         for model, views in zip(mace.model_list, mace.view_slices)])
+    assert cached.shape == (3,) + mace.recon_shape
+    assert _rel_max(cached, expected) < 1e-5
+    assert recon_dict['recon_params']['init source'] == 'computed (3 frames, direct reconstruction)'
+
+
 def _four_frame_model():
     """A four-frame model of the 24-view scan, at a period the frame count can
     carry, so the filter stays on without a warning."""

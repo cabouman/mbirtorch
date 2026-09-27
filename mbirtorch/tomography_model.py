@@ -3166,11 +3166,12 @@ class TomographyModel(ParameterHandler):
         cache.
 
         Args:
-            See :meth:`prox_map` for arguments.  ``rng`` is the generator the
-            partitions are drawn from; None uses the global np.random state.
+            Multiple: see :meth:`prox_map` for arguments.  ``rng`` is the generator the
+              partitions are drawn from; None uses the global np.random state.
 
         Returns:
-            The tuple :meth:`initialize_recon` returns.
+            sinogram, weights, init_recon, partitions, partition_sequence,
+            granularity, regularization_params
         """
         initialized = self.initialize_recon(
             sinogram, weights, init_recon, max_iterations, first_iteration,

@@ -23,6 +23,8 @@ Reconstruction and Projection
 
 .. automethod:: mbirtorch.TomographyModel.prox_map
 
+.. automethod:: mbirtorch.TomographyModel.initialize_prox
+
 .. automethod:: mbirtorch.TomographyModel.forward_project
 
 .. automethod:: mbirtorch.TomographyModel.back_project

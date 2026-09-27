@@ -2,7 +2,9 @@ name: CI
 on:
   # Tests run on pull requests, not on every push: the pull-request run
   # gates merging, and releases have their own checks (TestPyPI rc +
-  # check_published_wheel.sh).
+  # check_published_wheel.sh).  A pull request into prerelease runs the
+  # tests on one Python and skips the torch floor; a pull request into
+  # main and a dispatched run test every Python and the floor.
   pull_request:
     branches: [prerelease, main]
   # Explicit dispatch exists for the dependency watch: pull requests opened
@@ -22,8 +24,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - id: read
+        # A pull request into prerelease tests the first (oldest) Python only.
         run: |
-          echo "test=$(jq -c .test .github/python-versions.json)" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = pull_request ] && [ "${{ github.base_ref }}" = prerelease ]; then
+            echo "test=$(jq -c '[.test[0]]' .github/python-versions.json)" >> "$GITHUB_OUTPUT"
+          else
+            echo "test=$(jq -c .test .github/python-versions.json)" >> "$GITHUB_OUTPUT"
+          fi
           echo "docs=$(jq -r .docs .github/python-versions.json)" >> "$GITHUB_OUTPUT"
 
   test:
@@ -52,6 +59,8 @@ jobs:
     # only by the dependency watch's window rule (plans repo:
     # plans/mbirtorch_metrics/torch_version_policy_plan.md).
     needs: versions
+    # Not run for a pull request into prerelease.
+    if: ${{ !(github.event_name == 'pull_request' && github.base_ref == 'prerelease') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
