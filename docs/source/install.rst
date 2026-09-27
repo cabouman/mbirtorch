@@ -4,74 +4,70 @@
 Installation
 ============
 
-Install ``MBIRTorch`` from PyPI into a Python 3.11 or later environment::
+Install from PyPI
+-----------------
+
+MBIRTorch needs Python 3.11 or later.  Install it with::
 
     pip install mbirtorch
 
-The standard ``torch`` dependency installs automatically.  On a Linux
-machine with an NVIDIA GPU, the default torch wheel includes CUDA support;
-no separate CUDA variant of ``MBIRTorch`` is needed.
+On a Linux machine with an NVIDIA GPU, the default torch wheel includes CUDA support, and
+reconstructions run on the GPU.  On Apple Silicon macOS, the default torch wheel includes Metal
+support, and reconstructions run on the GPU.  No separate GPU variant of MBIRTorch is needed.
 
-**Installing from source**
 
-Install from source to modify the package or to run its test suite.
+Verify the installation
+-----------------------
 
-1. Download the source code
+Run the first demo script, as described in :doc:`quick_start`.  It needs no data and takes about
+a minute.
 
-Move to a directory of your choice and run the following two commands::
+
+Install from source
+-------------------
+
+Install from source to modify the package or to run its test suite.  First clone the repository::
 
     git clone https://github.com/cabouman/mbirtorch.git
     cd mbirtorch
 
-2. Install the conda environment and package
+Then install in one of two ways.
 
-We provide bash scripts that do a clean install of ``MBIRTorch`` in a new
-conda environment::
+**A new conda environment.**  The script below creates a conda environment named ``mbirtorch``,
+installs the package in editable mode with its test and documentation dependencies, and builds
+the documentation::
 
     cd dev_scripts
     source clean_install_all.sh
 
-This creates a conda environment named ``mbirtorch``, installs the package
-in editable mode with its test and documentation dependencies, and builds
-the documentation.
+The script deletes any existing conda environment named ``mbirtorch`` before creating the new one.
 
-To install into an existing environment instead, run this from the
-repository root::
+**An existing environment.**  From the repository root, install the package in editable mode with
+its test dependencies::
 
-    pip install .
+    pip install -e ".[test]"
 
-**Optional Pixi development environment**
+Either way, run the tests from the repository root::
 
-For contributors who use `Pixi <https://pixi.sh>`__, ``MBIRTorch`` also provides an
-optional reproducible development environment, defined by ``pixi.toml`` and pinned by
-``pixi.lock`` at the repository root.  This does not replace the conda installation
-workflow above.
+    pytest tests
 
-For the default CPU environment on Linux or Apple Silicon macOS::
+
+Pixi environment
+----------------
+
+For contributors who use `Pixi <https://pixi.sh>`__, the files ``pixi.toml`` and ``pixi.lock`` at
+the repository root define a pinned development environment.  This is an alternative to the conda
+environment above, not a replacement for it.
+
+On Linux or Apple Silicon macOS, the default environment uses the CPU build of torch::
 
     pixi run smoke
     pixi run test-fast
 
-For a CUDA-enabled Linux system::
+On a Linux machine with an NVIDIA driver for CUDA 13, use the ``cuda`` environment.  If the driver
+supports only CUDA 12, use ``cuda12`` instead::
 
     pixi run -e cuda smoke-torch
     pixi run -e cuda test-fast
 
-The ``cuda`` environment uses the CUDA 13 build of torch, which needs an NVIDIA driver
-that supports CUDA 13.  On a machine whose driver supports only CUDA 12, use the
-``cuda12`` environment instead::
-
-    pixi run -e cuda12 smoke-torch
-    pixi run -e cuda12 test-fast
-
-Additional useful tasks include::
-
-    pixi run test
-    pixi run docs
-
-**Verifying the installation**
-
-The tests are not part of the installed package, so run them from a source
-checkout.  From the repository root::
-
-    pytest tests
+The tasks ``test`` and ``docs`` run the full test suite and build the documentation.
