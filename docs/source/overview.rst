@@ -4,13 +4,13 @@ Overview
 
 **MBIRTorch** is a Python package for Model Based Iterative Reconstruction (MBIR) of images from tomographic data.
 
-- **Image quality:** MBIR uses a forward (sensor) model and a prior (image) model, which gives the best image quality.
+- **Image quality:** forward (sensor) and prior (image) models improve reconstruction quality.
 - **Ease of use:** automatic parameter selection produces a good reconstruction the first time.
 - **Speed:** the vectorized coordinate descent (VCD) algorithm converges fast, and PyTorch runs it on CPUs or GPUs,
   spreading one reconstruction across multiple GPUs (see :doc:`usr_multi_gpu`).
 - **Flexibility:** an object-oriented Python interface, and proximal map interfaces for Plug-and-Play priors.
 
-See :ref:`DemosFAQs` for demos as Jupyter notebooks and Python scripts, and :ref:`InstallationDocs` to install from source.
+See :ref:`InstallationDocs` to install the package from PyPI or from source, and :ref:`DemosFAQs` for example scripts.
 
 **Geometries**
 
