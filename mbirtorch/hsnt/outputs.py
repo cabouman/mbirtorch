@@ -16,8 +16,10 @@ def fit_quality(T, W, H, dose=None, device="cpu", dose_per_bin=None, open_beam_o
     """Reduced chi-square of the fit against Poisson noise, the mean of (T - e^-X)^2 / var over the data.
 
     For counts c ~ Poisson(d e^-X) over an open beam of d counts per bin, var = e^-X / d; an open beam measured as the
-    mean of n observations adds its own noise, e^-2X / (n d). Near 1 the residual is at the noise level; well above 1
-    the rank is too small or the model is wrong; well below 1 the fit follows the noise.
+    mean of n observations adds its own noise, e^-2X / (n d). The chi-square is proportional to the dose, and a
+    component more lowers it by only about 1 / pixels + 1 / bins. Near 1 the residual is at the noise level; well
+    above 1 the rank is too small, the model is wrong or the dose is overestimated; well below 1 the dose is
+    underestimated or the noise model overstates the variance.
 
     Args:
         T (numpy.ndarray): Transmission ratio, shape (pixels, bins).

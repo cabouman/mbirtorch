@@ -2,7 +2,9 @@
 and HDF5 inputs, and dehydrate / rehydrate / denoise runs whose outputs read back through the package's HDF5
 importer."""
 import json
+import logging
 import os
+from types import SimpleNamespace
 
 import h5py
 import numpy as np
@@ -11,7 +13,7 @@ import tifffile
 import torch
 
 import mbirtorch.hsnt as hsnt
-from mbirtorch.hsnt.cli import main
+from mbirtorch.hsnt.cli import _log_fit, main
 from mbirtorch.hsnt.loading import _smoothing_kernel, _tif_names, infer_input_type, load_dataset
 from mbirtorch.hsnt.outputs import component_check, fit_quality, mean_pixel_spectrum
 
@@ -376,6 +378,8 @@ def test_fit_diagnostics():
     T = (rng.poisson(flux * np.exp(-W @ H)) / np.maximum(ob, 1)).astype(np.float32)
     exact = fit_quality(T, W, H, dose=50.0, dose_per_bin=flux, open_beam_observations=2)["reduced_chi2"]
     assert abs(exact - 1) < 0.05 and fit_quality(T, W, H, dose=50.0)["reduced_chi2"] > 1.2
+    high = fit_quality(T, W, H, dose=50.0, dose_per_bin=flux * 4 / 3, open_beam_observations=2)["reduced_chi2"]
+    assert high == pytest.approx(4 / 3 * exact)                          # proportional to the dose
     assert component_check(W, H)["proportional_pairs"] == []             # distinct maps
     W2 = np.stack([W[:, 0], W[:, 0] * (1 + 0.05 * rng.standard_normal(W.shape[0]))], 1)    # a split material
     H2 = np.stack([H[0] * 0.5, H[0] * 0.5])
@@ -383,3 +387,21 @@ def test_fit_diagnostics():
     assert component_check(W2, H)["proportional_pairs"] == []            # proportional maps, distinct spectra: a mix
     total, contrib, n = mean_pixel_spectrum(W2, H2)
     assert total.shape == (K,) and n > 0 and np.allclose(total, contrib.sum(0))
+
+
+def test_the_chi_square_advice_follows_the_dose(caplog):
+    """The chi-square is proportional to the dose, and a component more lowers it by only about 1 / bins: a low one
+    points to an underestimated dose or an overstated variance, not to too large a rank; a high one also to an
+    overestimated dose."""
+    rep = dict(components=dict(proportional_pairs=[], max_spectral_cosine=0.1, max_map_correlation=0.2,
+                               row_noise_rel=[0.1]), fit=dict(relative_residual=0.01))
+    args = SimpleNamespace(basis=None, rank_detail=False, rank_note="estimated")
+    said = {}
+    for chi2 in (0.7, 0.4, 1.5, 2.5):
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="mbirtorch.hsnt"):
+            _log_fit(dict(rep, fit=dict(rep["fit"], reduced_chi2=chi2)), args)
+        said[chi2] = " ".join(r.getMessage() for r in caplog.records)
+    assert all("dose is underestimated" in said[c] and "rank" not in said[c] for c in (0.7, 0.4))
+    assert "proportional" in said[0.4] and all("dose overestimated" in said[c] for c in (1.5, 2.5))
+    assert "check the rank" in said[2.5]

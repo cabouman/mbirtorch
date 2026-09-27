@@ -293,13 +293,16 @@ def _log_fit(rep, args):
     if 0.8 <= chi2 <= 1.3:
         verdict = "at the Poisson noise level"
     elif chi2 > 1.3:
-        verdict = "above the noise level: the rank may be too small or the model misspecified"
+        verdict = "above the noise level: the rank may be too small, the model misspecified or the dose overestimated"
     else:
-        verdict = "below the noise level: the fit follows the noise (rank too large, or the dose is overestimated)"
+        verdict = "below the noise level: the dose is underestimated, or the noise model overstates the variance"
     log.info("fit: reduced chi-square %.3f (%s); relative residual in transmission %.4g", chi2, verdict,
              q["relative_residual"])
-    if not 0.5 <= chi2 <= 2.0:
+    if chi2 > 2.0:
         log.warning("reduced chi-square %.2f is far from 1; check the rank (%s) and the dose", chi2, args.rank_note)
+    elif chi2 < 0.5:
+        log.warning("reduced chi-square %.2f is far from 1; check the dose, to which it is proportional (a component "
+                    "more lowers it by only about 1 / bins)", chi2)
 
 
 def cmd_inspect(args):
