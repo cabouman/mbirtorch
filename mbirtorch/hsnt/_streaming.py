@@ -1,3 +1,5 @@
+import logging
+
 import numpy as np
 import torch
 
@@ -6,6 +8,8 @@ from ._loss import _nnal_prep
 from ._device import _default_device
 from ._newton import _kernels, _resolve_compile, solve_W
 from .factorization import _nnal_factorization
+
+log = logging.getLogger("mbirtorch.hsnt")
 
 
 def _h_stats_accumulate(W, H, T, prep, rows, cols, deriv, rowwise):
@@ -51,9 +55,10 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
         chunks (sequence of torch.Tensor): Chunks of the transmission ratio, each (pixels, bins), together making
             up T; any indexable sequence works, so chunks may be loaded lazily.
         num_materials (int): Rank R.
-        max_passes (int, optional): Polish passes over the data; 0 keeps the subsample fit. Defaults to 5.
-        rel_tol (float, optional): Stop when a pass changes the total loss by less than this, relatively.
-            Defaults to 1e-6.
+        max_passes (int, optional): Polish passes over the data; 0 keeps the subsample fit. A warning gives the last
+            pass's relative loss change when max_passes ends the passes before rel_tol does. Defaults to 5.
+        rel_tol (float, optional): Stop on the first pass that changes the total loss by at most this, relatively:
+            one pass, not the five steps in a row of the solver held whole. 0 runs every pass. Defaults to 1e-6.
         warmup_pixels (int, optional): Pixels for the initial fit, a seeded random subset of all the chunks (each
             chunk holding one is read for it). Defaults to 16384.
         device (str, optional): Torch device. Defaults to None, meaning CUDA if available, else CPU.
@@ -143,9 +148,14 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
                 print(f'  pass {p}{tag}: full-data loss {loss.item():.6e}  KKT residual {kkt:.2e}', flush=True)
             if prev_loss is not None and rel_tol > 0 and bool(torch.abs(loss - prev_loss) <= rel_tol * torch.abs(loss)):
                 break
-            prev_loss = loss
             if p == passes_max:
+                if prev_loss is not None and rel_tol > 0:
+                    change = abs(loss.item() - prev_loss.item()) / max(abs(loss.item()), np.finfo(np.float64).tiny)
+                    log.warning("streamed fit: max_passes (%d) ended the %s before the rel_tol stop: the last pass "
+                                "changed the loss by %.2e, relatively, against rel_tol %.2e", passes_max,
+                                "support refit" if tag else "polish passes", change, rel_tol)
                 break
+            prev_loss = loss
 
             # One exact Newton step on H from the accumulated statistics.
             d, slope, alpha_max = _h_direction(H, grad.to(H.dtype), flat.to(H.dtype), rows, cols)

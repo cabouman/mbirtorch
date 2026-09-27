@@ -8,20 +8,34 @@ import torch
 from ._device import _default_device
 
 
+def _loss_and_residual(T, W, H):
+    """The float64 loss of W @ H against T and the mean of (T - e^-X)^2 / e^-X, in blocks of outputs._CHUNK_ELEMENTS
+    entries, so that no P x K float64 array is formed."""
+    from ._loss import stable_nnal
+    from .outputs import _CHUNK_ELEMENTS
+    Hd = H.double()
+    chunk = max(1, _CHUNK_ELEMENTS // T.shape[1])
+    loss = resid = 0.0
+    for i in range(0, T.shape[0], chunk):
+        Xd = W[i:i + chunk].double() @ Hd
+        Th = torch.exp(-Xd)
+        Td = T[i:i + chunk].double()
+        loss += stable_nnal(Xd, Td).item()
+        resid += (((Td - Th) ** 2) / Th.clamp_min(1e-12)).sum().item()
+    return loss, resid / T.numel()
+
+
 def _lrt_rank(T, max_rank, label, verbose=0):
     """Sequential likelihood-ratio rank test on the pixels of T, a tensor on the device. Returns (rank, detail)."""
     from .factorization import _nnal_factorization
-    from ._loss import stable_nnal
     P, K = T.shape
     losses, resid = [], []
     for r in range(1, max_rank + 1):
         # uncompiled: the search solves small problems at six ranks, and each new shape would recompile
         W, H, _ = _nnal_factorization(T, r, max_steps=200, rel_tol=1e-6, compile_mode="off")
-        Xd = W.double() @ H.double()
-        Th = torch.exp(-Xd)
-        Td = T.double()
-        losses.append(stable_nnal(Xd, Td).item())
-        resid.append((((Td - Th) ** 2) / Th.clamp_min(1e-12)).mean().item())
+        loss, res = _loss_and_residual(T, W, H)
+        losses.append(loss)
+        resid.append(res)
     dose_eff = 1.0 / max(resid[-1], np.finfo(np.float64).tiny)
     gains = [dose_eff * (losses[i - 1] - losses[i]) for i in range(1, len(losses))]     # gains[i - 1]: component i + 1
     edge = 0.5 * (math.sqrt(P) + math.sqrt(K)) ** 2          # the gain of a component fitted to noise alone

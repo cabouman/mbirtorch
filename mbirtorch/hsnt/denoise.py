@@ -72,9 +72,9 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
     rank is the number of components; when it is not given it is estimated by likelihood-ratio tests
     (:func:`~mbirtorch.hsnt.estimate_rank`), which also pool pixels spatially when the leading axes are
     (views, rows, cols) or (rows, cols). The components are a nonnegative basis of the data, not necessarily the
-    pure materials. Data that do not fit the device (or with mode='stream') are factorized by chunks of pixels; rel_tol
-    is then the relative loss change per pass over the chunks, max_steps does not apply, and compile_mode compiles
-    only when 'on'.
+    pure materials. Data that do not fit the device (or with mode='stream') are factorized by chunks of pixels; the fit
+    then stops on the first pass over the chunks whose relative loss change is at most rel_tol, or after max_passes
+    passes, max_steps does not apply, and compile_mode compiles only when 'on'.
 
     Given a subspace_basis, only the maps are fitted: each pixel's maximum-likelihood coefficients W >= 0 for those
     spectra, by chunks of pixels when the data do not fit the device; max_steps and rel_tol then apply to each chunk's
@@ -103,18 +103,23 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
             refit, then re-solve W >= 0 on the supports. Defaults to False.
         max_steps (int, optional): Solver iteration cap. Defaults to 1000.
         rel_tol (float, optional): The solver stops after five consecutive steps whose relative loss change is at most
-            this. Defaults to 1e-8.
+            this; a streamed fit stops on one pass over the chunks that changes it by at most this. Defaults to 1e-8.
         max_rank (int, optional): Largest rank the estimate considers. Defaults to 6.
         device (str, optional): Torch device. Defaults to None, meaning CUDA if available, else CPU.
         compile_mode (str, optional): 'auto' compiles the solver with torch.compile on CUDA for data of at least 5e8
             entries, where it pays; 'on' always; 'off' never. The rank estimate always runs uncompiled. Defaults to
             'auto'.
         mode (str, optional): 'full' solves on the device at once, 'stream' by chunks of pixels, and 'auto' picks
-            from the memory the device has available. Streamed, spectra='unconstrained' and 'support' keep only part
-            of their gain over the maximum-likelihood spectra. Defaults to 'auto'.
+            from the memory the device has available and whether the solve compiles. Streamed, spectra='unconstrained'
+            and 'support' keep only part of their gain. On a 1M-pixel sphere phantom at dose 3 (one seed), against the
+            streamed maximum-likelihood spectra, streamed 'unconstrained' gained 0.7 to 3.3 dB at a loss 0.017 nats
+            per pixel higher and streamed 'support' 3.1 to 7.2 dB at 0.47 higher; solved whole, the two gained 7.2 to
+            12.8 dB over the maximum-likelihood spectra, at 0.11 and 0.46 nats per pixel above its loss. Pass
+            mode='full' when the device holds the data. Defaults to 'auto'.
         chunk_pixels (int, optional): Pixels per chunk when streamed. Defaults to None, from the available memory.
         max_passes (int, optional): Polish passes over the data when streamed, after an initial fit on a random
-            subsample of the pixels; 0 keeps that fit. Defaults to 5.
+            subsample of the pixels; 0 keeps that fit. A warning says when max_passes, not rel_tol, ends the passes.
+            Defaults to 5.
         verbose (int, optional): 0 prints nothing; 1 prints a summary; 2 also prints the rank search. Defaults to 1.
 
     Returns:

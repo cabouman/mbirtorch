@@ -143,10 +143,10 @@ def _device(name):
     return name
 
 
-def plan_memory(ds, device, mode, chunk_pixels, spectra="mle"):
-    """A full or streamed solve for the loaded data on `device`. Returns (mode, chunk_pixels, note)."""
+def plan_memory(ds, device, mode, chunk_pixels, spectra="mle", compile_mode="auto"):
+    """A full or streamed solve for the loaded data on `device`. Returns (mode, chunk_pixels, warmup_pixels, note)."""
     from ._fit import _plan
-    return _plan(ds.pixels, ds.bins, device, spectra, mode, chunk_pixels)
+    return _plan(ds.pixels, ds.bins, device, spectra, mode, chunk_pixels, compile_mode)
 
 
 def _penalty_arg(text):
@@ -202,9 +202,11 @@ def _load_basis(path, ds):
 def solve(ds, args, device):
     """Run the factorization and the requested spectra estimator. Returns (W, H, report) with W and H numpy."""
     from ._fit import _fit, _fit_fixed_basis
+    args.fit_report = {}                                # holds the memory plan for main's advice if the solve fails
     if args.basis:
         W, H, rep = _fit_fixed_basis(ds.T, args.basis_H, device=device, mode=args.mode, chunk_pixels=args.chunk_pixels,
-                                     max_steps=args.max_steps, rel_tol=args.rel_tol, compile_mode=args.compile)
+                                     max_steps=args.max_steps, rel_tol=args.rel_tol, compile_mode=args.compile,
+                                     report=args.fit_report)
         rep.update(rank=args.rank_value, rank_note=args.rank_note, rank_search=None, basis=os.path.abspath(args.basis))
         return W, H, rep
     if args.spectra == "support" and ds.dose is None:
@@ -215,7 +217,7 @@ def solve(ds, args, device):
     W, H, rep = _fit(ds.T, args.rank_value, spectra=args.spectra, dose=ds.dose, penalty=args.support_penalty,
                      free_refit=args.free_refit, wald_screen=args.wald_screen, device=device, mode=args.mode,
                      chunk_pixels=args.chunk_pixels, max_steps=args.max_steps, rel_tol=args.rel_tol,
-                     max_passes=args.max_passes, compile_mode=args.compile)
+                     max_passes=args.max_passes, compile_mode=args.compile, report=args.fit_report)
     rep.update(rank=args.rank_value, rank_note=args.rank_note, rank_search=args.rank_detail)
     return W, H, rep
 
@@ -379,7 +381,7 @@ def _pipeline(args, denoise):
     _check_outputs([base + n for n in names], [args.input, args.basis, *(args.open_beam or [])], args.overwrite)
     _resolve_rank(ds, args, device)
     if args.dry_run:
-        plan_memory(ds, device, args.mode, args.chunk_pixels, "basis" if args.basis else args.spectra)
+        plan_memory(ds, device, args.mode, args.chunk_pixels, "basis" if args.basis else args.spectra, args.compile)
         print(f"dry run: data loaded and checked, {args.rank_note}; no solve. Output base: {base}")
         return 0
     W, H, rep = solve(ds, args, device)
@@ -595,12 +597,15 @@ class _Options:
                       "pays; stream mode compiles only with 'on', and the rank estimate always runs uncompiled")
         g = sp.add_argument_group("advanced: memory")
         self.add(g, "--mode", choices=("auto", "full", "stream"), default="auto", advanced=True,
-                 help="full solve on the device or streamed by chunks of pixels (default: by available memory)")
+                 help="full solve on the device or streamed by chunks of pixels (default: full when its estimated "
+                      "working set, compiled or not, is within 80%% of the available memory)")
         self.add(g, "--chunk-pixels", type=_positive_int, advanced=True,
-                 help="pixels per chunk in stream mode (default: from available memory)")
+                 help="pixels per chunk in stream mode (default: from available memory); halve it if the device runs "
+                      "out of memory")
         self.add(g, "--max-passes", type=_nonneg_int, default=5, advanced=True,
-                 help="stream mode: polish passes over the data after the fit on a pixel subsample; 0 keeps that "
-                      "fit (default 5)")
+                 help="stream mode: polish passes over the data after the fit on a pixel subsample, stopping early on "
+                      "the first pass that changes the loss by at most --rel-tol, relatively; 0 keeps that fit "
+                      "(default 5)")
 
 
 def build_parser(show_all=False):
@@ -665,9 +670,34 @@ def build_parser(show_all=False):
     return p
 
 
+# Errors of cuBLAS, cuSOLVER and the CUDA runtime that an oversubscribed device raises in place of the allocator's
+# out-of-memory error (seen on a WSL2 laptop GPU, whose driver pages device memory instead of refusing it).
+_DEVICE_MEMORY_FAILURES = ("CUBLAS_STATUS_EXECUTION_FAILED", "CUBLAS_STATUS_ALLOC_FAILED", "CUSOLVER",
+                           "CUDA error: out of memory")
+
+
 def _is_device_out_of_memory(e):
+    """The allocator's out-of-memory error, or a RuntimeError naming one of _DEVICE_MEMORY_FAILURES."""
     torch = sys.modules.get("torch")
-    return torch is not None and isinstance(e, torch.cuda.OutOfMemoryError)
+    if torch is not None and isinstance(e, torch.cuda.OutOfMemoryError):
+        return True
+    return isinstance(e, RuntimeError) and any(s in str(e) for s in _DEVICE_MEMORY_FAILURES)
+
+
+def _out_of_memory_message(e, rep):
+    """The error line for a device out of memory: the failure, the memory plan of the solve it stopped (rep, the
+    solve's report so far) and the options that shrink the working set."""
+    torch = sys.modules.get("torch")
+    lines = str(e).strip().splitlines()
+    what = ("ran out of memory" if torch is not None and isinstance(e, torch.cuda.OutOfMemoryError)
+            else "failed, most likely out of memory")
+    text = f"error: the device {what} ({lines[0] if lines else type(e).__name__})"
+    if not rep.get("memory_plan"):
+        return text + ": try --mode stream or a smaller --chunk-pixels, --downsample or --wave-bin, or --device cpu"
+    text += f" in a {rep['mode']} solve; plan: {rep['memory_plan']}"
+    if rep["mode"] == "stream":
+        return text + f". Try half the chunk, --chunk-pixels {max(1, rep['chunk_pixels'] // 2)}, or --device cpu"
+    return text + ". Try --mode stream, a smaller --downsample or --wave-bin, or --device cpu"
 
 
 def main(argv=None):
@@ -695,8 +725,7 @@ def main(argv=None):
         if level <= logging.DEBUG:
             raise
         if _is_device_out_of_memory(e):
-            raise SystemExit(f"error: the device ran out of memory ({str(e).splitlines()[0]}): try --mode stream or a "
-                             "smaller --chunk-pixels, --downsample or --wave-bin, or --device cpu") from None
+            raise SystemExit(_out_of_memory_message(e, getattr(args, "fit_report", {}))) from None
         if isinstance(e, (InputError, OSError, MemoryError)):
             raise SystemExit(f"error: {e}") from None
         raise
