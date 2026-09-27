@@ -104,6 +104,24 @@ def _loss(W, H, T_host, device):
     return total
 
 
+def _report_zero_counts(rep, W, H, T, device, chunk):
+    """Record, and warn about, fitted attenuations above _ZERO_COUNT_BOUND on entries with no counts
+    (_zero_count_divergence), going through T (host numpy or a device tensor) by blocks of `chunk` rows."""
+    from .factorization import _ZERO_COUNT_BOUND, _zero_count_divergence
+    x_max, n_above = 0.0, 0
+    Hd = H.to(device)
+    for i in range(0, T.shape[0], chunk):
+        Tc = T[i:i + chunk] if torch.is_tensor(T) else torch.from_numpy(T[i:i + chunk])
+        m, n = _zero_count_divergence(W[i:i + chunk].to(device), Hd, Tc.to(device))
+        x_max, n_above = max(x_max, m), n_above + n
+    rep.update(zero_count_max_attenuation=x_max, zero_count_entries_above_bound=n_above)
+    if n_above:
+        log.warning("the fit puts %d zero-count entries above attenuation %g (largest %.3g). At a few counts per bin "
+                    "the likelihood keeps rising along a component that grows on the zero counts, so those entries, "
+                    "and the maps and spectra that carry them, depend on max_steps", n_above, _ZERO_COUNT_BOUND,
+                    x_max)
+
+
 def _fit_fixed_basis(T, H, device="cpu", mode="auto", chunk_pixels=None, max_steps=1000, rel_tol=1e-8,
                      compile_mode="auto", report=None):
     """The maps for a given basis: every pixel's maximum-likelihood W >= 0 with H fixed, independent problems solved
@@ -134,6 +152,7 @@ def _fit_fixed_basis(T, H, device="cpu", mode="auto", chunk_pixels=None, max_ste
     rep["loss_mle"] = rep["loss_final"] = _loss(W, Hd, T, device)
     log.info("maps for the given basis: %s, %d chunk(s) in %.1f s, loss %.6g", mode, rep["chunks"],
              rep["solve_seconds"], rep["loss_final"])
+    _report_zero_counts(rep, W, Hd, T, device, chunk)
     rep["W_zero_frac"], rep["H_zero_frac"] = (W == 0).double().mean().item(), (Hd == 0).double().mean().item()
     if device.startswith("cuda"):
         rep["gpu_peak_gib"] = round(torch.cuda.max_memory_allocated(device) / 2**30, 2)
@@ -194,6 +213,10 @@ def _fit(T, rank, spectra="mle", dose=None, penalty="auto", free_refit=False, wa
     steps_text = f"{rep['steps']} steps" if "steps" in rep else f"{rep['passes']} polish passes"
     log.info("factorization: %s, %s in %.1f s, loss %s", mode, steps_text, rep["solve_seconds"],
              "n/a" if rep["loss_mle"] is None else f"{rep['loss_mle']:.6g}")
+    if mode == "full" and rep["steps"] >= max_steps:
+        log.warning("the maximum-likelihood fit stopped at max_steps (%d) before its rel_tol stop", max_steps)
+    if mode == "full" or spectra != "unconstrained":  # the maximum-likelihood fit (a streamed free-signed W is not)
+        _report_zero_counts(rep, W, H, Td if mode == "full" else T, device, P if mode == "full" else chunk)
     if spectra == "unconstrained" and mode == "full":
         t1 = time.perf_counter()
         W, H, st = _unconstrained_spectra(Td, W, H, compile_mode=compile_mode)

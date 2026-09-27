@@ -186,10 +186,24 @@ def test_the_zero_count_divergence_is_reported(dev):
     """At about one count per bin the loss keeps falling along a component that grows on the zero counts, and
     _zero_count_divergence reports it; at dose 100 it reports nothing."""
     for dose, diverges in ((1.0, True), (100.0, False)):
-        T = _sphere_problem(dev, dose=dose)
-        W, H, _ = _nnal_factorization(T, 3, max_steps=300, compile_mode="off")
+        T = _sphere_problem(dev, n=32, K=100, dose=dose)
+        W, H, _ = _nnal_factorization(T, 3, max_steps=150, compile_mode="off")
         x_max, n_above = _zero_count_divergence(W, H, T)
         assert (n_above > 0) == diverges and (x_max > 50) == diverges
+
+
+def test_a_fit_reports_the_zero_count_divergence(caplog):
+    """The fit behind dehydrate records the largest attenuation it puts on a zero count, and warns when entries pass
+    the bound, full and streamed; at dose 100 it records none."""
+    from mbirtorch.hsnt._fit import _fit
+    for dose, mode in ((1.0, "full"), (1.0, "stream"), (100.0, "full")):
+        T = _sphere_problem("cpu", n=32, K=100, dose=dose).numpy()
+        caplog.clear()
+        with caplog.at_level("WARNING", logger="mbirtorch.hsnt"):
+            _, _, rep = _fit(T, 3, device="cpu", mode=mode, chunk_pixels=512, max_steps=150, max_passes=3,
+                             compile_mode="off")
+        diverges = rep["zero_count_entries_above_bound"] > 0
+        assert diverges == (dose == 1.0) and diverges == ("zero-count entries" in caplog.text)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")

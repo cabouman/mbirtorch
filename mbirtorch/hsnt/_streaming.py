@@ -184,9 +184,13 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
             accepted = torch.where(ok.any(0), alphas.gather(0, ok.float().argmax(0, keepdim=True)).squeeze(0),
                                    torch.zeros_like(alpha_max))
             Ht = (H.T - accepted[:, None] * d).clamp_(min=0)
-            # Same epsilon-active snap as block_newton_step: a bin component at the
-            # bound with an outward gradient becomes exactly zero, not a residue.
-            eps_active = _newton._ACTIVE_TOL * Ht.abs().amax(-1, keepdim=True).mean()
+            # Same epsilon-active snap as block_newton_step: a bin component at the bound with an outward gradient
+            # becomes exactly zero, not a residue. The epsilon is per component (its mean positive entry), so a
+            # snapped entry is at most 1e-6 of that component's scale; no other component sets it.
+            pos = Ht > 0
+            unit = (torch.where(pos, Ht, torch.zeros_like(Ht)).sum(0, keepdim=True)
+                    / pos.sum(0, keepdim=True).clamp_min(1))
+            eps_active = _newton._ACTIVE_TOL * unit
             Ht = torch.where((Ht <= eps_active) & (grad.T.to(Ht.dtype) > 0), torch.zeros_like(Ht), Ht)
             H = Ht.T.contiguous()
             passes = p + 1
