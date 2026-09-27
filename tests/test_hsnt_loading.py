@@ -1,12 +1,19 @@
-"""Tests for the hsnt loader's data checks, open-beam handling and memory: exact value fractions, the bright-region
-check against the loader's expected ratio, the calibration's view wording, and the working set of load_dataset."""
+"""Tests for the hsnt loader's data checks, dose and open-beam handling, and memory: exact value fractions, the
+bright-region check against the loader's expected ratio, the calibration's view wording, the dose of a range of a
+converted file and the check of a given dose, the smoothing of a low-count open beam, and the working set of
+load_dataset."""
+import json
+import warnings
+
 import h5py
 import numpy as np
 import pytest
+import tifffile
 from scipy.stats import poisson
 
 import mbirtorch.hsnt as hsnt
-from mbirtorch.hsnt.loading import _checks_from_summary, _stack_to_transmission, _summary_from_T, load_dataset
+from mbirtorch.hsnt.loading import (_checks_from_summary, _smooth_open_beam, _stack_to_transmission, _summary_from_T,
+                                    convert_to_hdf5, load_dataset)
 
 
 def _disk_file(path, n_obs, lam, exposure, K, seed, n=64):
@@ -79,3 +86,78 @@ def test_the_calibration_reports_the_views_mean_exposure(tmp_path):
     assert ds.dose == pytest.approx(100.0 * exposure.mean(), rel=1e-5)
     text = " ".join(c.message for c in ds.checks)
     assert "the dose is the views' mean" in text and "use the views' mean" in text and "median view" not in text
+
+
+def _write_stack(directory, counts):
+    """A TIFF stack of (rows, cols, bins) counts, one image per bin."""
+    directory.mkdir(parents=True)
+    for k in range(counts.shape[-1]):
+        tifffile.imwrite(directory / f"wave_idx_{k:05d}.tif", counts[:, :, k].astype(np.float32))
+    return str(directory)
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning")
+def test_a_wave_range_of_a_converted_file_takes_the_dose_of_its_columns(tmp_path):
+    """An open beam falling from 40 to 5 counts across 60 bins: a converted file loaded with --wave-range 30:60 takes
+    the median recorded open beam of those columns, as the TIFF stack loaded with that range estimates it, not the
+    whole file's; --wave-bin scales it."""
+    rng = np.random.default_rng(10)
+    lam = np.linspace(40, 5, 60)
+    sample = _write_stack(tmp_path / "sample", rng.poisson(0.7 * lam, (16, 16, 60)))
+    ob = _write_stack(tmp_path / "ob", rng.poisson(lam, (16, 16, 60)))
+    conv = str(tmp_path / "conv.h5")
+    convert_to_hdf5(sample, output=conv, open_beam=[ob])
+    whole, part = load_dataset(conv), load_dataset(conv, wave_range=(30, 60))
+    with h5py.File(conv) as f:
+        assert whole.dose == pytest.approx(f.attrs["dose"])
+        assert part.dose == pytest.approx(np.median(f["open_beam_dose"][30:60])) and part.dose < 0.75 * whole.dose
+    assert part.dose == pytest.approx(load_dataset(sample, open_beam=[ob], wave_range=(30, 60)).dose, rel=0.1)
+    assert load_dataset(conv, wave_range=(30, 60), wave_bin=2).dose == pytest.approx(2 * part.dose)
+
+
+def test_a_given_dose_is_checked_against_the_open_beam_dose_a_file_records(tmp_path):
+    """A file recording dose 110 at a calibration factor of 1.1 has an open-beam dose of 100: a given 100 passes, the
+    scaled 110 (which inspect prints) and 300 warn; on an uncalibrated file recording 100, 300 warns and 110 passes."""
+    T = np.full((1, 8, 8, 4), 0.8, dtype=np.float32)
+    background = dict(name="given", boxes=[[0, 2, 0, 2]], tiles=[1, 1], factor_median=1.1, tile_medians=[1.1],
+                      factor_range=[1.1, 1.1])
+    for name, dose, attrs in (("cal", 110.0, dict(background=json.dumps(background))), ("plain", 100.0, {})):
+        with h5py.File(tmp_path / f"{name}.h5", "w") as f:
+            f.create_dataset("data", data=T)
+            f.create_dataset("dataset_type", data=np.bytes_("transmission"))
+            f.attrs.update(dose=dose, **attrs)
+
+    def warned(name, dose):
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            load_dataset(str(tmp_path / f"{name}.h5"), dose=dose)
+        return " ".join(str(x.message) for x in w if "given dose" in str(x.message))
+
+    assert not warned("cal", 100.0) and "scaled twice" in warned("cal", 110.0) and "50%" in warned("cal", 300.0)
+    assert "50%" in warned("plain", 300.0) and not warned("plain", 110.0)
+
+
+def test_open_beam_smoothing_keeps_zero_counts_and_leaves_out_dead_pixels():
+    """At one count per pixel and bin the smoothed open beam keeps the raw mean (leaving out each zero count raised
+    it by 1 / (1 - e^-1) = 1.58); a pixel zero in every bin of the block is left out and filled from its
+    neighbors, which it does not lower."""
+    rng = np.random.default_rng(0)
+    ob = rng.poisson(1.0, size=(1, 128, 128, 8)).astype(np.float32)
+    assert _smooth_open_beam(ob.copy(), 3).mean() / ob.mean() == pytest.approx(1, abs=0.01)
+    ob = rng.poisson(100.0, size=(1, 32, 32, 8)).astype(np.float32)
+    ob[0, 10, 10] = 0
+    smoothed = _smooth_open_beam(ob, 3)
+    assert abs(smoothed[0, 10, 10].mean() / 100 - 1) < 0.05 and abs(smoothed[0, 9:12, 9:12].mean() / 100 - 1) < 0.03
+
+
+def test_smoothing_one_observation_warns_that_its_variance_reduction_is_assumed(tmp_path):
+    """With one open-beam observation the smoothing's variance reduction is that of independent pixels, which a
+    detector with correlated noise does not reach: a warning; with two it is measured: ok."""
+    rng = np.random.default_rng(4)
+    sample = _write_stack(tmp_path / "sample", rng.poisson(150.0, (16, 16, 4)))
+    for o in range(2):
+        _write_stack(tmp_path / "ob" / f"observation_{o + 1:02d}", rng.poisson(200.0, (16, 16, 4)))
+    one = load_dataset(sample, open_beam=[str(tmp_path / "ob" / "observation_01")], open_beam_smoothing=3)
+    two = load_dataset(sample, open_beam=[str(tmp_path / "ob")], open_beam_smoothing=3)
+    [c1], [c2] = ([c for c in ds.checks if "smoothed" in c.message] for ds in (one, two))
+    assert c1.level == "warn" and "overstates" in c1.message and c2.level == "ok"

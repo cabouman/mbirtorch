@@ -238,14 +238,19 @@ def _checks_from_summary(sm, spatial_shape, strict=False):
                                "--background-boxes"))
     smooth = sm.get("smoothing")
     if smooth is not None:
-        w, ratio, ind = smooth["width"], smooth["variance_ratio"], smooth["independent_ratio"]
-        c.append(Check("ok", f"open beam smoothed {w} x {w}{' at conversion' if smooth.get('recorded') else ''}: its "
-                             f"variance x {ratio:.3f}"
-                             + (f" across the observations (x {ind:.3f} if the pixels' noise were independent)"
-                                if smooth["measured"] else " (independent pixels; one observation)")
-                             + f", so it counts as {smooth['observations']:.3g} observations"
-                             + ("; the detector's noise is correlated between neighboring pixels, so smoothing gains "
-                                "little" if smooth["measured"] and ratio > 2 * ind else "")))
+        w, ratio, ind, measured = smooth["width"], smooth["variance_ratio"], smooth["independent_ratio"], \
+            smooth["measured"]
+        c.append(Check("ok" if measured else "warn",
+                       f"open beam smoothed {w} x {w}{' at conversion' if smooth.get('recorded') else ''}: its "
+                       f"variance x {ratio:.3f}"
+                       + (f" across the observations (x {ind:.3f} if the pixels' noise were independent)" if measured
+                          else " (independent pixels; one observation)")
+                       + f", so it counts as {smooth['observations']:.3g} observations"
+                       + ("; the detector's noise is correlated between neighboring pixels, so smoothing gains little"
+                          if measured and ratio > 2 * ind else "")
+                       + ("" if measured else ": one observation cannot measure the reduction, and on a detector whose "
+                          "noise is correlated between neighboring pixels the independent-pixel value overstates the "
+                          "observations")))
     if above > 0.5:
         c.append(Check("warn", f"{above:.1%} of T exceeds 1: the open beam may be too low or the sample missing"))
     elif above > 0:
@@ -409,11 +414,13 @@ class _Hdf5Blocks:
         self.first_index, self.bins = (ks.start, len(ks)) if len(ks) else (0, 0)
         self.source_bins = source[ks.start:ks.stop]
         attrs = dict(self.f.attrs, **g.attrs)
-        dose = attrs.get("dose")                                               # per file column; -1 when unknown
-        self.file_dose = float(dose) if dose is not None and float(dose) > 0 else None
         per_bin = g["open_beam_dose"][()] if "open_beam_dose" in g and g["open_beam_dose"].shape == source.shape \
             else None
         self.file_dose_per_bin = None if per_bin is None else np.asarray(per_bin, dtype=np.float64)[ks.start:ks.stop]
+        dose = attrs.get("dose")                                               # per file column; -1 when unknown
+        self.file_dose = float(dose) if dose is not None and float(dose) > 0 else None
+        if self.file_dose is not None and self.file_dose_per_bin is not None and 0 < len(ks) < len(source):
+            self.file_dose = float(np.median(self.file_dose_per_bin))          # that of the selected columns
         self.file_observations = float(attrs.get("open_beam_observations", 0))
         self.file_wave_bin = max(1, int(attrs.get("wave_bin", 1)))                 # source bins per column
         self.file_background = _json_attr(attrs, "background")                     # recorded by convert
@@ -607,9 +614,10 @@ def _smoothing_kernel(width):
 
 def _smooth_open_beam(full, width):
     """Smooth a full-resolution open beam (views, rows, cols, bins) image by image, mirrored at the edges. The window
-    is separable, the outer product of the normalized square root of the Hamming window with itself. Entries <= 0 (dead
-    pixels) are left out: the window is renormalized over the rest, so they neither lower their neighbors nor stay
-    zero unless their whole neighborhood is."""
+    is separable, the outer product of the normalized square root of the Hamming window with itself. Pixels <= 0 in
+    every bin of the block (dead detector pixels) are left out: the window is renormalized over the rest, so they
+    neither lower their neighbors nor stay zero unless their whole neighborhood is. A zero count of a live pixel stays
+    in, since leaving out the zeros of an open beam of lam counts would raise it by 1 / (1 - e^-lam)."""
     from scipy.ndimage import correlate1d
     w = np.sqrt(np.hamming(width))
     w /= w.sum()
@@ -620,11 +628,10 @@ def _smooth_open_beam(full, width):
         return correlate1d(correlate1d(a.transpose(order), w, axis=rows, mode="mirror"), w, axis=cols,
                            mode="mirror").transpose(np.argsort(order))
 
-    dead = full <= 0
+    dead = np.all(full <= 0, axis=-1, keepdims=True)
     if not dead.any():
         return smooth(full)
-    live = (~dead).astype(np.float32)
-    weight = smooth(live)
+    weight = smooth((~dead).astype(np.float32))                          # one weight per pixel, for every bin
     out = smooth(np.where(dead, np.float32(0), full))
     return np.where(weight > 1e-6, out / np.maximum(weight, 1e-6), np.float32(0)).astype(np.float32)
 
@@ -855,14 +862,34 @@ def _check_host_memory(n_bytes, what):
 
 def _merge_dose(dose, estimate, src, wave_bin):
     """The dose per grouped bin: the given one (per source bin, so times the source bins in a grouped bin: wave_bin
-    times those in a column of a converted file), checked against the open-beam estimate, else the estimate, else the
-    dose an HDF5 input records (per file column, times wave_bin)."""
+    times those in a column of a converted file), checked against the open-beam estimate or the open-beam dose an
+    HDF5 input records, else the estimate, else the dose an HDF5 input records (per file column, times wave_bin)."""
     if dose is None:
         return estimate if estimate is not None or src.file_dose is None else src.file_dose * wave_bin
+    if estimate is None and src.file_dose is not None:
+        _check_given_dose(dose, src)
     dose = dose * wave_bin * src.file_wave_bin
     if estimate is not None and abs(dose - estimate) / estimate > 0.5:
         warnings.warn(f"the given dose {dose:.3g} differs from the open-beam estimate {estimate:.3g} by more than 50%")
     return dose
+
+
+def _check_given_dose(dose, src):
+    """Warn when a given dose (per source bin) differs by more than 50% from the open-beam dose an HDF5 input
+    records, or, with a recorded calibration, lies nearer the recorded dose, which is scaled to the sample run's
+    exposure, than the open beam's: a given dose is the open beam's and is scaled by the calibration, so the scaled
+    dose inspect prints would be scaled twice."""
+    factor = src.file_background["factor_median"] if src.file_background is not None else 1.0
+    open_beam = src.file_dose / factor / src.file_wave_bin                 # per source bin, before the calibration
+    scaled = open_beam * factor
+    note = (f" (the file's dose over its calibration factor {factor:.4f}): --dose is the open beam's count, which the "
+            "calibration scales, so the scaled dose inspect prints would be scaled twice") if factor != 1.0 else ""
+    if abs(dose - open_beam) > 0.5 * open_beam:
+        warnings.warn(f"the given dose {dose:.3g} differs by more than 50% from the open-beam dose the file records, "
+                      f"{open_beam:.3g} per source bin{note}")
+    elif abs(dose - scaled) < abs(dose - open_beam):
+        warnings.warn(f"the given dose {dose:.3g} is nearer the file's dose at the sample run's exposure, "
+                      f"{scaled:.3g} per source bin, than its open-beam dose, {open_beam:.3g}{note}")
 
 
 def _dose_per_bin(dose, estimate, src, wave_bin):
