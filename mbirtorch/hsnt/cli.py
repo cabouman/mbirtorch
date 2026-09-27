@@ -316,8 +316,8 @@ def cmd_inspect(args):
     V, rows, cols = ds.spatial_shape
     print(f"\n{ds.source}\n  type {ds.dataset_type}; {V} view(s) x {rows} x {cols} pixels x {ds.bins} bins (source "
           f"bins {ds.bin_indices[0]}..{ds.bin_indices[-1]}); {ds.T.nbytes / 2**30:.2f} GiB as float32")
-    print(f"  T: min {st['min']:.4g}  median {st['median']:.4g}  mean {st['mean']:.4g}  max {st['max']:.4g}; zeros "
-          f"{st['zero']:.2%}, above 1: {ds.info['above_one']:.2%}" + ("  (sampled)" if st["sampled"] else ""))
+    print(f"  T: min {st['min']:.4g}  median {st['median']:.4g}  mean {st['mean']:.4g}  max {st['max']:.4g}"
+          + (" (sampled)" if st["sampled"] else "") + f"; zeros {st['zero']:.2%}, above 1: {ds.info['above_one']:.2%}")
     print(f"  dose: {'unknown' if ds.dose is None else f'{ds.dose:.4g} counts per pixel and bin'}")
     for c in ds.checks:
         print(f"  [{c.level:5s}] {c.message}")
@@ -531,8 +531,8 @@ class _Options:
         self.add(g, "--open-beam-smoothing", type=int, default=0, metavar="W",
                  help="smooth the averaged open beam in each bin with a W x W window (the square root of the outer "
                       "product of two Hamming windows, normalized), W odd and at least 3 (default 0, none; the ORNL "
-                      "SNAP preprocessing used 3); with one open-beam observation the variance reduction is assumed, "
-                      "not measured")
+                      "SNAP preprocessing used 3), leaving out pixels with no count in any selected bin; with one "
+                      "open-beam observation the variance reduction is assumed, not measured")
 
     def run(self, sp, device=False, dry_run=False, checks=True):
         g = sp.add_argument_group("run")
@@ -583,7 +583,8 @@ class _Options:
         self.add(g, "--support-penalty", type=_penalty_arg, default="auto", metavar="auto|F", advanced=True,
                  help="charge per selected component, F x log(bins) nats, or 'auto' (default): 0.5 up to 10 counts "
                       "per bin in the median pixel, rising to 2 at 100. On a test phantom 2 did as well or slightly "
-                      "better at 3 to 10 counts, and much worse below 3")
+                      "better at 3 to 10 counts; below 3 it was up to 8.6 dB worse on one spectrum and up to 3.4 dB "
+                      "better on another")
         self.add(g, "--free-refit", action="store_true", advanced=True,
                  help="drop the bound on the selected coefficients during the refit, then re-solve W >= 0 on the "
                       "supports")

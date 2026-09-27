@@ -1,7 +1,7 @@
 """Tests for the hsnt loader's data checks, dose and open-beam handling, and memory: exact value fractions, the
-bright-region check against the loader's expected ratio, the calibration's view wording, the dose of a range of a
-converted file and the check of a given dose, the smoothing of a low-count open beam, and the working set of
-load_dataset."""
+bright-region check against the loader's expected ratio (grouped and smoothed too), the calibration's view wording,
+the dose of a range of a converted file, a dose free of the blocks of bins, the check of a given dose, the smoothing
+of a low-count open beam in any blocks of bins, and the working set of load_dataset."""
 import json
 import tracemalloc
 import warnings
@@ -13,8 +13,8 @@ import tifffile
 from scipy.stats import poisson
 
 import mbirtorch.hsnt as hsnt
-from mbirtorch.hsnt.loading import (_checks_from_summary, _smooth_open_beam, _stack_to_transmission, _summary_from_T,
-                                    convert_to_hdf5, load_dataset)
+from mbirtorch.hsnt.loading import (_checks_from_summary, _dead_mask, _smooth_open_beam, _stack_to_transmission,
+                                    _summary_from_T, convert_to_hdf5, load_dataset)
 
 
 def _disk_file(path, n_obs, lam, exposure, K, seed, n=64):
@@ -35,8 +35,8 @@ def _disk_file(path, n_obs, lam, exposure, K, seed, n=64):
     return path
 
 
-def _bright_warnings(path):
-    return [c.message for c in load_dataset(path).checks if "transparent" in c.message]
+def _bright_warnings(path, **kw):
+    return [c.message for c in load_dataset(path, **kw).checks if "transparent" in c.message]
 
 
 def test_value_fractions_are_exact_and_the_sample_holds_every_bin():
@@ -66,9 +66,11 @@ def test_the_ratio_expectation_matches_the_loaders_open_beam():
 
 def test_the_bright_region_check_expects_the_loaders_ratio_bias(tmp_path):
     """Matched exposures at 5 counts and 2000 bins raise no alarm (the loader's ratio reads about 1.29 there, not the
-    first-order 1 + 1 / (n dose)); a sample run 7% below the open beam's exposure at 20 counts in each of 5
-    observations is flagged, against the matched level 1 + bias; a matched run there is not."""
-    assert not _bright_warnings(_disk_file(str(tmp_path / "low.h5"), 1, 5.0, 1.0, 2000, seed=200))
+    first-order 1 + 1 / (n dose)), also grouped by --wave-bin, whose grouped T carries the bias of its columns, not
+    that of their summed dose; a sample run 7% below the open beam's exposure at 20 counts in each of 5 observations
+    is flagged, against the matched level 1 + bias; a matched run there is not."""
+    low = _disk_file(str(tmp_path / "low.h5"), 1, 5.0, 1.0, 2000, seed=200)
+    assert not _bright_warnings(low) and not _bright_warnings(low, wave_bin=2) and not _bright_warnings(low, wave_bin=4)
     assert "below" in " ".join(_bright_warnings(_disk_file(str(tmp_path / "under.h5"), 5, 20.0, 0.93, 200, seed=2)))
     assert not _bright_warnings(_disk_file(str(tmp_path / "matched.h5"), 5, 20.0, 1.0, 200, seed=2))
 
@@ -140,15 +142,71 @@ def test_a_given_dose_is_checked_against_the_open_beam_dose_a_file_records(tmp_p
 
 def test_open_beam_smoothing_keeps_zero_counts_and_leaves_out_dead_pixels():
     """At one count per pixel and bin the smoothed open beam keeps the raw mean (leaving out each zero count raised
-    it by 1 / (1 - e^-1) = 1.58); a pixel zero in every bin of the block is left out and filled from its
-    neighbors, which it does not lower."""
+    it by 1 / (1 - e^-1) = 1.58), and 8 counts per pixel are too few to call a pixel without one dead; a pixel zero
+    in every bin of a bright open beam is left out and filled from its neighbors, which it does not lower."""
     rng = np.random.default_rng(0)
     ob = rng.poisson(1.0, size=(1, 128, 128, 8)).astype(np.float32)
-    assert _smooth_open_beam(ob.copy(), 3).mean() / ob.mean() == pytest.approx(1, abs=0.01)
+    dead = _dead_mask(ob.sum(-1, dtype=np.float64))
+    assert dead is None and _smooth_open_beam(ob.copy(), 3, dead).mean() / ob.mean() == pytest.approx(1, abs=0.01)
     ob = rng.poisson(100.0, size=(1, 32, 32, 8)).astype(np.float32)
     ob[0, 10, 10] = 0
-    smoothed = _smooth_open_beam(ob, 3)
-    assert abs(smoothed[0, 10, 10].mean() / 100 - 1) < 0.05 and abs(smoothed[0, 9:12, 9:12].mean() / 100 - 1) < 0.03
+    dead = _dead_mask(ob.sum(-1, dtype=np.float64))
+    smoothed = _smooth_open_beam(ob, 3, dead)
+    assert int(dead.sum()) == 1 and abs(smoothed[0, 10, 10].mean() / 100 - 1) < 0.05 and \
+        abs(smoothed[0, 9:12, 9:12].mean() / 100 - 1) < 0.03
+
+
+def _converted(tmp_path, name, sample, ob, **kw):
+    out, _, info = convert_to_hdf5(sample, output=str(tmp_path / f"{name}.h5"), open_beam=[ob], **kw)
+    with h5py.File(out) as f:
+        return f["data"][()], f.attrs["dose"], f["open_beam_dose"][()], info
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning")
+def test_smoothing_is_the_same_in_any_blocks_of_bins(tmp_path):
+    """At one count per pixel and bin over 32 bins, converted in blocks of 1 bin and of all 32: the same smoothed open
+    beam, so the same data and dose (the median open beam about 1). A pixel dead in a block of one bin but not in the
+    others keeps its zero count; one dead in every bin is left out, and recorded."""
+    rng = np.random.default_rng(11)
+    ob_counts = rng.poisson(1.0, (48, 48, 32))
+    ob_counts[10, 10] = 0
+    sample = _write_stack(tmp_path / "sample", rng.poisson(0.6, (48, 48, 32)))
+    ob = _write_stack(tmp_path / "ob", ob_counts)
+    T1, dose1, per_bin1, info = _converted(tmp_path, "one", sample, ob, open_beam_smoothing=3, block_bins=1)
+    T32, dose32, per_bin32, _ = _converted(tmp_path, "all", sample, ob, open_beam_smoothing=3, block_bins=32)
+    assert np.array_equal(T1, T32) and dose1 == dose32 and np.array_equal(per_bin1, per_bin32)
+    assert 0.85 < dose1 < 1.1 and info["open_beam_smoothing"]["dead_pixels"] == 1
+
+
+@pytest.mark.filterwarnings("ignore::UserWarning")
+def test_the_dose_is_the_same_in_any_blocks_of_bins(tmp_path):
+    """An open beam of 40 counts in 31 bins and 5 in 29: the dose is the median of the per-bin doses, about 40, in
+    blocks of 7 bins and of all 60, as a range of the converted file takes it and as load_dataset finds it (the median
+    of the blocks' medians read 5 in blocks of 7)."""
+    rng = np.random.default_rng(12)
+    lam = np.where(np.arange(60) < 31, 40.0, 5.0)
+    sample = _write_stack(tmp_path / "sample", rng.poisson(0.7 * lam, (16, 16, 60)))
+    ob = _write_stack(tmp_path / "ob", rng.poisson(lam, (16, 16, 60)))
+    _, dose7, per_bin, _ = _converted(tmp_path, "b7", sample, ob, block_bins=7)
+    _, dose60, _, _ = _converted(tmp_path, "b60", sample, ob, block_bins=60)
+    assert dose7 == dose60 == pytest.approx(np.median(per_bin)) and dose7 == pytest.approx(40, rel=0.05)
+    assert load_dataset(sample, open_beam=[ob]).dose == pytest.approx(dose7)
+    assert load_dataset(str(tmp_path / "b7.h5"), wave_range=(0, 59)).dose == pytest.approx(dose7)
+
+
+def test_the_bright_region_check_expects_a_smoothed_open_beams_ratio_bias(tmp_path):
+    """Matched exposures at 0.5 counts per pixel and bin against one smoothed observation: the loader's ratio reads
+    about 1.9 in the sample-free field, which the check expects (a Poisson count at the smoothed open beam's variance
+    expects about 1.5)."""
+    rng = np.random.default_rng(13)
+    n, K = 64, 200
+    yy, xx = np.mgrid[:n, :n]
+    disk = ((yy - n // 2) ** 2 + (xx - n // 2) ** 2 < 10 ** 2)[..., None]
+    sample = _write_stack(tmp_path / "sample", rng.poisson(0.5 * np.where(disk, 0.5, 1.0), (n, n, K)))
+    ob = _write_stack(tmp_path / "ob", rng.poisson(0.5, (n, n, K)))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        assert not _bright_warnings(sample, open_beam=[ob], open_beam_smoothing=3)
 
 
 def test_smoothing_one_observation_warns_that_its_variance_reduction_is_assumed(tmp_path):

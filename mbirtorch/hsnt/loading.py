@@ -121,11 +121,12 @@ def _check_elems(budget_mib):
     return max(2**20, int(budget_mib * 2**20) // 4)
 
 
-def _summary_from_T(T, dose, spatial_shape, background=None, n_obs=0, chunk_elems=2**24, dose_per_bin=None):
+def _summary_from_T(T, dose, spatial_shape, background=None, n_obs=0, chunk_elems=2**24, dose_per_bin=None,
+                    smoothing=None):
     """The quantities the data checks need, from a transmission matrix held in memory. The per-pixel and per-bin
     reductions, and the fractions of non-finite, negative, zero and above-one entries, run exactly by blocks of rows
     of about chunk_elems entries, so their working set stays small next to T; the range, mean and median come from a
-    sample of whole rows."""
+    sample of whole rows. smoothing is the open-beam smoothing's summary, for the bright check."""
     P, K = T.shape
     rows = max(1, chunk_elems // max(K, 1))
     pos_px, mean_px = np.empty(P, dtype=np.int64), np.empty(P, dtype=np.float64)
@@ -150,7 +151,7 @@ def _summary_from_T(T, dose, spatial_shape, background=None, n_obs=0, chunk_elem
     return dict(pixels=P, bins=K, nbytes=T.nbytes, stats=st, above_one=above / n, dead_px=_frac(pos_px == 0),
                 dead_bins=dead_bins, const_bins=int((bin_max == bin_min).sum()) - dead_bins, dose=dose,
                 bright=_bright_level(mean_px, spatial_shape, T[:: max(1, P // 20000)], dose, n_obs, dose_per_bin,
-                                     chunk_elems), background=background)
+                                     chunk_elems, smoothing), background=background)
 
 
 def _ratio_expectation(mu):
@@ -171,26 +172,53 @@ def _ratio_expectation(mu):
     return out.reshape(mu.shape)
 
 
-def _expected_ratio(dose_per_bin, n_obs):
+def _smoothed_ratio_expectation(m, width, side=256, seed=0):
+    """E[m / O'] for a smoothed open beam: O' is a field of independent Poisson(m) pixels smoothed by the loader's
+    width x width window (see _smooth_open_beam), its zeros replaced by the median positive value as the loader
+    replaces them. By simulation on a side x side field, one level per entry of m, with a fixed seed; the standard
+    error is below 1% from m = 0.3 up."""
+    m = np.maximum(np.asarray(m, dtype=np.float64).ravel(), 1e-3)
+    rng = np.random.default_rng(seed)
+    out = np.empty(m.size)
+    for i in range(0, m.size, 8):
+        mi = m[i:i + 8]
+        ob = _smooth_open_beam(rng.poisson(mi, size=(1, side, side, mi.size)).astype(np.float32), width)
+        ob = ob.reshape(-1, mi.size).astype(np.float64)
+        med = np.nan_to_num(np.nanmedian(np.where(ob > 0, ob, np.nan), axis=0), nan=1.0)
+        out[i:i + 8] = (mi / np.where(ob > 0, ob, med)).mean(0)
+    return out
+
+
+def _expected_ratio(dose_per_bin, n_obs, smoothing=None):
     """(low, high): the range of the transmission a sample-free region reads at matched exposure through the ratio
     of counts to the loader's open beam, the mean of n_obs observations (see _ratio_expectation, averaged over bins).
     The open beam's expected summed count in a bin is known only through its median, n_obs * dose_per_bin, which after
-    the zero replacement lies within one count of it; the range covers the counts within one of the median. (1, 1)
-    for an exact open beam (no observations) or an unknown dose."""
+    the zero replacement lies within one count of it; the range covers the counts within one of the median. A smoothed
+    open beam (smoothing: its summary, n_obs its effective observations) is no Poisson count: its expectation is that
+    of independent pixels smoothed alike (see _smoothed_ratio_expectation) at the count that gives them its variance,
+    n_obs * dose_per_bin * sum(kernel**2). (1, 1) for an exact open beam (no observations) or an unknown dose."""
     if not n_obs or dose_per_bin is None:
         return 1.0, 1.0
     medians, weight = np.unique(n_obs * np.asarray(dose_per_bin, dtype=np.float64).ravel(), return_counts=True)
-    e = _ratio_expectation(medians[:, None] + np.linspace(-1, 1, 9))
+    if smoothing is None:
+        e = _ratio_expectation(medians[:, None] + np.linspace(-1, 1, 9))
+    else:
+        m = medians[:, None] * float((_smoothing_kernel(smoothing["width"]) ** 2).sum()) + np.linspace(-1, 1, 9)
+        m = np.maximum(m, 1e-3)
+        lo, hi = float(m.min()), float(m.max())
+        grid = np.geomspace(lo, hi, int(np.clip(np.ceil(np.log(hi / lo) / np.log(1.1)), 1, 96)) + 1)
+        e = np.interp(np.log(m), np.log(grid), _smoothed_ratio_expectation(grid, smoothing["width"]))
     return float(np.average(e.min(1), weights=weight)), float(np.average(e.max(1), weights=weight))
 
 
-def _bright_level(pixel_means, spatial_shape, sub, dose=None, n_obs=0, dose_per_bin=None, chunk_elems=2**24):
+def _bright_level(pixel_means, spatial_shape, sub, dose=None, n_obs=0, dose_per_bin=None, chunk_elems=2**24,
+                  smoothing=None):
     """(level, low, high): the transmission of the most transparent regions, the 95th percentile of the per-pixel
     means pooled over b x b blocks (b = 4 when the image allows), and the range a sample-free region reads at matched
     exposure: the loader's expected ratio of counts to a noisy open beam (see _expected_ratio, from the dose per bin,
-    else the dose), widened by a margin of 0.03 plus five times the noise of a block mean (from the bin-to-bin
-    differences of the most transparent tenth of the pixel subsample sub, in blocks of rows whose float64 values
-    number about chunk_elems / 8), and by at least 0.05 below."""
+    else the dose, and the open-beam smoothing's summary), widened by a margin of 0.03 plus five times the noise of a
+    block mean (from the bin-to-bin differences of the most transparent tenth of the pixel subsample sub, in blocks of
+    rows whose float64 values number about chunk_elems / 8), and by at least 0.05 below."""
     V, rows, cols = spatial_shape
     b = 4 if rows >= 16 and cols >= 16 else 1
     m = pixel_means.reshape(V, rows, cols)[:, :rows // b * b, :cols // b * b]
@@ -208,7 +236,7 @@ def _bright_level(pixel_means, spatial_shape, sub, dose=None, n_obs=0, dose_per_
             per_row.append(np.mean(np.square(d, out=d), axis=1))
         sigma = np.sqrt(np.median(np.concatenate(per_row)) / 2)
         noise = float(sigma / np.sqrt(sub.shape[1] * b * b))
-    lo, hi = _expected_ratio(dose_per_bin if dose_per_bin is not None or dose is None else [dose], n_obs)
+    lo, hi = _expected_ratio(dose_per_bin if dose_per_bin is not None or dose is None else [dose], n_obs, smoothing)
     margin = 0.03 + 5 * noise
     return level, lo - max(0.05, margin), hi + margin
 
@@ -625,12 +653,41 @@ def _smoothing_kernel(width):
     return k / k.sum()
 
 
-def _smooth_open_beam(full, width):
+def _open_beam_total(obs, bins, block):
+    """The open beam's summed count per full-resolution pixel (views, rows, cols), over the source bins 0:bins of
+    every observation, read in blocks of bins; values <= 0 count as zero."""
+    total = None
+    for k0 in range(0, bins, block):
+        for o in obs:
+            s = np.clip(o.read(k0, min(k0 + block, bins), full=True), 0, None).sum(-1, dtype=np.float64)
+            total = s if total is None else np.add(total, s, out=total)
+    return total
+
+
+def _dead_mask(total):
+    """The dead detector pixels of an open beam, (views, rows, cols, 1), from its summed count per pixel over the
+    selected bins (see _open_beam_total): those with none. A live pixel of c expected counts has none with probability
+    e^-c, so they are told apart only when the median pixel's count is at least 20 (a probability below 2.1e-9); None
+    when no pixel is dead or the counts are too few to tell."""
+    if total is None:
+        return None
+    dead = total <= 0
+    if not dead.any():
+        return None
+    if np.median(total) < 20:
+        log.info("open-beam smoothing: %d pixels hold no count, too few counts (median %.3g) to call them dead",
+                 int(dead.sum()), float(np.median(total)))
+        return None
+    return dead[..., None]
+
+
+def _smooth_open_beam(full, width, dead=None):
     """Smooth a full-resolution open beam (views, rows, cols, bins) image by image, mirrored at the edges. The window
-    is separable, the outer product of the normalized square root of the Hamming window with itself. Pixels <= 0 in
-    every bin of the block (dead detector pixels) are left out: the window is renormalized over the rest, so they
-    neither lower their neighbors nor stay zero unless their whole neighborhood is. A zero count of a live pixel stays
-    in, since leaving out the zeros of an open beam of lam counts would raise it by 1 / (1 - e^-lam)."""
+    is separable, the outer product of the normalized square root of the Hamming window with itself. The dead pixels
+    (a mask that broadcasts to the image, see _dead_mask) are left out: the window is renormalized over the rest, so
+    they neither lower their neighbors nor stay zero unless their whole neighborhood is. A zero count of a live pixel
+    stays in, since leaving out the zeros of an open beam of lam counts would raise it by 1 / (1 - e^-lam); so the
+    mask comes from every selected bin, not from the bins at hand."""
     from scipy.ndimage import correlate1d
     w = np.sqrt(np.hamming(width))
     w /= w.sum()
@@ -641,35 +698,34 @@ def _smooth_open_beam(full, width):
         return correlate1d(correlate1d(a.transpose(order), w, axis=rows, mode="mirror"), w, axis=cols,
                            mode="mirror").transpose(np.argsort(order))
 
-    dead = np.all(full <= 0, axis=-1, keepdims=True)
-    if not dead.any():
+    if dead is None or not dead.any():
         return smooth(full)
-    weight = smooth((~dead).astype(np.float32))                          # one weight per pixel, for every bin
+    weight = smooth(np.broadcast_to(~dead, full.shape[:-1] + (1,)).astype(np.float32))    # one per pixel, every bin
     out = smooth(np.where(dead, np.float32(0), full))
     return np.where(weight > 1e-6, out / np.maximum(weight, 1e-6), np.float32(0)).astype(np.float32)
 
 
-def _smoothing_variances(images, width):
+def _smoothing_variances(images, width, dead=None):
     """(raw, smoothed): the variance across observations, summed over pixels, of full-resolution images
-    (observations, views, rows, cols, bins) before and after smoothing, each observation scaled to the mean exposure.
-    Their ratio is the smoothing's variance reduction, which is sum(kernel**2) only when the pixels' noise is
-    independent."""
+    (observations, views, rows, cols, bins) before and after smoothing (leaving out the dead pixels, a (views, rows,
+    cols, 1) mask), each observation scaled to the mean exposure. Their ratio is the smoothing's variance reduction,
+    which is sum(kernel**2) only when the pixels' noise is independent."""
     n = images.shape[0]
     x = images.astype(np.float32).reshape(n * images.shape[1], *images.shape[2:])
     scale = x.reshape(n, -1).mean(1, dtype=np.float64)
     x *= np.repeat(scale.mean() / np.where(scale > 0, scale, 1.0), images.shape[1]).astype(np.float32)[:, None, None,
                                                                                                         None]
-    smoothed = _smooth_open_beam(x, width).reshape(n, -1)
+    smoothed = _smooth_open_beam(x, width, None if dead is None else np.tile(dead, (n, 1, 1, 1))).reshape(n, -1)
     x = x.reshape(n, -1)
     return float(x.var(0, ddof=1, dtype=np.float64).sum()), float(smoothed.var(0, ddof=1, dtype=np.float64).sum())
 
 
-def _read_block(src, obs, itype, k0, k1, downsample, smoothing, background):
+def _read_block(src, obs, itype, k0, k1, downsample, smoothing, background, dead=None):
     """The inputs of bins k0:k1: the sample and the open-beam mean at the sampled pixels as (pixels, bins); with
     background boxes the full-resolution box sums of both (views, boxes, bins), counts for counts and transmission for
     transmission or attenuation data; and with smoothing and several observations the variance across them of the
     block's first bins before and after smoothing (see _smoothing_variances). Smoothing applies to the open beam at full
-    resolution."""
+    resolution and leaves out the dead pixels (see _dead_mask)."""
     P = src.views * src.rows * src.cols
     if background is None:
         a, box_a = src.read(k0, k1).reshape(P, k1 - k0), None
@@ -691,9 +747,9 @@ def _read_block(src, obs, itype, k0, k1, downsample, smoothing, background):
         ob = blk if ob is None else np.add(ob, blk, out=ob)
     ob /= len(obs)
     if smoothing:
-        ob = _smooth_open_beam(ob, smoothing)
+        ob = _smooth_open_beam(ob, smoothing, dead)
     box_ob = None if background is None else _box_sums(ob, background.boxes)
-    variances = _smoothing_variances(np.stack(first), smoothing) if first else None
+    variances = _smoothing_variances(np.stack(first), smoothing, dead) if first else None
     ob = _for_views(np.ascontiguousarray(ob[:, ::downsample, ::downsample]).reshape(-1, k1 - k0), src.views)
     return a, ob, box_a, box_ob, variances
 
@@ -731,18 +787,18 @@ def _apply_background(T, factors, background, views):
     return (factors * counts[None, :, None]).sum((0, 1)) / (counts.sum() * views)
 
 
-def _transmission_blocks(src, obs, itype, wave_bin, block, downsample, smoothing, background):
+def _transmission_blocks(src, obs, itype, wave_bin, block, downsample, smoothing, background, dead=None):
     """Yield (j0, j1, T, dose, info, factors) for successive blocks of grouped bins: the transmission (pixels, bins)
-    after the optional open-beam smoothing and background calibration, the block's open-beam dose, the conversion
-    notes (with 'dose_per_bin', when calibrated 'mean_factor' per bin, and when smoothed with several observations
-    'smoothing_variances'), and the tile factors (views, tiles, bins) or None. The next block is read while the caller
-    processes this one."""
+    after the optional open-beam smoothing (leaving out the dead pixels) and background calibration, the block's
+    open-beam dose, the conversion notes (with 'dose_per_bin', when calibrated 'mean_factor' per bin, and when smoothed
+    with several observations 'smoothing_variances'), and the tile factors (views, tiles, bins) or None. The next block
+    is read while the caller processes this one."""
     nb = src.bins
     starts = [k0 for k0 in range(0, nb - nb % wave_bin, block) if min(k0 + block, nb) // wave_bin * wave_bin > k0]
 
     def read(k0):
         k1 = min(k0 + block, nb) // wave_bin * wave_bin
-        return k1, _read_block(src, obs, itype, k0, k1, downsample, smoothing, background)
+        return k1, _read_block(src, obs, itype, k0, k1, downsample, smoothing, background, dead)
 
     pool = ThreadPoolExecutor(1)
     try:
@@ -927,25 +983,48 @@ def _probe_type(input_type, src, open_beam):
     return itype
 
 
-def _block_dose(dose_blocks):
-    """The median open-beam dose over blocks of bins, each block weighted by its bins."""
-    if not dose_blocks:
+def _open_beam_dose(per_bin):
+    """The open-beam dose: the median over bins of each bin's median open beam, whatever the blocks of bins, as a range
+    of a converted file takes it from the per-bin dose it records; None without an open beam."""
+    return None if per_bin is None else float(np.median(per_bin))
+
+
+def _smoothing_dead_mask(obs, smoothing, src, wave_bin, block):
+    """The dead pixels the open-beam smoothing leaves out (see _dead_mask), from every observation over every bin
+    the load keeps; None without smoothing."""
+    if not smoothing:
         return None
-    vals, w = np.array([v for v, _ in dose_blocks]), np.array([n for _, n in dose_blocks])
-    return float(np.median(np.repeat(vals, w)))
+    t0 = time.perf_counter()
+    dead = _dead_mask(_open_beam_total(obs, src.bins // wave_bin * wave_bin, block))
+    log.info("open-beam smoothing: %d dead pixels, found in %.1f s", 0 if dead is None else int(dead.sum()),
+             time.perf_counter() - t0)
+    return dead
 
 
-def _effective_observations(n_obs, smoothing, variances):
+def _ratio_dose(per_bin, dose, src, itype, wave_bin):
+    """The open-beam dose per bin at which the loaded transmission's ratio bias arises, for the bright check: the dose
+    per bin (or the dose), except for a transmission or attenuation input grouped by wave_bin, whose grouped T is the
+    mean of its columns' ratios and so carries their bias: the dose of each column."""
+    if itype == "counts" or wave_bin == 1:
+        return per_bin
+    if per_bin is not None:
+        return src.file_dose_per_bin[:len(per_bin) * wave_bin]
+    return None if dose is None else np.array([dose / wave_bin])
+
+
+def _effective_observations(n_obs, smoothing, variances, dead=None):
     """The open beam's observations over the smoothing's variance reduction, and a summary of the smoothing (None
-    without it). The reduction is measured across the observations when there are several (variances: summed raw and
-    smoothed variances); with one it is that of independent pixels, sum(kernel**2)."""
+    without it), with the dead pixels it left out. The reduction is measured across the observations when there are
+    several (variances: summed raw and smoothed variances); with one it is that of independent pixels,
+    sum(kernel**2)."""
     if not smoothing or not n_obs:
         return n_obs, None
     independent = float((_smoothing_kernel(smoothing) ** 2).sum())
     raw, smooth = variances if variances is not None else (0.0, 0.0)
     ratio = smooth / raw if raw > 0 and smooth > 0 else independent
     return n_obs / ratio, dict(width=smoothing, variance_ratio=ratio, independent_ratio=independent,
-                               measured=bool(raw > 0 and smooth > 0), observations=n_obs / ratio)
+                               measured=bool(raw > 0 and smooth > 0), observations=n_obs / ratio,
+                               dead_pixels=0 if dead is None else int(dead.sum()))
 
 
 def _calibrated(dose, per_bin, n_eff, background, factor_parts, mean_factor):
@@ -1000,7 +1079,8 @@ def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=Non
             whose centers it holds. Defaults to None: the preset's, else (1, 1).
         open_beam_smoothing (int, optional): Smooth the averaged open beam per bin, at full resolution, with a
             width x width window (odd, at least 3), the normalized square root of the outer product of two Hamming
-            windows; the noise model counts the smoothed open beam as more observations, by the variance reduction
+            windows, leaving out the pixels with no count in any selected bin of any observation (see _dead_mask);
+            the noise model counts the smoothed open beam as more observations, by the variance reduction
             measured across the observations; with one observation it is taken as that of independent pixels, which
             overstates the observations on a detector with correlated noise (SNAP's is). Defaults to 0, none.
         memory_budget_mib (float, optional): Working memory for the blocks of bins and of the checks, in MiB.
@@ -1029,16 +1109,16 @@ def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=Non
         _check_host_memory(P * K * 4 + block * _bytes_per_bin(src, len(obs), full),
                            f"loading {V} x {rows} x {cols} x {K} values")
         T = np.empty((P, K), dtype=np.float32)
-        dose_blocks, ob_zero, nonfinite, factor_parts, variances = [], 0.0, 0.0, [], []
+        ob_zero, nonfinite, factor_parts, variances = 0.0, 0.0, [], []
         ob_per_bin = np.zeros(K) if itype == "counts" else None
         mean_factor = np.ones(K)
-        blocks = _transmission_blocks(src, obs, itype, wave_bin, block, downsample, smoothing, background)
+        dead = _smoothing_dead_mask(obs, smoothing, src, wave_bin, block)
+        blocks = _transmission_blocks(src, obs, itype, wave_bin, block, downsample, smoothing, background, dead)
         for j0, j1, Tb, dose_b, info_b, factors in blocks:
             T[:, j0:j1] = Tb
             if "smoothing_variances" in info_b:
                 variances.append(info_b["smoothing_variances"])
             if dose_b is not None:
-                dose_blocks.append((dose_b, j1 - j0))
                 ob_per_bin[j0:j1] = info_b["dose_per_bin"]
             ob_zero += info_b.get("open_beam_zero_frac", 0.0) * (j1 - j0)
             nonfinite += info_b.get("attenuation_nonfinite_frac", 0.0) * (j1 - j0)
@@ -1049,8 +1129,8 @@ def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=Non
         info = {k: v / K for k, v in (("open_beam_zero_frac", ob_zero), ("attenuation_nonfinite_frac", nonfinite)) if v}
         _warn_conversion(info)
         per_bin = _dose_per_bin(dose, ob_per_bin, src, wave_bin)
-        merged = _merge_dose(dose, _block_dose(dose_blocks), src, wave_bin)
-        n_eff, sm_note = _effective_observations(len(obs), smoothing, _sum_variances(variances))
+        merged = _merge_dose(dose, _open_beam_dose(ob_per_bin), src, wave_bin)
+        n_eff, sm_note = _effective_observations(len(obs), smoothing, _sum_variances(variances), dead)
         bg, merged, per_bin, n_eff = _calibrated(merged, per_bin, n_eff, background, factor_parts, mean_factor)
         if dose is not None and merged is not None and src.file_background is not None:
             merged *= src.file_background["factor_median"]          # a given dose, to the exposure the file records
@@ -1073,9 +1153,11 @@ def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=Non
         if blocks is not None:
             blocks.close()                                  # stops the prefetch before the source closes
         src.close()
+    smoothed = ds.info.get("open_beam_smoothing")
     sm = dict(_summary_from_T(ds.T, ds.dose, ds.spatial_shape, bg, ds.open_beam_observations,
-                              chunk_elems=_check_elems(memory_budget_mib), dose_per_bin=ds.dose_per_bin),
-              smoothing=ds.info.get("open_beam_smoothing"))
+                              chunk_elems=_check_elems(memory_budget_mib),
+                              dose_per_bin=_ratio_dose(ds.dose_per_bin, ds.dose, src, itype, wave_bin),
+                              smoothing=smoothed), smoothing=smoothed)
     ds.info["T_stats"], ds.info["above_one"] = sm["stats"], sm["above_one"]
     ds.checks = _checks_from_summary(sm, ds.spatial_shape, strict)
     return ds
@@ -1163,17 +1245,17 @@ def convert_to_hdf5(path, output=None, open_beam=None, input_type="auto", datase
         bin_max = np.full(K, -np.inf, dtype=np.float32)
         stride = _sample_stride(P, K)
         sample = np.empty((-(-P // stride), K), dtype=np.float32)
-        dose_blocks, ob_zero, nonfinite_in, factor_parts, variances = [], 0.0, 0.0, [], []
+        ob_zero, nonfinite_in, factor_parts, variances = 0.0, 0.0, [], []
         ob_per_bin = np.zeros(K) if itype == "counts" else None
         mean_factor = np.ones(K)
-        blocks = _transmission_blocks(src, obs, itype, wave_bin, block, downsample, smoothing, background)
+        dead = _smoothing_dead_mask(obs, smoothing, src, wave_bin, block)
+        blocks = _transmission_blocks(src, obs, itype, wave_bin, block, downsample, smoothing, background, dead)
         n_blocks = len(range(0, nb - nb % wave_bin, block))
         with _written_atomically(out) as tmp, h5py.File(tmp, "w") as f:
             d = _create_hyperspectral(f, (V, rows, cols, K), as_type, chunks=(1, min(rows, 128), cols, min(16, K)))
             for j0, j1, T, dose_b, info_b, factors in tqdm(blocks, desc="convert", unit="block", total=n_blocks,
                                                            disable=not progress, leave=False):
                 if dose_b is not None:
-                    dose_blocks.append((dose_b, j1 - j0))
                     ob_per_bin[j0:j1] = info_b["dose_per_bin"]
                 ob_zero += info_b.get("open_beam_zero_frac", 0.0) * (j1 - j0)
                 nonfinite_in += info_b.get("attenuation_nonfinite_frac", 0.0) * (j1 - j0)
@@ -1202,9 +1284,9 @@ def convert_to_hdf5(path, output=None, open_beam=None, input_type="auto", datase
                     values = T
                 d[:, :, :, j0:j1] = values.reshape(V, rows, cols, j1 - j0)
                 del T, pos, values
-            given_dose, dose = dose, _merge_dose(dose, _block_dose(dose_blocks), src, wave_bin)
+            given_dose, dose = dose, _merge_dose(dose, _open_beam_dose(ob_per_bin), src, wave_bin)
             per_bin = _dose_per_bin(given_dose, ob_per_bin, src, wave_bin)
-            n_eff, sm_note = _effective_observations(len(obs), smoothing, _sum_variances(variances))
+            n_eff, sm_note = _effective_observations(len(obs), smoothing, _sum_variances(variances), dead)
             bg, dose, per_bin, n_eff = _calibrated(dose, per_bin, n_eff, background, factor_parts, mean_factor)
             n_eff = n_eff or src.file_observations
             if given_dose is not None and dose is not None and src.file_background is not None:
@@ -1223,8 +1305,9 @@ def convert_to_hdf5(path, output=None, open_beam=None, input_type="auto", datase
             sm = dict(pixels=P, bins=K, nbytes=P * K * 4, stats=st, above_one=tot["above"] / tot["n"],
                       dead_px=_frac(pos_px == 0), dead_bins=dead_bins,
                       const_bins=int((bin_max == bin_min).sum()) - dead_bins, dose=dose,
-                      bright=_bright_level(sum_px / K, (V, rows, cols), sample, dose, n_eff, per_bin,
-                                           _check_elems(memory_budget_mib)),
+                      bright=_bright_level(sum_px / K, (V, rows, cols), sample, dose, n_eff,
+                                           _ratio_dose(per_bin, dose, src, itype, wave_bin),
+                                           _check_elems(memory_budget_mib), smoothing=sm_note),
                       background=bg, smoothing=sm_note)
             checks = _checks_from_summary(sm, (V, rows, cols), strict)
             f.create_dataset("bin_indices", data=src.source_bins[:K * wave_bin:wave_bin])

@@ -34,9 +34,11 @@ the rank too low (a rank-6 test problem at 3 counts per bin returned rank 1), an
 chunks of pixels.
 
 At a few counts per bin the likelihood can keep rising along a component that grows on the zero counts, so the fit
-has no maximum: it ends at ``max_steps`` with attenuations of 10^10 or more on some zero-count entries, and the maps
-and spectra depend on ``max_steps``.  The fit warns when that happens, and the command line's report records the
-largest attenuation put on a zero count.
+has no maximum: it can run to ``max_steps``, and the maps and spectra then depend on ``max_steps``.  On a sphere
+phantom (48 x 48 pixels, 150 bins) the fit ran to ``max_steps`` at 1 to 1.5 counts per bin, with attenuations of
+order 10^17 on some zero-count entries; at 2 counts the stop came first, at about 10^8.  The fit warns whenever it
+puts an attenuation above 50 on a zero count, and the command line's report records the largest and how many entries
+exceed 50.
 
 The maximum-likelihood spectra are biased at low dose by the truncation of the pixel coefficients at zero.
 ``dehydrate`` offers two other estimators through ``spectra``.  ``'unconstrained'`` removes the bias by dropping the
@@ -104,7 +106,7 @@ maps and spectra.  ``rehydrate`` writes the product back as hyperspectral data, 
 ``denoise`` does both, and writes the report too.  The solve runs whole on the device when it fits and is streamed by
 chunks of pixels otherwise.  ``--spectra unconstrained`` and ``--spectra support`` select the spectra estimators
 described above; streamed, they keep only part of their gain: on the 1M-pixel sphere phantom at dose 3, over the
-streamed maximum-likelihood spectra, streamed ``unconstrained`` gained 0.7 to 3.3 dB (0.017 nats per pixel above its
+streamed maximum-likelihood spectra, streamed ``unconstrained`` gained 0.7 to 3.3 dB (0.016 nats per pixel above its
 loss) and streamed ``support`` 3.1 to 7.2 dB (0.47), against 7.2 to 12.8 dB solved whole (0.11 and 0.46).  The memory
 plan solves whole when the device holds the data; ``--mode full`` insists on it.  A streamed fit starts from spectra
 fitted on a random subsample of the pixels (16,384, or fewer when memory is short), and its polish passes refine them:
@@ -126,8 +128,9 @@ else one tile.  Without calibration, a data check warns when the most transparen
 what a matched exposure gives: the ratio bias the loader expects at the open beam's counts, plus a 3% margin and their
 noise (at least 5% on the low side).  ``--open-beam-smoothing W`` smooths the averaged open beam in each bin, at full
 resolution, before the division, with a W x W window: the normalized square root of the outer product of two Hamming
-windows.  The noise model then counts the open beam as more observations, by the reduction of its variance measured
-across the observations; the check reports it.
+windows.  It leaves out the dead pixels, those with no count in any selected bin of any observation (read once more
+for this), and keeps the zero counts of live pixels.  The noise model then counts the open beam as more observations,
+by the reduction of its variance measured across the observations; the check reports it.
 
 Multi-view data
 ^^^^^^^^^^^^^^^

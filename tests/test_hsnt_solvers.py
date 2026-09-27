@@ -352,7 +352,10 @@ def _enumerated_supports(T, W, H, dose, lam):
 
 def test_branch_and_bound_matches_the_enumeration_and_scales(dev):
     """Branch and bound reproduces the exhaustive search's supports on nearly every pixel of the test problem at the
-    same criterion, and runs at a rank the enumeration cannot reach (12). 'auto' is the penalty it names."""
+    same criterion. At a rank the enumeration cannot reach (12), from the maximum-likelihood maps for 12 spectra and
+    with no charge, it warns that the search is not exhaustive, selects at most _M_MAX components or all 12 (half the
+    pixels, at the maps and loss of the full fit), and never does worse than the full set or the empty one. 'auto' is
+    the penalty it names."""
     T, _, _ = _problem(dev, dose=10.0)
     W, H, _ = _mle(T)
     lam = 2 * np.log(T.shape[1])
@@ -367,8 +370,16 @@ def test_branch_and_bound_matches_the_enumeration_and_scales(dev):
     assert W_bb.min() >= 0 and bool((W_bb[~s_bb] == 0).all()) and s_bb.dtype == torch.bool
     rng = np.random.default_rng(5)
     H12 = torch.tensor(rng.uniform(0.05, 1.0, (12, T.shape[1])), dtype=torch.float32, device=dev)
-    s12, _, f12 = _select_supports(T, torch.zeros(T.shape[0], 12, device=dev), H12, dose=10.0, penalty=2.0)
-    assert s12.shape == (T.shape[0], 12) and s12.sum(1).max() <= 4 and torch.isfinite(f12).all()
+    W12 = _newton.solve_W(T, H12, torch.full((T.shape[0], 12), 0.05, device=dev), 100, 1e-12)
+    prep = _nnal_prep(T)
+    f_full = _newton._kernels("off")[2](W12 @ H12, T, prep, 1, dtype=torch.float64)
+    with pytest.warns(UserWarning, match="support selection at rank 12 is not exhaustive"):
+        s12, W0, f12 = _select_supports(T, W12, H12, dose=10.0, penalty=0.0)
+    n = s12.sum(1)
+    full = n == 12
+    assert s12.shape == (T.shape[0], 12) and bool(((n <= spectra._M_MAX) | full).all()) and torch.isfinite(f12).all()
+    assert full.double().mean() > 0.3 and torch.equal(W0[full], W12[full]) and torch.equal(f12[full], f_full[full])
+    assert bool((f12 <= f_full + 1e-9).all()) and bool((f12 <= _empty_fit_loss(T, prep) + 1e-9).all())
     s_auto = _select_supports(T, W, H, dose=10.0, penalty="auto")[0]
     assert torch.equal(s_auto, _select_supports(T, W, H, dose=10.0, penalty=_auto_penalty(T.mean(1), 10.0))[0])
 
@@ -407,7 +418,7 @@ def test_branch_and_bound_short_of_the_full_set(dev, monkeypatch):
     assert full.double().mean() > 0.2 and torch.equal(W0[full], W[full])
     assert (1000.0 * f + lam * s.sum(1)).sum().item() <= crit_enum * (1 + 1e-4)
     monkeypatch.setattr(spectra, "_M_MAX", 3)
-    with pytest.warns(UserWarning, match="select 3 of the 5 components"):
+    with pytest.warns(UserWarning, match=r"rank 5 is not exhaustive \(it is up to rank 4\).* select 3"):
         s3, _, _ = _select_supports(T, W, H, dose=1000.0, penalty=2.0)
     assert (s3.sum(1) == 5).double().mean() > 0.2 and not bool((s3.sum(1) == 4).any())
 

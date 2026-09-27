@@ -15,10 +15,8 @@ _UNC_MAX_STEPS, _UNC_REL_TOL = 100, 1e-8
 # The joint refit on the supports, and the W >= 0 re-solves.
 _REFIT_MAX_STEPS, _REFIT_REL_TOL, _W_MAX_STEPS, _CG_MAX = 300, 1e-10, 100, 10
 # Branch and bound: candidate materials per pixel, and the largest subset of them searched. Up to rank 6 the search is
-# exhaustive; above, it covers every subset of a pixel's six best single materials, and the full set.
+# exhaustive; above, it covers every subset of a pixel's six best single materials, and the full set, and warns.
 _K_TOP, _M_MAX = 6, 6
-# The share of pixels at the largest subset searched, short of the full set, above which the cap is reported.
-_CAP_WARN_FRAC = 0.05
 
 
 def _unconstrained_spectra(T, W, H, compile_mode='auto'):
@@ -185,9 +183,10 @@ def _select_branch_bound(T, W, H, dose, lam, f_full, k_top=_K_TOP, m_max=_M_MAX,
     singletons for the pixels the lower bound leaves open, then the full set. W is the full-model fit and f_full its
     per-pixel loss. The pixel loss is monotone in the subset, so f_full bounds every subset from below: a set of `size`
     materials can beat the current best only if dose * (f_best - f_full) > lam * (size - size(best)). When the subsets
-    stop short of the full set (m_max < R), the full set enters as the fit W, with no further fit, and a warning reports
-    more than _CAP_WARN_FRAC of the pixels at m_max when sizes between m_max and R go unsearched. Returns (idx, valid,
-    w, f) as padded per-pixel sets of width R."""
+    stop short of the full set (m_max < R), the full set enters as the fit W, with no further fit. The search is
+    exhaustive when every subset short of the full set is searched (k_top = R and m_max >= R - 1); otherwise a warning
+    says so, with the shares of the pixels at the full set and at m_max. Returns (idx, valid, w, f) as padded per-pixel
+    sets of width R."""
     P = T.shape[0]
     R = H.shape[0]
     dev = T.device
@@ -247,12 +246,13 @@ def _select_branch_bound(T, W, H, dose, lam, f_full, k_top=_K_TOP, m_max=_M_MAX,
         best_valid[full] = True
         best_w[full] = W[full].to(best_w.dtype)
         best_f = torch.where(full, f_full, best_f)
-    if m_max < R - 1:                                               # sizes m_max + 1 to R - 1 were not searched
-        capped = (best_valid.sum(1) == m_max).double().mean().item()
-        if capped > _CAP_WARN_FRAC:
-            warnings.warn(f"support selection: {100 * capped:.3g}% of the pixels select {m_max} of the {R} components, "
-                          f"the most the search tries short of all {R}; their best support may be larger (the search "
-                          f"is exhaustive up to rank {min(k_top, m_max + 1)})")
+    if k_top < R or m_max < R - 1:                                  # some subsets short of the full set go unsearched
+        n = best_valid.sum(1)
+        at_full, at_cap = ((n == R).double().mean().item(), (n == m_max).double().mean().item())
+        warnings.warn(f"support selection at rank {R} is not exhaustive (it is up to rank {min(k_top, m_max + 1)}): "
+                      f"it tries the subsets of up to {m_max} of each pixel's {k_top} best single components, and the "
+                      f"full set; {100 * at_full:.3g}% of the pixels select all {R} and {100 * at_cap:.3g}% select "
+                      f"{m_max}, and a better support may be among those not tried")
     return best_idx, best_valid, best_w, best_f
 
 

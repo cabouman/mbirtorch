@@ -113,7 +113,7 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
         mode (str, optional): 'full' solves on the device at once, 'stream' by chunks of pixels, and 'auto' picks
             from the memory the device has available and whether the solve compiles. Streamed, spectra='unconstrained'
             and 'support' keep only part of their gain. On a 1M-pixel sphere phantom at dose 3 (one seed), against the
-            streamed maximum-likelihood spectra, streamed 'unconstrained' gained 0.7 to 3.3 dB at a loss 0.017 nats
+            streamed maximum-likelihood spectra, streamed 'unconstrained' gained 0.7 to 3.3 dB at a loss 0.016 nats
             per pixel higher and streamed 'support' 3.1 to 7.2 dB at 0.47 higher; solved whole, the two gained 7.2 to
             12.8 dB over the maximum-likelihood spectra, at 0.11 and 0.46 nats per pixel above its loss. Pass
             mode='full' when the device holds the data. Defaults to 'auto'.
