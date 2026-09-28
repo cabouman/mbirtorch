@@ -92,7 +92,9 @@ def estimate_rank(data, dataset_type="attenuation", max_rank=6, device=None, poo
     not given, by sequential likelihood-ratio tests at full resolution and on spatially pooled pixels.
 
     The data are taken as :func:`~mbirtorch.hsnt.dehydrate` takes them: the spectral axis last and any leading axes;
-    when those are (views, rows, cols) or (rows, cols), blocks of neighboring pixels are also pooled.
+    when those are (views, rows, cols) or (rows, cols), blocks of neighboring pixels are also pooled. Without them the
+    test runs at full resolution only, and below 64 counts per bin, where pooling would run, it warns that it can miss
+    components.
 
     Ranks 1 to max_rank are fitted in turn. The loss gain of each added component is converted to log-likelihood
     units with a dose calibrated from the residual of the most flexible fit (the mean of (T - e^-X)^2 / e^-X is
@@ -154,6 +156,16 @@ def _estimate_rank(T, spatial_shape=None, device=None, max_rank=6, subsample=163
     detail = dict(full=d_full, pool_block=block, max_rank=max_rank, rank_full=rank_full, rank_pooled=None)
     rank = rank_full
     parts = [f"full resolution gave {rank_full}"]
+    if spatial_shape is None and pool == "auto" and d_full["effective_dose"] < 64.0:
+        # Below 64 counts per bin 'auto' pools, and the full-resolution test alone misses components: on the
+        # three-material sphere phantom (65,536 pixels) it gave rank 1 at up to 3 counts per bin and 2 at 10, where
+        # pooling gave 3.
+        parts.append("no pooling: the data have no image axes")
+        dose = d_full["effective_dose"]
+        warnings.warn(f"the rank was estimated at full resolution only ({dose:.3g} counts per bin): the data have no "
+                      "image axes, so neighboring pixels could not be pooled, and at this count the full-resolution "
+                      "test can miss components. Pass the data with its image axes, (views, rows, cols, bins) or "
+                      "(rows, cols, bins), or give the number of components")
     if block > 1:
         Tp = torch.from_numpy(_subsample(_pool_pixels(T_np, spatial_shape, block), subsample)).to(device)
         rank_pool, d_pool = _lrt_rank(Tp, max_rank, f"pooled {block}x{block}", verbose)

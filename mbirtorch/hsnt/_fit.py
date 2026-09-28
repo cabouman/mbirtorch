@@ -110,20 +110,34 @@ def _loss(W, H, T_host, device):
 
 def _report_zero_counts(rep, W, H, T, device, chunk):
     """Record, and warn about, fitted attenuations above _ZERO_COUNT_BOUND on entries with no counts
-    (_zero_count_divergence), going through T (host numpy or a device tensor) by blocks of `chunk` rows."""
-    from .factorization import _ZERO_COUNT_BOUND, _zero_count_divergence
+    (_zero_count_divergence), and the components that model the zero counts rather than a material: those holding at
+    least _CAPTURED_SHARE of their attenuation there (_zero_count_mass). Goes through T (host numpy or a device tensor)
+    by blocks of `chunk` rows."""
+    from .factorization import _CAPTURED_SHARE, _ZERO_COUNT_BOUND, _zero_count_divergence, _zero_count_mass
     x_max, n_above = 0.0, 0
     Hd = H.to(device)
+    on_zero = torch.zeros(Hd.shape[0], dtype=torch.float64, device=device)
     for i in range(0, T.shape[0], chunk):
         Tc = T[i:i + chunk] if torch.is_tensor(T) else torch.from_numpy(T[i:i + chunk])
-        m, n = _zero_count_divergence(W[i:i + chunk].to(device), Hd, Tc.to(device))
+        Wc, Tc = W[i:i + chunk].to(device), Tc.to(device)
+        m, n = _zero_count_divergence(Wc, Hd, Tc)
         x_max, n_above = max(x_max, m), n_above + n
-    rep.update(zero_count_max_attenuation=x_max, zero_count_entries_above_bound=n_above)
+        on_zero += _zero_count_mass(Wc, Hd, Tc)
+    total = W.to(torch.float64).sum(0).to(device) * Hd.to(torch.float64).sum(1)
+    share = torch.where(total > 0, on_zero / total.clamp_min(torch.finfo(torch.float64).tiny), torch.zeros_like(total))
+    captured = [k for k in range(share.numel()) if float(share[k]) >= _CAPTURED_SHARE]
+    rep.update(zero_count_max_attenuation=x_max, zero_count_entries_above_bound=n_above,
+               zero_count_share=[round(float(v), 6) for v in share], zero_count_components=captured)
     if n_above:
         log.warning("the fit puts %d zero-count entries above attenuation %g (largest %.3g). At a few counts per bin "
                     "the likelihood keeps rising along a component that grows on the zero counts, so those entries, "
                     "and the maps and spectra that carry them, depend on max_steps", n_above, _ZERO_COUNT_BOUND,
                     x_max)
+    if captured:
+        log.warning("components on zero counts: %s (the share of the component's attenuation on zero-count entries). "
+                    "Such a component models the zero counts rather than a material; the materials have %d of the %d "
+                    "components", ", ".join(f"{k} ({100 * float(share[k]):.2f}%)" for k in captured),
+                    share.numel() - len(captured), share.numel())
 
 
 def _fit_fixed_basis(T, H, device="cpu", mode="auto", chunk_pixels=None, max_steps=1000, rel_tol=1e-8,

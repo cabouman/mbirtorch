@@ -30,15 +30,24 @@ it is estimated by likelihood-ratio tests, run on at most 16,384 random pixels a
 pixels; each compares a component's gain in likelihood with a noise floor taken from the smallest gains of the same
 search.  When the true rank is near ``max_rank`` those gains include real components, the floor is set too high and
 the rank too low (a rank-6 test problem at 3 counts per bin returned rank 1), and the answer can change with
-``max_rank``: raise it when the gains do not level off.  Data that do not fit in the device memory are factorized by
-chunks of pixels.
+``max_rank``: raise it when the gains do not level off.  Pooling needs the image axes: data given as (pixels, bins)
+are tested at full resolution only, and below 64 counts per bin, where the pooled test would run, the estimate warns
+that it can miss components (on a three-material sphere phantom of 65,536 pixels the full-resolution test gave rank 1
+up to 3 counts per bin, where pooling gave 3).  Data that do not fit in the device memory are factorized by chunks of
+pixels.
 
 At a few counts per bin the likelihood can keep rising along a component that grows on the zero counts, so the fit
 has no maximum: it can run to ``max_steps``, and the maps and spectra then depend on ``max_steps``.  On a sphere
 phantom (48 x 48 pixels, 150 bins) the fit ran to ``max_steps`` at 1 to 1.5 counts per bin, with attenuations of
 order 10^17 on some zero-count entries; at 2 counts the stop came first, at about 10^8.  The fit warns whenever it
 puts an attenuation above 50 on a zero count, and the command line's report records the largest and how many entries
-exceed 50.
+exceed 50.  A component can end with its attenuation almost entirely on zero counts: it then models the zero counts
+rather than a material, and the fit has one component fewer for the materials.  The fit names such a component
+(99% of its attenuation or more on zero counts) in a warning, and the report records each component's share
+(``zero_count_share``) and the components named (``zero_count_components``).  On the sphere phantom at rank 3 it
+happened in 7 of 18 fits of 65,536 pixels at 1 to 3 counts per bin, and in 2 of 10 fits of 10^6 pixels at 3 counts.
+Where it happens is not a matter of the solver alone: on the smaller phantom the fit that gives a component to the zero
+counts can have the higher likelihood.
 
 The maximum-likelihood spectra are biased at low dose by the truncation of the pixel coefficients at zero.
 ``dehydrate`` offers two other estimators through ``spectra``.  ``'unconstrained'`` removes the bias by dropping the

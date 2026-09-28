@@ -234,7 +234,8 @@ def test_a_streamed_fit_at_one_count_per_bin_stays_finite_and_descends():
 
 def test_a_fit_reports_the_zero_count_divergence(caplog):
     """The fit behind dehydrate records the largest attenuation it puts on a zero count, and warns when entries pass
-    the bound, full and streamed; at dose 100 it records none."""
+    the bound, full and streamed; at one count per bin it also names the components that model the zero counts. At
+    dose 100 it records neither."""
     from mbirtorch.hsnt._fit import _fit
     for dose, mode in ((1.0, "full"), (1.0, "stream"), (100.0, "full")):
         T = _sphere_problem("cpu", n=32, K=100, dose=dose).numpy()
@@ -244,8 +245,34 @@ def test_a_fit_reports_the_zero_count_divergence(caplog):
                              compile_mode="off")
         diverges = rep["zero_count_entries_above_bound"] > 0
         assert diverges == (dose == 1.0) and diverges == ("zero-count entries" in caplog.text)
+        captured = bool(rep["zero_count_components"])
+        assert captured == (dose == 1.0) and captured == ("the zero counts rather than a material" in caplog.text)
         if mode == "full":
             assert rep["mle_hit_max_steps"] == (dose == 1.0)
+
+
+def test_a_component_that_models_the_zero_counts_is_named(caplog):
+    """A component whose attenuation lies on a block of zero counts is named, with its share, in the report and the
+    warning, which counts the components left for the materials; without it no component is named."""
+    from mbirtorch.hsnt._fit import _report_zero_counts
+    T = torch.full((40, 30), 0.5)
+    T[:4, :5] = 0
+    W, H = torch.full((40, 2), 0.3), torch.ones(2, 30)
+    W[:, 1], H[1] = 0, 0
+    W[:4, 1], H[1, :5] = 20.0, 3.0                          # component 1 lives on the zero block
+    rep = {}
+    with caplog.at_level("WARNING", logger="mbirtorch.hsnt"):
+        _report_zero_counts(rep, W, H, T, "cpu", 16)
+    share = rep["zero_count_share"]
+    assert rep["zero_count_components"] == [1] and share[1] == 1.0 and share[0] < 0.1
+    assert "components on zero counts: 1 (100.00%)" in caplog.text
+    assert "the materials have 1 of the 2 components" in caplog.text
+    W[:4, 1], H[1, :5], W[10:20, 1], H[1, 10:20] = 0.0, 0.0, 1.0, 1.0      # the same component on counted entries
+    rep = {}
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="mbirtorch.hsnt"):
+        _report_zero_counts(rep, W, H, T, "cpu", 16)
+    assert rep["zero_count_components"] == [] and "rather than a material" not in caplog.text
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -302,6 +329,20 @@ def test_rank_estimate_finds_the_rank_with_pooling_and_near_max_rank(dev):
     T = (rng.poisson(50.0 * np.exp(-W @ H)) / 50.0).astype(np.float32)
     rank, _, detail = hsnt.estimate_rank(T, "transmission", max_rank=6, device=dev)
     assert rank == R and detail["full"]["noise_tail"]
+
+
+def test_a_rank_estimated_without_image_axes_at_low_counts_warns(dev):
+    """Pixels given without image axes cannot be pooled: below 64 counts per bin, where pooling would run, the estimate
+    warns that the full-resolution test alone can miss components, and its note says so. With the image axes, or at
+    1000 counts per bin, it does not warn."""
+    with pytest.warns(UserWarning, match="full resolution only"):
+        _, note, detail = hsnt.estimate_rank(_sphere_problem(dev, dose=3.0), "transmission", max_rank=4, device=dev)
+    assert "no pooling" in note and detail["pool_block"] == 0
+    for data in (_sphere_problem(dev, dose=3.0).reshape(48, 48, -1), _sphere_problem(dev, dose=1000.0)):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            hsnt.estimate_rank(data, "transmission", max_rank=4, device=dev)
+        assert not any("full resolution only" in str(w.message) for w in caught)
 
 
 def test_spectra_estimators(dev):

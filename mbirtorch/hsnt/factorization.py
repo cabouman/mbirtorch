@@ -61,6 +61,10 @@ def _nnal_factorization(T, num_materials, max_steps=1000, rel_tol=1e-8, compile_
 
 # An attenuation above this on an entry with no counts is not constrained by the data (exp(-50) is 2e-22 of one count).
 _ZERO_COUNT_BOUND = 50.0
+# A component whose attenuation lies at least this share on zero-count entries models the zero counts, not a material.
+# On the 65,536-pixel sphere phantom at rank 3 and 1 to 100 counts per bin, the component that took the zero counts
+# held 0.9994 to 1.0 of its attenuation there (7 fits of 22), and no other component more than 0.78.
+_CAPTURED_SHARE = 0.99
 
 
 def _zero_count_divergence(W, H, T, chunk=2 ** 23):
@@ -80,3 +84,17 @@ def _zero_count_divergence(W, H, T, chunk=2 ** 23):
             x_max = max(x_max, float(torch.where(zero, X, torch.zeros_like(X)).max()))
         n_above += int((zero & ~(X <= _ZERO_COUNT_BOUND)).sum())
     return x_max, n_above
+
+
+def _zero_count_mass(W, H, T, chunk=2 ** 23):
+    """Each component's attenuation summed over the zero-count entries, sum over zero (p, b) of W_pk H_kb, (rank,) in
+    float64, by blocks of rows: divided by the component's total, (sum_p W_pk)(sum_b H_kb), the share of it the zero
+    counts hold."""
+    rows = max(1, chunk // max(T.shape[1], 1))
+    out = torch.zeros(W.shape[1], dtype=torch.float64, device=W.device)
+    Hd = H.to(torch.float64)
+    for i in range(0, T.shape[0], rows):
+        zero = (T[i:i + rows] <= 1e-12).to(torch.float64)
+        if bool(zero.any()):
+            out += (W[i:i + rows].to(torch.float64) * (zero @ Hd.T)).sum(0)
+    return out

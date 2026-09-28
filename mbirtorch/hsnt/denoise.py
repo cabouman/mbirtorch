@@ -87,7 +87,8 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
         dataset_type (str, optional): 'attenuation' or 'transmission', where attenuation = -log(transmission).
             Defaults to 'attenuation'.
         num_materials (int, optional): Rank of the factorization :math:`N_m`. Defaults to None, which estimates it
-            (or takes the rank of subspace_basis).
+            (or takes the rank of subspace_basis); the estimate pools neighboring pixels only when data has image axes
+            (see estimate_rank).
         subspace_basis (numpy.ndarray or torch.Tensor, optional): Spectra to hold fixed, shape :math:`(N_m, N_k)`,
             nonnegative, for example the subspace_basis of another dehydration of the same bins; spectra must then be
             'mle'. Defaults to None, which fits the spectra too.
