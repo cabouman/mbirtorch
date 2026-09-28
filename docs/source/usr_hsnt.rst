@@ -42,14 +42,17 @@ exceed 50.
 
 The maximum-likelihood spectra are biased at low dose by the truncation of the pixel coefficients at zero.
 ``dehydrate`` offers two other estimators through ``spectra``.  ``'unconstrained'`` removes the bias by dropping the
-bound while the spectra are estimated, and gains when the pixels are many (on a sphere phantom at 3 counts per bin, 7
-to 12 dB at 10^6 pixels, about nothing at 4 x 10^4, scored after the best linear mixing of the fitted spectra onto the
-true ones).  ``'support'`` instead identifies the coefficients whose true value is zero, holds them at zero, and
-refits the rest; it needs the dose.  It decides in the basis the maximum-likelihood fit ends in, which is some mixture
-of the materials: where the components are far from the pure materials, a pixel of one material needs several of them,
-and the selection mostly separates the sample from the background (on the 1M-pixel sphere phantom from 3 counts per
-bin up, its maps are exactly zero on 98.6 to 100% of the background pixels).  Its gain is therefore in the spectra at
-low dose rather than in the maps.
+bound while the spectra are estimated, and gains when the pixels are many.  On a sphere phantom at 3 to 10 counts per
+bin (scored after the best linear mixing of the fitted spectra onto the true ones; medians over four seeds), it gained
+-0.4 to +2.3 dB at 6.5 x 10^4 pixels, +0.8 to +4.9 dB at 1.3 x 10^5 and up to +7.6 dB at 2.6 x 10^5 to 5.2 x 10^5,
+where the gain varies with the seed and the dose, and 7 to 12 dB at 10^6 pixels and 3 counts, at 0.07 to 0.16 nats per
+pixel above the maximum-likelihood loss; below 2 counts per bin it gained nothing at these sizes.  ``'support'``
+instead identifies the coefficients whose true value is zero, holds them at zero, and refits the rest; it needs the
+dose.  It decides in the basis the maximum-likelihood fit ends in, which is some mixture of the materials: where the
+components are far from the pure materials, a pixel of one material needs several of them, and the selection mostly
+separates the sample from the background (on the 1M-pixel sphere phantom from 3 counts per bin up, its maps are
+exactly zero on 98.6 to 100% of the background pixels).  Its gain is therefore in the spectra at low dose rather than
+in the maps.
 
 Given a ``subspace_basis``, ``dehydrate`` fits only the maps: each pixel's maximum-likelihood coefficients for those
 spectra.  Data too large to hold at once, such as the many views of a scan, can then be dehydrated piece by piece
@@ -105,10 +108,16 @@ stack (or one bin of every selected view, when that is larger), and writes the h
 maps and spectra.  ``rehydrate`` writes the product back as hyperspectral data, for all bins or a ``--wave-range``.
 ``denoise`` does both, and writes the report too.  The solve runs whole on the device when it fits and is streamed by
 chunks of pixels otherwise.  ``--spectra unconstrained`` and ``--spectra support`` select the spectra estimators
-described above; streamed, they keep only part of their gain: on the 1M-pixel sphere phantom at dose 3, over the
-streamed maximum-likelihood spectra, streamed ``unconstrained`` gained 0.7 to 3.3 dB (0.016 nats per pixel above its
-loss) and streamed ``support`` 3.1 to 7.2 dB (0.47), against 7.2 to 12.8 dB solved whole (0.11 and 0.46).  The memory
-plan solves whole when the device holds the data; ``--mode full`` insists on it.  A streamed fit starts from spectra
+described above.  Streamed, their accuracy depends on the polish passes, ``--max-passes`` (default 5), which trade time
+for SNR.  On the 1M-pixel sphere phantom at dose 3 in 8 chunks, five passes left the streamed maximum-likelihood fit
+0.022 nats per pixel above the fit solved whole, with its spectra within 2.3 dB of it, and the streamed
+``unconstrained`` and ``support`` spectra 4.7 to 10.6 dB and 3.6 to 4.9 dB below the same estimators solved whole.  With
+40 passes, at four to six times the time, all three came within 0.5 dB of their fits solved whole (the
+maximum-likelihood fit stopped by itself after 32).  At dose 30, five passes left the maximum-likelihood fit within
+0.001 nats per pixel, while ``support`` stayed up to 6 dB short even after 40.  The memory plan solves whole when the
+device holds the data; ``--mode full`` insists on it.  An uncompiled solve needs about 1.4 times the memory of a
+compiled one, so on an 80 GB GPU a 1M-pixel, 1200-bin fit is solved whole when compiled (the default there) and
+streamed with ``--compile off``.  A streamed fit starts from spectra
 fitted on a random subsample of the pixels (16,384, or fewer when memory is short), and its polish passes refine them:
 a material with no pixels in the subsample is not found, and the gap to the fit solved whole grows with the number of
 pixels over the subsample size (the passes stop at ``--max-passes``, with a warning).  An output is never one of the

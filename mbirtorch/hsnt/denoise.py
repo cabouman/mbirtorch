@@ -93,7 +93,9 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
             'mle'. Defaults to None, which fits the spectra too.
         spectra (str, optional): 'mle', the maximum-likelihood spectra; 'unconstrained', a re-estimate without the
             bias the nonnegativity of W gives the spectra at low dose, which gains with many pixels (on a sphere
-            phantom at 3 counts per bin, 7 to 12 dB at 10^6 pixels, about nothing at 4 x 10^4); 'support',
+            phantom at 3 to 10 counts per bin, up to 2.3 dB at 6.5 x 10^4 pixels, up to 4.9 dB at 1.3 x 10^5 and 7
+            to 12 dB at 10^6, at 0.07 to 0.16 nats per pixel above the maximum-likelihood loss; nothing below 2
+            counts per bin); 'support',
             which decides the components present in each pixel and refits, and needs the dose: it corrects the same
             bias, and in the maps mostly zeroes the background, since a pixel of one material usually needs several
             of the fitted components. Defaults to 'mle'.
@@ -108,18 +110,24 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
         max_rank (int, optional): Largest rank the estimate considers. Defaults to 6.
         device (str, optional): Torch device. Defaults to None, meaning CUDA if available, else CPU.
         compile_mode (str, optional): 'auto' compiles the solver with torch.compile on CUDA for data of at least 5e8
-            entries (at 1M pixels a compiled step takes about a third of the eager time); 'on' always; 'off' never.
-            The rank estimate always runs uncompiled. Defaults to 'auto'.
+            entries, about where a first compiled call, compile included, becomes faster than an eager one (on an
+            H100: 1.1 to 1.4 times the eager time at 2.6 x 10^5 pixels and 1200 bins, 0.65 to 0.95 times from 4 x
+            10^5; a compile cache left by an earlier process roughly halves it). At 1M pixels a compiled step takes
+            about a third of the eager time and the solve needs about 0.7 times the memory. 'on' always; 'off'
+            never. The rank estimate always runs uncompiled. Defaults to 'auto'.
         mode (str, optional): 'full' solves on the device at once, 'stream' by chunks of pixels, and 'auto' picks
-            from the memory the device has available and whether the solve compiles. Streamed, spectra='unconstrained'
-            and 'support' keep only part of their gain. On a 1M-pixel sphere phantom at dose 3 (one seed), against the
-            streamed maximum-likelihood spectra, streamed 'unconstrained' gained 0.7 to 3.3 dB at a loss 0.016 nats
-            per pixel higher and streamed 'support' 3.1 to 7.2 dB at 0.47 higher; solved whole, the two gained 7.2 to
-            12.8 dB over the maximum-likelihood spectra, at 0.11 and 0.46 nats per pixel above its loss. Pass
-            mode='full' when the device holds the data. Defaults to 'auto'.
+            from the memory the device has available and whether the solve compiles. A streamed fit is only as close
+            to the fit solved whole as its polish passes take it (see max_passes). Pass mode='full' when the device
+            holds the data. Defaults to 'auto'.
         chunk_pixels (int, optional): Pixels per chunk when streamed. Defaults to None, from the available memory.
         max_passes (int, optional): Polish passes over the data when streamed, after an initial fit on a random
             subsample of the pixels; 0 keeps that fit. A warning says when max_passes, not rel_tol, ends the passes.
+            More passes trade time for SNR. On a 1M-pixel sphere phantom at dose 3 in 8 chunks (one seed), five passes
+            left the maximum-likelihood fit 0.022 nats per pixel above the fit solved whole and its spectra within
+            2.3 dB, and the spectra of spectra='unconstrained' and 'support' 4.7 to 10.6 dB and 3.6 to 4.9 dB below
+            the same estimators solved whole; 40 passes, at four to six times the time, brought all three within
+            0.5 dB (the maximum-likelihood fit stopped by itself after 32). At dose 30, five passes left the
+            maximum-likelihood fit within 0.001 nats per pixel, and 'support' up to 6 dB short even after 40.
             Defaults to 5.
         verbose (int, optional): 0 prints nothing; 1 prints a summary; 2 also prints the rank search. Defaults to 1.
 

@@ -484,7 +484,7 @@ Each subcommand's -h lists the options most runs need; --help-all lists every op
 
 _SPECTRA_HELP = ("how the component spectra are estimated. mle (default): the spectra that best fit the measured "
                  "counts. unconstrained: removes a bias the best fit has at low dose; worth it with many pixels (on "
-                 "a test phantom 7-12 dB at a million pixels, about nothing at 40,000). support: works out which "
+                 "a test phantom 7-12 dB at a million pixels, up to 2 dB at 65,000). support: works out which "
                  "components each pixel contains, which removes the same bias and zeroes the background of the maps; "
                  "needs the dose (an open beam or --dose)")
 
@@ -599,8 +599,8 @@ class _Options:
                       "(default 1e-8)")
         self.add(g, "--compile", choices=("auto", "on", "off"), default="auto", advanced=True,
                  help="compile the solver kernels: auto (default) on CUDA for data of 5e8 entries or more (about "
-                      "417k pixels at 1200 bins); stream mode compiles only with 'on', and the rank estimate always "
-                      "runs uncompiled")
+                      "417k pixels at 1200 bins, where a first compiled call starts to pay for its compile); stream "
+                      "mode compiles only with 'on', and the rank estimate always runs uncompiled")
         g = sp.add_argument_group("advanced: memory")
         self.add(g, "--mode", choices=("auto", "full", "stream"), default="auto", advanced=True,
                  help="full solve on the device or streamed by chunks of pixels (default: full when its estimated "
@@ -611,7 +611,8 @@ class _Options:
         self.add(g, "--max-passes", type=_nonneg_int, default=5, advanced=True,
                  help="stream mode: polish passes over the data after the fit on a pixel subsample, stopping early on "
                       "the first pass that changes the loss by at most --rel-tol, relatively; 0 keeps that fit "
-                      "(default 5)")
+                      "(default 5). More passes trade time for SNR: on a 1M-pixel test phantom at 3 counts per bin, 40 "
+                      "passes brought the streamed spectra within 0.5 dB of the fit solved whole, at 4-6x the time")
 
 
 def build_parser(show_all=False):
