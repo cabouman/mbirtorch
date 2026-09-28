@@ -205,13 +205,15 @@ def test_the_w_solve_reaches_stationarity_next_to_an_inward_entry(dev):
 
 
 def test_the_zero_count_divergence_is_reported(dev):
-    """At about one count per bin the loss keeps falling along a component that grows on the zero counts, and
-    _zero_count_divergence reports it; at dose 100 it reports nothing."""
+    """At about one count per bin the loss keeps falling along a component that grows on the zero counts, which
+    stops at the attenuation bound, and _zero_count_divergence reports the entries there; at dose 100 it reports
+    nothing."""
     for dose, diverges in ((1.0, True), (100.0, False)):
         T = _sphere_problem(dev, n=32, K=100, dose=dose)
         W, H, _ = _nnal_factorization(T, 3, max_steps=150, compile_mode="off")
         x_max, n_above = _zero_count_divergence(W, H, T)
-        assert (n_above > 0) == diverges and (x_max > 50) == diverges
+        assert (n_above > 0) == diverges and (x_max > 20) == diverges
+        assert bool(((W.amax(0) * H.amax(1)) <= _newton._X_MAX * (1 + 1e-5)).all())    # each component's peak
         # Next to the component grown on the zero counts, the block steps' snap of frozen entries is checked against
         # the row loss, so a step from the fit does not raise the loss.
         prep = _nnal_prep(T)
@@ -223,18 +225,19 @@ def test_the_zero_count_divergence_is_reported(dev):
 
 def test_a_streamed_fit_at_one_count_per_bin_stays_finite_and_descends():
     """At one count per bin the streamed polish neither raises its loss (its snap of frozen spectrum entries is kept
-    only where it does not raise a bin's loss) nor follows the zero-count direction until float32 overflows."""
+    only where it does not raise a bin's loss) nor follows the zero-count direction past the attenuation bound."""
     from mbirtorch.hsnt._fit import _fit
     T = _sphere_problem("cpu", n=32, K=100, dose=1.0).numpy()
     W, H, rep = _fit(T, 3, device="cpu", mode="stream", chunk_pixels=512, max_passes=10, compile_mode="off")
     losses = rep["loss_per_pass"]
-    assert np.isfinite(W).all() and np.isfinite(H).all() and len(losses) >= 8
+    assert np.isfinite(W).all() and np.isfinite(H).all() and len(losses) >= 2
+    assert float((W.max(0) * H.max(1)).max()) <= 27.7                  # each component's peak attenuation
     assert all(b <= a * (1 + 1e-9) for a, b in zip(losses, losses[1:]))
 
 
 def test_a_fit_reports_the_zero_count_divergence(caplog):
-    """The fit behind dehydrate records the largest attenuation it puts on a zero count, and warns when entries pass
-    the bound, full and streamed; at one count per bin it also names the components that model the zero counts. At
+    """The fit behind dehydrate records the largest attenuation it puts on a zero count, and warns when entries sit
+    at the attenuation bound, full and streamed; at one count per bin it also names the components that model the zero counts. At
     dose 100 it records neither."""
     from mbirtorch.hsnt._fit import _fit
     for dose, mode in ((1.0, "full"), (1.0, "stream"), (100.0, "full")):
@@ -243,12 +246,12 @@ def test_a_fit_reports_the_zero_count_divergence(caplog):
         with caplog.at_level("WARNING", logger="mbirtorch.hsnt"):
             _, _, rep = _fit(T, 3, device="cpu", mode=mode, chunk_pixels=512, max_steps=150, max_passes=3,
                              compile_mode="off")
-        diverges = rep["zero_count_entries_above_bound"] > 0
+        diverges = rep["zero_count_entries_at_bound"] > 0
         assert diverges == (dose == 1.0) and diverges == ("zero-count entries" in caplog.text)
         captured = bool(rep["zero_count_components"])
         assert captured == (dose == 1.0) and captured == ("the zero counts rather than a material" in caplog.text)
-        if mode == "full":
-            assert rep["mle_hit_max_steps"] == (dose == 1.0)
+        if mode == "full":                            # bounded, the fit stops on its own, not at max_steps
+            assert not rep["mle_hit_max_steps"]
 
 
 def test_a_component_that_models_the_zero_counts_is_named(caplog):
@@ -265,7 +268,7 @@ def test_a_component_that_models_the_zero_counts_is_named(caplog):
         _report_zero_counts(rep, W, H, T, "cpu", 16)
     share = rep["zero_count_share"]
     assert rep["zero_count_components"] == [1] and share[1] == 1.0 and share[0] < 0.1
-    assert "components on zero counts: 1 (100.00%)" in caplog.text
+    assert "components on zero counts: 1 (100.00%, 20 at the bound)" in caplog.text
     assert "the materials have 1 of the 2 components" in caplog.text
     W[:4, 1], H[1, :5], W[10:20, 1], H[1, 10:20] = 0.0, 0.0, 1.0, 1.0      # the same component on counted entries
     rep = {}

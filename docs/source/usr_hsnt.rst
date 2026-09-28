@@ -36,16 +36,20 @@ that it can miss components (on a three-material sphere phantom of 65,536 pixels
 up to 3 counts per bin, where pooling gave 3).  Data that do not fit in the device memory are factorized by chunks of
 pixels.
 
-At a few counts per bin the likelihood can keep rising along a component that grows on the zero counts, so the fit
-has no maximum: it can run to ``max_steps``, and the maps and spectra then depend on ``max_steps``.  On a sphere
-phantom (48 x 48 pixels, 150 bins) the fit ran to ``max_steps`` at 1 to 1.5 counts per bin, with attenuations of
-order 10^17 on some zero-count entries; at 2 counts the stop came first, at about 10^8.  The fit warns whenever it
-puts an attenuation above 50 on a zero count, and the command line's report records the largest and how many entries
-exceed 50.  A component can end with its attenuation almost entirely on zero counts: it then models the zero counts
-rather than a material, and the fit has one component fewer for the materials.  The fit names such a component
-(99% of its attenuation or more on zero counts) in a warning, and the report records each component's share
-(``zero_count_share``) and the components named (``zero_count_components``).  On the sphere phantom at rank 3 it
-happened in 7 of 18 fits of 65,536 pixels at 1 to 3 counts per bin, and in 2 of 10 fits of 10^6 pixels at 3 counts.
+At a few counts per bin the likelihood keeps rising along a component that grows on the zero counts: the loss of a
+zero count has no minimum.  The solver bounds each component's attenuation at 27.6 (a transmission of 10^-12, which
+any realistic dose records as zero counts), so such a component stops there instead of growing to 10^6 or more; well
+inside the bound nothing changes (on the 10^6-pixel sphere phantom at 3 counts per bin, the fits that never approach
+it are bitwise the same).  The fit warns when zero-count entries sit at the bound, and the command line's report
+records the largest attenuation on a zero count (``zero_count_max_attenuation``) and how many entries are at the bound
+(``zero_count_entries_at_bound``).  The bound does not stop a component from being spent on the zero counts: it then
+models the zero counts rather than a material, and the fit has one component fewer for the materials.  The fit names
+such a component (one that alone reaches the bound on zero counts, or holds 99% of its attenuation or more there) in a
+warning, and the report records each component's
+share (``zero_count_share``) and the components named (``zero_count_components``).  On the sphere phantom at rank 3 it
+happened in 7 of 18 fits of 65,536 pixels at 1 to 3 counts per bin, and in 2 of 10 fits of 10^6 pixels at 3 counts;
+there the bound brings the maps from -51 to -62 dB (spoiled by coefficients of 10^6) to within 0.6 dB of the other
+fits on Cu and 1.8 dB on Al, while the spectra keep the capture's cost (8.5 dB on Al).
 Where it happens is not a matter of the solver alone: on the smaller phantom the fit that gives a component to the zero
 counts can have the higher likelihood.
 

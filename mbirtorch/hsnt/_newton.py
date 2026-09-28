@@ -17,6 +17,11 @@ _ACTIVE_TOL = 1e-6
 # A block step that drives an entry to within this many ulps of zero sets it to exactly zero, so that fused (compiled)
 # and separate rounding take the same active-set decision.
 _SNAP_ULPS = 8.0
+# The largest attenuation one component may contribute to an entry, max_p W_pk * max_b H_kb <= _X_MAX: a transmission
+# of 1e-12, which any realistic dose records as zero counts. Well inside it the bound changes nothing; it keeps a
+# component spent on zero-count entries from growing without limit. Each step bounds W and H by _X_MAX over the
+# partner's current peak, a box fixed for the step.
+_X_MAX = 27.631021115928547                              # -log(1e-12)
 # The joint solve stops after this many consecutive accepted steps below rel_tol: its tail is slow and erratic, and a
 # single quiet step is followed by larger decreases often enough to make a one-step stop irreproducible.
 _PATIENCE = 5
@@ -58,7 +63,7 @@ def _kernels(compile_mode):
                                                   block_newton_step))
 
 
-def _two_metric_direction(V, grad, flat, rows, cols, jitter_rel=1e-9, nonneg=True):
+def _two_metric_direction(V, grad, flat, rows, cols, jitter_rel=1e-9, nonneg=True, ub=None):
     """Projected-Newton direction for a batch of rows of V (B, rank) under V >= 0.
 
     `flat` (B, Q) holds the upper triangle of each row's rank x rank Hessian
@@ -74,7 +79,9 @@ def _two_metric_direction(V, grad, flat, rows, cols, jitter_rel=1e-9, nonneg=Tru
     (a gauge change of X = W H) rescales its direction and nothing else. With
     nonneg=False there is no active set, no feasibility limit and alpha = 1. The
     constants are documented where they are defined (_ARMIJO_FLOOR, _TRUST_FLOOR
-    and _ACTIVE_TOL).
+    and _ACTIVE_TOL). ub (1, rank), when given, is an upper bound per component:
+    an entry within _ACTIVE_TOL of it with an outward gradient is frozen, and alpha
+    also keeps V <= ub.
 
     Returns (d, slope, alpha, bound, projected_gnorm2): d is the descent
     direction (V decreases along +d), slope = <grad, d> per row, alpha the
@@ -94,6 +101,8 @@ def _two_metric_direction(V, grad, flat, rows, cols, jitter_rel=1e-9, nonneg=Tru
     eps_active = _ACTIVE_TOL * unit
     unit = torch.where(unit > 0, unit, torch.ones_like(unit))
     bound = ((V <= eps_active) & (grad > 0)) if nonneg else torch.zeros_like(grad, dtype=torch.bool)
+    if ub is not None:
+        bound = bound | ((V >= ub * (1 - _ACTIVE_TOL)) & (grad < 0))
     free = ~bound
     projected_gnorm2 = ((grad * free) ** 2).sum(0)
     eye = torch.eye(rank, dtype=V.dtype, device=V.device)
@@ -113,8 +122,18 @@ def _two_metric_direction(V, grad, flat, rows, cols, jitter_rel=1e-9, nonneg=Tru
     d = torch.where((slope <= 0)[:, None], torch.clamp(rhs / diag_M, min=-limit, max=limit), d)
     slope = (grad * d).sum(-1)
     ratio = torch.where(d > 0, V / d.clamp_min(torch.finfo(V.dtype).tiny), torch.full_like(d, float('inf')))
+    if ub is not None:
+        up = (ub - V).clamp_min(0) / (-d).clamp_min(torch.finfo(V.dtype).tiny)
+        ratio = torch.minimum(ratio, torch.where(d < 0, up, torch.full_like(d, float('inf'))))
     alpha = torch.clamp(ratio.amin(-1), max=1.0) if nonneg else torch.ones_like(ratio.amin(-1))
     return d, slope, alpha, bound, projected_gnorm2
+
+
+def _partner_bound(other, axis):
+    """The upper bound (1, rank) of a factor's entries: _X_MAX over each component's peak in the other factor."""
+    peak = other.amax(0) if axis == 0 else other.amax(1)
+    return torch.where(peak > 0, _X_MAX / peak.clamp_min(torch.finfo(other.dtype).tiny),
+                       torch.full_like(peak, float('inf')))[None, :]
 
 
 def block_newton_step(V, other, X, T, prep, axis, jitter_rel=1e-9, nonneg=True):
@@ -154,7 +173,9 @@ def block_newton_step(V, other, X, T, prep, axis, jitter_rel=1e-9, nonneg=True):
         grad = (other.T @ G).T
         V = V.T
 
-    d, slope, alpha, bound, projected_gnorm2 = _two_metric_direction(V, grad, flat, rows, cols, jitter_rel, nonneg)
+    ub = _partner_bound(other, 1 - axis) if nonneg else None
+    d, slope, alpha, bound, projected_gnorm2 = _two_metric_direction(V, grad, flat, rows, cols, jitter_rel, nonneg,
+                                                                     ub)
 
     # X(alpha) along the step is exactly X - alpha * B, so the line search needs no extra matmul.
     if axis == 0:
@@ -201,6 +222,11 @@ def block_newton_step(V, other, X, T, prep, axis, jitter_rel=1e-9, nonneg=True):
             keep = l_try <= l_plain + _ARMIJO_FLOOR * torch.finfo(V.dtype).eps * l_plain.abs()
             V_new = torch.where(keep[:, None], V_new - dV, V_new)
             X_new = torch.where(expand(keep), X_try, X_new)
+    if ub is not None:                                   # rounding past the bound: clamp, and X with it
+        over = V_new > ub
+        if bool(over.any()):
+            V_new = torch.minimum(V_new, ub)
+            X_new = V_new @ other if axis == 0 else other @ V_new.T
     if axis == 1:
         V_new = V_new.T.contiguous()
     return V_new, X_new, (num_backtracks, projected_gnorm2)
@@ -281,7 +307,10 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, 
     w -- so H can be estimated without the truncation bias the bound induces
     (_unconstrained_spectra). w_mask (bool, W's shape) holds coefficients outside
     the mask at their current value, zero for a selected support
-    (_support_selected_spectra).
+    (_support_selected_spectra). With W >= 0 each step also keeps the attenuation
+    bound: W and H under _X_MAX over the other factor's peak per component, a box
+    fixed for the step (entries at its top with an outward gradient are frozen,
+    and the line search clamps to it).
     """
     nnal = stable_nnal if nnal is None else nnal
     deriv = stable_nnal_derivatives if deriv is None else deriv
@@ -304,6 +333,10 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, 
         if w_mask is not None:
             fW = fW & w_mask
         fH = ~((H <= 0) & (gH > 0))
+        if nonneg_W:                                     # the attenuation bound, a box fixed for this step
+            uW, uH = _partner_bound(H, 1), _partner_bound(W, 0).T
+            fW = fW & ~((W >= uW * (1 - _ACTIVE_TOL)) & (gW < 0))
+            fH = fH & ~((H >= uH * (1 - _ACTIVE_TOL)) & (gH < 0))
         gW, gH = gW * fW, gH * fH
         gnorm2 = _joint_dot(gW, gW, gH, gH)
         if not torch.isfinite(gnorm2) or gnorm2 == 0:
@@ -374,8 +407,10 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, 
             slope = -gnorm2
         a, accepted = 1.0, False
         for _ in range(30):
-            Wn = (W + a * xW).clamp_(min=0) if nonneg_W else W + a * xW
-            Hn = (H + a * xH).clamp_(min=0)
+            Wn = torch.minimum((W + a * xW).clamp_(min=0), uW) if nonneg_W else W + a * xW
+            Hn = torch.minimum((H + a * xH).clamp_(min=0), uH) if nonneg_W else (H + a * xH).clamp_(min=0)
+            if nonneg_W:                                 # both factors moved: W under _X_MAX over the new peaks
+                Wn = torch.minimum(Wn, _partner_bound(Hn, 1))
             new_loss = nnal(Wn @ Hn, T, prep, dtype=torch.float64)
             if torch.isfinite(new_loss) and new_loss <= loss + 1e-4 * a * slope:
                 accepted = True

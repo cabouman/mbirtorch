@@ -3,7 +3,7 @@
 import torch
 
 from ._linalg import _attenuation_for_start, _nonneg_least_squares_start, nndsvda
-from ._newton import _resolve_compile, joint_newton_optimize
+from ._newton import _X_MAX, _resolve_compile, joint_newton_optimize
 
 
 def _initial_factors(T, num_materials):
@@ -26,8 +26,9 @@ def _nnal_factorization(T, num_materials, max_steps=1000, rel_tol=1e-8, compile_
     stop is insensitive to rounding: compiled and eager solves, and solves from nearby starts, end within about 5e-7
     of each other in loss (1M pixels; 3e-10 for compiled against eager at dose 3). The factors can still differ where
     the loss is flat, and the problem is not convex, so a start far from the NNDSVDa one can reach another local
-    optimum. At a few counts per bin the loss can also keep falling without limit along a component that grows on
-    zero counts (_zero_count_divergence reports it); the factors then depend on max_steps.
+    optimum. At a few counts per bin the loss keeps falling along a component that grows on zero counts; the solver
+    bounds each component's attenuation at _newton._X_MAX (a transmission of 1e-12), so such a component stops there
+    (_zero_count_divergence reports it), but it still models the zero counts rather than a material.
 
     Args:
         T (torch.Tensor): Transmission ratio, (pixels, bins): counts divided by the open-beam counts, zero counts
@@ -59,8 +60,8 @@ def _nnal_factorization(T, num_materials, max_steps=1000, rel_tol=1e-8, compile_
                                  compile_mode=compile_mode)
 
 
-# An attenuation above this on an entry with no counts is not constrained by the data (exp(-50) is 2e-22 of one count).
-_ZERO_COUNT_BOUND = 50.0
+# A zero-count entry whose attenuation reaches this share of the solver's bound (_newton._X_MAX) sits at the bound.
+_AT_BOUND = 0.999
 # A component whose attenuation lies at least this share on zero-count entries models the zero counts, not a material.
 # On the 65,536-pixel sphere phantom at rank 3 and 1 to 100 counts per bin, the component that took the zero counts
 # held 0.9994 to 1.0 of its attenuation there (7 fits of 22), and no other component more than 0.78.
@@ -68,9 +69,9 @@ _CAPTURED_SHARE = 0.99
 
 
 def _zero_count_divergence(W, H, T, chunk=2 ** 23):
-    """(largest fitted attenuation on a zero-count entry, number of zero-count entries above _ZERO_COUNT_BOUND), by
-    blocks of rows. The loss exp(-X) of a zero count has no minimum: at a few counts per bin the fit can grow a
-    component on the zero counts for as long as it runs, and these numbers show it."""
+    """(largest fitted attenuation on a zero-count entry, number of zero-count entries at the attenuation bound
+    _newton._X_MAX), by blocks of rows. The loss exp(-X) of a zero count has no minimum: at a few counts per bin the
+    fit grows a component on the zero counts until the bound stops it, and these numbers show it."""
     rows = max(1, chunk // max(T.shape[1], 1))
     x_max, n_above = 0.0, 0
     for i in range(0, T.shape[0], rows):
@@ -82,8 +83,24 @@ def _zero_count_divergence(W, H, T, chunk=2 ** 23):
             x_max = float('inf')
         else:
             x_max = max(x_max, float(torch.where(zero, X, torch.zeros_like(X)).max()))
-        n_above += int((zero & ~(X <= _ZERO_COUNT_BOUND)).sum())
+        n_above += int((zero & ~(X < _AT_BOUND * _X_MAX)).sum())
     return x_max, n_above
+
+
+def _components_at_bound(W, H, T, chunk=2 ** 23):
+    """The number of zero-count entries at which each component alone reaches the attenuation bound, W_pk H_kb >=
+    _AT_BOUND * _X_MAX, (rank,), by blocks of rows. A material's component never comes near the bound; one that
+    reaches it on the zero counts is spent on them."""
+    rows = max(1, chunk // max(T.shape[1], 1))
+    out = torch.zeros(W.shape[1], dtype=torch.int64, device=W.device)
+    for k in range(W.shape[1]):
+        near = W[:, k] * H[k].amax() >= _AT_BOUND * _X_MAX            # only these pixels can reach it
+        idx = near.nonzero().flatten()
+        for i in range(0, idx.numel(), rows):
+            p = idx[i:i + rows]
+            Xk = W[p, k:k + 1] @ H[k:k + 1]
+            out[k] += int(((T[p] <= 1e-12) & (Xk >= _AT_BOUND * _X_MAX)).sum())
+    return out
 
 
 def _zero_count_mass(W, H, T, chunk=2 ** 23):

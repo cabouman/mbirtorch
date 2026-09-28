@@ -27,12 +27,12 @@ def _h_stats_accumulate(W, H, T, prep, rows, cols, deriv, rowwise):
     return W.T @ G, (W[:, rows] * W[:, cols]).T @ Z, rowwise(X, T, prep, 0, dtype=torch.float64)
 
 
-def _h_direction(H, grad, flat, rows, cols, jitter_rel=1e-9):
+def _h_direction(H, grad, flat, rows, cols, jitter_rel=1e-9, ub=None):
     """Projected-Newton direction on H from accumulated statistics: the H axis of
-    block_newton_step on the (K, R) transpose. Returns (d, slope, alpha_max, bound)
-    with one row/entry per bin, bound the entries frozen at the bound; see
-    _newton._two_metric_direction."""
-    d, slope, alpha, bound, _ = _newton._two_metric_direction(H.T, grad.T, flat.T, rows, cols, jitter_rel)
+    block_newton_step on the (K, R) transpose, under the upper bound ub (1, R) when
+    given. Returns (d, slope, alpha_max, bound) with one row/entry per bin, bound the
+    entries frozen at a bound; see _newton._two_metric_direction."""
+    d, slope, alpha, bound, _ = _newton._two_metric_direction(H.T, grad.T, flat.T, rows, cols, jitter_rel, ub=ub)
     return d, slope, alpha, bound
 
 
@@ -124,6 +124,7 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
             flat = torch.zeros(rows.numel(), H.shape[1], dtype=torch.float64, device=H.device)
             base = torch.zeros(H.shape[1], dtype=torch.float64, device=H.device)
             scale = torch.zeros(H.shape, dtype=torch.float64, device=H.device)     # W^T T, the gradient's natural scale
+            w_peak = torch.zeros(H.shape[0], dtype=H.dtype, device=H.device)      # for the attenuation bound on H
             nxt = to_device(chunks[0])
             for i in range(len(chunks)):
                 Tc = nxt
@@ -138,6 +139,7 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
                 flat += f_c
                 base += b_c
                 scale += (W.T @ Tc).to(torch.float64)
+                w_peak = torch.maximum(w_peak, W.amax(0))
                 del Tc, W
             loss = base.sum(dtype=torch.float64)
             finite = all(bool(torch.isfinite(x).all()) for x in (loss, grad, flat))
@@ -170,7 +172,12 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
             prev_loss = loss
 
             # One exact Newton step on H from the accumulated statistics.
-            d, slope, alpha_max, bound = _h_direction(H, grad.to(H.dtype), flat.to(H.dtype), rows, cols)
+            # The attenuation bound (see _newton._X_MAX): H under _X_MAX over each component's largest W, while the
+            # chunks' W solves keep W under _X_MAX over H's peak. The free-signed W of the unconstrained spectra is
+            # not bounded.
+            ub = (torch.where(w_peak > 0, _newton._X_MAX / w_peak.clamp_min(torch.finfo(H.dtype).tiny),
+                              torch.full_like(w_peak, float('inf')))[None, :] if nonneg_W else None)
+            d, slope, alpha_max, bound = _h_direction(H, grad.to(H.dtype), flat.to(H.dtype), rows, cols, ub=ub)
             alphas = alpha_max[None, :] * (0.5 ** torch.arange(_LS_TRIALS, dtype=H.dtype, device=H.device))[:, None]
             # The epsilon-active snap, as in block_newton_step: the frozen entries (their step is zero) are set to zero,
             # but only in bins whose loss the snap does not raise, so pass B also scores every trial with the snap.
@@ -208,6 +215,8 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
             Ht = H.T - step
             reach = (d > 0) & (step >= H.T * (1.0 - _newton._SNAP_ULPS * torch.finfo(H.dtype).eps))  # see _SNAP_ULPS
             Ht = torch.where(reach, torch.zeros_like(Ht), Ht).clamp_(min=0)
+            if ub is not None:
+                Ht = torch.minimum(Ht, ub)
             if with_snap:
                 chosen = trial.gather(0, first).squeeze(0)
                 keep = ok.any(0) & (trial_snap.gather(0, first).squeeze(0) <= chosen + noise)
