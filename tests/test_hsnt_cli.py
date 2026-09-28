@@ -4,6 +4,7 @@ importer."""
 import json
 import logging
 import os
+import warnings
 from types import SimpleNamespace
 
 import h5py
@@ -13,6 +14,7 @@ import tifffile
 import torch
 
 import mbirtorch.hsnt as hsnt
+from mbirtorch.hsnt import loading
 from mbirtorch.hsnt.cli import _log_fit, main
 from mbirtorch.hsnt.loading import _smoothing_kernel, _tif_names, infer_input_type, load_dataset
 from mbirtorch.hsnt.outputs import component_check, fit_quality, mean_pixel_spectrum
@@ -350,16 +352,24 @@ def test_library_dehydrate_and_hyper_denoise(stacks, capsys):
         hsnt.hyper_denoise(A, num_materials=R, safety_factor=2, verbose=0)          # the NMF's keywords are refused
 
 
-def test_bad_values_are_refused_and_a_failed_run_leaves_no_output(stacks, tmp_path):
+def test_bad_values_are_refused_and_a_failed_run_leaves_no_output(stacks, tmp_path, capsys, monkeypatch):
+    """Bad options are refused; negative transmissions are clipped at zero with a warning, as dehydrate clips an
+    array, so even a strict run passes; a check that fails (here on negatives a loader without the clipping lets
+    through) stops a strict run, and the conversion then leaves no output."""
     for bad in (["--wave-bin", "0"], ["--dose", "-1"], ["--max-rank", "0"], ["--rank", "0"], ["--rel-tol", "x"]):
         with pytest.raises(SystemExit):
             main(["dehydrate", stacks["h5"], "-o", str(tmp_path), "-q"] + bad)      # argparse refuses them
     W, H = _truth()
     T = np.exp(-W @ H).reshape(1, ROWS, COLS, K).astype(np.float32)
-    T[:, :, :, 3] = -0.5                                                 # a transmission cannot be negative
+    T[:, :, :, 3] = -0.5
     bad = str(tmp_path / "negative.h5")
     _write_transmission(bad, T)
-    assert main(["inspect", bad, "-q"]) == 0                             # reported, not fatal
+    capsys.readouterr()
+    with warnings.catch_warnings():
+        warnings.simplefilter("always")
+        assert main(["inspect", bad, "--strict", "-q"]) == 0
+    assert f"{100 / K:.3g}% of the entries have a negative transmission; clipped at zero" in capsys.readouterr().err
+    monkeypatch.setattr(loading, "_clean_transmission", lambda T: {})
     with pytest.raises(SystemExit, match="check"):
         main(["inspect", bad, "--strict", "-q"])
     with pytest.raises(SystemExit, match="check"):                       # the check fails at the end of the conversion

@@ -97,9 +97,10 @@ Command line
 ``mbirtorch-hsnt`` (also ``python -m mbirtorch.hsnt``) runs the dehydration on an HDF5 file in the hsnt layout, on
 a directory of TIFF images, one per wavelength bin, or on a directory of such directories, one per view.  A stack of
 counts is normalized by an open-beam stack (``--open-beam``; a directory of observations is averaged), which all the
-views share; transmissions and attenuations are used as they are.  ``inspect``, ``convert``, ``dehydrate`` and
-``denoise`` run the data checks (non-finite values, negatives, zero counts, dead pixels and bins, dose) and log them;
-``--strict`` stops on a failed one.
+views share; transmissions and attenuations are used as they are.  Entries whose transmission is NaN or infinite
+become zero counts and negative transmissions (from negative counts, for example) are clipped at zero, with a
+warning, as ``dehydrate`` treats an array.  ``inspect``, ``convert``, ``dehydrate`` and ``denoise`` run the data
+checks (zero counts, dead pixels and bins, dose) and log them; ``--strict`` stops on a failed one.
 
 .. code-block:: bash
 

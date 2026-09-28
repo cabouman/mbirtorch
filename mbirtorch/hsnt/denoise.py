@@ -29,11 +29,36 @@ def _spatial_shape(lead):
     return tuple(lead) if len(lead) == 3 else (1,) + tuple(lead) if len(lead) == 2 else None
 
 
+def _clean_transmission(T):
+    """Set every non-finite entry of a float32 transmission to zero (a zero count, which the likelihood handles) and
+    clip the negative ones at zero, in place. Returns the shares of the entries changed, 'nonfinite_frac' and
+    'negative_frac', for those that occur; the loader and the functions here share it, so the files and the arrays
+    are treated alike."""
+    info = {}
+    bad = ~np.isfinite(T)
+    if bad.any():
+        info["nonfinite_frac"] = float(bad.mean())
+        T[bad] = 0.0
+    negative = T < 0
+    if negative.any():
+        info["negative_frac"] = float(negative.mean())
+        T[negative] = 0.0
+    return info
+
+
+def _warn_cleaning(info):
+    if info.get("nonfinite_frac"):
+        warnings.warn(f"{100 * info['nonfinite_frac']:.3g}% of the entries are NaN or have an infinite transmission; "
+                      "treated as zero counts")
+    if info.get("negative_frac"):
+        warnings.warn(f"{100 * info['negative_frac']:.3g}% of the entries have a negative transmission; clipped at "
+                      "zero")
+
+
 def _to_transmission(data, dataset_type):
     """(pixels, bins) float32 transmission ratio from an array with any leading axes, and the input shape.
 
-    Every non-finite value becomes zero transmission (a zero count, which the likelihood handles) and negative
-    transmissions are clipped at zero.
+    Every non-finite transmission becomes zero and negative transmissions are clipped at zero (_clean_transmission).
     """
     if dataset_type not in ("attenuation", "transmission"):
         raise ValueError("'dataset_type' must be either 'attenuation' or 'transmission'.")
@@ -47,11 +72,7 @@ def _to_transmission(data, dataset_type):
             T = np.exp(-a)
     else:
         T = a.copy()
-    bad = ~np.isfinite(T)
-    if bad.any():
-        warnings.warn(f"{100 * bad.mean():.3g}% of the data are NaN or infinite; treated as zero counts")
-        T[bad] = 0.0
-    np.maximum(T, 0.0, out=T)
+    _warn_cleaning(_clean_transmission(T))
     if not bool((T > 0).any()):
         raise ValueError("the data hold no counts: the transmission is zero everywhere")
     return np.ascontiguousarray(T, dtype=np.float32), shape
@@ -83,7 +104,8 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
 
     Args:
         data (numpy.ndarray or torch.Tensor): Hyperspectral data with any leading axes and the spectral axis of
-            length :math:`N_k` last. NaN and infinite values are treated as zero counts, with a warning.
+            length :math:`N_k` last. Entries whose transmission is NaN or infinite are treated as zero counts and
+            negative transmissions are clipped at zero, with a warning, as the command line treats a file.
         dataset_type (str, optional): 'attenuation' or 'transmission', where attenuation = -log(transmission).
             Defaults to 'attenuation'.
         num_materials (int, optional): Rank of the factorization :math:`N_m`. Defaults to None, which estimates it

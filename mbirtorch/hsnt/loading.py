@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from .denoise import _clean_transmission, _warn_cleaning
 from .io import (ALLOWED_KEYS, _create_hyperspectral, _data_selection, _decode, _find_data_group, _write_metadata,
                  _written_atomically)
 
@@ -251,7 +252,7 @@ def _checks_from_summary(sm, spatial_shape, strict=False):
     if st["nonfinite"] > 0:
         c.append(Check("error", f"{st['nonfinite']:.2%} of T is NaN or inf; the loader should have replaced these"))
     if st["negative"] > 0:
-        c.append(Check("error", f"{st['negative']:.2%} of T is negative: a transmission ratio cannot be"))
+        c.append(Check("error", f"{st['negative']:.2%} of T is negative; the loader should have clipped these"))
     above, bg = sm["above_one"], sm.get("background")
     bright, low, high = sm.get("bright", (float("nan"),) * 3)
     if bg is not None:
@@ -878,7 +879,8 @@ def _stack_to_transmission(a, input_type, open_beam=None, wave_bin=1):
     """Convert (pixels, bins) values of the given type to a transmission ratio, binning bins if asked.
 
     Returns (T, dose, info). Open-beam entries that are zero or negative take the bin's median open beam; every
-    non-finite value becomes zero transmission.
+    non-finite transmission becomes zero and negative ones are clipped at zero, as for the arrays dehydrate takes
+    (info records the shares, 'nonfinite_frac' and 'negative_frac').
     """
     info = {}
     if input_type == "counts":
@@ -897,14 +899,14 @@ def _stack_to_transmission(a, input_type, open_beam=None, wave_bin=1):
     elif input_type == "transmission":
         T, dose = _bin_spectral(a, wave_bin, "mean"), None
     elif input_type == "attenuation":
-        nonfinite = ~np.isfinite(a)
-        bad = nonfinite & (a != np.inf)                     # +inf is zero transmission, as convert stores it
-        if bad.any():
-            info["attenuation_nonfinite_frac"] = _frac(bad)
-        T, dose = _bin_spectral(np.exp(-np.where(nonfinite, np.inf, a)), wave_bin, "mean"), None
+        with np.errstate(over="ignore", invalid="ignore"):
+            T = np.exp(-a.astype(np.float32, copy=False))     # +inf, as convert stores zero transmission, gives 0
+        info.update(_clean_transmission(T))                 # before binning, so that a NaN does not spoil its group
+        return _bin_spectral(T, wave_bin, "mean"), None, info
     else:
         raise InputError(f"unknown input type {input_type!r}")
-    T = np.nan_to_num(T.astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
+    T = T.astype(np.float32)                                # a copy: the block can be the reader's array
+    info.update(_clean_transmission(T))
     return T, dose, info
 
 
@@ -912,9 +914,7 @@ def _warn_conversion(info):
     if info.get("open_beam_zero_frac"):
         warnings.warn(f"the open beam is zero or negative in {100 * info['open_beam_zero_frac']:.3g}% of pixel-bins; "
                       "those use the bin's median open beam")
-    if info.get("attenuation_nonfinite_frac"):
-        warnings.warn(f"{100 * info['attenuation_nonfinite_frac']:.3g}% of the attenuation is NaN or -inf; treated as "
-                      "zero transmission")
+    _warn_cleaning(info)
 
 
 def _check_host_memory(n_bytes, what):
@@ -1109,7 +1109,7 @@ def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=Non
         _check_host_memory(P * K * 4 + block * _bytes_per_bin(src, len(obs), full),
                            f"loading {V} x {rows} x {cols} x {K} values")
         T = np.empty((P, K), dtype=np.float32)
-        ob_zero, nonfinite, factor_parts, variances = 0.0, 0.0, [], []
+        ob_zero, nonfinite, negative, factor_parts, variances = 0.0, 0.0, 0.0, [], []
         ob_per_bin = np.zeros(K) if itype == "counts" else None
         mean_factor = np.ones(K)
         dead = _smoothing_dead_mask(obs, smoothing, src, wave_bin, block)
@@ -1121,12 +1121,14 @@ def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=Non
             if dose_b is not None:
                 ob_per_bin[j0:j1] = info_b["dose_per_bin"]
             ob_zero += info_b.get("open_beam_zero_frac", 0.0) * (j1 - j0)
-            nonfinite += info_b.get("attenuation_nonfinite_frac", 0.0) * (j1 - j0)
+            nonfinite += info_b.get("nonfinite_frac", 0.0) * (j1 - j0)
+            negative += info_b.get("negative_frac", 0.0) * (j1 - j0)
             if factors is not None:
                 mean_factor[j0:j1] = info_b["mean_factor"]
                 factor_parts.append(factors)
             del Tb
-        info = {k: v / K for k, v in (("open_beam_zero_frac", ob_zero), ("attenuation_nonfinite_frac", nonfinite)) if v}
+        info = {k: v / K for k, v in (("open_beam_zero_frac", ob_zero), ("nonfinite_frac", nonfinite),
+                                      ("negative_frac", negative)) if v}
         _warn_conversion(info)
         per_bin = _dose_per_bin(dose, ob_per_bin, src, wave_bin)
         merged = _merge_dose(dose, _open_beam_dose(ob_per_bin), src, wave_bin)
@@ -1245,7 +1247,7 @@ def convert_to_hdf5(path, output=None, open_beam=None, input_type="auto", datase
         bin_max = np.full(K, -np.inf, dtype=np.float32)
         stride = _sample_stride(P, K)
         sample = np.empty((-(-P // stride), K), dtype=np.float32)
-        ob_zero, nonfinite_in, factor_parts, variances = 0.0, 0.0, [], []
+        ob_zero, nonfinite_in, negative_in, factor_parts, variances = 0.0, 0.0, 0.0, [], []
         ob_per_bin = np.zeros(K) if itype == "counts" else None
         mean_factor = np.ones(K)
         dead = _smoothing_dead_mask(obs, smoothing, src, wave_bin, block)
@@ -1258,7 +1260,8 @@ def convert_to_hdf5(path, output=None, open_beam=None, input_type="auto", datase
                 if dose_b is not None:
                     ob_per_bin[j0:j1] = info_b["dose_per_bin"]
                 ob_zero += info_b.get("open_beam_zero_frac", 0.0) * (j1 - j0)
-                nonfinite_in += info_b.get("attenuation_nonfinite_frac", 0.0) * (j1 - j0)
+                nonfinite_in += info_b.get("nonfinite_frac", 0.0) * (j1 - j0)
+                negative_in += info_b.get("negative_frac", 0.0) * (j1 - j0)
                 if "smoothing_variances" in info_b:
                     variances.append(info_b["smoothing_variances"])
                 if factors is not None:
@@ -1295,7 +1298,8 @@ def convert_to_hdf5(path, output=None, open_beam=None, input_type="auto", datase
                 bg = dict(src.file_background, recorded=True)
             if sm_note is None and src.file_smoothing is not None:
                 sm_note = dict(src.file_smoothing, recorded=True)
-            _warn_conversion(dict(open_beam_zero_frac=ob_zero / K, attenuation_nonfinite_frac=nonfinite_in / K))
+            _warn_conversion(dict(open_beam_zero_frac=ob_zero / K, nonfinite_frac=nonfinite_in / K,
+                                  negative_frac=negative_in / K))
             if tot["inf_out"]:
                 warnings.warn(f"{tot['inf_out']} zero-transmission entries are inf in the attenuation output; the "
                               "solvers map them back to zero transmission")

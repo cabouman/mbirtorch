@@ -91,6 +91,37 @@ def test_the_calibration_reports_the_views_mean_exposure(tmp_path):
     assert "the dose is the views' mean" in text and "use the views' mean" in text and "median view" not in text
 
 
+def _cleaning_warnings(run):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        out = run()
+    return out, sorted(str(w.message) for w in caught if "% of the entries" in str(w.message))
+
+
+def test_the_loader_treats_bad_values_as_dehydrate_does(tmp_path):
+    """Negative, NaN and infinite transmissions, and NaN, -inf and overflowing attenuations, load and convert (one bin
+    per block) to the transmission dehydrate makes of the same array, with the same warnings; +inf attenuation is
+    zero transmission, with no warning. Negative counts divided by the open beam are clipped as well."""
+    rng = np.random.default_rng(3)
+    T = rng.uniform(0.05, 1.0, (1, 8, 8, 12)).astype(np.float32)
+    T[0, 0, :3, 1], T[0, 1, 0, 5], T[0, 2, 1, 7], T[0, 3, 2, 9] = -0.2, np.nan, np.inf, -np.inf
+    A = -np.log(np.abs(T))
+    A[0, 4, 4, 2], A[0, 5, 5, 3], A[0, 6, 6, 4], A[0, 7, 7, 6] = np.nan, -np.inf, np.inf, -100.0
+    for itype, data in (("transmission", T), ("attenuation", A)):
+        path, conv = str(tmp_path / f"{itype}.h5"), str(tmp_path / f"{itype}_conv.h5")
+        hsnt.export_hsnt_data_hdf5(path, data, hsnt.create_hsnt_metadata(dataset_type=itype))
+        (ref, _), expected = _cleaning_warnings(lambda: hsnt.denoise._to_transmission(data, itype))
+        assert len(expected) == (2 if itype == "transmission" else 1) and ref.min() == 0.0
+        loaded, said = _cleaning_warnings(lambda: load_dataset(path, memory_budget_mib=1e-3).T)
+        assert np.array_equal(loaded, ref) and said == expected
+        _, said = _cleaning_warnings(lambda: convert_to_hdf5(path, output=conv, as_type="transmission", block_bins=1))
+        assert np.array_equal(load_dataset(conv).T, ref) and said == expected
+    counts, ob = rng.poisson(1.0, (64, 12)).astype(np.float32) - 1.0, np.full((64, 12), 2.0, dtype=np.float32)
+    (Tc, _, info), said = _cleaning_warnings(lambda: _stack_to_transmission(counts, "counts", open_beam=ob))
+    assert np.mean(counts < 0) > 0.2 and info["negative_frac"] == pytest.approx(np.mean(counts < 0))
+    assert Tc.min() == 0.0 and not said
+
+
 def _write_stack(directory, counts):
     """A TIFF stack of (rows, cols, bins) counts, one image per bin."""
     directory.mkdir(parents=True)
