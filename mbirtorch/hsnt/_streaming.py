@@ -71,8 +71,8 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
         nonneg_W (bool, optional): False estimates H with the bound on W dropped during the polish passes (the
             unconstrained spectra), then re-solves W >= 0 for every chunk. Defaults to True.
         support_selection (dict, optional): Support selection after the passes: 'dose' (required) and optionally
-            'penalty' ('auto' or a multiple of log K; 'auto' is judged once from every chunk), 'wald_screen',
-            'free_refit' and 'max_passes' (the refit's pass budget). One pass selects each chunk's supports; the
+            'penalty' ('auto' or a multiple of log K; 'auto' is judged once from every chunk), 'wald_screen'
+            and 'max_passes' (the refit's pass budget). One pass selects each chunk's supports; the
             polish loop then runs again with W confined to them. The supports are returned in
             stats['support_chunks'], the refit's losses in stats['loss_refit'] and stats['kkt_refit'].
             Defaults to None.
@@ -234,7 +234,6 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
                               _weak_components)
         opt = dict(support_selection)
         dose = opt.pop('dose')
-        free = bool(opt.pop('free_refit', False))
         refit_passes = opt.pop('max_passes', max_passes)
         penalty = opt.pop('penalty', 'auto')
         wald_screen = opt.pop('wald_screen', 0.0)
@@ -264,17 +263,11 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
                 W_chunks[i][:, weak_cpu] = W_mle[i][:, weak_cpu]
         del W_mle
 
-        # The polish loop again, W confined to the supports (free-signed there if free_refit).
+        # The polish loop again, W confined to the supports.
         def solve_masked(Tc, W0, i):
-            return _solve_W_on_support(Tc, H, W0, S_chunks[i].to(device), nonneg=not free)
+            return _solve_W_on_support(Tc, H, W0, S_chunks[i].to(device))
 
         refit_passes = polish(solve_masked, refit_passes, '_refit')
-        if free:
-            for i in range(len(chunks)):
-                Tc = to_device(chunks[i])
-                W_c = W_chunks[i].to(device=device, dtype=H.dtype)
-                W_chunks[i] = _solve_W_on_support(Tc, H, W_c, S_chunks[i].to(device)).cpu()
-                del Tc
         _warn_collinear_rows(H)
         if stats is not None:
             stats['support_chunks'] = S_chunks

@@ -177,7 +177,7 @@ def _fit_fixed_basis(T, H, device="cpu", mode="auto", chunk_pixels=None, max_ste
     return W.numpy().astype(np.float32), np.asarray(H, dtype=np.float32), rep
 
 
-def _fit(T, rank, spectra="mle", dose=None, penalty="auto", free_refit=False, wald_screen=0.0, device="cpu",
+def _fit(T, rank, spectra="mle", dose=None, penalty="auto", wald_screen=0.0, device="cpu",
          mode="auto", chunk_pixels=None, max_steps=1000, rel_tol=1e-8, max_passes=5, warmup_pixels=16384,
          compile_mode="auto", report=None):
     """Fit T (host numpy, pixels x bins, float32) at the given rank. Returns (W, H, report): numpy factors and a dict
@@ -213,7 +213,7 @@ def _fit(T, rank, spectra="mle", dose=None, penalty="auto", free_refit=False, wa
         rep["steps"] = int(steps)
     else:
         chunks = [torch.from_numpy(T[i:i + chunk]) for i in range(0, P, chunk)]
-        support = (dict(dose=dose, penalty=penalty, free_refit=free_refit, wald_screen=wald_screen)
+        support = (dict(dose=dose, penalty=penalty, wald_screen=wald_screen)
                    if spectra == "support" else None)
         W_chunks, H, passes = _stream_factorization(chunks, rank, max_passes=max_passes, rel_tol=rel_tol,
                                                     warmup_pixels=warmup, device=device,
@@ -245,7 +245,7 @@ def _fit(T, rank, spectra="mle", dose=None, penalty="auto", free_refit=False, wa
     elif spectra == "support" and mode == "full":
         t1 = time.perf_counter()
         W, H, S, st = _support_selected_spectra(Td, W, H, dose, penalty=penalty, wald_screen=wald_screen,
-                                                free_refit=free_refit, compile_mode=compile_mode)
+                                                compile_mode=compile_mode)
         rep.update(support_steps=int(st), support_seconds=round(time.perf_counter() - t1, 2),
                    mean_support_size=S.sum(1).double().mean().item())
     elif spectra == "support":

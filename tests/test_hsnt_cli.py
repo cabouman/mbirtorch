@@ -297,7 +297,7 @@ def test_stream_mode_and_the_spectra_estimators_on_the_command_line(stacks, tmp_
     out = str(tmp_path / "stream")
     assert main(["dehydrate", stacks["sample"], "--open-beam", stacks["open_beam"], "--rank", str(R), "-o", out,
                  "--mode", "stream", "--chunk-pixels", "40", "--max-passes", "2", "--spectra", "support",
-                 "--support-penalty", "1", "--free-refit", "--no-plots", "-q"]) == 0
+                 "--support-penalty", "1", "--no-plots", "-q"]) == 0
     rep = _report(out, "sample")["result"]
     assert rep["mode"] == "stream" and rep["passes"] >= 1 and 0 < rep["mean_support_size"] <= R
     assert rep["loss_final"] >= rep["loss_mle"] * (1 - 1e-6)            # the constrained refit cannot beat the MLE

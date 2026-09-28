@@ -42,8 +42,8 @@ def _unconstrained_spectra(T, W, H, compile_mode='auto'):
 _FREE_SET_ELEMS = 2 ** 27       # elements of one (pixels, m, bins) block: 0.5 GB in float32, about eight live
 
 
-def _fit_free_sets(T, H, idx, valid, w0, steps=8, nonneg=True, rows=None):
-    """Newton fit of every pixel on its own small set of materials, batched over pixels; w >= 0 unless nonneg=False.
+def _fit_free_sets(T, H, idx, valid, w0, steps=8, rows=None):
+    """Newton fit of every pixel on its own small set of materials, batched over pixels, with w >= 0.
 
     idx (P, m) holds material indices (anything where valid is False is padding), w0 (P, m) the start. The per-pixel
     Hessian is the m x m block of the free set, so one Newton step costs a (P, m, K) gather-product whatever R is;
@@ -54,19 +54,19 @@ def _fit_free_sets(T, H, idx, valid, w0, steps=8, nonneg=True, rows=None):
     P, m = idx.shape
     chunk = max(1, _FREE_SET_ELEMS // (m * H.shape[1]))
     if P <= chunk and rows is None:
-        return _fit_free_sets_block(T, H, idx, valid, w0, steps, nonneg)
+        return _fit_free_sets_block(T, H, idx, valid, w0, steps)
     ws, fs = [], []
     for s in range(0, P, chunk):
         e = min(P, s + chunk)
         Tc = T[s:e] if rows is None else T[rows[s:e]]
-        w, f = _fit_free_sets_block(Tc, H, idx[s:e], valid[s:e], w0[s:e], steps, nonneg)
+        w, f = _fit_free_sets_block(Tc, H, idx[s:e], valid[s:e], w0[s:e], steps)
         ws.append(w)
         fs.append(f)
         del Tc
     return torch.cat(ws), torch.cat(fs)
 
 
-def _fit_free_sets_block(T, H, idx, valid, w0, steps, nonneg):
+def _fit_free_sets_block(T, H, idx, valid, w0, steps):
     m = idx.shape[1]
     dev = T.device
     prep = _nnal_prep(T)
@@ -79,7 +79,7 @@ def _fit_free_sets_block(T, H, idx, valid, w0, steps, nonneg):
         G, Z = stable_nnal_derivatives(X, T, prep)
         g = torch.einsum('pk,pmk->pm', G, Hf)
         Hs = torch.einsum('pk,pmk,pnk->pmn', Z, Hf, Hf) + 1e-6 * eye
-        free = valid & ~((w <= 0) & (g > 0)) if nonneg else valid
+        free = valid & ~((w <= 0) & (g > 0))
         Hs = torch.where(free[:, :, None] & free[:, None, :], Hs, eye.expand_as(Hs))
         rhs = torch.where(free, g, torch.zeros_like(g))
         # pinv: identical or zero spectra make Hs singular
@@ -94,7 +94,7 @@ def _fit_free_sets_block(T, H, idx, valid, w0, steps, nonneg):
         for _ in range(8):
             trial = torch.where(done, torch.zeros_like(alpha), alpha)
             wt = (w - trial[:, None] * d)
-            wt = (wt.clamp(min=0) if nonneg else wt) * valid
+            wt = wt.clamp(min=0) * valid
             decrease = (g * (w - wt)).sum(1).clamp(min=0)              # first-order decrease along the projected step
             ft = _nnal_rowwise(torch.einsum('pm,pmk->pk', wt, Hf), T, prep, 1, dtype=torch.float64)
             ok = (ft <= f - 1e-4 * decrease + _ARMIJO_FLOOR * torch.finfo(T.dtype).eps * f.abs()) | (trial == 0)
@@ -104,7 +104,7 @@ def _fit_free_sets_block(T, H, idx, valid, w0, steps, nonneg):
                 break
             alpha = alpha * 0.5
         w_new = (w - accepted[:, None] * d)
-        w_new = (w_new.clamp(min=0) if nonneg else w_new) * valid
+        w_new = w_new.clamp(min=0) * valid
         X = torch.einsum('pm,pmk->pk', w_new, Hf)
         f_new = _nnal_rowwise(X, T, prep, 1, dtype=torch.float64)
         moved = (f - f_new).abs() > 1e-9 * f.abs()
@@ -144,10 +144,10 @@ def _support_sets(support, W):
     return idx, valid, W.gather(1, idx)
 
 
-def _solve_W_on_support(T, H, W, support, steps=30, nonneg=True):
-    """W given H, restricted to each pixel's support: exact per-pixel Newton, W >= 0 unless nonneg=False."""
-    idx, valid, w0 = _support_sets(support, W.clamp(min=0) if nonneg else W)
-    w, _ = _fit_free_sets(T, H, idx, valid, w0, steps=steps, nonneg=nonneg)
+def _solve_W_on_support(T, H, W, support, steps=30):
+    """W >= 0 given H, restricted to each pixel's support: exact per-pixel Newton."""
+    idx, valid, w0 = _support_sets(support, W.clamp(min=0))
+    w, _ = _fit_free_sets(T, H, idx, valid, w0, steps=steps)
     return _scatter_support(idx, valid, w, W.shape[1])[1]
 
 
@@ -321,16 +321,14 @@ def _warn_collinear_rows(H, cosine=0.999):
                       "are not separately identified; consider a smaller rank")
 
 
-def _support_selected_spectra(T, W, H, dose, penalty='auto', wald_screen=0.0, free_refit=False, compile_mode='auto'):
+def _support_selected_spectra(T, W, H, dose, penalty='auto', wald_screen=0.0, compile_mode='auto'):
     """Choose each pixel's material subset by penalized likelihood, then refit with the other coefficients held at 0.
 
     The truncation bias of the maximum-likelihood spectra comes from coefficients whose true value is zero. Once those
     are identified and held at zero, the remaining ones sit in the interior and W >= 0, with the variance reduction it
     brings, is kept. Each pixel takes the subset minimizing dose * loss + charge * (subset size), the empty subset
     included (_select_supports), and W on the supports and H are then refit jointly. One selection round is used:
-    re-selecting from refit spectra compounds the selection errors. With free_refit the selected coefficients are free
-    during the refit and W >= 0 is re-solved on the supports afterwards, so a falsely admitted coefficient adds
-    zero-mean noise rather than bias. A component selected in almost no pixel reverts to the maximum-likelihood
+    re-selecting from refit spectra compounds the selection errors. A component selected in almost no pixel reverts to the maximum-likelihood
     treatment (_guard_components). The selection works in the basis W and H are in: where the components are strongly
     mixed combinations of the materials, a pixel of one material needs several of them, and the supports mostly
     separate the sample from the background.
@@ -344,8 +342,6 @@ def _support_selected_spectra(T, W, H, dose, penalty='auto', wald_screen=0.0, fr
     support, W0, _ = _select_supports(T, W, H, dose, penalty=penalty, wald_screen=wald_screen)
     _guard_components(support, W, W0)
     Wn, Hn, steps, _ = _joint_newton_pcg(T, W0, H, max_steps=_REFIT_MAX_STEPS, cg_max=_CG_MAX, rel_tol=_REFIT_REL_TOL,
-                                         prep=prep, nnal=nnal_fn, deriv=deriv, w_mask=support, nonneg_W=not free_refit)
-    if free_refit:
-        Wn = _solve_W_on_support(T, Hn, Wn, support)
+                                         prep=prep, nnal=nnal_fn, deriv=deriv, w_mask=support)
     _warn_collinear_rows(Hn)
     return Wn, Hn, support, steps

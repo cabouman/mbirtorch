@@ -346,19 +346,17 @@ def test_a_rank_estimated_without_image_axes_at_low_counts_warns(dev):
 
 
 def test_spectra_estimators(dev):
-    """The unconstrained estimate keeps W >= 0. Support selection holds the coefficients off its supports at zero;
-    the free refit keeps the same supports and fits the data alike, and with no penalty about as well as the
-    unconstrained estimate. A component selected almost nowhere reverts to the maximum-likelihood treatment."""
+    """The unconstrained estimate keeps W >= 0. Support selection holds the coefficients off its supports at zero,
+    and with no penalty keeps at least as many. A component selected almost nowhere reverts to the maximum-likelihood
+    treatment."""
     T, _, _ = _problem(dev)
     W, H, _ = _mle(T)
     Wu, Hu, _ = _unconstrained_spectra(T, W, H)
     Ws, Hs, support, _ = _support_selected_spectra(T, W, H, dose=10.0)
-    Wf, Hf, support_f, _ = _support_selected_spectra(T, W, H, dose=10.0, free_refit=True)
-    assert Wu.min() >= 0 and Hu.shape == H.shape and Ws.min() >= 0 and Wf.min() >= 0 and Hf.min() >= 0
-    assert bool((Ws[~support] == 0).all()) and torch.equal(support_f, support) and bool((Wf[~support] == 0).all())
-    assert abs(_loss(Wf, Hf, T) - _loss(Ws, Hs, T)) <= 1e-3 * _loss(Ws, Hs, T)
-    Wz, Hz, support_z, _ = _support_selected_spectra(T, W, H, dose=10.0, penalty=0.0, free_refit=True)
-    assert support_z.sum() >= support.sum() and abs(_loss(Wz, Hz, T) - _loss(Wu, Hu, T)) <= 2e-3 * _loss(Wu, Hu, T)
+    assert Wu.min() >= 0 and Hu.shape == H.shape and Ws.min() >= 0 and Hs.min() >= 0
+    assert bool((Ws[~support] == 0).all())
+    Wz, Hz, support_z, _ = _support_selected_spectra(T, W, H, dose=10.0, penalty=0.0)
+    assert support_z.sum() >= support.sum() and Wz.min() >= 0 and bool((Wz[~support_z] == 0).all())
     P = 5000
     guard = torch.rand(P, 3, device=dev) > 0.5
     guard[:, 1] = False
@@ -466,7 +464,7 @@ def test_branch_and_bound_short_of_the_full_set(dev, monkeypatch):
 
 def test_pixel_fits_meet_the_kkt_conditions(dev):
     """From a uniform start, where the coupled Newton step pushes entries at zero outward, every pixel's w >= 0 fit
-    reaches its KKT point; the free-sign fit reaches a zero gradient with some coefficients negative."""
+    reaches its KKT point."""
     T, _, Ht = _problem(dev, P=512)
     H = Ht.float()
     idx = torch.arange(3, device=dev).expand(512, 3).contiguous()
@@ -474,15 +472,12 @@ def test_pixel_fits_meet_the_kkt_conditions(dev):
     w, _ = _fit_free_sets(T, H, idx, valid, torch.full((512, 3), 0.5, device=dev), steps=8)
     g = stable_nnal_derivatives(w @ H, T, _nnal_prep(T))[0] @ H.T / T.shape[1]
     assert w.min() >= 0 and torch.where(w > 0, g.abs(), (-g).clamp(min=0)).max() < 1e-6
-    w, _ = _fit_free_sets(T, H, idx, valid, torch.zeros(512, 3, device=dev), steps=40, nonneg=False)
-    g = stable_nnal_derivatives(w @ H, T, _nnal_prep(T))[0] @ H.T / T.shape[1]
-    assert g.abs().max() < 1e-3 and bool((w < 0).any())            # the bound is off
 
 
 def test_streaming_matches_the_full_solve(dev):
-    """Streamed by chunks of pixels, the MLE, the unconstrained estimate and support selection (with either refit)
-    land within 1% of the loss of the solve held whole, and keep W >= 0. The MLE starts from pixels drawn across all
-    the chunks, so a leading chunk free of the sample does not keep it from the full solve's loss."""
+    """Streamed by chunks of pixels, the MLE, the unconstrained estimate and support selection land within 1% of the
+    loss of the solve held whole, and keep W >= 0. The MLE starts from pixels drawn across all the chunks, so a
+    leading chunk free of the sample does not keep it from the full solve's loss."""
     T, _, _ = _problem(dev, P=4096)
     tiles = [T[i:i + 1024].cpu() for i in range(0, 4096, 1024)]
     Wm, Hm, _ = _mle(T)
@@ -500,13 +495,12 @@ def test_streaming_matches_the_full_solve(dev):
     W = torch.cat([w.to(dev) for w in W_chunks])
     Wu, Hu, _ = _unconstrained_spectra(T, Wm, Hm)
     assert W.min() >= 0 and abs(_loss(W, H, T) - _loss(Wu, Hu, T)) <= 1e-2 * _loss(Wu, Hu, T)
-    for free in (False, True):
-        stats = {}
-        W_chunks, H, _ = _stream_factorization(tiles, 3, max_passes=3, rel_tol=1e-8, warmup_pixels=1024, device=dev,
-                                               stats=stats, support_selection=dict(dose=10.0, free_refit=free))
-        W = torch.cat([w.to(dev) for w in W_chunks])
-        S = torch.cat(stats["support_chunks"]).to(dev)
-        assert S.shape == W.shape and bool((W[~S] == 0).all()) and W.min() >= 0
-        Ws, Hs, Sm, _ = _support_selected_spectra(T, Wm, Hm, dose=10.0, free_refit=free)
-        assert abs(S.sum(1).double().mean().item() - Sm.sum(1).double().mean().item()) < 0.1
-        assert _loss(W, H, T) <= 1.01 * _loss(Ws, Hs, T)
+    stats = {}
+    W_chunks, H, _ = _stream_factorization(tiles, 3, max_passes=3, rel_tol=1e-8, warmup_pixels=1024, device=dev,
+                                           stats=stats, support_selection=dict(dose=10.0))
+    W = torch.cat([w.to(dev) for w in W_chunks])
+    S = torch.cat(stats["support_chunks"]).to(dev)
+    assert S.shape == W.shape and bool((W[~S] == 0).all()) and W.min() >= 0
+    Ws, Hs, Sm, _ = _support_selected_spectra(T, Wm, Hm, dose=10.0)
+    assert abs(S.sum(1).double().mean().item() - Sm.sum(1).double().mean().item()) < 0.1
+    assert _loss(W, H, T) <= 1.01 * _loss(Ws, Hs, T)

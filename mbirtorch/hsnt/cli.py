@@ -216,7 +216,7 @@ def solve(ds, args, device):
     if args.rank_value > min(ds.pixels, ds.bins):
         raise InputError(f"--rank {args.rank_value} exceeds min(pixels, bins) = {min(ds.pixels, ds.bins)}")
     W, H, rep = _fit(ds.T, args.rank_value, spectra=args.spectra, dose=ds.dose, penalty=args.support_penalty,
-                     free_refit=args.free_refit, wald_screen=args.wald_screen, device=device, mode=args.mode,
+                     wald_screen=args.wald_screen, device=device, mode=args.mode,
                      chunk_pixels=args.chunk_pixels, max_steps=args.max_steps, rel_tol=args.rel_tol,
                      max_passes=args.max_passes, compile_mode=args.compile, report=args.fit_report)
     rep.update(rank=args.rank_value, rank_note=args.rank_note, rank_search=args.rank_detail)
@@ -255,7 +255,6 @@ def _run_attrs(ds, rep, args, **extra):
     """Provenance written as HDF5 attributes: where the data came from and how the solve was set up."""
     return dict(source=ds.source, input_type=ds.dataset_type, mode=rep["mode"],
                 spectra="given basis" if args.basis else args.spectra, support_penalty=str(args.support_penalty),
-                free_refit=bool(args.free_refit),
                 downsample=args.downsample, wave_bin=args.wave_bin, dose=-1.0 if ds.dose is None else float(ds.dose),
                 mbirtorch_hsnt_cli="1", **({"basis": os.path.abspath(args.basis)} if args.basis else {}),
                 **({"background": json.dumps(ds.info["background"])} if "background" in ds.info else {}),
@@ -582,9 +581,6 @@ class _Options:
                       "per bin in the median pixel, rising to 2 at 100. On a test phantom 2 did as well or slightly "
                       "better at 3 to 10 counts; below 3 it was up to 8.6 dB worse on one spectrum and up to 3.4 dB "
                       "better on another")
-        self.add(g, "--free-refit", action="store_true", advanced=True,
-                 help="drop the bound on the selected coefficients during the refit, then re-solve W >= 0 on the "
-                      "supports")
         self.add(g, "--wald-screen", type=_nonneg_float, default=0.0, metavar="F", advanced=True,
                  help="skip single-component fits below F x penalty of Wald statistic in the full fit (0 = off; "
                       "trades rare-component recall for time)")
