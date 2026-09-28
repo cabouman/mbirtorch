@@ -70,9 +70,10 @@ if compare_uncalibrated:
 # ----------------------------------------------------------------------------------------------
 if show_viewer:
     if compare_uncalibrated:
-        mbirtorch.slice_viewer(recon_meta, recon,
+        mbirtorch.slice_viewer(recon_meta, recon, vmin=0.0, vmax=0.1,
                                slice_label=[f'uncalibrated (metadata offset {meta_offset:+.3f} mm)',
                                             f'calibrated (offset {ct_model.get_params("det_channel_offset"):+.3f} mm)'],
                                title='VoluMax reconstruction: uncalibrated vs calibrated channel offset')
     else:
-        mbirtorch.slice_viewer(recon, data_dicts=[recon_dict], title='VoluMax cone-beam MBIR reconstruction')
+        mbirtorch.slice_viewer(recon, data_dicts=[recon_dict], vmin=0.0, vmax=0.1,
+                               title='VoluMax cone-beam MBIR reconstruction')

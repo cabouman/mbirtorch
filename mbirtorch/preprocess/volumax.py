@@ -236,8 +236,8 @@ def convert_volumax_to_mbirtorch_params(params, geometry, downsample_factor=(1, 
 
     The crop is applied first, in raw detector pixels.  The detector rotation is applied to the sinogram about the
     detector center, so the offsets are rotated into that frame (:func:`rotate_offsets_for_det_rotation`).  The channel
-    offset is the metadata value and the view angles are ``objectAngle`` as recorded; :func:`calibrate_volumax_geometry`
-    later refines the channel offset and chooses the sign of the angles from the sinogram.
+    offset is the metadata value, which :func:`calibrate_volumax_geometry` later refines from the sinogram.  The view
+    angles are ``-objectAngle``: the VoluMax ``objectAngle`` turns opposite to the view angles of ``ConeBeamModel``.
 
     Args:
         params (dict): Geometry parameters from :func:`load_scans_and_params`.
@@ -280,7 +280,9 @@ def convert_volumax_to_mbirtorch_params(params, geometry, downsample_factor=(1, 
     delta_det_row *= downsample_factor[0]
     delta_det_channel *= downsample_factor[1]
 
-    angles = np.ascontiguousarray(np.unwrap(np.deg2rad(params['angles_deg'])), dtype=np.float32)
+    # The VoluMax objectAngle turns opposite to the ConeBeamModel view angle, so the angles are negated.  This is a
+    # property of the scanner; the opposite-view consistency of two scans (HIP_Can and Hexagonal) confirmed it.
+    angles = np.ascontiguousarray(-np.unwrap(np.deg2rad(params['angles_deg'])), dtype=np.float32)
     sid, sdd = geometry['source_iso_dist'], geometry['source_detector_dist']
     cone_beam_params = dict(sinogram_shape=(len(angles), int(num_det_rows), int(num_det_channels)), angles=angles,
                             source_detector_dist=float(sdd), source_iso_dist=float(sid),
@@ -627,130 +629,53 @@ def _estimate_channel_offset(model, sino):
     return offset, offset_warnings
 
 
-def _check_rotation_direction(model, sino):
-    """
-    Run ``check_rotation_direction`` on a reduced problem that it accepts.
-
-    Its view stride and detector bin must divide the view and detector counts, so trailing views, bottom rows, and
-    right channels are dropped first, and the offsets are moved to the new detector center as
-    :func:`mbirtorch.preprocess.apply_detector_crop` does.  Its warning about an undecided result is suppressed,
-    because the caller weighs the result together with the conjugate-view score.
-    """
-    num_views, num_rows, num_channels = sino.shape
-    # The reduced problem keeps every 4th view and bins the detector to at most 512 channels with at least 0.6 reduced
-    # views per reduced channel; the cost of the check grows with the cube of the reduced width.  One bin factor
-    # applies to both rows and channels, so it cannot exceed the number of rows.
-    view_stride = 4
-    reduced_channels = min(512, (num_views // view_stride) / 0.6)
-    bin_factor = min(max(2, int(np.ceil(num_channels / reduced_channels))), num_rows)
-    v = num_views - num_views % view_stride
-    r, c = num_rows - num_rows % bin_factor, num_channels - num_channels % bin_factor
-    if (v, r, c) != (num_views, num_rows, num_channels):
-        required, _, _ = model.get_all_params()
-        cut = mbirtorch.copy_ct_model(model, new_angles=np.asarray(required['angles'])[:v],
-                                      new_helical_z_shifts=np.asarray(required['helical_z_shifts'])[:v],
-                                      new_num_det_rows=r, new_num_det_cols=c, no_warning=True)
-        delta_row, delta_channel, row_offset, channel_offset = model.get_params(
-            ['delta_det_row', 'delta_det_channel', 'det_row_offset', 'det_channel_offset'])
-        cut.set_params(no_warning=True, det_row_offset=row_offset + (num_rows - r) / 2 * delta_row,
-                       det_channel_offset=channel_offset + (num_channels - c) / 2 * delta_channel)
-        model, sino = cut, sino[:v, :r, :c]
-    with warnings.catch_warnings():
-        warnings.filterwarnings('ignore', message='check_rotation_direction: the worse direction')
-        return gc.check_rotation_direction(model, sino, view_stride=view_stride, bin_factor=bin_factor)
-
-
-def _margin(scores):
-    """Return the ratio of the worse (larger) score to the better (smaller) one."""
-    return float(np.max(scores) / max(np.min(scores), 1e-30))
-
-
 def calibrate_volumax_geometry(model, sino, det_rotation=0.0, verbose=1):
     """
-    Measure the channel offset and the rotation direction from the sinogram and set them on the model.
+    Measure the channel offset from the sinogram and set it on the model.
 
-    The calibration uses the estimators in ``mbirtorch.preprocess.geometry_calibration`` in four steps:
+    The calibration uses the estimators in ``mbirtorch.preprocess.geometry_calibration`` in three steps:
 
     1. :func:`~mbirtorch.preprocess.geometry_calibration.estimate_det_channel_offset` refines the metadata channel
-       offset by comparing each view with its opposite, once with the view angles as recorded and once with them
-       negated.
-    2. The rotation direction is the one whose offset estimate has the lower conjugate-view score.  When the ratio of
-       the two scores is below 1.5, :func:`~mbirtorch.preprocess.geometry_calibration.check_rotation_direction`
-       gives a second score: a score with a ratio of 1.5 or more decides, two weaker scores that agree are used, and
-       otherwise the angles are kept as recorded.  A warning is issued in each of these cases.
-    3. The direction and the offset are applied with
-       :func:`~mbirtorch.preprocess.geometry_calibration.apply_calibration`.  The offsets were rotated into the frame
-       of the rotation-corrected sinogram using the metadata channel offset, so ``det_row_offset`` is updated for the
-       change in the channel offset.
-    4. The detector rotation from the metadata is kept.
+       offset by comparing each view with its opposite, and the result is applied with
+       :func:`~mbirtorch.preprocess.geometry_calibration.apply_calibration`.
+    2. The offsets were rotated into the frame of the rotation-corrected sinogram using the metadata channel offset,
+       so ``det_row_offset`` is updated for the change in the channel offset.
+    3. The detector rotation from the metadata is kept.
        :func:`~mbirtorch.preprocess.geometry_calibration.estimate_det_rotation` measures any rotation left in the
        sinogram, and a warning is issued when the data clearly show one that moves the edge channels by a pixel or
        more.
 
+    The rotation direction is not estimated; it is fixed by :func:`convert_volumax_to_mbirtorch_params`.
+
     Args:
-        model (ConeBeamModel): Model from ``mbirtorch.preprocess.finalize_model``.  Its channel offset, row offset,
-            ``recon_slice_offset``, and view angles are updated in place.
+        model (ConeBeamModel): Model from ``mbirtorch.preprocess.finalize_model``.  Its channel offset, row offset, and
+            ``recon_slice_offset`` are updated in place.
         sino (numpy.ndarray): The sinogram the model was built for. Not modified.
         det_rotation (float, optional): Detector rotation in radians that was already removed from ``sino``.
             Defaults to ``0.0``.
         verbose (int, optional): Verbosity level. Defaults to ``1``.
 
     Returns:
-        dict: The ``CalibrationResult`` of each step: ``det_channel_offset``, ``det_channel_offset_other_direction``,
-        ``rotation_direction`` (value +1 or -1, the factor applied to ``objectAngle``), ``rotation_direction_check``
-        (None unless step 2 needed it), and ``det_rotation_residual``.
+        dict: The ``CalibrationResult`` of the channel offset (``det_channel_offset``) and of the residual detector
+        rotation (``det_rotation_residual``).
     """
     if verbose > 0:
-        print('\n########## Calibrating the channel offset and rotation direction from the sinogram')
+        print('\n########## Calibrating the channel offset from the sinogram')
     delta = float(model.get_params('delta_det_channel'))
     start, row_start = (float(x) for x in model.get_params(['det_channel_offset', 'det_row_offset']))
 
-    # Step 1: the channel offset for each rotation direction.
-    required, _, _ = model.get_all_params()
-    negated = mbirtorch.copy_ct_model(model, new_angles=-np.asarray(required['angles']),
-                                      new_helical_z_shifts=np.asarray(required['helical_z_shifts']), no_warning=True)
-    (offset_pos, warnings_pos), (offset_neg, warnings_neg) = (_estimate_channel_offset(model, sino),
-                                                              _estimate_channel_offset(negated, sino))
-    offsets, offset_warnings = {1.0: offset_pos, -1.0: offset_neg}, {1.0: warnings_pos, -1.0: warnings_neg}
-
-    # Step 2: the rotation direction.  A score decides only when the worse direction scores at least 1.5 times the
-    # better one, the margin that check_rotation_direction itself uses.
-    min_margin = 1.5
-    conjugate_scores = np.array([offsets[1.0].score, offsets[-1.0].score])
-    evidence = {'conjugate views': (1.0 if conjugate_scores[0] <= conjugate_scores[1] else -1.0,
-                                    _margin(conjugate_scores))}
-    direction = None
-    angle_sign, decided_by = evidence['conjugate views'][0], 'conjugate views'
-    if evidence['conjugate views'][1] < min_margin:
-        direction = _check_rotation_direction(model, sino)
-        evidence['reconstruction residual'] = (float(direction.value), _margin(direction.scores))
-        decided = {k: e for k, e in evidence.items() if e[1] >= min_margin}
-        signs = {e[0] for e in evidence.values()}
-        if decided:
-            decided_by = max(decided, key=lambda k: decided[k][1])
-            angle_sign = decided[decided_by][0]
-        elif len(signs) == 1:
-            angle_sign, decided_by = signs.pop(), 'both scores (weak)'
-        else:
-            angle_sign, decided_by = 1.0, 'none; kept as recorded'
-        warnings.warn('calibrate_volumax_geometry: the rotation direction is only weakly determined by the data ('
-                      + ', '.join(f'{k} {s:+.0f} at {m:.2f}x' for k, (s, m) in evidence.items())
-                      + f'); using {angle_sign:+.0f} ({decided_by}).  This can happen for a nearly rotationally '
-                      'symmetric object, a narrow fan angle, or noisy data; check the reconstruction.')
-
-    # Step 3: apply the direction and the offset, and update the row offset.
-    rotation_direction = gc.CalibrationResult(
-        parameter='rotation_direction', value=float(angle_sign), score=float(offsets[angle_sign].score),
-        candidates=np.array([1.0, -1.0]), scores=conjugate_scores, method=decided_by, reduction=dict(evidence=evidence))
-    offset = offsets[angle_sign]
-    for w in offset_warnings[angle_sign]:
+    # Step 1: the channel offset, which _estimate_channel_offset applies to the model.
+    offset, offset_warnings = _estimate_channel_offset(model, sino)
+    for w in offset_warnings:
         warnings.warn(w.message, w.category)
-    gc.apply_calibration(model, sino, [rotation_direction, offset])
+
+    # Step 2: under the detector rotation, the channel correction moves the row offset by -tan(det_rotation) times
+    # as much.
     row = float(row_start - np.tan(det_rotation) * (offset.value - start))
     if row != row_start:
         gc.apply_calibration(model, sino, offset._replace(parameter='det_row_offset', value=row))
 
-    # Step 4: check for a detector rotation left in the sinogram.  After the metadata rotation is removed only a small
+    # Step 3: check for a detector rotation left in the sinogram.  After the metadata rotation is removed only a small
     # residual is expected, so +/- 1 degree is searched.
     bound = np.deg2rad(1.0)
     with warnings.catch_warnings():
@@ -770,8 +695,6 @@ def calibrate_volumax_geometry(model, sino, det_rotation=0.0, verbose=1):
         print(f'   det_channel_offset: metadata {start:+.4f} mm -> data {offset.value:+.4f} mm '
               f'({(offset.value - start) / delta:+.2f} channels), {offset.reduction["pairs_kept"]} of '
               f'{offset.reduction["num_pairs"]} view pairs kept; det_row_offset {row_start:+.4f} -> {row:+.4f} mm')
-        print(f'   rotation direction {angle_sign:+.0f} (angles = {angle_sign:+.0f} * objectAngle), decided by '
-              f'{decided_by}; ' + ', '.join(f'{k} {s:+.0f} at {m:.2f}x' for k, (s, m) in evidence.items()))
         print(f'   det_rotation {det_rotation:+.3e} rad from the metadata kept; residual rotation '
               f'{np.rad2deg(residual.value):+.4f} deg ({edge_px:.2f} px at the edge channels, score {gain:.3f}x better '
               f'than no rotation)' + (f'; search notes: {"; ".join(notes)}' if notes else ''))
@@ -780,6 +703,4 @@ def calibrate_volumax_geometry(model, sino, det_rotation=0.0, verbose=1):
                       f'remains after the metadata rotation was removed ({edge_px:.1f} px at the edge channels, score '
                       f'{gain:.2f}x better than no rotation).  The metadata rotation assumes that the rotation axis is '
                       'the vertical axis of the scanner; check the slices far from the central plane.')
-    return dict(det_channel_offset=offset, det_channel_offset_other_direction=offsets[-angle_sign],
-                rotation_direction=rotation_direction, rotation_direction_check=direction,
-                det_rotation_residual=residual)
+    return dict(det_channel_offset=offset, det_rotation_residual=residual)
