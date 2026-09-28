@@ -28,6 +28,11 @@ log = logging.getLogger(__name__)
 
 INPUT_TYPES = ("counts", "transmission", "attenuation")
 
+# An open-beam value below this fraction of its bin's median holds no count: it is the floating-point residue a dead
+# pixel keeps after processing (+-1e-12 in the ORNL Fe cube), which as a divisor would give transmissions of 1e14.
+# A live pixel's mean over n observations is at least 1/n count when it is positive.
+_OPEN_BEAM_FLOOR = 1e-6
+
 # Instrument-specific presets for background_boxes. Boxes are (y0, y1, x0, x1) in full-resolution detector pixels and
 # must be free of the sample; tiles (rows, cols) split the detector into regions calibrated separately.
 _BACKGROUND_PRESETS = {
@@ -667,12 +672,12 @@ def _open_beam_total(obs, bins, block):
 
 def _dead_mask(total):
     """The dead detector pixels of an open beam, (views, rows, cols, 1), from its summed count per pixel over the
-    selected bins (see _open_beam_total): those with none. A live pixel of c expected counts has none with probability
+    selected bins (see _open_beam_total): those with none, or less than _OPEN_BEAM_FLOOR of the median. A live pixel of c expected counts has none with probability
     e^-c, so they are told apart only when the median pixel's count is at least 20 (a probability below 2.1e-9); None
     when no pixel is dead or the counts are too few to tell."""
     if total is None:
         return None
-    dead = total <= 0
+    dead = total <= _OPEN_BEAM_FLOOR * np.median(total)
     if not dead.any():
         return None
     if np.median(total) < 20:
@@ -878,17 +883,17 @@ def _bin_spectral(a, n, how):
 def _stack_to_transmission(a, input_type, open_beam=None, wave_bin=1):
     """Convert (pixels, bins) values of the given type to a transmission ratio, binning bins if asked.
 
-    Returns (T, dose, info). Open-beam entries that are zero or negative take the bin's median open beam; every
-    non-finite transmission becomes zero and negative ones are clipped at zero, as for the arrays dehydrate takes
-    (info records the shares, 'nonfinite_frac' and 'negative_frac').
+    Returns (T, dose, info). Open-beam entries that hold no count (_no_open_beam_count) take the bin's median open
+    beam; every non-finite transmission becomes zero and negative ones are clipped at zero, as for the arrays dehydrate
+    takes (info records the shares, 'nonfinite_frac' and 'negative_frac').
     """
     info = {}
     if input_type == "counts":
         counts, ob = _bin_spectral(a, wave_bin, "sum"), _bin_spectral(open_beam, wave_bin, "sum")
-        bad = ob <= 0
+        stride = max(1, ob.shape[0] // 8192)                                       # medians on a pixel subsample
+        bad = _no_open_beam_count(ob, stride)
         if bad.any():
             info["open_beam_zero_frac"] = _frac(bad)
-            stride = max(1, ob.shape[0] // 8192)                                   # medians on a pixel subsample
             sub = np.where(bad[::stride], np.nan, ob[::stride])
             med = np.nanmedian(sub, axis=0)
             med = np.nan_to_num(med, nan=float(np.nanmedian(sub)) if np.isfinite(sub).any() else 1.0)
@@ -910,10 +915,19 @@ def _stack_to_transmission(a, input_type, open_beam=None, wave_bin=1):
     return T, dose, info
 
 
+def _no_open_beam_count(ob, stride):
+    """The entries of an open beam (pixels, bins) that hold no count: those at most zero, and those below
+    _OPEN_BEAM_FLOOR of their bin's median positive value over the pixels ob[::stride]."""
+    bad = ob <= 0
+    med = np.nanmedian(np.where(bad[::stride], np.nan, ob[::stride]), axis=0)
+    return bad | (ob < _OPEN_BEAM_FLOOR * np.nan_to_num(med, nan=0.0)[None, :])
+
+
 def _warn_conversion(info):
     if info.get("open_beam_zero_frac"):
-        warnings.warn(f"the open beam is zero or negative in {100 * info['open_beam_zero_frac']:.3g}% of pixel-bins; "
-                      "those use the bin's median open beam")
+        warnings.warn(f"the open beam holds no count (zero, negative, or below {_OPEN_BEAM_FLOOR:g} of the bin's "
+                      f"median) in {100 * info['open_beam_zero_frac']:.3g}% of pixel-bins; those use the bin's median "
+                      "open beam")
     _warn_cleaning(info)
 
 

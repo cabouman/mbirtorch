@@ -91,6 +91,22 @@ def test_the_calibration_reports_the_views_mean_exposure(tmp_path):
     assert "the dose is the views' mean" in text and "use the views' mean" in text and "median view" not in text
 
 
+def test_an_open_beam_of_floating_point_residue_holds_no_count():
+    """A dead pixel whose processing left 1e-12 in its open beam: a count there is divided by the bin's median open
+    beam, as for an open beam of zero, not by the residue (a transmission of 2e12), and the smoothing's dead mask
+    counts the pixel as dead."""
+    rng = np.random.default_rng(4)
+    ob = rng.poisson(30.0, (64, 8)).astype(np.float32)
+    counts = rng.poisson(15.0, (64, 8)).astype(np.float32)
+    ob[5], counts[5] = 1e-12, 2.0
+    T, _, info = _stack_to_transmission(counts, "counts", open_beam=ob)
+    assert T[5].max() < 0.1 and T.max() < 2 and info["open_beam_zero_frac"] == pytest.approx(1 / 64)
+    total = rng.poisson(1e4, (1, 8, 8)).astype(np.float64)
+    total[0, 2, 3] = 8 * 13 * 1e-12
+    dead = _dead_mask(total)
+    assert dead is not None and dead.sum() == 1 and dead[0, 2, 3, 0]
+
+
 def _cleaning_warnings(run):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
