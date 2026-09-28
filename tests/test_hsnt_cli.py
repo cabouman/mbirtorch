@@ -354,8 +354,7 @@ def test_library_dehydrate_and_hyper_denoise(stacks, capsys):
 
 def test_bad_values_are_refused_and_a_failed_run_leaves_no_output(stacks, tmp_path, capsys, monkeypatch):
     """Bad options are refused; negative transmissions are clipped at zero with a warning, as dehydrate clips an
-    array, so even a strict run passes; a check that fails (here on negatives a loader without the clipping lets
-    through) stops a strict run, and the conversion then leaves no output."""
+    array; a conversion that fails at its end (here in the data checks) leaves no output."""
     for bad in (["--wave-bin", "0"], ["--dose", "-1"], ["--max-rank", "0"], ["--rank", "0"], ["--rel-tol", "x"]):
         with pytest.raises(SystemExit):
             main(["dehydrate", stacks["h5"], "-o", str(tmp_path), "-q"] + bad)      # argparse refuses them
@@ -367,14 +366,16 @@ def test_bad_values_are_refused_and_a_failed_run_leaves_no_output(stacks, tmp_pa
     capsys.readouterr()
     with warnings.catch_warnings():
         warnings.simplefilter("always")
-        assert main(["inspect", bad, "--strict", "-q"]) == 0
+        assert main(["inspect", bad, "-q"]) == 0
     assert f"{100 / K:.3g}% of the entries have a negative transmission; clipped at zero" in capsys.readouterr().err
-    monkeypatch.setattr(loading, "_clean_transmission", lambda T: {})
-    with pytest.raises(SystemExit, match="check"):
-        main(["inspect", bad, "--strict", "-q"])
-    with pytest.raises(SystemExit, match="check"):                       # the check fails at the end of the conversion
-        main(["convert", bad, "-o", str(tmp_path / "strict.h5"), "--strict", "-q"])
-    assert not [f for f in os.listdir(tmp_path) if f.startswith("strict")]         # neither the file nor a .partial
+
+    def failing_checks(*args):
+        raise loading.InputError("the checks failed")
+
+    monkeypatch.setattr(loading, "_checks_from_summary", failing_checks)
+    with pytest.raises(SystemExit, match="the checks failed"):
+        main(["convert", bad, "-o", str(tmp_path / "failed.h5"), "-q"])
+    assert not [f for f in os.listdir(tmp_path) if f.startswith("failed")]         # neither the file nor a .partial
 
 
 def test_fit_diagnostics():

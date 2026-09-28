@@ -247,9 +247,9 @@ def _bright_level(pixel_means, spatial_shape, sub, dose=None, n_obs=0, dose_per_
     return level, lo - max(0.05, margin), hi + margin
 
 
-def _checks_from_summary(sm, spatial_shape, strict=False):
+def _checks_from_summary(sm, spatial_shape):
     """The standard data checks for a summary (from _summary_from_T or the conversion's accumulators), as a list of
-    Check. Raises ValueError if strict and any check is an error."""
+    Check."""
     st, c = sm["stats"], []
     P, K = sm["pixels"], sm["bins"]
     c.append(Check("ok", f"{P:,} pixels x {K:,} bins ({spatial_shape[0]} view(s) x {spatial_shape[1]} x "
@@ -325,9 +325,6 @@ def _checks_from_summary(sm, spatial_shape, strict=False):
     if K > P:
         c.append(Check("warn", f"more bins ({K}) than pixels ({P}): the spectra are poorly determined; use "
                                "--downsample less or --wave-bin more"))
-    errors = [x for x in c if x.level == "error"]
-    if errors and strict:
-        raise InputError(f"{len(errors)} data check(s) failed: " + "; ".join(x.message for x in errors))
     return c
 
 
@@ -1058,7 +1055,7 @@ def _sum_variances(parts):
 
 
 def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=None, views=None, wave_range=None,
-                 wave_bin=1, downsample=1, strict=False, workers=None, background_boxes=None, background_tiles=None,
+                 wave_bin=1, downsample=1, workers=None, background_boxes=None, background_tiles=None,
                  open_beam_smoothing=0, memory_budget_mib=512):
     """Load a TIFF stack or an hsnt HDF5 file as a transmission ratio, with the data checks.
 
@@ -1082,7 +1079,6 @@ def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=Non
         wave_range (tuple, optional): (start, stop) over the source bins. Defaults to None, all bins.
         wave_bin (int, optional): Group this many adjacent bins. Defaults to 1.
         downsample (int, optional): Keep every n-th row and column. Defaults to 1.
-        strict (bool, optional): Raise ValueError if a data check reports an error. Defaults to False.
         workers (int, optional): Threads decoding TIFF images. Defaults to None, min(8, CPUs).
         background_boxes (str or list, optional): Sample-free boxes (y0, y1, x0, x1) in full-resolution pixels, or the
             name of an instrument preset ('ornl-snap': ORNL SNAP's four corner boxes, one per chip). In each bin,
@@ -1175,7 +1171,7 @@ def load_dataset(path, open_beam=None, input_type="auto", dataset=None, dose=Non
                               dose_per_bin=_ratio_dose(ds.dose_per_bin, ds.dose, src, itype, wave_bin),
                               smoothing=smoothed), smoothing=smoothed)
     ds.info["T_stats"], ds.info["above_one"] = sm["stats"], sm["above_one"]
-    ds.checks = _checks_from_summary(sm, ds.spatial_shape, strict)
+    ds.checks = _checks_from_summary(sm, ds.spatial_shape)
     return ds
 
 
@@ -1210,7 +1206,7 @@ def _converted_path(path):
 
 def convert_to_hdf5(path, output=None, open_beam=None, input_type="auto", dataset=None, dose=None, views=None,
                     wave_range=None, wave_bin=1, downsample=1, as_type="attenuation", block_bins=None,
-                    memory_budget_mib=256, workers=None, strict=False, progress=False, background_boxes=None,
+                    memory_budget_mib=256, workers=None, progress=False, background_boxes=None,
                     background_tiles=None, open_beam_smoothing=0):
     """Convert a TIFF stack or HDF5 file to an hsnt HDF5 file, streamed in blocks of bins.
 
@@ -1327,7 +1323,7 @@ def convert_to_hdf5(path, output=None, open_beam=None, input_type="auto", datase
                                            _ratio_dose(per_bin, dose, src, itype, wave_bin),
                                            _check_elems(memory_budget_mib), smoothing=sm_note),
                       background=bg, smoothing=sm_note)
-            checks = _checks_from_summary(sm, (V, rows, cols), strict)
+            checks = _checks_from_summary(sm, (V, rows, cols))
             f.create_dataset("bin_indices", data=src.source_bins[:K * wave_bin:wave_bin])
             if per_bin is not None:
                 f.create_dataset("open_beam_dose", data=per_bin)

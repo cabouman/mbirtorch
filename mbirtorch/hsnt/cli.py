@@ -119,7 +119,7 @@ def _load(args, log_checks=True):
     ds = load_dataset(args.input, open_beam=args.open_beam, input_type=args.input_type, dataset=args.dataset,
                       dose=args.dose, views=_parse_slice(args.views, "views"),
                       wave_range=_parse_slice(args.wave_range, "wave-range"), wave_bin=args.wave_bin,
-                      downsample=args.downsample, strict=args.strict,
+                      downsample=args.downsample,
                       background_boxes=_background_spec(args.background_boxes),
                       background_tiles=args.background_tiles, open_beam_smoothing=args.open_beam_smoothing)
     log.info("loaded in %.1f s", ds.info["load_seconds"])
@@ -341,7 +341,7 @@ def cmd_convert(args):
                                      views=_parse_slice(args.views, "views"),
                                      wave_range=_parse_slice(args.wave_range, "wave-range"), wave_bin=args.wave_bin,
                                      downsample=args.downsample, as_type=args.as_type,
-                                     memory_budget_mib=args.memory_budget, workers=args.workers, strict=args.strict,
+                                     memory_budget_mib=args.memory_budget, workers=args.workers,
                                      progress=not args.quiet,
                                      background_boxes=_background_spec(args.background_boxes),
                                      background_tiles=args.background_tiles,
@@ -534,7 +534,7 @@ class _Options:
                       "SNAP preprocessing used 3), leaving out pixels with no count in any selected bin; with one "
                       "open-beam observation the variance reduction is assumed, not measured")
 
-    def run(self, sp, device=False, dry_run=False, checks=True):
+    def run(self, sp, device=False, dry_run=False):
         g = sp.add_argument_group("run")
         if device:
             self.add(g, "--device", default="auto", metavar="auto|cpu|cuda|cuda:N",
@@ -545,10 +545,7 @@ class _Options:
         self.add(g, "-q", "--quiet", action="store_true", help="warnings and errors only")
         self.add(g, "--help-all", action="store_true", help="show every option, including solver, memory, "
                  "rank-test and support-selection settings")
-        g = sp.add_argument_group("advanced: checks and logging" if checks else "advanced: logging")
-        if checks:
-            self.add(g, "--strict", action="store_true", advanced=True,
-                     help="stop if any data check reports an error")
+        g = sp.add_argument_group("advanced: logging")
         self.add(g, "--log-file", advanced=True, help="also write the log here")
 
     def rank_test(self, sp):
@@ -666,7 +663,7 @@ def build_parser(show_all=False):
     opt.add(g, "--as-type", choices=("attenuation", "transmission"),
             help="quantity to write (default: the file's dataset_type)")
     opt.add(g, "--overwrite", action="store_true", help="replace the output if it already exists")
-    opt.run(s, checks=False)                           # rehydrate reads a dehydrated file, not data to check
+    opt.run(s)
     s.set_defaults(func=cmd_rehydrate)
 
     s = sub.add_parser("denoise", help="dehydrate and rehydrate: write the denoised hyperspectral data in the hsnt "

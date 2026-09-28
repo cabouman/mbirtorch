@@ -102,7 +102,7 @@ floating-point residue a dead pixel can keep after processing) take the bin's me
 attenuations are used as they are.  Entries whose transmission is NaN or infinite
 become zero counts and negative transmissions (from negative counts, for example) are clipped at zero, with a
 warning, as ``dehydrate`` treats an array.  ``inspect``, ``convert``, ``dehydrate`` and ``denoise`` run the data
-checks (zero counts, dead pixels and bins, dose) and log them; ``--strict`` stops on a failed one.
+checks (zero counts, dead pixels and bins, dose) and log them.
 
 .. code-block:: bash
 
