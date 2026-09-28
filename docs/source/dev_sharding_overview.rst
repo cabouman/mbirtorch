@@ -103,8 +103,8 @@ Where to look
   the band sum, the boundary-slice exchange, and the thread pool.
 - ``mbirtorch/tomography_model.py``: the placements, the sharded projection drivers, the batch
   and band policies, and the sharded reconstruction loop.
-- ``mbirtorch/projectors.py`` and the geometry modules: the per-view-batch kernels, described in
-  :doc:`dev_projector_kernels`.
+- ``mbirtorch/projectors.py`` and the geometry modules: the per-view-batch projection functions,
+  described in :doc:`dev_adding_geometry`.
 - ``tests/test_sharding.py``: the sharded projectors, the direct reconstructions, and the full
   reconstruction are each compared with the one-device result, including device counts that do
   not divide the axes evenly.
