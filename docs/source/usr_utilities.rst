@@ -38,6 +38,16 @@ moving ones.  In a space-time plane (t-x, t-y, or t-z) each row of the image is 
 the two sliders pick the line of the volume that is shown.  An edge that moves from frame to
 frame then appears as a slanted or zigzag line.
 
+The figures show the viewer on a synthetic 4D volume: a Shepp-Logan phantom that shifts by up
+to two pixels, in a direction that turns 60 degrees per frame, next to the unshifted phantom.
+In the x-y plane, the mean inside an ROI on the phantom's edge rises and falls every 6 frames,
+and the static phantom gives a flat line.  In the t-y plane the shift appears as a zigzag of
+the edges, and the static phantom's edges are straight.
+
+.. plot:: figs/slice_viewer4d.py
+   :alt: The 4D viewer in the x-y plane with an ROI and its mean against frame, and in the
+         t-y plane, where the edges of the shifting phantom zigzag.
+
 
 General Purpose
 ---------------

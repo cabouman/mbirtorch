@@ -551,11 +551,14 @@ class SliceViewer4D(SliceViewer):
         self._label_slice_slider()
 
         # This opaque rectangle is drawn under partial redraws.  Marking it
-        # animated keeps it out of ordinary full draws.
+        # animated keeps it out of ordinary full draws.  Its bounds are in screen
+        # pixels, so it is also kept out of the layout: a figure saved with a tight
+        # bounding box at another resolution would otherwise grow to include it.
         self._clear_rect = sf.Rectangle((0, 0), 1, 1,
                                         facecolor=self.fig.get_facecolor(),
                                         edgecolor='none', animated=True,
                                         transform=sf.IdentityTransform())
+        self._clear_rect.set_in_layout(False)
         self.fig.add_artist(self._clear_rect)
 
         if self.show_instructions:
