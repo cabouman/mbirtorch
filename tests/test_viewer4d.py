@@ -17,7 +17,8 @@ import matplotlib.pyplot as plt
 from matplotlib.backend_bases import KeyEvent, MouseEvent
 
 import mbirtorch
-from mbirtorch.viewers.slice_figure4d import SliceViewer4D, VolumeStack4D
+from mbirtorch.viewers.slice_figure import SliceViewer
+from mbirtorch.viewers.slice_figure4d import PLANE_LABELS, SliceViewer4D, VolumeStack4D
 
 
 def make_volume(shape, seed=0):
@@ -59,14 +60,56 @@ class TestFrames:
 
     def test_slice_axis_counts_each_arrays_own_axes(self):
         vol4d, vol3d = make_volume((2, 3, 4, 5)), make_volume((3, 4, 5))
-        # Axis 1 of a 4D array and axis 0 of a 3D array both mean x.
+        # Axis 1 of a 4D array and axis 0 of a 3D array both mean x.  The display axes
+        # are rows, columns, slice axis, and second axis, in (t, x, y, z) numbering.
         stack = VolumeStack4D([vol4d, vol3d], slice_axis=[1, 0])
-        assert stack.axes_perms == [[1, 2, 0], [1, 2, 0]]
+        assert stack.display_axes == [[2, 3, 1, 0], [2, 3, 1, 0]]
         assert stack.slice_image(0).shape == stack.slice_image(1).shape == (4, 5)
         # The default is z for both.
-        assert VolumeStack4D([vol4d, vol3d]).axes_perms == [[0, 1, 2], [0, 1, 2]]
+        assert VolumeStack4D([vol4d, vol3d]).display_axes == [[1, 2, 3, 0], [1, 2, 3, 0]]
         with pytest.raises(ValueError, match='4D array must be 1, 2, or 3'):
             VolumeStack4D([vol4d], slice_axis=0)
+
+
+class TestSpaceTimePlanes:
+    def test_t_x_plane_shows_one_line_in_every_frame(self):
+        vol4d = make_volume((5, 4, 6, 3), 1)
+        stack = VolumeStack4D([vol4d])
+        stack.set_plane([0], (0, 1))
+        # The slice slider keeps z, and the frame-row slider moves y.
+        assert stack.display_axes[0] == [0, 1, 3, 2]
+        assert stack.second_axis == 2
+        y, z = stack.cur_seconds[0], stack.cur_slices[0]
+        np.testing.assert_array_equal(stack.slice_image(0), vol4d[:, :, y, z])
+        stack.set_second(5)
+        np.testing.assert_array_equal(stack.slice_image(0), vol4d[:, :, 5, z])
+
+    def test_3d_volume_is_constant_and_shorter_volume_shows_its_own_frames(self):
+        stack = VolumeStack4D([make_volume((5, 4, 6, 3)), make_volume((3, 4, 6, 3), 1),
+                               make_volume((4, 6, 3), 2)])
+        stack.set_plane([0, 1, 2], (0, 1))
+        assert [stack.slice_image(i).shape[0] for i in range(3)] == [5, 3, 5]
+        image = stack.slice_image(2)
+        assert np.all(image == image[0])
+
+    def test_frame_index_returns_with_a_spatial_plane(self):
+        vol4d = make_volume((5, 4, 6, 3), 1)
+        stack = VolumeStack4D([vol4d])
+        stack.set_frame(3)
+        stack.set_plane([0], (0, 2))
+        assert stack.display_axes[0] == [0, 2, 3, 1]
+        stack.set_plane([0], (1, 2))
+        assert stack.display_axes[0] == [1, 2, 3, 0] and stack.master_frame == 3
+        np.testing.assert_array_equal(stack.slice_image(0),
+                                      vol4d[3][:, :, stack.cur_slices[0]])
+
+    def test_t_z_plane_puts_y_on_the_slice_slider(self):
+        stack = VolumeStack4D([make_volume((5, 4, 6, 3))])
+        stack.set_plane([0], (0, 3))
+        assert stack.display_axes[0] == [0, 3, 2, 1]
+        stack.transpose(0)
+        assert stack.display_axes[0] == [3, 0, 2, 1]
+        assert stack.slice_image(0).shape == (3, 5)
 
 
 class TestDifference:
@@ -192,6 +235,78 @@ class TestWindow:
         menu = viewer._dialog['panel_ax'].get_position()
         assert menu.x0 == pytest.approx(x / viewer.fig.bbox.width, abs=0.005)
         assert menu.y1 == pytest.approx(y / viewer.fig.bbox.height, abs=0.005)
+
+    def test_dialog_layout_matches_the_slice_viewer_in_inches(self, make_viewer):
+        # The inherited dialogs are laid out for the slice viewer's 8-inch figure, and
+        # the 4D figure is taller.  The distances inside a dialog must match in inches.
+        def range_dialog_layout(viewer):
+            viewer._open_range_dialog_infigure()
+            viewer.fig.canvas.draw()
+            dpi = viewer.fig.dpi
+            panel = viewer._dialog['panel_ax'].bbox
+            hint_y = (viewer._dialog['texts']['hint'].get_position()[1]
+                      * viewer.fig.bbox.height)
+            min_box = viewer._dialog['widgets']['min'].ax.bbox
+            return [panel.height / dpi, (panel.y1 - hint_y) / dpi,
+                    (panel.y1 - min_box.y1) / dpi]
+
+        viewer_3d = SliceViewer(make_volume((32, 32, 4)))
+        viewer_3d.fig.canvas.draw()
+        try:
+            expected = range_dialog_layout(viewer_3d)
+        finally:
+            plt.close(viewer_3d.fig)
+        np.testing.assert_allclose(range_dialog_layout(make_viewer(shifting_square())),
+                                   expected, atol=0.01)
+
+    def test_space_time_plane_shows_the_shift_as_a_zigzag(self, make_viewer):
+        viewer = make_viewer(shifting_square(), slice_label='moving')
+        radio = viewer.axis_radios[0]
+        radio.set_active(PLANE_LABELS.index('t-y'))
+        assert viewer.stack.display_axes[0] == [0, 2, 3, 1]
+        assert viewer.frame_slider.label.get_text() == 'x'
+        assert viewer.slice_slider.label.get_text() == 'z'
+        assert not viewer._play_ax.get_visible()
+        assert not viewer.roi_plot_ax.get_visible()
+        assert viewer.axes[0].get_aspect() == 'auto'
+        assert viewer.axes[0].get_title().splitlines()[0] == 'moving: x = 16, z = 2'
+        # Each row is one frame.  The left edge of the square repeats every 6 frames.
+        image = viewer.stack.slice_image(0)
+        left_edges = np.argmax(image > 0.5, axis=1)
+        np.testing.assert_array_equal(left_edges[:6], left_edges[6:])
+        assert len(set(left_edges[:6])) > 1
+        # Space does not play in a space-time plane.
+        _press_key(viewer.fig, ' ')
+        assert not viewer.playing
+        # In a spatial plane the frame row sets the frame and plays again.
+        radio.set_active(PLANE_LABELS.index('x-y'))
+        assert viewer.frame_slider.label.get_text() == 't'
+        assert viewer._play_ax.get_visible() and viewer.roi_plot_ax.get_visible()
+        assert viewer.axes[0].get_aspect() == 1.0
+
+    def test_position_sliders_sit_together_above_the_intensity_slider(self, make_viewer):
+        viewer = make_viewer(shifting_square())
+        boxes = [slider.ax.get_position() for slider in
+                 (viewer.slice_slider, viewer.frame_slider, viewer.intensity_slider)]
+        assert boxes[0].y0 > boxes[1].y0 > boxes[2].y0
+        # The three sliders line up.
+        for box in boxes[1:]:
+            assert (box.x0, box.x1) == pytest.approx((boxes[0].x0, boxes[0].x1))
+
+    def test_space_time_plane_couples_the_panels(self, make_viewer):
+        viewer = make_viewer(shifting_square(), shifting_square())
+        viewer._toggle_couple_axes()
+        assert not viewer.sync_axes and len(viewer.axis_radios) == 2
+        viewer.axis_radios[1].set_active(PLANE_LABELS.index('t-x'))
+        assert viewer.sync_axes and len(viewer.axis_radios) == 1
+        assert viewer.stack.display_axes == [[0, 1, 3, 2], [0, 1, 3, 2]]
+        labels = [label for label, _callback in viewer._menu_items(0)]
+        assert 'Decouple slice axes' not in labels
+
+    def test_shorter_volume_lines_up_in_time(self, make_viewer):
+        viewer = make_viewer(shifting_square(12), shifting_square(6))
+        viewer.axis_radios[0].set_active(PLANE_LABELS.index('t-y'))
+        assert viewer.axes[0].get_ylim() == viewer.axes[1].get_ylim() == (11.5, -0.5)
 
     def test_frame_keys_and_playback(self, make_viewer):
         viewer = make_viewer(shifting_square(), slice_label='moving')
