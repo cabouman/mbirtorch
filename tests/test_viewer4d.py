@@ -180,6 +180,19 @@ class TestWindow:
         np.testing.assert_allclose(means[:6], means[6:])
         assert means.std() > 0
 
+    def test_menu_opens_at_the_cursor_on_a_retina_screen(self, make_viewer):
+        # A Retina screen has two physical pixels per logical pixel, and mouse events
+        # give the position in physical pixels.
+        viewer = make_viewer(shifting_square())
+        viewer.fig.canvas._set_device_pixel_ratio(2)
+        viewer.fig.canvas.draw()
+        bbox = viewer.axes[0].bbox
+        x, y = (bbox.x0 + bbox.x1) / 2, (bbox.y0 + bbox.y1) / 2
+        _process(viewer.fig, 'button_press_event', x, y, 3)
+        menu = viewer._dialog['panel_ax'].get_position()
+        assert menu.x0 == pytest.approx(x / viewer.fig.bbox.width, abs=0.005)
+        assert menu.y1 == pytest.approx(y / viewer.fig.bbox.height, abs=0.005)
+
     def test_frame_keys_and_playback(self, make_viewer):
         viewer = make_viewer(shifting_square(), slice_label='moving')
         _press_key(viewer.fig, '.')

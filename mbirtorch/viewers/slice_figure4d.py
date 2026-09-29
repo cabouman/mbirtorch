@@ -7,6 +7,8 @@ adds a frame slider, playback, and a plot of the ROI mean against frame.  A 4D a
 base package at most, so it loads without a GUI toolkit.
 """
 
+import copy
+
 import matplotlib
 import numpy as np
 
@@ -710,6 +712,17 @@ class SliceViewer4D(SliceViewer):
                 'Close the window to quit')
             message_type = None
         super()._show_message(show, message_type=message_type, message=message)
+
+    def _open_menu_dialog(self, items, event):
+        # The inherited method divides the click position by the canvas size in
+        # logical pixels, and mouse events give the position in physical pixels.
+        # The position is converted to logical pixels here, so the menu opens at the
+        # cursor on a screen whose device pixel ratio is above 1, such as Retina.
+        ratio = self.fig.canvas.device_pixel_ratio
+        if ratio != 1:
+            event = copy.copy(event)
+            event.x, event.y = event.x / ratio, event.y / ratio
+        super()._open_menu_dialog(items, event)
 
     def _main_widgets(self):
         widgets = super()._main_widgets()
