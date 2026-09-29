@@ -498,14 +498,16 @@ class SliceViewer4D(SliceViewer):
         n = self.stack.n_volumes
         self.fig = sf.plt.figure(figsize=(6 * n, 10.5))
         self.fig.suptitle(self.title)
-        # The rows are the panels, the plane radios, the slice slider, the frame row,
-        # the intensity slider, and the plot of the ROI mean against frame.  The slice
-        # slider and the frame-row slider sit together, because together they set the
-        # position along the two hidden axes.
-        self.gs = sf.gridspec.GridSpec(nrows=6, ncols=n,
-                                       height_ratios=[14, 3, 1, 1, 1, 4],
+        # The rows are the panels, the plane radios, a block of sliders, and the plot
+        # of the ROI mean against frame.  The block holds the slice slider, the frame
+        # row, and the intensity slider, close together.  The slice slider and the
+        # frame-row slider come first, because together they set the position along
+        # the two hidden axes.
+        self.gs = sf.gridspec.GridSpec(nrows=4, ncols=n, height_ratios=[14, 3, 3.5, 4],
                                        left=0.12, right=0.95, top=0.92,
-                                       bottom=0.05, hspace=0.5, figure=self.fig)
+                                       bottom=0.05, hspace=0.3, figure=self.fig)
+        self._slider_rows = sf.gridspec.GridSpecFromSubplotSpec(
+            3, 1, subplot_spec=self.gs[2, :], hspace=0.6)
         self.axes = [None] * n
         self.caxes = [None] * n
         self.images = [None] * n
@@ -530,10 +532,19 @@ class SliceViewer4D(SliceViewer):
             self.fig.text(0.01, 0.25, sf.multiline('Press h', 'for help'),
                           fontdict={'color': 'red'})
 
+    @staticmethod
+    def _slider_cells(spec):
+        # A slider row splits into a label cell, the slider, and a value cell, in the
+        # proportions of the inherited _slider_slot, so all the sliders line up.
+        return sf.gridspec.GridSpecFromSubplotSpec(1, 3, subplot_spec=spec,
+                                                   width_ratios=[1.7, 8.0, 2.0])
+
     def _slider_slot(self, row):
-        # The inherited intensity slider asks for row 3, which holds the frame row in
-        # this figure, so it is placed in row 4.
-        return super()._slider_slot(4 if row == 3 else row)
+        # The inherited sliders ask for row 2 (slice) and row 3 (intensity).  Here they
+        # are the first and the last row of the slider block, with the frame row
+        # between them.
+        block_row = {2: 0, 3: 2}[row]
+        return self._slider_cells(self._slider_rows[block_row, 0])[0, 1]
 
     def _title_text(self, i):
         stack = self.stack
@@ -596,12 +607,10 @@ class SliceViewer4D(SliceViewer):
             AXIS_NAMES[axes.pop()] if len(axes) == 1 else 'Slice')
 
     def _create_frame_row(self):
-        # The row is split into the same three cells as the inherited _slider_slot
-        # splits the other slider rows, so the frame-row slider lines up with them.
-        # The left cell holds the Play button beside the slider's label, and the right
-        # cell holds the frame label that playback shows in place of the slider's value.
-        cells = sf.gridspec.GridSpecFromSubplotSpec(
-            1, 3, subplot_spec=self.gs[3, :], width_ratios=[1.7, 8.0, 2.0])
+        # The frame row is the middle row of the slider block.  Its left cell holds the
+        # Play button beside the slider's label, and its right cell holds the frame
+        # label that playback shows in place of the slider's value.
+        cells = self._slider_cells(self._slider_rows[1, 0])
         left = sf.gridspec.GridSpecFromSubplotSpec(
             1, 2, subplot_spec=cells[0, 0], width_ratios=[1.0, 0.7])
         self._play_ax = self.fig.add_subplot(left[0, 0])
@@ -653,7 +662,7 @@ class SliceViewer4D(SliceViewer):
     def _create_roi_plot(self):
         # The plot spans the sliders' columns, so its frame axis lines up with the
         # frame-row slider.
-        self.roi_plot_ax = self.fig.add_subplot(self._slider_slot(5))
+        self.roi_plot_ax = self.fig.add_subplot(self._slider_cells(self.gs[3, :])[0, 1])
         ax = self.roi_plot_ax
         ax.set_xlabel('t', fontsize=ROI_PLOT_FONT_SIZE)
         ax.set_ylabel('ROI mean', fontsize=ROI_PLOT_FONT_SIZE)
