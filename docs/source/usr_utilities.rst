@@ -26,6 +26,19 @@ the reconstruction volume sit for one view at a time; see
 :ref:`GeometryViewerDocs`.
 
 
+.. _Viewer4DDocs:
+
+4D Data Viewer
+--------------
+
+.. autofunction:: mbirtorch.view_utils.slice_viewer4d
+
+A 3D volume shown next to 4D volumes stays fixed in time, so it serves as a reference for the
+moving ones.  In a space-time plane (t-x, t-y, or t-z) each row of the image is one frame, and
+the two sliders pick the line of the volume that is shown.  An edge that moves from frame to
+frame then appears as a slanted or zigzag line.
+
+
 General Purpose
 ---------------
 

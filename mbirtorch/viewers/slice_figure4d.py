@@ -453,12 +453,13 @@ class SliceViewer4D(SliceViewer):
 
     The window of :class:`SliceViewer` gains radio buttons for six planes, a frame-row
     slider, and a plot of the ROI mean against frame.  In a spatial plane (x-y, x-z,
-    y-z) the frame-row slider sets the frame, with a Play button: space plays and
-    pauses, and comma and period step one frame back and forward.  In a space-time
-    plane (t-x, t-y, t-z) each row is one frame, and the two sliders set the line of
-    the volume that is shown.  Construction builds the figure but does not display it;
-    call :meth:`show` to display.  All data logic lives in :class:`VolumeStack4D`
-    (``self.stack``).
+    y-z) the frame-row slider sets the frame.  Its Play button steps through the
+    frames, and every panel shows the slice chosen with the plane buttons and the slice
+    slider.  Space plays and pauses, and comma and period step one frame back and
+    forward.  In a space-time plane (t-x, t-y, t-z) each row is one frame, and the two
+    sliders set the line of the volume that is shown.  Construction builds the figure
+    but does not display it; call :meth:`show` to display.  All data logic lives in
+    :class:`VolumeStack4D` (``self.stack``).
 
     Args:
         *datasets (ndarray or None): One or more 2D, 3D, or 4D arrays to display.  A 4D
@@ -1191,7 +1192,8 @@ def slice_viewer4d(*datasets, data_dicts=None, title='', vmin=None, vmax=None,
     viewer has every feature of :func:`slice_viewer`.  It adds a frame slider with a
     Play button, space-time planes (t-x, t-y, t-z) that show one line of the volume in
     every frame, a plot of the ROI mean against frame, and, with ``movie_fn``, a
-    "Save movie" menu item.
+    "Save movie" menu item.  Play steps through the frames, and every panel shows the
+    slice chosen with the plane buttons and the slice slider.
 
     Args:
         *datasets (ndarray or None): One or more 2D, 3D, or 4D arrays to display.  A 4D
