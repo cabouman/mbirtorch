@@ -66,6 +66,7 @@ __all__ = [
     "generate_3d_shepp_logan_low_dynamic_range", "clear_cache",
     "get_memory_stats", "SliceViewer", "VolumeStack", "slice_viewer",
     "GeometryScene", "GeometryFigure", "geometry_viewer",
+    "SliceViewer4D", "VolumeStack4D", "slice_viewer4d",
     "stitch_arrays", "get_ct_model", "copy_ct_model", "save_volume_as_gif",
     "MACE4DModel", "temporal_filter_matrix", "apply_temporal_filter",
     "generate_demo_data", "generate_3d_shepp_logan_reference",
@@ -78,7 +79,8 @@ __all__ = [
 # Lazy exports (PEP 562) resolve on first attribute access, so importing mbirtorch does
 # not pull in matplotlib or the preprocess, hsnt and vcls dependencies.
 _VIEWER_EXPORTS = ("SliceViewer", "VolumeStack", "slice_viewer",
-                   "GeometryScene", "GeometryFigure", "geometry_viewer")
+                   "GeometryScene", "GeometryFigure", "geometry_viewer",
+                   "SliceViewer4D", "VolumeStack4D", "slice_viewer4d")
 
 _LAZY_MODULES = ("preprocess", "hsnt", "vcls", "mace")
 
@@ -109,7 +111,8 @@ _LAZY_NAMES = {
 if TYPE_CHECKING:
     from . import preprocess, hsnt, vcls, mace
     from .view_utils import (SliceViewer, VolumeStack, slice_viewer,
-                             GeometryScene, GeometryFigure, geometry_viewer)
+                             GeometryScene, GeometryFigure, geometry_viewer,
+                             SliceViewer4D, VolumeStack4D, slice_viewer4d)
     from .mace import (MACE, Task, ForwardProxAgent, QGGMRFDenoiserAgent, HyperplaneAgent,
                        resolve_device_pool)
     from .mace4d import MACE4DModel, temporal_filter_matrix, apply_temporal_filter

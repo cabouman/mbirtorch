@@ -12,11 +12,17 @@ The package-level functions ``mbirtorch.slice_viewer`` and
 ``mbirtorch.geometry_viewer`` come from ``mbirtorch.view_utils``, which wraps
 the slice viewer's entry point with the tensor and data-dict conversions that
 the models' outputs need and re-exports the geometry viewer's as it is.
+
+``slice_figure4d`` holds the 4D viewer, which subclasses the slice viewer's two
+classes: ``VolumeStack4D`` and ``SliceViewer4D``, with its entry point
+``slice_viewer4d``.  ``mbirtorch.slice_viewer4d`` wraps it in the same way.
 """
 
 from .slice_figure import SliceViewer, VolumeStack, slice_viewer
+from .slice_figure4d import SliceViewer4D, VolumeStack4D, slice_viewer4d
 from .geometry_scene import GeometryScene
 from .geometry_figure import GeometryFigure, geometry_viewer
 
 __all__ = ['SliceViewer', 'VolumeStack', 'slice_viewer', 'GeometryScene',
-           'GeometryFigure', 'geometry_viewer']
+           'GeometryFigure', 'geometry_viewer', 'SliceViewer4D', 'VolumeStack4D',
+           'slice_viewer4d']

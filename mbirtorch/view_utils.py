@@ -9,6 +9,9 @@ become numpy arrays, and rich data dicts -- e.g. the recon_dict returned by
 The geometry viewer needs no conversion on the way in, because its scene reads
 the model directly and its figure converts a tensor overlay itself, so the
 function is re-exported as it is.
+
+The 4D viewer (mbirtorch/viewers/slice_figure4d.py) gets the same conversions
+through :func:`slice_viewer4d`.
 """
 
 import pprint
@@ -17,12 +20,14 @@ import numpy as np
 
 from .viewers.slice_figure import SliceViewer, VolumeStack
 from .viewers.slice_figure import slice_viewer as _slice_viewer
+from .viewers.slice_figure4d import SliceViewer4D, VolumeStack4D
+from .viewers.slice_figure4d import slice_viewer4d as _slice_viewer4d
 from .viewers.geometry_scene import GeometryScene
 from .viewers.geometry_figure import GeometryFigure, geometry_viewer
 
 __all__ = ['SliceViewer', 'VolumeStack', 'convert_subdicts_to_strings',
            'slice_viewer', 'GeometryScene', 'GeometryFigure',
-           'geometry_viewer']
+           'geometry_viewer', 'SliceViewer4D', 'VolumeStack4D', 'slice_viewer4d']
 
 
 def _to_numpy(dataset):
@@ -140,3 +145,64 @@ def slice_viewer(*datasets, data_dicts=None, title='', vmin=None, vmax=None,
                          slice_axis=slice_axis, cmap=cmap,
                          show_instructions=show_instructions, block=block,
                          save_fn=save_fn)
+
+
+def slice_viewer4d(*datasets, data_dicts=None, title='', vmin=None, vmax=None,
+                   slice_label=None, slice_axis=None, cmap='gray',
+                   show_instructions=True, block=True, save_fn=None, fps=5):
+    """
+    Launch an interactive viewer for one or more 4D volumes, such as the output of
+    :meth:`MACE4DModel.recon <mbirtorch.MACE4DModel.recon>`.
+
+    The viewer has every feature of :func:`slice_viewer`.  It adds a frame slider
+    with a Play button, and a plot of the mean inside the ROI circle against frame.
+    Space plays and pauses, and comma and period step one frame back and forward.
+
+    Args:
+        *datasets (ndarray, tensor, or None): One or more 2D, 3D, or 4D arrays to
+            display.  A 4D array is ``(t, x, y, z)``.  A 2D or 3D array stays fixed in
+            time.  Torch tensors (including CUDA and MPS tensors) are converted to
+            numpy automatically.
+        data_dicts (None or dict or list of None or dicts, optional): Dictionary of
+            entries associated with the data (e.g., the recon_dict from
+            :meth:`MACE4DModel.recon <mbirtorch.MACE4DModel.recon>`).  Nested dicts
+            are serialized to display strings automatically.
+        title (str, optional): Figure title.  Defaults to an empty string.
+        vmin (float, optional): Minimum intensity value for display.  Defaults to the
+            minimum over every voxel of every volume.
+        vmax (float, optional): Maximum intensity value for display.  Defaults to the
+            maximum over every voxel of every volume.
+        slice_label (str or list of str, optional): Label(s) at the start of each
+            panel title.  Defaults to no label.
+        slice_axis (int or list of int, optional): Axis along which to slice, counted
+            in each array's own axes: 1, 2, or 3 for a 4D array, and 0, 1, or 2 for a
+            3D array.  Defaults to z.  With 3D and 4D arrays together, give a list.
+        cmap (str, optional): Colormap to use.  Defaults to "gray".
+        show_instructions (bool, optional): Whether to display the help hint in the
+            figure.  Defaults to True.
+        block (bool, optional): If True (default), block until the window is closed.
+            If False, leave the window open and return immediately, as in
+            :func:`slice_viewer`.
+        save_fn (callable, optional): Replacement for the built-in HDF5 writer used by
+            the viewer's Save action, called as
+            ``save_fn(file_path, array, array_name, attributes_dict)``.
+        fps (float, optional): Playback speed in frames per second.  Defaults to 5.
+
+    Returns:
+        SliceViewer4D: the viewer object.
+
+    Example:
+        >>> import mbirtorch
+        >>> recon_4d, recon_dict = mace4d_model.recon(sinogram)
+        >>> mbirtorch.slice_viewer4d(recon_4d, data_dicts=recon_dict, vmin=0, vmax=0.06)
+    """
+    datasets = [_to_numpy(dataset) for dataset in datasets]
+    if isinstance(data_dicts, dict):
+        data_dicts = convert_subdicts_to_strings(data_dicts)
+    elif isinstance(data_dicts, (list, tuple)):
+        data_dicts = [convert_subdicts_to_strings(d) for d in data_dicts]
+    return _slice_viewer4d(*datasets, data_dicts=data_dicts, title=title,
+                           vmin=vmin, vmax=vmax, slice_label=slice_label,
+                           slice_axis=slice_axis, cmap=cmap,
+                           show_instructions=show_instructions, block=block,
+                           save_fn=save_fn, fps=fps)
