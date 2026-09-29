@@ -719,7 +719,10 @@ class SliceViewer4D(SliceViewer):
         if legend is not None:
             legend.remove()
         circle = self.circles[0] if self.circles else None
-        if circle is not None and ax.get_visible():
+        # The plot follows the frames, so it is computed in a spatial plane only.  The
+        # stack's plane is checked because a plane change moves the slice slider, and
+        # so calls this method, before the plot is hidden.
+        if circle is not None and self.stack.second_axis == 0 and ax.get_visible():
             x, y = circle.center
             radius = circle.get_radius()
             last_frame = self.stack.max_frames - 1
@@ -733,7 +736,9 @@ class SliceViewer4D(SliceViewer):
                 else:
                     frames = np.arange(means.size)
                 label = self.stack.labels[i].strip() or 'Image {}'.format(i)
-                (line,) = ax.plot(frames, means, lw=1.2, label=label)
+                # Each volume keeps one color, however often the plot is recomputed.
+                (line,) = ax.plot(frames, means, lw=1.2, label=label,
+                                  color='C{}'.format(i))
                 self._roi_lines.append(line)
         self._roi_hint.set_visible(not self._roi_lines)
         if self._roi_lines:
@@ -958,21 +963,25 @@ class SliceViewer4D(SliceViewer):
         self.playing = True
         self._hide_tooltips()
         self.play_button.label.set_text('Pause')
-        # Playback redraws only the images, the ROI graphics above them, the frame
-        # label, and the plot marker.  They are marked animated, so ordinary draws
-        # leave them out, and their backgrounds are saved after one full draw.
-        # Nothing else changes while the viewer plays, which is what keeps the
-        # macosx backend from redrawing the whole figure on each frame.
+        # On a canvas that can blit, playback redraws only the images, the ROI
+        # graphics above them, the frame label, and the plot marker.  They are marked
+        # animated, so ordinary draws leave them out, and their backgrounds are saved
+        # after one full draw.  Nothing else changes while the viewer plays, which is
+        # what keeps the macosx backend from redrawing the whole figure on each frame.
+        # A canvas that cannot blit, such as the WebAgg and notebook canvases, redraws
+        # the whole figure on each frame, so the artists stay in ordinary draws.
+        canvas = self.fig.canvas
+        blit = getattr(canvas, 'supports_blit', False)
         regions = self._playback_regions()
-        for _bbox, artists in regions:
-            for artist in artists:
-                artist.set_animated(True)
+        if blit:
+            for _bbox, artists in regions:
+                for artist in artists:
+                    artist.set_animated(True)
         self.frame_slider.valtext.set_visible(False)
         self._frame_label.set_text('t = {}'.format(self.stack.master_frame))
         self._frame_label.set_visible(True)
-        canvas = self.fig.canvas
         canvas.draw()
-        if getattr(canvas, 'supports_blit', False):
+        if blit:
             self._play_regions = [(bbox, canvas.copy_from_bbox(bbox), artists)
                                   for bbox, artists in regions]
         else:
@@ -1014,14 +1023,11 @@ class SliceViewer4D(SliceViewer):
             self._play_timer.stop()
             self._play_timer = None
         self.playing = False
+        # Only a canvas that can blit has animated artists and saved regions.
         if self._play_regions is not None:
-            artists = [artist for _bbox, _background, region_artists in self._play_regions
-                       for artist in region_artists]
-        else:
-            artists = [artist for _bbox, region_artists in self._playback_regions()
-                       for artist in region_artists]
-        for artist in artists:
-            artist.set_animated(False)
+            for _bbox, _background, artists in self._play_regions:
+                for artist in artists:
+                    artist.set_animated(False)
         self._play_regions = None
         self._frame_label.set_visible(False)
         self.frame_slider.valtext.set_visible(True)

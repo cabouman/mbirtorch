@@ -223,6 +223,26 @@ class TestWindow:
         np.testing.assert_allclose(means[:6], means[6:])
         assert means.std() > 0
 
+    def test_roi_plot_returns_after_a_space_time_plane(self, make_viewer):
+        viewer = make_viewer(shifting_square(), make_volume((32, 32, 4)))
+        ax = viewer.axes[0]
+        x0, y0 = ax.transData.transform((10, 16))
+        x1, y1 = ax.transData.transform((13, 16))
+        _process(viewer.fig, 'button_press_event', x0, y0, 1)
+        _process(viewer.fig, 'motion_notify_event', x1, y1)
+        _process(viewer.fig, 'button_release_event', x1, y1, 1)
+        means = np.asarray(viewer._roi_lines[0].get_ydata())
+        colors = [line.get_color() for line in viewer._roi_lines]
+        radio = viewer.axis_radios[0]
+        radio.set_active(PLANE_LABELS.index('t-y'))
+        assert viewer.stack.display_axes[0] == [0, 2, 3, 1]
+        assert not viewer.roi_plot_ax.get_visible()
+        radio.set_active(PLANE_LABELS.index('x-y'))
+        assert viewer.roi_plot_ax.get_visible()
+        np.testing.assert_allclose(viewer._roi_lines[0].get_ydata(), means)
+        # Each volume keeps its color when the plot is recomputed.
+        assert [line.get_color() for line in viewer._roi_lines] == colors
+
     def test_menu_opens_at_the_cursor_on_a_retina_screen(self, make_viewer):
         # A Retina screen has two physical pixels per logical pixel, and mouse events
         # give the position in physical pixels.
@@ -332,6 +352,24 @@ class TestWindow:
         _press_key(viewer.fig, ' ')
         viewer._play_step()
         assert viewer.stack.master_frame == 0
+        _press_key(viewer.fig, ' ')
+        assert not viewer.playing
+
+    def test_playback_without_blitting_keeps_the_images(self, make_viewer):
+        # The WebAgg and notebook canvases cannot blit, so playback redraws the whole
+        # figure on each frame, and the images must stay in those draws.
+        viewer = make_viewer(shifting_square())
+        canvas = viewer.fig.canvas
+        canvas.supports_blit = False
+        _press_key(viewer.fig, ' ')
+        viewer._play_step()
+        assert viewer.playing and viewer.stack.master_frame == 1
+        canvas.draw()
+        # A row through the square has edges, and a blank panel has none.
+        pixels = np.asarray(canvas.buffer_rgba())
+        bbox = viewer.axes[0].bbox
+        row = int(pixels.shape[0] - (bbox.y0 + bbox.y1) / 2)
+        assert pixels[row, int(bbox.x0):int(bbox.x1), :3].std() / 255 > 0.05
         _press_key(viewer.fig, ' ')
         assert not viewer.playing
 
