@@ -11,13 +11,15 @@ the model directly and its figure converts a tensor overlay itself, so the
 function is re-exported as it is.
 
 The 4D viewer (mbirtorch/viewers/slice_figure4d.py) gets the same conversions
-through :func:`slice_viewer4d`.
+through :func:`slice_viewer4d`, which also passes :func:`save_volume_as_gif` as
+the writer of its "Save movie" item.
 """
 
 import pprint
 
 import numpy as np
 
+from .utilities import save_volume_as_gif
 from .viewers.slice_figure import SliceViewer, VolumeStack
 from .viewers.slice_figure import slice_viewer as _slice_viewer
 from .viewers.slice_figure4d import SliceViewer4D, VolumeStack4D
@@ -155,8 +157,11 @@ def slice_viewer4d(*datasets, data_dicts=None, title='', vmin=None, vmax=None,
     :meth:`MACE4DModel.recon <mbirtorch.MACE4DModel.recon>`.
 
     The viewer has every feature of :func:`slice_viewer`.  It adds a frame slider
-    with a Play button, and a plot of the mean inside the ROI circle against frame.
-    Space plays and pauses, and comma and period step one frame back and forward.
+    with a Play button, space-time planes (t-x, t-y, t-z) that show one line of the
+    volume in every frame, and a plot of the mean inside the ROI circle against
+    frame.  Space plays and pauses, and comma and period step one frame back and
+    forward.  The right-click menu's "Save movie" item writes a panel's view as a GIF
+    with :func:`save_volume_as_gif`.
 
     Args:
         *datasets (ndarray, tensor, or None): One or more 2D, 3D, or 4D arrays to
@@ -205,4 +210,4 @@ def slice_viewer4d(*datasets, data_dicts=None, title='', vmin=None, vmax=None,
                            vmin=vmin, vmax=vmax, slice_label=slice_label,
                            slice_axis=slice_axis, cmap=cmap,
                            show_instructions=show_instructions, block=block,
-                           save_fn=save_fn, fps=fps)
+                           save_fn=save_fn, fps=fps, movie_fn=save_volume_as_gif)

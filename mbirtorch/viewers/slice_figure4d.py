@@ -9,6 +9,9 @@ toolkit.
 """
 
 import copy
+import os
+import re
+import sys
 
 import matplotlib
 import numpy as np
@@ -391,6 +394,26 @@ class VolumeStack4D(VolumeStack):
             return None
         return planes[:, mask].mean(axis=1)
 
+    # --- Movies ---
+
+    def movie_frame_count(self, i):
+        """Number of frames of volume ``i``'s movie: its positions along the frame-row slider's axis."""
+        return self._source(i).shape[self.display_axes[i][3]]
+
+    def movie_view(self, i):
+        """Arguments of ``save_volume_as_gif`` that write volume ``i``'s view as a movie.
+
+        Returns ``(volume, frame_axis, slice_axis, slice_index)``.  The movie plays along
+        the frame-row slider's axis at the current slice.  When the panel shows its two
+        axes transposed, they are swapped in ``volume``, so each movie frame matches the
+        panel.
+        """
+        rows, columns, slice_axis, second_axis = self.display_axes[i]
+        volume = self._source(i)
+        if rows > columns:
+            volume = np.swapaxes(volume, rows, columns)
+        return volume, second_axis, slice_axis, self.cur_slices[i]
+
     # --- File load ---
 
     def load_array(self, image_index, new_array, data_dict=None):
@@ -457,12 +480,17 @@ class SliceViewer4D(SliceViewer):
             Defaults to True.
         save_fn (callable, optional): Replacement for the built-in HDF5 writer, called
             as ``save_fn(file_path, array, array_name, attributes_dict)``.
-        fps (float, optional): Playback speed in frames per second.  Defaults to 5.
+        fps (float, optional): Playback speed in frames per second, also used for
+            movies.  Defaults to 5.
+        movie_fn (callable, optional): Writer for the menu's "Save movie" item, called
+            as mbirtorch's ``save_volume_as_gif`` is: ``movie_fn(volume, filename,
+            frame_axis=..., slice_axis=..., slice_index=..., vmin=..., vmax=...,
+            fps=...)``.  Defaults to None, which leaves the item out.
     """
 
     def __init__(self, *datasets, data_dicts=None, title='', vmin=None, vmax=None,
                  slice_label=None, slice_axis=None, cmap='gray',
-                 show_instructions=True, save_fn=None, fps=5):
+                 show_instructions=True, save_fn=None, fps=5, movie_fn=None):
         if fps <= 0:
             raise ValueError('fps must be positive; got {}.'.format(fps))
         sf._load_pyplot()
@@ -474,6 +502,7 @@ class SliceViewer4D(SliceViewer):
         self.show_instructions = show_instructions
         self.save_fn = save_fn if save_fn is not None else sf._save_data_hdf5
         self.fps = float(fps)
+        self.movie_fn = movie_fn
 
         self._init_interaction_state()
         self._build_figure()
@@ -759,6 +788,11 @@ class SliceViewer4D(SliceViewer):
         if self.stack.second_axis != 0:
             # A space-time plane is shown in every panel, so the panels stay coupled.
             items = [item for item in items if item[0] != 'Decouple slice axes']
+        if self.movie_fn is not None and self.stack.movie_frame_count(i) > 1:
+            labels = [label for label, _callback in items]
+            position = (labels.index('Save data to h5') + 1 if 'Save data to h5' in labels
+                        else len(items) - 1)
+            items.insert(position, ('Save movie', lambda i=i: self._on_movie_button(i)))
         return items
 
     def _reset_view(self, volume_index=None):
@@ -780,6 +814,92 @@ class SliceViewer4D(SliceViewer):
                     self.axes[i].set_xlim(*span)
         finally:
             self._in_sync_callback = already_syncing
+
+    # --- Save movie ---
+
+    def _movie_file_name(self, i):
+        # For example init_x-y_z32.gif: the label, the plane, and the fixed slice.
+        stack = self.stack
+        slice_axis = stack.display_axes[i][2]
+        label = re.sub(r'[^A-Za-z0-9_-]+', '_', stack.labels[i]).strip('_') or 'volume'
+        plane = PLANE_LABELS[PLANES.index(stack.plane(i))]
+        return '{}_{}_{}{}.gif'.format(label, plane, AXIS_NAMES[slice_axis],
+                                       stack.cur_slices[i])
+
+    def _on_movie_button(self, i):
+        name = self._movie_file_name(i)
+        chosen = self._native_choose_movie_path(self._last_dir, name)
+        if chosen is sf._NATIVE_UNAVAILABLE:
+            self._open_movie_dialog(i, name)
+        elif chosen is not None:
+            self._finish_movie(i, chosen)
+
+    def _native_choose_movie_path(self, directory, initial_file):
+        """Return a chosen path, None if cancelled, or the unavailable marker.
+
+        The macOS save panel runs in its own process, so it works under every
+        backend.  On other systems the in-figure path dialog is used.
+        """
+        if (sys.platform != 'darwin'
+                or matplotlib.get_backend().lower() in sf.NONINTERACTIVE_BACKENDS):
+            return sf._NATIVE_UNAVAILABLE
+        import subprocess
+
+        def quoted(text):
+            return text.replace('\\', '\\\\').replace('"', '\\"')
+
+        script = ('POSIX path of (choose file name with prompt "Save movie as GIF" '
+                  f'default name "{quoted(initial_file)}" '
+                  f'default location POSIX file "{quoted(directory)}")')
+        try:
+            result = subprocess.run(['osascript', '-e', script],
+                                    capture_output=True, text=True)
+        except OSError:
+            return sf._NATIVE_UNAVAILABLE
+        if result.returncode != 0:
+            if 'canc' in (result.stderr or '').lower():
+                return None  # the user cancelled the panel
+            return sf._NATIVE_UNAVAILABLE
+        return result.stdout.strip() or None
+
+    def _open_movie_dialog(self, i, name):
+        """In-figure dialog with a path box for the movie file."""
+        self._open_dialog('movie')
+        x0, y0, w, h = self._dialog_panel(6.0, 1.9)
+        self._dialog_text('title', (x0 + 0.02 * w, y0 + h - 0.05),
+                          'Save movie as GIF', fontweight='bold')
+        self._dialog_textbox('path', 'Path ',
+                             (x0 + 0.09 * w, y0 + 0.48 * h, 0.88 * w, 0.2 * h),
+                             os.path.join(self._last_dir, name))
+        self._dialog_text('error', (x0 + 0.02 * w, y0 + 0.33 * h), '', color='red')
+        self._dialog_button('Save', (x0 + 0.58 * w, y0 + 0.06 * h, 0.18 * w, 0.2 * h),
+                            lambda i=i: self._movie_dialog_accept(i))
+        self._dialog_button('Cancel', (x0 + 0.79 * w, y0 + 0.06 * h, 0.17 * w, 0.2 * h),
+                            self._close_dialog)
+        self.fig.canvas.draw_idle()
+
+    def _movie_dialog_accept(self, i):
+        path = os.path.expanduser(self._dialog['widgets']['path'].text.strip())
+        if not path or os.path.isdir(path):
+            self._dialog_error('Enter a file path, ending in a file name')
+            return
+        self._finish_movie(i, path)
+
+    def _finish_movie(self, i, path):
+        """Write volume ``i``'s view to ``path`` as a GIF, at the displayed intensity range."""
+        if not path.lower().endswith('.gif'):
+            path += '.gif'
+        volume, frame_axis, slice_axis, slice_index = self.stack.movie_view(i)
+        vmin, vmax = self.images[i].get_clim()
+        try:
+            self.movie_fn(volume, path, frame_axis=frame_axis, slice_axis=slice_axis,
+                          slice_index=slice_index, vmin=vmin, vmax=vmax, fps=self.fps)
+        except Exception as e:
+            self._file_error(f"Failed to save movie: {e}")
+            return
+        self._last_dir = os.path.dirname(os.path.abspath(path)) or self._last_dir
+        self._close_dialog(draw=False)
+        self._show_message(True, message=f"Saved movie to {path}. Press Esc to dismiss.")
 
     # --- Frame-row slider, stepping, and playback ---
 
@@ -1063,13 +1183,15 @@ class SliceViewer4D(SliceViewer):
 
 def slice_viewer4d(*datasets, data_dicts=None, title='', vmin=None, vmax=None,
                    slice_label=None, slice_axis=None, cmap='gray',
-                   show_instructions=True, block=True, save_fn=None, fps=5):
+                   show_instructions=True, block=True, save_fn=None, fps=5,
+                   movie_fn=None):
     """Launch an interactive viewer for one or more 4D volumes.
 
     This function builds a :class:`SliceViewer4D`, shows it, and returns it.  The
     viewer has every feature of :func:`slice_viewer`.  It adds a frame slider with a
     Play button, space-time planes (t-x, t-y, t-z) that show one line of the volume in
-    every frame, and a plot of the ROI mean against frame.
+    every frame, a plot of the ROI mean against frame, and, with ``movie_fn``, a
+    "Save movie" menu item.
 
     Args:
         *datasets (ndarray or None): One or more 2D, 3D, or 4D arrays to display.  A 4D
@@ -1094,7 +1216,11 @@ def slice_viewer4d(*datasets, data_dicts=None, title='', vmin=None, vmax=None,
             :func:`slice_viewer`.
         save_fn (callable, optional): Replacement for the built-in HDF5 writer, called
             as ``save_fn(file_path, array, array_name, attributes_dict)``.
-        fps (float, optional): Playback speed in frames per second.  Defaults to 5.
+        fps (float, optional): Playback speed in frames per second, also used for
+            movies.  Defaults to 5.
+        movie_fn (callable, optional): Writer for the "Save movie" item, called as
+            mbirtorch's ``save_volume_as_gif`` is.  Defaults to None, which leaves the
+            item out.  ``mbirtorch.slice_viewer4d`` passes ``save_volume_as_gif``.
 
     Returns:
         SliceViewer4D: the viewer object.
@@ -1103,7 +1229,7 @@ def slice_viewer4d(*datasets, data_dicts=None, title='', vmin=None, vmax=None,
                            vmin=vmin, vmax=vmax, slice_label=slice_label,
                            slice_axis=slice_axis, cmap=cmap,
                            show_instructions=show_instructions, save_fn=save_fn,
-                           fps=fps)
+                           fps=fps, movie_fn=movie_fn)
     viewer.show(block=block)
     # Nonblocking viewers join the slice viewer's registry, so a later blocking call
     # of either viewer adopts and closes them.

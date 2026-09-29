@@ -336,6 +336,70 @@ class TestWindow:
         assert not viewer.playing
 
 
+def gif_frames(volume, frame_axis, slice_axis, slice_index):
+    """The frames that save_volume_as_gif writes for these arguments, as its docstring
+    states them: slice_axis held at slice_index, frame_axis looping, and the other two
+    axes in increasing order."""
+    index = [slice(None)] * 4
+    index[slice_axis] = slice_index
+    return np.moveaxis(np.asarray(volume)[tuple(index)],
+                       frame_axis - (frame_axis > slice_axis), 0)
+
+
+class TestMovie:
+    @pytest.mark.parametrize('plane, transpose', [((1, 2), False), ((1, 2), True),
+                                                  ((0, 2), False), ((0, 3), True)])
+    def test_movie_frames_match_the_panel(self, plane, transpose):
+        stack = VolumeStack4D([make_volume((5, 4, 6, 3), 1)])
+        stack.set_plane([0], plane)
+        if transpose:
+            stack.transpose(0)
+        frames = gif_frames(*stack.movie_view(0))
+        assert len(frames) == stack.movie_frame_count(0)
+        for k in range(len(frames)):
+            stack.set_second(k)
+            np.testing.assert_array_equal(frames[k], stack.slice_image(0))
+
+    def test_save_movie_writes_the_panel_view(self, make_viewer, tmp_path):
+        calls = []
+        viewer = make_viewer(shifting_square(), make_volume((32, 32, 4)),
+                             slice_label=['moving', 'static'],
+                             movie_fn=lambda volume, filename, **kwargs:
+                                 calls.append((filename, kwargs)))
+        # A 3D volume has one frame in a spatial plane, so it has no movie.
+        assert 'Save movie' in [label for label, _callback in viewer._menu_items(0)]
+        assert 'Save movie' not in [label for label, _callback in viewer._menu_items(1)]
+        # On Agg the in-figure path dialog opens, with a default file name.
+        viewer._on_movie_button(0)
+        assert viewer._dialog['kind'] == 'movie'
+        assert viewer._dialog['widgets']['path'].text.endswith('moving_x-y_z2.gif')
+        viewer._dialog['widgets']['path'].set_val(str(tmp_path / 'moving'))
+        viewer._movie_dialog_accept(0)
+        filename, kwargs = calls[0]
+        assert filename == str(tmp_path / 'moving.gif')
+        assert (kwargs['frame_axis'], kwargs['slice_axis'], kwargs['slice_index']) == (0, 3, 2)
+        assert (kwargs['vmin'], kwargs['vmax']) == viewer.images[0].get_clim()
+        assert kwargs['fps'] == viewer.fps
+        assert viewer._dialog is None
+
+    def test_wrapper_writes_one_gif_frame_per_frame(self, tmp_path):
+        from PIL import Image
+        import mbirtorch.viewers.slice_figure as viewer_module
+
+        with pytest.warns(UserWarning, match='non-interactive'):
+            viewer = mbirtorch.slice_viewer4d(shifting_square(), block=False)
+        try:
+            assert viewer.movie_fn is mbirtorch.save_volume_as_gif
+            path = str(tmp_path / 'square.gif')
+            viewer._finish_movie(0, path)
+            with Image.open(path) as gif:
+                assert gif.n_frames == 12
+        finally:
+            plt.close(viewer.fig)
+            if viewer in viewer_module._NONBLOCKING_VIEWERS:
+                viewer_module._NONBLOCKING_VIEWERS.remove(viewer)
+
+
 class TestWrapper:
     def test_4d_tensor_is_converted(self):
         import torch
