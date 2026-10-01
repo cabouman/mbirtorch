@@ -53,7 +53,9 @@ This procedure stands on its own.  The TestPyPI steps above are optional.
    * Opens the pull request from ``prerelease`` to ``main``.
    * Nothing is uploaded anywhere.
 
-   Next: Once the checks pass on GitHub, accept the pull request from prerelease to main.
+   Next: review the pull request on GitHub.  The tests run on it automatically,
+   so their result shows next to the Merge button.  When you are happy, accept
+   the pull request from ``prerelease`` to ``main``.
 
 2. Publish the release::
 
@@ -63,12 +65,13 @@ This procedure stands on its own.  The TestPyPI steps above are optional.
 
    * Checks that ``main`` contains ``__version__ = 0.X.Y``; stops if the
      pull request is not merged yet.
-   * Creates a GitHub release with tag ``v0.X.Y`` on ``main``.
-   * CI builds the package, then pauses and waits for your approval.
+   * Fast-forwards ``prerelease`` up to ``main`` so the two branches are
+     identical, and updates your local ``main`` to match.
+   * Creates a GitHub release with tag ``v0.X.Y`` on the shared commit.
+   * CI builds the package and publishes it to PyPI.  No approval step.
 
-   Next: You must next approve the deployment on GitHub.
-   To do this: On GitHub, open the Actions tab, click the running release
-   workflow, click "Review deployments", check the "pypi" box, and click "Approve and deploy".
+   After this, ``main``, ``prerelease``, and the ``v0.X.Y`` tag are all on the
+   same commit.
 
 3. Check the PyPI upload.  Make a clean conda environment with the new
    version and run the tests::
