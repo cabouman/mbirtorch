@@ -9,30 +9,21 @@ def _nnal_prep(T):
     removes a full log over T from every loss and derivative evaluation.
 
     Returns:
-        (log_T, positive, all_positive, taylor_cutoff)
+        (log_T, positive, all_positive)
     """
     positive = T > 0
     Tsafe = torch.where(positive, T, torch.ones((), dtype=T.dtype, device=T.device))
     log_T = torch.log(Tsafe)
     all_positive = bool(positive.all())
-    # Crossover for the phi series: truncation ~ |Xp|^3/24 against cancellation
-    # ~ eps/|Xp|^2 (a fixed 1e-3 would be ~40x too small in float32).
-    taylor_cutoff = (24.0 * torch.finfo(T.dtype).eps) ** 0.25
-    return log_T, positive, all_positive, taylor_cutoff
+    return log_T, positive, all_positive
 
 
 def _nnal_elementwise(X, T, prep):
-    """The shifted NNAL term by term: T * phi(X + log T) with phi(u) = exp(-u) - 1 + u,
-    a Taylor branch below the dtype-aware cutoff, and exp(-X) where T == 0.
-    stable_nnal and _nnal_rowwise are reductions of this one tensor."""
-    log_T, positive, all_positive, taylor_cutoff = prep
+    """The shifted NNAL term by term: T * phi(X + log T) with phi(u) = exp(-u) - 1 + u, and exp(-X) where
+    T == 0. stable_nnal and _nnal_rowwise are reductions of this one tensor."""
+    log_T, positive, all_positive = prep
     Xp = X + log_T
-    phi = torch.where(
-        torch.abs(Xp) < taylor_cutoff,
-        Xp * Xp * (0.5 + Xp * (-1.0 / 6.0 + Xp / 24.0)),
-        torch.expm1(-Xp) + Xp,
-    )
-    loss = T * phi
+    loss = T * (torch.expm1(-Xp) + Xp)
     if not all_positive:
         # T == 0 means Xp == X, so the zero-count term is exp(-Xp). It must be a
         # real exp: expm1(-Xp) saturates at exactly -1 for Xp above ~37 in
@@ -75,7 +66,7 @@ def stable_nnal_derivatives(X: torch.Tensor, T: torch.Tensor, prep=None):
     where L is the non-negative attenuation loss in a
     numerically stable way that handles T = 0 appropriately.
     """
-    log_T, positive, all_positive, _ = _nnal_prep(T) if prep is None else prep
+    log_T, positive, all_positive = _nnal_prep(T) if prep is None else prep
 
     Xp = X + log_T
 
