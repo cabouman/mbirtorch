@@ -13,7 +13,7 @@ function is re-exported as it is.
 The 4D viewer (mbirtorch/viewers/slice_figure4d.py) gets the same conversions
 through :func:`slice_viewer4d`.  That function also passes
 :func:`~mbirtorch.utilities.save_volume_as_gif` as the writer of the viewer's
-"Save movie" item.
+GIF buttons.
 """
 
 import pprint
@@ -157,14 +157,14 @@ def slice_viewer4d(*datasets, data_dicts=None, title='', vmin=None, vmax=None,
     Launch an interactive viewer for one or more 4D volumes, such as the output of
     :meth:`MACE4DModel.recon <mbirtorch.MACE4DModel.recon>`.
 
-    The viewer has every feature of :func:`slice_viewer`.  It adds a frame slider
-    with a Play button, space-time planes (t-x, t-y, t-z) that show one line of the
-    volume in every frame, and a plot of the mean inside the ROI circle against
-    frame.  Play steps through the frames, and every panel shows the slice chosen
-    with the plane buttons and the slice slider.  Space plays and pauses, and comma
-    and period step one frame back and forward.  The right-click menu's "Save movie"
-    item writes a panel's view as a GIF with
-    :func:`~mbirtorch.utilities.save_volume_as_gif`.
+    The viewer has every feature of :func:`slice_viewer`.  It adds a frame slider,
+    space-time planes (t-x, t-y, t-z) that show one line of the volume in every
+    frame, and a plot of the mean inside the ROI circle against frame.  The slice
+    slider and the frame slider each have a Play button and a GIF button.  Play steps
+    through that slider's axis in every panel, in spatial and space-time planes.  GIF
+    saves that movie for every panel that changes along the axis, one file per panel,
+    with :func:`~mbirtorch.utilities.save_volume_as_gif`.  Space plays and pauses the
+    frame slider, and comma and period step it back and forward.
 
     Args:
         *datasets (ndarray, tensor, or None): One or more 2D, 3D, or 4D arrays to

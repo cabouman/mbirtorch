@@ -2,10 +2,10 @@
 
 The slice viewer in ``slice_figure`` is not changed.  This module subclasses its two
 classes.  ``VolumeStack4D`` adds the time axis to the data model, and ``SliceViewer4D``
-adds a frame-row slider with playback, space-time planes, and a plot of the ROI mean
-against frame.  A 4D array is ``(t, x, y, z)``.  Like ``slice_figure``, this module
-imports numpy and the matplotlib base package at most, so it loads without a GUI
-toolkit.
+adds a frame-row slider, playback and GIFs along either position slider, space-time
+planes, and a plot of the ROI mean against frame.  A 4D array is ``(t, x, y, z)``.
+Like ``slice_figure``, this module imports numpy and the matplotlib base package at
+most, so it loads without a GUI toolkit.
 """
 
 import copy
@@ -32,6 +32,10 @@ PLANE_LABELS = tuple('{}-{}'.format(AXIS_NAMES[a], AXIS_NAMES[b]) for a, b in PL
 
 ROI_PLOT_FONT_SIZE = 8
 ROI_PLOT_HINT = 'Draw an ROI on an image to plot its mean against frame'
+
+# The two position rows of the slider block.  The slice row holds the slice slider, and
+# the frame row holds the frame-row slider.  Each has a Play button and a GIF button.
+ROWS = ('slice', 'frame')
 
 # The inherited in-figure dialogs place their parts at fixed fractions of the figure
 # height, laid out for the slice viewer's figure, which is 8 inches tall.
@@ -396,23 +400,26 @@ class VolumeStack4D(VolumeStack):
 
     # --- Movies ---
 
-    def movie_frame_count(self, i):
-        """Number of frames of volume ``i``'s movie: its positions along the frame-row slider's axis."""
-        return self._source(i).shape[self.display_axes[i][3]]
+    def movie_frame_count(self, i, axis):
+        """Number of frames of volume ``i``'s movie along ``axis``, one of its hidden axes."""
+        return self._source(i).shape[axis]
 
-    def movie_view(self, i):
+    def movie_view(self, i, axis):
         """Arguments of ``save_volume_as_gif`` that write volume ``i``'s view as a movie.
 
-        Returns ``(volume, frame_axis, slice_axis, slice_index)``.  The movie plays along
-        the frame-row slider's axis at the current slice.  When the panel shows its two
-        axes transposed, they are swapped in ``volume``, so each movie frame matches the
-        panel.
+        ``axis`` is one of the volume's two hidden axes, in (t, x, y, z) numbering.  The
+        movie plays along it, and the other hidden axis stays at its current position.
+        Returns ``(volume, frame_axis, slice_axis, slice_index)``.  When the panel shows
+        its two axes transposed, they are swapped in ``volume``, so each movie frame
+        matches the panel.
         """
         rows, columns, slice_axis, second_axis = self.display_axes[i]
         volume = self._source(i)
         if rows > columns:
             volume = np.swapaxes(volume, rows, columns)
-        return volume, second_axis, slice_axis, self.cur_slices[i]
+        if axis == second_axis:
+            return volume, second_axis, slice_axis, self.cur_slices[i]
+        return volume, slice_axis, second_axis, self.cur_seconds[i]
 
     # --- File load ---
 
@@ -453,13 +460,14 @@ class SliceViewer4D(SliceViewer):
 
     The window of :class:`SliceViewer` gains radio buttons for six planes, a frame-row
     slider, and a plot of the ROI mean against frame.  In a spatial plane (x-y, x-z,
-    y-z) the frame-row slider sets the frame.  Its Play button steps through the
-    frames, and every panel shows the slice chosen with the plane buttons and the slice
-    slider.  Space plays and pauses, and comma and period step one frame back and
-    forward.  In a space-time plane (t-x, t-y, t-z) each row is one frame, and the two
-    sliders set the line of the volume that is shown.  Construction builds the figure
-    but does not display it; call :meth:`show` to display.  All data logic lives in
-    :class:`VolumeStack4D` (``self.stack``).
+    y-z) the frame-row slider sets the frame.  In a space-time plane (t-x, t-y, t-z)
+    each row is one frame, and the two sliders set the line of the volume that is
+    shown.  The slice slider and the frame-row slider each have a Play button, which
+    steps through that slider's axis, and a GIF button, which saves that movie for
+    every panel.  Space plays and pauses the frame row, and comma and period step it
+    back and forward.  Construction builds the figure but does not display it; call
+    :meth:`show` to display.  All data logic lives in :class:`VolumeStack4D`
+    (``self.stack``).
 
     Args:
         *datasets (ndarray or None): One or more 2D, 3D, or 4D arrays to display.  A 4D
@@ -482,11 +490,11 @@ class SliceViewer4D(SliceViewer):
         save_fn (callable, optional): Replacement for the built-in HDF5 writer, called
             as ``save_fn(file_path, array, array_name, attributes_dict)``.
         fps (float, optional): Playback speed in frames per second, also used for
-            movies.  Defaults to 5.
-        movie_fn (callable, optional): Writer for the menu's "Save movie" item, called
-            as mbirtorch's ``save_volume_as_gif`` is: ``movie_fn(volume, filename,
-            frame_axis=..., slice_axis=..., slice_index=..., vmin=..., vmax=...,
-            fps=...)``.  Defaults to None, which leaves the item out.
+            GIFs.  Defaults to 5.
+        movie_fn (callable, optional): Writer for the GIF buttons, called as mbirtorch's
+            ``save_volume_as_gif`` is: ``movie_fn(volume, filename, frame_axis=...,
+            slice_axis=..., slice_index=..., vmin=..., vmax=..., fps=...)``.  Defaults
+            to None, which leaves the GIF buttons out.
     """
 
     def __init__(self, *datasets, data_dicts=None, title='', vmin=None, vmax=None,
@@ -514,11 +522,16 @@ class SliceViewer4D(SliceViewer):
     def _init_interaction_state(self):
         super()._init_interaction_state()
         self.playing = False
+        # The row that plays, 'slice' or 'frame', while playing is True.
+        self._play_row = None
         self._play_timer = None
         self._play_regions = None
         self.frame_slider = None
-        self.play_button = None
-        self._frame_label = None
+        # Per row: its Play button, its buttons, and the label that playback shows in
+        # place of the slider's value.
+        self.play_buttons = {}
+        self._row_buttons = {}
+        self._play_labels = {}
         self.roi_plot_ax = None
         self._roi_lines = []
         self._roi_marker = None
@@ -545,6 +558,8 @@ class SliceViewer4D(SliceViewer):
         self._create_tooltips()
         self._create_axis_row()
         self._create_slice_slider()
+        self._create_row_controls('slice')
+        self._set_row_visible('slice', self.stack.max_slices > 1)
         self._create_intensity_slider()
         self._create_frame_row()
         self._create_roi_plot()
@@ -567,10 +582,11 @@ class SliceViewer4D(SliceViewer):
 
     @staticmethod
     def _slider_cells(spec):
-        # A slider row splits into a label cell, the slider, and a value cell, in the
-        # proportions of the inherited _slider_slot, so all the sliders line up.
+        # A slider row splits into a cell for its buttons and label, the slider, and a
+        # value cell.  Every slider row and the ROI plot use these proportions, so they
+        # line up.
         return sf.gridspec.GridSpecFromSubplotSpec(1, 3, subplot_spec=spec,
-                                                   width_ratios=[1.7, 8.0, 2.0])
+                                                   width_ratios=[2.5, 8.0, 2.0])
 
     def _slider_slot(self, row):
         # The inherited sliders ask for row 2 (slice) and row 3 (intensity).  Here they
@@ -639,23 +655,42 @@ class SliceViewer4D(SliceViewer):
         self.slice_slider.label.set_text(
             AXIS_NAMES[axes.pop()] if len(axes) == 1 else 'Slice')
 
-    def _create_frame_row(self):
-        # The frame row is the middle row of the slider block.  Its left cell holds the
-        # Play button beside the slider's label, and its right cell holds the frame
-        # label that playback shows in place of the slider's value.
-        cells = self._slider_cells(self._slider_rows[1, 0])
+    def _create_row_controls(self, row):
+        """Add the Play and GIF buttons of a position row, and its playback label.
+
+        ``row`` is 'slice' (the first row of the slider block) or 'frame' (the second).
+        The buttons sit in the row's left cell, beside the slider's label, and the label
+        that playback shows in place of the slider's value sits in the right cell.
+        Returns the row's cells.
+        """
+        cells = self._slider_cells(self._slider_rows[ROWS.index(row), 0])
         left = sf.gridspec.GridSpecFromSubplotSpec(
-            1, 2, subplot_spec=cells[0, 0], width_ratios=[1.0, 0.7])
-        self._play_ax = self.fig.add_subplot(left[0, 0])
-        self.play_button = sf.Button(self._play_ax, 'Play')
-        self.play_button.label.set_fontsize(sf.STRIP_FONT_SIZE)
-        self.play_button.on_clicked(lambda _event: self._toggle_play())
+            1, 3, subplot_spec=cells[0, 0], width_ratios=[1.0, 0.8, 0.7], wspace=0.15)
+        play_button = sf.Button(self.fig.add_subplot(left[0, 0]), 'Play')
+        play_button.on_clicked(lambda _event: self._toggle_play(row))
+        buttons = [play_button]
+        if self.movie_fn is not None:
+            gif_button = sf.Button(self.fig.add_subplot(left[0, 1]), 'GIF')
+            gif_button.on_clicked(lambda _event: self._on_gif_button(row))
+            buttons.append(gif_button)
+        for button in buttons:
+            button.label.set_fontsize(sf.STRIP_FONT_SIZE)
+        self.play_buttons[row] = play_button
+        self._row_buttons[row] = buttons
+        label_ax = self.fig.add_subplot(cells[0, 2])
+        label_ax.axis('off')
+        self._play_labels[row] = label_ax.text(0.02, 0.5, '', va='center', fontsize=10,
+                                               visible=False, transform=label_ax.transAxes)
+        return cells
+
+    def _set_row_visible(self, row, visible):
+        for button in self._row_buttons[row]:
+            button.ax.set_visible(visible)
+
+    def _create_frame_row(self):
+        # The frame row is the middle row of the slider block.
+        cells = self._create_row_controls('frame')
         self._frame_slider_ax = self.fig.add_subplot(cells[0, 1])
-        self._frame_label_ax = self.fig.add_subplot(cells[0, 2])
-        self._frame_label_ax.axis('off')
-        self._frame_label = self._frame_label_ax.text(
-            0.02, 0.5, '', va='center', fontsize=10, visible=False,
-            transform=self._frame_label_ax.transAxes)
         self._update_second_slider()
 
     def _make_frame_slider(self):
@@ -673,14 +708,13 @@ class SliceViewer4D(SliceViewer):
         stack = self.stack
         count = stack.second_count
         visible = count > 1
-        # Playback and the ROI plot follow the frames, so they appear in a spatial
-        # plane only.
-        plays = visible and stack.second_axis == 0
         self._frame_slider_ax.set_visible(visible)
-        self._play_ax.set_visible(plays)
+        self._set_row_visible('frame', visible)
         if self.roi_plot_ax is not None:
-            self.roi_plot_ax.set_visible(plays)
-            if plays:
+            # The ROI plot follows the frames, so it appears in a spatial plane only.
+            roi_visible = visible and stack.second_axis == 0
+            self.roi_plot_ax.set_visible(roi_visible)
+            if roi_visible:
                 self.roi_plot_ax.set_xlim(0, count - 1)
         if not visible:
             return
@@ -797,11 +831,6 @@ class SliceViewer4D(SliceViewer):
         if self.stack.second_axis != 0:
             # A space-time plane is shown in every panel, so the panels stay coupled.
             items = [item for item in items if item[0] != 'Decouple slice axes']
-        if self.movie_fn is not None and self.stack.movie_frame_count(i) > 1:
-            labels = [label for label, _callback in items]
-            position = (labels.index('Save data to h5') + 1 if 'Save data to h5' in labels
-                        else len(items) - 1)
-            items.insert(position, ('Save movie', lambda i=i: self._on_movie_button(i)))
         return items
 
     def _reset_view(self, volume_index=None):
@@ -824,30 +853,59 @@ class SliceViewer4D(SliceViewer):
         finally:
             self._in_sync_callback = already_syncing
 
-    # --- Save movie ---
+    # --- The two position rows: their axes, and the panels that change along them ---
 
-    def _movie_file_name(self, i):
-        # For example init_x-y_z32.gif: the label, the plane, and the fixed slice.
+    def _row_slider(self, row):
+        return self.slice_slider if row == 'slice' else self.frame_slider
+
+    def _row_axis(self, row, i):
+        """Axis of volume ``i`` that the row's slider moves, in (t, x, y, z) numbering."""
+        slice_axis, second_axis = self.stack.display_axes[i][2:]
+        return slice_axis if row == 'slice' else second_axis
+
+    def _row_position(self, row):
+        """Return (position, number of positions) of the row's slider."""
         stack = self.stack
-        slice_axis = stack.display_axes[i][2]
+        if row == 'slice':
+            return stack.master_index, stack.max_slices
+        return stack.second_position, stack.second_count
+
+    def _moving_panels(self, row):
+        """Panels whose view changes along the row's axis."""
+        return [i for i in range(self.stack.n_volumes)
+                if self.stack.movie_frame_count(i, self._row_axis(row, i)) > 1]
+
+    # --- GIF buttons ---
+
+    def _gif_file_name(self, row, i):
+        # For example init_x-y_along-z_t3.gif: the label, the plane, the axis the movie
+        # plays along, and the position along the other hidden axis.
+        stack = self.stack
+        slice_axis, second_axis = stack.display_axes[i][2:]
+        axis = self._row_axis(row, i)
+        fixed_axis, fixed_index = ((second_axis, stack.cur_seconds[i]) if axis == slice_axis
+                                   else (slice_axis, stack.cur_slices[i]))
         label = re.sub(r'[^A-Za-z0-9_-]+', '_', stack.labels[i]).strip('_') or 'volume'
         plane = PLANE_LABELS[PLANES.index(stack.plane(i))]
-        return '{}_{}_{}{}.gif'.format(label, plane, AXIS_NAMES[slice_axis],
-                                       stack.cur_slices[i])
+        name = '{}_{}_along-{}'.format(label, plane, AXIS_NAMES[axis])
+        # A volume that does not change in time has no frame to name.
+        if fixed_axis != 0 or stack.has_time(i):
+            name += '_{}{}'.format(AXIS_NAMES[fixed_axis], fixed_index)
+        return name + '.gif'
 
-    def _on_movie_button(self, i):
-        name = self._movie_file_name(i)
-        chosen = self._native_choose_movie_path(self._last_dir, name)
+    def _on_gif_button(self, row):
+        chosen = self._native_choose_folder(self._last_dir)
         if chosen is sf._NATIVE_UNAVAILABLE:
-            self._open_movie_dialog(i, name)
+            self._open_gif_dialog(row)
         elif chosen is not None:
-            self._finish_movie(i, chosen)
+            self._write_gifs(row, chosen)
 
-    def _native_choose_movie_path(self, directory, initial_file):
-        """Return a chosen path, None if cancelled, or the unavailable marker.
+    def _native_choose_folder(self, directory):
+        """Return a folder chosen in the macOS folder panel, None if cancelled, or the
+        unavailable marker.
 
-        The macOS save panel runs in its own process, so it works under every
-        backend.  On other systems the in-figure path dialog is used.
+        The panel runs in its own process, so it works under every backend.  On other
+        systems the in-figure dialog is used.
         """
         if (sys.platform != 'darwin'
                 or matplotlib.get_backend().lower() in sf.NONINTERACTIVE_BACKENDS):
@@ -857,8 +915,7 @@ class SliceViewer4D(SliceViewer):
         def quoted(text):
             return text.replace('\\', '\\\\').replace('"', '\\"')
 
-        script = ('POSIX path of (choose file name with prompt "Save movie as GIF" '
-                  f'default name "{quoted(initial_file)}" '
+        script = ('POSIX path of (choose folder with prompt "Save the GIFs in" '
                   f'default location POSIX file "{quoted(directory)}")')
         try:
             result = subprocess.run(['osascript', '-e', script],
@@ -871,44 +928,65 @@ class SliceViewer4D(SliceViewer):
             return sf._NATIVE_UNAVAILABLE
         return result.stdout.strip() or None
 
-    def _open_movie_dialog(self, i, name):
-        """In-figure dialog with a path box for the movie file."""
-        self._open_dialog('movie')
+    def _open_gif_dialog(self, row):
+        """In-figure dialog with a path box for the folder of the GIFs."""
+        self._open_dialog('gif')
         x0, y0, w, h = self._dialog_panel(6.0, 1.9)
         self._dialog_text('title', (x0 + 0.02 * w, y0 + h - 0.05),
-                          'Save movie as GIF', fontweight='bold')
-        self._dialog_textbox('path', 'Path ',
-                             (x0 + 0.09 * w, y0 + 0.48 * h, 0.88 * w, 0.2 * h),
-                             os.path.join(self._last_dir, name))
+                          'Save the GIFs in a folder', fontweight='bold')
+        self._dialog_textbox('path', 'Folder ',
+                             (x0 + 0.11 * w, y0 + 0.48 * h, 0.86 * w, 0.2 * h),
+                             self._last_dir)
         self._dialog_text('error', (x0 + 0.02 * w, y0 + 0.33 * h), '', color='red')
         self._dialog_button('Save', (x0 + 0.58 * w, y0 + 0.06 * h, 0.18 * w, 0.2 * h),
-                            lambda i=i: self._movie_dialog_accept(i))
+                            lambda: self._gif_dialog_accept(row))
         self._dialog_button('Cancel', (x0 + 0.79 * w, y0 + 0.06 * h, 0.17 * w, 0.2 * h),
                             self._close_dialog)
         self.fig.canvas.draw_idle()
 
-    def _movie_dialog_accept(self, i):
-        path = os.path.expanduser(self._dialog['widgets']['path'].text.strip())
-        if not path or os.path.isdir(path):
-            self._dialog_error('Enter a file path, ending in a file name')
+    def _gif_dialog_accept(self, row):
+        folder = os.path.expanduser(self._dialog['widgets']['path'].text.strip())
+        if not folder:
+            self._dialog_error('Enter a folder')
             return
-        self._finish_movie(i, path)
+        self._write_gifs(row, folder)
 
-    def _finish_movie(self, i, path):
-        """Write volume ``i``'s view to ``path`` as a GIF, at the displayed intensity range."""
-        if not path.lower().endswith('.gif'):
-            path += '.gif'
-        volume, frame_axis, slice_axis, slice_index = self.stack.movie_view(i)
-        vmin, vmax = self.images[i].get_clim()
-        try:
-            self.movie_fn(volume, path, frame_axis=frame_axis, slice_axis=slice_axis,
-                          slice_index=slice_index, vmin=vmin, vmax=vmax, fps=self.fps)
-        except Exception as e:
-            self._file_error(f"Failed to save movie: {e}")
-            return
-        self._last_dir = os.path.dirname(os.path.abspath(path)) or self._last_dir
+    def _write_gifs(self, row, folder):
+        """Write one GIF per panel that changes along the row's axis into ``folder``.
+
+        Each GIF plays the panel's view along the axis, at the displayed intensity
+        range.  A file that exists already is kept, and the new GIF gets a numbered
+        name.
+        """
+        os.makedirs(folder, exist_ok=True)
+        written = []
+        for i in self._moving_panels(row):
+            path = self._unused_path(os.path.join(folder, self._gif_file_name(row, i)))
+            volume, frame_axis, slice_axis, slice_index = self.stack.movie_view(
+                i, self._row_axis(row, i))
+            vmin, vmax = self.images[i].get_clim()
+            try:
+                self.movie_fn(volume, path, frame_axis=frame_axis, slice_axis=slice_axis,
+                              slice_index=slice_index, vmin=vmin, vmax=vmax, fps=self.fps)
+            except Exception as e:
+                self._file_error(f"Failed to save a GIF: {e}")
+                return
+            written.append(os.path.basename(path))
+        self._last_dir = os.path.abspath(folder)
         self._close_dialog(draw=False)
-        self._show_message(True, message=f"Saved movie to {path}. Press Esc to dismiss.")
+        count = '1 GIF' if len(written) == 1 else '{} GIFs'.format(len(written))
+        self._show_message(True, message=sf.multiline(
+            'Saved {} in {}:'.format(count, folder), *written, 'Press Esc to dismiss.'))
+
+    @staticmethod
+    def _unused_path(path):
+        """Return ``path``, or ``path`` with a number before its extension if it exists."""
+        stem, extension = os.path.splitext(path)
+        number = 2
+        while os.path.exists(path):
+            path = '{}_{}{}'.format(stem, number, extension)
+            number += 1
+        return path
 
     # --- Frame-row slider, stepping, and playback ---
 
@@ -928,58 +1006,69 @@ class SliceViewer4D(SliceViewer):
         self.frame_slider.set_val(
             int(np.clip(stack.second_position + step, 0, stack.second_count - 1)))
 
-    def _toggle_play(self):
+    def _toggle_play(self, row='frame'):
+        """Play the row's slider, or pause it if it is playing.
+
+        One row plays at a time, so a row that plays stops when the other row starts.
+        """
+        playing_row = self._play_row
         if self.playing:
             self._stop_playback()
-        else:
-            self._start_playback()
+        if playing_row != row:
+            self._start_playback(row)
 
     def _pause_if_playing(self):
         if self.playing:
             self._stop_playback()
 
-    def _playback_regions(self):
-        """(bbox, artists) pairs that playback redraws on every frame."""
+    def _playback_regions(self, row):
+        """(bbox, artists) pairs that playback of the row redraws on every step."""
         regions = []
-        for i in range(self.stack.n_volumes):
-            if not self.stack.has_time(i):
-                continue
+        for i in self._moving_panels(row):
             # The ROI circle and its statistics sit above the image, so they are
             # redrawn after it.
             artists = [self.images[i]] + [artist for artist in
                                           (self.circles[i], self.stats_texts[i])
                                           if artist is not None]
             regions.append((self.axes[i].bbox, artists))
-        regions.append((self._frame_label_ax.bbox, [self._frame_label]))
-        if self.roi_plot_ax.get_visible():
+        label = self._play_labels[row]
+        regions.append((label.axes.bbox, [label]))
+        # The marker of the ROI plot follows the frame.
+        if row == 'frame' and self.roi_plot_ax.get_visible():
             regions.append((self.roi_plot_ax.bbox, [self._roi_marker]))
         return regions
 
-    def _start_playback(self):
-        # Only the frames play, so playback runs in a spatial plane.
-        if (self.frame_slider is None or self._dialog is not None
-                or self.stack.second_axis != 0):
+    def _row_label_text(self, row):
+        # For example "t = 3": the slider's name and its position.
+        return '{} = {}'.format(self._row_slider(row).label.get_text(),
+                                self._row_position(row)[0])
+
+    def _start_playback(self, row):
+        slider = self._row_slider(row)
+        if slider is None or self._dialog is not None or self._row_position(row)[1] < 2:
             return
         self.playing = True
+        self._play_row = row
         self._hide_tooltips()
-        self.play_button.label.set_text('Pause')
+        self.play_buttons[row].label.set_text('Pause')
         # On a canvas that can blit, playback redraws only the images, the ROI
-        # graphics above them, the frame label, and the plot marker.  They are marked
-        # animated, so ordinary draws leave them out, and their backgrounds are saved
-        # after one full draw.  Nothing else changes while the viewer plays, which is
-        # what keeps the macosx backend from redrawing the whole figure on each frame.
-        # A canvas that cannot blit, such as the WebAgg and notebook canvases, redraws
-        # the whole figure on each frame, so the artists stay in ordinary draws.
+        # graphics above them, the playback label, and the plot marker.  They are
+        # marked animated, so ordinary draws leave them out, and their backgrounds are
+        # saved after one full draw.  Nothing else changes while the viewer plays,
+        # which is what keeps the macosx backend from redrawing the whole figure on each
+        # step.  A canvas that cannot blit, such as the WebAgg and notebook canvases,
+        # redraws the whole figure on each step, so the artists stay in ordinary draws.
         canvas = self.fig.canvas
         blit = getattr(canvas, 'supports_blit', False)
-        regions = self._playback_regions()
+        regions = self._playback_regions(row)
         if blit:
             for _bbox, artists in regions:
                 for artist in artists:
                     artist.set_animated(True)
-        self.frame_slider.valtext.set_visible(False)
-        self._frame_label.set_text('t = {}'.format(self.stack.master_frame))
-        self._frame_label.set_visible(True)
+        slider.valtext.set_visible(False)
+        label = self._play_labels[row]
+        label.set_text(self._row_label_text(row))
+        label.set_visible(True)
         canvas.draw()
         if blit:
             self._play_regions = [(bbox, canvas.copy_from_bbox(bbox), artists)
@@ -992,15 +1081,20 @@ class SliceViewer4D(SliceViewer):
         self._play_timer.start()
 
     def _play_step(self):
-        """Advance playback by one frame, looping at the end."""
+        """Advance playback by one position, looping at the end."""
         if not self.playing:
             return
-        stack = self.stack
-        changed = stack.set_frame((stack.master_frame + 1) % stack.max_frames)
+        row = self._play_row
+        position, count = self._row_position(row)
+        if row == 'slice':
+            changed = self.stack.set_master_index((position + 1) % count)
+        else:
+            changed = self.stack.set_second((position + 1) % count)
         for i in changed:
-            self.images[i].set_data(stack.slice_image(i))
-        self._frame_label.set_text('t = {}'.format(stack.master_frame))
-        self._move_roi_marker()
+            self.images[i].set_data(self.stack.slice_image(i))
+        self._play_labels[row].set_text(self._row_label_text(row))
+        if row == 'frame':
+            self._move_roi_marker()
         self._blit_playback()
 
     def _blit_playback(self):
@@ -1019,22 +1113,27 @@ class SliceViewer4D(SliceViewer):
             pass
 
     def _stop_playback(self):
+        row = self._play_row
         if self._play_timer is not None:
             self._play_timer.stop()
             self._play_timer = None
         self.playing = False
+        self._play_row = None
         # Only a canvas that can blit has animated artists and saved regions.
         if self._play_regions is not None:
             for _bbox, _background, artists in self._play_regions:
                 for artist in artists:
                     artist.set_animated(False)
         self._play_regions = None
-        self._frame_label.set_visible(False)
-        self.frame_slider.valtext.set_visible(True)
-        self.play_button.label.set_text('Play')
-        # The slider and the titles were left alone during playback, so they catch
-        # up here.  Setting the slider refreshes the panels and the ROI statistics.
-        self.frame_slider.set_val(self.stack.master_frame)
+        self._play_labels[row].set_visible(False)
+        slider = self._row_slider(row)
+        slider.valtext.set_visible(True)
+        self.play_buttons[row].label.set_text('Play')
+        # The slider, the titles, and the ROI plot were left alone during playback, so
+        # they catch up here.  Setting the slider moves the ROI plot's marker or
+        # recomputes its curves.
+        slider.set_val(self._row_position(row)[0])
+        self.refresh()
         self._display_roi_stats(force=True)
         self.fig.canvas.draw_idle()
 
@@ -1053,10 +1152,11 @@ class SliceViewer4D(SliceViewer):
             self._play_timer.stop()
             self._play_timer = None
         self.playing = False
+        self._play_row = None
 
     def _on_button_press(self, event):
-        # The Play button handles its own clicks.
-        if event.inaxes is not getattr(self, '_play_ax', None):
+        # A Play button handles its own clicks, which pause or switch the playback.
+        if event.inaxes not in [button.ax for button in self.play_buttons.values()]:
             self._pause_if_playing()
         super()._on_button_press(event)
 
@@ -1074,11 +1174,16 @@ class SliceViewer4D(SliceViewer):
             self.fig.canvas.draw_idle()
 
     def _on_key(self, event):
-        if self._dialog is None and self.frame_slider is not None:
-            if event.key == ' ':
-                self._toggle_play()
+        # Space pauses any playback, or plays the frame row.  Comma and period step the
+        # frame row.
+        if self._dialog is None:
+            if event.key == ' ' and (self.playing or self.frame_slider is not None):
+                if self.playing:
+                    self._stop_playback()
+                else:
+                    self._start_playback('frame')
                 return
-            if event.key in (',', '.'):
+            if event.key in (',', '.') and self.frame_slider is not None:
                 self._step_frame(-1 if event.key == ',' else 1)
                 return
         self._pause_if_playing()
@@ -1092,7 +1197,8 @@ class SliceViewer4D(SliceViewer):
                 'Right-click the intensity slider or press Set range '
                 'for exact bounds',
                 'Plane t-x, t-y, or t-z shows one line of the volume in every frame',
-                'Press [space] to play or pause, [,] and [.] to step one position',
+                'Play and GIF beside a slider play its axis and save it as GIFs',
+                'Press [space] to play or pause, [,] and [.] to step the frame row',
                 'Press [esc] to remove ROI/messages/dialogs',
                 'Close the window to quit')
             message_type = None
@@ -1146,10 +1252,15 @@ class SliceViewer4D(SliceViewer):
 
     def _main_widgets(self):
         widgets = super()._main_widgets()
-        for widget in (self.frame_slider, self.play_button):
-            if widget is not None:
-                widgets.append(widget)
+        if self.frame_slider is not None:
+            widgets.append(self.frame_slider)
+        for buttons in self._row_buttons.values():
+            widgets.extend(buttons)
         return widgets
+
+    def _update_slice_slider(self):
+        super()._update_slice_slider()
+        self._set_row_visible('slice', self.stack.max_slices > 1)
 
     # --- Actions that change what the ROI plot shows ---
 
@@ -1198,11 +1309,11 @@ def slice_viewer4d(*datasets, data_dicts=None, title='', vmin=None, vmax=None,
     """Launch an interactive viewer for one or more 4D volumes.
 
     This function builds a :class:`SliceViewer4D`, shows it, and returns it.  The
-    viewer has every feature of :func:`slice_viewer`.  It adds a frame slider with a
-    Play button, space-time planes (t-x, t-y, t-z) that show one line of the volume in
-    every frame, a plot of the ROI mean against frame, and, with ``movie_fn``, a
-    "Save movie" menu item.  Play steps through the frames, and every panel shows the
-    slice chosen with the plane buttons and the slice slider.
+    viewer has every feature of :func:`slice_viewer`.  It adds a frame slider,
+    space-time planes (t-x, t-y, t-z) that show one line of the volume in every frame,
+    and a plot of the ROI mean against frame.  The slice slider and the frame slider
+    each have a Play button, which steps through that slider's axis in every panel, and,
+    with ``movie_fn``, a GIF button, which saves that movie for every panel.
 
     Args:
         *datasets (ndarray or None): One or more 2D, 3D, or 4D arrays to display.  A 4D
@@ -1228,10 +1339,10 @@ def slice_viewer4d(*datasets, data_dicts=None, title='', vmin=None, vmax=None,
         save_fn (callable, optional): Replacement for the built-in HDF5 writer, called
             as ``save_fn(file_path, array, array_name, attributes_dict)``.
         fps (float, optional): Playback speed in frames per second, also used for
-            movies.  Defaults to 5.
-        movie_fn (callable, optional): Writer for the "Save movie" item, called as
+            GIFs.  Defaults to 5.
+        movie_fn (callable, optional): Writer for the GIF buttons, called as
             mbirtorch's ``save_volume_as_gif`` is.  Defaults to None, which leaves the
-            item out.  ``mbirtorch.slice_viewer4d`` passes ``save_volume_as_gif``.
+            GIF buttons out.  ``mbirtorch.slice_viewer4d`` passes ``save_volume_as_gif``.
 
     Returns:
         SliceViewer4D: the viewer object.

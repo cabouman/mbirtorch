@@ -4,9 +4,11 @@ The model tests check the frame rules (a 3D volume stays fixed in time, and a
 shorter 4D volume holds its last frame), how slice_axis counts each array's axes,
 differences between 4D and 3D volumes, Load of a 4D array, the ROI mean against
 frame, and the default display range.  The controller tests run headlessly on Agg:
-they render a window, draw an ROI with mouse events, step and play frames, and open
-the viewer through the mbirtorch wrapper with a tensor.
+they render a window, draw an ROI with mouse events, step frames, play either slider,
+save GIFs, and open the viewer through the mbirtorch wrapper with a tensor.
 """
+
+import os
 
 import numpy as np
 import pytest
@@ -286,7 +288,6 @@ class TestWindow:
         assert viewer.stack.display_axes[0] == [0, 2, 3, 1]
         assert viewer.frame_slider.label.get_text() == 'x'
         assert viewer.slice_slider.label.get_text() == 'z'
-        assert not viewer._play_ax.get_visible()
         assert not viewer.roi_plot_ax.get_visible()
         assert viewer.axes[0].get_aspect() == 'auto'
         assert viewer.axes[0].get_title().splitlines()[0] == 'moving: x = 16, z = 2'
@@ -295,13 +296,10 @@ class TestWindow:
         left_edges = np.argmax(image > 0.5, axis=1)
         np.testing.assert_array_equal(left_edges[:6], left_edges[6:])
         assert len(set(left_edges[:6])) > 1
-        # Space does not play in a space-time plane.
-        _press_key(viewer.fig, ' ')
-        assert not viewer.playing
-        # In a spatial plane the frame row sets the frame and plays again.
+        # In a spatial plane the frame row sets the frame, and the ROI plot returns.
         radio.set_active(PLANE_LABELS.index('x-y'))
         assert viewer.frame_slider.label.get_text() == 't'
-        assert viewer._play_ax.get_visible() and viewer.roi_plot_ax.get_visible()
+        assert viewer.roi_plot_ax.get_visible()
         assert viewer.axes[0].get_aspect() == 1.0
 
     def test_position_sliders_sit_together_above_the_intensity_slider(self, make_viewer):
@@ -355,6 +353,55 @@ class TestWindow:
         _press_key(viewer.fig, ' ')
         assert not viewer.playing
 
+    def test_slice_row_plays_along_the_slice_axis(self, make_viewer):
+        viewer = make_viewer(shifting_square(), slice_label='moving')
+        assert all(viewer.play_buttons[row].ax.get_visible() for row in ('slice', 'frame'))
+        viewer.frame_slider.set_val(3)
+        viewer._toggle_play('slice')
+        assert viewer.playing and viewer.play_buttons['slice'].label.get_text() == 'Pause'
+        # The timer does not fire on Agg, so the playback steps are taken by hand.  The
+        # slice row loops through z at the current frame.
+        viewer._play_step()
+        assert (viewer.stack.master_index, viewer.stack.master_frame) == (3, 3)
+        viewer._play_step()
+        assert viewer.stack.master_index == 0
+        np.testing.assert_array_equal(np.asarray(viewer.images[0].get_array()),
+                                      viewer.stack.slice_image(0))
+        viewer._toggle_play('slice')
+        assert not viewer.playing and viewer.slice_slider.val == 0
+        assert viewer.axes[0].get_title().splitlines()[0] == 'moving: t = 3, z = 0'
+
+    def test_slice_row_is_hidden_without_slices(self, make_viewer):
+        viewer = make_viewer(shifting_square(depth=1))
+        assert not viewer.play_buttons['slice'].ax.get_visible()
+        assert viewer.play_buttons['frame'].ax.get_visible()
+
+    def test_one_row_plays_at_a_time(self, make_viewer):
+        viewer = make_viewer(shifting_square())
+        viewer._toggle_play('frame')
+        viewer._toggle_play('slice')
+        assert viewer.playing and viewer._play_row == 'slice'
+        assert viewer.play_buttons['frame'].label.get_text() == 'Play'
+        assert viewer.play_buttons['slice'].label.get_text() == 'Pause'
+        # Space pauses whichever row plays.
+        _press_key(viewer.fig, ' ')
+        assert not viewer.playing
+
+    def test_space_time_playback_sweeps_the_hidden_axis(self, make_viewer):
+        viewer = make_viewer(shifting_square(), slice_label='moving')
+        viewer.axis_radios[0].set_active(PLANE_LABELS.index('t-y'))
+        assert viewer.play_buttons['frame'].ax.get_visible()
+        # In t-y the frame row plays x, so every step shows the t-y image at the next x.
+        _press_key(viewer.fig, ' ')
+        assert viewer.playing
+        viewer._play_step()
+        assert viewer.stack.second_position == 17
+        np.testing.assert_array_equal(np.asarray(viewer.images[0].get_array()),
+                                      viewer.stack.slice_image(0))
+        _press_key(viewer.fig, ' ')
+        assert not viewer.playing and viewer.frame_slider.val == 17
+        assert viewer.axes[0].get_title().splitlines()[0] == 'moving: x = 17, z = 2'
+
     def test_playback_without_blitting_keeps_the_images(self, make_viewer):
         # The WebAgg and notebook canvases cannot blit, so playback redraws the whole
         # figure on each frame, and the images must stay in those draws.
@@ -387,40 +434,58 @@ def gif_frames(volume, frame_axis, slice_axis, slice_index):
 class TestMovie:
     @pytest.mark.parametrize('plane, transpose', [((1, 2), False), ((1, 2), True),
                                                   ((0, 2), False), ((0, 3), True)])
-    def test_movie_frames_match_the_panel(self, plane, transpose):
+    @pytest.mark.parametrize('row', ['slice', 'frame'])
+    def test_movie_frames_match_the_panel(self, plane, transpose, row):
+        # A movie along either hidden axis shows what the panel shows when that
+        # axis's slider steps.
         stack = VolumeStack4D([make_volume((5, 4, 6, 3), 1)])
         stack.set_plane([0], plane)
         if transpose:
             stack.transpose(0)
-        frames = gif_frames(*stack.movie_view(0))
-        assert len(frames) == stack.movie_frame_count(0)
+        slice_axis, second_axis = stack.display_axes[0][2:]
+        axis = slice_axis if row == 'slice' else second_axis
+        frames = gif_frames(*stack.movie_view(0, axis))
+        assert len(frames) == stack.movie_frame_count(0, axis)
         for k in range(len(frames)):
-            stack.set_second(k)
+            if row == 'slice':
+                stack.set_master_index(k)
+            else:
+                stack.set_second(k)
             np.testing.assert_array_equal(frames[k], stack.slice_image(0))
 
-    def test_save_movie_writes_the_panel_view(self, make_viewer, tmp_path):
+    def test_gif_button_writes_one_gif_per_panel_that_moves(self, make_viewer, tmp_path):
         calls = []
         viewer = make_viewer(shifting_square(), make_volume((32, 32, 4)),
                              slice_label=['moving', 'static'],
                              movie_fn=lambda volume, filename, **kwargs:
-                                 calls.append((filename, kwargs)))
-        # A 3D volume has one frame in a spatial plane, so it has no movie.
-        assert 'Save movie' in [label for label, _callback in viewer._menu_items(0)]
-        assert 'Save movie' not in [label for label, _callback in viewer._menu_items(1)]
-        # On Agg the in-figure path dialog opens, with a default file name.
-        viewer._on_movie_button(0)
-        assert viewer._dialog['kind'] == 'movie'
-        assert viewer._dialog['widgets']['path'].text.endswith('moving_x-y_z2.gif')
-        viewer._dialog['widgets']['path'].set_val(str(tmp_path / 'moving'))
-        viewer._movie_dialog_accept(0)
-        filename, kwargs = calls[0]
-        assert filename == str(tmp_path / 'moving.gif')
+                                 calls.append((os.path.basename(filename), kwargs)))
+        assert 'Save movie' not in [label for label, _callback in viewer._menu_items(0)]
+        # On Agg the in-figure folder dialog opens.  A 3D volume does not change in
+        # time, so the frame row writes a GIF of the 4D panel only.
+        viewer._on_gif_button('frame')
+        assert viewer._dialog['kind'] == 'gif'
+        viewer._dialog['widgets']['path'].set_val(str(tmp_path))
+        viewer._gif_dialog_accept('frame')
+        assert viewer._dialog is None
+        assert [name for name, _kwargs in calls] == ['moving_x-y_along-t_z2.gif']
+        kwargs = calls[0][1]
         assert (kwargs['frame_axis'], kwargs['slice_axis'], kwargs['slice_index']) == (0, 3, 2)
         assert (kwargs['vmin'], kwargs['vmax']) == viewer.images[0].get_clim()
         assert kwargs['fps'] == viewer.fps
-        assert viewer._dialog is None
+        # Along z both panels change.  A file that exists already is kept.
+        calls.clear()
+        (tmp_path / 'static_x-y_along-z.gif').write_bytes(b'')
+        viewer._write_gifs('slice', str(tmp_path))
+        assert [name for name, _kwargs in calls] == ['moving_x-y_along-z_t0.gif',
+                                                     'static_x-y_along-z_2.gif']
+        kwargs = calls[0][1]
+        assert (kwargs['frame_axis'], kwargs['slice_axis'], kwargs['slice_index']) == (3, 0, 0)
 
-    def test_wrapper_writes_one_gif_frame_per_frame(self, tmp_path):
+    def test_gif_buttons_need_a_writer(self, make_viewer):
+        viewer = make_viewer(shifting_square())
+        assert [len(viewer._row_buttons[row]) for row in ('slice', 'frame')] == [1, 1]
+
+    def test_wrapper_writes_one_gif_frame_per_position(self, tmp_path):
         from PIL import Image
         import mbirtorch.viewers.slice_figure as viewer_module
 
@@ -428,10 +493,12 @@ class TestMovie:
             viewer = mbirtorch.slice_viewer4d(shifting_square(), block=False)
         try:
             assert viewer.movie_fn is mbirtorch.save_volume_as_gif
-            path = str(tmp_path / 'square.gif')
-            viewer._finish_movie(0, path)
-            with Image.open(path) as gif:
+            viewer._write_gifs('frame', str(tmp_path))
+            viewer._write_gifs('slice', str(tmp_path))
+            with Image.open(tmp_path / 'volume_x-y_along-t_z2.gif') as gif:
                 assert gif.n_frames == 12
+            with Image.open(tmp_path / 'volume_x-y_along-z_t0.gif') as gif:
+                assert gif.n_frames == 4
         finally:
             plt.close(viewer.fig)
             if viewer in viewer_module._NONBLOCKING_VIEWERS:
