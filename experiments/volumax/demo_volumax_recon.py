@@ -19,10 +19,11 @@ weight_type = None                # None, or a weight type for mbirtorch.gen_wei
 sinogram_path = None              # optional precomputed -log sinogram (.npy)
 output_path = None                # e.g. './output/volumax_recon.h5'; None skips saving
 show_viewer = True
-compare_uncalibrated = False      # also reconstruct with the uncalibrated channel offset from the metadata, to compare
+compare_calibrated = False        # also reconstruct with the channel offset estimated from the sinogram, to compare
+                                  # (the estimate compares opposite views, so it needs a full rotation)
 
 # ----------------------------------------------------------------------------------------------
-# 1. Sinogram and calibrated cone-beam model
+# 1. Sinogram and cone-beam model with the geometry from the metadata
 # ----------------------------------------------------------------------------------------------
 sino, ct_model = volumax.get_sino_and_model(scan_dir, downsample_factor=downsample_factor,
                                             subsample_view_factor=subsample_view_factor, sinogram_path=sinogram_path)
@@ -47,33 +48,32 @@ if output_path is not None:
     print(f'Reconstruction saved to {output_path}')
 
 # ----------------------------------------------------------------------------------------------
-# 4. Optional: the same reconstruction with the uncalibrated channel offset from the metadata
+# 4. Optional: the same reconstruction with the channel offset estimated from the sinogram
 # ----------------------------------------------------------------------------------------------
-if compare_uncalibrated:
-    # The channel offset from the metadata alone, in the frame of the model; the calibration starts from it.
+if compare_calibrated:
+    # The calibration needs the detector rotation from the metadata, which was already removed from the sinogram.
     _, volumax_params = volumax.load_scans_and_params(scan_dir, subsample_view_factor=subsample_view_factor,
                                                       downsample_factor=downsample_factor, verbose=0, load_scans=False)
-    geometry = volumax.compute_geometry(volumax_params, verbose=0)
-    _, optional_params = volumax.convert_volumax_to_mbirtorch_params(volumax_params, geometry,
-                                                                     downsample_factor=downsample_factor, verbose=0)
-    meta_offset = optional_params['det_channel_offset']
-    ct_model_meta = mbirtorch.copy_ct_model(ct_model, no_warning=True)
-    ct_model_meta.set_params(det_channel_offset=meta_offset)
+    det_rotation = volumax.compute_geometry(volumax_params, verbose=0)['det_rotation']
+    ct_model_cal = mbirtorch.copy_ct_model(ct_model, no_warning=True)
+    volumax.calibrate_volumax_geometry(ct_model_cal, sino, det_rotation=det_rotation)
+    meta_offset = ct_model.get_params('det_channel_offset')
+    cal_offset = ct_model_cal.get_params('det_channel_offset')
     t0 = time.time()
-    recon_meta, _ = ct_model_meta.recon(sino, weights=weights, max_iterations=max_iterations)
-    recon_meta = np.asarray(recon_meta)
-    print(f'Uncalibrated reconstruction (det_channel_offset {meta_offset:+.4f} mm instead of '
-          f'{ct_model.get_params("det_channel_offset"):+.4f} mm) in {time.time() - t0:.1f} s')
+    recon_cal, _ = ct_model_cal.recon(sino, weights=weights, max_iterations=max_iterations)
+    recon_cal = np.asarray(recon_cal)
+    print(f'Calibrated reconstruction (det_channel_offset {cal_offset:+.4f} mm instead of {meta_offset:+.4f} mm) in '
+          f'{time.time() - t0:.1f} s')
 
 # ----------------------------------------------------------------------------------------------
 # 5. View the reconstruction
 # ----------------------------------------------------------------------------------------------
 if show_viewer:
-    if compare_uncalibrated:
-        mbirtorch.slice_viewer(recon_meta, recon, vmin=0.0, vmax=0.1,
-                               slice_label=[f'uncalibrated (metadata offset {meta_offset:+.3f} mm)',
-                                            f'calibrated (offset {ct_model.get_params("det_channel_offset"):+.3f} mm)'],
-                               title='VoluMax reconstruction: uncalibrated vs calibrated channel offset')
+    if compare_calibrated:
+        mbirtorch.slice_viewer(recon, recon_cal, vmin=0.0, vmax=0.1,
+                               slice_label=[f'metadata offset {meta_offset:+.3f} mm',
+                                            f'calibrated offset {cal_offset:+.3f} mm'],
+                               title='VoluMax reconstruction: metadata vs calibrated channel offset')
     else:
         mbirtorch.slice_viewer(recon, data_dicts=[recon_dict], vmin=0.0, vmax=0.1,
                                title='VoluMax cone-beam MBIR reconstruction')
