@@ -1,9 +1,12 @@
 import concurrent.futures as cf
 import json
+import math
 import time
 import warnings
 from pathlib import Path
 import numpy as np
+import torch
+from scipy.optimize import minimize_scalar
 import mbirtorch
 import mbirtorch.preprocess as mtp
 from mbirtorch.preprocess import geometry_calibration as gc
@@ -704,3 +707,615 @@ def calibrate_volumax_geometry(model, sino, det_rotation=0.0, verbose=1):
                       f'{gain:.2f}x better than no rotation).  The metadata rotation assumes that the rotation axis is '
                       'the vertical axis of the scanner; check the slices far from the central plane.')
     return dict(det_channel_offset=offset, det_rotation_residual=residual)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Channel offset from the reprojection of a direct reconstruction
+# ---------------------------------------------------------------------------------------------------------------------
+def estimate_channel_offset_reprojection(model, sino, *, max_views=(120, 180, 360), coarse_channels=48,
+                                         final_channels=384, search_fraction=0.25, row_fraction=0.35,
+                                         truncation_pad='auto', tolerance_channels=0.01, verbose=0):
+    """
+    Estimate ``det_channel_offset`` from the agreement of the sinogram with the reprojection of its direct
+    reconstruction.
+
+    For a candidate offset, the sinogram is reconstructed with ``recon_direct`` (FDK) using the model at that offset,
+    the reconstruction is forward projected with the same model, and each measured view is compared with its
+    reprojection.  At the correct offset the reconstruction reproduces the data.  At a wrong offset, rays measured from
+    opposite sides disagree, and the reprojection shows displaced and doubled edges.  The estimate is the candidate
+    whose reprojection agrees best with the data.
+
+    Unlike :func:`~mbirtorch.preprocess.geometry_calibration.estimate_det_channel_offset`, which compares each view with
+    its opposite view, no view is paired with another, so the views need not cover a full rotation or be evenly spaced.
+    The method still needs some rays that are measured from both sides, which takes views over an arc of at least
+    about 180 degrees minus the fan angle.  For a shorter arc the data are consistent with any offset, and a
+    ``ValueError`` is raised.
+
+    The comparison tolerates an imperfect reconstruction (noise, streaks, truncation, scatter, beam hardening):
+
+    - The data and the reprojection are compared through their derivative along the channels, after smoothing along
+      the rows.  An offset error moves edges, while scatter, cupping, and other slowly varying errors mostly drop out
+      of the derivative.
+    - Each view contributes ``1 - rho**2``, where ``rho`` is the correlation of the two derivatives.  This loss does not
+      depend on the gain of the view and lies between 0 and 1, so a few bad views cannot dominate the score.
+    - Photon-starved pixels, the detector edges, and channels whose rays leave the reconstruction support are not
+      scored.  When the object extends past the detector edges, the views are extended with a smooth taper before the
+      reconstruction.
+    - Rays are weighted for redundancy (generalized Parker weights with the angular spacing of each view), so a short
+      scan or an irregular view set is reconstructed with each ray counted once.
+
+    To keep the cost low, every score is computed on subsampled data, in a coarse-to-fine search.  Each level keeps
+    every k-th view (at most ``max_views`` views), averages b x b blocks of detector pixels, scores only the rows within
+    ``row_fraction`` of the detector height around the central plane, and reconstructs only the slab of slices that
+    these rows see.  The coarsest level, at about ``coarse_channels`` channels, scans a window of ``search_fraction``
+    of the detector width on each side of the model's offset and keeps the narrow minimum that is most prominent relative to the curve, which is
+    robust to a start far from the answer.  Each finer level halves the block size and searches around the previous
+    estimate, and the finest level, at most ``final_channels`` channels, refines the estimate with a bounded Brent
+    search to ``tolerance_channels``.
+
+    Args:
+        model (ConeBeamModel): A model of a circular scan, whose ``det_channel_offset`` is the starting value of the
+            search. Not modified.
+        sino (numpy.ndarray or torch.Tensor): The sinogram, with shape (num_views, num_det_rows, num_det_channels). Not modified.
+        max_views (int or tuple[int, ...], optional): Largest number of views used at each level, coarse to fine; the
+            last value is used for any further levels. Defaults to ``(120, 180, 360)``.
+        coarse_channels (int, optional): Approximate number of binned channels at the coarsest level.
+            Defaults to ``48``.
+        final_channels (int, optional): Largest number of binned channels at the finest level. Defaults to ``384``.
+        search_fraction (float, optional): Half-width of the coarse search window, as a fraction of the detector
+            width. Defaults to ``0.25``.
+        row_fraction (float, optional): Fraction of the detector rows, around the central plane, that is scored.
+            Defaults to ``0.35``.
+        truncation_pad (bool or str, optional): With ``'auto'``, the views are extended before the reconstruction when
+            the detector edges carry part of the object; True or False always or never extends them.
+            Defaults to ``'auto'``.
+        tolerance_channels (float, optional): Tolerance of the final search, in channels of ``sino``.
+            Defaults to ``0.01``.
+        verbose (int, optional): Verbosity level. Defaults to ``0``.
+
+    Returns:
+        CalibrationResult: ``parameter`` is ``'det_channel_offset'``, ``value`` is the estimate in ALU, and ``method`` is
+        ``'reprojection'``.  ``candidates`` and ``scores`` hold the evaluations of the finest level.  ``reduction``
+        holds the starting value, the angular coverage of the views, the fraction of rays with a measured opposite ray,
+        the run time, and, for each level, the block size, the reduced sinogram and reconstruction shapes, the
+        candidates and scores, the estimate, and the search notes.
+
+    Raises:
+        ValueError: If the model is not a circular ``ConeBeamModel``, the sinogram shape does not match the model, too
+            few rays have a measured opposite ray, or the coarse score curve is flat, so the data do not determine the
+            offset.
+
+    Example:
+        .. code-block:: python
+
+            from mbirtorch.preprocess import geometry_calibration as gc
+            from mbirtorch.preprocess import volumax
+            result = volumax.estimate_channel_offset_reprojection(model, sino)
+            gc.apply_calibration(model, sino, result)
+    """
+    if not isinstance(model, mbirtorch.ConeBeamModel) or gc._is_helical(model):
+        raise ValueError('estimate_channel_offset_reprojection supports a ConeBeamModel of a circular scan only.')
+    num_views, num_rows, num_channels = (int(n) for n in model.get_params('sinogram_shape'))
+    if tuple(sino.shape) != (num_views, num_rows, num_channels):
+        raise ValueError(f'The sinogram shape {tuple(sino.shape)} does not match the model sinogram shape '
+                         f'{(num_views, num_rows, num_channels)}.')
+    t_start = time.perf_counter()
+    delta = float(model.get_params('delta_det_channel'))
+    start = float(model.get_params('det_channel_offset'))
+    device = gc._resolve_work_device()
+    views_per_level = [int(v) for v in np.atleast_1d(max_views)]
+    if min(views_per_level) < 1 or coarse_channels < 1 or final_channels < 1:
+        raise ValueError('max_views, coarse_channels, and final_channels must be positive.')
+
+    # A ray measured only once is reproduced by the direct reconstruction at any offset, so the offset is determined
+    # only by rays whose opposite ray is also measured.
+    gamma = _channel_fan_angles(model, (np.arange(num_channels) - (num_channels - 1) / 2.0) * delta - start)
+    redundancy = _ReprojectionRedundancy(gc._view_angles(model), float(np.ptp(gamma)))
+    redundant_fraction = redundancy.redundant_fraction(gamma)
+    if redundant_fraction < 0.003:
+        raise ValueError(f'The views cover {redundancy.coverage_deg:.1f} degrees, and only '
+                         f'{100 * redundant_fraction:.2f} % of the rays have a measured opposite ray.  A direct '
+                         'reconstruction reproduces such data at any channel offset, so the offset cannot be estimated '
+                         'from this scan.')
+
+    # Block sizes of the levels: about coarse_channels binned channels at the coarsest level, halving at each finer
+    # level, down to at most final_channels binned channels, in at most four levels.
+    min_bin = max(1, int(math.ceil(num_channels / float(final_channels))))
+    bins = [max(min_bin, int(round(num_channels / float(coarse_channels))))]
+    while bins[-1] > min_bin and len(bins) < 4:
+        bins.append(max(min_bin, int(round(bins[-1] / 2.0))))
+    bins[-1] = min_bin
+
+    if verbose > 0:
+        print('\n########## Channel offset from the reprojection of a direct reconstruction')
+        print(f'   views cover {redundancy.coverage_deg:.1f} degrees, {100 * redundant_fraction:.1f} % of the rays '
+              f'have a measured opposite ray; block sizes {bins}')
+    estimate, prev_bin, levels = start, None, []
+    for index, b in enumerate(bins):
+        last = index == len(bins) - 1
+        notes = []
+        if index == 0:
+            # The coarse window spans search_fraction of the detector width, and at least 12 channels, on each side.
+            half = max(12.0, search_fraction * num_channels) * delta
+            step, max_slides = b * delta, 4
+        else:
+            half, step, max_slides = prev_bin * delta, 0.5 * b * delta, 2
+        # At the coarse level all channels except the edges are scored.  Masking the channels whose rays leave the
+        # support anywhere in the wide window would make the mask depend on where the window sits, and far from the
+        # answer it leaves a channel subset that a wrong offset explains well.
+        level = _ReprojectionLevel(model, sino, b, views_per_level[min(index, len(views_per_level) - 1)],
+                                   row_fraction, truncation_pad, support_mask=index > 0, device=device)
+        contrast = None
+        if index == 0 or not last:
+            grid_best, est, candidates, scores, center = _grid_search_level(level, estimate, half, step, max_slides,
+                                                                            index == 0, notes)
+            # A finer level whose minimum moved more than a block from the window center is searched again around it,
+            # with the channel mask of the new window.
+            if index > 0 and abs(grid_best - center) > b * delta:
+                notes.append('re-centered')
+                grid_best, est, candidates, scores, center = _grid_search_level(level, grid_best, half, step,
+                                                                                max_slides, False, notes)
+            contrast = _curve_contrast(scores)
+            chosen = int(np.argmin(np.abs(candidates - grid_best)))
+            competing = _competing_dips(scores, chosen)
+            if competing:
+                notes.append(f'competing local minima on the grid at '
+                             f'{", ".join(f"{candidates[k]:+.4f}" for k in competing)} (score '
+                             f'{", ".join(f"{scores[k]:.3f}" for k in competing)} vs {scores[chosen]:.3f} at the '
+                             f'chosen {candidates[chosen]:+.4f})')
+            if index == 0 and contrast < 0.1:
+                raise ValueError(f'The reprojection score does not determine the channel offset on this scan: the '
+                                 f'coarse score curve is flat (contrast {contrast:.3f} < 0.1).')
+        if last:
+            # The finest level ends with a bounded Brent search around the estimate (after the grid when it is also the
+            # coarsest level).
+            if index == 0:
+                estimate, prev_bin, step = est, b, 0.5 * b * delta
+                level.support_mask = True
+            lo, hi = estimate - 0.75 * prev_bin * delta, estimate + 0.75 * prev_bin * delta
+            level.set_window((lo - step, hi + step))
+            est, evaluated = _bounded_brent(level, lo, hi, tolerance_channels * delta)
+            if abs(est - estimate) > b * delta:
+                notes.append('re-centered')
+                level.set_window((est - 0.5 * prev_bin * delta - step, est + 0.5 * prev_bin * delta + step))
+                est, evaluated = _bounded_brent(level, est - 0.5 * prev_bin * delta, est + 0.5 * prev_bin * delta,
+                                                tolerance_channels * delta)
+            if min(est - lo, hi - est) < 0.02 * (hi - lo):
+                notes.append('final minimum at the bracket edge')
+            candidates = np.array(sorted(evaluated))
+            scores = np.array([evaluated[x] for x in candidates])
+            final_score = level.loss(est)
+        levels.append(dict(bin_factor=b, sinogram_shape=level.shape, recon_shape=level.recon_shape, pad=level.pad,
+                           scored_rows=int(level.score_rows.size), estimate=est, candidates=candidates, scores=scores,
+                           contrast=contrast, notes=notes, evaluations=level.num_evaluations,
+                           seconds=level.seconds))
+        if verbose > 0:
+            print(f'   level {index}: block {b}, sinogram {level.shape}, recon {level.recon_shape}, estimate '
+                  f'{est:+.5f} ({(est - start) / delta:+.3f} channels from the start), {level.num_evaluations} '
+                  f'evaluations in {level.seconds:.2f} s' + (f', contrast {contrast:.3f}' if contrast is not None else '')
+                  + (f' [{"; ".join(notes)}]' if notes else ''))
+        estimate, prev_bin = est, b
+        del level
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+
+    for level_info in levels:
+        for note in level_info['notes']:
+            if 'edge' in note or 'competing' in note:
+                warnings.warn(f'estimate_channel_offset_reprojection: block {level_info["bin_factor"]}: {note}')
+    seconds = time.perf_counter() - t_start
+    if verbose > 0:
+        print(f'   det_channel_offset {start:+.4f} -> {estimate:+.4f} ({(estimate - start) / delta:+.2f} channels) in '
+              f'{seconds:.1f} s')
+    reduction = dict(start=start, bins=bins, coverage_deg=redundancy.coverage_deg,
+                     redundant_fraction=redundant_fraction, coarse_contrast=levels[0]['contrast'], levels=levels,
+                     seconds=seconds)
+    return gc.CalibrationResult(parameter='det_channel_offset', value=float(estimate), score=float(final_score),
+                                candidates=np.asarray(levels[-1]['candidates'], dtype=float),
+                                scores=np.asarray(levels[-1]['scores'], dtype=float), method='reprojection',
+                                reduction=reduction)
+
+
+def _channel_fan_angles(model, u):
+    """Fan angles of the rays that reach the detector positions ``u`` (relative to the source's perpendicular foot)."""
+    sdd = float(model.get_params('source_detector_dist'))
+    return u / sdd if model.get_params('use_curved_detector') else np.arctan(u / sdd)
+
+
+class _ReprojectionRedundancy:
+    """
+    Redundancy and angular quadrature weights for an arbitrary set of view angles.
+
+    ``coverage(phi)`` is a smooth indicator of the view angles the scan covers: 1 inside a covered arc and tapering to
+    0 over ``taper`` at the edges of every large gap between views.  The ray at view angle beta and fan angle gamma has
+    its opposite ray at view angle beta + pi - 2 gamma, and its weight is ``2 q a(beta) / (a(beta) + a(beta + pi - 2
+    gamma))``, a generalized Parker weight, where ``q`` is the angular spacing of the view relative to 2 pi / num_views.
+    The factor ``2 q`` undoes the even spacing over a full rotation that ``recon_direct`` assumes, so for views evenly
+    spaced over a full rotation every weight is 1.
+    """
+
+    def __init__(self, angles, fan_angle):
+        self.angles = np.asarray(angles, dtype=np.float64)
+        num_views = self.angles.size
+        wrapped = np.mod(self.angles, 2 * np.pi)
+        order = np.argsort(wrapped)
+        sorted_angles = wrapped[order]
+        gaps = np.diff(np.append(sorted_angles, sorted_angles[0] + 2 * np.pi))      # gap after each sorted view
+        median_gap = float(np.median(gaps))
+        # A large gap is more than 3 median gaps and more than 2 degrees; it is where a partial scan starts or ends.
+        large = gaps > max(3.0 * median_gap, math.radians(2.0))
+        self.partial = bool(np.any(large)) and num_views > 1
+        # Quadrature: half of the gaps on both sides of a view, where a large gap counts as one median gap.
+        effective = np.where(large, median_gap, gaps)
+        self.q = np.empty(num_views)
+        self.q[order] = 0.5 * (effective + np.roll(effective, 1)) / (2 * np.pi / num_views)
+        self.taper = max(fan_angle, 3 * median_gap)
+        self.coverage_deg = math.degrees(2 * np.pi - float(gaps[large].sum())) if self.partial else 360.0
+        if self.partial:
+            # Each covered arc runs from half a median gap before the view after a large gap to half a median gap after
+            # the view before the next large gap.
+            ends = sorted_angles[large] + 0.5 * median_gap
+            starts = np.mod(np.roll(sorted_angles, -1)[large] - 0.5 * median_gap, 2 * np.pi)
+            self.arcs = [(float(s), float(s + np.mod(ends - s, 2 * np.pi).min())) for s in starts]
+            self.coverage_of_views = self.coverage(self.angles)
+
+    def coverage(self, phi):
+        """The smooth indicator of the covered view angles at the angles ``phi``."""
+        phi = np.asarray(phi, dtype=np.float64)
+        out = np.zeros(phi.shape)
+        for arc_start, arc_end in self.arcs:
+            relative = np.mod(phi - arc_start, 2 * np.pi)
+            length = arc_end - arc_start
+            distance = np.minimum(relative, length - relative)
+            value = np.sin(0.5 * np.pi * np.clip(distance / self.taper, 0.0, 1.0)) ** 2
+            out = np.where(relative <= length, np.maximum(out, value), out)
+        return out
+
+    def redundant_fraction(self, gamma):
+        """Fraction of the rays (views x fan angles ``gamma``) whose opposite ray is also measured."""
+        if not self.partial:
+            return 1.0
+        return float(np.mean(self.coverage(self.angles[:, None] + np.pi - 2.0 * np.asarray(gamma)[None, :]) > 0))
+
+    def weights(self, gamma):
+        """Weights of shape (num_views, num_channels) for the fan angles ``gamma`` of the channels."""
+        if not self.partial:
+            return np.repeat(self.q[:, None], gamma.size, axis=1)
+        own = self.coverage_of_views[:, None]
+        opposite = self.coverage(self.angles[:, None] + np.pi - 2.0 * gamma[None, :])
+        return 2.0 * self.q[:, None] * own / np.maximum(own + opposite, 1e-12)
+
+
+def _reprojection_kernel(sigma, derivative=False):
+    """A normalized Gaussian kernel, or a derivative-of-Gaussian kernel that gives slope 1 on a unit ramp."""
+    radius = max(1, int(math.ceil(3.0 * sigma)))
+    x = np.arange(-radius, radius + 1, dtype=np.float64)
+    kernel = np.exp(-0.5 * (x / sigma) ** 2)
+    kernel /= kernel.sum()
+    if derivative:
+        kernel = -x / sigma ** 2 * kernel
+        kernel /= -(kernel * x).sum()
+        kernel = kernel[::-1].copy()        # conv1d computes a correlation
+    return kernel
+
+
+def _filter_last_axis(x, kernel):
+    """Filter the last axis of the tensor ``x`` with a 1D kernel, with replicate padding."""
+    k = torch.as_tensor(np.ascontiguousarray(kernel), dtype=x.dtype, device=x.device)
+    radius = (k.numel() - 1) // 2
+    y = torch.nn.functional.pad(x.reshape(-1, 1, x.shape[-1]), (radius, radius), mode='replicate')
+    return torch.nn.functional.conv1d(y, k.view(1, 1, -1)).reshape(x.shape)
+
+
+class _ReprojectionLevel:
+    """
+    The subsampled data and model of one level of :func:`estimate_channel_offset_reprojection`, and the score of a
+    candidate offset.
+
+    The sinogram is reduced to every k-th view (at most ``max_views`` views), b x b blocks of detector pixels, and the
+    window of rows that the slab of slices seen by the scored rows projects onto.  A copy of the model is reduced to
+    match, with a reconstruction of only that slab, which equals a full reconstruction on the scored rows.  Candidate
+    offsets are always values of ``det_channel_offset`` for the model passed in.
+    """
+
+    def __init__(self, model, sino, bin_factor, max_views, row_fraction, truncation_pad, support_mask, device):
+        b = int(bin_factor)
+        num_views, num_rows, num_channels = (int(n) for n in model.get_params('sinogram_shape'))
+        delta_c, delta_r, offset, row_offset, sdd, sid = (float(x) for x in model.get_params(
+            ['delta_det_channel', 'delta_det_row', 'det_channel_offset', 'det_row_offset', 'source_detector_dist',
+             'source_iso_dist']))
+        self.model_in = model
+        self.sdd, self.sid = sdd, sid
+        self.support_mask = support_mask
+        self.device = device
+        self.view_index = np.arange(0, num_views, max(1, int(math.ceil(num_views / float(max_views)))))
+        angles = gc._view_angles(model)[self.view_index]
+
+        # Channels: the remainder of the block averaging is cropped evenly from both sides, which moves the detector
+        # center by offset_shift.
+        remainder = num_channels % b
+        self.c_lo, self.c_hi = remainder // 2, num_channels - (remainder - remainder // 2)
+        self.offset_shift = -(remainder // 2 - remainder / 2.0) * delta_c
+        self.num_channels = (num_channels - remainder) // b
+
+        # Rows: the scored band of row_fraction of the detector rows around the central plane, the slab of slices that
+        # these rays cross, and the window of rows that the slab projects onto.
+        min_mag, max_mag = model.pixel_magnification_bounds()
+        self.support_radius = float(sdd / min_mag - sid)
+        center_row = (num_rows - 1) / 2.0
+        band = min(num_rows, max(4 * b, int(round(row_fraction * num_rows))))
+        plane_row = center_row + row_offset / delta_r
+        plane_row = min(max(plane_row, (band - 1) / 2.0), num_rows - 1 - (band - 1) / 2.0)
+
+        def row_to_v(row):
+            return (row - center_row) * delta_r - row_offset
+
+        v_lo, v_hi = sorted((row_to_v(plane_row - band / 2.0), row_to_v(plane_row + band / 2.0)))
+        delta_voxel = b * delta_c / (sdd / sid)
+        z_values = [v / m for v in (v_lo, v_hi) for m in (min_mag, max_mag)]
+        z_lo, z_hi = min(z_values) - delta_voxel, max(z_values) + delta_voxel
+        v_needed = [z * m for z in (z_lo, z_hi) for m in (min_mag, max_mag)]
+        footprint = max_mag * delta_voxel
+        row_lo, row_hi = sorted(center_row + (np.array([min(v_needed) - footprint, max(v_needed) + footprint])
+                                              + row_offset) / delta_r)
+        r_lo = max(0, int(math.floor(row_lo)) - b)
+        r_hi = min(num_rows, int(math.ceil(row_hi)) + 1 + b)
+        extra = (r_hi - r_lo) % b
+        if extra:
+            # Grow the window to a multiple of b, toward higher rows first and then toward lower rows, and trim it
+            # where the detector ends.
+            grow = b - extra
+            r_hi_new = min(num_rows, r_hi + grow)
+            grow -= r_hi_new - r_hi
+            r_hi = r_hi_new
+            r_lo = max(0, r_lo - grow)
+            r_hi -= (r_hi - r_lo) % b
+        num_binned_rows = (r_hi - r_lo) // b
+        if num_binned_rows < 1:
+            raise ValueError(f'The detector has {num_rows} rows, fewer than the block size {b}; lower coarse_channels.')
+        row_offset_reduced = row_offset - (r_lo - (num_rows - (r_hi - r_lo)) / 2.0) * delta_r
+        binned_row_centers = r_lo + (np.arange(num_binned_rows) + 0.5) * b - 0.5
+        v_binned = row_to_v(binned_row_centers)
+        self.score_rows = np.where((v_binned >= v_lo - 1e-9) & (v_binned <= v_hi + 1e-9))[0]
+        if self.score_rows.size == 0:
+            self.score_rows = np.array([int(np.argmin(np.abs(v_binned - 0.5 * (v_lo + v_hi))))])
+
+        # The reduced data, read and block-averaged in chunks of about 256 MB of views, so that the full-resolution
+        # sinogram is never copied.
+        chunk = max(1, int(2 ** 26 // max(1, (r_hi - r_lo) * (self.c_hi - self.c_lo))))
+        parts = []
+        for k in range(0, len(self.view_index), chunk):
+            views = self.view_index[k:k + chunk]
+            if torch.is_tensor(sino):
+                block = sino[torch.as_tensor(views, device=sino.device), r_lo:r_hi, self.c_lo:self.c_hi]
+                block = block.detach().to(device=device, dtype=torch.float32)
+            else:
+                block = torch.as_tensor(np.asarray(sino[views, r_lo:r_hi, self.c_lo:self.c_hi], dtype=np.float32),
+                                        device=device)
+            parts.append(block.reshape(len(views), num_binned_rows, b, self.num_channels, b).mean(dim=(2, 4)))
+            del block
+        y = torch.cat(parts, dim=0).contiguous()
+        del parts
+        self.shape = tuple(y.shape)
+
+        # Truncation: when the detector edges carry part of the object (the median edge value is more than 5 % of the
+        # median row maximum), the views are extended on both sides by a cosine taper of the edge values, so the ramp
+        # filter of the reconstruction sees no step.  The extension is symmetric, so the detector center does not move;
+        # only the measured channels are scored.
+        edge = torch.maximum(y[..., :2].mean(dim=-1), y[..., -2:].mean(dim=-1))
+        edge_ratio = float(edge.flatten().median()) / max(float(y.amax(dim=-1).flatten().median()), 1e-12)
+        pad = 0
+        if truncation_pad is True or (truncation_pad == 'auto' and edge_ratio > 0.05):
+            pad = max(2, int(round(0.25 * self.num_channels)))
+        self.pad = pad
+        if pad:
+            j = torch.arange(1, pad + 1, device=device, dtype=y.dtype)
+            taper = torch.cos(0.5 * math.pi * j / (pad + 1)) ** 2
+            self.y_in = torch.cat([y[..., :2].mean(dim=-1, keepdim=True) * taper.flip(0), y,
+                                   y[..., -2:].mean(dim=-1, keepdim=True) * taper], dim=-1).contiguous()
+        else:
+            self.y_in = y
+        num_channels_in = self.num_channels + 2 * pad
+
+        reduced = mbirtorch.copy_ct_model(model, new_angles=angles.astype(np.float32),
+                                          new_num_det_rows=num_binned_rows, new_num_det_cols=num_channels_in,
+                                          no_warning=True)
+        reduced.set_params(no_warning=True, delta_det_channel=b * delta_c, delta_det_row=b * delta_r,
+                           det_row_offset=row_offset_reduced, det_channel_offset=offset + self.offset_shift, verbose=0)
+        if not isinstance(model.get_params('use_ror_mask'), bool):
+            reduced.set_params(use_ror_mask=True)           # a custom mask has the size of the full reconstruction
+        reduced.auto_set_recon_geometry(no_warning=True)
+        recon_rows, recon_cols, _ = reduced.get_params('recon_shape')
+        delta_z = float(reduced.get_params('voxel_slice_aspect')) * float(reduced.get_params('delta_voxel'))
+        num_slices = max(1, int(math.ceil((z_hi - z_lo) / delta_z)))
+        reduced.set_params(no_warning=True, recon_shape=(recon_rows, recon_cols, num_slices),
+                           recon_slice_offset=0.5 * (z_lo + z_hi))
+        self.model = reduced
+        self.recon_shape = (int(recon_rows), int(recon_cols), num_slices)
+
+        # The compared features: a Gaussian smoothing along the rows (sigma 2 binned rows), then a derivative of
+        # Gaussian along the channels (sigma 1.2 binned channels).
+        self.row_kernel = _reprojection_kernel(2.0)
+        self.derivative_kernel = _reprojection_kernel(1.2, derivative=True)
+        self.y_features = self._features(y)
+        self.redundancy = _ReprojectionRedundancy(angles, 2.0 * math.atan(0.5 * num_channels * delta_c / sdd))
+        # Detector positions of the extended and of the measured channels relative to the detector center.
+        self.u_in = (np.arange(num_channels_in) - (num_channels_in - 1) / 2.0) * b * delta_c
+        self.u = self.u_in[pad:pad + self.num_channels]
+
+        # Pixels that are never scored: photon-starved pixels (line integral above 5, transmission below 0.7 %) and
+        # 2 binned channels around them.
+        starved = y[:, self.score_rows, :] > 5.0
+        if bool(starved.any()):
+            starved = torch.nn.functional.max_pool1d(starved.float().reshape(-1, 1, self.num_channels), 5, stride=1,
+                                                     padding=2).reshape(starved.shape) > 0
+        self.static_mask = ~starved
+        self.channel_ok = None
+        self.cache = {}
+        self.num_evaluations = 0
+        self.seconds = 0.0
+
+    def _features(self, x):
+        """The channel derivative of the row-smoothed views ``x`` (views, rows, channels), on the scored rows."""
+        x = _filter_last_axis(x.transpose(1, 2), self.row_kernel).transpose(1, 2)
+        return _filter_last_axis(x, self.derivative_kernel)[:, self.score_rows, :]
+
+    def set_window(self, window):
+        """Score only the channels away from the detector edges and, if ``support_mask`` is set, whose rays stay
+        within 90 % of the support radius for every candidate offset in ``window``."""
+        ok = np.ones(self.num_channels, dtype=bool)
+        ok[:2] = False
+        ok[-2:] = False
+        for d in (window if self.support_mask else ()):
+            gamma = _channel_fan_angles(self.model_in, self.u - (float(d) + self.offset_shift))
+            ok &= np.abs(self.sid * np.sin(gamma)) <= 0.9 * self.support_radius
+        self.channel_ok = torch.as_tensor(ok, device=self.device)
+        self.cache = {}
+
+    def _reprojection_features(self, d):
+        """The features of the reprojection of the direct reconstruction at the offset ``d``."""
+        offset = float(d) + self.offset_shift
+        y = self.y_in
+        if self.redundancy.partial or not np.allclose(self.redundancy.q, 1.0):
+            weights = self.redundancy.weights(_channel_fan_angles(self.model_in, self.u_in - offset))
+            if not np.allclose(weights, 1.0):
+                y = y * torch.as_tensor(weights.astype(np.float32), device=self.device)[:, None, :]
+        self.model.set_params(det_channel_offset=offset)
+        recon = self.model.recon_direct(y, output_sharded=True)
+        projection = self.model.forward_project(recon, output_sharded=True)
+        del recon
+        projection = torch.as_tensor(projection, device=self.device)
+        if self.pad:
+            projection = projection[..., self.pad:self.pad + self.num_channels]
+        return self._features(projection)
+
+    def loss(self, d):
+        """The mean over the views of ``1 - rho**2`` at the offset ``d``, where ``rho`` is the correlation of the
+        measured and reprojected features over the scored pixels of the view."""
+        key = round(float(d), 9)
+        if key not in self.cache:
+            t0 = time.perf_counter()
+            mask = (self.static_mask & self.channel_ok[None, None, :]).float()
+            measured = self.y_features * mask
+            reprojected = self._reprojection_features(d) * mask
+            accumulate = torch.float32 if self.device.type == 'mps' else torch.float64
+            sxy = (measured * reprojected).sum(dim=(1, 2), dtype=accumulate)
+            sxx = (measured * measured).sum(dim=(1, 2), dtype=accumulate)
+            syy = (reprojected * reprojected).sum(dim=(1, 2), dtype=accumulate)
+            rho2 = sxy ** 2 / torch.clamp(sxx * syy, min=1e-30)
+            loss = torch.where((sxx > 0) & (syy > 0), 1.0 - rho2, torch.ones_like(rho2))
+            self.cache[key] = float(loss.mean())
+            self.num_evaluations += 1
+            self.seconds += time.perf_counter() - t0
+        return self.cache[key]
+
+
+def _grid_search_level(level, center, half, step, max_slides, select_dip, notes):
+    """
+    Score a grid of offsets ``center +- half`` with spacing ``step``, and refine the chosen grid point with a parabola.
+
+    While the chosen point is at an edge of the grid and the curve is not flat, the window slides to center on it, at
+    most ``max_slides`` times.  The chosen point is the grid minimum, or with ``select_dip`` the most prominent narrow
+    dip (see ``_most_prominent_dip``).
+
+    Returns:
+        tuple: ``(grid_best, estimate, grid, scores, center)``, where ``center`` is the center of the last window.
+    """
+    num_half = max(1, int(round(half / step)))
+    slides = 0
+    while True:
+        grid = center + step * np.arange(-num_half, num_half + 1)
+        level.set_window((grid[0] - step, grid[-1] + step))
+        scores = np.array([level.loss(x) for x in grid])
+        i = _most_prominent_dip(scores) if select_dip else int(np.argmin(scores))
+        if i not in (0, grid.size - 1) or slides >= max_slides or _curve_contrast(scores) < 0.1:
+            break
+        center = float(grid[i])
+        slides += 1
+        notes.append(f'window slid to {center:+.4f}')
+    if i in (0, grid.size - 1):
+        notes.append('minimum at the window edge')
+    estimate = float(grid[i])
+    if 0 < i < grid.size - 1:
+        vertex = _parabola_minimum(grid[i - 1:i + 2], scores[i - 1:i + 2])
+        if vertex is not None and grid[i - 1] <= vertex <= grid[i + 1]:
+            estimate = vertex
+    return float(grid[i]), estimate, grid, scores, center
+
+
+def _parabola_minimum(x, f):
+    """The vertex of the parabola through three points, or None when the parabola does not open upward."""
+    x, f = np.asarray(x, dtype=float), np.asarray(f, dtype=float)
+    x0 = x.mean()
+    scale = max(np.ptp(x), 1e-12)
+    t = (x - x0) / scale
+    c2, c1, _ = np.linalg.lstsq(np.vstack([t ** 2, t, np.ones_like(t)]).T, f, rcond=None)[0]
+    if c2 <= 0:
+        return None
+    return float(x0 - scale * c1 / (2 * c2))
+
+
+def _most_prominent_dip(f, k=2):
+    """
+    Index of the most prominent narrow dip of the curve ``f``: among its local minima, edges included, the one with
+    the smallest ratio ``f[i] / min(f[i - k], f[i + k])``.
+
+    At the coarse level an offset error of two binned channels already doubles every edge, so the true minimum is a dip
+    about one grid step wide, and the curve rises on both sides of it within ``k`` steps.  The ratio does not depend on
+    the level of the curve, so a narrow dip at the bottom of the curve wins over a dip of the same absolute depth higher
+    up.  A wrong offset that places the rotation axis outside the object's shadow can give a broad basin as deep as the
+    true minimum, because the inconsistent projections then fall off the detector, but the curve does not rise on both
+    sides of any point of the basin, so the ratios in the basin stay near 1.
+    """
+    f = np.asarray(f, dtype=float)
+    n = f.size
+    best, best_ratio = int(np.argmin(f)), np.inf
+    for i in range(n):
+        if (i > 0 and f[i] > f[i - 1]) or (i < n - 1 and f[i] > f[i + 1]):
+            continue
+        neighbors = [f[j] for j in (i - k, i + k) if 0 <= j < n]
+        lower = min(neighbors) if neighbors else f[i]
+        ratio = f[i] / lower if lower > 0 else 1.0
+        if ratio < best_ratio:
+            best, best_ratio = i, ratio
+    return best
+
+
+def _competing_dips(f, chosen, fraction=0.1):
+    """Indices of local minima of ``f``, other than ``chosen`` and its neighbors, that come within ``fraction`` of the
+    curve's depth (median minus the chosen value) of the chosen minimum, or lie below it."""
+    f = np.asarray(f, dtype=float)
+    depth = float(np.median(f)) - float(f[chosen])
+    out = []
+    for k in range(f.size):
+        left = f[k - 1] if k > 0 else np.inf
+        right = f[k + 1] if k < f.size - 1 else np.inf
+        if abs(k - chosen) > 1 and f[k] < left and f[k] <= right and f[k] - f[chosen] < fraction * depth:
+            out.append(k)
+    return out
+
+
+def _curve_contrast(f):
+    """The relative depth ``(median - min) / median`` of a score curve, near 0 for a flat curve."""
+    f = np.asarray(f, dtype=float)
+    median = float(np.median(f))
+    return (median - float(f.min())) / max(median, 1e-30)
+
+
+def _bounded_brent(level, lo, hi, tolerance):
+    """
+    Minimize the score of ``level`` over ``[lo, hi]`` with a bounded Brent search.
+
+    Returns:
+        tuple: ``(best, evaluated)``, where ``evaluated`` maps each evaluated offset to its score.
+    """
+    evaluated = {}
+
+    def objective(x):
+        evaluated[float(x)] = level.loss(float(x))
+        return evaluated[float(x)]
+
+    result = minimize_scalar(objective, bounds=(lo, hi), method='bounded', options=dict(xatol=tolerance))
+    best = min(evaluated, key=evaluated.get)
+    x = float(result.x)
+    return (x if evaluated.get(x, np.inf) <= evaluated[best] else best), evaluated
