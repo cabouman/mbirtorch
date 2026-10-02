@@ -10,70 +10,63 @@ In the ``mbirtorch`` conda environment::
 
     dev_scripts/run_tests.sh
 
-Releasing a New Version
------------------------
+Releasing a version
+-------------------
 
-This is only available for registered maintainers.  It requires the ``gh``
-command, logged in to GitHub.  The example below releases version 0.X.Y.
+mbirtorch is published to PyPI by the GitHub Actions workflow in
+``.github/workflows/release.yml``.  You drive it from your machine with
+``dev_scripts/release.sh``: one command opens a pull request for you to review,
+and after you merge it a second command tags the release and publishes it.
+Uploads use Trusted Publishing, so no API token is ever stored or typed.
 
-Releasing to TestPyPI
-+++++++++++++++++++++
+The examples release version ``0.X.Y``.  Replace ``0.X.Y`` with the version you
+are releasing.
 
-1. Publish a release candidate to TestPyPI::
+Dry run on TestPyPI (optional, recommended the first time)
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+1. Publish a release candidate::
 
        dev_scripts/release.sh 0.X.Yrc1
 
-   What this does:
+   Stamps the version, pushes ``prerelease``, and creates a pre-release tagged
+   ``v0.X.Yrc1``.  CI builds the package and uploads it to TestPyPI.  No approval
+   is needed.
 
-   * Sets ``__version__`` to 0.X.Yrc1, commits, and pushes to ``prerelease``.
-   * Creates a GitHub pre-release with tag ``v0.X.Yrc1``.
-   * CI builds the package and uploads it to TestPyPI.  No approval needed.
+2. Check the upload::
 
-2. Check the TestPyPI upload.  Make a clean conda environment with the
-   release candidate and run the tests::
+       pip install -i https://test.pypi.org/simple/ mbirtorch
 
-       dev_scripts/make_test_environment.sh 0.X.Yrc1
-       conda activate test
-       dev_scripts/run_tests.sh
-
-   If a test fails, fix the problem and repeat from step 1 with ``0.X.Yrc2``.
-
-Releasing to PyPI
-+++++++++++++++++
-
-This procedure stands on its own.  The TestPyPI steps above are optional.
+Release to PyPI
++++++++++++++++
 
 1. Open the release pull request::
 
        dev_scripts/release.sh 0.X.Y
 
-   What this does:
+   Sets the version on ``prerelease``, pushes it, and opens the pull request to
+   ``main``.  Nothing is published yet.
 
-   * Sets ``__version__`` to 0.X.Y, commits, and pushes to ``prerelease``.
-   * Opens the pull request from ``prerelease`` to ``main``.
-   * Nothing is uploaded anywhere.
+2. Review the pull request on GitHub.  The tests run on it automatically, so
+   their result shows next to the Merge button.  When you are happy, merge it.
 
-   Next: Once the checks pass on GitHub, accept the pull request from prerelease to main.
-
-2. Publish the release::
+3. Publish the release::
 
        dev_scripts/release.sh 0.X.Y --publish
 
-   What this does:
+   Fast-forwards ``prerelease`` up to ``main``, updates your local ``main`` to
+   match, tags the shared commit ``v0.X.Y``, and CI builds and publishes it to
+   PyPI.  No approval step.
 
-   * Checks that ``main`` contains ``__version__ = 0.X.Y``; stops if the
-     pull request is not merged yet.
-   * Creates a GitHub release with tag ``v0.X.Y`` on ``main``.
-   * CI builds the package, then pauses and waits for your approval.
+4. Confirm it is live::
 
-   Next: You must next approve the deployment on GitHub.
-   To do this: On GitHub, open the Actions tab, click the running release
-   workflow, click "Review deployments", check the "pypi" box, and click "Approve and deploy".
+       pip install mbirtorch
 
-3. Check the PyPI upload.  Make a clean conda environment with the new
-   version and run the tests::
+Notes
++++++
 
-       dev_scripts/make_test_environment.sh
-       conda activate test
-       dev_scripts/run_tests.sh
-
+- After step 3, ``main``, ``prerelease``, and the ``v0.X.Y`` tag are all on the
+  same commit.
+- The tag is always ``v`` followed by the version; the build fails if the tag
+  does not match ``__version__``.
+- The version is single-sourced from the package's ``__init__.py``.
