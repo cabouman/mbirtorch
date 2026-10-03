@@ -6,6 +6,7 @@ caller's arrays left unwritten; and one initialization reused across calls."""
 import numpy as np
 import pytest
 import torch
+from torch._dynamo.utils import counters as dynamo_counters
 
 import mbirtorch
 from mbirtorch import denoising
@@ -32,7 +33,11 @@ def test_denoise_is_scale_equivariant(device, prior):
     passes sigma_noise, which must then set sigma_y.  In both cases the
     denoised image must be at least 30% closer to the clean image than the
     noisy image is, because returning the input unchanged is also scale
-    equivariant."""
+    equivariant.
+
+    Each scale gives new values of sigma_noise and sigma_x.  These values
+    enter the compiled update as tensors, so the calls after the first must
+    not compile it again."""
     shape = (32, 32, 8)
     clean = np.zeros(shape, dtype=np.float32)
     clean[8:-8, 8:-8, 2:-2] = 1.0
@@ -60,10 +65,15 @@ def test_denoise_is_scale_equivariant(device, prior):
     err_noisy = np.linalg.norm(noisy - clean)
     err_den = np.linalg.norm(reference - clean)
     assert err_den < 0.7 * err_noisy, (err_den, err_noisy)
+    # A recompilation is counted rather than made an error, because the
+    # compiled wrappers catch an error and fall back to eager.
+    graphs_before = dynamo_counters['stats']['unique_graphs']
     for scale in (2.0 ** 10, 2.0 ** -10):
         rel = _rel_max(denoise_scaled(scale), reference)
         print(f"{prior} on {device}: scale {scale:g} differs from scale 1 by {rel:.2e}")
         assert rel < 1e-5, (scale, rel)
+    new_graphs = dynamo_counters['stats']['unique_graphs'] - graphs_before
+    assert new_graphs == 0, f'{new_graphs} new compiled graphs for new noise levels'
 
 
 def test_sharded_denoise_matches_single_device():
