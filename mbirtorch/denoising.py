@@ -33,7 +33,7 @@ from . import vcd_utils
 from ._memory_ledger import image_ell1, stack_ell1
 from ._utils import _AUTO_REGULARIZATION_PARAM_NAMES, Param, recon_param_names
 from .projectors import maybe_compile
-from .tomography_model import TomographyModel
+from .tomography_model import TomographyModel, _diagonal_update_direction
 
 # Each denoiser takes the next number at construction, and that number names
 # its own compiled instances.
@@ -87,24 +87,36 @@ def _sample_tiles(num_rows, num_cols, num_leading, point_budget):
     return spread(num_rows), spread(num_cols)
 
 
+def _identity_update_direction(cur_error, fm_constant, prior_grad, prior_hess):
+    """Return the update direction at the pixels of one subset for the
+    identity forward model.
+
+    The data term is fm_constant * ||y - x||^2 / 2, where fm_constant is
+    1 / sigma_y^2 and ``cur_error`` is y - x.  So the first derivative of the
+    data term is -fm_constant * cur_error, and its second derivative is
+    fm_constant.  The reconstruction uses fm_constant * fm_hessian as the
+    second derivative, and fm_hessian is 1 at every pixel for the identity
+    forward model.
+
+    The three denoiser updates call this one function.  Scaling y, sigma_y,
+    and sigma_x by c scales the direction by c, so the step size alpha does
+    not depend on the units of the image.
+    """
+    return _diagonal_update_direction(-fm_constant * cur_error, prior_grad,
+                                      fm_constant, prior_hess)
+
+
 def vcd_subset_denoiser(flat_image, flat_error_image, pixel_indices,
                         fm_constant, qggmrf_params, image_shape):
     """One VCD subset update for the identity forward model (the analog of
     vcd_subset_updater).  Mutates both state tensors in place and returns
-    (flat_image, flat_error_image, ell1, alpha).
-
-    The formulas and their order of operations are fixed by the golden-value
-    tests (tests/test_denoiser.py); do not rearrange them."""
+    (flat_image, flat_error_image, ell1, alpha)."""
     prior_grad, prior_hess = _qggmrf.qggmrf_gradient_and_hessian_at_indices(
         flat_image, image_shape, pixel_indices, qggmrf_params)
 
-    # The forward Hessian is all 1s for the qggmrf proximal map.
     cur_error_image = flat_error_image[pixel_indices]
-    forward_grad = -fm_constant * cur_error_image
-    forward_hess = 1
-
-    delta_recon_at_indices = -((forward_grad + prior_grad)
-                               / (forward_hess + prior_hess))
+    delta_recon_at_indices = _identity_update_direction(
+        cur_error_image, fm_constant, prior_grad, prior_hess)
 
     # These two sums are delta^T grad Q(x_hat; x'=x_hat) and an upper bound
     # on the prior Hessian term.  Both are used to find the step size alpha.
@@ -153,13 +165,9 @@ def vcd_subset_denoiser_batched(flat_image, flat_error_image, pixel_indices,
     prior_grad, prior_hess = _qggmrf.qggmrf_gradient_and_hessian_batched(
         flat_image, image_shape, pixel_indices, qggmrf_params)
 
-    # The forward Hessian is all 1s for the qggmrf proximal map.
     cur_error_image = flat_error_image[:, pixel_indices]
-    forward_grad = -fm_constant * cur_error_image
-    forward_hess = 1
-
-    delta_recon_at_indices = -((forward_grad + prior_grad)
-                               / (forward_hess + prior_hess))
+    delta_recon_at_indices = _identity_update_direction(
+        cur_error_image, fm_constant, prior_grad, prior_hess)
 
     prior_linear = torch.sum(prior_grad * delta_recon_at_indices, dim=(1, 2))
     prior_quadratic_approx = torch.sum(prior_hess * delta_recon_at_indices ** 2,
@@ -844,8 +852,8 @@ class QGGMRFDenoiser(TomographyModel):
                                 qggmrf_params, left_halo=halos['left'][j],
                                 right_halo=halos['right'][j])
                             cur_error = flat_error.tensors[j][idx[j]]
-                            forward_grad = -fm_constant * cur_error
-                            delta = -((forward_grad + grad) / (1.0 + hess))
+                            delta = _identity_update_direction(
+                                cur_error, fm_constant, grad, hess)
                             # The four sums are scalar tensors, not floats, and
                             # are combined on the lead device.
                             return (delta,
