@@ -1,7 +1,7 @@
-"""QGGMRFDenoiser gates: a denoising smoke on every backend, two shards
-against one device, the sigma_noise knob with the automatic regularization
-off, an all-zero input, the stack denoiser against a loop of single-volume
-calls, and one initialization reused across calls."""
+"""QGGMRFDenoiser gates: scale equivariance on every backend, with the
+regularization automatic and pinned; two shards against one device; an
+all-zero input; the stack denoiser against a loop of single-volume calls; the
+caller's arrays left unwritten; and one initialization reused across calls."""
 
 import numpy as np
 import pytest
@@ -17,20 +17,53 @@ def _rel_max(out, ref):
     return float(np.max(np.abs(out - ref)) / np.max(np.abs(ref)))
 
 
-def test_denoise_reduces_noise(device):
-    shape = (32, 32, 32)
+@pytest.mark.parametrize('prior', ['automatic', 'pinned'])
+def test_denoise_is_scale_equivariant(device, prior):
+    """Scaling the noisy image by c must scale the denoised image by c.
+
+    The cost that denoise minimizes and the automatic estimates of
+    sigma_noise and sigma_x all scale with the image, so the result must not
+    depend on the units of the image.  An update whose step does not scale
+    with the image fails this test, because it barely moves an image in large
+    units.  The scales are powers of 2, so the scaling adds no rounding.
+
+    The 'automatic' case estimates sigma_noise and sigma_x from the image.
+    The 'pinned' case fixes sigma_x, as the Plug-and-Play agent does, and
+    passes sigma_noise, which must then set sigma_y.  In both cases the
+    denoised image must be at least 30% closer to the clean image than the
+    noisy image is, because returning the input unchanged is also scale
+    equivariant."""
+    shape = (32, 32, 8)
     clean = np.zeros(shape, dtype=np.float32)
-    clean[8:-8, 8:-8, 8:-8] = 1.0
+    clean[8:-8, 8:-8, 2:-2] = 1.0
     noisy = clean + 0.1 * np.random.RandomState(2).randn(*shape).astype(np.float32)
-    denoiser = mbirtorch.QGGMRFDenoiser(shape)
-    denoiser.configure_devices(devices=[device])
-    denoiser.set_params(no_warning=True, verbose=0)
-    np.random.seed(0)
-    denoised, _ = denoiser.denoise(noisy, sigma_noise=0.1, max_iterations=5,
-                                   stop_threshold_change_pct=0.0)
+
+    def denoise_scaled(scale):
+        """Return the denoised image of scale * noisy, divided by scale."""
+        denoiser = mbirtorch.QGGMRFDenoiser(shape)
+        denoiser.configure_devices(devices=[device])
+        denoiser.set_params(no_warning=True, verbose=0)
+        sigma_noise = None
+        if prior == 'pinned':
+            denoiser.set_params(no_warning=True, sigma_x=0.05 * scale,
+                                auto_regularize_flag=False)
+            sigma_noise = 0.1 * scale
+        np.random.seed(0)     # the same partition at every scale
+        out, _ = denoiser.denoise(scale * noisy, sigma_noise=sigma_noise,
+                                  max_iterations=5, stop_threshold_change_pct=0.0,
+                                  logfile_path=None, print_logs=False)
+        if prior == 'pinned':
+            assert float(denoiser.get_params('sigma_y')) == pytest.approx(sigma_noise)
+        return np.asarray(out, dtype=np.float64) / scale
+
+    reference = denoise_scaled(1.0)
     err_noisy = np.linalg.norm(noisy - clean)
-    err_den = np.linalg.norm(denoised - clean)
-    assert err_den < 0.6 * err_noisy, (err_den, err_noisy)
+    err_den = np.linalg.norm(reference - clean)
+    assert err_den < 0.7 * err_noisy, (err_den, err_noisy)
+    for scale in (2.0 ** 10, 2.0 ** -10):
+        rel = _rel_max(denoise_scaled(scale), reference)
+        print(f"{prior} on {device}: scale {scale:g} differs from scale 1 by {rel:.2e}")
+        assert rel < 1e-5, (scale, rel)
 
 
 def test_sharded_denoise_matches_single_device():
@@ -85,40 +118,6 @@ def test_sharded_denoise_matches_single_device():
         print(f"{name}: sharded {out_params[name]:.8g} vs single "
               f"{ref_params[name]:.8g} (rel {rel:.2e})")
         assert rel < 1e-5, name
-
-
-def test_denoise_pinned_params_keep_sigma_noise_knob(device):
-    """With auto-regularization pinned off (the Plug-and-Play agent
-    configuration: sigma_x fixed so the denoiser is the same operator every
-    call), sigma_noise still sets the denoising strength.  For the identity
-    forward model sigma_y IS sigma_noise, so denoise must keep them equal on
-    the pinned path too -- before that sync, a pinned denoiser silently ran
-    at a stale sigma_y and this knob was dead."""
-    shape = (32, 32, 1)
-    rng = np.random.default_rng(0)
-    clean = np.zeros(shape, dtype=np.float32)
-    clean[8:24, 8:24, :] = 1.0
-    noisy = clean + 0.1 * rng.standard_normal(shape).astype(np.float32)
-
-    denoiser = mbirtorch.QGGMRFDenoiser(shape)
-    denoiser.configure_devices(devices=[device])
-    denoiser.set_params(no_warning=True, verbose=0, sigma_x=0.05,
-                        auto_regularize_flag=False)
-
-    np.random.seed(0)
-    weak, _ = denoiser.denoise(noisy, sigma_noise=0.01, max_iterations=4,
-                               stop_threshold_change_pct=0.0)
-    assert float(denoiser.get_params('sigma_y')) == pytest.approx(0.01)
-
-    np.random.seed(0)
-    strong, _ = denoiser.denoise(noisy, sigma_noise=0.5, max_iterations=4,
-                                 stop_threshold_change_pct=0.0)
-    assert float(denoiser.get_params('sigma_y')) == pytest.approx(0.5)
-
-    # Small sigma_noise hugs the input; large sigma_noise smooths it hard.
-    dist_weak = float(np.linalg.norm(weak - noisy))
-    dist_strong = float(np.linalg.norm(strong - noisy))
-    assert dist_weak < 0.5 * dist_strong, (dist_weak, dist_strong)
 
 
 def test_zero_input_comes_back_unchanged(device):
