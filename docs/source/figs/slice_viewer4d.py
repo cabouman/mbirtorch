@@ -22,6 +22,7 @@ labels = ['shifting phantom', 'static phantom']
 # The x-y plane at frame 4, with an ROI on the left edge of the phantom, on the middle row.
 # The frame is set first, so the ROI statistics describe the frame that is shown.
 viewer = SliceViewer4D(moving, phantom, slice_label=labels, show_instructions=False,
+                       movie_fn=mbirtorch.save_volume_as_gif,
                        title='x-y plane: an ROI on an edge and its mean against frame')
 viewer.fig.canvas.draw()
 viewer.frame_slider.set_val(4)
@@ -37,6 +38,7 @@ for name, (x, y) in (('button_press_event', (edge, 48)),
 
 # The t-y plane at x = 48: each row is one frame.
 viewer_ty = SliceViewer4D(moving, phantom, slice_label=labels, show_instructions=False,
+                          movie_fn=mbirtorch.save_volume_as_gif,
                           title='t-y plane: one line of the volume in every frame')
 viewer_ty.axis_radios[0].set_active(PLANE_LABELS.index('t-y'))
 viewer_ty.frame_slider.set_val(48)
