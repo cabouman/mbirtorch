@@ -958,7 +958,12 @@ class SliceViewer4D(SliceViewer):
         range.  A file that exists already is kept, and the new GIF gets a numbered
         name.
         """
-        os.makedirs(folder, exist_ok=True)
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError as e:
+            # For example, the path is an existing file.
+            self._file_error(f"Cannot save the GIFs in {folder}: {e.strerror or e}")
+            return
         written = []
         for i in self._moving_panels(row):
             path = self._unused_path(os.path.join(folder, self._gif_file_name(row, i)))
