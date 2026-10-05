@@ -12,7 +12,7 @@ def get_sino_and_model(scan_dir, *, downsample_factor=(1, 1), subsample_view_fac
                        crop_pixels_top=0, crop_pixels_bottom=0, auto_crop=False, verbose=1, min_transmission=1e-4,
                        background_offset='per_view', sinogram_path=None, num_workers=8, batch_size=90):
     """
-    Load a Zeiss VoluMax scan, compute its sinogram, and return a ready-to-reconstruct model.
+    Load a Zeiss VoluMax scan, compute its sinogram, and return a ready-to-reconstruct model and the scan metadata.
 
     Args:
         scan_dir (str): Path to the VoluMax scan folder, which contains ``AcquisitionParameters.json``.
@@ -36,19 +36,29 @@ def get_sino_and_model(scan_dir, *, downsample_factor=(1, 1), subsample_view_fac
         batch_size (int, optional): Number of views per batch when the sinogram is computed. Defaults to 90.
 
     Returns:
-        tuple: ``(sino, model)``
+        tuple: ``(sino, model, metadata)``
 
             - ``sino`` (numpy.ndarray): the sinogram with shape (num_views, num_det_rows, num_det_channels).
             - ``model`` (ConeBeamModel): a model with the geometry from the metadata and its reconstruction geometry
               set.
+            - ``metadata`` (dict): the metadata of the scan, with three entries.
+
+              - ``'acquisition'`` (dict): the contents of ``AcquisitionParameters.json``, unchanged.  It holds the
+                scan name and mode, the tube voltage and current, the filter, the detector settings, and the
+                corrections already applied to the projections.
+              - ``'projections'`` (dict): the per-view metadata of the views that were loaded, as arrays over the
+                views: ``view_ids``, ``object_angle`` (degrees), and ``source_position``, ``detector_position``,
+                ``object_position``, ``span_vector_u``, and ``span_vector_v`` (mm, each of shape (num_views, 3)).
+              - ``'geometry'`` (dict): the full-resolution geometry that the reader derives from the metadata: the two
+                distances, the magnification, the detector offsets, and the detector rotation.
 
     Example:
         .. code-block:: python
 
-            sino, model = mbirtorch.preprocess.volumax.get_sino_and_model(scan_dir)
+            sino, model, metadata = mbirtorch.preprocess.volumax.get_sino_and_model(scan_dir)
             recon, recon_dict = model.recon(sino)
     """
-    sino, required_params, optional_params, _ = _compute_sino_and_params(
+    sino, required_params, optional_params, metadata = _compute_sino_and_params(
         scan_dir, downsample_factor=downsample_factor, subsample_view_factor=subsample_view_factor,
         crop_pixels_sides=crop_pixels_sides, crop_pixels_top=crop_pixels_top, crop_pixels_bottom=crop_pixels_bottom,
         verbose=verbose, min_transmission=min_transmission, background_offset=background_offset,
@@ -57,7 +67,7 @@ def get_sino_and_model(scan_dir, *, downsample_factor=(1, 1), subsample_view_fac
     if verbose > 0:
         print('\n########## Model parameters')
         model.print_params()
-    return sino, model
+    return sino, model, metadata
 
 
 def _compute_sino_and_params(scan_dir, downsample_factor=(1, 1), subsample_view_factor=1, crop_pixels_sides=0,
@@ -69,10 +79,10 @@ def _compute_sino_and_params(scan_dir, downsample_factor=(1, 1), subsample_view_
     This is the private helper for :func:`get_sino_and_model`, which documents the arguments.
 
     Returns:
-        tuple: ``(sino, required_params, optional_params, geometry)``.  ``required_params`` holds the ConeBeamModel
+        tuple: ``(sino, required_params, optional_params, metadata)``.  ``required_params`` holds the ConeBeamModel
         constructor arguments and a ``geometry_type`` entry that ``build_model`` uses to select the model class.
-        ``optional_params`` holds the ``set_params`` arguments.  ``geometry`` is the full-resolution geometry from
-        :func:`compute_geometry`.
+        ``optional_params`` holds the ``set_params`` arguments.  ``metadata`` is the scan metadata that
+        :func:`get_sino_and_model` returns.
     """
     if verbose > 0:
         print('\n########## Loading VoluMax projections and geometry')
@@ -113,7 +123,9 @@ def _compute_sino_and_params(scan_dir, downsample_factor=(1, 1), subsample_view_
         sino = mtp.correct_background_offset(sino, option=background_offset)
     if verbose > 0:
         print(f'sinogram shape = {sino.shape}, min {sino.min():.4f}, max {sino.max():.4f}')
-    return sino, cone_beam_params, optional_params, geometry
+    metadata = dict(acquisition=volumax_params['acquisition'], projections=volumax_params['projections'],
+                    geometry=geometry)
+    return sino, cone_beam_params, optional_params, metadata
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -474,7 +486,9 @@ def load_scans_and_params(scan_dir, view_id_start=0, view_id_end=None, subsample
             - ``obj_scan`` (numpy.ndarray or None): the transmission images after the crop and downsampling, float32
               with shape (num_views, num_det_rows, num_det_channels).
             - ``volumax_params`` (dict): the geometry vectors and detector parameters from ``volumax_vectors``,
-              plus the scan folder, the view indices, the crop and downsampling settings, and ``min_transmission``.
+              plus the scan folder, the view indices, the crop and downsampling settings, ``min_transmission``,
+              ``acquisition`` (the contents of ``AcquisitionParameters.json``), and ``projections`` (the per-view
+              metadata of the selected views).
 
     Raises:
         FileNotFoundError: If ``scan_dir`` does not contain ``AcquisitionParameters.json`` or per-view metadata, or,
@@ -501,6 +515,11 @@ def load_scans_and_params(scan_dir, view_id_start=0, view_id_end=None, subsample
         crop_pixels_sides=int(crop_pixels_sides), crop_pixels_top=int(crop_pixels_top),
         crop_pixels_bottom=int(crop_pixels_bottom),
         downsample_factor=(int(downsample_factor[0]), int(downsample_factor[1])), min_transmission=min_transmission,
+        acquisition=meta['acq'],
+        projections=dict(view_ids=view_ids, object_angle=meta['angles_deg'][view_ids],
+                         source_position=meta['source'][view_ids], detector_position=meta['detector'][view_ids],
+                         object_position=meta['object'][view_ids], span_vector_u=meta['span_u'][view_ids],
+                         span_vector_v=meta['span_v'][view_ids]),
     ))
 
     obj_scan = None

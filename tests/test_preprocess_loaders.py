@@ -2,6 +2,8 @@
 math, ported from mbirjax's TestConfigCropUnification.  Loader runs on real
 scan data happen on the cluster (the increment-4 end-to-end gate)."""
 
+import json
+
 import numpy as np
 import pytest
 
@@ -151,3 +153,35 @@ def test_volumax_geometry_with_a_leaning_detector():
     hit = np.array([-100. + sdd, 0., 0.]) - np.array([50., 1., 2.])
     assert g['det_row_offset'] == pytest.approx(np.dot(hit, [-np.sin(lean), 0., -np.cos(lean)]))
     assert g['det_channel_offset_metadata'] == pytest.approx(np.dot(hit, [0., -1., 0.]))
+
+
+def test_volumax_get_sino_and_model_returns_the_metadata(tmp_path):
+    # A scan folder with 6 views of an 8 x 10 detector, written in the VoluMax layout.
+    n, nrows, nchan, pitch = 6, 8, 10, 0.2
+    metrics = dict(sourcePosition=dict(x=-100., y=0., z=0.), detectorPosition=dict(x=50., y=0., z=0.),
+                   objectPosition=dict(x=0., y=0., z=-30.), spanVectorU=dict(x=0., y=-pitch, z=0.),
+                   spanVectorV=dict(x=0., y=0., z=-pitch))
+    acquisition = dict(name='test', numberOfProjections=n, mode='ACQUISITION_MODE_STOP_GO',
+                       tubeParameters=dict(accelerationVoltageInKV=350, sourceCurrentInMicroA=2000),
+                       detectorParameters=dict(pixelPitch=dict(horizontal=pitch, vertical=pitch),
+                                               imageSize=dict(width=nchan, height=nrows)),
+                       startProjectionMetrics=dict(metrics, objectAngle=0.0))
+    (tmp_path / 'Projections' / 'Metadata').mkdir(parents=True)
+    (tmp_path / 'Projections' / 'Images').mkdir()
+    (tmp_path / 'AcquisitionParameters.json').write_text(json.dumps(acquisition))
+    for i in range(n):
+        view = dict(projectionType='PROJECTION_TYPE_OBJECT', imageIndex=i, imageSize=dict(width=nchan, height=nrows),
+                    projectionMetrics=dict(metrics, objectAngle=60.0 * i))
+        (tmp_path / 'Projections' / 'Metadata' / f'Projection_{i:05d}.json').write_text(json.dumps(view))
+        np.full((nrows, nchan), 0.5, dtype='<f4').tofile(tmp_path / 'Projections' / 'Images' / f'Projection_{i:05d}.float32')
+
+    sino, model, metadata = mtp.volumax.get_sino_and_model(str(tmp_path), subsample_view_factor=2, verbose=0,
+                                                           background_offset=None)
+    assert sino.shape == (3, nrows, nchan)
+    assert np.allclose(sino, np.log(2.0), atol=1e-5)
+    assert model.get_params('source_iso_dist') == pytest.approx(100.0)
+    assert metadata['acquisition'] == acquisition
+    assert list(metadata['projections']['view_ids']) == [0, 2, 4]
+    assert np.allclose(metadata['projections']['object_angle'], [0.0, 120.0, 240.0])
+    assert metadata['projections']['source_position'].shape == (3, 3)
+    assert metadata['geometry']['source_detector_dist'] == pytest.approx(150.0)

@@ -23,8 +23,11 @@ show_viewer = True
 # ----------------------------------------------------------------------------------------------
 # 1. Sinogram and cone-beam model with the geometry from the metadata
 # ----------------------------------------------------------------------------------------------
-sino, ct_model = volumax.get_sino_and_model(scan_dir, downsample_factor=downsample_factor,
-                                            subsample_view_factor=subsample_view_factor, sinogram_path=sinogram_path)
+sino, ct_model, metadata = volumax.get_sino_and_model(scan_dir, downsample_factor=downsample_factor,
+                                                      subsample_view_factor=subsample_view_factor,
+                                                      sinogram_path=sinogram_path)
+tube = metadata['acquisition']['tubeParameters']
+print(f'Tube: {tube["accelerationVoltageInKV"]} kV, {tube["sourceCurrentInMicroA"]} uA')
 
 # ----------------------------------------------------------------------------------------------
 # 2. Weights, regularization, and reconstruction
