@@ -421,3 +421,35 @@ def _auto_denoiser(shape, device, sigma_noise=0.1):
 
 def _rel(a, b):
     return abs(float(a) - float(b)) / abs(float(b))
+
+
+# ── the noise estimate ───────────────────────────────────────────────────────
+
+def test_noise_estimate_returns_the_level_of_white_and_correlated_noise():
+    """The noise estimate is the median absolute difference of voxels 5
+    apart, divided by sqrt(2) times 0.6745.  On a volume with no edges it must
+    return the noise level to within 2%, both for white noise and for noise
+    correlated between neighbors.  The correlated noise is white noise
+    blurred by a Gaussian of 1 voxel, which gives neighbors a correlation of
+    0.78 and makes adjacent voxels differ less.  An offset of -1000, as an
+    image in HU has, must not change the estimate, and a region of exact
+    zeros, as a mask leaves, must not lower it."""
+    from scipy import ndimage
+
+    shape = (64, 64, 32)
+    sigma = 0.1
+    white = np.random.default_rng(7).standard_normal(shape)
+    correlated = ndimage.gaussian_filter(white, 1.0)
+    denoiser = mbirtorch.QGGMRFDenoiser(shape)
+    for name, noise in (('white', white), ('correlated', correlated)):
+        volume = (1.0 + sigma * noise / noise.std()).astype(np.float32)
+        estimate = denoiser.estimate_image_noise_std(volume)
+        shifted = denoiser.estimate_image_noise_std(volume - 1000)
+        masked = volume.copy()
+        masked[:16] = 0
+        in_mask = denoiser.estimate_image_noise_std(masked)
+        print(f"{name} noise: estimate / sigma {estimate / sigma:.4f}, with an offset "
+              f"{shifted / sigma:.4f}, with a masked region {in_mask / sigma:.4f}")
+        assert abs(estimate / sigma - 1) < 0.02
+        assert abs(shifted / estimate - 1) < 1e-3
+        assert abs(in_mask / sigma - 1) < 0.02

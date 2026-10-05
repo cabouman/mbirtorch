@@ -50,6 +50,13 @@ _F32_EPS = float(np.finfo(np.float32).eps)
 _SIGMA_X_FLOOR = 1e-6
 # The whole-volume statistics read at most this many voxels.
 _STATISTICS_POINT_BUDGET = 5_000_000
+# The noise estimate compares voxels this many apart along an axis.  Noise
+# that is correlated between neighbors makes adjacent voxels differ less.
+_NOISE_PAIR_SEPARATION = 5
+# The median of |Z| for a standard normal Z.  The difference of two voxels
+# with independent noise of standard deviation sigma has standard deviation
+# sqrt(2) sigma.
+_NORMAL_ABS_MEDIAN = 0.6744897501960817
 
 # The sampled statistics use this many tiles per axis, and a tile edge shorter
 # than _MIN_TILE is not read.
@@ -91,6 +98,31 @@ def _sample_tiles(num_rows, num_cols, num_leading, point_budget):
         return [slice(start, start + width) for start in starts]
 
     return spread(num_rows), spread(num_cols)
+
+
+def _pair_stride(shape, separation, point_budget):
+    """Return the smallest stride at which the voxel pairs of the noise
+    estimate number at most ``point_budget``.
+
+    Along each axis longer than ``separation``, the pairs lie on lines along
+    that axis.  The lines are taken at the stride along the other two axes,
+    and every pair of voxels ``separation`` apart on a line is used.
+    """
+    def num_pairs(stride):
+        total = 0
+        for axis in range(3):
+            if shape[axis] > separation:
+                lines = 1
+                for other in range(3):
+                    if other != axis:
+                        lines *= -(-shape[other] // stride)
+                total += (shape[axis] - separation) * lines
+        return total
+
+    stride = 1
+    while num_pairs(stride) > point_budget:
+        stride += 1
+    return stride
 
 
 def _as_device_scalars(fm_constant, qggmrf_params, like):
@@ -428,28 +460,63 @@ class QGGMRFDenoiser(TomographyModel):
 
     def estimate_image_noise_std(self, image):
         """
-        Estimate the noise standard deviation from the image (two passes of
-        support-indicator + neighbor-difference std).
+        Estimate the noise standard deviation of an image from the
+        differences of voxel pairs.
 
-        Only a strided subsample of at most about five million points is ever
-        used, so the element count and the stride come from the image's
-        SHAPE rather than from a host copy, and the subsample itself is taken
-        through :func:`_subsample_to_host`.  A sharded image is therefore
-        strided on its own devices and never brought over whole.  The stride
-        arithmetic is unchanged, so any given image still yields the estimate
-        it always did.
+        The pairs are the voxels that lie 5 apart along one of the three
+        axes.  The estimate is the median absolute difference of the pairs,
+        divided by sqrt(2) times 0.6745, which is the median of the absolute
+        value of a standard normal variable.  For white Gaussian noise in a
+        region with no edges, the estimate is the noise standard deviation.
+
+        The two voxels of a pair are not adjacent, because noise that is
+        correlated between neighbors, as in an FDK image, makes adjacent
+        voxels differ less.  An edge between the two voxels of a pair adds to
+        their difference, so the estimate is high on an image with strong
+        edges and low noise.  A constant added to the image does not change
+        the estimate.  A pair with a voxel that is exactly 0 is left out, so
+        that a masked region does not lower the estimate.  When no axis is
+        longer than 5 voxels, the pairs lie as far apart as the longest axis
+        allows.
+
+        At most about five million pairs are used.  The pairs lie on lines
+        along each axis, and the lines are taken at a stride along the other
+        two axes.  The stride comes from the image's shape, and only the
+        lines are copied to the host, so a sharded image is never brought
+        over whole.
+
+        Args:
+            image (numpy or tensor or Shards): the 3D volume.
+
+        Returns:
+            float: the estimate, or 0.0 when no pair is left.
         """
-        num_rows, num_cols, num_slices = _volume_shape(image)
-        num_elements = num_rows * num_cols * num_slices
-        num_pts_to_use = np.minimum(5_000_000, num_elements)
-        stride = round((num_elements / num_pts_to_use) ** (1 / 3))
-        small_image = _subsample_to_host(image, stride, stride, stride)
-
-        support_indicator = self._get_sino_indicator(small_image, sigma_noise=0.0)
-        sigma_noise = self._get_estimate_of_recon_std(small_image, support_indicator)
-        support_indicator = self._get_sino_indicator(small_image, sigma_noise=sigma_noise)
-        sigma_noise = self._get_estimate_of_recon_std(small_image, support_indicator)
-        return sigma_noise
+        shape = _volume_shape(image)
+        separation = min(_NOISE_PAIR_SEPARATION, max(shape) - 1)
+        if separation < 1:
+            return 0.0
+        stride = _pair_stride(shape, separation, _STATISTICS_POINT_BUDGET)
+        differences = []
+        for axis in range(3):
+            if shape[axis] <= separation:
+                continue
+            steps = [stride, stride, stride]
+            steps[axis] = 1
+            lines = _subsample_to_host(image, *steps)
+            if not np.issubdtype(lines.dtype, np.floating):
+                # An integer difference could overflow.
+                lines = lines.astype(np.float64)
+            first = [slice(None)] * 3
+            second = [slice(None)] * 3
+            first[axis] = slice(0, shape[axis] - separation)
+            second[axis] = slice(separation, shape[axis])
+            first, second = lines[tuple(first)], lines[tuple(second)]
+            kept = (first != 0) & (second != 0)
+            differences.append(np.abs(second - first)[kept])
+        differences = np.concatenate(differences)
+        if differences.size == 0:
+            return 0.0
+        return float(np.median(differences)) / (np.sqrt(2.0) * _NORMAL_ABS_MEDIAN)
 
     def _get_estimate_of_recon_std(self, noisy_image, support_indicator):
         """Return an estimate of the noise standard deviation.  Each voxel of
@@ -633,9 +700,9 @@ class QGGMRFDenoiser(TomographyModel):
         self._apply_device_policy(workload='denoise')
         image_shape = tuple(int(n) for n in self.get_params('recon_shape'))
         if sigma_noise is None and image is not None:
-            # This estimate strides all three axes itself, so it takes the
-            # image in whatever form the caller supplied.  A stack is read as
-            # one volume, with its volumes joined along the row axis.
+            # This estimate samples the image itself, so it takes the image
+            # in whatever form the caller supplied.  A stack is read as one
+            # volume, with its volumes joined along the row axis.
             volume = (image.reshape(-1, image_shape[1], image_shape[2])
                       if _is_stack(image) else image)
             sigma_noise = self.estimate_image_noise_std(volume)
