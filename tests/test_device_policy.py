@@ -607,7 +607,7 @@ def test_a_denoiser_placed_like_a_ct_model_takes_its_sharded_volume():
     assert isinstance(placed, _sharding.Shards)
 
     denoised, _ = denoiser.denoise(placed, sigma_noise=0.1, max_iterations=1,
-                                   stop_threshold_change_pct=0.0,
+                                   stop_threshold=0.0,
                                    logfile_path=None, print_logs=False,
                                    output_sharded=True)
     assert isinstance(denoised, _sharding.Shards)

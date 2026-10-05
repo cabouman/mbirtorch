@@ -1,7 +1,9 @@
 """QGGMRFDenoiser gates: scale equivariance on every backend, with the
-regularization automatic and pinned; two shards against one device; an
-all-zero input; the stack denoiser against a loop of single-volume calls; the
-caller's arrays left unwritten; and one initialization reused across calls."""
+regularization automatic and pinned; the stopping rule's distance to the MAP
+estimate, with and without an offset; the error for the old name of the stop
+parameter; two shards against one device; an all-zero input; the stack
+denoiser against a loop of single-volume calls; the caller's arrays left
+unwritten; and one initialization reused across calls."""
 
 import numpy as np
 import pytest
@@ -55,7 +57,7 @@ def test_denoise_is_scale_equivariant(device, prior):
             sigma_noise = 0.1 * scale
         np.random.seed(0)     # the same partition at every scale
         out, _ = denoiser.denoise(scale * noisy, sigma_noise=sigma_noise,
-                                  max_iterations=5, stop_threshold_change_pct=0.0,
+                                  max_iterations=5, stop_threshold=0.0,
                                   logfile_path=None, print_logs=False)
         if prior == 'pinned':
             assert float(denoiser.get_params('sigma_y')) == pytest.approx(sigma_noise)
@@ -76,10 +78,72 @@ def test_denoise_is_scale_equivariant(device, prior):
     assert new_graphs == 0, f'{new_graphs} new compiled graphs for new noise levels'
 
 
+def test_gradient_rule_stops_within_its_threshold_of_the_map_estimate(device):
+    """The sweep stops when sigma_noise times the rms gradient of the cost
+    falls below stop_threshold.  At any image, sigma_noise times the rms
+    gradient bounds the rms distance to the MAP estimate in units of
+    sigma_noise.  The sweep takes each gradient during the sweep rather than
+    at the image it ends with, so its statistic only approximates that
+    bound.  Each sweep must still end within its threshold of the MAP
+    estimate, which is the same sweep run to a threshold of 1e-4.
+
+    The prior is strong, with sigma_x / sigma_noise = 0.1, so the sweeps need
+    many iterations.  The same volume is also denoised in HU-like units,
+    scaled by 1000 with 1000 subtracted, so that air lies at -1000.  The old
+    rule, a percent change of the image, stopped early on such an image,
+    because the offset inflates the image's norm.  The rule on the gradient
+    does not depend on an offset."""
+    shape = (24, 24, 8)
+    clean = np.zeros(shape, dtype=np.float32)
+    clean[6:-6, 6:-6, 2:-2] = 1.0
+    noisy = clean + 0.1 * np.random.RandomState(5).randn(*shape).astype(np.float32)
+
+    def run(scale, offset, threshold, max_iterations=200):
+        """Return the denoised image of scale * noisy + offset, mapped back by
+        the inverse transform, and the gradient statistic of each iteration."""
+        denoiser = mbirtorch.QGGMRFDenoiser(shape)
+        denoiser.configure_devices(devices=[device])
+        denoiser.set_params(no_warning=True, verbose=0, sigma_x=0.01 * scale,
+                            auto_regularize_flag=False)
+        np.random.seed(0)
+        out, out_dict = denoiser.denoise(scale * noisy + offset, sigma_noise=0.1 * scale,
+                                         max_iterations=max_iterations,
+                                         stop_threshold=threshold,
+                                         logfile_path=None, print_logs=False)
+        out = (np.asarray(out, dtype=np.float64) - offset) / scale
+        return out, out_dict['recon_params']['gradient_statistic']
+
+    map_estimate, statistics = run(1.0, 0.0, 1e-4, max_iterations=2000)
+    assert statistics[-1] < 1e-4
+    for scale, offset in ((1.0, 0.0), (1000.0, -1000.0)):
+        for threshold in (0.1, 0.03, 0.01):
+            out, statistics = run(scale, offset, threshold)
+            distance = float(np.sqrt(np.mean((out - map_estimate) ** 2))) / 0.1
+            print(f"scale {scale:g}, offset {offset:g}, threshold {threshold}: "
+                  f"{len(statistics)} iterations, last statistic {statistics[-1]:.4g}, "
+                  f"distance to the MAP estimate {distance:.4g}")
+            assert len(statistics) < 200 and statistics[-1] < threshold
+            assert distance < threshold
+
+
+def test_the_old_stop_parameter_raises_an_error_that_names_the_new_one():
+    """stop_threshold replaced stop_threshold_change_pct, and its unit changed
+    from percent to sigma_noise.  A call that passes the old name must fail
+    with a message that names the new parameter."""
+    shape = (8, 10, 12)
+    denoiser = _pinned_denoiser(shape, 'cpu')
+    stack = _ramp_stack(2, shape)
+    with pytest.raises(TypeError, match='Use stop_threshold instead'):
+        denoiser.denoise(stack[0], sigma_noise=0.1, stop_threshold_change_pct=0.2)
+    with pytest.raises(TypeError, match='Use stop_threshold instead'):
+        denoiser.denoise_stack(stack, sigma_noise=0.1, stop_threshold_change_pct=0.2)
+
+
 def test_sharded_denoise_matches_single_device():
     """Two CPU shards vs one device on the same seeded problem: the denoised
-    volume and the automatically set regularization parameters must both agree
-    with the single-device run.
+    volume, the iteration at which the default stopping rule ends each sweep,
+    the gradient statistic at each iteration, and the automatically set
+    regularization parameters must all agree with the single-device run.
 
     The sharded path stages halos once per pass and combines the step-size sums
     on the lead device, so agreement is at float level, not bitwise (gate per
@@ -101,22 +165,25 @@ def test_sharded_denoise_matches_single_device():
     ref_den.configure_devices(devices=['cpu'])
     ref_den.set_params(no_warning=True, verbose=0)
     np.random.seed(0)
-    ref, ref_dict = ref_den.denoise(noisy, max_iterations=5,
-                                    stop_threshold_change_pct=0.0, logfile_path=None)
+    ref, ref_dict = ref_den.denoise(noisy, logfile_path=None)
 
     sh_den = mbirtorch.QGGMRFDenoiser(shape)
     sh_den.configure_devices(devices=['cpu', 'cpu'])
     sh_den.set_params(no_warning=True, verbose=0)
     np.random.seed(0)
-    out, out_dict = sh_den.denoise(sh_den._shard_recon(noisy), max_iterations=5,
-                                   stop_threshold_change_pct=0.0, logfile_path=None,
+    out, out_dict = sh_den.denoise(sh_den._shard_recon(noisy), logfile_path=None,
                                    output_sharded=True)
     out = np.asarray(out.gather())
 
     assert out.shape == ref.shape
     rel = float(np.max(np.abs(out - ref)) / np.max(np.abs(ref)))
-    print(f"sharded vs single denoise rel_max = {rel:.2e}")
+    ref_statistics = np.array(ref_dict['recon_params']['gradient_statistic'])
+    out_statistics = np.array(out_dict['recon_params']['gradient_statistic'])
+    print(f"sharded vs single denoise rel_max = {rel:.2e}, iterations "
+          f"{len(out_statistics)} vs {len(ref_statistics)}")
     assert rel < 1e-4
+    assert len(out_statistics) == len(ref_statistics)
+    assert _rel_max(out_statistics, ref_statistics) < 1e-5
     # The denoiser dict carries the run log and notes, like recon's.
     # (verbose=0 logs no iteration lines, so only the keys are checked.)
     assert 'recon_log' in out_dict and 'notes' in out_dict
@@ -146,7 +213,7 @@ def test_zero_input_comes_back_unchanged(device):
     np.random.seed(0)
     out, _ = denoiser.denoise(np.zeros(shape, dtype=np.float32),
                               sigma_noise=0.1, max_iterations=2,
-                              stop_threshold_change_pct=0.0)
+                              stop_threshold=0.0)
     assert np.array_equal(np.asarray(out), np.zeros(shape, dtype=np.float32))
 
     stack_shape = (8, 10, 12)
@@ -159,7 +226,7 @@ def test_zero_input_comes_back_unchanged(device):
     stack_denoiser.set_params(no_warning=True, verbose=0)
     np.random.seed(0)
     stack_out, info = stack_denoiser.denoise_stack(zeros, sigma_noise=0.1, max_iterations=2,
-                                                   stop_threshold_change_pct=0.0)
+                                                   stop_threshold=0.0)
     assert info['regularization_params']['sigma_x'] == denoising._SIGMA_X_FLOOR
     assert np.all(np.isfinite(stack_out))
     assert np.array_equal(stack_out, zeros)
@@ -206,6 +273,7 @@ def test_denoise_stack_equals_a_loop_of_denoise_calls(device):
     shape = (8, 10, 12)
     num_volumes = 6
     sigma_noise = 0.1
+    threshold = 0.03
     stack = _ramp_stack(num_volumes, shape)
 
     auto = mbirtorch.QGGMRFDenoiser(shape)
@@ -213,8 +281,7 @@ def test_denoise_stack_equals_a_loop_of_denoise_calls(device):
     auto.set_params(no_warning=True, verbose=0)
     np.random.seed(0)
     denoised, info = auto.denoise_stack(stack, sigma_noise=sigma_noise,
-                                        max_iterations=15,
-                                        stop_threshold_change_pct=0.2)
+                                        stop_threshold=threshold)
 
     # The parameter moved: the reported sigma_x is the method's own value.
     reported = info['regularization_params']['sigma_x']
@@ -227,15 +294,16 @@ def test_denoise_stack_equals_a_loop_of_denoise_calls(device):
     # sigma_x pinned to that value on the same seeded partition.
     reference = np.empty_like(stack)
     reference_counts = []
+    reference_statistics = []
     single = _pinned_denoiser(shape, device, sigma_x=reported)
     for volume in range(num_volumes):
         np.random.seed(0)     # the same partition for every volume
         out, out_dict = single.denoise(stack[volume], sigma_noise=sigma_noise,
-                                       max_iterations=15,
-                                       stop_threshold_change_pct=0.2,
+                                       stop_threshold=threshold,
                                        logfile_path=None, print_logs=False)
         reference[volume] = out
         reference_counts.append(int(out_dict['recon_params']['num_iterations']))
+        reference_statistics.append(out_dict['recon_params']['gradient_statistic'])
 
     rel = _rel_max(denoised, reference)
     counts = [int(n) for n in info['num_iterations']]
@@ -246,6 +314,11 @@ def test_denoise_stack_equals_a_loop_of_denoise_calls(device):
     assert counts == reference_counts
     assert len(set(counts)) >= 2, 'the volumes must stop at different iterations'
     assert [len(h) for h in info['nmae_pct']] == counts
+    # Each volume stopped by the rule, and its gradient statistic at each
+    # iteration is that of its own denoise call.
+    for statistics, reference_values in zip(info['gradient_statistic'], reference_statistics):
+        assert statistics[-1] < threshold
+        assert _rel_max(statistics, reference_values) < 1e-5
     assert info['batch_size'] == num_volumes
     assert set(info['regularization_params']) == {'sigma_y', 'sigma_x', 'sigma_prox'}
     # The volumes changed: this is a denoise, not a copy.
@@ -272,7 +345,7 @@ def test_denoise_stack_never_writes_the_caller_s_arrays(device):
         before_init = init.clone() if torch.is_tensor(init) else init.copy()
 
         out, _ = denoiser.denoise_stack(stack, sigma_noise=0.1, init_stack=init,
-                                        max_iterations=2, stop_threshold_change_pct=0.0)
+                                        max_iterations=2, stop_threshold=0.0)
         moved = (float(torch.max(torch.abs(out - before_init))) if torch.is_tensor(out)
                  else float(np.max(np.abs(out - before_init))))
         print(f"{kind}: the sweep moved the image by {moved:.3e}")
@@ -295,7 +368,7 @@ def test_one_initialization_fixes_the_stack_sweep(device):
     sweep uses."""
     shape = (8, 10, 12)
     stack = _ramp_stack(4, shape)
-    sweep = dict(sigma_noise=0.1, max_iterations=4, stop_threshold_change_pct=0.0)
+    sweep = dict(sigma_noise=0.1, max_iterations=4, stop_threshold=0.0)
 
     denoiser = mbirtorch.QGGMRFDenoiser(shape)
     denoiser.configure_devices(devices=[device])
@@ -319,7 +392,7 @@ def test_one_initialization_fixes_the_stack_sweep(device):
     # grouping is kept.
     held = denoiser.denoise_data['partition']
     _out, info = denoiser.denoise_stack(stack, sigma_noise=0.25, max_iterations=1,
-                                        stop_threshold_change_pct=0.0,
+                                        stop_threshold=0.0,
                                         do_initialization=False)
     assert denoiser.denoise_data['partition'] is held
     assert info['regularization_params']['sigma_y'] == pytest.approx(0.25)
