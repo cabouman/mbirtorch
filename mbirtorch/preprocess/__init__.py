@@ -7,3 +7,4 @@ from . import pymbir
 from . import zeiss_tct
 from . import zeiss
 from . import geometry_calibration
+from . import volumax

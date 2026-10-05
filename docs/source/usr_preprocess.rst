@@ -56,6 +56,15 @@ Zeiss translation tomography functions
 .. autofunction:: load_scans_and_params
 
 
+Zeiss VoluMax reader
+--------------------
+
+.. currentmodule:: mbirtorch.preprocess.volumax
+
+.. autofunction:: get_sino_and_model
+.. autofunction:: load_scans_and_params
+
+
 PYMBIR functions
 ----------------
 
