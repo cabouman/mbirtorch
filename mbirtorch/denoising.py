@@ -87,6 +87,23 @@ def _sample_tiles(num_rows, num_cols, num_leading, point_budget):
     return spread(num_rows), spread(num_cols)
 
 
+def _as_device_scalars(fm_constant, qggmrf_params, like):
+    """Return ``fm_constant`` and ``qggmrf_params`` with fm_constant and sigma_x
+    as 0-d tensors of the dtype and on the device of the tensor ``like``.
+
+    torch.compile treats a Python float argument as a constant, so it compiles
+    the update again for each new value of the float.  fm_constant and sigma_x
+    change with the noise level of each image.  As tensors, they are ordinary
+    inputs, and one compiled update serves every noise level.
+    """
+    b, sigma_x, p, q, T = qggmrf_params
+
+    def scalar(value):
+        return torch.tensor(float(value), dtype=like.dtype, device=like.device)
+
+    return scalar(fm_constant), (b, scalar(sigma_x), p, q, T)
+
+
 def _identity_update_direction(cur_error, fm_constant, prior_grad, prior_hess):
     """Return the update direction at the pixels of one subset for the
     identity forward model.
@@ -740,6 +757,8 @@ class QGGMRFDenoiser(TomographyModel):
             flat_error_image = (image_t.reshape((-1, image_shape[2]))
                                 - flat_image).contiguous()
             subset_denoiser = maybe_compile(vcd_subset_denoiser, self.compile_enabled)
+            fm_constant_t, qggmrf_params_t = _as_device_scalars(
+                fm_constant, qggmrf_params, flat_image)
             nmae_update = np.zeros(max_iters)
             alpha_values = np.zeros(max_iters)
             num_iters = 0
@@ -750,7 +769,8 @@ class QGGMRFDenoiser(TomographyModel):
                     for k in range(partition.shape[0]):
                         flat_image, flat_error_image, ell1_subset, alpha_subset = \
                             subset_denoiser(flat_image, flat_error_image, partition[k],
-                                            fm_constant, qggmrf_params, tuple(image_shape))
+                                            fm_constant_t, qggmrf_params_t,
+                                            tuple(image_shape))
                         ell1_accum = ell1_accum + ell1_subset
                         alpha_accum = alpha_accum + alpha_subset
 
@@ -823,6 +843,9 @@ class QGGMRFDenoiser(TomographyModel):
         grad_hess = [maybe_compile(_qggmrf.qggmrf_gradient_and_hessian_at_indices,
                                    self.compile_enabled, instance_key=i)
                      for i in range(n)]
+        # Each device gets its own tensor copies of fm_constant and sigma_x.
+        scalars_per_dev = [_as_device_scalars(fm_constant, qggmrf_params, t)
+                           for t in flat_image.tensors]
         idx_per_dev = [[torch.as_tensor(partition[k], dtype=torch.int64).to(d)
                         for d in devices] for k in range(partition.shape[0])]
         halos = {'left': [None] * n, 'right': [None] * n}
@@ -847,20 +870,21 @@ class QGGMRFDenoiser(TomographyModel):
                         idx = idx_per_dev[k]
 
                         def terms_worker(j, dev):
+                            fm_constant_j, qggmrf_params_j = scalars_per_dev[j]
                             grad, hess = grad_hess[j](
                                 flat_image.tensors[j], image_shape, idx[j],
-                                qggmrf_params, left_halo=halos['left'][j],
+                                qggmrf_params_j, left_halo=halos['left'][j],
                                 right_halo=halos['right'][j])
                             cur_error = flat_error.tensors[j][idx[j]]
                             delta = _identity_update_direction(
-                                cur_error, fm_constant, grad, hess)
+                                cur_error, fm_constant_j, grad, hess)
                             # The four sums are scalar tensors, not floats, and
                             # are combined on the lead device.
                             return (delta,
                                     torch.sum(grad * delta),
                                     torch.sum(hess * delta ** 2),
-                                    fm_constant * torch.sum(cur_error * delta),
-                                    fm_constant * torch.sum(delta * delta))
+                                    fm_constant_j * torch.sum(cur_error * delta),
+                                    fm_constant_j * torch.sum(delta * delta))
 
                         results = _sharding.run_per_device(
                             devices, terms_worker, executor=self._per_device_pool)
@@ -1305,6 +1329,8 @@ class QGGMRFDenoiser(TomographyModel):
         """
         num_vols = int(flat_image.shape[0])
         device = flat_image.device
+        fm_constant, qggmrf_params = _as_device_scalars(fm_constant, qggmrf_params,
+                                                        flat_image)
         active_host = np.ones(num_vols, dtype=bool)
         active = torch.ones(num_vols, dtype=torch.bool, device=device)
         counts = np.zeros(num_vols, dtype=int)
