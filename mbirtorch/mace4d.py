@@ -29,10 +29,10 @@ from .parameter_handler import ParameterHandler
 from .utilities import construct_time_frame_models
 from .vcd_utils import gen_set_of_pixel_partitions, named_rng, named_seed
 
-# Iterations and stop threshold of each denoiser sweep.  The threshold is tighter
-# than the 0.2 percent a standalone denoise uses.
-_DENOISE_MAX_ITERATIONS = 15
-_DENOISE_STOP_THRESHOLD_PCT = 0.05
+# Iterations and stop threshold of each denoiser sweep.  The threshold is in
+# units of the noise level; see QGGMRFDenoiser.denoise_stack.
+_DENOISE_MAX_ITERATIONS = 200
+_DENOISE_STOP_THRESHOLD = 0.03
 # The filter is applied to the data-fit outputs in slabs of about this size.
 _FILTER_SLAB_BYTES = 64 * 2 ** 20
 
@@ -740,11 +740,16 @@ class MACE4DModel(ParameterHandler):
                                                  [iteration + 1, kind, index, part, device_index,
                                                   round(start, 3), round(end, 3)])))
             if verbose:
+                # A volume that ran the full count may not have reached the
+                # stop threshold.
+                at_cap = sum(1 for n in counts if n >= _DENOISE_MAX_ITERATIONS)
+                cap_note = (f' ({at_cap} of {len(counts)} volumes ran the full '
+                            f'{_DENOISE_MAX_ITERATIONS})' if at_cap else '')
                 self.logger.info(
                     f'[MACE] Iteration {iteration + 1}/{max_iterations}: prox={prox_total:.2f}s, '
                     f'denoise={denoise_total:.2f}s, makespan={makespan:.2f}s, '
                     f"total={loop.info['time'][-1]:.2f}s, change={change_pct:.4f}%, "
-                    f'denoiser iterations={mean_iterations:.1f}')
+                    f'denoiser iterations={mean_iterations:.1f}{cap_note}')
 
         with loop:
             x_bar, _ = loop.run(max_iterations=max_iterations,
@@ -863,7 +868,7 @@ class MACE4DModel(ParameterHandler):
                     padded(stack, count), sigma_noise=sigma,
                     init_stack=None if init_stack is None else padded(init_stack, count),
                     max_iterations=_DENOISE_MAX_ITERATIONS,
-                    stop_threshold_change_pct=_DENOISE_STOP_THRESHOLD_PCT,
+                    stop_threshold=_DENOISE_STOP_THRESHOLD,
                     batch_size=count, overwrite_input=True,
                     do_initialization=False)
                 with lock:
@@ -989,7 +994,8 @@ class MACE4DModel(ParameterHandler):
             'denoiser sigma_x': float(sigma_x),
             'denoiser sigma_x source': sigma_x_source,
             'denoiser sharpness': self.get_params('sharpness'),
-            'denoiser stop_threshold_change_pct': _DENOISE_STOP_THRESHOLD_PCT,
+            'denoiser max_iterations': _DENOISE_MAX_ITERATIONS,
+            'denoiser stop_threshold': _DENOISE_STOP_THRESHOLD,
             'nbr_weight_time': float(self.get_params('nbr_weight_time')),
             'nbr_weight_time note': ('1.0 weights a frame neighbor 1.5 times a spatial '
                                      'neighbor; 2/3 weights them equally'),

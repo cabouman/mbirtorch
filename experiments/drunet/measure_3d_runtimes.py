@@ -75,7 +75,7 @@ def main():
     timed('qGGMRF denoise, 8 iterations',
           lambda: denoiser.denoise(recon4, sigma_noise=sigma_prox,
                                    max_iterations=8,
-                                   stop_threshold_change_pct=0.0,
+                                   stop_threshold=0.0,
                                    print_logs=False, output_sharded=True))
 
     net = load_drunet(device)

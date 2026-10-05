@@ -656,7 +656,7 @@ def measure(cfg):
             # same amount of work per run.
             out, _info = model.denoise(staged, sigma_noise=DENOISE_SIGMA,
                                        max_iterations=ITERATIONS,
-                                       stop_threshold_change_pct=0.0)
+                                       stop_threshold=0.0)
         else:
             out, _info = model.recon(staged, weights=weights,
                                      max_iterations=ITERATIONS,

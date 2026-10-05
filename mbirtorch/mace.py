@@ -819,7 +819,7 @@ class QGGMRFDenoiserAgent:
         output, _ = self.model.denoise(
             w, sigma_noise=self.sigma_noise, use_ror_mask=self.use_ror_mask,
             init_image=init_image, max_iterations=self.inner_iterations,
-            stop_threshold_change_pct=0.0, logfile_path=None, print_logs=False,
+            stop_threshold=0.0, logfile_path=None, print_logs=False,
             output_sharded=True, do_initialization=False)
         _reject_divided_output(output, 'QGGMRFDenoiserAgent')
         if self.use_warm_start:
