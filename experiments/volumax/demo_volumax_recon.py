@@ -2,7 +2,7 @@ import os
 import time
 import numpy as np
 import mbirtorch
-from mbirtorch.preprocess import volumax
+from mbirtorch.preprocess import volumax, geometry_calibration
 
 # ----------------------------------------------------------------------------------------------
 # Parameters
@@ -30,7 +30,13 @@ tube = metadata['acquisition']['tubeParameters']
 print(f'Tube: {tube["accelerationVoltageInKV"]} kV, {tube["sourceCurrentInMicroA"]} uA')
 
 # ----------------------------------------------------------------------------------------------
-# 2. Weights, regularization, and reconstruction
+# 2. Channel offset estimated from the sinogram, which replaces the metadata value
+# ----------------------------------------------------------------------------------------------
+det_channel_offset = geometry_calibration.estimate_det_channel_offset_reprojection(ct_model, sino, verbose=1)
+ct_model.set_params(det_channel_offset=det_channel_offset)
+
+# ----------------------------------------------------------------------------------------------
+# 3. Weights, regularization, and reconstruction
 # ----------------------------------------------------------------------------------------------
 weights = None if weight_type is None else mbirtorch.gen_weights(sino, weight_type=weight_type)
 ct_model.set_params(sharpness=sharpness, snr_db=snr_db)
@@ -41,7 +47,7 @@ recon = np.asarray(recon)
 print(f'Reconstruction {recon.shape} in {time.time() - t0:.1f} s; min {recon.min():.4f}, max {recon.max():.4f}')
 
 # ----------------------------------------------------------------------------------------------
-# 3. Optional: save the reconstruction
+# 4. Optional: save the reconstruction
 # ----------------------------------------------------------------------------------------------
 if output_path is not None:
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
@@ -49,7 +55,7 @@ if output_path is not None:
     print(f'Reconstruction saved to {output_path}')
 
 # ----------------------------------------------------------------------------------------------
-# 4. View the reconstruction
+# 5. View the reconstruction
 # ----------------------------------------------------------------------------------------------
 if show_viewer:
     mbirtorch.slice_viewer(recon, data_dicts=[recon_dict], vmin=0.0, vmax=0.1,

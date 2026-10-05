@@ -38,7 +38,8 @@ def get_sino_and_model(scan_dir, *, downsample_factor=(1, 1), subsample_view_fac
     Returns:
         tuple: ``(sino, model, metadata)``
 
-            - ``sino`` (numpy.ndarray): the sinogram with shape (num_views, num_det_rows, num_det_channels).
+            - ``sino`` (numpy.ndarray): the sinogram, corrected for the detector rotation from the metadata, with
+              shape (num_views, num_det_rows, num_det_channels).
             - ``model`` (ConeBeamModel): a model with the geometry from the metadata and its reconstruction geometry
               set.
             - ``metadata`` (dict): the metadata of the scan, with three entries.
