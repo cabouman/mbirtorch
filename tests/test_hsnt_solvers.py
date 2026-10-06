@@ -6,7 +6,6 @@ every device of the repository's ``device`` fixture except MPS, which lacks the 
 """
 import itertools
 import warnings
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -19,11 +18,7 @@ from mbirtorch.hsnt._streaming import _stream_factorization
 from mbirtorch.hsnt.factorization import _initial_factors, _nnal_factorization, _zero_count_divergence
 from mbirtorch.hsnt.spectra import (_auto_penalty, _empty_fit_loss, _fit_free_sets, _guard_components, _select_supports,
                                     _support_selected_spectra, _unconstrained_spectra)
-
-
-def _material_basis():
-    """The reference Ni, Cu and Al attenuation spectra of experiments/hsnt, (3, 1200)."""
-    return np.load(Path(__file__).resolve().parents[1] / "experiments" / "hsnt" / "binaries" / "material_basis.npy")
+from hsnt_basis import material_basis
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -60,7 +55,7 @@ def _problem(device, P=2048, K=200, R=3, dose=10.0, seed=0, noisy=True, dtype=to
 
 def _sphere_problem(device, n=48, K=150, dose=100.0, seed=7):
     """Three overlapping spheres seen along one axis, with the reference spectra: most pixels mix two materials."""
-    basis = _material_basis()
+    basis = material_basis()
     yy, xx = np.mgrid[:n, :n] + 0.5
     maps = []
     for (cy, cx), density in zip(((0.38, 0.38), (0.38, 0.62), (0.6, 0.5)), (0.25, 0.25, 0.75)):
@@ -195,7 +190,7 @@ def test_the_w_solve_reaches_stationarity_next_to_an_inward_entry(dev):
     """A bound entry with an inward gradient takes a scaled-gradient step outside the Newton system, so its partners'
     Newton moves do not assume a step it does not take: the W solve reaches a small projected gradient on data with
     nearly collinear spectra, where such pixels used to stall."""
-    basis = _material_basis()
+    basis = material_basis()
     rng = np.random.default_rng(1)
     Hn = basis[:3, ::4][:, :300].astype(np.float64)
     W = np.zeros((4096, 3))

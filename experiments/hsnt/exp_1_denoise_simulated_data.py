@@ -43,8 +43,11 @@ def main():
     # Fix seed for random number generation
     np.random.seed(129)
 
-    # Load theoretical linear attenuation coefficients for Ni, Cu, and Al
-    material_basis = np.load(os.path.join(SCRIPT_DIR, 'binaries', 'material_basis.npy'))
+    # Load theoretical linear attenuation coefficients for Ni, Cu, and Al (run exp_0_generate_material_basis.py once)
+    basis_path = os.path.join(SCRIPT_DIR, 'binaries', 'material_basis.npy')
+    if not os.path.exists(basis_path):
+        raise SystemExit(f'{basis_path} not found: run exp_0_generate_material_basis.py first')
+    material_basis = np.load(basis_path)
 
     # Generate simulated noisy hyperspectral data and ground truth
     noisy_hyper_projection, _, gt_hyper_projection = hsnt.generate_hyper_data(

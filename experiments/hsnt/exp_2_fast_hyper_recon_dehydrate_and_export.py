@@ -2,9 +2,9 @@
 Hyperspectral Dehydration & Rehydration
 ---------------------------------------
 
-Examples 3(a) + 3(b) demonstrate the use of dehydration and rehydration for fast hyperspectral reconstruction.
+Experiments 2 and 3 demonstrate the use of dehydration and rehydration for fast hyperspectral reconstruction.
 A simulated hyperspectral neutron dataset containing three materials (Ni, Cu, and Al) is used for the purpose.
-This script - example 3(a) - performs dehydration followed by MBIR and then exports the dehydrated reconstructions.
+This script - experiment 2 - performs dehydration followed by MBIR and then exports the dehydrated reconstructions.
 """
 
 import os
@@ -42,8 +42,11 @@ def main():
     # Fix seed for random number generation
     np.random.seed(129)
 
-    # Load theoretical linear attenuation coefficients for Ni, Cu, and Al
-    material_basis = np.load(os.path.join(SCRIPT_DIR, 'binaries', 'material_basis.npy'))
+    # Load theoretical linear attenuation coefficients for Ni, Cu, and Al (run exp_0_generate_material_basis.py once)
+    basis_path = os.path.join(SCRIPT_DIR, 'binaries', 'material_basis.npy')
+    if not os.path.exists(basis_path):
+        raise SystemExit(f'{basis_path} not found: run exp_0_generate_material_basis.py first')
+    material_basis = np.load(basis_path)
 
     # Generate simulated noisy hyperspectral projection data
     hsnt_data, angles, _ = hsnt.generate_hyper_data(material_basis,

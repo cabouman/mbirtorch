@@ -5,7 +5,6 @@ import json
 import logging
 import os
 import warnings
-from pathlib import Path
 from types import SimpleNamespace
 
 import h5py
@@ -19,13 +18,9 @@ from mbirtorch.hsnt import loading
 from mbirtorch.hsnt.cli import _log_fit, main
 from mbirtorch.hsnt.loading import _smoothing_kernel, _tif_names, infer_input_type, load_dataset
 from mbirtorch.hsnt.outputs import component_check, fit_quality, mean_pixel_spectrum
+from hsnt_basis import material_basis
 
 ROWS, COLS, K, R, DOSE = 12, 10, 40, 2, 50.0
-
-
-def _material_basis():
-    """The reference Ni, Cu and Al attenuation spectra of experiments/hsnt, (3, 1200)."""
-    return np.load(Path(__file__).resolve().parents[1] / "experiments" / "hsnt" / "binaries" / "material_basis.npy")
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -344,7 +339,7 @@ def test_library_dehydrate_and_hyper_denoise(stacks, capsys):
     assert streamed[0].min() >= 0 and _relative_error(hsnt.rehydrate(streamed), X) < 0.35
     with pytest.raises(ValueError, match="chunk_pixels"):
         hsnt.dehydrate(A, num_materials=R, chunk_pixels=0, verbose=0)
-    phantom = _material_basis()
+    phantom = material_basis()
     noisy, _, truth = hsnt.generate_hyper_data(phantom, 1, 8, 8, 300, None, 0)     # the 7th argument is verbose
     assert noisy.shape == truth.shape == (1, 8, 8, phantom.shape[1]) and np.abs(noisy - truth).max() > 1e-2
     maps, same, _ = hsnt.dehydrate(A, subspace_basis=basis, verbose=0)  # the maps of a given basis

@@ -2,9 +2,9 @@
 Hyperspectral Dehydration & Rehydration
 ---------------------------------------
 
-Examples 3(a) + 3(b) demonstrate the use of dehydration and rehydration for fast hyperspectral reconstruction.
+Experiments 2 and 3 demonstrate the use of dehydration and rehydration for fast hyperspectral reconstruction.
 A simulated hyperspectral neutron dataset containing three materials (Ni, Cu, and Al) is used for the purpose.
-This script - example 3(b) - imports the dehydrated reconstructions from 3(a) and performs rehydration.
+This script - experiment 3 - imports the dehydrated reconstructions from experiment 2 and performs rehydration.
 """
 
 import os
@@ -37,7 +37,7 @@ def main():
     # Import dehydrated reconstructions from HDF5 file
     filename = os.path.join(input_path, dataset_name + ".h5")
     if not os.path.exists(filename):
-        warnings.warn(f"{filename} not found. Run example_3_a_fast_hyper_recon_dehydrate_and_export.py first.")
+        warnings.warn(f"{filename} not found. Run exp_2_fast_hyper_recon_dehydrate_and_export.py first.")
         return
     hsnt_dehydrated_recons, _ = hsnt.import_hsnt_data_hdf5(filename)
 

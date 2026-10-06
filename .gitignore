@@ -32,3 +32,4 @@ dev_scripts/_widening_floor_runs/
 
 # outputs of the experiments/hsnt scripts
 experiments/hsnt/processed_data/
+experiments/hsnt/binaries/

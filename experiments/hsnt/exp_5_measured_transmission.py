@@ -2,18 +2,31 @@
 Hyperspectral Dehydration & Rehydration
 ---------------------------------------
 
-This mini script tests the performance of the algorithm for low quality transmission data.
+This script denoises a measured low-count transmission image: one view of a Ni cylinder at ORNL's SNAP
+instrument with a 0.8 C proton charge. The data are on the Purdue data depot (readable from Gilbreth and Gautschi).
 """
 
+import glob
 import os
 import time
 
 import matplotlib.pyplot as plt
 import numpy as np
+import tifffile
 
 from mbirtorch.hsnt import hyper_denoise
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = '/depot/bouman/data/ORNL/hsnt/old/Ni_single_view_temp'
+
+
+def load_transmission(data_dir=DATA_DIR, charge='0_8c', sample='Ni_cylinder_projections'):
+    """Return (transmission, wavelengths): the sample counts divided by the mean open beam, (rows, cols, bins)."""
+    read_stack = lambda folder: np.stack([tifffile.imread(f) for f in sorted(glob.glob(os.path.join(folder, 'wave_idx_*.tif')))], axis=-1)
+    counts = read_stack(os.path.join(data_dir, charge, sample))
+    open_beam = np.mean([read_stack(d) for d in sorted(glob.glob(os.path.join(data_dir, charge, 'open_beam', 'observation_*')))], axis=0)
+    transmission = np.divide(counts, open_beam, out=np.zeros_like(counts), where=open_beam > 0).astype(np.float32)
+    wavelengths = np.load(os.path.join(data_dir, 'wave_angstrom.npy'))
+    return transmission, wavelengths
 
 
 def plot_pixel_spectra(wavelengths, noisy_data, denoised_data, dataset_type, pixel=(200, 200),
@@ -40,10 +53,9 @@ def main():
     num_materials = 1
     max_steps = 300
 
-    # Load noisy transmission data and corresponding wavelength values
-    input_path = os.path.join(SCRIPT_DIR, "input_data")
-    noisy_data = np.load(os.path.join(input_path, "test_transmission_data_0.8C.npy"))
-    wavelengths = np.load(os.path.join(input_path, "test_wavelengths_0.8C.npy"))
+    # Load the measured transmission and its wavelengths (about 3 GB of TIFFs; a few minutes)
+    noisy_data, wavelengths = load_transmission()
+    print(f'Loaded transmission {noisy_data.shape}, wavelengths {wavelengths.min():.2f} to {wavelengths.max():.2f} A')
 
     # Denoise using wrong (attenuation) and right (transmission) mode
     denoised_data = {dataset_type: hyper_denoise(noisy_data, dataset_type=dataset_type, num_materials=num_materials,
