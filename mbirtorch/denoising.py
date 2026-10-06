@@ -39,13 +39,16 @@ from . import vcd_utils
 from ._memory_ledger import image_ell1, stack_ell1
 from ._utils import _AUTO_REGULARIZATION_PARAM_NAMES, Param, recon_param_names
 from .projectors import maybe_compile
-from .tomography_model import TomographyModel, _diagonal_update_direction
+from .tomography_model import (TomographyModel, _clamped_alpha, _diagonal_update_direction,
+                               _warn_if_most_alphas_large)
 
 # Each denoiser takes the next number at construction, and that number names
 # its own compiled instances.
 _instance_counter = itertools.count(1)
 
-_F32_EPS = float(np.finfo(np.float32).eps)
+# The denoiser clamps its step size alpha at this value, the default of
+# max_alpha.
+_MAX_ALPHA = 1.5
 # The stack statistics never set sigma_x below this value.
 _SIGMA_X_FLOOR = 1e-6
 # The whole-volume statistics read at most this many voxels.
@@ -200,10 +203,11 @@ def vcd_subset_denoiser(flat_image, flat_error_image, pixel_indices,
                         fm_constant, qggmrf_params, image_shape):
     """One VCD subset update for the identity forward model (the analog of
     vcd_subset_updater).  Mutates both state tensors in place and returns
-    (flat_image, flat_error_image, ell1, alpha, grad_sq).
+    (flat_image, flat_error_image, ell1, alpha, large_alpha, grad_sq).
 
-    ``grad_sq`` is the sum, over the voxels of the subset, of the squared
-    gradient of the cost at each voxel just before its update."""
+    ``large_alpha`` is 1 when alpha before the clamp is above _LARGE_ALPHA, and
+    0 otherwise.  ``grad_sq`` is the sum, over the voxels of the subset, of the
+    squared gradient of the cost at each voxel just before its update."""
     prior_grad, prior_hess = _qggmrf.qggmrf_gradient_and_hessian_at_indices(
         flat_image, image_shape, pixel_indices, qggmrf_params)
 
@@ -223,11 +227,8 @@ def vcd_subset_denoiser(flat_image, flat_error_image, pixel_indices,
     forward_linear = fm_constant * torch.sum(cur_error_image * delta_sinogram)
     forward_quadratic = fm_constant * torch.sum(delta_sinogram * delta_sinogram)
 
-    alpha_numerator = forward_linear - prior_linear
-    alpha_denominator = forward_quadratic + prior_quadratic_approx + _F32_EPS
-    alpha = alpha_numerator / alpha_denominator
-    max_alpha = 1.5
-    alpha = torch.clamp(alpha, _F32_EPS, max_alpha)
+    alpha, large_alpha = _clamped_alpha(forward_linear, prior_linear, forward_quadratic,
+                                        prior_quadratic_approx, _MAX_ALPHA)
 
     delta_recon_at_indices = alpha * delta_recon_at_indices
     flat_image.index_add_(0, pixel_indices, delta_recon_at_indices)
@@ -235,7 +236,7 @@ def vcd_subset_denoiser(flat_image, flat_error_image, pixel_indices,
     cur_error_image = cur_error_image - alpha * delta_sinogram
     flat_error_image.index_copy_(0, pixel_indices, cur_error_image)
     ell1_for_subset = torch.sum(torch.abs(delta_recon_at_indices))
-    return flat_image, flat_error_image, ell1_for_subset, alpha, grad_sq
+    return flat_image, flat_error_image, ell1_for_subset, alpha, large_alpha, grad_sq
 
 
 def vcd_subset_denoiser_batched(flat_image, flat_error_image, pixel_indices,
@@ -252,11 +253,14 @@ def vcd_subset_denoiser_batched(flat_image, flat_error_image, pixel_indices,
     num_slices), are mutated in place.
 
     Returns:
-        (flat_image, flat_error_image, ell1, alpha, grad_sq): the two state
-        tensors, the ell-1 norm of each volume's step, shape (num_volumes,),
-        the step size of each volume, shape (num_volumes,), and for each
-        volume the sum over the subset's voxels of the squared gradient of
-        the cost before the update, shape (num_volumes,).
+        (flat_image, flat_error_image, ell1, alpha, large_alpha, grad_sq): the
+        two state tensors, the ell-1 norm of each volume's step, shape
+        (num_volumes,), the step size of each volume, shape (num_volumes,),
+        a flag for each volume that is 1 when its alpha before the clamp is
+        above _LARGE_ALPHA and 0 otherwise, shape (num_volumes,), and for each
+        volume the sum over the subset's voxels of the squared gradient of the
+        cost before the update, shape (num_volumes,).  A volume whose entry of
+        ``active`` is False has a flag of 0.
     """
     prior_grad, prior_hess = _qggmrf.qggmrf_gradient_and_hessian_batched(
         flat_image, image_shape, pixel_indices, qggmrf_params)
@@ -276,13 +280,11 @@ def vcd_subset_denoiser_batched(flat_image, flat_error_image, pixel_indices,
     forward_quadratic = fm_constant * torch.sum(delta_sinogram * delta_sinogram,
                                                 dim=(1, 2))
 
-    alpha_numerator = forward_linear - prior_linear
-    alpha_denominator = forward_quadratic + prior_quadratic_approx + _F32_EPS
-    alpha = alpha_numerator / alpha_denominator
-    max_alpha = 1.5
-    alpha = torch.clamp(alpha, _F32_EPS, max_alpha)
-    # A frozen volume takes no step.
+    alpha, large_alpha = _clamped_alpha(forward_linear, prior_linear, forward_quadratic,
+                                        prior_quadratic_approx, _MAX_ALPHA)
+    # A frozen volume takes no step, and its flag is 0.
     alpha = torch.where(active, alpha, torch.zeros_like(alpha))
+    large_alpha = torch.where(active, large_alpha, torch.zeros_like(large_alpha))
 
     delta_scaled = alpha[:, None, None] * delta_recon_at_indices
     flat_image.index_add_(1, pixel_indices, delta_scaled)
@@ -290,7 +292,7 @@ def vcd_subset_denoiser_batched(flat_image, flat_error_image, pixel_indices,
     cur_error_image = cur_error_image - delta_scaled
     flat_error_image.index_copy_(1, pixel_indices, cur_error_image)
     ell1_for_subset = torch.sum(torch.abs(delta_scaled), dim=(1, 2))
-    return flat_image, flat_error_image, ell1_for_subset, alpha, grad_sq
+    return flat_image, flat_error_image, ell1_for_subset, alpha, large_alpha, grad_sq
 
 
 def _is_stack(image):
@@ -902,14 +904,16 @@ class QGGMRFDenoiser(TomographyModel):
                 for i in range(max_iters):
                     ell1_accum = 0.0
                     alpha_accum = 0.0
+                    num_large_alpha = 0.0
                     grad_sq_accum = 0.0
                     for k in range(partition.shape[0]):
-                        flat_image, flat_error_image, ell1_subset, alpha_subset, grad_sq = \
-                            subset_denoiser(flat_image, flat_error_image, partition[k],
-                                            fm_constant_t, qggmrf_params_t,
-                                            tuple(image_shape))
+                        (flat_image, flat_error_image, ell1_subset, alpha_subset,
+                         large_alpha, grad_sq) = subset_denoiser(
+                            flat_image, flat_error_image, partition[k], fm_constant_t,
+                            qggmrf_params_t, tuple(image_shape))
                         ell1_accum = ell1_accum + ell1_subset
                         alpha_accum = alpha_accum + alpha_subset
+                        num_large_alpha = num_large_alpha + large_alpha
                         grad_sq_accum = grad_sq_accum + grad_sq
 
                     # A zero image gives nan rather than raising
@@ -919,6 +923,7 @@ class QGGMRFDenoiser(TomographyModel):
                             else float('nan'))
                     nmae_update[i] = nmae
                     alpha_values[i] = float(alpha_accum) / partition.shape[0]
+                    _warn_if_most_alphas_large(float(num_large_alpha), partition.shape[0])
                     statistics[i] = _gradient_statistic(
                         float(grad_sq_accum), partition, image_shape[2], fm_constant)
                     num_iters += 1
@@ -1018,6 +1023,7 @@ class QGGMRFDenoiser(TomographyModel):
                         flat_image, self.dev2dev_safe)
                     ell1_accum = 0.0
                     alpha_accum = 0.0
+                    num_large_alpha = 0.0
                     # Entry j is written only by the worker of device j.
                     grad_sq_per_dev = [0.0] * n
                     for k in range(partition.shape[0]):
@@ -1049,9 +1055,9 @@ class QGGMRFDenoiser(TomographyModel):
                         prior_quadratic = combine_on_lead([r[2] for r in results])
                         forward_linear = combine_on_lead([r[3] for r in results])
                         forward_quadratic = combine_on_lead([r[4] for r in results])
-                        alpha = ((forward_linear - prior_linear)
-                                 / (forward_quadratic + prior_quadratic + _F32_EPS))
-                        alpha = torch.clamp(alpha, _F32_EPS, 1.5)
+                        alpha, large_alpha = _clamped_alpha(
+                            forward_linear, prior_linear, forward_quadratic,
+                            prior_quadratic, _MAX_ALPHA)
                         # Each shard needs its own copy of the step size to
                         # scale its delta.
                         alpha_per_device = (
@@ -1069,6 +1075,7 @@ class QGGMRFDenoiser(TomographyModel):
                             devices, apply_worker, executor=self._per_device_pool)
                         ell1_accum = ell1_accum + combine_on_lead(ell1_parts)
                         alpha_accum = alpha_accum + alpha
+                        num_large_alpha = num_large_alpha + large_alpha
 
                     # The convergence test needs Python numbers, so this is the one
                     # host synchronization point of the pass.  A zero image gives nan.
@@ -1078,6 +1085,7 @@ class QGGMRFDenoiser(TomographyModel):
                             else float('nan'))
                     nmae_update[i] = nmae
                     alpha_values[i] = float(alpha_accum) / partition.shape[0]
+                    _warn_if_most_alphas_large(float(num_large_alpha), partition.shape[0])
                     statistics[i] = _gradient_statistic(
                         float(combine_on_lead(grad_sq_per_dev)), partition,
                         image_shape[2], fm_constant)
@@ -1520,20 +1528,26 @@ class QGGMRFDenoiser(TomographyModel):
         statistics = [[] for _ in range(num_vols)]
         for i in range(max_iters):
             ell1_accum = torch.zeros(num_vols, dtype=flat_image.dtype, device=device)
+            num_large_alpha = torch.zeros(num_vols, dtype=flat_image.dtype, device=device)
             grad_sq_accum = torch.zeros(num_vols, dtype=flat_image.dtype, device=device)
             for k in range(partition.shape[0]):
-                flat_image, flat_error_image, ell1_subset, _alpha, grad_sq = subset_denoiser(
+                (flat_image, flat_error_image, ell1_subset, _alpha, large_alpha,
+                 grad_sq) = subset_denoiser(
                     flat_image, flat_error_image, partition[k], fm_constant_t,
                     qggmrf_params_t, tuple(image_shape), active)
                 ell1_accum = ell1_accum + ell1_subset
+                num_large_alpha = num_large_alpha + large_alpha
                 grad_sq_accum = grad_sq_accum + grad_sq
             # The stopping test needs Python numbers, so there is one host read per
             # iteration.  The ratio is formed in float64, and a zero volume gives nan.
-            stats = torch.stack([ell1_accum, stack_ell1(flat_image), grad_sq_accum])
+            stats = torch.stack([ell1_accum, stack_ell1(flat_image), grad_sq_accum,
+                                 num_large_alpha])
             stats = stats.cpu().numpy().astype(np.float64)
             with np.errstate(divide='ignore', invalid='ignore'):
                 nmae = stats[0] / stats[1]
             statistic = _gradient_statistic(stats[2], partition, image_shape[2], fm_constant)
+            # A volume that stopped before this iteration has a count of 0.
+            _warn_if_most_alphas_large(stats[3].max(), partition.shape[0])
             for j in np.flatnonzero(active_host):
                 history[j].append(100.0 * float(nmae[j]))
                 statistics[j].append(float(statistic[j]))
