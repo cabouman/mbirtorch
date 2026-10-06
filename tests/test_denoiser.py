@@ -3,7 +3,10 @@ regularization automatic and pinned; the stopping rule's distance to the MAP
 estimate, with and without an offset; the error for the old name of the stop
 parameter; two shards against one device; an all-zero input; the stack
 denoiser against a loop of single-volume calls; the caller's arrays left
-unwritten; and one initialization reused across calls."""
+unwritten; one initialization reused across calls; and the warning for an
+update direction that is too short."""
+
+import warnings
 
 import numpy as np
 import pytest
@@ -12,6 +15,7 @@ from torch._dynamo.utils import counters as dynamo_counters
 
 import mbirtorch
 from mbirtorch import denoising
+from mbirtorch.tomography_model import _diagonal_update_direction
 
 
 def _rel_max(out, ref):
@@ -453,3 +457,53 @@ def test_noise_estimate_returns_the_level_of_white_and_correlated_noise():
         assert abs(estimate / sigma - 1) < 0.02
         assert abs(shifted / estimate - 1) < 1e-3
         assert abs(in_mask / sigma - 1) < 0.02
+
+
+# ── the warning for a large step size ────────────────────────────────────────
+
+def _direction_with_unit_data_curvature(cur_error, fm_constant, prior_grad, prior_hess):
+    """The update direction with 1 in place of fm_constant as the second
+    derivative of the data term.  The denoiser had this error until its
+    direction was fixed to give the same result in any unit."""
+    return _diagonal_update_direction(-fm_constant * cur_error, prior_grad, 1.0, prior_hess)
+
+
+@pytest.mark.parametrize('form', ['one device', 'two shards', 'stack'])
+def test_a_direction_that_is_too_short_warns(monkeypatch, form):
+    """When the update direction is divided by c, the line search computes
+    about c times the step size alpha.  Each form of the sweep must warn when,
+    in more than half of the subsets of an iteration, alpha before the clamp
+    is above 10.
+
+    The image is a noisy box multiplied by 100, and sigma_noise is 10, so
+    sigma_y is 10 and fm_constant is 0.01.  The direction with 1 in place of
+    fm_constant is then too short, and alpha before the clamp is between 44
+    and 48 in every subset.  The correct direction gives an alpha of 1 and
+    must not warn.  The denoisers do not compile their updates, which keeps
+    the test fast."""
+    shape = (24, 24, 10)
+    scale = 100.0
+    clean = np.zeros(shape, dtype=np.float32)
+    clean[6:-6, 6:-6, 2:-2] = 1.0
+    noisy = scale * (clean + 0.1 * np.random.RandomState(4).randn(*shape).astype(np.float32))
+
+    def sweep():
+        denoiser = mbirtorch.QGGMRFDenoiser(shape, compile_mode='off')
+        denoiser.configure_devices(devices=['cpu', 'cpu'] if form == 'two shards' else ['cpu'])
+        denoiser.set_params(no_warning=True, verbose=0, sigma_x=0.05 * scale,
+                            auto_regularize_flag=False)
+        np.random.seed(0)
+        run = dict(sigma_noise=0.1 * scale, max_iterations=2, stop_threshold=0.0)
+        if form == 'stack':
+            denoiser.denoise_stack(np.stack([noisy, noisy[::-1]]), **run)
+        else:
+            image = denoiser._shard_recon(noisy) if form == 'two shards' else noisy
+            denoiser.denoise(image, logfile_path=None, print_logs=False, **run)
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings('error', message='In more than half of the subsets')
+        sweep()
+    monkeypatch.setattr(denoising, '_identity_update_direction',
+                        _direction_with_unit_data_curvature)
+    with pytest.warns(RuntimeWarning, match='In more than half of the subsets'):
+        sweep()

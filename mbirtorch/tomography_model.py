@@ -75,6 +75,53 @@ def _apply_update(flat_recon, error_sinogram, pixel_indices, delta_scaled,
     return flat_recon, error_sinogram, delta_sumsq, ell1
 
 
+# When the update direction is divided by c, the line search computes about c
+# times the step size alpha.  In tests of recon, prox_map and the denoiser, no
+# subset had an alpha above 3.6 before the clamp.  So when more than half of the
+# subsets of an iteration have an alpha above _LARGE_ALPHA, the update direction
+# is likely too short.
+_LARGE_ALPHA = 10.0
+
+
+def _clamped_alpha(forward_linear, prior_linear, forward_quadratic,
+                   prior_quadratic, max_alpha):
+    """Return the step size alpha of one subset update and a flag for a large
+    alpha.
+
+    The four sums of the line search define a quadratic model of the cost
+    along the update direction.  Alpha is the minimizer of this model, except
+    that _F32_EPS is added to the denominator of its formula.  Alpha is then
+    clamped to the interval from _F32_EPS to max_alpha.  The flag is 1 where
+    alpha before the clamp is above _LARGE_ALPHA, and 0 elsewhere.  The sums
+    are scalar tensors for one volume, or have one entry per volume for a
+    stack, and both results have the shape and the dtype of the sums.  The
+    flag is a number rather than a boolean, so that summing the flags creates
+    no tensor of another dtype.
+    """
+    alpha = ((forward_linear - prior_linear)
+             / (forward_quadratic + prior_quadratic + _F32_EPS))
+    large_alpha = (alpha > _LARGE_ALPHA).to(alpha.dtype)
+    return torch.clamp(alpha, _F32_EPS, max_alpha), large_alpha
+
+
+def _warn_if_most_alphas_large(num_large_alpha, num_subsets):
+    """Warn when, in more than half of the subsets of one iteration, alpha
+    before the clamp is above _LARGE_ALPHA.
+
+    ``num_large_alpha`` is the sum, over the subsets of the iteration, of the
+    flag that :func:`_clamped_alpha` returns.  For a stack of volumes, it is
+    the largest such sum over the volumes.  The message is the same at every
+    call, so Python's default warning filter suppresses its repeats.
+    """
+    if 2 * num_large_alpha > num_subsets:
+        warnings.warn(
+            'In more than half of the subsets of one iteration, the line search computed '
+            f'a step size alpha above {_LARGE_ALPHA:g}.  The update direction is then '
+            'likely too short, for example because the Hessian diagonal used to compute '
+            'it is too large.  In the subsets where alpha exceeds max_alpha, the clamp '
+            'limits the step, so the iterations converge slowly.', RuntimeWarning)
+
+
 def _resolve_device(device):
     """'auto' -> cuda if available, else mps, else cpu; else the given device."""
     if device != 'auto':
@@ -2434,7 +2481,9 @@ class TomographyModel(ParameterHandler):
 
             Returns:
                 flat_recon, error_sinogram, ell1_for_subset,
-                alpha_for_subset, delta_sumsq_subset.
+                alpha_for_subset, large_alpha, delta_sumsq_subset.
+                large_alpha is 1 when alpha before the clamp is above
+                _LARGE_ALPHA, and 0 otherwise.
             """
             pixel_indices_per_device = [torch.as_tensor(pixel_indices, dtype=torch.int64).to(dev)
                        for dev in devices]
@@ -2528,10 +2577,8 @@ class TomographyModel(ParameterHandler):
 
             # The line search runs on the device.  The step alpha stays a
             # scalar tensor, so no subset costs a host synchronization.
-            alpha_numerator = forward_linear - prior_linear
-            alpha_denominator = forward_quadratic + prior_quadratic_approx + _F32_EPS
-            alpha = alpha_numerator / alpha_denominator
-            alpha = torch.clamp(alpha, _F32_EPS, max_alpha)
+            alpha, large_alpha = _clamped_alpha(forward_linear, prior_linear, forward_quadratic,
+                                                prior_quadratic_approx, max_alpha)
             alpha_per_device = ([alpha] if num_devices == 1 else
                          [_sharding.move_shard(alpha, dev, self.dev2dev_safe)
                           for dev in devices])
@@ -2568,7 +2615,7 @@ class TomographyModel(ParameterHandler):
                  for sumsq, _ in apply_results]))
             ell1_for_subset = combine_on_lead(
                 [ell1 for _, ell1 in apply_results])
-            return (flat_recon, error_sinogram, ell1_for_subset, alpha,
+            return (flat_recon, error_sinogram, ell1_for_subset, alpha, large_alpha,
                     delta_sumsq_subset)
 
         vcd_subset_updater.stage_halos = stage_halos
@@ -2588,9 +2635,11 @@ class TomographyModel(ParameterHandler):
 
         Returns:
             (flat_recon, error_sinogram, ell1_for_partition, alpha,
-            delta_sumsq_partition): the updated state, the summed L1 recon
-            change, alpha averaged over the subsets, and the per-slice sum
-            of squared update values over the partition.
+            num_large_alpha, delta_sumsq_partition): the updated state, the
+            summed L1 recon change, alpha averaged over the subsets, the
+            number of subsets whose alpha before the clamp is above
+            _LARGE_ALPHA, and the per-slice sum of squared update values over
+            the partition.
         """
         # The qGGMRF boundary halos are staged once for this whole pass over
         # the partition.
@@ -2600,20 +2649,22 @@ class TomographyModel(ParameterHandler):
         # a different random sequence changes the iteration trace that the tests compare against.
         ell1_for_partition = 0
         alpha_sum = 0
+        num_large_alpha = 0
         delta_sumsq_partition = 0
         draw = np.random if rng is None else rng
         subset_indices = draw.permutation(partition.shape[0])
 
         for index in subset_indices:
             subset = partition[index]
-            (flat_recon, error_sinogram, ell1_for_subset, alpha_for_subset,
+            (flat_recon, error_sinogram, ell1_for_subset, alpha_for_subset, large_alpha,
              delta_sumsq_subset) = vcd_subset_updater(flat_recon, error_sinogram, subset)
             ell1_for_partition += ell1_for_subset
             alpha_sum += alpha_for_subset
+            num_large_alpha = num_large_alpha + large_alpha
             delta_sumsq_partition = delta_sumsq_partition + delta_sumsq_subset
 
         return (flat_recon, error_sinogram, ell1_for_partition,
-                alpha_sum / partition.shape[0], delta_sumsq_partition)
+                alpha_sum / partition.shape[0], num_large_alpha, delta_sumsq_partition)
 
     def _vcd_recon(self, sinogram, partitions, partition_sequence,
                    stop_threshold_change_pct, weights=None, init_recon=None,
@@ -2828,7 +2879,7 @@ class TomographyModel(ParameterHandler):
         try:
             for i in range(max_iters):
                 partition = partitions[partition_sequence[i]]
-                (flat_recon, error_sinogram, ell1_for_partition, alpha,
+                (flat_recon, error_sinogram, ell1_for_partition, alpha, num_large_alpha,
                  delta_sumsq_partition) = self.vcd_partition_iterator(
                     vcd_subset_updater, flat_recon, error_sinogram, partition,
                     rng=rng)
@@ -2845,6 +2896,7 @@ class TomographyModel(ParameterHandler):
                 nmae_update[i] = (float(ell1_for_partition) / recon_l1_f
                                   if recon_l1_f else float('nan'))
                 alpha_values[i] = float(alpha)
+                _warn_if_most_alphas_large(float(num_large_alpha), partition.shape[0])
                 delta_norm_per_slice[i] = np.sqrt(
                     delta_sumsq_partition.cpu().numpy())[:recon_shape[2]]
 
