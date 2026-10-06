@@ -57,6 +57,45 @@ To choose the devices yourself, call ``model.configure_devices``, for example
 See :ref:`usr_multi_gpu` for reconstruction on several GPUs.
 
 
+Hyperspectral neutron data (hsnt)
+---------------------------------
+
+``hsnt.dehydrate`` and ``hsnt.hyper_denoise`` keep their names, but they fit the Poisson
+likelihood of the counts instead of the scikit-learn NMF that MBIRJAX called, and they return a
+basis of rank ``num_materials`` rather than ``safety_factor * num_materials``.  The arguments
+after ``num_materials`` are keyword only, and MBIRJAX's NMF keywords (``safety_factor``,
+``beta_loss``, ``max_iter``, ``tolerance``, ``batch_size``, ``random_state``) raise a
+``TypeError``.  The same holds for ``mbirtorch.dehydrate`` and ``mbirtorch.hyper_denoise``.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 50 50
+
+   * - MBIRJAX
+     - MBIRTorch
+   * - ``hsnt.dehydrate(data, num_materials=3, safety_factor=2)``
+     - ``hsnt.dehydrate(data, num_materials=3)``
+   * - ``hsnt.hyper_denoise(data, num_materials=3, safety_factor=2)``
+     - ``hsnt.hyper_denoise(data, num_materials=3)``
+   * - ``hsnt.generate_hyper_data(material_basis, detector_rows, detector_columns, dosage_rate, material_thickness)``
+       (MBIRJAX 0.6.11 to 0.6.15)
+     - ``hsnt.generate_hyper_data(material_basis, num_angles, detector_rows, detector_columns, dosage_rate,
+       material_density)``
+
+Without ``num_materials`` the rank is estimated.  ``mode`` and ``chunk_pixels`` bound the
+memory, as ``batch_size`` did, and ``verbose=2`` prints the rank search rather than plotting it.
+``subspace_basis`` keeps its meaning, with the given spectra always held fixed (MBIRJAX refitted
+them for data of up to 2**27 entries); leave out ``num_materials`` then, since the rank is the
+basis's number of rows.  ``generate_hyper_data`` treats the open beam as noiseless and floors
+the transmission at 1e-30 rather than 1e-8, so a seed gives different data, and ``noisy=False``
+(keyword only) returns the noiseless data.  Its ``material_density`` is a volume fraction that
+scales a rounded bar about 10 thick at its center, not a thickness, so the MBIRJAX 0.6.11 to
+0.6.15 values do not carry over (the defaults 2, 2, 10 became 0.2, 0.2, 1), and it returns
+``[noisy, angles, truth]`` of shape (views, rows, columns, bins).  The ``hsnt`` module also adds
+``estimate_rank`` and the ``mbirtorch-hsnt`` command line.  See
+:ref:`HSNTDocs`.
+
+
 Removed names
 -------------
 
