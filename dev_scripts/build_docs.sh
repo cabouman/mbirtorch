@@ -8,7 +8,7 @@ cd ../docs
 make clean html
 
 echo ""
-echo "*** The html documentation is at mbirjax/docs/build/html/index.html ***"
+echo "*** The html documentation is at mbirtorch/docs/build/html/index.html ***"
 echo ""
 
 cd ../dev_scripts
