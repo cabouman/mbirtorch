@@ -55,21 +55,16 @@ def _with_key_docstring(style):
     return decorator
 
 
-@_with_key_docstring("dict")
 def import_hsnt_data_hdf5(filename):
-    """
-    Import a hyperspectral dataset and metadata from an HDF5 file.
+    """Import a hyperspectral dataset and its metadata from an HDF5 file.
 
     Args:
         filename: Path to the HDF5 file.
 
     Returns:
-        A list containing hyperspectral data and parameters in the form [data, metadata].
-            - data: ndarray with spectral last axis (hyperspectral form), a list (dehydrated form), or None.
-            - metadata: A dictionary with the keys shown below.
-
-    Keys:
-    {_KEY_DOCS}
+        [data, metadata]: data is an ndarray with the spectral axis last (hyperspectral form), a list
+        [subspace_data, subspace_basis, dataset_type] (dehydrated form), or None; metadata is a dict with the keys
+        of create_hsnt_metadata.
     """
     data = None
     metadata = {key: None for key in ALLOWED_KEYS}
@@ -112,28 +107,17 @@ def import_hsnt_data_hdf5(filename):
 
 @_with_key_docstring("arg")
 def create_hsnt_metadata(**kwargs):
-    """
-    Create a dictionary of parameters (metadata) associated with a hyperspectral neutron dataset.
+    """Create the metadata dict of a hyperspectral neutron dataset. Keys not given are None.
 
     Args:
     {_KEY_DOCS}
 
     Returns:
-        dict: Dictionary containing hyperspectral neutron dataset parameters (metadata).
+        dict: The metadata.
 
     Example:
-        >>> metadata = create_hsnt_metadata(
-        ...     dataset_name="sample1",
-        ...     dataset_type="attenuation",
-        ...     dataset_modality="hyperspectral neutron",
-        ...     wavelengths=np.linspace(1.0, 5.0, 50),
-        ...     alu_unit="mm",
-        ...     alu_value=1.0,
-        ...     dataset_geometry="parallel",
-        ...     angles=np.linspace(0, 180, 10)
-        ... )
-        >>> print(metadata["dataset_name"])
-        sample1
+        >>> metadata = create_hsnt_metadata(dataset_name="sample1", dataset_type="transmission",
+        ...                                 wavelengths=np.linspace(1.0, 5.0, 50), angles=np.linspace(0, 180, 10))
     """
     for key in kwargs.keys():
         if key not in ALLOWED_KEYS:
@@ -147,21 +131,14 @@ def create_hsnt_metadata(**kwargs):
     return metadata
 
 
-@_with_key_docstring("dict")
 def export_hsnt_data_hdf5(filename, data, metadata=None):
-    """
-    Export a hyperspectral dataset and metadata to an HDF5 file.
+    """Export a hyperspectral dataset and its metadata to an HDF5 file.
 
     Args:
         filename: Path to the HDF5 file.
-        data: ndarray with spectral last axis (hyperspectral form) or a list (dehydrated form).
-        metadata: A dictionary with the keys shown below. Use create_hsnt_metadata to create a metadata dictionary.
-
-    Keys:
-    {_KEY_DOCS}
-
-    Returns:
-        None. Creates an HDF5 file with the corresponding structure.
+        data: ndarray with the spectral axis last (hyperspectral form), or [subspace_data, subspace_basis,
+            dataset_type] (dehydrated form).
+        metadata: The dict from create_hsnt_metadata. Defaults to None.
     """
     if metadata is None:
         metadata = {}

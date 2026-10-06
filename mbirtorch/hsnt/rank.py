@@ -88,46 +88,26 @@ def _subsample(T, n):
 
 
 def estimate_rank(data, dataset_type="attenuation", max_rank=6, device=None, pool="auto", verbose=0):
-    """Estimate the number of components of a hyperspectral dataset, the rank dehydrate uses when num_materials is
-    not given, by sequential likelihood-ratio tests at full resolution and on spatially pooled pixels.
+    """Estimate the number of components of a hyperspectral dataset by likelihood-ratio tests.
 
-    The data are taken as :func:`~mbirtorch.hsnt.dehydrate` takes them: the spectral axis last and any leading axes;
-    when those are (views, rows, cols) or (rows, cols), blocks of neighboring pixels are also pooled. Without them the
-    test runs at full resolution only, and below 64 counts per bin, where pooling would run, it warns that it can miss
-    components.
-
-    Ranks 1 to max_rank are fitted in turn. The loss gain of each added component is converted to log-likelihood
-    units with a dose calibrated from the residual of the most flexible fit (the mean of (T - e^-X)^2 / e^-X is
-    1 / dose for Poisson noise), so the nominal dose does not matter. A component that fits only noise gains at most
-    about 0.5 (sqrt(P) + sqrt(K))^2, the top of the noise's singular spectrum. The noise floor is the median gain of
-    those of the last three ranks that stay below twice that, and at least (P + K) / 2; a component is accepted
-    while its gain exceeds twice the floor. When none of the last three gains is that small, the search is capped
-    and a warning says to raise max_rank. The floor is taken from gains of the same search, which can include real
-    components when the true rank is near max_rank: then the floor is set too high and the rank too low (a rank-6
-    test problem at 3 counts per bin returned rank 1), and the answer can change with max_rank. Compare the gains,
-    which verbose prints, and raise max_rank when they do not level off.
-
-    That floor grows with the pixel count as fast as a faint material's evidence, so at low dose the full-resolution
-    test misses weak materials. Pooling blocks of neighboring pixels keeps the evidence (summed counts stay Poisson)
-    but divides the nuisance count, so the same test on pooled pixels has more power. The larger of the two ranks is
-    returned: over-estimating the rank costs little, under-estimating it caps the fit.
+    Ranks 1 to max_rank are fitted in turn, and a component is kept while its gain in log-likelihood stands well
+    above the gain a component that fits only noise would give. When the leading axes are (views, rows, cols) or
+    (rows, cols), the test is also run on blocks of pooled pixels, which is more sensitive to faint materials at low
+    dose, and the larger of the two ranks is returned. This is the rank dehydrate uses when num_materials is not
+    given.
 
     Args:
         data (numpy.ndarray or torch.Tensor): Hyperspectral data with any leading axes and the spectral axis last.
         dataset_type (str, optional): 'attenuation' or 'transmission'. Defaults to 'attenuation'.
         max_rank (int, optional): Largest rank considered. Defaults to 6.
-        device (str, optional): Torch device for the solves. Defaults to None, meaning CUDA if available, else CPU.
-        pool (str or int, optional): Pooling block size. 'auto' (default) chooses the block from the calibrated dose so
-            that pooled pixels hold about 64 counts per bin, with blocks of at most ceil(sqrt(2 P / K)) pixels a side
-            (so about K / 2 pooled pixels, somewhat fewer after the rounding) and no pooling above 64 counts per bin
-            (pooled mixed pixels are not exactly low rank and would add spurious rank at high dose). An integer fixes
-            the block; 0 disables pooling.
+        device (str, optional): Torch device. Defaults to None: CUDA if available, else CPU.
+        pool (str or int, optional): Pooling block size in pixels; 'auto' chooses it from the dose, 0 disables
+            pooling. Defaults to 'auto'.
         verbose (int, optional): 1 prints each search's gains and decision. Defaults to 0.
 
     Returns:
         (rank, note, detail): the rank, a one-line account of how it was chosen, and a dict with the searches'
-        numbers ('full', and 'pooled' when pooling ran, each with gains, effective_dose and threshold; 'pool_block';
-        'rank_full'; 'rank_pooled').
+        gains, effective doses and thresholds.
     """
     from .denoise import _spatial_shape, _to_transmission
     T, shape = _to_transmission(data, dataset_type)

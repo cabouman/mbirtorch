@@ -1,9 +1,4 @@
-"""Dehydration and rehydration of hyperspectral neutron data with the maximum-likelihood NNAL factorization.
-
-``dehydrate`` fits the factorization X = W H of the attenuation and returns the package's dehydrated form
-``[subspace_data, subspace_basis, dataset_type]``; ``rehydrate`` multiplies it back and ``hyper_denoise`` chains the
-two.
-"""
+"""Dehydration and rehydration of hyperspectral neutron data by the maximum-likelihood factorization X = W H."""
 import warnings
 
 import numpy as np
@@ -81,86 +76,43 @@ def _to_transmission(data, dataset_type):
 def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_basis=None, spectra="mle", dose=None,
               penalty="auto", max_steps=1000, rel_tol=1e-8, max_rank=6, device=None,
               compile_mode="auto", mode="auto", chunk_pixels=None, max_passes=5, verbose=1, **kwargs):
-    """Dehydrate a hyperspectral dataset by the maximum-likelihood factorization X = W H of its attenuation.
+    """Dehydrate a hyperspectral dataset: factor its attenuation as X = W H, W, H >= 0, by maximum likelihood.
 
-    The dehydrated form [subspace_data, subspace_basis, dataset_type] and the dehydrate-and-rehydrate approach are
-    those of Chowdhury et al. (see :func:`~mbirtorch.hsnt.rehydrate`); the estimator here is the maximum-likelihood fit
-    of the counts rather than a least-squares NMF of the attenuation.
-
-    The spectral axis must be the last axis; the leading axes are kept. The fit minimizes the non-negative
-    attenuation loss sum[exp(-X) + T X] of the transmission T = exp(-attenuation), with W >= 0 and H >= 0. It is the
-    Poisson log-likelihood of the counts, up to a constant, when the open beam is the same in every pixel and bin. The
-    rank is the number of components; when it is not given it is estimated by likelihood-ratio tests
-    (:func:`~mbirtorch.hsnt.estimate_rank`), which also pool pixels spatially when the leading axes are
-    (views, rows, cols) or (rows, cols). The components are a nonnegative basis of the data, not necessarily the
-    pure materials. Data that do not fit the device (or with mode='stream') are factorized by chunks of pixels; the fit
-    then stops on the first pass over the chunks whose relative loss change is at most rel_tol, or after max_passes
-    passes, max_steps does not apply, and compile_mode compiles only when 'on'.
-
-    Given a subspace_basis, only the maps are fitted: each pixel's maximum-likelihood coefficients W >= 0 for those
-    spectra, by chunks of pixels when the data do not fit the device; max_steps and rel_tol then apply to each chunk's
-    solve, and compile_mode compiles a chunked solve only when 'on'. Data too large to hold at once can be dehydrated
-    piece by piece (for example view by view) against a basis fitted on part of them.
+    The spectral axis is last; the leading axes are kept. The fit maximizes the Poisson likelihood of the counts,
+    written in terms of the transmission T = exp(-X), so zero counts are handled directly. When num_materials is
+    not given, the rank is estimated by likelihood-ratio tests (see estimate_rank). The components are a
+    nonnegative basis of the data, not necessarily the pure materials. Data too large for the device are fitted
+    by chunks of pixels. Given a subspace_basis, only the maps W are fitted.
 
     Args:
-        data (numpy.ndarray or torch.Tensor): Hyperspectral data with any leading axes and the spectral axis of
-            length :math:`N_k` last. Entries whose transmission is NaN or infinite are treated as zero counts and
-            negative transmissions are clipped at zero, with a warning, as the command line treats a file.
-        dataset_type (str, optional): 'attenuation' or 'transmission', where attenuation = -log(transmission).
+        data (numpy.ndarray or torch.Tensor): Hyperspectral data, spectral axis of length :math:`N_k` last. NaN or
+            infinite transmissions count as zero counts; negative transmissions are clipped at zero.
+        dataset_type (str, optional): 'attenuation' or 'transmission', with attenuation = -log(transmission).
             Defaults to 'attenuation'.
-        num_materials (int, optional): Rank of the factorization :math:`N_m`. Defaults to None, which estimates it
-            (or takes the rank of subspace_basis); the estimate pools neighboring pixels only when data has image axes
-            (see estimate_rank).
-        subspace_basis (numpy.ndarray or torch.Tensor, optional): Spectra to hold fixed, shape :math:`(N_m, N_k)`,
-            nonnegative, for example the subspace_basis of another dehydration of the same bins; spectra must then be
-            'mle'. Defaults to None, which fits the spectra too.
-        spectra (str, optional): 'mle', the maximum-likelihood spectra; 'unconstrained', a re-estimate without the
-            bias the nonnegativity of W gives the spectra at low dose, which gains with many pixels (on a sphere
-            phantom at 3 to 10 counts per bin, up to 2.3 dB at 6.5 x 10^4 pixels, up to 4.9 dB at 1.3 x 10^5 and 7
-            to 12 dB at 10^6, at 0.07 to 0.16 nats per pixel above the maximum-likelihood loss; nothing below 2
-            counts per bin); 'support',
-            which decides the components present in each pixel and refits, and needs the dose: it corrects the same
-            bias, and in the maps mostly zeroes the background, since a pixel of one material usually needs several
-            of the fitted components. Defaults to 'mle'.
+        num_materials (int, optional): Rank :math:`N_m` of the factorization. Defaults to None, which estimates it.
+        subspace_basis (numpy.ndarray or torch.Tensor, optional): Spectra of shape :math:`(N_m, N_k)` to hold
+            fixed; only the maps are then fitted. Defaults to None.
+        spectra (str, optional): 'mle', the maximum-likelihood spectra; 'unconstrained', a re-estimate that removes
+            the bias of the nonnegativity constraint at low dose; 'support', which selects the components present in
+            each pixel and refits (needs dose). Defaults to 'mle'.
         dose (float, optional): Open-beam counts per pixel and bin, for spectra='support'. Defaults to None.
-        penalty (str or float, optional): Support selection's charge per component, as a multiple of log(N_k), or
-            'auto', which moves from 0.5 to 2 with the counts per pixel and bin. Defaults to 'auto'.
+        penalty (str or float, optional): Charge per component for spectra='support', as a multiple of log(N_k), or
+            'auto'. Defaults to 'auto'.
         max_steps (int, optional): Solver iteration cap. Defaults to 1000.
-        rel_tol (float, optional): The solver stops after five consecutive steps whose relative loss change is at most
-            this; a streamed fit stops on one pass over the chunks that changes it by at most this. Defaults to 1e-8.
+        rel_tol (float, optional): Stop when the relative loss change stays below this. Defaults to 1e-8.
         max_rank (int, optional): Largest rank the estimate considers. Defaults to 6.
-        device (str, optional): Torch device. Defaults to None, meaning CUDA if available, else CPU.
-        compile_mode (str, optional): 'auto' compiles the solver with torch.compile on CUDA for data of at least 5e8
-            entries, about where a first compiled call, compile included, becomes faster than an eager one (on an
-            H100: 1.1 to 1.4 times the eager time at 2.6 x 10^5 pixels and 1200 bins, 0.65 to 0.95 times from 4 x
-            10^5; a compile cache left by an earlier process roughly halves it). At 1M pixels a compiled step takes
-            about a third of the eager time and the solve needs about 0.7 times the memory. 'on' always; 'off'
-            never. The rank estimate always runs uncompiled. Defaults to 'auto'.
-        mode (str, optional): 'full' solves on the device at once, 'stream' by chunks of pixels, and 'auto' picks
-            from the memory the device has available and whether the solve compiles. A streamed fit is only as close
-            to the fit solved whole as its polish passes take it (see max_passes). Pass mode='full' when the device
-            holds the data. Defaults to 'auto'.
+        device (str, optional): Torch device. Defaults to None: CUDA if available, else CPU.
+        compile_mode (str, optional): 'auto', 'on' or 'off' for torch.compile. Defaults to 'auto'.
+        mode (str, optional): 'full' fits on the device at once, 'stream' by chunks of pixels, 'auto' picks from
+            the available memory. Defaults to 'auto'.
         chunk_pixels (int, optional): Pixels per chunk when streamed. Defaults to None, from the available memory.
-        max_passes (int, optional): Polish passes over the data when streamed, after an initial fit on a random
-            subsample of the pixels; 0 keeps that fit. A warning says when max_passes, not rel_tol, ends the passes.
-            More passes trade time for SNR. On a 1M-pixel sphere phantom at dose 3 in 8 chunks (one seed), five passes
-            left the maximum-likelihood fit 0.022 nats per pixel above the fit solved whole and its spectra within
-            2.3 dB, and the spectra of spectra='unconstrained' and 'support' 4.7 to 10.6 dB and 3.6 to 4.9 dB below
-            the same estimators solved whole; 40 passes, at four to six times the time, brought all three within
-            0.5 dB (the maximum-likelihood fit stopped by itself after 32). At dose 30, five passes left the
-            maximum-likelihood fit within 0.001 nats per pixel, and 'support' up to 6 dB short even after 40.
-            Defaults to 5.
-        verbose (int, optional): 0 prints nothing; 1 prints a summary; 2 also prints the rank search. Defaults to 1.
+        max_passes (int, optional): Passes over the chunks when streamed. Defaults to 5.
+        verbose (int, optional): 0 prints nothing; 1 a summary; 2 also the rank search. Defaults to 1.
 
     Returns:
-        list: [subspace_data, subspace_basis, dataset_type], where subspace_data is W reshaped to the leading axes
-        plus :math:`N_m` (float32), subspace_basis is H of shape :math:`(N_m, N_k)` (float32), and dataset_type is
-        the input's, so that :func:`~mbirtorch.hsnt.rehydrate` returns the same quantity as the input.
-
-    Example:
-        >>> [subspace_data, subspace_basis, dataset_type] = dehydrate(data, num_materials=3)
-        >>> data.shape, subspace_data.shape, subspace_basis.shape
-        ((N_x, N_y, N_z, ..., N_k), (N_x, N_y, N_z, ..., 3), (3, N_k))
+        list: [subspace_data, subspace_basis, dataset_type]: W reshaped to the leading axes plus :math:`N_m`, H of
+        shape :math:`(N_m, N_k)`, both float32, and the input's dataset_type, so that rehydrate returns the same
+        quantity as the input.
     """
     from ._device import _default_device
     from ._fit import _fit
@@ -215,54 +167,35 @@ def _check_basis(subspace_basis, bins, num_materials, spectra):
 
 
 def hyper_denoise(data, dataset_type="attenuation", num_materials=None, **kwargs):
-    """Denoise a hyperspectral dataset by dehydration and rehydration, the approach of Chowdhury et al. (see
-    :func:`~mbirtorch.hsnt.rehydrate`), with the maximum-likelihood fit of :func:`~mbirtorch.hsnt.dehydrate`.
+    """Denoise a hyperspectral dataset: dehydrate, then rehydrate.
 
     Args:
         data (numpy.ndarray or torch.Tensor): Hyperspectral data with the spectral axis last.
         dataset_type (str, optional): 'attenuation' or 'transmission'. Defaults to 'attenuation'.
         num_materials (int, optional): Rank of the factorization. Defaults to None, which estimates it.
-        **kwargs: The keyword arguments of :func:`~mbirtorch.hsnt.dehydrate`, which it documents: subspace_basis,
-            spectra, dose, penalty, max_steps, rel_tol, max_rank, device, compile_mode, mode,
-            chunk_pixels, max_passes and verbose.
+        **kwargs: The keyword arguments of :func:`~mbirtorch.hsnt.dehydrate`.
 
     Returns:
-        numpy.ndarray: The rank-:math:`N_m` fit, with the shape of the input and the input's dataset_type, float32.
-
-    Example:
-        >>> denoised = hyper_denoise(data, dataset_type="transmission")            # rank estimated
-        >>> denoised = hyper_denoise(data, dataset_type="transmission", num_materials=3, spectra="unconstrained",
-        ...                          verbose=0)
-        >>> denoised.shape == data.shape
-        True
+        numpy.ndarray: The denoised data, float32, with the shape and dataset_type of the input.
     """
     _reject_unknown_keywords("hyper_denoise", {k: v for k, v in kwargs.items() if k in _L2_KEYWORDS})
     return rehydrate(dehydrate(data, dataset_type=dataset_type, num_materials=num_materials, **kwargs))
 
 
 def rehydrate(dehydrated_data, hyperspectral_idx=None):
-    """
-    Rehydrate/decompress selected spectral bins from dehydrated hyperspectral data as described in:
+    """Rehydrate dehydrated hyperspectral data: multiply the maps by the spectra, for all or selected bins.
 
-    M. S. N. Chowdhury, D. Yang, S. Tang, S. V. Venkatakrishnan, H. Z. Bilheux, G. T. Buzzard, and C. A. Bouman, "Fast Hyperspectral Neutron Tomography," IEEE Transactions on Computational Imaging, vol. 11, pp. 663–677, 2025. doi:10.1109/TCI.2025.3567854
+    The method is described in M. S. N. Chowdhury et al., "Fast Hyperspectral Neutron Tomography," IEEE Trans.
+    Computational Imaging, vol. 11, pp. 663-677, 2025, doi:10.1109/TCI.2025.3567854.
 
     Args:
-        dehydrated_data: Dehydrated hyperspectral data in the form [subspace_data, subspace_basis, dataset_type]:
-
-            - subspace_data: ndarray with arbitrary axes and a subspace axis of length :math:`N_s` in the last position.
-            - subspace_basis: ndarray of shape :math:`(N_s, N_k)`, where rows are subspace basis spectra.
-            - dataset_type: 'attenuation' or 'transmission' where attenuation = -log(transmission).
-        hyperspectral_idx: A list of :math:`N_h` indices along the original spectral axis to rehydrate. If None, all :math:`N_k`
-            spectral bins are rehydrated. Defaults to None.
+        dehydrated_data: [subspace_data, subspace_basis, dataset_type]: the maps, with the component axis of length
+            :math:`N_s` last; the spectra, shape :math:`(N_s, N_k)`; and 'attenuation' or 'transmission'.
+        hyperspectral_idx: Indices of the spectral bins to rehydrate. Defaults to None, all :math:`N_k` bins.
 
     Returns:
-        Rehydrated/decompressed hyperspectral data with the same shape as the input subspace_data except the last axis
-        length is :math:`N_h (N_h <= N_k)`.
-
-    Example:
-        >>> hyper_data = rehydrate([subspace_data, subspace_basis, dataset_type], hyperspectral_idx=[5, 10, 15])
-        >>> subspace_data.shape, subspace_basis.shape, hyper_data.shape
-        ((N_x, N_y, N_z, ..., N_s), (N_s, N_k), (N_x, N_y, N_z, ..., 3))
+        numpy.ndarray: Hyperspectral data with the shape of subspace_data, except that the last axis holds the
+        selected bins; attenuation or transmission as dataset_type says.
     """
     [subspace_data, subspace_basis, dataset_type] = dehydrated_data
 
