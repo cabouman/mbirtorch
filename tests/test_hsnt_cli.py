@@ -340,8 +340,9 @@ def test_library_dehydrate_and_hyper_denoise(stacks, capsys):
     with pytest.raises(ValueError, match="chunk_pixels"):
         hsnt.dehydrate(A, num_materials=R, chunk_pixels=0, verbose=0)
     phantom = material_basis()
-    noisy, _, truth = hsnt.generate_hyper_data(phantom, 1, 8, 8, 300, None, 0)     # the 7th argument is verbose
-    assert noisy.shape == truth.shape == (1, 8, 8, phantom.shape[1]) and np.abs(noisy - truth).max() > 1e-2
+    counts, open_beam, _, truth = hsnt.generate_hyper_data(phantom, 1, 8, 8, 300, None, 0)  # the 7th argument is verbose
+    assert counts.shape == open_beam.shape == truth.shape == (1, 8, 8, phantom.shape[1])
+    assert np.all(open_beam == 300) and np.abs(counts / open_beam - np.exp(-truth)).max() > 1e-2
     maps, same, _ = hsnt.dehydrate(A, subspace_basis=basis, verbose=0)  # the maps of a given basis
     assert np.array_equal(same, basis) and np.abs(maps - sub_data).max() < 1e-3 * sub_data.max()
     chunked = hsnt.dehydrate(A, subspace_basis=basis, mode="stream", chunk_pixels=40, verbose=1)[0]

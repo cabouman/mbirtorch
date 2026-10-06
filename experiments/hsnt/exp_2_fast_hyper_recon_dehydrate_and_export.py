@@ -32,7 +32,6 @@ def main():
     detector_columns = 64  # Number of columns in the detector
     dosage_rate = 300  # Neutron dosage rate
     material_density = {"Ni": 0.25, "Cu": 0.25, "Al": 0.75}  # Define material density (vol. fraction)
-    dataset_type = 'attenuation'  # Choose between 'attenuation' or 'transmission'
 
     # Fast hyperspectral reconstruction parameters
     num_materials = 3  # Number of materials
@@ -48,23 +47,26 @@ def main():
         raise SystemExit(f'{basis_path} not found: run exp_0_generate_material_basis.py first')
     material_basis = np.load(basis_path)
 
-    # Generate simulated noisy hyperspectral projection data
-    hsnt_data, angles, _ = hsnt.generate_hyper_data(material_basis,
-                                                    num_angles=num_angles,
-                                                    detector_rows=detector_rows,
-                                                    detector_columns=detector_columns,
-                                                    dosage_rate=dosage_rate,
-                                                    material_density=material_density,
-                                                    verbose=verbose)
+    # Generate simulated Poisson counts and the open beam
+    counts, open_beam, angles, _ = hsnt.generate_hyper_data(material_basis,
+                                                            num_angles=num_angles,
+                                                            detector_rows=detector_rows,
+                                                            detector_columns=detector_columns,
+                                                            dosage_rate=dosage_rate,
+                                                            material_density=material_density,
+                                                            verbose=verbose)
+
+    # Normalize the counts by the open beam (the detector calibration). Dehydration takes the transmission.
+    transmission = counts / open_beam
 
     # MBIR model setup
     ct_model = mt.ParallelBeamModel((num_angles, detector_rows, detector_columns), angles)
     ct_model.set_params(snr_db=recon_snr_db, verbose=0)
 
     # Perform dehydration
-    subspace_data, subspace_basis, dataset_type = hsnt.dehydrate(hsnt_data, dataset_type=dataset_type,
-                                                                 num_materials=num_materials, mode='stream',
-                                                                 chunk_pixels=16384, verbose=verbose)
+    subspace_data, subspace_basis, _ = hsnt.dehydrate(transmission, dataset_type='transmission',
+                                                      num_materials=num_materials, mode='stream',
+                                                      chunk_pixels=16384, verbose=verbose)
 
     # Perform MBIR on each subspace component
     subspace_recons = []
@@ -74,8 +76,9 @@ def main():
         subspace_recons.append(subspace_recon)
     subspace_recons = np.stack(subspace_recons, axis=-1)
 
-    # Export dehydrated reconstructions into HDF5 file
-    hsnt_dehydrated_recons = [subspace_recons, subspace_basis, dataset_type]
+    # Export dehydrated reconstructions into HDF5 file. The reconstructions are linear attenuation coefficients, so
+    # rehydrating them gives attenuation, whatever the type of the projection data was.
+    hsnt_dehydrated_recons = [subspace_recons, subspace_basis, 'attenuation']
     metadata = hsnt.create_hsnt_metadata(dataset_name=dataset_name)
     filename = os.path.join(output_path, dataset_name + ".h5")
     hsnt.export_hsnt_data_hdf5(filename, hsnt_dehydrated_recons, metadata)

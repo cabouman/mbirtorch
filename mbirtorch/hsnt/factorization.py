@@ -11,7 +11,7 @@ def _initial_factors(T, num_materials):
 
     The model is X = W @ H with X = -log(T), so T itself is not low rank. A zero count only says the attenuation
     exceeds that of the faintest pixel that did register, so it is floored at half the smallest positive
-    transmission; transmissions below 1e-12 count as zero counts (generate_hyper_data marks them 1e-30).
+    transmission; transmissions below 1e-12 count as zero counts.
     """
     return nndsvda(_attenuation_for_start(T), n_components=num_materials)
 

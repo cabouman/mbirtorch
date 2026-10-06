@@ -6,10 +6,11 @@ from .denoise import rehydrate
 def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector_columns=64, dosage_rate=300,
                         material_density=None, verbose=1, *, noisy=True):
     """
-    Simulate noisy hyperspectral neutron attenuation data for :math:`N_m=3` materials (Ni, Cu, Al) and :math:`N_k` wavelength bins.
+    Simulate hyperspectral neutron counts for :math:`N_m=3` materials (Ni, Cu, Al) and :math:`N_k` wavelength bins.
 
-    The open beam is noiseless, dosage_rate counts in every pixel and bin; the sample counts are Poisson; the
-    transmission is floored at 1e-30 before the logarithm, so a zero count becomes an attenuation of about 69.
+    The open beam is noiseless, dosage_rate counts in every pixel and bin; the sample counts are Poisson. Divide the
+    counts by the open beam to get the transmission that dehydrate takes with dataset_type='transmission'; a zero
+    count is a zero transmission, which the likelihood handles.
 
     Args:
         material_basis: ndarray of shape :math:`(N_m, N_k)`, where rows are material linear attenuation coefficient spectra.
@@ -22,11 +23,12 @@ def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector
         noisy: Whether to generate noisy data (keyword only). Defaults to True.
 
     Returns:
-        A list in the form [noisy_hyper_projection, angles, gt_hyper_projection].
-            - noisy_hyper_projection: Simulated noisy hyperspectral data of shape :math:`(N_v, N_r, N_c, N_k)`, in
-              the dtype of material_basis.
+        A list in the form [counts, open_beam, angles, gt_hyper_projection].
+            - counts: Poisson counts through the sample, shape :math:`(N_v, N_r, N_c, N_k)`, in the dtype of
+              material_basis.
+            - open_beam: Open-beam counts of the same shape, dosage_rate everywhere.
             - angles: ndarray of view angles in radians.
-            - gt_hyper_projection: Ground truth noiseless hyperspectral data of same shape.
+            - gt_hyper_projection: Ground truth noiseless attenuation of the same shape.
 
     """
     if material_basis.shape[0] != 3:
@@ -47,7 +49,6 @@ def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector
     if np.any(material_basis < 0):
         raise ValueError("material_basis should be non-negative attenuation coefficients.")
 
-    epsilon = 1e-30
     number_of_materials = material_basis.shape[0]
     number_of_wavelengths = material_basis.shape[1]
 
@@ -67,24 +68,20 @@ def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector
 
     gt_hyper_projection = rehydrate([material_projection, material_basis, 'attenuation'])
 
-    noiseless_open_beam = dosage_rate * np.ones((detector_rows, detector_columns, number_of_wavelengths),
-                                                dtype=material_basis.dtype)
+    open_beam = np.full(gt_hyper_projection.shape, dosage_rate, dtype=material_basis.dtype)
 
-    noiseless_object_scan = np.exp(-gt_hyper_projection) * noiseless_open_beam
-    noiseless_object_scan = np.nan_to_num(noiseless_object_scan, nan=0, posinf=0, neginf=0)
+    expected_counts = np.exp(-gt_hyper_projection) * open_beam
+    expected_counts = np.nan_to_num(expected_counts, nan=0, posinf=0, neginf=0)
 
     # The measured counts are Poisson distributed; the open beam is taken as noiseless.
-    noisy_object_scan = np.random.poisson(noiseless_object_scan) if noisy else noiseless_object_scan
-
-    ratio = (noisy_object_scan / noiseless_open_beam).astype(material_basis.dtype)
-    ratio[ratio < epsilon] = epsilon
-    noisy_hyper_projection = -np.log(ratio)
+    counts = np.random.poisson(expected_counts) if noisy else expected_counts
+    counts = counts.astype(material_basis.dtype)
 
     if verbose >= 1:
         print("generate_hyper_data(): ")
         print("   -Shape of material_basis (linear attenuation coefficients for Ni, Cu, and Al):", material_basis.shape)
         print("   -Shape of material_projection (density of Ni, Cu, and Al):", material_projection.shape)
-        print("   -Shape of hyperspectral data: ", noisy_hyper_projection.shape)
+        print("   -Shape of counts and open beam: ", counts.shape)
 
     if verbose > 1:
         import matplotlib.pyplot as plt
@@ -95,5 +92,5 @@ def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector
         plt.title("Material basis functions (Ni, Cu, Al)")
         plt.legend(["Ni", "Cu", "Al"])
 
-    return [noisy_hyper_projection, angles, gt_hyper_projection]
+    return [counts, open_beam, angles, gt_hyper_projection]
 
