@@ -97,32 +97,3 @@ def generate_hyper_data(material_basis, num_angles=1, detector_rows=64, detector
 
     return [noisy_hyper_projection, angles, gt_hyper_projection]
 
-
-def _material_basis_wavelengths(num_bins, lam0=1.5099, step=0.0025196):
-    """Wavelength in Angstrom of each bin of the packaged phantom basis, which stores spectra without an axis.
-
-    The axis is linear, calibrated from the nickel row's Bragg edges (fcc, a = 3.5231 A), which it places to 1.3 mA
-    rms.
-
-    Args:
-        num_bins (int): Number of bins.
-        lam0 (float, optional): Wavelength of bin 0 in Angstrom. Defaults to 1.5099.
-        step (float, optional): Bin width in Angstrom. Defaults to 0.0025196.
-
-    Returns:
-        numpy.ndarray: The wavelengths, float64, shape (num_bins,).
-    """
-    return lam0 + step * np.arange(num_bins, dtype=np.float64)
-
-
-def load_material_basis():
-    """The phantom's material spectra and their wavelength axis.
-
-    Returns:
-        (basis, wavelengths): basis of shape (3, 1200), float32, the linear attenuation per unit density of Ni, Cu and
-        Al (the rows generate_hyper_data expects), and the wavelength of each bin in Angstrom.
-    """
-    from importlib.resources import files
-    with files("mbirtorch.hsnt").joinpath("data", "material_basis.npy").open("rb") as f:
-        basis = np.load(f).astype(np.float32)
-    return basis, _material_basis_wavelengths(basis.shape[1])

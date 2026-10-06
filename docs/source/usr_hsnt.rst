@@ -9,7 +9,7 @@ detector pixel in each of many wavelength bins.  A sample made of a few material
 X = W H: a nonnegative spectrum per component in H and a map per component in W.  The components span the
 materials' spectra but need not be the materials themselves.  The module estimates W and H from the counts
 (dehydration), multiplies them back into denoised data (rehydration), estimates the number of components, and
-reads and writes the hsnt HDF5 layout.  See ``demo_13_hsnt.py`` for a worked example, and `Command line`_ for
+reads and writes the hsnt HDF5 layout.  See the scripts in `experiments/hsnt <https://github.com/cabouman/mbirtorch/blob/main/experiments/hsnt/>`__ for worked examples, and `Command line`_ for
 running the same steps on files.  The solvers accumulate in float64, so they run on CUDA or the CPU; on a Mac the
 automatic device choice uses the CPU rather than MPS.  On a small GPU, a streamed solve that fails in cuBLAS or
 cuSOLVER is most likely out of memory: the command line then prints the memory plan and suggests half the chunk
@@ -92,7 +92,6 @@ Synthetic data
 --------------
 
 .. autofunction:: generate_hyper_data
-.. autofunction:: load_material_basis
 
 
 Command line

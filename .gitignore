@@ -29,3 +29,6 @@ dev_scripts/_widening_floor_runs/
 
 # pixi environments
 .pixi/
+
+# outputs of the experiments/hsnt scripts
+experiments/hsnt/processed_data/

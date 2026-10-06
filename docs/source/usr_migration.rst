@@ -92,7 +92,7 @@ the transmission at 1e-30 rather than 1e-8, so a seed gives different data, and 
 scales a rounded bar about 10 thick at its center, not a thickness, so the MBIRJAX 0.6.11 to
 0.6.15 values do not carry over (the defaults 2, 2, 10 became 0.2, 0.2, 1), and it returns
 ``[noisy, angles, truth]`` of shape (views, rows, columns, bins).  The ``hsnt`` module also adds
-``estimate_rank``, ``load_material_basis`` and the ``mbirtorch-hsnt`` command line.  See
+``estimate_rank`` and the ``mbirtorch-hsnt`` command line.  See
 :ref:`HSNTDocs`.
 
 

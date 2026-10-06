@@ -91,9 +91,5 @@ version = {attr = "mbirtorch.__version__"}
 # wheel).
 find = {include = ["mbirtorch*"]}
 
-[tool.setuptools.package-data]
-# The spectra of the hsnt phantom, read by mbirtorch.hsnt.load_material_basis.
-"mbirtorch.hsnt" = ["data/*.npy"]
-
 [project.urls]
 source = "https://github.com/cabouman/mbirtorch"
