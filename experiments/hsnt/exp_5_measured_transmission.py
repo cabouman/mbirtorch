@@ -17,15 +17,27 @@ import tifffile
 from mbirtorch.hsnt import hyper_denoise
 
 DATA_DIR = '/depot/bouman/data/ORNL/hsnt/old/Ni_single_view_temp'
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CACHE_DIR = os.path.join(SCRIPT_DIR, 'processed_data')  # git ignores it
 
 
 def load_transmission(data_dir=DATA_DIR, charge='0_8c', sample='Ni_cylinder_projections'):
-    """Return (transmission, wavelengths): the sample counts divided by the mean open beam, (rows, cols, bins)."""
+    """Return (transmission, wavelengths): the sample counts divided by the mean open beam, (rows, cols, bins).
+
+    The first call reads about 11,000 TIFFs (a few minutes) and saves the result, about 3 GB, in CACHE_DIR; later
+    calls load that file.
+    """
+    cache = os.path.join(CACHE_DIR, f'{sample}_{charge}_transmission.npz')
+    if os.path.exists(cache):
+        cached = np.load(cache)
+        return cached['transmission'], cached['wavelengths']
     read_stack = lambda folder: np.stack([tifffile.imread(f) for f in sorted(glob.glob(os.path.join(folder, 'wave_idx_*.tif')))], axis=-1)
     counts = read_stack(os.path.join(data_dir, charge, sample))
     open_beam = np.mean([read_stack(d) for d in sorted(glob.glob(os.path.join(data_dir, charge, 'open_beam', 'observation_*')))], axis=0)
     transmission = np.divide(counts, open_beam, out=np.zeros_like(counts), where=open_beam > 0).astype(np.float32)
     wavelengths = np.load(os.path.join(data_dir, 'wave_angstrom.npy'))
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    np.savez(cache, transmission=transmission, wavelengths=wavelengths)
     return transmission, wavelengths
 
 
@@ -53,7 +65,7 @@ def main():
     num_materials = 1
     max_steps = 300
 
-    # Load the measured transmission and its wavelengths (about 3 GB of TIFFs; a few minutes)
+    # Load the measured transmission and its wavelengths (from the TIFFs the first time, then from the cache)
     noisy_data, wavelengths = load_transmission()
     print(f'Loaded transmission {noisy_data.shape}, wavelengths {wavelengths.min():.2f} to {wavelengths.max():.2f} A')
 
