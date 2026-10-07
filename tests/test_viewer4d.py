@@ -481,6 +481,20 @@ class TestMovie:
         kwargs = calls[0][1]
         assert (kwargs['frame_axis'], kwargs['slice_axis'], kwargs['slice_index']) == (3, 0, 0)
 
+    def test_gif_dialog_reports_a_file_given_as_the_folder(self, make_viewer, tmp_path):
+        calls = []
+        viewer = make_viewer(shifting_square(),
+                             movie_fn=lambda volume, filename, **kwargs: calls.append(filename))
+        existing_file = tmp_path / 'movie.gif'
+        existing_file.write_bytes(b'')
+        viewer._on_gif_button('frame')
+        viewer._dialog['widgets']['path'].set_val(str(existing_file))
+        viewer._gif_dialog_accept('frame')
+        # The dialog stays open with the error, and no GIF is written.
+        assert viewer._dialog['kind'] == 'gif'
+        assert viewer._dialog['texts']['error'].get_text().startswith('Cannot save the GIFs')
+        assert calls == []
+
     def test_gif_buttons_need_a_writer(self, make_viewer):
         viewer = make_viewer(shifting_square())
         assert [len(viewer._row_buttons[row]) for row in ('slice', 'frame')] == [1, 1]

@@ -100,6 +100,7 @@ MBIRTorch: High-performance tomographic reconstruction
    dev_sharding_overview
    dev_adding_geometry
    dev_maintenance
+   dev_hsnt_notes
 
 
 .. _PyTorch: https://pytorch.org/docs/stable/index.html
