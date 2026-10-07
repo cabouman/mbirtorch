@@ -49,6 +49,15 @@ Reconstruction
 
 .. automethod:: mbirtorch.MACE4DModel.recon
 
+Viewing the Result
+------------------
+
+:func:`~mbirtorch.view_utils.slice_viewer4d` shows the 4D reconstruction with a frame slider,
+playback, and space-time planes.  See :ref:`Viewer4DDocs` for its other features::
+
+    recon_4d, recon_dict = mace4d_model.recon(sinogram)
+    mbirtorch.slice_viewer4d(recon_4d, data_dicts=recon_dict)
+
 Device Pool
 -----------
 

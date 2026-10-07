@@ -302,7 +302,8 @@ def load_data_hdf5(file_path):
 
     Returns:
         tuple: (array, data_dict)
-            - array (ndarray): The array saved by :func:`save_data_hdf5`
+            - array (ndarray): The array saved by :func:`save_data_hdf5`, with its shape, such as a
+              3D volume (nx, ny, nz) or a 4D volume (num_times, nx, ny, nz)
             - data_dict (dict): A dict with the attributes for the data array.
 
     Raises:
@@ -404,7 +405,8 @@ def save_data_hdf5(file_path, array, array_name='array', attributes_dict=None):
 
     Args:
         file_path (str): Full path to the output HDF5 file. Directories will be created if they do not exist.
-        array (ndarray, tensor, or Shards): The volume data to save.
+        array (ndarray, tensor, or Shards): The data to save, of any shape, such as a 3D volume
+            (nx, ny, nz) or a 4D volume (num_times, nx, ny, nz).
         array_name (str): Name of the dataset within the HDF5 file. Defaults to 'array'.
         attributes_dict (dict, optional): Dictionary of attributes to store as metadata in the dataset.
             Keys must be strings, and values should be serializable as HDF5 attributes.
