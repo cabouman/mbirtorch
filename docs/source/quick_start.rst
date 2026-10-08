@@ -37,8 +37,8 @@ Put your data in two numpy arrays:
 
 The sinogram holds line integrals, not raw photon counts.  For transmission data, divide each
 view by the air scan and take the negative log of the ratio.  The function
-:func:`mbirtorch.preprocess.compute_sino_transmission` does this, and it also subtracts the
-dark scan and interpolates defective pixels.  See :ref:`PreprocessDocs` for more.
+:func:`mbirtorch.preprocess.scan_to_sino` does this from the object, blank, and dark scans,
+and it also fills the defective pixels.  See :ref:`PreprocessDocs` for more.
 
 A parallel-beam reconstruction is then one call, and a viewer opens with one more::
 
