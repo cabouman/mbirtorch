@@ -20,25 +20,13 @@ Each is short and self-contained; adjust the parameters near the top and rerun t
    * - ``demo_1_parallel_basics.py``
      - The basic pipeline: make a phantom, project it to a sinogram, reconstruct, view.
    * - ``demo_2_cone_beam.py``
-     - Cone-beam geometry, simulated measurement noise, noise weighting, saving results.
-   * - ``demo_3_parallel_roi.py``
-     - Region-of-interest reconstruction when the object extends outside the field of view.
-   * - ``demo_4_cone_axial_fov.py``
-     - Cone-beam artifacts from material above and below the field of view, and axial padding.
-   * - ``demo_5_direct_vs_mbir.py``
-     - Direct reconstruction (FBP) versus model-based reconstruction (MBIR), including sparse views.
-   * - ``demo_6_helical.py``
-     - Helical cone-beam scanning and reconstruction.
-   * - ``demo_7_multiaxis.py``
-     - The multiaxis parallel geometry (laminography): tilted views and their reconstruction.
-   * - ``demo_8_units_and_voxels.py``
-     - Physical units (ALUs), detector spacing, voxel shape, and auto_set_recon_geometry().
-   * - ``demo_9_denoiser.py``
-     - The qGGMRF denoiser applied to a noisy 3D image.
-   * - ``demo_10_geometry_calibration.py``
-     - Estimating the center of rotation and the detector rotation from the sinogram, and the effect of the correction on the reconstruction.
-   * - ``demo_11_geometry_viewer.py``
-     - The geometry viewer: the scan geometry drawn from the model, with a sinogram and a phantom overlaid and a second geometry compared.
+     - Cone beam geometry, simulated measurement noise, noise weighting, saving results.
+   * - ``demo_3_helical.py``
+     - Helical cone beam scanning and reconstruction.
+   * - ``demo_4_multiaxis.py``
+     - The multi-axis parallel geometry (laminography): tilted views and their reconstruction.
+   * - ``demo_8_autograd.py``
+     - The differentiable projectors: reconstruction by gradient descent in PyTorch.
 
 
 Data Generation
@@ -91,8 +79,6 @@ You can improve the reconstruction by increasing recon_shape:
 
 Note that the scale factor need only be large enough to give some padding around the region of valid projection --
 it does not need to match the size of the true object.  Larger scale factors will lead to increased time and memory.
-
-See ``demo_3_parallel_roi.py`` for an example of this.
 
 Q: How can I check my scan geometry before reconstructing?
 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++

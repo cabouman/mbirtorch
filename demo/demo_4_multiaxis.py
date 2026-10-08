@@ -1,4 +1,4 @@
-"""Demo 7: the multiaxis parallel geometry (laminography).
+"""Demo 4: the multiaxis parallel geometry (laminography).
 
 In this geometry each view has two angles: the usual rotation about the
 vertical axis (the azimuth), plus a tilt of the beam out of the horizontal

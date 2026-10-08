@@ -1,4 +1,4 @@
-"""Demo 6: helical cone-beam reconstruction.
+"""Demo 3: helical cone-beam reconstruction.
 
 In a helical scan the object moves steadily along the rotation axis while
 the source rotates, so a short detector can cover a long object.  Each view

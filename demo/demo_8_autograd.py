@@ -1,4 +1,4 @@
-"""Demo 12: the differentiable projectors.
+"""Demo 8: the differentiable projectors.
 
 Reconstruct by gradient descent instead of by calling recon().  The
 reconstruction is an ordinary torch tensor with requires_grad=True, the

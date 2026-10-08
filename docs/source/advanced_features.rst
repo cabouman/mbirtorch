@@ -96,7 +96,7 @@ Two parameters correct for a detector that is not centered on the rotation axis:
 - ``det_row_offset``: the offset along the row direction.
 
 Both are in the same units as the detector spacing.  The channel offset can be estimated from the
-sinogram, as shown in ``demo_10_geometry_calibration.py`` in :ref:`DemosFAQs`.
+sinogram; see the geometry calibration section of :ref:`PreprocessDocs`.
 
 
 Large volumes and multiple GPUs
