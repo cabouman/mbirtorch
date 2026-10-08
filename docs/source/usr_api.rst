@@ -16,7 +16,6 @@ individual pages for more detail. See :ref:`DemosFAQs` for examples.
 * :ref:`AutogradDocs`
 * :ref:`PreprocessDocs`
 * :ref:`Utilities`
-* :ref:`GeometryViewerDocs`
 * :ref:`VCLSDocs`
 * :ref:`HSNTDocs`
 
@@ -56,6 +55,5 @@ individual pages for more detail. See :ref:`DemosFAQs` for examples.
    usr_autograd
    usr_preprocess
    usr_utilities
-   usr_geometry_viewer
    usr_vcls
    usr_hsnt

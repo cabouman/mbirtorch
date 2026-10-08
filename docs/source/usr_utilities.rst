@@ -10,8 +10,13 @@ synthetic data, and managing the on-disk compile cache.
 Saving and loading models and reconstructions is handled through TomographyModel: :ref:`SaveLoadDocs`.
 
 
-3D Data Viewer
---------------
+.. _Viewer4DDocs:
+
+3D and 4D Data Viewers
+----------------------
+
+The 3D viewer shows one or more volumes slice by slice, and the 4D viewer adds a frame axis
+for a volume that changes in time.
 
 .. autofunction:: mbirtorch.view_utils.slice_viewer
 
@@ -19,17 +24,6 @@ Here is an example showing views of a modified Shepp-Logan phantom, with changin
 
 .. image:: https://www.math.purdue.edu/~buzzard/images/slice_viewer_demo.gif
    :alt: An animated image of the slice viewer.
-
-The slice viewer shows the data.  The scan geometry itself is drawn by
-``mbirtorch.geometry_viewer``, which shows where the source, the detector, and
-the reconstruction volume sit for one view at a time; see
-:ref:`GeometryViewerDocs`.
-
-
-.. _Viewer4DDocs:
-
-4D Data Viewer
---------------
 
 .. autofunction:: mbirtorch.view_utils.slice_viewer4d
 
@@ -47,6 +41,33 @@ the edges, and the static phantom's edges are straight.
 .. plot:: figs/slice_viewer4d.py
    :alt: The 4D viewer in the x-y plane with an ROI and its mean against frame, and in the
          t-y plane, where the edges of the shifting phantom zigzag.
+
+
+.. _GeometryViewerDocs:
+
+Geometry Viewer
+---------------
+
+The geometry viewer draws the scanner geometry of a model: where the source, the detector, and
+the reconstruction volume sit, which way the gantry turns, and whether the volume projects
+inside the detector.  Use it to check a scan before reconstructing it, and to compare an
+estimated geometry with the vendor's by drawing one over the other.
+
+.. code-block:: python
+
+    ct_model = mbirtorch.ConeBeamModel(sinogram.shape, angles,
+                                       source_detector_dist=source_detector_dist,
+                                       source_iso_dist=source_iso_dist)
+    mbirtorch.geometry_viewer(ct_model, sinogram=sinogram, recon=recon,
+                              compare=dict(det_channel_offset=10.0),
+                              title='Cone-beam scan geometry')
+
+.. image:: figs/geometry_viewer_cone.png
+   :alt: The geometry viewer's five panels: a 3D view, a top view of the xy
+         plane, a side view of the yz plane, the detector face in row and
+         channel index, and a text panel of derived numbers.
+
+.. autofunction:: mbirtorch.view_utils.geometry_viewer
 
 
 General Purpose
