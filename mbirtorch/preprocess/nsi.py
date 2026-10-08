@@ -22,7 +22,7 @@ def get_sino_and_model(dataset_dir, *, downsample_factor=(1, 1), subsample_view_
     left with a stale (default-pitch) reconstruction grid.
 
     Args:
-        dataset_dir (str): Path to the NSI scan directory (see :func:`load_scans_and_params` for the layout).
+        dataset_dir (str): Path to the NSI scan directory (see ``load_scans_and_params`` for the layout).
         downsample_factor (Tuple[int, int], optional): Detector row/channel downsampling. Defaults to (1, 1).
         subsample_view_factor (int, optional): Keep every n-th view. Defaults to 1.
         crop_pixels_sides (int, optional): Pixels to crop from each lateral side before the sinogram is

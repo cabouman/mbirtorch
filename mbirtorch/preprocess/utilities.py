@@ -1020,7 +1020,7 @@ def finalize_model(sino, required_params, optional_params, *, auto_crop=False, s
     Build a ready-to-reconstruct model from a reader's ``(sino, required_params, optional_params)``.
 
     The shared tail of each scanner reader's ``get_sino_and_model``: optionally remove blank sinogram
-    margins (:func:`_auto_crop_sino`), then build the model (construct -> set_params ->
+    margins (``_auto_crop_sino``), then build the model (construct -> set_params ->
     auto_set_recon_geometry).  ``required_params`` must carry a ``geometry_type`` entry so the model class
     can be resolved.
 
