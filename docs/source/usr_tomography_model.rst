@@ -72,9 +72,20 @@ Call ``configure_devices`` to choose the devices yourself, or set the environmen
 Saving and Loading
 ------------------
 
-.. automethod:: mbirtorch.TomographyModel.save_recon_hdf5
+``export_recon_hdf5`` writes a reconstruction and its ``recon_dict`` to one HDF5 file, and
+``import_recon_hdf5`` reads them back::
 
-.. automethod:: mbirtorch.TomographyModel.load_recon_hdf5
+    recon, recon_dict = ct_model.recon(sinogram)
+    mbirtorch.export_recon_hdf5('output/recon.h5', recon, recon_dict)
+    recon, recon_dict = mbirtorch.import_recon_hdf5('output/recon.h5')
+
+The file holds the volume as the dataset ``recon`` in right-hand axis order, (slice, col, row),
+so that other programs read it the natural way, and it holds the recon parameters, model
+parameters, log, and notes as attributes.  The slice viewers open it.
+
+.. autofunction:: mbirtorch.export_recon_hdf5
+
+.. autofunction:: mbirtorch.import_recon_hdf5
 
 
 .. _detailed-parameter-docs:

@@ -68,15 +68,9 @@ Weight Generation
 IO Functions
 ------------
 
-As noted above, saving and loading models and reconstructions is handled through TomographyModel: :ref:`SaveLoadDocs`.
-
-The functions here are for direct interactions with files.
+Saving and loading a reconstruction is described under :ref:`SaveLoadDocs`.
 
 .. autofunction:: mbirtorch.utilities.download_and_extract
-.. autofunction:: mbirtorch.utilities.save_data_hdf5
-.. autofunction:: mbirtorch.utilities.load_data_hdf5
-.. autofunction:: mbirtorch.utilities.export_recon_hdf5
-.. autofunction:: mbirtorch.utilities.import_recon_hdf5
 .. autofunction:: mbirtorch.utilities.save_volume_as_gif
 
 

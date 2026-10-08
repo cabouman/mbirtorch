@@ -66,9 +66,9 @@ print(f'Normalized RMS error between reconstruction and phantom: {nrmse:.3f}')
 
 # Save the reconstruction and its settings to one file.  The file can be
 # reloaded later for viewing, or to continue from this result:
-#     recon, recon_dict = mbirtorch.TomographyModel.load_recon_hdf5(filepath)
+#     recon, recon_dict = mbirtorch.import_recon_hdf5(filepath)
 filepath = './output/demo2_recon.h5'
-ct_model.save_recon_hdf5(filepath, recon, recon_dict)
+mbirtorch.export_recon_hdf5(filepath, recon, recon_dict)
 print(f'Reconstruction saved to {filepath}')
 
 # Display the geometry

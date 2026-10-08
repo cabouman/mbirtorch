@@ -3007,7 +3007,7 @@ class TomographyModel(ParameterHandler):
             with entries 'recon_params' (per-iteration traces and settings),
             'recon_log' (the run's log text), 'notes', and
             'model_params' (a snapshot of the model parameters).  The dict can be
-            given to :func:`~mbirtorch.view_utils.slice_viewer` and :meth:`save_recon_hdf5`.
+            given to :func:`~mbirtorch.view_utils.slice_viewer` and :func:`~mbirtorch.export_recon_hdf5`.
         """
         # The initial reconstruction is checked against the shape of the whole volume, which a
         # sharded array does not have, so a sharded init_recon is refused.
@@ -3425,7 +3425,7 @@ class TomographyModel(ParameterHandler):
         """
         Collect the recon parameters, logs, notes, and optionally all model parameters into a dict
         with entries 'recon_params', 'recon_log', 'notes', and 'model_params'.  This dict can be used with
-        :func:`mbirtorch.view_utils.slice_viewer` and :meth:`TomographyModel.save_recon_hdf5`.
+        :func:`mbirtorch.view_utils.slice_viewer` and :func:`mbirtorch.export_recon_hdf5`.
         By default the entries hold their original values; str_format=True serializes each top-level
         entry to a string.
 
@@ -3475,59 +3475,14 @@ class TomographyModel(ParameterHandler):
         return recon_dict
 
     def save_recon_hdf5(self, filepath, recon, recon_dict=None):
-        """
-        Save the reconstruction array and optionally the recon_dict from :meth:`~mbirtorch.TomographyModel.recon`.
-
-        This method creates a file that contains a single dataset named 'recon', with the entries in recon_dict
-        serialized to strings and saved as hdf5 dataset attributes.
-
-        The resulting file can be loaded with :meth:`load_recon_hdf5` or :func:`mbirtorch.view_utils.slice_viewer`.
-
-        Args:
-            filepath (str or Path): Path to the output HDF5 file. Should typically end with a .h5 extension.
-            recon (array-like): The reconstruction volume as a NumPy array, torch tensor, or the
-                sharded device form from ``recon(..., output_sharded=True)``.
-            recon_dict (dict or None, optional): The dict returned by :meth:`recon`
-
-        Raises:
-            Exception: If saving the file or directory creation fails.
-
-        Example:
-            >>> recon, recon_dict = ct_model.recon(sinogram)
-            >>> recon_dict['notes'] += 'Test scan'
-            >>> ct_model.save_recon_hdf5("output/my_recon.h5", recon, recon_dict=recon_dict)
-        """
-        from .utilities import save_data_hdf5, _to_host
-        arr = _to_host(recon)
-        save_data_hdf5(filepath, arr, 'recon', recon_dict)
-
-        if self.logger:
-            self.logger.info(f"Saved reconstruction and params to '{filepath}'")
+        """Deprecated: use :func:`mbirtorch.export_recon_hdf5`."""
+        warnings.warn('save_recon_hdf5 is deprecated; use mbirtorch.export_recon_hdf5.', FutureWarning, stacklevel=2)
+        from .utilities import export_recon_hdf5
+        export_recon_hdf5(filepath, recon, recon_dict)
 
     @staticmethod
     def load_recon_hdf5(filepath):
-        """
-        This function loads a numpy array stored in an HDF5 file created by :meth:`~mbirtorch.TomographyModel.save_recon_hdf5`.
-        It also loads any associated attribute dict.
-
-        Args:
-            filepath (str): Path to the HDF5 file containing the reconstructed volume.
-
-        Returns:
-            (recon, recon_dict)
-                - recon (ndarray): The array saved by save_recon_hdf5()
-                - recon_dict (dict): A dict with the same entries as the one :meth:`recon` returns, with
-                  each value as the string it was stored as in the HDF5 attributes
-
-        Raises:
-            FileNotFoundError: If the file does not exist.
-            ValueError: If more than one dataset is found in the file.
-
-        Example:
-            >>> recon, recon_dict = ct_model.load_recon_hdf5("output/recon_volume.h5")
-            >>> recon.shape
-            (64, 256, 256)
-        """
-        from .utilities import load_data_hdf5
-        recon, recon_dict = load_data_hdf5(filepath)
-        return recon, recon_dict
+        """Deprecated: use :func:`mbirtorch.import_recon_hdf5`."""
+        warnings.warn('load_recon_hdf5 is deprecated; use mbirtorch.import_recon_hdf5.', FutureWarning, stacklevel=2)
+        from .utilities import import_recon_hdf5
+        return import_recon_hdf5(filepath)

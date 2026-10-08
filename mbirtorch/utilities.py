@@ -290,36 +290,11 @@ def _to_host(array):
     return np.asarray(array)
 
 
-def load_data_hdf5(file_path):
-    """
-    Load a numpy array from an HDF5 file.
-
-    This function loads an array stored in an HDF5 file using :func:`save_data_hdf5`.
-    It also loads any associated attributes and returns them as a dict.
-
-    Args:
-        file_path (str): Path to the HDF5 file containing the array.
-
-    Returns:
-        tuple: (array, data_dict)
-            - array (ndarray): The array saved by :func:`save_data_hdf5`, with its shape, such as a
-              3D volume (nx, ny, nz) or a 4D volume (num_times, nx, ny, nz)
-            - data_dict (dict): A dict with the attributes for the data array.
-
-    Raises:
-        FileNotFoundError: If the file does not exist.
-        ValueError: If the file contains more than one dataset.
-        IndexError: If the file contains no dataset.
-
-    Example:
-        >>> import mbirtorch
-        >>> recon, recon_dict = mbirtorch.load_data_hdf5("output/recon_volume.h5")
-        >>> recon.shape
-        (64, 256, 256)
-    """
+def _load_array_hdf5(file_path):
+    """Return (array, attributes) from a file holding one dataset, the attributes as stored."""
     import h5py
     with h5py.File(file_path, "r") as f:
-        array_names = [key for key in f.keys()]  # A file from save_data_hdf5 has exactly one key.
+        array_names = [key for key in f.keys()]
         if len(array_names) > 1:
             raise ValueError('More than one array found in {}. Unable to load.'.format(file_path))
         data_name = array_names[0]
@@ -329,6 +304,12 @@ def load_data_hdf5(file_path):
             data_dict[name] = f[data_name].attrs[name]
 
         return array, data_dict
+
+
+def load_data_hdf5(file_path):
+    """Deprecated: use :func:`import_recon_hdf5`."""
+    warnings.warn('load_data_hdf5 is deprecated; use import_recon_hdf5.', FutureWarning, stacklevel=2)
+    return _load_array_hdf5(file_path)
 
 
 def _shard_axis_block(shards, i0, i1):
@@ -371,7 +352,7 @@ def _sharded_host_shape_dtype(shards):
 _HDF5_SLAB_BYTES = 1 << 30
 
 
-def _write_hdf5_streaming(file_path, array_name, out_shape, dtype, produce_slab, attributes_dict=None):
+def _write_hdf5_streaming(file_path, array_name, out_shape, dtype, produce_slab, attributes_dict=None, chunks=None):
     """Create an HDF5 dataset with the given shape and dtype, then fill it one
     slab at a time along axis 0.  The call produce_slab(i0, i1) returns the
     contiguous slab written to dset[i0:i1].  Only one slab is held at a time.
@@ -380,7 +361,7 @@ def _write_hdf5_streaming(file_path, array_name, out_shape, dtype, produce_slab,
     from .view_utils import convert_subdicts_to_strings
     makedirs(file_path)
     with h5py.File(file_path, 'w') as f:
-        dset = f.create_dataset(array_name, shape=out_shape, dtype=dtype)
+        dset = f.create_dataset(array_name, shape=out_shape, dtype=dtype, chunks=chunks)
         if len(out_shape) == 0:
             dset[...] = produce_slab(0, 0)
         else:
@@ -394,38 +375,10 @@ def _write_hdf5_streaming(file_path, array_name, out_shape, dtype, produce_slab,
                 dset.attrs[key] = value
 
 
-def save_data_hdf5(file_path, array, array_name='array', attributes_dict=None):
-    """
-    Save an array to an HDF5 file, optionally including metadata as attributes.
-    The resulting structure has a single dataset with one array and associated text attributes.
-    These can be retrieved using :func:`load_data_hdf5`.
-
-    Large arrays and sharded volumes (a ``Shards`` container) are written one slab at a time,
-    so no full copy of the array is built on the host.
-
-    Args:
-        file_path (str): Full path to the output HDF5 file. Directories will be created if they do not exist.
-        array (ndarray, tensor, or Shards): The data to save, of any shape, such as a 3D volume
-            (nx, ny, nz) or a 4D volume (num_times, nx, ny, nz).
-        array_name (str): Name of the dataset within the HDF5 file. Defaults to 'array'.
-        attributes_dict (dict, optional): Dictionary of attributes to store as metadata in the dataset.
-            Keys must be strings, and values should be serializable as HDF5 attributes.
-
-    Returns:
-        None
-
-    Example:
-        >>> import numpy as np
-        >>> volume = np.random.rand(64, 64, 64)
-        >>> attrs = {'voxel_size': '1.0mm', 'modality': 'CT'}
-        >>> save_data_hdf5('output/recon.h5', volume, array_name='recon', attributes_dict=attrs)
-
-    Example:
-        >>> recon, recon_dict = ct_model.recon(sinogram)
-        >>> recon_info = {'ALU units': '0.3mm', 'sinogram name': 'test part 038'}
-        >>> file_path = './output/test_part_038.h5'
-        >>> mbirtorch.save_data_hdf5(file_path, recon, recon_info)
-    """
+def _save_array_hdf5(file_path, array, array_name='array', attributes_dict=None):
+    """Write one array, of any shape, as the dataset ``array_name`` with the entries of
+    ``attributes_dict`` as text attributes.  A numpy array, a tensor, or a sharded volume is
+    written one slab at a time, so no full copy is made on the host."""
     if isinstance(array, _sharding.Shards):
         out_shape, dtype, produce_slab = _sharded_slab_source(array)
         _write_hdf5_streaming(file_path, array_name, out_shape, dtype, produce_slab, attributes_dict)
@@ -439,6 +392,12 @@ def save_data_hdf5(file_path, array, array_name='array', attributes_dict=None):
         return np.asarray(array) if array.ndim == 0 else np.ascontiguousarray(array[i0:i1])
 
     _write_hdf5_streaming(file_path, array_name, array.shape, array.dtype, produce_slab, attributes_dict)
+
+
+def save_data_hdf5(file_path, array, array_name='array', attributes_dict=None):
+    """Deprecated: use :func:`export_recon_hdf5`."""
+    warnings.warn('save_data_hdf5 is deprecated; use export_recon_hdf5.', FutureWarning, stacklevel=2)
+    _save_array_hdf5(file_path, array, array_name, attributes_dict)
 
 
 def _sharded_slab_source(shards):
@@ -484,61 +443,132 @@ def _sharded_slab_source(shards):
     return out_shape, dtype, produce_slab
 
 
+# The layout of a reconstruction file.  The volume is the dataset 'recon' in right-hand axis
+# order, (slice, col, row) for a 3D volume and (time, slice, col, row) for a 4D one, and the
+# attribute 'axes' states that order.  The transposes map memory order to file order and back.
+_RECON_FORMAT = 'mbirtorch_recon_v2'
+_RECON_AXES = {3: 'slice,col,row', 4: 'time,slice,col,row'}
+_RECON_TRANSPOSE = {3: (2, 1, 0), 4: (0, 3, 2, 1)}
+
+
+def _json_default(value):
+    """Encode what json cannot: arrays, tensors, numpy scalars, sets, and anything else as text."""
+    if hasattr(value, 'detach'):
+        value = value.detach().cpu().numpy()
+    if isinstance(value, np.ndarray):
+        return {'__ndarray__': value.tolist(), 'dtype': str(value.dtype)}
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, (set, tuple)):
+        return list(value)
+    return str(value)
+
+
+def _json_object_hook(obj):
+    if len(obj) == 2 and '__ndarray__' in obj and 'dtype' in obj:
+        return np.asarray(obj['__ndarray__'], dtype=obj['dtype'])
+    return obj
+
+
+def _recon_attributes(recon_dict, ndim):
+    """Return the attributes of a reconstruction file: the format tag, the axis order, the
+    package version, and one attribute per entry of recon_dict.  A dict entry becomes JSON text
+    so that it reads back; a string stays as it is; anything else becomes text."""
+    import json
+    from . import __version__
+    attrs = {'format': _RECON_FORMAT, 'axes': _RECON_AXES[ndim], 'mbirtorch_version': __version__}
+    for key, value in (recon_dict or {}).items():
+        if isinstance(value, dict):
+            attrs[key] = json.dumps(value, default=_json_default)
+        elif isinstance(value, str):
+            attrs[key] = value
+        else:
+            attrs[key] = str(value)
+    return attrs
+
+
 def export_recon_hdf5(file_path, recon, recon_dict=None, remove_flash=False, radial_margin=10, top_margin=10, bottom_margin=10):
     """
-    Export a 3D reconstruction volume to an HDF5 file with optional post-processing.
+    Write a reconstruction and its recon_dict to an HDF5 file.
 
-    This function works with numpy arrays, torch tensors, and sharded volumes (a ``Shards``
-    container).  A sharded volume is copied to the host and written one slab at a time, so the
-    file equals the single-device export.
-    The function also transposes the reconstruction to right-hand coordinates (slice, col, row),
-    and writes the reconstruction and optional metadata to an HDF5 file.
+    The file holds the volume as the dataset ``recon`` in right-hand axis order, (slice, col, row)
+    for a 3D volume and (time, slice, col, row) for a 4D one, so that other programs read it the
+    natural way; the attribute ``axes`` states the order.  The entries of ``recon_dict`` are
+    attributes, the dicts as JSON and the log and notes as text.  :func:`import_recon_hdf5` reads
+    the file back, and the slice viewers open it.
 
     Args:
-        file_path (str): Full path to the output HDF5 file. Parent directories will be created if they do not exist.
-        recon (ndarray, tensor, or Shards): 3D volume in (row, col, slice) order. Will be converted to NumPy before writing.
-        recon_dict (dict, optional): Dictionary of attributes to store as metadata in the dataset.
-        remove_flash (bool, optional): Whether to apply a cylindrical mask to remove peripheral and top/bottom slices. Defaults to False.
-        radial_margin (int, optional): Margin in pixels to subtract from the cylinder radius. Defaults to 10.
-        top_margin (int, optional): Number of top slices to set to zero along the Z-axis. Defaults to 10.
-        bottom_margin (int, optional): Number of bottom slices to set to zero along the Z-axis. Defaults to 10.
+        file_path (str): Path of the output file.  Missing directories are created.
+        recon (ndarray, tensor, or Shards): the volume in (row, col, slice) order, or a 4D volume in
+            (time, row, col, slice) order.  A volume sharded by slice is streamed from the devices
+            without a host copy.
+        recon_dict (dict, optional): the dict returned by :meth:`~mbirtorch.TomographyModel.recon`.
+        remove_flash (bool, optional): If True, zero the voxels outside a cylinder and the top and
+            bottom slices before writing.  Defaults to False.
+        radial_margin (int, optional): Voxels taken off the cylinder radius.  Defaults to 10.
+        top_margin (int, optional): Slices zeroed at the top.  Defaults to 10.
+        bottom_margin (int, optional): Slices zeroed at the bottom.  Defaults to 10.
 
     Example:
-        >>> import numpy as np
-        >>> recon = np.ones((128, 128, 64))  # (row, col, slice) order
-        >>> export_recon_hdf5("output/recon_volume.h5", recon, recon_dict={"scan_id": "sample1"})
+        >>> recon, recon_dict = ct_model.recon(sinogram)
+        >>> mbirtorch.export_recon_hdf5('output/recon.h5', recon, recon_dict)
+        >>> mbirtorch.export_recon_hdf5('output/recon.h5', recon, recon_dict, remove_flash=True)
     """
-    # A three dimensional volume sharded on the slice axis is streamed one slab at a time from
-    # the devices.  Every other input is copied to a single host array first.
+    from . import preprocess
+
+    def mask(block, s0, s1):
+        # block holds slices [s0, s1) of a volume of num_slices slices, in (row, col, slice) order.
+        ds = s1 - s0
+        local_top = min(max(top_margin - s0, 0), ds)
+        local_bottom = min(max(s1 - (num_slices - bottom_margin), 0), ds)
+        return preprocess.apply_cylindrical_mask(block, radial_margin, local_top, local_bottom)
+
+    # A 3D volume sharded on the slice axis is streamed one slab at a time from the devices.
+    # Every other input is copied to a single host array first.
     if (isinstance(recon, _sharding.Shards) and recon.tensors[0].ndim == 3
             and recon.placement.axis % 3 == 2):
         (num_rows, num_cols, num_slices), np_dtype = _sharded_host_shape_dtype(recon)
+        ndim = 3
 
         def get_block(s0, s1):
-            return _shard_axis_block(recon, s0, s1)          # (rows, cols, ds) on the host
+            return _shard_axis_block(recon, s0, s1)
     else:
         recon = _to_host(recon)
-        num_rows, num_cols, num_slices = recon.shape
         np_dtype = recon.dtype
+        ndim = recon.ndim
+        if ndim == 3:
+            num_rows, num_cols, num_slices = recon.shape
 
-        def get_block(s0, s1):
-            return recon[:, :, s0:s1]
+            def get_block(s0, s1):
+                return recon[:, :, s0:s1]
+        elif ndim == 4:
+            num_times, num_rows, num_cols, num_slices = recon.shape
+        else:
+            raise ValueError(f'recon must be a 3D or 4D volume; got shape {recon.shape}')
 
     # Each slab is masked, transposed, and written on its own, so no full transposed volume is
-    # built.  A slab holds all rows and columns, so the circular mask is the same for every slab.
-    from . import preprocess
+    # built.  A 3D slab holds all rows and columns, so the circular mask is the same for every slab.
+    if ndim == 3:
+        def produce_slab(s0, s1):
+            block = get_block(s0, s1)
+            if remove_flash:
+                block = mask(block, s0, s1)
+            return np.ascontiguousarray(np.transpose(block, _RECON_TRANSPOSE[3]))   # (ds, cols, rows)
 
-    def produce_slab(s0, s1):
-        block = get_block(s0, s1)
-        if remove_flash:
-            ds = s1 - s0
-            local_top = min(max(top_margin - s0, 0), ds)                       # Top slices falling in this slab.
-            local_bottom = min(max(s1 - (num_slices - bottom_margin), 0), ds)  # Bottom slices falling in this slab.
-            block = preprocess.apply_cylindrical_mask(block, radial_margin, local_top, local_bottom)
-        return np.ascontiguousarray(np.transpose(block, (2, 1, 0)))            # (ds, cols, rows)
+        out_shape = (num_slices, num_cols, num_rows)
+        chunks = (1, num_cols, num_rows)
+    else:
+        def produce_slab(t0, t1):
+            block = recon[t0:t1]
+            if remove_flash:
+                block = np.stack([mask(frame, 0, num_slices) for frame in block])
+            return np.ascontiguousarray(np.transpose(block, _RECON_TRANSPOSE[4]))   # (dt, slices, cols, rows)
 
-    _write_hdf5_streaming(file_path, 'recon', (num_slices, num_cols, num_rows), np_dtype,
-                          produce_slab, recon_dict)
+        out_shape = (num_times, num_slices, num_cols, num_rows)
+        chunks = (1, 1, num_cols, num_rows)
+
+    _write_hdf5_streaming(file_path, 'recon', out_shape, np_dtype, produce_slab,
+                          _recon_attributes(recon_dict, ndim), chunks=chunks)
 
 
 def _resolve_geometry_class(geometry_type):
@@ -580,7 +610,7 @@ def _recon_shape_at_pitch(recon_shape, automatic_pitch, pitch, slices_are_rows=F
 def build_model(required_params, optional_params=None, regularization=None):
     """
     Construct a model from the parameter dicts returned by
-    :meth:`~mbirtorch.TomographyModel.get_all_params`.
+    ``get_all_params``.
 
     The model class is taken from the ``geometry_type`` entry of ``required_params``.  The model is
     constructed, the optional parameters and regularization are applied, and ``auto_set_recon_geometry``
@@ -1479,31 +1509,59 @@ def calc_tct_recon_params(source_det_dist, source_iso_dist, delta_det_row, delta
 
 def import_recon_hdf5(file_path):
     """
-    Import a 3D reconstruction volume from an HDF5 file.
+    Read a reconstruction and its recon_dict from a file written by :func:`export_recon_hdf5`.
 
-    This function loads a reconstruction volume and associated metadata from an HDF5 file,
-    and reorders the volume axes from the file's (slice, col, row) layout to (row, col, slice)
-    to match MBIRTORCH conventions, so a volume written by export_recon_hdf5 is recovered unchanged.
+    The volume comes back in (row, col, slice) order, or (time, row, col, slice) for a 4D volume,
+    and the recon_dict with the entries and types it was written with.  A file written before the
+    layout was recorded in the file is read by its dataset name, with a warning: ``recon`` is taken
+    to be in (slice, col, row) order, and ``volume`` or ``array`` in (row, col, slice) order; its
+    attributes come back as the strings they were stored as.
 
     Args:
-        file_path (str): Path to the HDF5 file containing the reconstruction volume.
+        file_path (str): Path of the file.
 
     Returns:
-        Tuple[np.ndarray, dict]: A tuple containing:
-            - recon (np.ndarray): The reconstructed 3D volume in (row, col, slice) order.
-            - recon_dict (dict): Dictionary containing metadata associated with the reconstruction.
+        (recon, recon_dict)
 
     Example:
-        >>> from mbirtorch import import_recon_hdf5
-        >>> recon, recon_dict = import_recon_hdf5("output/recon_volume.h5")
-        >>> print(recon.shape)
-        (128, 128, 64)
+        >>> recon, recon_dict = mbirtorch.import_recon_hdf5('output/recon.h5')
     """
-    recon, recon_dict = load_data_hdf5(file_path=file_path)
+    import json
+    import h5py
+    with h5py.File(file_path, 'r') as f:
+        names = list(f.keys())
+        if 'recon' in names:
+            name = 'recon'
+        elif len(names) == 1:
+            name = names[0]
+        else:
+            raise ValueError(f'{file_path} holds {len(names)} datasets and none is named recon')
+        recon = f[name][()]
+        attrs = {k: (v.decode() if isinstance(v, bytes) else v) for k, v in f[name].attrs.items()}
 
-    recon = np.transpose(recon, axes=(2, 1, 0))
+    if attrs.pop('format', None) == _RECON_FORMAT:
+        axes = attrs.pop('axes')
+        attrs.pop('mbirtorch_version', None)
+        recon = np.transpose(recon, _RECON_TRANSPOSE[len(axes.split(','))])
+        recon_dict = {}
+        for key, value in attrs.items():
+            if isinstance(value, str) and value[:1] == '{':
+                try:
+                    value = json.loads(value, object_hook=_json_object_hook)
+                except ValueError:
+                    pass
+            recon_dict[key] = value
+        return recon, recon_dict
 
-    return recon, recon_dict
+    # A file from before the layout was recorded.  Its writer fixed the dataset name.
+    if name == 'recon':
+        warnings.warn(f'{file_path} is in the old layout; it is read as (slice, col, row), so a file '
+                      f'written by save_recon_hdf5 comes back transposed.')
+        if recon.ndim == 3:
+            recon = np.transpose(recon, (2, 1, 0))
+    else:
+        warnings.warn(f'{file_path} is in the old layout; it is read as stored.')
+    return recon, attrs
 
 
 def merge_log_files(merged_path, labeled_paths):

@@ -100,12 +100,12 @@ Users can set, get, and printout parameters using the following primary methods.
 Saving and Loading
 ------------------
 
-* Saving and loading of the data and the dict of parameters/logs returned from :meth:`~mbirtorch.TomographyModel.recon` are implemented in :meth:`~mbirtorch.TomographyModel.save_recon_hdf5` and :meth:`~mbirtorch.TomographyModel.load_recon_hdf5`.
+* A reconstruction and the dict of parameters and logs returned from :meth:`~mbirtorch.TomographyModel.recon` are written to one HDF5 file and read back with :func:`~mbirtorch.export_recon_hdf5` and :func:`~mbirtorch.import_recon_hdf5`.
 
 .. autosummary::
 
-   TomographyModel.save_recon_hdf5
-   TomographyModel.load_recon_hdf5
+   export_recon_hdf5
+   import_recon_hdf5
 
 
 Utilities
@@ -123,8 +123,6 @@ generating synthetic data, and clearing the on-disk compile cache.
    vcd_utils.gen_weights
    vcd_utils.gen_weights_mar
    utilities.download_and_extract
-   utilities.export_recon_hdf5
-   utilities.import_recon_hdf5
    utilities.generate_3d_shepp_logan_low_dynamic_range
    utilities.clear_cache
 

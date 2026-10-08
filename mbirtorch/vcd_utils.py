@@ -249,7 +249,7 @@ def gen_weights(sinogram, weight_type):
     already placed on the devices is rejected, because the arithmetic here
     reads host arrays and single tensors only.  Compute the weights from the
     host sinogram first, then place both at once with
-    :meth:`~mbirtorch.TomographyModel.prepare_sino_for_devices`.
+    ``prepare_sino_for_devices``.
 
     Args:
         sinogram (ndarray or tensor): 3D array of shape
