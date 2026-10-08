@@ -106,6 +106,7 @@ Synthetic Data Generation
 .. autofunction:: mbirtorch.utilities.generate_3d_shepp_logan_low_dynamic_range
 
 .. autofunction:: mbirtorch.utilities.gen_translation_phantom
+.. autofunction:: mbirtorch.utilities.gen_polygon_phantom
 
 For 4D reconstruction, a moving phantom and the sinogram of one scan of it:
 

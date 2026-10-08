@@ -1939,6 +1939,31 @@ def gen_translation_vectors(num_x_translations, num_z_translations, x_spacing, z
     return translation_vectors
 
 
+def gen_polygon_phantom(recon_shape):
+    """
+    A phantom of one asymmetric convex polygon, the same in every slice, for view selection.
+
+    The polygon has five sides and no symmetry, so its edges face a few directions and the
+    best view angles are not evenly spaced.  Its vertices are scaled to the volume.
+
+    Args:
+        recon_shape (tuple of int): (num_rows, num_cols, num_slices).
+
+    Returns:
+        numpy.ndarray: The phantom, float32, 1.0 inside the polygon and 0 elsewhere.
+    """
+    from matplotlib.path import Path
+
+    num_rows, num_cols, num_slices = recon_shape
+    # Vertices as (row, col) on a 512 by 512 grid, scaled to this one.
+    vertices = np.array([[100, 440], [80, 260], [280, 60], [420, 280], [360, 460]], dtype=np.float64)
+    vertices *= np.array([num_rows, num_cols]) / 512.0
+    rows, cols = np.meshgrid(np.arange(num_rows), np.arange(num_cols), indexing='ij')
+    inside = Path(vertices).contains_points(np.stack([rows.ravel(), cols.ravel()], axis=-1))
+    image = inside.reshape(num_rows, num_cols).astype(np.float32)
+    return np.repeat(image[:, :, None], num_slices, axis=2)
+
+
 def gen_cube_phantom(recon_shape, device=None):
     """Code to generate a simple phantom """
     import torch

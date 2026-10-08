@@ -46,7 +46,7 @@ from .utilities import (generate_3d_shepp_logan_low_dynamic_range, clear_cache,
                         build_model, download_and_extract,
                         copy_ct_model, stitch_arrays, save_volume_as_gif,
                         get_ct_model, generate_demo_data, generate_demo_data_4d,
-                        generate_3d_shepp_logan_reference, gen_cube_phantom,
+                        generate_3d_shepp_logan_reference, gen_cube_phantom, gen_polygon_phantom,
                         gen_translation_vectors, gen_translation_phantom,
                         get_helical_half_rotation_slice_range,
                         merge_log_files)

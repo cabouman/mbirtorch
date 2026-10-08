@@ -27,6 +27,8 @@ Each is short and self-contained; adjust the parameters near the top and rerun t
      - The multi-axis parallel geometry (laminography): tilted views and their reconstruction.
    * - ``demo_5_mace4d.py``
      - 4D reconstruction of a moving object, one volume per time frame, against FBP per window.
+   * - ``demo_6_view_selection.py``
+     - Sparse view selection: pick the few view angles that reconstruct a reference object best.
    * - ``demo_8_autograd.py``
      - The differentiable projectors: reconstruction by gradient descent in PyTorch.
 
