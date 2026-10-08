@@ -2944,70 +2944,40 @@ class TomographyModel(ParameterHandler):
               logfile_path='~/.mbirtorch/logs/recon.log', print_logs=True,
               output_sharded=False, rng=None):
         """
-        Perform MBIR reconstruction using the Multi-Granular Vector Coordinate
-        Descent algorithm.  This function takes care of generating its own
-        partitions and partition sequence.
+        Reconstruct a volume from a sinogram by MBIR.
 
-        To restart a recon using the same partition sequence, set
-        first_iteration to the number of iterations completed so far and set
-        init_recon to the output of the previous recon; this continues the
-        partition sequence from where the previous recon left off.
-
-        Device use: on CUDA with several devices, this chooses a device
-        count automatically.  Two rules make the choice: measured speed
-        thresholds decide how many devices are worth using at this problem
-        size, and a memory check confirms the chosen layout fits before the
-        first large allocation.  Nothing needs to change in a calling
-        script.  ``configure_devices(num_devices=n)`` fixes the count
-        instead, and ``configure_devices(num_devices=1)`` pins the run to
-        one device for reproducibility.  The environment variable
-        ``MBIRTORCH_NUM_DEVICES`` pins the count process-wide, which is
-        what a test suite or a nightly should use.
-
-        Reproducibility note: the pixel partitions and the order in which the
-        subsets are visited are drawn from numpy's global random number
-        generator, so reconstructions vary slightly from run to run.  For a
-        reproducible result, call ``np.random.seed(seed)`` before calling this
-        method, or pass ``rng``, which makes the draws independent of anything
-        else the process draws.  Results also differ slightly with the device
-        count, and that difference decays as iterations proceed.
+        The reconstruction runs the Multi-Granular Vector Coordinate Descent algorithm for up to
+        ``max_iterations`` iterations, or until the change between iterations falls below
+        ``stop_threshold_change_pct``.  On a machine with several GPUs it uses them by itself
+        (see :meth:`configure_devices`).  The pixel partitions and their order are drawn from
+        numpy's random number generator, so two runs differ slightly; call ``np.random.seed`` first
+        or pass ``rng`` for the same result every time.
 
         Args:
-            sinogram (numpy or tensor or Shards): 3D sinogram data with shape
-                (num_views, num_det_rows, num_det_channels).  The device form
-                as returned by ``prepare_sino_for_devices`` is accepted
-                too, so repeated reconstructions of one large sinogram pay the
-                host-to-device transfer once.
-            weights (numpy or tensor or Shards, optional): 3D positive weights
-                with the same shape as the sinogram, in a plain array or in the
-                device form.  Defaults to None (all 1s).
-            init_recon (array, int, or None, optional): initial reconstruction.
-                If None, recon_direct is called with default arguments.
-            max_iterations (int, optional): maximum number of VCD iterations.
-            stop_threshold_change_pct (float, optional): stop when
-                100 * ||delta_recon||_1 / ||recon||_1 between iterations drops
-                below this value.  Defaults to 0.2; set 0 to guarantee exactly
-                max_iterations.
-            first_iteration (int, optional): the number of iterations previously
-                completed when restarting a recon.  Defaults to 0.
-            logfile_path (str, optional): Path to the output log file ('~' expands to the
-                user's home directory).  If None or empty, no log file is written.
-                Defaults to '~/.mbirtorch/logs/recon.log'.
-            print_logs (bool, optional): If true then print logs to console.  Defaults to True.
-            output_sharded (bool, optional): If False (default), return a
-                numpy array.  If True, return the device form: a torch
-                tensor on a single device, or a Shards container (one
-                tensor per device) on a multi-device model.
-            rng (numpy.random.Generator, optional): the generator every random
-                draw of the run comes from, the partitions and the order of
-                the subsets.  Defaults to None, the global np.random state.
+            sinogram (numpy or tensor): 3D sinogram with shape (num_views, num_det_rows, num_det_channels).
+            weights (numpy or tensor, optional): positive weights of the same shape.  Defaults to None (all 1s).
+            init_recon (array, optional): initial reconstruction.  Defaults to None, a direct reconstruction.
+            max_iterations (int, optional): maximum number of iterations.  Defaults to 15.
+            stop_threshold_change_pct (float, optional): stop when the percent change in the volume between
+                iterations drops below this value.  Defaults to 0.2; set 0 to run exactly max_iterations.
+            first_iteration (int, optional): to continue a reconstruction, the number of iterations already
+                done, with ``init_recon`` the previous result.  Defaults to 0.
+            logfile_path (str, optional): path of the log file.  Defaults to '~/.mbirtorch/logs/recon.log';
+                None writes no file.
+            print_logs (bool, optional): print the log to the console.  Defaults to True.
+            output_sharded (bool, optional): return the volume on the devices instead of as a numpy array.
+                Defaults to False.
+            rng (numpy.random.Generator, optional): the generator for every random draw of the run.
+                Defaults to None, the global numpy state.
 
         Returns:
-            (recon, recon_dict): the reconstruction volume, and a dict
-            with entries 'recon_params' (per-iteration traces and settings),
-            'recon_log' (the run's log text), 'notes', and
-            'model_params' (a snapshot of the model parameters).  The dict can be
-            given to :func:`~mbirtorch.view_utils.slice_viewer` and :func:`~mbirtorch.export_recon_hdf5`.
+            (recon, recon_dict): the reconstruction volume, and a dict with entries 'recon_params'
+            (settings and per-iteration traces), 'recon_log' (the log text), 'notes', and 'model_params'
+            (the model parameters).  The dict can be given to :func:`~mbirtorch.view_utils.slice_viewer`
+            and :func:`~mbirtorch.export_recon_hdf5`.
+
+        Example:
+            >>> recon, recon_dict = ct_model.recon(sinogram, weights=weights)
         """
         # The initial reconstruction is checked against the shape of the whole volume, which a
         # sharded array does not have, so a sharded init_recon is refused.
@@ -3134,72 +3104,40 @@ class TomographyModel(ParameterHandler):
                  logfile_path='~/.mbirtorch/logs/prox.log', print_logs=True,
                  output_sharded=False, rng=None):
         """
-        Proximal Map function for use in Plug-and-Play applications.  This
-        function is similar to recon, but it essentially uses a prior with a
-        mean of prox_input and a standard deviation of sigma_prox.
+        Compute the proximal map of the data term, for Plug-and-Play loops.
 
-        Reproducibility note: the pixel partitions and the order in which the
-        subsets are visited are drawn from numpy's global random number
-        generator; call ``np.random.seed(seed)`` first for a reproducible
-        result, or pass ``rng``.
+        This is :meth:`recon` with the prior replaced by a Gaussian of mean ``prox_input`` and
+        standard deviation ``sigma_prox``.  A Plug-and-Play loop alternates this method with a
+        denoiser.  The random draws are as in :meth:`recon`.
 
         Args:
-            prox_input (numpy or tensor or Shards): proximal map input with the
-                same shape as the reconstruction.  The device form is accepted
-                too, so a Plug-and-Play loop can feed back what a denoiser
-                returned with ``output_sharded=True``, provided the two models
-                share a device layout (see :meth:`configure_devices`).
-            sinogram (numpy or tensor or Shards): 3D sinogram data with shape
-                (num_views, num_det_rows, num_det_channels).  The device form
-                as returned by ``prepare_sino_for_devices`` is accepted
-                too, so a Plug-and-Play loop that prepares its sinogram once
-                pays the host-to-device transfer once rather than on every
-                call.
-            sigma_prox (None or float, optional): standard deviation of the
-                proximal map prior term.  If None, set automatically from the
-                sinogram.  Defaults to None.
-            weights (numpy or tensor or Shards, optional): 3D positive weights
-                with the same shape as the sinogram, in a plain array or in the
-                device form.  Defaults to None (all 1s).
-            init_recon (numpy or tensor, optional): reconstruction used for
-                initialization.  Defaults to None (determined by _vcd_recon).
-            do_initialization (bool, optional): If True, initialize parameters
-                (partitions and regularization) through :meth:`initialize_prox`.
-                Set False if a previous prox_map call on this model, or a call
-                to :meth:`initialize_prox`, already initialized this sinogram.
-            stop_threshold_change_pct (float, optional): stop when the NMAE
-                percent change drops below this value.  Defaults to 0.2.
-            max_iterations (int, optional): maximum VCD iterations, counted
-                from iteration 0: a call resuming at ``first_iteration=k``
-                runs ``max_iterations - k`` iterations.  Defaults to 3.
-            first_iteration (int, optional): cumulative iteration count for
-                restarts.  The partition sequence is advanced by this amount
-                (on the cached ``do_initialization=False`` path too), so a
-                Plug-and-Play loop that passes the total number of prox
-                iterations completed so far walks the sequence coarse to fine
-                and, past its end, stays on its last (typically finest)
-                entry.  Defaults to 0.
-            logfile_path (str, optional): Path to the output log file ('~' expands to the
-                user's home directory).  If None or empty, no log file is written.
-                Defaults to '~/.mbirtorch/logs/prox.log'.  A Plug-and-Play loop
-                that passes do_initialization=False after its first call keeps
-                writing to the log that call opened, so the whole loop lands in
-                one file.
-            print_logs (bool, optional): If true then print logs to console.  Defaults to True.
-            output_sharded (bool, optional): If False (default), return a
-                numpy array.  If True, return the device form: a torch
-                tensor on a single device, or a Shards container (one
-                tensor per device) on a multi-device model.
-            rng (numpy.random.Generator, optional): the generator every random
-                draw of the call comes from, the partitions when this call
-                initializes and the order of the subsets.  Defaults to None,
-                the global np.random state.
+            prox_input (numpy or tensor): the proximal map input, with the shape of the reconstruction.
+            sinogram (numpy or tensor): 3D sinogram with shape (num_views, num_det_rows, num_det_channels).
+            sigma_prox (float, optional): standard deviation of the prior.  Defaults to None, set from the sinogram.
+            weights (numpy or tensor, optional): positive weights of the same shape as the sinogram.
+                Defaults to None (all 1s).
+            init_recon (numpy or tensor, optional): initial reconstruction.  Defaults to None.
+            do_initialization (bool, optional): set False after the first call of a loop on the same
+                sinogram, so the partitions and regularization are not computed again.  Defaults to True.
+            stop_threshold_change_pct (float, optional): stop when the percent change between iterations
+                drops below this value.  Defaults to 0.2.
+            max_iterations (int, optional): maximum number of iterations, counted from iteration 0.
+                Defaults to 3.
+            first_iteration (int, optional): the total number of proximal map iterations done so far in
+                the loop, which continues the partition sequence.  Defaults to 0.
+            logfile_path (str, optional): path of the log file.  Defaults to '~/.mbirtorch/logs/prox.log';
+                None writes no file.
+            print_logs (bool, optional): print the log to the console.  Defaults to True.
+            output_sharded (bool, optional): return the volume on the devices instead of as a numpy array,
+                which a loop can pass to a denoiser on the same devices.  Defaults to False.
+            rng (numpy.random.Generator, optional): the generator for every random draw.  Defaults to
+                None, the global numpy state.
 
         Returns:
-            (recon, recon_dict): the reconstruction volume, and a dict
-            with entries 'recon_params' (per-iteration traces and settings),
-            'recon_log' (the run's log text), 'notes', and
-            'model_params' (a snapshot of the model parameters).
+            (recon, recon_dict): the volume and a dict with the entries of :meth:`recon`.
+
+        Example:
+            >>> recon, _ = ct_model.prox_map(prox_input, sinogram, sigma_prox=0.5)
         """
         # The initial reconstruction is checked against the shape of the whole volume, which a
         # sharded array does not have, so a sharded init_recon is refused.

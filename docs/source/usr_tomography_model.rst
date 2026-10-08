@@ -21,19 +21,17 @@ Reconstruction and Projection
 
 .. automethod:: mbirtorch.TomographyModel.recon_direct
 
-.. automethod:: mbirtorch.TomographyModel.prox_map
+.. automethod:: mbirtorch.TomographyModel.recon_split_sino
 
-.. automethod:: mbirtorch.TomographyModel.initialize_prox
+.. automethod:: mbirtorch.TomographyModel.recon_plastic_metal
 
 .. automethod:: mbirtorch.TomographyModel.forward_project
 
 .. automethod:: mbirtorch.TomographyModel.back_project
 
-.. automethod:: mbirtorch.TomographyModel.recon_split_sino
+``prox_map`` is for Plug-and-Play loops that alternate a reconstruction step with a denoiser.
 
-.. automethod:: mbirtorch.TomographyModel.recon_plastic_metal
-
-.. automethod:: mbirtorch.TomographyModel.project_points
+.. automethod:: mbirtorch.TomographyModel.prox_map
 
 
 Parameter Handling
