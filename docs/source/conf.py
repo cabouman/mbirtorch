@@ -148,6 +148,9 @@ html_theme = 'sphinx_book_theme'
 # Theme options are theme-specific and customize the look and feel of a theme
 # further.  For a list of options available for each theme, see the
 # documentation.
+# The right-hand page menu lists methods by name only, without the class prefix.
+toc_object_entries_show_parents = 'hide'
+
 html_theme_options = {
     'show_toc_level': 2,
     'repository_url': 'https://github.com/cabouman/mbirtorch',
