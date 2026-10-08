@@ -73,6 +73,7 @@ __all__ = [
     # These hsnt and vcls names resolve lazily through __getattr__.
     "hyper_denoise", "dehydrate", "rehydrate", "import_hsnt_data_hdf5",
     "create_hsnt_metadata", "export_hsnt_data_hdf5", "generate_hyper_data",
+    "synthetic_material_basis", "gen_material_phantom", "generate_hyper_sinogram",
     "get_opt_views", "show_image_with_projection_rays",
 ]
 
@@ -90,6 +91,8 @@ _LAZY_NAMES = {
     'hyper_denoise': 'hsnt', 'dehydrate': 'hsnt', 'rehydrate': 'hsnt',
     'import_hsnt_data_hdf5': 'hsnt', 'create_hsnt_metadata': 'hsnt',
     'export_hsnt_data_hdf5': 'hsnt', 'generate_hyper_data': 'hsnt',
+    'synthetic_material_basis': 'hsnt', 'gen_material_phantom': 'hsnt',
+    'generate_hyper_sinogram': 'hsnt',
     'subsample_R_gamma': 'vcls', 'max_abs_neighbor_diff': 'vcls',
     'get_opt_views': 'vcls', 'compute_view_basis_functions': 'vcls',
     'compute_cov_matrix': 'vcls', 'compute_vcl': 'vcls',
@@ -118,7 +121,9 @@ if TYPE_CHECKING:
     from .mace4d import MACE4DModel, temporal_filter_matrix, apply_temporal_filter
     from .hsnt import (hyper_denoise, dehydrate, rehydrate,
                        import_hsnt_data_hdf5, create_hsnt_metadata,
-                       export_hsnt_data_hdf5, generate_hyper_data)
+                       export_hsnt_data_hdf5, generate_hyper_data,
+                       synthetic_material_basis, gen_material_phantom,
+                       generate_hyper_sinogram)
     from .vcls import (subsample_R_gamma, max_abs_neighbor_diff, get_opt_views,
                        compute_view_basis_functions, compute_cov_matrix,
                        compute_vcl, compute_opt_angle_subset,

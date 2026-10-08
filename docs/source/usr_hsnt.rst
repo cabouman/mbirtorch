@@ -52,6 +52,13 @@ Import/Export
 Synthetic data
 --------------
 
+A simulated scan for trying the method: a phantom of three materials, three synthetic spectra,
+and the hyperspectral sinogram of the phantom through a tomography model, with Poisson counts.
+``demo_7_hyperspectral.py`` dehydrates, reconstructs, and rehydrates one.
+
+.. autofunction:: gen_material_phantom
+.. autofunction:: synthetic_material_basis
+.. autofunction:: generate_hyper_sinogram
 .. autofunction:: generate_hyper_data
 
 
