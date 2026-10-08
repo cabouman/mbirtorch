@@ -107,6 +107,12 @@ Synthetic Data Generation
 
 .. autofunction:: mbirtorch.utilities.gen_translation_phantom
 
+For 4D reconstruction, a moving phantom and the sinogram of one scan of it:
+
+.. autofunction:: mbirtorch.utilities.generate_demo_data_4d
+.. autofunction:: mbirtorch.phantoms_4d.gen_moving_phantom
+.. autofunction:: mbirtorch.phantoms_4d.rack_and_pinion
+
 
 Cache Management
 ----------------

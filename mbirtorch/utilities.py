@@ -2295,3 +2295,81 @@ def generate_demo_data(
 
     del ct_model_for_generation
     return phantom, sinogram, params
+def generate_demo_data_4d(
+    object_type='rack-and-pinion',
+    model_type='parallel',
+    num_views=240,
+    num_rotations=2,
+    num_det_rows=64,
+    num_det_channels=64,
+    num_steps=24,
+    devices=None,
+    **object_options,
+):
+    """
+    Create a moving object and the sinogram of one continuous scan of it, for 4D demonstrations.
+
+    The object is a moving phantom from ``mbirtorch.phantoms_4d``, sampled at ``num_steps``
+    evenly spaced times over the scan.  The views are in time order and are divided evenly among
+    the steps: the views of step k are projected from the object at step k.  With 240 views and
+    24 steps, views 0 to 9 see the object in its first state, views 10 to 19 in its second, and
+    so on.  A 4D reconstruction such as :class:`~mbirtorch.MACE4DModel` divides the views into
+    frames on its own; nothing here depends on that.
+
+    Args:
+        object_type (str, optional): A name in ``mbirtorch.phantoms_4d.MOVING_PHANTOMS``.
+            Defaults to 'rack-and-pinion'.
+        model_type (str, optional): 'parallel' or 'cone'.  Defaults to 'parallel'.
+        num_views (int, optional): Views in the scan.  Defaults to 240.
+        num_rotations (float, optional): Rotations the scan covers.  Defaults to 2.
+        num_det_rows (int, optional): Detector rows.  Defaults to 64.
+        num_det_channels (int, optional): Detector channels.  Defaults to 64.
+        num_steps (int, optional): Times at which the object is sampled.  Defaults to 24.
+        devices (sequence of devices, optional): Devices to project on.  Defaults to None, the
+            model's automatic choice.
+        **object_options: Passed to the phantom function, such as ``rotation_degrees`` for the
+            rack and pinion.
+
+    Returns:
+        tuple: (phantom_4d, sinogram, params)
+            - phantom_4d: the object at each step, float32, shape (num_steps, num_rows,
+              num_cols, num_slices).  The volume shape is the model's reconstruction shape.
+            - sinogram: shape (num_views, num_det_rows, num_det_channels), a host numpy array.
+            - params (dict): 'angles', the angle of each view; 'step_of_view', the step each view
+              was projected from; 'num_rotations' and 'num_steps'; and for 'cone' the two
+              source distances.
+    """
+    import mbirtorch
+    from .phantoms_4d import gen_moving_phantom
+
+    model_type = ModelType(model_type)
+    sinogram_shape = (num_views, num_det_rows, num_det_channels)
+    angles = 2.0 * np.pi * num_rotations * np.arange(num_views) / num_views
+    params = {'angles': angles, 'num_rotations': num_rotations, 'num_steps': num_steps}
+    if model_type == ModelType.PARALLEL:
+        ct_model = mbirtorch.ParallelBeamModel(sinogram_shape, angles)
+    elif model_type == ModelType.CONE:
+        source_detector_dist = 4 * num_det_channels
+        source_iso_dist = source_detector_dist / 2
+        ct_model = mbirtorch.ConeBeamModel(sinogram_shape, angles, source_detector_dist=source_detector_dist,
+                                           source_iso_dist=source_iso_dist)
+        params.update(source_detector_dist=source_detector_dist, source_iso_dist=source_iso_dist)
+    else:
+        raise ValueError(f"model_type must be 'parallel' or 'cone' for 4D data; got {model_type.value!r}.")
+    ct_model.set_params(verbose=0)
+    if devices is not None:
+        ct_model.configure_devices(devices)
+
+    phantom_shape = tuple(int(n) for n in ct_model.get_params('recon_shape'))
+    phantom_4d = gen_moving_phantom(object_type, phantom_shape, num_steps, **object_options)
+
+    # Each step's views are projected from that step's object.
+    step_of_view = (np.arange(num_views) * num_steps) // num_views
+    params['step_of_view'] = step_of_view
+    sinogram = np.zeros(sinogram_shape, dtype=np.float32)
+    for step in range(num_steps):
+        views = step_of_view == step
+        sinogram[views] = ct_model.forward_project(phantom_4d[step])[views]
+    return phantom_4d, sinogram, params
+
+

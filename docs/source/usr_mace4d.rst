@@ -13,7 +13,8 @@ time resolution.  The frames are reconstructed together by the MACE algorithm of
 :cite:`mace4d`, with a prior along time as well as space.  A built-in filter along the frame
 axis removes the periodic modulation that the overlapping windows produce.
 
-The model is built on the model of the whole scan.
+The model is built on the model of the whole scan.  ``demo_5_mace4d.py`` is a complete
+example on a moving phantom from :func:`~mbirtorch.utilities.generate_demo_data_4d`.
 
 .. code-block:: python
 
