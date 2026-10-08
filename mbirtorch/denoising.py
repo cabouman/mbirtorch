@@ -252,32 +252,18 @@ def _subsample_to_host(image, row_step=1, col_step=1, slice_step=1):
 
 class QGGMRFDenoiser(TomographyModel):
     """
-    The QGGMRFDenoiser uses the recon framework to implement a qggmrf proximal
-    map denoiser.  The primary interface is through :meth:`denoise`.
+    A denoiser for additive white Gaussian noise, built on the qGGMRF prior of the
+    reconstruction.  Call :meth:`denoise` on one volume or :meth:`denoise_stack` on several.
 
-    With default settings, and with X a clean image and W equal to AWGN of
-    standard deviation sigma_noise, the result of :meth:`denoise` applied to
-    X + W is the MAP estimate of the denoised image using the qGGMRF prior.
-
-    :meth:`denoise` settles the device layout through the same
-    once-per-model automatic policy ``recon`` uses, sized by the denoiser's
-    own memory plan rather than by a reconstruction it will never run.
-    ``configure_devices`` pins a layout explicitly, and an explicit layout is
-    never second-guessed.  On a multi-device layout the image is divided
-    across the devices by slice.
-
-    Every call settles its own noise level, regularization parameters, and
-    pixel partition, so a caller who denoises a different volume each time
-    gets parameters fitted to that volume.  A caller who needs one fixed
-    operator instead calls :meth:`initialize_denoiser` once and then passes
-    ``do_initialization=False``, which reuses what that call settled.
+    Each call estimates the noise level and sets the regularization from the volume it is
+    given.  To apply one fixed denoiser to a series of volumes, call ``initialize_denoiser``
+    once and pass ``do_initialization=False`` on every call after it.
 
     Args:
-        image_shape (tuple of int): shape of the images to denoise
-            (3-dimensional).  To denoise a 2D image, use shape (1, m, n).
-        compile_mode (str, optional): 'auto' (default) compiles the
-            computational kernels with torch.compile; 'off' runs without
-            compilation.
+        image_shape (tuple of int): The shape of the volumes to denoise, three integers.
+            For a 2D image use (1, num_rows, num_cols).
+        compile_mode (str, optional): 'auto' compiles the kernels with ``torch.compile``;
+            'off' does not.  Defaults to 'auto'.
     """
 
     # This name selects the speed floors in _widening_floors that set the
@@ -632,57 +618,36 @@ class QGGMRFDenoiser(TomographyModel):
                 logfile_path='~/.mbirtorch/logs/recon.log', print_logs=True,
                 output_sharded=False, do_initialization=True):
         """
-        Compute the MAP denoiser assuming AWGN and the 3D qGGMRF prior.
-
-        The amount of denoising can be changed by changing sigma_noise.  If
-        sigma_noise is None, it is estimated from the image.  Denoising strength
-        can also be adjusted with the ``sharpness`` parameter (default 0.0).
-
-        The first call settles the model's device layout, so it may raise the
-        memory preflight's ``MemoryPreflightError`` when no device count
-        holds the sweep.  ``MBIRTORCH_NUM_DEVICES`` caps the automatic count,
-        and ``configure_devices`` fixes it outright.
+        Denoise a volume, assuming additive white Gaussian noise and the qGGMRF prior.
 
         Args:
-            image (numpy or tensor or Shards): the 3D volume to be denoised.
-                The slice-sharded device form is accepted too, so a
-                Plug-and-Play loop can feed back what a reconstruction
-                returned with ``output_sharded=True``, provided the two models
-                share a device layout (see
-                :meth:`~mbirtorch.TomographyModel.configure_devices` and its
-                ``like=`` argument).
-            sigma_noise (float, optional): estimated noise std in the image.
-                If None, estimated from the image.  ``sigma_y`` is kept equal
-                to ``sigma_noise`` (for the identity forward model they are
-                the same parameter), whether or not auto-regularization is on.
-            use_ror_mask: restrict denoising to a masked region (None default,
-                which keeps the model's current setting; False for no mask,
-                True for the inscribed ellipse, or a custom 2D mask).
-            init_image (numpy or tensor or Shards, optional): initial image
-                for the minimization, in a plain array or in the device form.
-                Defaults to ``image``.
-            max_iterations (int, optional): maximum VCD iterations.
-            stop_threshold_change_pct (float, optional): stop when
-                100 * ||delta||_1 / ||image||_1 drops below this.  0 guarantees
-                exactly max_iterations.
-            first_iteration (int, optional): iteration label offset for logs.
-            logfile_path (str, optional): Path to the output log file ('~' expands to the
-                user's home directory).  If None or empty, no log file is written.
-                Defaults to '~/.mbirtorch/logs/recon.log'.
-            print_logs (bool, optional): If true then print logs to console.  Defaults to True.
-            output_sharded (bool, optional): if True return the device form
-                (slice-sharded across several devices).
-            do_initialization (bool, optional): If True, settle the noise
-                level, the regularization parameters, and the pixel partition
-                for this call through :meth:`initialize_denoiser`.  False
-                reuses what a previous call or a direct call to
-                :meth:`initialize_denoiser` settled, so that every call is the
-                same operator.  Defaults to True.
+            image (numpy array, tensor, or Shards): The volume to denoise, with the shape the
+                denoiser was built for.
+            sigma_noise (float, optional): The noise standard deviation.  None estimates it
+                from ``image``.  Defaults to None.
+            use_ror_mask (bool, array, or None, optional): False denoises the whole volume,
+                True the inscribed ellipse, and a 2D array of 0s and 1s the columns marked 1.
+                None keeps the model's setting, which starts as False.  Defaults to None.
+            init_image (numpy array, tensor, or Shards, optional): The starting point of the
+                minimization.  Defaults to ``image``.
+            max_iterations (int, optional): The most iterations to run.  Defaults to 15.
+            stop_threshold_change_pct (float, optional): Stop when the percent change of the
+                volume in an iteration falls below this.  0 runs every iteration.  Defaults
+                to 0.2.
+            first_iteration (int, optional): The iteration number of the first iteration in
+                the log.  Defaults to 0.
+            logfile_path (str, optional): The log file.  None or '' writes none.  Defaults to
+                '~/.mbirtorch/logs/recon.log'.
+            print_logs (bool, optional): If True, print the log.  Defaults to True.
+            output_sharded (bool, optional): If True, return the volume in the device form it
+                was processed in rather than as a numpy array.  Defaults to False.
+            do_initialization (bool, optional): If True, estimate the noise level and set the
+                regularization for this call.  False reuses what the previous call, or a call
+                to ``initialize_denoiser``, set.  Defaults to True.
 
         Returns:
-            (denoised_image, denoiser_dict): the denoised volume, and a dict
-            with entries 'recon_params', 'recon_log', 'notes', and
-            'model_params' (as in the dict :meth:`TomographyModel.recon` returns).
+            tuple: ``(denoised_image, denoise_dict)``: the denoised volume and a dictionary
+            with the same entries as the one :meth:`~mbirtorch.TomographyModel.recon` returns.
 
         Example:
             >>> denoiser = mbirtorch.QGGMRFDenoiser(noisy_image.shape)
@@ -1052,84 +1017,39 @@ class QGGMRFDenoiser(TomographyModel):
                       batch_size=None, overwrite_input=False,
                       do_initialization=True):
         """
-        Denoise a stack of same-shaped volumes with shared parameters, each
-        volume as :meth:`denoise` would denoise it alone.
+        Denoise a stack of volumes of the same shape, each as :meth:`denoise` would, with one
+        noise level and one set of regularization parameters for all of them.
 
-        The volumes are independent.  The sweep carries a leading volume axis,
-        each volume has its own line-search step size, and each volume has its
-        own stopping test: a volume whose change falls below the threshold is
-        frozen, its step is zero from then on, and the other volumes keep
-        iterating.  The result and the per-volume iteration counts therefore
-        equal those of calling :meth:`denoise` once per volume with the same
-        parameters and the same pixel partition.
-
-        The parameters are set once for the whole stack.  ``sigma_noise`` is
-        shared by every volume, and ``sigma_y`` is kept equal to it.  When
-        auto-regularization is on, the regularization parameters are set by
-        `auto_set_regularization_params_from_stack` from a subsample of
-        about 20 whole volumes, evenly spaced, with the neighbor differences
-        taken between adjacent frames.  This differs from :meth:`denoise`,
-        which reads a row subsample of a single image.  One pixel partition is
-        used by every volume: it is drawn from the global numpy random
-        generator, so a seeded call is reproducible, and
-        :meth:`initialize_denoiser` settles one that every later call reuses.
-
-        The sweep runs on the denoiser's device, in batches of ``batch_size``
-        volumes.  The last batch is padded to the full size by repeating its
-        last volume, so one compiled shape serves every batch of a call, and
-        the padded results are discarded.  This method uses one device: a
-        denoiser configured with more than one device raises.  No log file is
+        The volumes are independent: each has its own stopping test, and the result for each
+        equals a call of :meth:`denoise` on it alone with the same parameters.  The
+        regularization is set from a subsample of the stack rather than from one volume.  The
+        stack is processed in batches of ``batch_size`` volumes on one device.  No log file is
         written.
 
-        The sweep holds two arrays per volume, the working image and the
-        residual.  A stack swept as one batch is returned as that working
-        image, with no separate output array; several batches write into
-        one.  By default the caller's tensors are never written: a tensor
-        already on the sweep device in float32 is cloned into the working
-        image, so the call holds the input beside the two.  With
-        ``overwrite_input`` the sweep takes such a tensor over instead, which
-        saves one array per volume; the caller must not read it afterward.
-
         Args:
-            stack (numpy or tensor): the volumes to denoise, with shape
-                (num_volumes,) + image_shape.
-            sigma_noise (float, optional): noise std shared by every volume.
-                None estimates it from the merged stack.
-            init_stack (numpy or tensor, optional): initial image for each
-                volume, with the shape of ``stack``.  Defaults to ``stack``.
-            max_iterations (int, optional): maximum VCD iterations per volume.
-            stop_threshold_change_pct (float, optional): a volume stops when
-                100 * ||delta||_1 / ||volume||_1 drops below this.  0 runs
-                every volume for exactly max_iterations.
-            batch_size (int, optional): volumes swept at once.  None chooses
-                the size with `auto_batch_size`, which is the whole stack
-                on a device without a readable memory budget.
-            overwrite_input (bool, optional): let the sweep write ``stack``
-                and ``init_stack`` in place when they are float32 tensors
-                already on the sweep device, rather than clone them.  A numpy
-                array is never written.  Defaults to False.
-            do_initialization (bool, optional): If True, settle the noise
-                level, the regularization parameters, and the pixel partition
-                for this call through :meth:`initialize_denoiser`.  False
-                reuses what a previous call or a direct call to
-                :meth:`initialize_denoiser` settled, so that every call is the
-                same operator.  Defaults to True.
+            stack (numpy array or tensor): The volumes, shape (num_volumes,) + image_shape.
+            sigma_noise (float, optional): The noise standard deviation shared by every volume.
+                None estimates it from the stack.  Defaults to None.
+            init_stack (numpy array or tensor, optional): The starting point for each volume,
+                the shape of ``stack``.  Defaults to ``stack``.
+            max_iterations (int, optional): The most iterations to run per volume.  Defaults to 15.
+            stop_threshold_change_pct (float, optional): A volume stops when its percent change
+                in an iteration falls below this.  0 runs every iteration.  Defaults to 0.2.
+            batch_size (int, optional): Volumes processed at once.  None chooses from the
+                device memory.  Defaults to None.
+            overwrite_input (bool, optional): If True, a float32 tensor already on the device
+                is written in place rather than copied, which saves memory; do not read it
+                afterward.  Defaults to False.
+            do_initialization (bool, optional): As in :meth:`denoise`.  Defaults to True.
 
         Returns:
-            (denoised_stack, info): the denoised volumes, numpy for numpy input
-            and a tensor on the input's device for tensor input, which shares
-            the input's storage when ``overwrite_input`` let the sweep write
-            it; and a dict
-            with 'num_iterations' (one count per volume), 'nmae_pct' (one list
-            per volume holding the percent change at each of its iterations),
-            'regularization_params', and 'batch_size'.
+            tuple: ``(denoised_stack, info)``: the denoised volumes, numpy for numpy input and
+            a tensor for tensor input, and a dictionary with 'num_iterations' and 'nmae_pct'
+            per volume, 'regularization_params', and 'batch_size'.
 
         Raises:
-            ValueError: if ``stack`` or ``init_stack`` has the wrong shape, if
-                ``batch_size`` is below 1, or if the denoiser is configured
-                with more than one device.
-            TypeError: if ``stack`` or ``init_stack`` is in the divided device
-                form.
+            ValueError: If ``stack`` or ``init_stack`` has the wrong shape, if ``batch_size``
+                is below 1, or if the denoiser is configured for more than one device.
 
         Example:
             >>> denoiser = mbirtorch.QGGMRFDenoiser(stack.shape[1:])
@@ -1326,36 +1246,17 @@ class QGGMRFDenoiser(TomographyModel):
 
 def median_filter3d(x, max_block_gb=4.0, return_min_max=False):
     """
-    Apply a 27-point (3x3x3) median filter to a 3-D array using replicated
-    (edge) boundary conditions.  Optionally also return the min and max of
-    each 27-point neighborhood.
+    Apply a 3x3x3 median filter to a 3D array, with edge values repeated at the boundary.
 
     Args:
-        x (ndarray or tensor): Input array.
-        max_block_gb (float, optional): A rough upper bound on the amount of
-            memory in GB to use for the filtering.  Defaults to 4.0.
-        return_min_max (bool, optional): If True, the output is a tuple
-            (median, min, max).
+        x (numpy array or tensor): The array.
+        max_block_gb (float, optional): About how much memory, in GB, the filter may use at
+            once; the array is processed in blocks along its first axis.  Defaults to 4.0.
+        return_min_max (bool, optional): If True, also return the minimum and the maximum of
+            each 3x3x3 neighborhood.  Defaults to False.
 
     Returns:
-        ndarray or tensor (or tuple of 3): An array of the same shape and
-        dtype as ``x`` containing the median-filtered result, numpy for
-        numpy input and tensor for tensor input.
-
-    Raises:
-        TypeError: If ``x`` is in the divided device form.
-
-    Note:
-        The array is processed in blocks along axis 0 so that roughly
-        ``max_block_gb`` of temporary data exists at once.  If axis 0 is
-        short relative to another axis, swapping axis 0 with the long axis
-        first may use less memory.
-
-    Example:
-        >>> import numpy as np
-        >>> import mbirtorch
-        >>> vol = np.arange(27.).reshape(3, 3, 3)
-        >>> mbirtorch.median_filter3d(vol)
+        The filtered array, the shape and type of ``x``, or the tuple ``(median, min, max)``.
     """
     import torch.nn.functional as F
     from .tomography_model import _resolve_device

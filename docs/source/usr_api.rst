@@ -11,7 +11,6 @@ individual pages for more detail. See :ref:`DemosFAQs` for examples.
 * :ref:`ParametersDocs`
 * :ref:`TomographyModelDocs`
 * :ref:`GeometryModelsDocs`
-* :ref:`DenoisingDocs`
 * :ref:`MACE4DDocs`
 * :ref:`AutogradDocs`
 * :ref:`PreprocessDocs`
@@ -50,7 +49,6 @@ individual pages for more detail. See :ref:`DemosFAQs` for examples.
    usr_parameters
    usr_tomography_model
    usr_geometry_models
-   usr_denoising
    usr_mace4d
    usr_autograd
    usr_preprocess

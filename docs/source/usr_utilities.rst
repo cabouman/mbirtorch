@@ -73,6 +73,7 @@ estimated geometry with the vendor's by drawing one over the other.
 General Purpose
 ---------------
 
+.. autofunction:: mbirtorch.median_filter3d
 .. autofunction:: mbirtorch.utilities.stitch_arrays
 .. autofunction:: mbirtorch.utilities.get_ct_model
 .. autofunction:: mbirtorch.utilities.copy_ct_model

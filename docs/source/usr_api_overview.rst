@@ -46,18 +46,12 @@ for direct (non-iterative) reconstruction in the case of many views and low-nois
 Denoising
 ---------
 
-See :ref:`DenoisingDocs` for details on Denoising Functions.
-These includes functions for computing the MAP denoiser using the qGGMRF prior and a 3D median filter.
+The identity geometry: its reconstruction is the MAP denoiser under the qGGMRF prior, handy in
+a Plug-and-Play loop.  See :ref:`DenoisingDocs`.
 
 .. autosummary::
 
    QGGMRFDenoiser.denoise
-
-The median filter is implemented using a fixed 3x3x3 neighborhood with replicated edges at the boundary.
-
-.. autosummary::
-
-   median_filter3d
 
 Differentiable Projectors
 -------------------------
@@ -107,6 +101,7 @@ generating synthetic data, and clearing the on-disk compile cache.
    view_utils.slice_viewer
    view_utils.slice_viewer4d
    view_utils.geometry_viewer
+   median_filter3d
    vcd_utils.gen_weights
    vcd_utils.gen_weights_mar
    utilities.download_and_extract

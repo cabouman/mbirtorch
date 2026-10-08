@@ -36,6 +36,11 @@ same reconstruction, projection, and parameter methods, described in :ref:`Tomog
 
        Cone beam views of a translated, non-rotating object.  Thin, flat objects.  Under
        development.
+   * -
+     - :ref:`DenoisingDocs`
+
+       The identity geometry, :math:`y = x + w`.  Its reconstruction is a MAP denoiser,
+       handy in a Plug-and-Play loop.
 
 .. toctree::
    :hidden:
@@ -45,3 +50,4 @@ same reconstruction, projection, and parameter methods, described in :ref:`Tomog
    usr_cone_beam_model
    usr_multiaxis_parallel_beam_model
    usr_translation_model
+   usr_denoising
