@@ -14,19 +14,6 @@ commonly used functions are described below.  See :ref:`DemosFAQs` for examples.
 .. automodule:: mbirtorch
    :no-index:
 
-One-Call Reconstruction
------------------------
-
-For a basic reconstruction, one function call takes the sinogram and the geometry and returns the
-reconstruction, with no model to create first:
-
-.. autosummary::
-
-   recon_simple_parallel
-   recon_simple_cone
-
-The model classes below give full control over the same reconstruction.
-
 Geometry Models
 ---------------
 

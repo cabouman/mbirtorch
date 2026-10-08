@@ -140,7 +140,7 @@ class TomographyModel(ParameterHandler):
     Base class for all tomography geometries.  It provides projection
     (:meth:`forward_project`, :meth:`back_project`), reconstruction
     (:meth:`recon`, :meth:`prox_map`, :meth:`recon_direct`), device
-    configuration (:meth:`configure_devices`), and parameter handling.
+    configuration (:meth:`~mbirtorch.TomographyModel.configure_devices`), and parameter handling.
     Users construct a geometry subclass (for example ``ConeBeamModel`` or
     ``ParallelBeamModel``) rather than this class.
 
@@ -990,7 +990,7 @@ class TomographyModel(ParameterHandler):
 
     def _install_device_layout(self, devices):
         """Rebuild the placements over ``devices``.  Both
-        :meth:`configure_devices` and the automatic choice call this.  It does
+        :meth:`~mbirtorch.TomographyModel.configure_devices` and the automatic choice call this.  It does
         not change ``device_layout_is_automatic``."""
         devices = [torch.device(d) for d in devices]
         self.torch_device = devices[0]
@@ -2949,7 +2949,7 @@ class TomographyModel(ParameterHandler):
         The reconstruction runs the Multi-Granular Vector Coordinate Descent algorithm for up to
         ``max_iterations`` iterations, or until the change between iterations falls below
         ``stop_threshold_change_pct``.  On a machine with several GPUs it uses them by itself
-        (see :meth:`configure_devices`).  The pixel partitions and their order are drawn from
+        (see :meth:`~mbirtorch.TomographyModel.configure_devices`).  The pixel partitions and their order are drawn from
         numpy's random number generator, so two runs differ slightly; call ``np.random.seed`` first
         or pass ``rng`` for the same result every time.
 

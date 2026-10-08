@@ -4,26 +4,22 @@
 Parallel Beam Model
 ===================
 
-The ``ParallelBeamModel`` class implements a geometry and reconstruction model for parallel-beam computed tomography.
-This class inherits all behaviors and attributes of the :ref:`TomographyModelDocs`.
-It also implements some parallel-beam specific functions such as FBP (Filtered Back Projection) reconstruction.
+.. plot:: figs/geom_parallel.py
+   :align: center
+   :width: 60%
 
-Note that for parallel-beam geometry the default value of ``delta_voxel`` = ``delta_det_channel`` = 1 ALU,
-which results in pixel spacing that is the same as detector channel spacing.
-However, these parameters can be changed by the user with the ``TomographyModel.set_params()`` method.
-The spacing between slices of the reconstruction are fixed to be the same as the spacing between detector rows.
+In the parallel beam geometry the rays of every view are parallel, as from a source at
+infinity, and the object rotates about an axis parallel to the detector columns.  The
+model is built from the sinogram shape and the view angles.  The voxels are cubes with
+spacing ``delta_voxel``, which defaults to the detector channel spacing
+``delta_det_channel`` of 1 ALU, and the reconstruction covers the width and the height of
+the detector.  Change these with :meth:`~mbirtorch.TomographyModel.set_params`; see
+:ref:`ParametersDocs`.
 
-See the API docs for the :class:`~mbirtorch.TomographyModel` class for details on a wide range
-of functions that can be implemented using the ``ParallelBeamModel``.
+.. code-block:: python
 
-Simple Reconstruction
----------------------
-
-For a basic reconstruction, one function call takes the sinogram and the view angles and returns
-the reconstruction.  The class below gives full control over the geometry, the parameters, and the
-reconstruction itself.
-
-.. autofunction:: mbirtorch.recon_simple_parallel
+    ct_model = mbirtorch.ParallelBeamModel(sinogram.shape, angles)
+    recon, recon_dict = ct_model.recon(sinogram)
 
 Constructor
 -----------
@@ -31,8 +27,14 @@ Constructor
 .. autoclass:: mbirtorch.ParallelBeamModel
    :show-inheritance:
 
-Alternative Reconstruction
---------------------------
+Reconstruction
+--------------
+
+``recon`` is the iterative reconstruction.  ``recon_fbp`` is filtered back projection, fast and
+non-iterative, which ``recon`` uses as its starting point.  ``recon_split_sino`` reconstructs a
+sinogram too large for memory in overlapping bands of detector rows.
+
+.. automethod:: mbirtorch.ParallelBeamModel.recon
 
 .. automethod:: mbirtorch.ParallelBeamModel.recon_fbp
 

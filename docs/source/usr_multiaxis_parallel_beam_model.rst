@@ -4,18 +4,22 @@
 Multi-Axis Parallel Model
 =========================
 
-The ``MultiAxisParallelModel`` class implements a geometry and reconstruction model for parallel beam but with the ability to rotate in azimuth and tilt in elevation.
-Therefore, parallel beam laminography is a special case of this geometry when there is a constant tilt for all views.
+.. plot:: figs/geom_multiaxis.py
+   :align: center
+   :width: 60%
 
-This class inherits all behaviors and attributes of the :ref:`TomographyModelDocs`.
-It also implements multi-axis parallel-beam direct reconstruction methods such as ``recon_direct`` and ``recon_fbp``.
+The multi-axis parallel geometry is the parallel beam geometry with a second angle: each view
+has an azimuth, the usual rotation about the object's z axis, and an elevation, the angle at
+which the rays leave the xy plane.  With a constant elevation it is parallel beam
+laminography, and with zero elevation it is the parallel beam model.  The model is built from
+the sinogram shape and a two-column array of angles.  The voxels are cubes with spacing
+``delta_voxel``, which defaults to the detector channel spacing of 1 ALU.
 
-For multi-axis parallel beam geometry, the default detector channel spacing is ``delta_det_channel`` is 1 ALU,
-and the voxels are 3D cubes with spacing ``delta_voxel = delta_det_channel``.
-However, these parameters can be changed by the user using the ``TomographyModel.set_params()`` method.
+.. code-block:: python
 
-See the API docs for the :class:`~mbirtorch.TomographyModel` class for details on a wide range
-of functions that can be implemented using the ``MultiAxisParallelModel``.
+    angles = np.stack([azimuth, elevation], axis=1)     # radians, one row per view
+    ct_model = mbirtorch.MultiAxisParallelModel(sinogram.shape, angles)
+    recon, recon_dict = ct_model.recon(sinogram)
 
 Constructor
 -----------
@@ -23,7 +27,12 @@ Constructor
 .. autoclass:: mbirtorch.MultiAxisParallelModel
    :show-inheritance:
 
-Alternative Reconstruction
---------------------------
+Reconstruction
+--------------
+
+``recon`` is the iterative reconstruction.  ``recon_fbp`` is filtered back projection, fast and
+non-iterative, which ``recon`` uses as its starting point.
+
+.. automethod:: mbirtorch.MultiAxisParallelModel.recon
 
 .. automethod:: mbirtorch.MultiAxisParallelModel.recon_fbp
