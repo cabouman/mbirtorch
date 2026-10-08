@@ -56,12 +56,12 @@ the cross-reference target that ``:show-inheritance:`` needs on every model clas
 .. automethod:: mbirtorch.TomographyModel.get_recon_dict
 
 
-Recon Shape and Voxel Spacing
------------------------------
+Recon FOV and Voxel Spacing
+---------------------------
 
 .. automethod:: mbirtorch.TomographyModel.auto_set_recon_geometry
 
-.. automethod:: mbirtorch.TomographyModel.scale_recon_shape
+.. automethod:: mbirtorch.TomographyModel.resize_recon_fov
 
 .. automethod:: mbirtorch.TomographyModel.get_magnification
 

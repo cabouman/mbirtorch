@@ -91,8 +91,8 @@ Array size of reconstruction. This is set automatically (by ``auto_set_recon_geo
 For cone beam, the automatic shape can pad each end of the slice axis using
 the cone beam-specific ``axial_pad_fraction`` parameter.
 If the object extends beyond the field of view *laterally*, MBIRTorch will issue a warning during reconstruction.
-In this case, the reconstruction can be improved by using :meth:`~mbirtorch.TomographyModel.scale_recon_shape` with
-``scale_recon_shape(s, s)`` and ``s`` typically chosen as ``s >= 1.1``.
+In this case, the reconstruction can be improved by using :meth:`~mbirtorch.TomographyModel.resize_recon_fov` with
+``resize_recon_fov(s, s)`` and ``s`` typically chosen as ``s >= 1.1``.
 
 .. _param-delta_det_channel:
 

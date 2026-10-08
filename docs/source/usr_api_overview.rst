@@ -51,7 +51,7 @@ for direct (non-iterative) reconstruction in the case of many views and low-nois
 .. autosummary::
 
    TomographyModel.recon
-   TomographyModel.scale_recon_shape
+   TomographyModel.resize_recon_fov
    TomographyModel.prox_map
    TomographyModel.forward_project
    TomographyModel.back_project

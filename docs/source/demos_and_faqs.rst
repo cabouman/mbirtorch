@@ -87,7 +87,7 @@ You can improve the reconstruction by increasing recon_shape:
 
 .. code-block:: python
 
-        ct_model.scale_recon_shape(row_scale=1.2, col_scale=1.2)
+        ct_model.resize_recon_fov(row_scale=1.2, col_scale=1.2)
 
 Note that the scale factor need only be large enough to give some padding around the region of valid projection --
 it does not need to match the size of the true object.  Larger scale factors will lead to increased time and memory.
@@ -197,10 +197,10 @@ sinogram stripes that produce these rings, plus ``interpolate_defective_pixels``
 bad detector pixels and ``remove_sino_offset`` for a residual sinogram offset.
 
 A bright ring at the outer *boundary* of the reconstruction -- typically accompanied by the
-"Lateral FoV truncation detected" warning -- means the object extends past the field of view; see the next FAQ.
+"Lateral FOV truncation detected" warning -- means the object extends past the field of view; see the next FAQ.
 
 
-Q: What does the "Lateral FoV truncation detected" warning mean?
+Q: What does the "Lateral FOV truncation detected" warning mean?
 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 A: The object extends beyond the detector's lateral field of view: at every view angle, material outside
@@ -209,7 +209,7 @@ The result is a bright ring at the reconstruction boundary, a bias across the wh
 convergence.
 
 Image quality can often be improved in this case by padding the region of reconstruction using the
-``model.scale_recon_shape(s, s)`` method with ``s >= 1.1``.
+``model.resize_recon_fov(s, s)`` method with ``s >= 1.1``.
 
 For the *axial* (slice) direction in cone beam, the automatic geometry can pad the slice
 axis via the ``axial_pad_fraction`` parameter (default 0 = no padding, 1 = full padding --

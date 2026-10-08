@@ -60,7 +60,7 @@ interior.  The two directions are handled separately.
   at each end.  The value is a single fraction or a ``(top, bottom)`` pair.  The default 0 adds no
   slices, and 1 pads each end out to the farthest slice reached by any measured ray.
 - **Across the rotation axis:** MBIRTorch prints a warning when the object appears to extend past
-  the detector.  In that case, call ``ct_model.scale_recon_shape(s, s)`` with ``s`` of 1.1 or
+  the detector.  In that case, call ``ct_model.resize_recon_fov(s, s)`` with ``s`` of 1.1 or
   more before reconstructing.
 
 

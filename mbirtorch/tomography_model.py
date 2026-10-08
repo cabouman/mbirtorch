@@ -2044,9 +2044,9 @@ class TomographyModel(ParameterHandler):
                                                 sino_indicator[:, :, -1])))
         if edge_frac > 0.02 and self.get_params('verbose') > 0:
             warnings.warn(
-                f"Lateral FoV truncation detected: the object support reaches the detector's "
+                f"Lateral FOV truncation detected: the object support reaches the detector's "
                 f"edge channels in {edge_frac:.0%} of the sampled view-rows.  Consider using "
-                f"scale_recon_shape(s, s) where s >= 1.1 to improve image quality.")
+                f"resize_recon_fov(s, s) where s >= 1.1 to improve image quality.")
 
     def auto_set_sigma_y(self, sinogram, sino_indicator, weights=1):
         """Set sigma_y from the (typically view-subsampled) sinogram, its
@@ -3324,17 +3324,19 @@ class TomographyModel(ParameterHandler):
     def gen_weights(sinogram, weight_type):
         return vcd_utils.gen_weights(sinogram, weight_type)
 
-    def scale_recon_shape(self, row_scale=1.0, col_scale=1.0, slice_scale=1.0):
+    def resize_recon_fov(self, row_scale=1.0, col_scale=1.0, slice_scale=1.0):
         """
-        Scale the reconstruction shape by the given scale factors.
+        Resize the reconstruction field of view (FOV) by the given scale factors.
 
-        This can be used before starting a reconstruction to improve results
-        when part of the object projects outside the detector.  The method
-        updates the internal `recon_shape` parameter.
+        The voxel size stays the same; the number of voxels in each direction is
+        multiplied by its scale factor.  This can be used before starting a
+        reconstruction to improve results when part of the object projects
+        outside the detector.  The method updates the internal `recon_shape`
+        parameter.
 
-        For lateral field-of-view truncation (flagged by the "Lateral FoV
-        truncation detected" warning), use ``scale_recon_shape(s, s)`` with
-        ``s`` typically chosen as ``s >= 1.1``.
+        For lateral FOV truncation (flagged by the "Lateral FOV truncation
+        detected" warning), use ``resize_recon_fov(s, s)`` with ``s``
+        typically chosen as ``s >= 1.1``.
 
         Args:
             row_scale (float): Scale factor for the number of recon rows.
@@ -3342,7 +3344,7 @@ class TomographyModel(ParameterHandler):
             slice_scale (float): Scale factor for the number of recon slices.
 
         Returns:
-            tuple[int, int, int]: pixels added to (rows, columns, slices).
+            tuple[int, int, int]: voxels added to (rows, columns, slices).
         """
         old_rows, old_cols, old_slices = self.get_params('recon_shape')
         new_rows = int(old_rows * row_scale)
@@ -3350,6 +3352,11 @@ class TomographyModel(ParameterHandler):
         new_slices = int(old_slices * slice_scale)
         self.set_params(recon_shape=(new_rows, new_cols, new_slices))
         return new_rows - old_rows, new_cols - old_cols, new_slices - old_slices
+
+    def scale_recon_shape(self, row_scale=1.0, col_scale=1.0, slice_scale=1.0):
+        # Deprecated name for resize_recon_fov; kept so old scripts keep running.
+        warnings.warn('scale_recon_shape is deprecated; use resize_recon_fov instead.', FutureWarning, stacklevel=2)
+        return self.resize_recon_fov(row_scale, col_scale, slice_scale)
 
     def recon_slice_z(self, slice_indices=None):
         """The axial coordinate, in ALU, of the center of each recon slice.
