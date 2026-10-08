@@ -432,6 +432,28 @@ class TranslationModel(TomographyModel):
         return self.fdk_filter(sinogram, filter_name=filter_name,
                                output_sharded=output_sharded)
 
+    def recon_tct_direct(self, sinogram, weights=None):
+        """
+        Direct reconstruction derived for the translation geometry (TCT FBP) with a planar source trajectory:
+        each detector row is padded with its edge values, pre-weighted, ramp filtered and cropped, then
+        backprojected with the depth weight D_sd / (D_sp - y)^2 and averaged over the translation paths that
+        record each voxel.  See :func:`mbirtorch.tct_direct.tct_direct_recon` for the formula.
+
+        Unlike :meth:`recon_fdk`, which reuses the rotational FDK weights with the adjoint backprojector, this
+        reconstruction follows the TCT direct reconstruction theory; like any direct method for this
+        limited-angle geometry, it reconstructs only the frequencies the scan measures.
+
+        Args:
+            sinogram (numpy or torch array): Sinogram with shape (num_views, num_det_rows, num_det_channels).
+            weights (numpy or torch array, optional): Sinogram weights; the valid detector panel is the bounding
+                box of the elements with a positive weight.  Defaults to None (whole detector).
+
+        Returns:
+            numpy array: The reconstruction with shape ``recon_shape``.
+        """
+        from .tct_direct import tct_direct_recon
+        return tct_direct_recon(self, sinogram, weights=weights)
+
     def _get_estimate_of_recon_std(self, sinogram, sino_indicator):
         """This method estimates the standard deviation of the reconstruction from the
         sinogram.  The estimate uses the voxel size along the row axis."""
