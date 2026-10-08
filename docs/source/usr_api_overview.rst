@@ -87,7 +87,7 @@ use inside a deep-learning pipeline.
 Parameter Handling
 ------------------
 
-See :ref:`Primary Parameters <ParametersDocs>` page for a description of the primary parameters.
+See :ref:`ParametersDocs` for a description of the parameters.
 Users can set, get, and printout parameters using the following primary methods.
 
 .. autosummary::

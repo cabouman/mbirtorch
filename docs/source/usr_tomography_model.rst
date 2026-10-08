@@ -88,7 +88,7 @@ parameters, log, and notes as attributes.  The slice viewers open it.
 
 .. _detailed-parameter-docs:
 
-Parameter Documentation
------------------------
+Parameters
+----------
 
-See the :ref:`Primary Parameters <ParametersDocs>` page.
+The parameters a model holds, with their defaults, are listed on the :ref:`ParametersDocs` page.
