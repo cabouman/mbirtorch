@@ -7,8 +7,7 @@ Parameters
 A model holds the parameters listed here.  Read one with ``get_params('name')``, change it with
 ``set_params(name=value)``, and print them all with ``print_params()``.  Lengths are in ALU
 (arbitrary length units); see :ref:`param-units`.  The parameters particular to one geometry,
-such as the source and detector distances of cone beam, are described with that geometry's
-constructor on its own page.
+are in the cone beam table at the end and with each geometry's constructor on its own page.
 
 
 The three you set
@@ -68,8 +67,50 @@ when a model is built.  If you change a detector parameter with ``set_params``, 
 
 If the object extends past the detector laterally, the reconstruction warns.  Enlarge the
 reconstruction with :meth:`~mbirtorch.TomographyModel.resize_recon_fov`, ``resize_recon_fov(s, s)``
-with ``s`` of 1.1 or more.  For cone beam, the slice range can be padded with the cone beam
-parameter ``axial_pad_fraction``.
+with ``s`` of 1.1 or more.  For cone beam, pad the slice axis with ``axial_pad_fraction`` and
+shift it with ``recon_slice_offset``, both in the cone beam table below.
+
+
+Cone beam
+---------
+
+The source distances, ``helical_z_shifts``, and ``use_curved_detector`` are given to the
+:class:`~mbirtorch.ConeBeamModel` constructor.  The other two are set with ``set_params`` after
+the model is built.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 14 64
+
+   * - Parameter
+     - Default
+     - What it does
+   * - ``source_detector_dist``
+     - required
+     - The distance from the X-ray source to the detector, in ALU.
+   * - ``source_iso_dist``
+     - required
+     - The distance from the X-ray source to the center of rotation, in ALU.
+   * - ``helical_z_shifts``
+     - None
+     - The shift of the object along the rotation axis at each view, in ALU, one value per angle.
+       None is a circular scan with no shift.
+   * - ``use_curved_detector``
+     - False
+     - False is a flat panel.  True is a cylindrical detector of radius ``source_detector_dist``,
+       so every detector row is at the same distance from the source.
+   * - ``recon_slice_offset``
+     - 0.0
+     - The position of the center of the reconstruction along the rotation axis, in ALU.  Set
+       automatically to the center of the band of the object the detector sees.  Set it yourself
+       afterwards to shift the reconstruction up or down; a positive value moves it down, toward
+       the higher detector row indices.
+   * - ``axial_pad_fraction``
+     - 0.0
+     - How far the automatic geometry pads each end of the slice axis, as a fraction of the
+       distance the outermost rays reach past the band the detector sees: 0 adds nothing, 1 pads
+       to the deepest point any measured ray reaches.  A (top, bottom) pair pads the two ends
+       differently.
 
 
 Detector geometry
