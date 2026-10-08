@@ -682,7 +682,7 @@ class QGGMRFDenoiser(TomographyModel):
         Returns:
             (denoised_image, denoiser_dict): the denoised volume, and a dict
             with entries 'recon_params', 'recon_log', 'notes', and
-            'model_params' (as in :meth:`TomographyModel.get_recon_dict`).
+            'model_params' (as in the dict :meth:`TomographyModel.recon` returns).
 
         Example:
             >>> denoiser = mbirtorch.QGGMRFDenoiser(noisy_image.shape)

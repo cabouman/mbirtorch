@@ -897,67 +897,33 @@ class TomographyModel(ParameterHandler):
     # ── device configuration ──────────────────────────────────────────────────
     def configure_devices(self, num_devices=1, devices=None, like=None):
         """
-        Set the compute devices the model uses.
+        Choose the devices the model computes on.
 
-        Specify either a CUDA device count (``num_devices=n``), an explicit
-        device list (``devices=['cpu']``, ``['mps']``, or
-        ``['cuda:0', 'cuda:1']``), or another model to match
-        (``like=other_model``).  With more than one device, the sinogram
-        is divided across the devices by view and the reconstruction by
-        slice.
+        Give a number of GPUs, a list of devices, or another model to match::
 
-        ``like=`` exists for a Plug-and-Play or ADMM loop, which alternates
-        :meth:`prox_map` on a reconstruction model with
-        :meth:`~mbirtorch.QGGMRFDenoiser.denoise` on a denoiser over the same
-        volume.  Placing the two models on the same devices lets that volume
-        pass between them in its device form (``output_sharded=True``),
-        instead of being gathered to the host and scattered again on every
-        half-iteration::
+            ct_model.configure_devices(2)                             # the first two GPUs
+            ct_model.configure_devices(devices=['cuda:0', 'cuda:2'])  # these two GPUs
+            ct_model.configure_devices(devices=['cpu'])               # the CPU
+            denoiser.configure_devices(like=ct_model)                 # the same devices as ct_model
 
-            denoiser = QGGMRFDenoiser(ct_model.get_params('recon_shape'))
-            denoiser.configure_devices(like=ct_model)
+        Without a call, the model chooses by itself: a GPU when there is one, and on a machine
+        with several GPUs as many as help at the problem size.  A call turns that choice off for
+        this model, so ``configure_devices(1)`` pins a run to one GPU for a reproducible result.
+        Results differ slightly with the number of GPUs, and the difference shrinks as the
+        iterations proceed.
 
-        The one limit is worth stating plainly: this makes RECON-like arrays
-        interchangeable, not sinogram-like ones.  A denoiser's sinogram IS its
-        image, so its sinogram placement divides an image by slice, while a
-        projection model's divides a sinogram by view; they are different
-        things, and nothing exchanges sinograms with a denoiser anyway.
+        ``like=`` is for a Plug-and-Play loop that passes a volume between a reconstruction model
+        and a denoiser: on the same devices the volume stays on the GPUs between the two.
+        Configure the other model first.
 
-        Without a call to this method, the model chooses its devices
-        automatically: it prefers cuda, then mps, then cpu, and on CUDA it
-        may spread a reconstruction across several devices (see
-        :meth:`recon`).  Calling this method turns the automatic choice off
-        permanently for this model, so ``configure_devices(num_devices=1)``
-        pins a run to one device for reproducibility.  The
-        ``MBIRTORCH_NUM_DEVICES`` environment variable pins the count for a
-        whole process.  Results can differ slightly with the device count,
-        and the difference decays as iterations proceed.
-
-        The device layout is built from the current sinogram and recon
-        shapes, so call this after any geometry change.
-
-        Call this function to set the device layout before any array is placed on the devices.
+        Call this after any change to the sinogram or reconstruction shape.
 
         Args:
-            num_devices (int, optional): number of devices to use.  1 (the
-                default) uses the model's default device (cuda, mps, or
-                cpu); values above 1 require that many CUDA devices.
-            devices (list, optional): explicit device list.  Overrides
-                num_devices.
-            like (TomographyModel, optional): another model (a geometry model
-                or a ``QGGMRFDenoiser``) whose device list this model copies,
-                so that recon-like arrays can pass between the two in their
-                device form.  The two models must agree on their recon shape,
-                which is what makes a volume from one usable by the other;
-                they need not agree on their sinogram shapes, and a denoiser
-                paired with a geometry model never does.  What is copied is the
-                layout the other model has at this moment, so configure that
-                model first: one whose layout is still automatic has not
-                chosen yet -- it settles on its first reconstruction -- and
-                the pair would then end up on different layouts.  ``like``
-                and ``devices`` cannot both be given, and ``num_devices`` is
-                ignored when ``like`` is: it has a default value, so an
-                explicit ``num_devices=1`` cannot be told from the default.
+            num_devices (int, optional): number of GPUs.  Defaults to 1.
+            devices (list, optional): device names, such as ``['cuda:0', 'cuda:1']`` or ``['cpu']``.
+                Overrides num_devices.
+            like (TomographyModel, optional): a model whose devices this model copies.  The two
+                must have the same recon shape.
         """
         if like is not None and devices is not None:
             raise ValueError(
@@ -1421,41 +1387,20 @@ class TomographyModel(ParameterHandler):
     _floor_family = None
 
     def prepare_sino_for_devices(self, sinogram, weights=None):
-        """Place a sinogram (and optionally weights) in the model's device
-        form, once.
+        """
+        Send a sinogram (and optionally weights) to the model's devices once.
 
-        The device form is the layout the reconstruction methods use
-        internally: the sinogram is divided across the configured devices by
-        view.
-
-        Calling this is OPTIONAL: every reconstruction method applies the
-        same placement automatically to a plain input.  Use this function to
-        transfer just once when running several reconstructions on
-        the same large sinogram.  What it returns goes straight into
-        :meth:`recon` and :meth:`prox_map` in place of the sinogram (and the
-        weights), so those calls do no transfer of their own.
-        If the device configuration changes afterwards, the prepared array no
-        longer matches, and the reconstruction methods raise an error; re-run
-        this method to fix it.
-
-        On a model whose device layout is still automatic, this call also
-        decides the layout, and every later reconstruction on the model
-        reuses it.  The layout is sized for a full reconstruction whenever one
-        fits.  On a problem too large for any full reconstruction, the memory
-        check falls back to what this call itself allocates, which is much
-        smaller, the way the direct reconstructions do; preparing a sinogram
-        then succeeds where a full reconstruction could not run.  A later
-        :meth:`recon` on such a layout runs the memory check again and raises
-        ``MemoryPreflightError``, rather than reusing a layout that was never
-        checked for it.
+        Every reconstruction method does this by itself.  Call it when you reconstruct the same
+        large sinogram several times, and pass what it returns to :meth:`recon` or
+        :meth:`prox_map` in place of the sinogram; the copy to the GPUs then happens once.
+        Call it again after any change to the devices.
 
         Args:
             sinogram (numpy or tensor): sinogram in the model's sinogram_shape.
             weights (numpy or tensor, optional): weights of the same shape.
 
         Returns:
-            The prepared sinogram, or a (sinogram, weights) tuple when weights
-            were given.
+            The prepared sinogram, or a (sinogram, weights) tuple when weights were given.
         """
         # The layout is settled before the sinogram is placed.  Placing first would put the
         # whole sinogram on the lead device and then move it again.
@@ -2636,7 +2581,7 @@ class TomographyModel(ParameterHandler):
         Args:
             sinogram (numpy or tensor or Shards): 3D sinogram data with shape
                 (num_views, num_det_rows, num_det_channels).  The device form
-                as returned by :meth:`prepare_sino_for_devices` is accepted
+                as returned by ``prepare_sino_for_devices`` is accepted
                 too, so repeated reconstructions of one large sinogram pay the
                 host-to-device transfer once.
             partitions (list): K partitions, each an (N_subsets, N_indices)
@@ -3030,7 +2975,7 @@ class TomographyModel(ParameterHandler):
         Args:
             sinogram (numpy or tensor or Shards): 3D sinogram data with shape
                 (num_views, num_det_rows, num_det_channels).  The device form
-                as returned by :meth:`prepare_sino_for_devices` is accepted
+                as returned by ``prepare_sino_for_devices`` is accepted
                 too, so repeated reconstructions of one large sinogram pay the
                 host-to-device transfer once.
             weights (numpy or tensor or Shards, optional): 3D positive weights
@@ -3206,7 +3151,7 @@ class TomographyModel(ParameterHandler):
                 share a device layout (see :meth:`configure_devices`).
             sinogram (numpy or tensor or Shards): 3D sinogram data with shape
                 (num_views, num_det_rows, num_det_channels).  The device form
-                as returned by :meth:`prepare_sino_for_devices` is accepted
+                as returned by ``prepare_sino_for_devices`` is accepted
                 too, so a Plug-and-Play loop that prepares its sinogram once
                 pays the host-to-device transfer once rather than on every
                 call.

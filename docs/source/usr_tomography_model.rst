@@ -56,25 +56,15 @@ Recon FOV and Voxel Spacing
 .. automethod:: mbirtorch.TomographyModel.get_magnification
 
 
-Device Configuration
---------------------
+Choosing the GPUs
+-----------------
 
-On a machine with multiple GPUs, MBIRTorch automatically divides a reconstruction across
-them to increase the available memory and reduce reconstruction time -- with no change to
-your script, and for every geometry.  The device count is chosen once per model, when its
-first reconstruction starts: measured speed thresholds decide how many devices are worth
-using, and a memory check confirms the layout fits.  The methods below give explicit
-control over which devices are used.  Per-device memory use is reported by ``mbirtorch.get_memory_stats()``.
-See :doc:`usr_multi_gpu` for a full discussion.
+On a machine with several GPUs, a reconstruction uses them with no change to your script.
+Call ``configure_devices`` to choose the devices yourself, or set the environment variable
+``MBIRTORCH_NUM_DEVICES`` to set the number of GPUs for a whole process.  See
+:doc:`usr_multi_gpu` for how several GPUs are used and how to get the most out of them.
 
 .. automethod:: mbirtorch.TomographyModel.configure_devices
-
-.. automethod:: mbirtorch.TomographyModel.prepare_sino_for_devices
-
-.. REPLACED(device_summary): MBIRJAX documents a ``device_summary`` property here, which
-   reports the devices its automatic selection chose.  MBIRTorch reports the layout a run
-   settled on in the run log's device line, and ``get_memory_stats`` covers the per-device
-   reporting, so the property will not be ported.
 
 
 .. _SaveLoadDocs:
