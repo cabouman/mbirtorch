@@ -43,10 +43,12 @@ Q: How do I load my scanner's data?
 
 A: Scanner data arrives as a folder of radiographs with a blank scan, a dark scan, and the
 scanner's description of the geometry, and turning that into a sinogram and a correctly set up model
-takes several steps that are easy to get wrong.  For each supported scanner, ``get_sino_and_model``
-does all of them in one call and returns the sinogram and a model ready to reconstruct, for example
-``mbirtorch.preprocess.nsi.get_sino_and_model(dataset_dir)``.  The functions it uses are available on
-their own for a scanner without a reader.  See :ref:`PreprocessDocs`.
+takes several steps that are easy to get wrong.  MBIRTorch has a scanner loader for each supported
+instrument: a ``get_sino_and_model`` function that does all of the steps in one call and returns the
+sinogram and a model ready to reconstruct, for example
+``mbirtorch.preprocess.nsi.get_sino_and_model(dataset_dir)``.  The loaders and the instruments they
+support are listed in :ref:`ScannerLoaders`.  For an instrument without a loader, the functions the
+loaders use are available on their own; see :ref:`PreprocessDocs`.
 
 Q: How can I check my scan geometry before reconstructing?
 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -162,7 +164,7 @@ Parallel beam geometry is faster and could be used for cone beam data, but it ma
 close to the object.
 
 For transmission tomography, it is critically important to preprocess the raw photon measurements by normalizing by an air-scan and taking the negative log of the ratio.
-The scanner readers in ``mbirtorch.preprocess`` do this, and the functions they use are available for other scanners.
+The scanner loaders in ``mbirtorch.preprocess`` (see :ref:`ScannerLoaders`) do this, and the functions they use are available for other instruments.
 
 In cone-beam scans, it is sometimes the case that the rotation direction is reversed.
 The symptom is a reconstruction that is subtly warped, with shapes distorted and the top and

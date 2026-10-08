@@ -45,8 +45,9 @@ See :ref:`Utilities`.
 Prepare data
 ------------
 
-One call per scanner loads a scan and returns the sinogram and the model: ``nsi``, ``zeiss``,
-``zeiss_tct``, and ``pymbir`` each have a ``get_sino_and_model``.  See :ref:`PreprocessDocs`.
+A scanner loader, one per supported instrument, reads the scan and returns the sinogram and the
+model in one call: ``nsi``, ``zeiss``, ``zeiss_tct``, and ``pymbir`` each have a
+``get_sino_and_model``.  See :ref:`ScannerLoaders`.
 
 More
 ----

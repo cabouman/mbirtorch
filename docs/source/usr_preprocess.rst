@@ -13,11 +13,16 @@ raw scans, or work on a reconstruction.  Scripts that use them are in the
 `mbirtorch_applications <https://github.com/cabouman/mbirtorch_applications>`__ repository.
 
 
-Loading a scan
---------------
+.. _ScannerLoaders:
 
-Each supported scanner has a ``get_sino_and_model`` function that loads the scan, computes the
-sinogram, and returns a model of the right geometry with its parameters set.
+Scanner loaders
+---------------
+
+A scanner loader is a function for one specific instrument.  It reads that instrument's files,
+computes the sinogram, and returns it with a model of the right geometry and its parameters set.
+Each is a ``get_sino_and_model`` function in a module named for the instrument.  The instruments
+with loaders are North Star Imaging (NSI) scanners, Zeiss Versa and Ultra scanners, Zeiss
+translation CT, and the ORNL HDF5 format.
 
 .. code-block:: python
 
@@ -28,7 +33,7 @@ sinogram, and returns a model of the right geometry with its parameters set.
     weights = mbirtorch.gen_weights(sino, weight_type='transmission_root')
     recon, recon_dict = model.recon(sino, weights=weights)
 
-The Zeiss translation reader also returns a weight mask as a third value.
+The Zeiss translation loader also returns a weight mask as a third value.
 
 North Star Imaging (NSI)
 ^^^^^^^^^^^^^^^^^^^^^^^^
@@ -64,7 +69,7 @@ Correcting a sinogram
 
 .. currentmodule:: mbirtorch.preprocess
 
-These take the sinogram a reader returns and give back a corrected one.  Beam hardening and stripe
+These take the sinogram a scanner loader returns and give back a corrected one.  Beam hardening and stripe
 corrections are applied before the reconstruction.  View alignment needs a first reconstruction,
 so it comes after one.
 
@@ -85,9 +90,9 @@ so it comes after one.
 Building a sinogram from raw scans
 ----------------------------------
 
-For a scanner without a reader, start from the object, blank, and dark scans and run the same steps
-the readers run.  The readers' ``load_scans_and_params`` functions return the raw scans and the
-scanner's parameters when you want to start from those.
+For an instrument without a scanner loader, start from the object, blank, and dark scans and run
+the same steps the loaders run.  The loaders' ``load_scans_and_params`` functions return the raw
+scans and the scanner's parameters when you want to start from those.
 
 .. code-block:: python
 
@@ -167,7 +172,7 @@ and a sinogram that is already divided across devices.  A divided sinogram has t
 host first.  :func:`parameter_sweep` accepts any parallel-beam or cone-beam scan, but not a
 translation scan.
 
-When the reader supplies a detector tilt, prefer it over the estimate, and check the slices far from
+When the scanner loader supplies a detector tilt, prefer it over the estimate, and check the slices far from
 the central plane before applying an estimate, because a detector rotation displaces those slices
 most.  Treat a rotation-direction answer that comes with a warning as undecided.
 

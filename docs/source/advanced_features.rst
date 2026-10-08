@@ -13,16 +13,14 @@ Parameters are set on the model object::
 
     ct_model.set_params(sharpness=1.5, det_channel_offset=2.0)
 
-The reconstruction shape and the voxel spacing are computed from the geometry parameters when the
-model is created.  A later change to a detector spacing does not update them.  After changing
-``delta_det_channel`` or ``delta_det_row``, call ``ct_model.auto_set_recon_geometry()`` to recompute
-``recon_shape`` and ``delta_voxel``.
+After changing a detector parameter, call ``ct_model.auto_set_recon_geometry()`` so that the
+reconstruction geometry follows; see `Changing the reconstruction field of view`_ below.
 
 To see every parameter and its current value, call ``ct_model.print_params()``.
 
 
-Image quality
--------------
+Tuning image quality
+--------------------
 
 Two parameters control the tradeoff between resolution and noise:
 
@@ -35,37 +33,69 @@ Both parameters set the underlying regularization automatically.  Setting ``sigm
 directly turns the automatic setting off.
 
 
-Reconstruction size and voxel spacing
--------------------------------------
+Setting detector parameters
+---------------------------
+Four parameters describe the detector, all in arbitrary length units:
 
-The reconstruction array size and voxel pitch are set automatically to cover the field of view.
-To reconstruct a different region, set these parameters:
-
-- ``recon_shape``: a tuple ``(num_rows, num_cols, num_slices)``.
-- ``delta_voxel``: the spacing between voxels in each direction.
 - ``delta_det_channel`` and ``delta_det_row``: the spacing between detector channels and between
   detector rows.
+- ``det_channel_offset``: the offset of the center of rotation from the center of the detector,
+  along the channel direction.  A wrong value gives rings near the center of the reconstruction.
+- ``det_row_offset``: the offset of the source-to-detector line from the center of the detector,
+  along the row direction.
 
-All spacings are in arbitrary length units, which are explained in :ref:`Unit Conversion <ALU_conversion_label>`.
+The scanner loaders, the functions for specific instruments described in :ref:`ScannerLoaders`, set
+them from the scanner's files.  To set them yourself::
 
+    ct_model.set_params(delta_det_channel=0.1, det_channel_offset=2.0)
+    ct_model.auto_set_recon_geometry()
 
-Objects larger than the field of view
--------------------------------------
-
-When part of the object projects outside the detector at some views, the measurements that the
-reconstruction cannot explain produce a bright ring at the edge of the volume and a bias in the
-interior.  The two directions are handled separately.
-
-- **Along the rotation axis (cone beam only):** set ``axial_pad_fraction`` to pad the slice axis
-  at each end.  The value is a single fraction or a ``(top, bottom)`` pair.  The default 0 adds no
-  slices, and 1 pads each end out to the farthest slice reached by any measured ray.
-- **Across the rotation axis:** MBIRTorch prints a warning when the object appears to extend past
-  the detector.  In that case, call ``ct_model.resize_recon_fov(s, s)`` with ``s`` of 1.1 or
-  more before reconstructing.
+The second line is required after any change to these parameters; without it the reconstruction
+comes out at the wrong scale.  The channel offset can be estimated from the sinogram; see the
+geometry calibration section of :ref:`PreprocessDocs`.
 
 
-Sinogram weights
-----------------
+Changing the reconstruction field of view
+-----------------------------------------
+
+The reconstruction fills a box of voxels, the field of view (FOV).  When the model is built, the
+box is set from the detector: across the rotation axis it covers what the detector sees, and
+along the rotation axis it is centered on the band of the object the detector sees.  Two reasons
+to change it: the object is larger than the detector's view, which leaves a bright ring at the
+edge of the reconstruction and a bias inside, and MBIRTorch warns about it; or you want only part
+of the volume, to save time and memory.
+
+Do it in this order:
+
+1. Set the detector parameters, if any need changing, such as the detector spacings or offsets.
+2. Call ``ct_model.auto_set_recon_geometry()``.  This recomputes the box and the voxel size from
+   the detector.  Without it the reconstruction comes out at the wrong scale, and it also resets
+   any change made in the next step, so it comes first.
+3. Resize the box with ``resize_recon_fov``, one scale factor per direction.  The voxel size stays
+   the same; a factor above 1 enlarges the box and a factor below 1 shrinks it.
+
+.. code-block:: python
+
+    ct_model.set_params(delta_det_channel=0.1)
+    ct_model.auto_set_recon_geometry()
+    ct_model.resize_recon_fov(1.2, 1.2)              # 20 percent wider across the rotation axis
+
+For a cone beam scan, the box can also be moved along the rotation axis with
+``recon_slice_offset``, in ALU, with a positive value moving it down relative to the detector,
+and padded at both ends with ``axial_pad_fraction``, a fraction from 0, no padding, to 1, out to
+the farthest slice any measured ray reaches:
+
+.. code-block:: python
+
+    ct_model.set_params(recon_slice_offset=offset, axial_pad_fraction=0.5)
+
+The box and the voxel size can also be set directly, with ``recon_shape`` and ``delta_voxel``;
+they and the detector parameters are described in :ref:`ParametersDocs`.  All spacings are in
+arbitrary length units, explained in :ref:`Unit Conversion <ALU_conversion_label>`.
+
+
+Sinogram weighting
+------------------
 
 The weights array has the same shape as the sinogram.  Each entry is the assumed inverse noise
 variance of the corresponding sinogram entry.  Weights for the common noise models come from
@@ -84,19 +114,6 @@ that pass through the metal::
     weights = mbirtorch.gen_weights_mar(ct_model, sinogram, init_recon=None)
 
 Passing a first reconstruction as ``init_recon`` gives a better estimate of where the metal is.
-
-
-Geometry offsets
-----------------
-
-Two parameters correct for a detector that is not centered on the rotation axis:
-
-- ``det_channel_offset``: the offset of the center of rotation from the center of the detector,
-  along the channel direction.
-- ``det_row_offset``: the offset along the row direction.
-
-Both are in the same units as the detector spacing.  The channel offset can be estimated from the
-sinogram; see the geometry calibration section of :ref:`PreprocessDocs`.
 
 
 Large volumes and multiple GPUs

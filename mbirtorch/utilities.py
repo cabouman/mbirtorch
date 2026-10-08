@@ -573,7 +573,7 @@ def export_recon_hdf5(file_path, recon, recon_dict=None, remove_flash=False, rad
 
 def _resolve_geometry_class(geometry_type):
     """Return the model class named by a ``geometry_type`` string.  That string
-    is recorded by ``get_all_params`` and by the scan readers."""
+    is recorded by ``get_all_params`` and by the scanner loaders."""
     import mbirtorch
     geometry_type = str(geometry_type)
     for name in ('ConeBeamModel', 'MultiAxisParallelBeamModel',
@@ -615,7 +615,7 @@ def build_model(required_params, optional_params=None, regularization=None):
     The model class is taken from the ``geometry_type`` entry of ``required_params``.  The model is
     constructed, the optional parameters and regularization are applied, and ``auto_set_recon_geometry``
     sets the reconstruction geometry the dicts do not carry.  A ``recon_shape``, ``delta_voxel``, or
-    ``recon_slice_offset`` the dicts do carry, from a reader or from a model whose values were set by
+    ``recon_slice_offset`` the dicts do carry, from a scanner loader or from a model whose values were set by
     hand, is kept; when a pitch is supplied without a shape, the automatic shape is sized at that pitch.
 
     Args:

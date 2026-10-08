@@ -942,9 +942,9 @@ def apply_config_crop(num_det_rows, num_det_channels, det_row_offset, det_channe
                       delta_det_row, delta_det_channel, *,
                       crop_pixels_top, crop_pixels_bottom, crop_pixels_sides):
     """
-    Apply a configuration (manual) detector crop to a reader's SCALAR geometry values.
+    Apply a configuration (manual) detector crop to a scanner loader's SCALAR geometry values.
 
-    Scalar-in / scalar-out adapter around :func:`apply_detector_crop` -- the readers' configuration crop
+    Scalar-in / scalar-out adapter around :func:`apply_detector_crop` -- the scanner loaders' configuration crop
     acts on loose scalars (not a param dict) at conversion time, so this packs them, applies the shared
     detector-plane crop (shape reduction + offset compensation for an asymmetric top/bottom crop), and
     unpacks the results.  A detector crop does not change the number of views, so it is neither taken nor
@@ -975,9 +975,9 @@ def apply_config_crop(num_det_rows, num_det_channels, det_row_offset, det_channe
 
 def finalize_model(sino, required_params, optional_params, *, auto_crop=False, safety_buffer=20):
     """
-    Build a model from a reader's sinogram and parameter dictionaries.
+    Build a model from a scanner loader's sinogram and parameter dictionaries.
 
-    This is the last step of each reader's ``get_sino_and_model``.  With ``auto_crop`` the blank
+    This is the last step of each scanner loader's ``get_sino_and_model``.  With ``auto_crop`` the blank
     margins of the sinogram are removed first and the geometry is adjusted to match.
 
     Args:
