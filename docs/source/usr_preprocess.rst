@@ -22,7 +22,7 @@ A scanner loader is a function for one specific instrument.  It reads that instr
 computes the sinogram, and returns it with a model of the right geometry and its parameters set.
 Each is a ``get_sino_and_model`` function in a module named for the instrument.  The instruments
 with loaders are North Star Imaging (NSI) scanners, Zeiss Versa and Ultra scanners, Zeiss
-translation CT, and the ORNL HDF5 format.
+translation CT, Zeiss VoluMax, and the ORNL HDF5 format.
 
 .. code-block:: python
 
@@ -53,6 +53,13 @@ Zeiss translation CT
 ^^^^^^^^^^^^^^^^^^^^
 
 .. currentmodule:: mbirtorch.preprocess.zeiss_tct
+
+.. autofunction:: get_sino_and_model
+
+Zeiss VoluMax
+^^^^^^^^^^^^^
+
+.. currentmodule:: mbirtorch.preprocess.volumax
 
 .. autofunction:: get_sino_and_model
 
