@@ -4,48 +4,64 @@
 User API
 ========
 
-See :ref:`UserAPIOverviewDocs` for a high-level introduction to the main features of MBIRTorch, then browse
-individual pages for more detail. See :ref:`DemosFAQs` for examples.
-
-* :ref:`UserAPIOverviewDocs`
-* :ref:`ParametersDocs`
-* :ref:`TomographyModelDocs`
-* :ref:`GeometryModelsDocs`
-* :ref:`MACE4DDocs`
-* :ref:`AutogradDocs`
-* :ref:`PreprocessDocs`
-* :ref:`Utilities`
-* :ref:`VCLSDocs`
-* :ref:`HSNTDocs`
-
-
-.. DIVERGENCE(automodule members): mbirjax's copy of this directive carries
-   ":members: :undoc-members: :show-inheritance:".  Those options are dropped here on
-   purpose, to reproduce mbirjax's RENDERED page rather than its directive text.
-   mbirjax/__init__.py defines no __all__, so autodoc treats every name as an imported
-   member and documents NONE of them; mbirjax's rendered page is 16.7 KB.
-   mbirtorch/__init__.py declares an explicit __all__, which autodoc honors.
-
-   Narrowing __all__ to the public surface (2026-08-07) was tried and is NOT sufficient:
-   with the options restored the page measured 140 KB against mbirjax's 16.7 KB.  The
-   reason is that ":members:" documents each CLASS AND ALL ITS METHODS -- 250 entries
-   across the seven exported classes -- which no narrowing of __all__ affects, since the
-   classes must stay in it.  Restoring the options also re-raised 8 warnings from method
-   docstrings that reference private helpers (_get_estimate_of_recon_std,
-   _sharding.run_per_device, get_psf_radii).
-
-   Restoring these options therefore requires a different mechanism, not a narrower
-   __all__.
+A reconstruction is three calls: build a model of the scan geometry, reconstruct, and look
+at the result.  Everything else is reached from the menu on the left.
 
 .. automodule:: mbirtorch
    :no-index:
+
+Build a model
+-------------
+
+* :class:`~mbirtorch.ParallelBeamModel`: parallel rays.
+* :class:`~mbirtorch.ConeBeamModel`: rays from a point source, circular or helical.
+* :class:`~mbirtorch.MultiAxisParallelModel`: parallel rays with a per-view elevation; laminography.
+* :class:`~mbirtorch.TranslationModel`: cone beam views of a translated object; under development.
+
+See :ref:`GeometryModelsDocs`.
+
+Reconstruct
+-----------
+
+.. autosummary::
+
+   TomographyModel.recon
+   TomographyModel.set_params
+   TomographyModel.forward_project
+   TomographyModel.back_project
+
+See :ref:`TomographyModelDocs` and :ref:`ParametersDocs`.
+
+View and save
+-------------
+
+.. autosummary::
+
+   view_utils.slice_viewer
+   export_recon_hdf5
+
+See :ref:`Utilities`.
+
+Prepare data
+------------
+
+One call per scanner loads a scan and returns the sinogram and the model: ``nsi``, ``zeiss``,
+``zeiss_tct``, and ``pymbir`` each have a ``get_sino_and_model``.  See :ref:`PreprocessDocs`.
+
+More
+----
+
+* :ref:`MACE4DDocs`: 4D reconstruction of a moving object.
+* :ref:`VCLSDocs`: pick the few view angles that reconstruct an object best.
+* :ref:`DenoisingDocs`: the MAP denoiser, for Plug-and-Play loops.
+* :ref:`AutogradDocs`: the projectors as differentiable PyTorch operations.
+* :ref:`usr_multi_gpu`: reconstruction across several GPUs.
 
 .. toctree::
    :hidden:
    :maxdepth: 4
    :caption: Classes
 
-   usr_api_overview
    usr_parameters
    usr_tomography_model
    usr_geometry_models

@@ -73,4 +73,4 @@ crisper edges and more noise, and a lower value gives smoother images::
 The geometry parameters, such as the offset of the center of rotation, are set the same way.
 The parameters are described in :ref:`ParametersDocs`, the model classes are
 :class:`~mbirtorch.ParallelBeamModel` and :class:`~mbirtorch.ConeBeamModel`, and the most used
-functions are summarized in :ref:`UserAPIOverviewDocs`.
+functions are summarized in :ref:`UserAPIDocs`.
