@@ -245,29 +245,20 @@ def remove_dead_fluctuating_stripes_interpolation(sino, snr, filter_size, index_
 
 def remove_all_stripe(sino, snr=3, large_filter_size=61, small_filter_size=21):
     """
-    Removes all types of stripe artifacts from a sinogram using a combination of three algorithms:
-    1. Interpolation-based removal of unresponsive and fluctuating stripes.
-    2. Sorting-based removal of large partial and full stripes.
-    3. Sorting-based removal of small to medium partial and full stripes.
+    Remove stripe artifacts of all sizes from a sinogram.
 
-    This method is adapted from `tomopy.remove_all_stripes()` and is based on:
-    Vo N, Atwood RC, Drakopoulos M. "Superior techniques for eliminating ring artifacts in x-ray micro-tomography."
-    Optics Express, 26(22):28396–28412, 2018.
+    The three steps of Vo, Atwood, and Drakopoulos, Optics Express 26(22), 2018, as in tomopy's
+    ``remove_all_stripe``: unresponsive and fluctuating stripes are interpolated over, then large
+    stripes and then small stripes are removed by sorting and median filtering.
 
     Args:
-        sino (ndarray): A 3D sinogram array with shape (num_views, num_det_rows, num_det_channels).
-        snr (float, optional): Signal-to-noise ratio used for stripe detection. A typical value is 3.0. Defaults to 3.
-        large_filter_size (int, optional): Median filter window size for removing large stripes. Defaults to 61.
-        small_filter_size (int, optional): Median filter window size for removing small-to-medium stripes. Defaults to 21.
+        sino (numpy.ndarray): Sinogram, shape (num_views, num_det_rows, num_det_channels).
+        snr (float, optional): Signal-to-noise ratio used to detect stripes.  Defaults to 3.
+        large_filter_size (int, optional): Median filter window for the large stripes.  Defaults to 61.
+        small_filter_size (int, optional): Median filter window for the small stripes.  Defaults to 21.
 
     Returns:
-        ndarray: Corrected 3D sinogram array after removing all stripe artifacts.
-
-    Example:
-        >>> import numpy as np
-        >>> import mbirtorch.preprocess as mtp
-        >>> sino = np.ones((180, 128, 256))  # Simulated 3D sinogram
-        >>> cleaned_sino = mtp.remove_all_stripe(sino)
+        numpy.ndarray: The corrected sinogram, the shape of ``sino``.
     """
     from concurrent.futures import ThreadPoolExecutor
     sino = np.asarray(sino, dtype=np.float32)
@@ -292,29 +283,18 @@ def remove_all_stripe(sino, snr=3, large_filter_size=61, small_filter_size=21):
 
 def remove_stripe_fw(sino, wavelet_filter_name="db5", sigma=2):
     """
-    Removes vertical stripe artifacts from a 3D sinogram using a combined wavelet-Fourier filtering technique.
+    Remove vertical stripes from a sinogram by combined wavelet and Fourier filtering.
 
-    This method uses a 2D Discrete Wavelet Transform followed by a 2D Fourier transform to suppress vertical stripes,
-    as described in:
-    Beat Münch et al., "Stripe and ring artifact removal with combined wavelet—Fourier filtering", Optics Express, 2009.
-
-    This implementation is adapted from the Tomopy library's `remove_stripe_fw()`:
-    https://github.com/tomopy/tomopy.git
+    The method of Münch et al., Optics Express 17(10), 2009, as in tomopy's ``remove_stripe_fw``.
 
     Args:
-        sino (ndarray): 3D sinogram data with shape (num_views, num_det_rows, num_det_channels).
-        wavelet_filter_name (str, optional): Wavelet filter type (e.g., 'db5', 'haar'). Defaults to 'db5'.
-        sigma (float, optional): Damping parameter in the Fourier domain. Controls the strength of stripe suppression.
-            Defaults to 2.
+        sino (numpy.ndarray): Sinogram, shape (num_views, num_det_rows, num_det_channels).
+        wavelet_filter_name (str, optional): The wavelet, such as 'db5' or 'haar'.  Defaults to 'db5'.
+        sigma (float, optional): Damping width in the Fourier domain; it sets the strength of the
+            suppression.  Defaults to 2.
 
     Returns:
-        ndarray: Corrected sinogram data with reduced vertical stripe artifacts.
-
-    Example:
-        >>> import numpy as np
-        >>> import mbirtorch.preprocess as mtp
-        >>> sino = np.ones((180, 128, 256))  # Simulated sinogram
-        >>> cleaned_sino = mtp.remove_stripe_fw(sino)
+        numpy.ndarray: The corrected sinogram, the shape of ``sino``.
     """
     import pywt
     sino = np.array(sino, dtype=np.float32)
@@ -351,22 +331,16 @@ def remove_stripe_fw(sino, wavelet_filter_name="db5", sigma=2):
 
 def remove_sino_offset(sino):
     """
-    Remove additive offsets in the sinogram caused by material outside the field of view.
+    Remove from each view the additive offset caused by material outside the field of view.
 
-    This function corrects each row of the sinogram so that the sum over channels is constant
-    across views and equal to the minimum sum observed across all views.
+    For each detector row, the mean over channels is made the same in every view, equal to the
+    smallest of the per-view means.
 
     Args:
-        sino (ndarray): Sinogram with shape (num_views, num_rows, num_channels).
+        sino (numpy.ndarray): Sinogram, shape (num_views, num_det_rows, num_det_channels).
 
     Returns:
-        ndarray: Corrected sinogram with the same shape as the input.
-
-    Example:
-        >>> import numpy as np
-        >>> import mbirtorch.preprocess as mtp
-        >>> sino = np.ones((180, 128, 256)) + np.linspace(0, 1, 180)[:, None, None]
-        >>> corrected_sino = mtp.remove_sino_offset(sino)
+        numpy.ndarray: The corrected sinogram, the shape of ``sino``.
     """
     sino_channel_avg = np.mean(sino, axis=2)
 

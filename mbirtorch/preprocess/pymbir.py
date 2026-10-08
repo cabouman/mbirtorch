@@ -5,36 +5,31 @@ import h5py
 
 def get_sino_and_model(filename, *, bh_correction=True, auto_crop=False, subsample_view_factor=1):
     """
-    Load an ORNL HDF5 scan, compute its sinogram, and return a ready-to-reconstruct model.
+    Load an ORNL HDF5 scan, compute its sinogram, and return a cone beam model ready to reconstruct.
 
-    One-call replacement for the old ``compute_sino_and_params -> ConeBeamModel(...) -> set_params ->
-    auto_set_recon_geometry`` sequence: it constructs the ConeBeamModel, applies the detector
-    parameters, and computes the reconstruction geometry, so the returned model can never be left with a
-    stale (default-pitch) reconstruction grid.
+    The file holds the sinogram, already converted to negative log transmission, together with the
+    geometry and the beam hardening parameters.  The detector rotation stored in the file is removed
+    from the sinogram.  Lengths in the model are in detector pixels.
 
     Args:
-        filename (str): Path to the ORNL HDF5 file containing projection data and geometry attributes.
-        bh_correction (bool, optional): Apply beam hardening correction using the file's stored
-            parameters. Defaults to True.
-        auto_crop (bool, optional): If True, detect and remove blank sinogram margins after the sinogram
-            is computed, shrinking the reconstruction. Defaults to False.
-        subsample_view_factor (int, optional): Keep every Nth view (and its angle). Defaults to 1.
+        filename (str): Path to the HDF5 file.
+        bh_correction (bool, optional): If True, apply the beam hardening correction whose parameters
+            are stored in the file.  Defaults to True.
+        auto_crop (bool, optional): If True, remove the blank margins of the sinogram and shrink the
+            reconstruction to match.  Defaults to False.
+        subsample_view_factor (int, optional): Keep every n-th view.  Defaults to 1.
 
     Returns:
-        tuple: ``(sino, model)`` where
-
-            - ``sino`` (numpy.ndarray): the computed sinogram, shape (num_views, num_det_rows, num_det_channels).
-            - ``model`` (ConeBeamModel): a model with its reconstruction geometry already set.
+        tuple: ``(sino, model)``: the sinogram, shape (num_views, num_det_rows, num_det_channels), and
+        a ConeBeamModel with its parameters set.  Weights are not returned; make them with
+        ``mbirtorch.gen_weights``.
 
     Example:
         .. code-block:: python
 
-            sino, model = mbirtorch.preprocess.pymbir.get_sino_and_model("scan.h5")
+            sino, model = mbirtorch.preprocess.pymbir.get_sino_and_model('scan.h5')
             weights = mbirtorch.gen_weights(sino, weight_type='transmission_root')
             recon, recon_dict = model.recon(sino, weights=weights)
-
-    Note:
-        Reconstruction weights are not returned; generate them with ``mbirtorch.gen_weights``.
     """
     import mbirtorch.preprocess as mtp
     sino, required_params, optional_params = _compute_sino_and_params(filename, bh_correction=bh_correction)
@@ -63,7 +58,7 @@ def _compute_sino_and_params(filename, bh_correction=True):
 
         if np.abs(det_rotation) > 1e-6:
             sinogram = mtp.correct_det_rotation(sinogram, det_rotation=det_rotation)
-            warnings.warn('TODO: Verify the direction of sinogram rotation.')
+            warnings.warn('The detector rotation stored in the file was removed from the sinogram; the sign of that rotation has not been checked against a scan.')
 
     # build_model resolves the model class from this entry.
     cone_beam_params['geometry_type'] = str(mbirtorch.ConeBeamModel)

@@ -253,27 +253,21 @@ def _rotation_kernel(sino_batch, det_rotation, center=None):
 
 def correct_det_rotation(sino, det_rotation=0.0, batch_size=30, devices=None):
     """
-    Correct sinogram data to account for detector rotation, using batch processing and GPU acceleration.
+    Rotate every view of a sinogram to remove a detector rotation.
 
-    Accepted forms: `sino` may be a NumPy array or a torch tensor, and the result is always a NumPy
-    array on the host.  Any GPU use is internal -- the views are moved to a device one batch at a
-    time and each batch's result is brought back.  A sinogram in the divided device form (a
-    ``Shards`` container, as produced by the multi-GPU projectors) is not accepted; gather it to the
-    host first with ``shards.gather()``.
+    Takes a numpy array or a tensor and returns a numpy array.
 
     Args:
-        sino (numpy array or tensor): Sinogram data with 3D shape (num_views, num_det_rows, num_det_channels).
-        det_rotation (float, optional): tilt angle between the rotation axis and the detector columns in radians.
-        batch_size (int): Number of views to process in each batch to avoid memory overload.
-        devices (sequence or None): devices to spread the views over.  None (default) uses all
-            visible CUDA devices, capped by ``MBIRTORCH_NUM_DEVICES`` when that is set, or the
-            default device when there are none.
+        sino (numpy array or tensor): Sinogram, shape (num_views, num_det_rows, num_det_channels).
+        det_rotation (float, optional): The angle between the rotation axis and the detector columns,
+            in radians.  Defaults to 0.0.
+        batch_size (int, optional): Views processed at a time.  Defaults to 30.
+        devices (sequence or None, optional): Devices to spread the views over.  None uses all visible
+            CUDA devices, capped by ``MBIRTORCH_NUM_DEVICES`` when it is set, or the default device
+            when there are none.  Defaults to None.
 
     Returns:
-        numpy.ndarray: The corrected sinogram, with the same shape as `sino`.
-
-    Raises:
-        TypeError: If `sino` is in the divided device form.
+        numpy.ndarray: The corrected sinogram, the shape of ``sino``.
     """
     pipeline.reject_shards('correct_det_rotation', sino=sino)
 
@@ -283,19 +277,21 @@ def correct_det_rotation(sino, det_rotation=0.0, batch_size=30, devices=None):
 
 def correct_background_offset(sino, edge_width=9, option='global'):
     """
-    Correct background offset in a sinogram.
+    Subtract the background offset of a sinogram, estimated from its edges.
+
+    The offset of a view is the median of the medians of its left, right, and top edge strips, each
+    ``edge_width`` pixels wide.  With ``option='global'`` one value, the 10th percentile of the
+    per-view offsets, is subtracted from every view.  With ``'per_view'`` each view's own offset is
+    subtracted.
 
     Args:
-        sino (numpy.ndarray): Sinogram data with shape (num_views, num_det_rows, num_det_channels).
-        edge_width (int, optional): Width of the edge regions in pixels. Must be an integer >= 1.  Defaults to 9.
-        option (str or None): One of:
-            - None: No correction; return the input sinogram unchanged.
-            - "global": Estimate one scalar offset from edge regions across all views.
-            - "per_view": Estimate one offset per view from edge regions.
+        sino (numpy.ndarray): Sinogram, shape (num_views, num_det_rows, num_det_channels).
+        edge_width (int, optional): Width of the edge strips in pixels, at least 1.  Defaults to 9.
+        option (str or None, optional): 'global', 'per_view', or None to return ``sino`` unchanged.
             Defaults to 'global'.
 
     Returns:
-        sino_corrected (numpy.ndarray)
+        numpy.ndarray: The corrected sinogram, the shape of ``sino``.
     """
 
     if option is None:
@@ -457,34 +453,29 @@ def scan_to_sino(obj_scan, blank_scan, dark_scan, defective_pixel_array=(),
                  downsample_factor=(1, 1), det_rotation=0.0,
                  batch_size=90, devices=None):
     """
-    Compute the sinogram from the object, blank, and dark scans, with optional down-sampling and
-    detector rotation.
+    Compute the sinogram from the object, blank, and dark scans.
 
-    The steps run as one fused kernel per view batch, view-sharded across devices.
-
-    Accepted forms: the scans may be NumPy arrays or torch tensors (a tensor blank or dark scan is
-    brought to the host and reduced with NumPy).  The result is always a NumPy array on the host.
-    Any GPU use is internal -- the views are moved to a device one batch at a time and each batch's
-    result is brought back.  An array in the divided device form (a ``Shards``
-    container, as produced by the multi-GPU projectors) is not accepted; gather it to the host first
-    with ``shards.gather()``.
+    The views are downsampled by block averaging, each is converted to ``-log(|obj - dark| /
+    |blank - dark|)`` with the blank and dark scans averaged over their views, the defective and
+    non-positive pixels are filled from their neighbors, and the detector rotation is removed.  A
+    step is skipped at its default.  Takes numpy arrays or tensors and returns a numpy array.
 
     Args:
-        obj_scan (numpy array or tensor): cropped object scan, batched along axis 0 (views).
-        blank_scan, dark_scan (ndarray): cropped blank and dark scans.
-        defective_pixel_array (ndarray or tuple): shared defective-pixel (row, col) coords, or ().
-        downsample_factor (tuple[int, int]): detector row/channel downsample; (1, 1) skips downsampling.
-        det_rotation (float): detector rotation in radians; 0 skips the rotation.
-        batch_size (int): number of views per on-device batch.
-        devices (sequence or None): devices to spread the views over.  None (default) uses all
-            visible CUDA devices, capped by ``MBIRTORCH_NUM_DEVICES`` when that is set, or the
-            default device when there are none.
+        obj_scan (numpy array or tensor): Object scan, shape (num_views, num_det_rows, num_det_channels).
+        blank_scan (numpy array or tensor): Blank scan or scans, shape (num_blank, num_det_rows, num_det_channels).
+        dark_scan (numpy array or tensor): Dark scan or scans, shape (num_dark, num_det_rows, num_det_channels).
+        defective_pixel_array (numpy.ndarray or tuple, optional): The (row, col) coordinates of the
+            defective pixels, shape (num_defective, 2), or () for none.  Defaults to ().
+        downsample_factor (tuple[int, int], optional): Detector (row, channel) downsampling.  Defaults to (1, 1).
+        det_rotation (float, optional): Detector rotation in radians.  Defaults to 0.0.
+        batch_size (int, optional): Views processed at a time.  Defaults to 90.
+        devices (sequence or None, optional): Devices to spread the views over.  None uses all visible
+            CUDA devices, capped by ``MBIRTORCH_NUM_DEVICES`` when it is set, or the default device
+            when there are none.  Defaults to None.
 
     Returns:
-        numpy.ndarray: the sinogram, shape (num_views, num_det_rows, num_det_channels).
-
-    Raises:
-        TypeError: If any of the scans is in the divided device form.
+        numpy.ndarray: The sinogram, shape (num_views, num_det_rows, num_det_channels) after
+        downsampling.
     """
     pipeline.reject_shards('scan_to_sino', obj_scan=obj_scan, blank_scan=blank_scan,
                            dark_scan=dark_scan, defective_pixel_array=defective_pixel_array)
@@ -530,50 +521,28 @@ def scan_to_sino(obj_scan, blank_scan, dark_scan, defective_pixel_array=(),
 
 def crop_view_data(obj_scan, blank_scan, dark_scan, crop_pixels_sides=0, crop_pixels_top=0, crop_pixels_bottom=0, defective_pixel_array=()):
     """
-    Crop `obj_scan`, `blank_scan`, and `dark_scan` by the specified pixel amounts and update `defective_pixel_array`.
+    Crop the object, blank, and dark scans and update the defective pixel list to match.
 
-    The same number of pixels is cropped from the left and right sides (via `crop_pixels_sides`) to
-    preserve the detector center/rotation axis. Top and bottom cropping are controlled independently by
-    `crop_pixels_top` and `crop_pixels_bottom`. Any defective pixels that fall outside the cropped region
-    are removed; remaining coordinates are shifted to the new origin of the cropped images.
+    The same number of pixels is cropped from the left and the right, so the detector center is
+    kept.  Defective pixels outside the crop are dropped and the rest are re-indexed to the cropped
+    scans.
 
     Args:
-        obj_scan (np.ndarray):
-            Sinogram stack of shape `(num_views, num_det_rows, num_det_channels)`.
-        blank_scan (np.ndarray):
-            Blank scan(s) of shape `(num_blank_views, num_det_rows, num_det_channels)`.
-        dark_scan (np.ndarray):
-            Dark scan(s) of shape `(num_dark_views, num_det_rows, num_det_channels)`.
-        crop_pixels_sides (int, optional):
-            Number of pixels to remove from **each** side (left and right) of the detector channels.
-            Defaults to `0`.
-        crop_pixels_top (int, optional):
-            Number of pixels to remove from the top (small row indices). Defaults to `0`.
-        crop_pixels_bottom (int, optional):
-            Number of pixels to remove from the bottom (large row indices). Defaults to `0`.
-        defective_pixel_array (np.ndarray | tuple, optional):
-            Array of shape `(num_defective_pixels, 2)` containing `(row, col)` pixel coordinates that are
-            known to be defective **in detector coordinates shared across views**. May be an empty tuple
-            `()` if no defects are provided. Defaults to `()`.
+        obj_scan (numpy.ndarray): Object scan, shape (num_views, num_det_rows, num_det_channels).
+        blank_scan (numpy.ndarray): Blank scan or scans, shape (num_blank, num_det_rows, num_det_channels).
+        dark_scan (numpy.ndarray): Dark scan or scans, shape (num_dark, num_det_rows, num_det_channels).
+        crop_pixels_sides (int, optional): Pixels to crop from each side.  Defaults to 0.
+        crop_pixels_top (int, optional): Pixels to crop from the top (low row indices).  Defaults to 0.
+        crop_pixels_bottom (int, optional): Pixels to crop from the bottom (high row indices).  Defaults to 0.
+        defective_pixel_array (numpy.ndarray or tuple, optional): The (row, col) coordinates of the
+            defective pixels, shape (num_defective, 2), or () for none.  Defaults to ().
 
     Returns:
-        tuple:
-            A 4-tuple `(obj_scan, blank_scan, dark_scan, defective_pixel_array)` where
-
-            * **obj_scan** (*np.ndarray*): Cropped object scan of shape `(num_views, new_rows, new_cols)`.
-            * **blank_scan** (*np.ndarray*): Cropped blank scan(s) of shape `(num_blank_views, new_rows, new_cols)`.
-            * **dark_scan** (*np.ndarray*): Cropped dark scan(s) of shape `(num_dark_views, new_rows, new_cols)`.
-            * **defective_pixel_array** (*np.ndarray | tuple*): Updated defective-pixel coordinates in the
-              cropped detector grid (shape `(N_def, 2)`), or `()` if no defects remain.
+        tuple: ``(obj_scan, blank_scan, dark_scan, defective_pixel_array)``, cropped.
 
     Raises:
-        AssertionError: If any crop amount is negative, or if
-            `crop_pixels_top + crop_pixels_bottom >= num_det_rows`, or if
-            `crop_pixels_sides >= num_det_channels // 2`.
-
-    Notes:
-        This function supports both singleton and multi-view `blank_scan`/`dark_scan`. Cropping is applied
-        identically across all views.
+        AssertionError: If a crop is negative, the top and bottom crops together reach the detector
+            height, or twice the side crop reaches the detector width.
     """
     assert (0 <= crop_pixels_sides < obj_scan.shape[2] // 2 and
             0 <= crop_pixels_top and 0 <= crop_pixels_bottom and crop_pixels_top + crop_pixels_bottom < obj_scan.shape[1]), \
@@ -773,32 +742,21 @@ def project_vector_to_vector(u1, u2):
 
 def apply_cylindrical_mask(recon, radial_margin=0, top_margin=0, bottom_margin=0):
     """
-    Applies a cylindrical mask to a 3D reconstruction volume.
+    Zero the voxels of a reconstruction outside a centered cylinder.
 
-    This function zeros out all voxels outside a centered cylindrical region
-    in the (row, col) plane and also zeroes a specified number of slices from
-    the top and bottom along the Z-axis (slice axis).
-
-    This function is useful for removing `flash` that typically accumulates on the boundaries of an MBIR reconstruction volume.
-
-    Note:
-        A numpy recon is masked on the host and a torch recon on its own device, so a large host volume
-        is never shipped onto a single device (which would OOM for big recons).
+    The radius of the cylinder is half the larger of the row and column extents, less
+    ``radial_margin``, and ``top_margin`` and ``bottom_margin`` slices are zeroed at the two ends.
+    This removes the flash that a reconstruction leaves at the boundary of the volume.  A numpy
+    array, a tensor, or a sharded volume is masked where it sits and returned in the same form.
 
     Args:
-        recon (np.ndarray or torch.Tensor): 3D volume with shape (num_rows, num_cols, num_slices).
-        radial_margin (int): Margin to subtract from the cylinder radius in pixels.
-        top_margin (int): Number of top slices to set to zero along the Z-axis.
-        bottom_margin (int): Number of bottom slices to set to zero along the Z-axis.
+        recon (numpy.ndarray, torch.Tensor, or Shards): Reconstruction, shape (num_rows, num_cols, num_slices).
+        radial_margin (int, optional): Pixels taken off the cylinder radius.  Defaults to 0.
+        top_margin (int, optional): Slices zeroed at the top.  Defaults to 0.
+        bottom_margin (int, optional): Slices zeroed at the bottom.  Defaults to 0.
 
     Returns:
-        np.ndarray or torch.Tensor: Masked 3D volume of the same shape and array module as `recon`.
-
-    Example:
-        >>> vol = np.ones((128, 128, 64))
-        >>> masked_vol = apply_cylindrical_mask(vol,radial_margin=10,top_margin=4,bottom_margin=4)
-        >>> masked_vol.shape
-        (128, 128, 64)
+        The masked reconstruction, the shape and type of ``recon``.
     """
     # The top and bottom margins are global slice ranges, so each shard zeroes its own overlap with them.
     if isinstance(recon, _sharding.Shards):
@@ -1017,22 +975,21 @@ def apply_config_crop(num_det_rows, num_det_channels, det_row_offset, det_channe
 
 def finalize_model(sino, required_params, optional_params, *, auto_crop=False, safety_buffer=20):
     """
-    Build a ready-to-reconstruct model from a reader's ``(sino, required_params, optional_params)``.
+    Build a model from a reader's sinogram and parameter dictionaries.
 
-    The shared tail of each scanner reader's ``get_sino_and_model``: optionally remove blank sinogram
-    margins (``_auto_crop_sino``), then build the model (construct -> set_params ->
-    auto_set_recon_geometry).  ``required_params`` must carry a ``geometry_type`` entry so the model class
-    can be resolved.
+    This is the last step of each reader's ``get_sino_and_model``.  With ``auto_crop`` the blank
+    margins of the sinogram are removed first and the geometry is adjusted to match.
 
     Args:
-        sino (ndarray): The computed sinogram.
-        required_params (dict): Model constructor arguments plus ``geometry_type``.
-        optional_params (dict): ``set_params`` arguments.
-        auto_crop (bool, optional): If True, remove blank sinogram margins before building. Defaults to False.
-        safety_buffer (int, optional): Blank margin (pixels) to keep when auto-cropping. Defaults to 20.
+        sino (numpy.ndarray): The sinogram.
+        required_params (dict): The model constructor arguments plus a ``geometry_type`` entry that
+            names the model class.
+        optional_params (dict): Arguments for ``set_params``.
+        auto_crop (bool, optional): If True, remove the blank margins of the sinogram.  Defaults to False.
+        safety_buffer (int, optional): Blank margin in pixels kept when auto-cropping.  Defaults to 20.
 
     Returns:
-        tuple: ``(sino, model)`` -- the (possibly cropped) sinogram and the ready model.
+        tuple: ``(sino, model)``: the sinogram, cropped if asked, and the model with its parameters set.
     """
     if auto_crop:
         sino, required_params, optional_params = _auto_crop_sino(sino, required_params, optional_params, safety_buffer)
@@ -1169,22 +1126,20 @@ def _translate_views_bilinear(sino, shifts):
 
 def align_sino_views(ct_model, sino, recon_direct):
     """
-    Align each sinogram view using estimated per-view shifts.
+    Shift each view of a sinogram to align it with the forward projection of a first reconstruction.
 
-    This function performs sinogram alignment in two steps:
-    1. Estimate a 2D shift for each sinogram view.
-    2. Align each sinogram view using the estimated shift with the forward projected reconstruction.
-
-    The alignment helps correct small per-view misalignments between the
-    measured sinogram and the forward projection of a preliminary reconstruction.
+    A 2D shift is estimated for each view by comparing it with the forward projection of
+    ``recon_direct``, and the view is shifted by that amount.  This corrects small per-view motion
+    of the object.
 
     Args:
-        ct_model (mt.TomographyModel): A CT model object that defined the CT geometry.
-        sino (numpy array or tensor): 3D sinogram data with shape (num_views, num_det_rows, num_det_channels).
-        recon_direct (numpy array or tensor): A preliminary 3D reconstruction of the sinogram.
+        ct_model (TomographyModel): The model of the scan.
+        sino (numpy array or tensor): Sinogram, shape (num_views, num_det_rows, num_det_channels).
+        recon_direct (numpy array or tensor): A first reconstruction of ``sino``, such as the output
+            of :meth:`~mbirtorch.TomographyModel.recon_direct`.
 
     Returns:
-        numpy array: Aligned sinogram with the same shape as the input sinogram (num_views, num_det_rows, num_det_channels).
+        numpy.ndarray: The aligned sinogram, the shape of ``sino``.
     """
     estimated_shifts = estimate_sino_view_offset(ct_model, sino, recon_direct)
 
@@ -1559,37 +1514,28 @@ def _zinger_threshold(sino, zinger_pixel_ratio, max_views_to_use=20):
 def correct_zinger_pixels(sino, zinger_pixel_ratio=0.1, num_passes=3, batch_size=90, devices=None,
                           max_views_to_use=20):
     """
-    Detect and correct zinger pixels in a background-corrected sinogram.
+    Replace the zinger pixels of a sinogram with the mean of their neighbors.
 
-    A pixel is a zinger if ``value < -zinger_pixel_ratio * RMS(sino over its support)``; the threshold
-    is estimated from a small view subsample, so the sinogram background offset must be removed first
-    (see :func:`correct_background_offset`).  Zingers and non-finite pixels are replaced by the mean of
-    their finite 3x3 in-view neighbors in ``num_passes`` fill passes.  Runs per view-batch, so device
-    memory stays bounded.
-
-    Accepted forms: `sino` may be a NumPy array or a torch tensor, and the result is always a NumPy
-    array on the host.  Any GPU use is internal -- the views are moved to a device one batch at a
-    time and each batch's result is brought back.  A sinogram in the divided device form (a
-    ``Shards`` container, as produced by the multi-GPU projectors) is not accepted; gather it to the
-    host first with ``shards.gather()``.
+    A zinger is a pixel whose value is below ``-zinger_pixel_ratio`` times the RMS value of the
+    sinogram.  The RMS value is estimated from ``max_views_to_use`` views, so the background offset
+    must already be removed; see :func:`correct_background_offset`.  Zingers and non-finite pixels
+    are replaced by the mean of their finite 3x3 neighbors in the same view, in ``num_passes``
+    passes, so a cluster up to that radius is filled.  A pixel still unfilled is set to 0 with a
+    warning.  Takes a numpy array or a tensor and returns a numpy array.
 
     Args:
-        sino (numpy array or tensor): Background-corrected 3D sinogram of shape
-            (num_views, num_det_rows, num_det_channels).
-        zinger_pixel_ratio (float, optional): Ratio used for zinger detection. Defaults to 0.1.
-        num_passes (int, optional): Fill passes = max correctable zinger-cluster radius. Defaults to 3.
-        batch_size (int, optional): Views per on-device batch. Defaults to 90.
-        devices (sequence or None, optional): devices to spread the views over.  None (default)
-            uses all visible CUDA devices, capped by ``MBIRTORCH_NUM_DEVICES`` when that is set,
-            or the default device when there are none.
-        max_views_to_use (int, optional): Views sampled for the threshold estimate. Defaults to 20.
+        sino (numpy array or tensor): Sinogram with its background offset removed, shape (num_views,
+            num_det_rows, num_det_channels).
+        zinger_pixel_ratio (float, optional): The detection ratio.  Defaults to 0.1.
+        num_passes (int, optional): Fill passes.  Defaults to 3.
+        batch_size (int, optional): Views processed at a time.  Defaults to 90.
+        devices (sequence or None, optional): Devices to spread the views over.  None uses all visible
+            CUDA devices, capped by ``MBIRTORCH_NUM_DEVICES`` when it is set, or the default device
+            when there are none.  Defaults to None.
+        max_views_to_use (int, optional): Views sampled for the RMS estimate.  Defaults to 20.
 
     Returns:
-        numpy.ndarray: Sinogram with zinger pixels corrected; any pixel still NaN after ``num_passes``
-        is set to 0 (with a warning).
-
-    Raises:
-        TypeError: If `sino` is in the divided device form.
+        numpy.ndarray: The corrected sinogram, the shape of ``sino``.
     """
     pipeline.reject_shards('correct_zinger_pixels', sino=sino)
 

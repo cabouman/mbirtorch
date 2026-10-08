@@ -126,31 +126,24 @@ def _masked_histogram(image, valid_mask, num_bins, xp):
 
 def multi_threshold_otsu(image, classes=2, num_bins=1024, valid_mask=None):
     """
-    Segment an image into multiple intensity classes using Otsu's method.
+    Compute the Otsu thresholds that divide an image into ``classes`` intensity classes.
 
-    This function computes optimal threshold values that divide an image into the specified
-    number of classes by minimizing the intra-class variance. It returns `classes - 1` thresholds
-    that can be used to partition the image intensity range into `classes` distinct segments.
+    The thresholds minimize the within-class variance of the histogram.  Nothing is segmented; apply
+    the thresholds yourself.  A numpy array, a tensor, or a sharded volume is accepted.
 
     Args:
-        image (np.ndarray, torch.Tensor, or Shards):
-            Input image of floating-point values.
-        classes (int, optional):
-            Number of classes to divide the image into. Must be ≥ 2. Defaults to 2.
-        num_bins (int, optional):
-            Number of bins to use when constructing the image histogram. Defaults to 1024.
-        valid_mask (array or None, optional):
-            Broadcastable boolean mask, True on the entries to include.  Used e.g. to restrict the
-            histogram range and counts to a region of interest.  None includes everything.
+        image (numpy.ndarray, torch.Tensor, or Shards): Image of floating-point values.
+        classes (int, optional): The number of classes, at least 2.  Defaults to 2.
+        num_bins (int, optional): Histogram bins.  Defaults to 1024.
+        valid_mask (array or None, optional): Boolean mask of the entries to include.  None includes
+            all.  Defaults to None.
 
     Returns:
-        list of float:
-            A list of `classes - 1` threshold values, given in increasing order. These thresholds
-            can be used to separate the image into `classes` distinct intensity regions.
+        list of float: ``classes - 1`` thresholds in increasing order.
 
     Example:
-        >>> thresholds = multi_threshold_otsu(image, classes=4)
-        >>> # Resulting thresholds will split image into 4 intensity regions
+        >>> low, high = multi_threshold_otsu(recon, classes=3)
+        >>> plastic = (recon > low) & (recon <= high)
     """
     if classes < 2:
         raise ValueError("Number of classes must be at least 2")
@@ -239,34 +232,27 @@ def _otsu_thresholds_dp(hist, num_thresholds):
 
 def segment_plastic_metal(recon, num_metal, radial_margin=None, top_margin=None, bottom_margin=None):
     """
-    Segment a reconstruction into plastic and multiple metal masks using multi-threshold Otsu.
+    Segment a reconstruction into a plastic mask and one mask per metal.
 
-    ``recon`` may be a host numpy array, a torch tensor, or a sharded volume (a ``Shards``
-    container); the class masks are returned in the same form as the input, on the same
-    devices.  A sharded volume is processed shard by shard where it sits: only the small
-    histogram tables travel, never the volume.
+    The volume is masked with :func:`apply_cylindrical_mask` and split into ``num_metal + 2``
+    classes by Otsu thresholds.  The lowest class is background, the next is plastic, and the rest
+    are the metals in order of increasing value.  The scale of a mask is the mean of the volume over
+    it.  A numpy array, a tensor, or a sharded volume is accepted, and the masks come back in the
+    same form.
 
     Args:
-        recon (np.ndarray, torch.Tensor, or Shards): Reconstructed volume.
-        num_metal (int): Number of metal materials to segment.
-        radial_margin (int or None, optional): Margin in pixels to subtract from the cylindrical mask
-            radius.  None (default) uses a size-relative margin, max(2, min(10, min(rows, cols) // 25)):
-            identical to the former fixed 10 for volumes 250 pixels and wider, and proportionally
-            smaller for small volumes (where a fixed 10 would cut real object).
-        top_margin (int or None, optional): Number of slices to mask out from the top of the volume.
-            None (default) uses max(2, min(10, num_slices // 25)) with the same rationale.
-        bottom_margin (int or None, optional): Number of slices to mask out from the bottom.
-            None (default) as for top_margin.
+        recon (numpy.ndarray, torch.Tensor, or Shards): Reconstruction, shape (num_rows, num_cols, num_slices).
+        num_metal (int): The number of metals.
+        radial_margin (int or None, optional): Pixels taken off the cylinder radius.  None uses
+            ``max(2, min(10, min(num_rows, num_cols) // 25))``.  Defaults to None.
+        top_margin (int or None, optional): Slices masked at the top.  None uses
+            ``max(2, min(10, num_slices // 25))``.  Defaults to None.
+        bottom_margin (int or None, optional): Slices masked at the bottom.  None as for
+            ``top_margin``.  Defaults to None.
 
     Returns:
-        tuple: ``(plastic_mask, metal_masks, plastic_scale, metal_scales)``.  Each mask has the same
-        type as ``recon``: numpy in gives numpy out, tensor in gives tensor out, ``Shards`` in gives
-        ``Shards`` out.
-
-            - plastic_mask (np.ndarray, torch.Tensor, or Shards): Binary mask for plastic regions.
-            - metal_masks (list): One binary mask per metal region, each in the same form as ``recon``.
-            - plastic_scale (float): Scaling factor for the plastic region.
-            - metal_scales (list of float): One scaling factor per metal region.
+        tuple: ``(plastic_mask, metal_masks, plastic_scale, metal_scales)``: the plastic mask, a
+        list of ``num_metal`` metal masks, and the scale of each as a float.
     """
     if num_metal <= 0:
         raise ValueError("num_metal must be positive")

@@ -14,32 +14,33 @@ def get_sino_and_model(dataset_dir, *, downsample_factor=(1, 1), subsample_view_
                        crop_pixels_sides=None, crop_pixels_top=None, crop_pixels_bottom=None,
                        auto_crop=False, verbose=1, offset_correction=True):
     """
-    Load an NSI scan dataset, compute its sinogram, and return a ready-to-reconstruct model.
+    Load an NSI scan, compute its sinogram, and return a cone beam model ready to reconstruct.
 
-    This is the one-call replacement for the ``compute_sino_and_params -> ConeBeamModel(...) ->
-    set_params -> auto_set_recon_geometry`` sequence: it constructs the ConeBeamModel, applies the
-    detector parameters, and computes the reconstruction geometry, so the returned model can never be
-    left with a stale (default-pitch) reconstruction grid.
+    The scan directory holds the radiographs, the blank and dark scans, the ``.nsipro`` config file,
+    and the geometry report.  The crops default to the values in the config file, and the top and
+    bottom crops are always made equal, to the larger of the two.  The background offset is removed
+    per view.  Lengths in the model are in mm.
 
     Args:
-        dataset_dir (str): Path to the NSI scan directory (see ``load_scans_and_params`` for the layout).
-        downsample_factor (Tuple[int, int], optional): Detector row/channel downsampling. Defaults to (1, 1).
-        subsample_view_factor (int, optional): Keep every n-th view. Defaults to 1.
-        crop_pixels_sides (int, optional): Pixels to crop from each lateral side before the sinogram is
-            computed. If None, uses the NSI config file. Defaults to None.
-        crop_pixels_top (int, optional): Pixels to crop from the top. If None, uses the NSI config. Defaults to None.
-        crop_pixels_bottom (int, optional): Pixels to crop from the bottom. If None, uses the NSI config. Defaults to None.
-        auto_crop (bool, optional): If True, detect and remove blank sinogram margins after the sinogram
-            is computed, shrinking the reconstruction. Defaults to False.
-        verbose (int, optional): Verbosity level. Defaults to 1.
-        offset_correction (bool, optional): Apply detector offset correction from the Geometry Report.
-            Defaults to True.
+        dataset_dir (str): Path to the NSI scan directory.
+        downsample_factor (tuple[int, int], optional): Detector (row, channel) downsampling.  Defaults to (1, 1).
+        subsample_view_factor (int, optional): Keep every n-th view.  Defaults to 1.
+        crop_pixels_sides (int, optional): Pixels to crop from each side of the detector.  None takes
+            the value in the config file.  Defaults to None.
+        crop_pixels_top (int, optional): Pixels to crop from the top.  None takes the config file value.
+            Defaults to None.
+        crop_pixels_bottom (int, optional): Pixels to crop from the bottom.  None takes the config file
+            value.  Defaults to None.
+        auto_crop (bool, optional): If True, remove the blank margins of the sinogram and shrink the
+            reconstruction to match.  Defaults to False.
+        verbose (int, optional): 0 prints nothing, 1 prints progress.  Defaults to 1.
+        offset_correction (bool, optional): If True, take the detector position from the geometry report
+            rather than the config file.  Defaults to True.
 
     Returns:
-        tuple: ``(sino, model)`` where
-
-            - ``sino`` (numpy.ndarray): the computed sinogram, shape (num_views, num_det_rows, num_det_channels).
-            - ``model`` (ConeBeamModel): a model with its reconstruction geometry already set.
+        tuple: ``(sino, model)``: the sinogram, shape (num_views, num_det_rows, num_det_channels), and
+        a ConeBeamModel with its parameters set.  Weights are not returned; make them with
+        ``mbirtorch.gen_weights``.
 
     Example:
         .. code-block:: python
@@ -47,9 +48,6 @@ def get_sino_and_model(dataset_dir, *, downsample_factor=(1, 1), subsample_view_
             sino, model = mbirtorch.preprocess.nsi.get_sino_and_model(dataset_dir)
             weights = mbirtorch.gen_weights(sino, weight_type='transmission_root')
             recon, recon_dict = model.recon(sino, weights=weights)
-
-    Note:
-        Reconstruction weights are not returned; generate them with ``mbirtorch.gen_weights``.
     """
     sino, required_params, optional_params = _compute_sino_and_params(
         dataset_dir, downsample_factor=downsample_factor, subsample_view_factor=subsample_view_factor,

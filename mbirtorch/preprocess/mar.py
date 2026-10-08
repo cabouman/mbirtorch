@@ -136,45 +136,22 @@ def BH_correction(sino, alpha, batch_size=64, devices=None):
     """
     Apply a polynomial beam hardening correction to a sinogram.
 
-    This function applies a polynomial correction to each view of the sinogram
-    by evaluating powers of the sinogram values and weighting them by the coefficients in `alpha`.
-
-    The corrected sinogram is computed as:
-
-        corrected_sino = alpha[0] * sino + alpha[1] * sino**2 + alpha[2] * sino**3 + ...
-
-    It processes the sinogram in batches of views for memory efficiency.
-
-    Accepted forms: `sino` may be a NumPy array or a torch tensor, and the result is always a NumPy
-    array on the host.  Any GPU use is internal -- the views are moved to a device one batch at a
-    time and each batch's result is brought back.  A sinogram in the divided device form (a
-    ``Shards`` container, as produced by the multi-GPU projectors) is not accepted; gather it to the
-    host first with ``shards.gather()``.
+    Each value ``p`` of the sinogram is replaced by ``alpha[0] p + alpha[1] p**2 + alpha[2] p**3 + ...``.
+    Takes a numpy array or a tensor and returns a numpy array.
 
     Args:
-        sino (numpy array or tensor, of shape (views, rows, cols)):
-            Input sinogram to correct.
-        alpha (list or array of floats):
-            Coefficients for the polynomial correction. The k-th term corresponds to sino^(k+1).
-        batch_size (int, optional, default=64):
-            Number of views to process in a single batch.
-        devices (sequence or None, optional):
-            Devices to spread the view batches over.  The views are split into contiguous blocks,
-            one per device, and the blocks are processed at the same time.  None (the default) uses
-            all visible CUDA devices, capped by ``MBIRTORCH_NUM_DEVICES`` when that is set, or the
-            default device when there are none.
+        sino (numpy array or tensor): Sinogram, shape (num_views, num_det_rows, num_det_channels).
+        alpha (sequence of float): The polynomial coefficients; ``alpha[k]`` multiplies ``p**(k+1)``.
+        batch_size (int, optional): Views processed at a time.  Defaults to 64.
+        devices (sequence or None, optional): Devices to spread the views over.  None uses all visible
+            CUDA devices, capped by ``MBIRTORCH_NUM_DEVICES`` when it is set, or the default device
+            when there are none.  Defaults to None.
 
     Returns:
-        corrected_sino: numpy.ndarray of shape (views, rows, cols)
-            Beam hardening corrected sinogram.
-
-    Raises:
-        TypeError: If `sino` is in the divided device form.
+        numpy.ndarray: The corrected sinogram, the shape of ``sino``.
 
     Example:
-        >>> import mbirtorch.preprocess as mtp
-        >>> alpha = [1.0, 0.2, 0.1]  # Correction: sino + 0.2 * sino^2 + 0.1 * sino^3
-        >>> corrected_sino = mtp.BH_correction(sino, alpha)
+        >>> sino = mtp.BH_correction(sino, alpha=[1.0, 0.2, 0.1])
     """
     pipeline.reject_shards('BH_correction', sino=sino)
 
