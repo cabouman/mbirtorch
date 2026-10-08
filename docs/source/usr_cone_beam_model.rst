@@ -15,8 +15,8 @@ model needs the distance from the source to the detector and from the source to 
 rotation axis, in the same units as the detector pixel pitch.  The voxels are cubes with
 spacing ``delta_voxel``, which defaults to ``delta_det_channel / magnification`` with
 ``magnification = source_detector_dist / source_iso_dist``, so a larger magnification gives
-smaller voxels.  Change these with :meth:`~mbirtorch.TomographyModel.set_params`; see
-:ref:`ParametersDocs`.
+smaller voxels.  Change these with :meth:`~mbirtorch.TomographyModel.set_params`, then call
+``auto_set_recon_geometry`` so the reconstruction geometry follows; see :ref:`ParametersDocs`.
 
 .. code-block:: python
 

@@ -47,6 +47,12 @@ Parameter Handling
 Recon FOV and Voxel Spacing
 ---------------------------
 
+The region of reconstruction and the voxel size are computed from the detector once, when the
+model is built.  After changing a detector or geometry parameter with ``set_params``, call
+``auto_set_recon_geometry`` to recompute them, or the reconstruction comes out at the wrong
+scale.  Then, if needed, enlarge or shrink the region with ``resize_recon_fov``.  The FAQ on the
+region of reconstruction in :ref:`DemosFAQs` walks through both.
+
 .. automethod:: mbirtorch.TomographyModel.auto_set_recon_geometry
 
 .. automethod:: mbirtorch.TomographyModel.resize_recon_fov

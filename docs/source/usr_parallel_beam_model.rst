@@ -13,8 +13,8 @@ infinity, and the object rotates about an axis parallel to the detector columns.
 model is built from the sinogram shape and the view angles.  The voxels are cubes with
 spacing ``delta_voxel``, which defaults to the detector channel spacing
 ``delta_det_channel`` of 1 ALU, and the reconstruction covers the width and the height of
-the detector.  Change these with :meth:`~mbirtorch.TomographyModel.set_params`; see
-:ref:`ParametersDocs`.
+the detector.  Change these with :meth:`~mbirtorch.TomographyModel.set_params`, then call
+``auto_set_recon_geometry`` so the reconstruction geometry follows; see :ref:`ParametersDocs`.
 
 .. code-block:: python
 

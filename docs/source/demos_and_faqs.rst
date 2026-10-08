@@ -35,56 +35,18 @@ Each is short and self-contained; adjust the parameters near the top and rerun t
      - The differentiable projectors: reconstruction by gradient descent in PyTorch.
 
 
-Data Generation
----------------
-
-Most demos start from synthetic data created with :func:`~mbirtorch.utilities.generate_demo_data`.  It builds a 3D
-phantom (a simplified Shepp-Logan head or a cube) and the corresponding simulated sinogram for a chosen
-geometry, so you can try MBIRTorch without a real dataset:
-
-.. code-block:: python
-
-    import mbirtorch
-    phantom, sinogram, params = mbirtorch.generate_demo_data(object_type='shepp-logan', model_type='cone',
-                                                             num_views=64, num_det_rows=128, num_det_channels=128)
-    angles = params['angles']
-    ct_model = mbirtorch.ConeBeamModel(sinogram.shape, angles,
-                                       source_detector_dist=params['source_detector_dist'],
-                                       source_iso_dist=params['source_iso_dist'])
-    recon, recon_dict = ct_model.recon(sinogram)
-
-Key options:
-
-* ``object_type`` -- ``'shepp-logan'`` or ``'cube'``.
-* ``model_type`` -- ``'parallel'``, ``'cone'``, or ``'multiaxis'``; ``params`` returns the
-  matching geometry parameters (always the view ``angles``, plus the source distances for
-  cone beam and the tilt for multiaxis).
-* ``num_views``, ``num_det_rows``, ``num_det_channels`` -- the sinogram size; increase these (with a GPU)
-  to make a larger problem.
-* ``target_max_attenuation`` -- scales the phantom so its sinogram has a realistic peak attenuation
-  regardless of the array size (without it, the sinogram values grow with the volume size).
-
-The phantom and sinogram are always returned as host NumPy arrays, ready to pass to a reconstruction.
-The phantom is a reference object; the sinogram is the input you would normally reconstruct.  See
-:ref:`synthetic-data-generation` for the full list of options and the related phantom generators.
-
-
 FAQs
 ----
 
-Q: Why is there a bright ring around my reconstruction?
-+++++++++++++++++++++++++++++++++++++++++++++++++++++++
+Q: How do I load my scanner's data?
++++++++++++++++++++++++++++++++++++
 
-A: If the object does not project completely inside the detector, then MBIR will produce a bright ring
-around the edge of the reconstruction to account for the portion of the object that projects to the detector in only some views.
-You can improve the reconstruction by increasing recon_shape:
-
-.. code-block:: python
-
-        ct_model.resize_recon_fov(row_scale=1.2, col_scale=1.2)
-
-Note that the scale factor need only be large enough to give some padding around the region of valid projection --
-it does not need to match the size of the true object.  Larger scale factors will lead to increased time and memory.
+A: Scanner data arrives as a folder of radiographs with a blank scan, a dark scan, and the
+scanner's description of the geometry, and turning that into a sinogram and a correctly set up model
+takes several steps that are easy to get wrong.  For each supported scanner, ``get_sino_and_model``
+does all of them in one call and returns the sinogram and a model ready to reconstruct, for example
+``mbirtorch.preprocess.nsi.get_sino_and_model(dataset_dir)``.  The functions it uses are available on
+their own for a scanner without a reader.  See :ref:`PreprocessDocs`.
 
 Q: How can I check my scan geometry before reconstructing?
 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -96,6 +58,83 @@ voxel (0, 0, 0), and reports whether the region of reconstruction
 projects inside the detector.  Pass ``sinogram=`` to paint a view of the
 data on the detector face, and ``compare=dict(det_channel_offset=...)``
 to draw a second geometry over the first.  See :ref:`GeometryViewerDocs`.
+
+Q: Why is there a bright ring around my reconstruction?
++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+A: If the object does not project completely inside the detector, then MBIR will produce a bright ring
+around the edge of the reconstruction to account for the portion of the object that projects to the detector in only some views.
+The reconstruction warns with "Lateral FOV truncation detected" when it sees this.  At every view angle, material
+outside the field of view contributes to the measurements, but no reconstruction voxel is available to explain it.
+The result is a bright ring at the reconstruction boundary, a bias across the whole interior, and slowed
+convergence.
+
+You can improve the reconstruction by enlarging the region of reconstruction:
+
+.. code-block:: python
+
+        ct_model.resize_recon_fov(1.2, 1.2)
+
+Note that the scale factor need only be large enough to give some padding around the region of valid projection --
+it does not need to match the size of the true object.  Larger scale factors will lead to increased time and memory.
+The next question explains the region of reconstruction and the ways to change it.
+
+Q: How do I make the region of reconstruction larger or smaller, or move it up or down?
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+A: The region of reconstruction is the box of voxels the reconstruction fills.  When a model is
+built, it is set from the detector: across the rotation axis it covers what the detector sees, and
+along the rotation axis it is centered on the band of the object the detector sees.  Its size is
+the parameter ``recon_shape``, in voxels, and its voxel spacing is ``delta_voxel``.
+
+**To make it larger or smaller**, call ``resize_recon_fov`` with one scale factor per direction,
+rows, columns, and slices.  The voxel size stays the same and the number of voxels is multiplied by
+the factor, so a factor above 1 enlarges the region and a factor below 1 shrinks it, and the region
+stays centered where it was:
+
+.. code-block:: python
+
+        ct_model.resize_recon_fov(1.2, 1.2)          # 20 percent wider across the rotation axis
+        ct_model.resize_recon_fov(1.0, 1.0, 0.5)     # half as tall along the rotation axis
+
+Enlarging it is the fix when the object extends past the detector, see the question above.
+Shrinking it saves time and memory when only part of the volume is of interest.
+
+**To move it up or down** along the rotation axis, in a cone beam scan, set ``recon_slice_offset``
+in ALU.  A positive value moves the region down relative to the detector, toward the higher
+detector row indices.  Shrinking and moving together reconstruct one part of a tall object:
+
+.. code-block:: python
+
+        ct_model.resize_recon_fov(1.0, 1.0, 0.5)             # the central half of the slices
+        ct_model.set_params(recon_slice_offset=offset)       # moved to the part you want, in ALU
+
+A cone beam region can also be padded at both ends along the rotation axis with
+``axial_pad_fraction``; see :ref:`ParametersDocs`.
+
+**Do these last.**  If you change a detector or geometry parameter after building the model, such
+as ``delta_det_channel``, ``delta_det_row``, ``det_channel_offset``, ``det_row_offset``, or the source
+distances, call ``ct_model.auto_set_recon_geometry()`` right after, and only then resize or move the
+region.  That call recomputes ``recon_shape``, ``delta_voxel``, and ``recon_slice_offset`` from the
+detector, so it undoes any resizing or moving done before it; and without it the region keeps the
+old voxel size, and the reconstruction comes out at the wrong scale.  See the next question.
+
+Q: I changed a detector parameter and now my reconstruction is wrong.  Why?
++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+A: The reconstruction geometry, the voxel size and the region of reconstruction, is computed from
+the detector parameters once, when the model is built.  Changing a detector parameter afterwards
+with ``set_params`` does not recompute it, so the voxels no longer match the detector and the
+reconstruction is distorted or at the wrong scale.  After any change to ``delta_det_channel``,
+``delta_det_row``, ``det_channel_offset``, ``det_row_offset``, ``source_detector_dist``, or
+``source_iso_dist``, call:
+
+.. code-block:: python
+
+        ct_model.set_params(delta_det_channel=0.1)
+        ct_model.auto_set_recon_geometry()
+
+Then resize or move the region of reconstruction if you need to, as in the question above.
 
 Q: Why is my reconstruction blurry?
 +++++++++++++++++++++++++++++++++++
@@ -113,31 +152,6 @@ The next thing to check is the rotation direction, which
 :func:`~mbirtorch.preprocess.geometry_calibration.check_rotation_direction` decides from the sinogram.
 A blurry cone beam reconstruction can also come from an incorrect ``source_detector_dist`` or ``source_iso_dist``.
 
-Q: How can I do larger reconstructions?
-+++++++++++++++++++++++++++++++++++++++
-
-A: MBIRTorch runs on both CPU and GPU computers, but we strongly recommend the use of GPUs for large reconstructions since they are much faster.
-On a GPU, the size of the reconstruction is typically limited by the amount of GPU memory.
-So you should find a fast GPU with the largest possible memory. These days that is typically 40GB to 80GB of GPU memory.
-The GPU will be hosted on a CPU, and it is best if that CPU also has even a larger amount of memory, ideally greater than 200GB.
-
-Note that a 2K x 2K x 2K reconstruction occupies 32GB of memory, not counting the sinogram or memory needed for processing.
-If your machine has multiple GPUs, MBIRTorch automatically divides the reconstruction across them: the memory
-available for the problem grows roughly in proportion to the number of GPUs.  Large reconstructions typically get
-faster as well, but small ones do not; see :doc:`usr_multi_gpu` for the measured behavior and the details.
-If you have no GPU, all processing is done on the CPU.
-
-If your reconstruction is still too large, use :meth:`~mbirtorch.TomographyModel.recon_split_sino`, which splits the
-detector rows into overlapping bands, reconstructs one band at a time, and stitches the results together.  A cone beam
-reconstruction splits into two halves; a parallel beam reconstruction splits into as many parts as the memory requires,
-either the number estimated from the memory available on your devices or the number you ask for with
-``slices_per_part``.  With a cone beam system you can also reconstruct a subset of the central slices, and you can make
-sure axial padding is disabled (``axial_pad_fraction=0``, the default -- see :ref:`ConeBeamModelDocs`) if that padding
-is what pushes you over the memory limit.
-
-We continue to improve the time and memory efficiency of MBIRTorch.
-
-
 Q: Why does my reconstruction have artifacts?
 +++++++++++++++++++++++++++++++++++++++++++++
 
@@ -148,7 +162,7 @@ Parallel beam geometry is faster and could be used for cone beam data, but it ma
 close to the object.
 
 For transmission tomography, it is critically important to preprocess the raw photon measurements by normalizing by an air-scan and taking the negative log of the ratio.
-We provide simple preprocessing utilities in ``mbirtorch.preprocess`` for doing this, and we plan to provide more utilities for specific instruments in the future.
+The scanner readers in ``mbirtorch.preprocess`` do this, and the functions they use are available for other scanners.
 
 In cone-beam scans, it is sometimes the case that the rotation direction is reversed.
 The symptom is a reconstruction that is subtly warped, with shapes distorted and the top and
@@ -176,48 +190,41 @@ Using weights will reduce metal artifacts, and the function ``gen_weights_mar()`
 
 Cupping is typically caused by beam hardening with polychromatic X-ray sources.
 This can be partially corrected with a low order polynomial correction.
-The preprocessing utilities include ``BH_correction`` for this, together with
-``fit_beam_hardening_curve`` and ``apply_beam_hardening_curve`` for fitting and applying a
-correction curve directly.
+The preprocessing utilities include ``BH_correction`` for this.
 
 Ring artifacts away from the center of reconstruction are typically caused by detector nonuniformity.
 Detector nonuniformity results from the variation in detector sensitivity from pixel to pixel.
 This variation is taken out to some degree by air scan normalization, but some variation may remain.
 These variations will lead to concentric rings in the reconstruction.
 The preprocessing utilities include ``remove_all_stripe`` and ``remove_stripe_fw`` for the
-sinogram stripes that produce these rings, plus ``interpolate_defective_pixels`` for isolated
-bad detector pixels and ``remove_sino_offset`` for a residual sinogram offset.
+sinogram stripes that produce these rings, and ``remove_sino_offset`` for a residual sinogram offset.
 
 A bright ring at the outer *boundary* of the reconstruction -- typically accompanied by the
-"Lateral FOV truncation detected" warning -- means the object extends past the field of view; see the next FAQ.
+"Lateral FOV truncation detected" warning -- means the object extends past the field of view; see the question above.
 
+Q: How can I do larger reconstructions?
++++++++++++++++++++++++++++++++++++++++
 
-Q: What does the "Lateral FOV truncation detected" warning mean?
-++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+A: MBIRTorch runs on both CPU and GPU computers, but we strongly recommend the use of GPUs for large reconstructions since they are much faster.
+On a GPU, the size of the reconstruction is typically limited by the amount of GPU memory.
+So you should find a fast GPU with the largest possible memory. These days that is typically 40GB to 80GB of GPU memory.
+The GPU will be hosted on a CPU, and it is best if that CPU also has even a larger amount of memory, ideally greater than 200GB.
 
-A: The object extends beyond the detector's lateral field of view: at every view angle, material outside
-the field of view contributes to the measurements, but no reconstruction voxel is available to explain it.
-The result is a bright ring at the reconstruction boundary, a bias across the whole interior, and slowed
-convergence.
+Note that a 2K x 2K x 2K reconstruction occupies 32GB of memory, not counting the sinogram or memory needed for processing.
+If your machine has multiple GPUs, MBIRTorch automatically divides the reconstruction across them: the memory
+available for the problem grows roughly in proportion to the number of GPUs.  Large reconstructions typically get
+faster as well, but small ones do not; see :doc:`usr_multi_gpu` for the measured behavior and the details.
+If you have no GPU, all processing is done on the CPU.
 
-Image quality can often be improved in this case by padding the region of reconstruction using the
-``model.resize_recon_fov(s, s)`` method with ``s >= 1.1``.
+If your reconstruction is still too large, use :meth:`~mbirtorch.TomographyModel.recon_split_sino`, which splits the
+detector rows into overlapping bands, reconstructs one band at a time, and stitches the results together.  A cone beam
+reconstruction splits into two halves; a parallel beam reconstruction splits into as many parts as the memory requires,
+either the number estimated from the memory available on your devices or the number you ask for with
+``slices_per_part``.  With a cone beam system you can also reconstruct a subset of the slices by shrinking and moving the region of
+reconstruction, as in the question on the region of reconstruction above, and you can make sure axial padding is
+disabled (``axial_pad_fraction=0``, the default) if that padding is what pushes you over the memory limit.
 
-For the *axial* (slice) direction in cone beam, the automatic geometry can pad the slice
-axis via the ``axial_pad_fraction`` parameter (default 0 = no padding, 1 = full padding --
-see :ref:`ConeBeamModelDocs`).
-
-
-Q: How can I shift region-of-reconstruction up or down for a conebeam reconstruction?
-+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-
-A: By default the region is centered on the band of the object the detector sees, at
-``-det_row_offset / magnification`` plus the center of any helical travel, so a detector row offset moves the
-region with the detector.  You can shift the region of reconstruction up or down using
-``ct_model.set_params(recon_slice_offset=offset)`` before calling recon.
-Positive values of ``offset`` will shift the region down relative to the detector.
-This is useful if you would like to reconstruct the top or bottom half of a conebeam reconstruction in order to save memory.
-
+We continue to improve the time and memory efficiency of MBIRTorch.
 
 Q: What are the differences between (iterative) recon and recon_fbp/recon_fdk?
 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -236,9 +243,8 @@ detector) and the sinograms have little noise.  Iterative reconstruction typical
 relatively few views and/or the sinograms are noisy.  Iterative reconstruction takes more time and memory than
 FBP/FDK but can produce significantly better reconstructions when the collected data is less than ideal.
 
-
 Q: What does the warning about torch running host operations on one thread mean?
-+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 A: Torch runs its host (CPU) tensor operations on a pool of threads, and it takes the size of
 that pool from the environment variables ``OMP_NUM_THREADS`` and ``MKL_NUM_THREADS`` when Python
@@ -253,3 +259,4 @@ unset the two variables before starting Python, or call ``torch.set_num_threads(
 number of cores you want to use, before the reconstruction.  If you set the variables to one on
 purpose, for instance to run several processes on one node, the warning can be ignored or
 silenced with the ``warnings`` module.
+

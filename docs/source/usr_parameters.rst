@@ -36,8 +36,16 @@ Reconstruction geometry
 -----------------------
 
 These are set for you by :meth:`~mbirtorch.TomographyModel.auto_set_recon_geometry`, which runs
-when a model is built.  If you change a detector parameter with ``set_params``, call
-``auto_set_recon_geometry`` again so that these follow.
+once, when a model is built.
+
+.. warning::
+
+   If you change a detector or geometry parameter after building the model, such as
+   ``delta_det_channel``, ``delta_det_row``, the detector offsets, or the source distances, call
+   ``ct_model.auto_set_recon_geometry()`` right after.  The reconstruction geometry is not updated
+   on its own, and without the call the reconstruction comes out at the wrong scale.  Resize or
+   shift the region of reconstruction only after that call, because the call resets
+   ``recon_shape``, ``delta_voxel``, and ``recon_slice_offset``.
 
 .. list-table::
    :header-rows: 1

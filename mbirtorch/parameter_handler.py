@@ -217,7 +217,10 @@ class ParameterHandler:
         """
         Set parameters by keyword, as in ``model.set_params(sharpness=0.7)``.
 
-        Setting a geometry parameter rebuilds the projectors.  Setting ``sigma_y``, ``sigma_x``,
+        Setting a geometry parameter rebuilds the projectors but does not recompute the
+        reconstruction geometry: after changing a detector parameter such as
+        ``delta_det_channel``, call ``auto_set_recon_geometry``, or the reconstruction comes out
+        at the wrong scale.  Setting ``sigma_y``, ``sigma_x``,
         or ``sigma_prox`` directly turns off automatic regularization and warns; setting
         ``sharpness`` or ``snr_db`` turns it back on.  An unknown parameter name raises ValueError.
 

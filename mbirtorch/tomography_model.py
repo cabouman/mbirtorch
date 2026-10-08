@@ -292,9 +292,11 @@ class TomographyModel(ParameterHandler):
         geometry parameters and sinogram shape.  Each geometry model defines
         this.
 
-        Note: This function should be run after changing geometry parameters
-        such as ``delta_det_channel``.  It will set reconstruction parameters
-        such as ``recon_shape`` and ``delta_voxel`` to reasonable values.
+        Call this after changing any detector or geometry parameter with
+        ``set_params``, such as ``delta_det_channel``; otherwise the
+        reconstruction comes out at the wrong scale.  It sets ``recon_shape``,
+        ``delta_voxel``, and ``recon_slice_offset`` from the detector, so
+        resize or shift the region of reconstruction only after it.
 
         Args:
             no_compile (bool, optional): If True, do not rebuild the
