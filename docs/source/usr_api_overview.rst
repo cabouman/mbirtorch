@@ -141,4 +141,13 @@ The ``preprocess`` subpackage loads lazily: ``import mbirtorch`` does not pull i
 dependency stack, and ``import mbirtorch.preprocess`` or the first attribute access loads
 it.
 
-It also includes functions for optimal view selection.
+
+Sparse View Selection
+---------------------
+
+Before a scan, pick the few view angles that best reconstruct an object like the reference.
+See :ref:`VCLSDocs`.
+
+.. autosummary::
+
+   vcls.get_opt_views
