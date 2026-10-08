@@ -215,37 +215,17 @@ class ParameterHandler:
 
     def set_params(self, no_warning=False, no_compile=False, **kwargs):
         """
-        Update parameters using keyword arguments.
+        Set parameters by keyword, as in ``model.set_params(sharpness=0.7)``.
 
-        This method updates internal model parameters.  If any key
-        geometry-related parameters are modified, it triggers a rebuild of the
-        projector system unless suppressed via the `no_compile` flag.
-
-        Four special cases apply:
-
-        - Directly setting a regularization parameter (``sigma_y``, ``sigma_x``,
-          or ``sigma_prox``) disables auto-regularization and warns, so the
-          user's value is actually used by ``recon``.  With ``no_warning=True``
-          neither happens: the value is stored and auto-regularization stays
-          on.  (The automatic setters use that path internally.)
-        - Setting ``sharpness`` or ``snr_db`` re-enables a disabled
-          auto-regularization, with a warning unless ``no_warning``.
-        - An unknown parameter name raises ValueError listing the valid names,
-          except under ``no_warning`` (the construction path), where it is
-          ADDED as a new recompile-flagged parameter (how the geometry's own
-          parameters, e.g. ``angles``, enter).
-        - No validity check runs here.  Validation is deferred to
-          reconstruction entry (``verify_valid_params`` in ``_vcd_recon``), so
-          multi-step geometry changes (set a new sinogram shape, then call
-          ``auto_set_recon_geometry``) work without a transiently-inconsistent
-          state raising.
+        Setting a geometry parameter rebuilds the projectors.  Setting ``sigma_y``, ``sigma_x``,
+        or ``sigma_prox`` directly turns off automatic regularization and warns; setting
+        ``sharpness`` or ``snr_db`` turns it back on.  An unknown parameter name raises ValueError.
 
         Args:
-            no_warning (bool, optional): If True, disables warnings and the
-                unknown-parameter check.  Defaults to False.
-            no_compile (bool, optional): If True, suppresses the projector
-                rebuild after updates.  Defaults to False.
-            **kwargs: parameter names and values to update.
+            no_warning (bool, optional): If True, store the values without warnings and without
+                changing automatic regularization.  Defaults to False.
+            no_compile (bool, optional): If True, do not rebuild the projectors.  Defaults to False.
+            **kwargs: parameter names and values.
 
         Example:
             >>> model.set_params(recon_shape=(128, 128, 128), sharpness=0.7)

@@ -3061,7 +3061,8 @@ class TomographyModel(ParameterHandler):
             (recon, recon_dict): the reconstruction volume, and a dict
             with entries 'recon_params' (per-iteration traces and settings),
             'recon_log' (the run's log text), 'notes', and
-            'model_params' (a snapshot of the model parameters).
+            'model_params' (a snapshot of the model parameters).  The dict can be
+            given to :func:`~mbirtorch.view_utils.slice_viewer` and :meth:`save_recon_hdf5`.
         """
         # The initial reconstruction is checked against the shape of the whole volume, which a
         # sharded array does not have, so a sharded init_recon is refused.
@@ -3541,7 +3542,7 @@ class TomographyModel(ParameterHandler):
             filepath (str or Path): Path to the output HDF5 file. Should typically end with a .h5 extension.
             recon (array-like): The reconstruction volume as a NumPy array, torch tensor, or the
                 sharded device form from ``recon(..., output_sharded=True)``.
-            recon_dict (dict or None, optional): The dictionary of recon attributes from :meth:`get_recon_dict`
+            recon_dict (dict or None, optional): The dict returned by :meth:`recon`
 
         Raises:
             Exception: If saving the file or directory creation fails.
@@ -3570,7 +3571,7 @@ class TomographyModel(ParameterHandler):
         Returns:
             (recon, recon_dict)
                 - recon (ndarray): The array saved by save_recon_hdf5()
-                - recon_dict (dict): A dict with the same entries as :meth:`get_recon_dict`, with
+                - recon_dict (dict): A dict with the same entries as the one :meth:`recon` returns, with
                   each value as the string it was stored as in the HDF5 attributes
 
         Raises:

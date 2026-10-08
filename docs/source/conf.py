@@ -86,6 +86,9 @@ nitpick_ignore = [
     # torch's inherited one, which refers to "Module" unqualified.  Both are external.
     ('py:class', 'torch.nn.modules.module.Module'),
     ('py:class', 'Module'),
+    # The model classes inherit from ParameterHandler, an internal base class that the
+    # user never calls, so it is not documented; :show-inheritance: still names it.
+    ('py:class', 'mbirtorch.parameter_handler.ParameterHandler'),
 ]
 
 # Exclude __init__ method from documentation

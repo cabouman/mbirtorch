@@ -93,8 +93,8 @@ Users can set, get, and printout parameters using the following primary methods.
 .. autosummary::
 
    TomographyModel.set_params
-   parameter_handler.ParameterHandler.get_params
-   parameter_handler.ParameterHandler.print_params
+   TomographyModel.get_params
+   TomographyModel.print_params
 
 
 Saving and Loading

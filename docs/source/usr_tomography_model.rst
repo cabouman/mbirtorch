@@ -39,21 +39,11 @@ Reconstruction and Projection
 Parameter Handling
 ------------------
 
-``TomographyModel`` inherits its parameter accessors from ``ParameterHandler``.  That class
-is not exported at package level, so it is documented explicitly here.  This also supplies
-the cross-reference target that ``:show-inheritance:`` needs on every model class.
-
-.. autoclass:: mbirtorch.parameter_handler.ParameterHandler
-
 .. automethod:: mbirtorch.TomographyModel.set_params
 
-.. automethod:: mbirtorch.parameter_handler.ParameterHandler.get_params
+.. automethod:: mbirtorch.TomographyModel.get_params
 
-.. automethod:: mbirtorch.parameter_handler.ParameterHandler.print_params
-
-.. automethod:: mbirtorch.TomographyModel.get_all_params
-
-.. automethod:: mbirtorch.TomographyModel.get_recon_dict
+.. automethod:: mbirtorch.TomographyModel.print_params
 
 
 Recon FOV and Voxel Spacing
