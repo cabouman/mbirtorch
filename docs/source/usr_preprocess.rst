@@ -94,8 +94,8 @@ so it comes after one.
 .. autofunction:: align_sino_views
 
 
-Building a sinogram from raw scans
-----------------------------------
+Building a sinogram
+-------------------
 
 For an instrument without a scanner loader, start from the object, blank, and dark scans and run
 the same steps the loaders run.  The loaders' ``load_scans_and_params`` functions return the raw
