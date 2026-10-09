@@ -74,5 +74,4 @@ beam), ``dehydrate``, ``rehydrate`` and ``denoise``:
    mbirtorch-hsnt convert sample_tifs/ --open-beam open_beam/ -o sample.h5
    mbirtorch-hsnt denoise sample.h5 -o results/
 
-``mbirtorch-hsnt <subcommand> -h`` lists the options.  The options for multi-view scans and for ORNL SNAP data
-are described in :ref:`HSNTDevNotes`.
+``mbirtorch-hsnt <subcommand> -h`` lists the options.

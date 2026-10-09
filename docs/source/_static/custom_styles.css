@@ -1,7 +1,6 @@
 
 :root {
   --block-bg-opacity: 0.8;   /* nearly full accent color; lower it (e.g. .5) for a translucent tint */
-  --pst-sidebar-secondary: 21rem;   /* right-hand page menu; the theme default of 17rem cuts off long method names */
 }
 
 /* Accent colors for the home-page cards.  pydata-sphinx-theme paints the card BODY opaque

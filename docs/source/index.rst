@@ -85,7 +85,6 @@ MBIRTorch: High-performance tomographic reconstruction
    :caption: User Guide
 
    install
-   usr_migration
    unit_conversion
    usr_api
    usr_multi_gpu
@@ -96,11 +95,11 @@ MBIRTorch: High-performance tomographic reconstruction
    :maxdepth: 4
    :caption: Developer Guide
 
+   usr_migration
    dev_performance_dashboard
    dev_sharding_overview
    dev_adding_geometry
    dev_maintenance
-   dev_hsnt_notes
 
 
 .. _PyTorch: https://pytorch.org/docs/stable/index.html
