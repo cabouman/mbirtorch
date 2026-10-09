@@ -12,11 +12,40 @@ __all__ = ['correct_background_offset', 'correct_det_rotation', 'remove_all_stri
            'remove_sino_offset']
 
 
+def _resample_views(sino_batch, angles, sampling_offsets):
+    """Resample each view of a batch by its rotation about the detector center and its sampling offset.
+
+    Output pixel ``p`` of a view takes the input at ``R (p - center) + center + offset``, with ``R``
+    the rotation matrix of ``correct_det_rotation`` and ``offset`` in pixels as ``(row, channel)``.
+    The interpolation is bicubic, and a sample from outside the view takes the nearest edge value.
+
+    Args:
+        sino_batch (tensor): (num_views, num_det_rows, num_det_channels) on the working device.
+        angles (tensor): (num_views,) in radians, on the same device.
+        sampling_offsets (tensor): (num_views, 2) in pixels, on the same device.
+    """
+    num_views, num_rows, num_cols = sino_batch.shape
+    device, dtype = sino_batch.device, sino_batch.dtype
+    center_row, center_col = (num_rows - 1) / 2.0, (num_cols - 1) / 2.0
+    grid_i, grid_j = torch.meshgrid(torch.arange(num_rows, dtype=dtype, device=device),
+                                    torch.arange(num_cols, dtype=dtype, device=device), indexing='ij')
+    cos_a = torch.cos(angles.to(dtype))[:, None, None]
+    sin_a = torch.sin(angles.to(dtype))[:, None, None]
+    rel_i, rel_j = grid_i[None] - center_row, grid_j[None] - center_col
+    src_row = cos_a * rel_i + sin_a * rel_j + center_row + sampling_offsets[:, 0, None, None].to(dtype)
+    src_col = -sin_a * rel_i + cos_a * rel_j + center_col + sampling_offsets[:, 1, None, None].to(dtype)
+    # grid_sample takes (x, y) in [-1, 1], with align_corners=True mapping -1 and 1 to the edge pixels.
+    grid = torch.stack([2.0 * src_col / max(num_cols - 1, 1) - 1.0,
+                        2.0 * src_row / max(num_rows - 1, 1) - 1.0], dim=-1)
+    out = torch.nn.functional.grid_sample(sino_batch[:, None].to(torch.float32), grid.to(torch.float32),
+                                          mode='bicubic', padding_mode='border', align_corners=True)
+    return out[:, 0].to(dtype)
+
+
 def _rotation_kernel(sino_batch, det_rotation, center=None):
     """Rotate the (row, channel) plane of each view in a batch by ``det_rotation`` radians.
 
-    The interpolation is bilinear, and a sample from outside the view is zero.  The rotated sampling
-    grid is computed once for the (row, channel) plane and used for every view in the batch.
+    The interpolation is bicubic, and a sample from outside the view takes the nearest edge value.
 
     Args:
         sino_batch (tensor): (num_views, num_det_rows, num_det_channels).
@@ -29,49 +58,26 @@ def _rotation_kernel(sino_batch, det_rotation, center=None):
     """
     num_views, num_rows, num_cols = sino_batch.shape
     device = sino_batch.device
-    dtype = sino_batch.dtype
-    cos_a = math.cos(det_rotation)
-    sin_a = math.sin(det_rotation)
-    if center is None:
-        center_row = (num_rows - 1) / 2.0
-        center_col = (num_cols - 1) / 2.0
-    else:
-        center_row, center_col = (float(c) for c in center)
-
-    # Each output pixel (i, j) samples the input at R @ pixel + offset, where offset = center - R @ center.
-    grid_i, grid_j = torch.meshgrid(torch.arange(num_rows, dtype=dtype, device=device),
-                                    torch.arange(num_cols, dtype=dtype, device=device), indexing='ij')
-    offset_row = center_row - (cos_a * center_row + sin_a * center_col)
-    offset_col = center_col - (-sin_a * center_row + cos_a * center_col)
-    src_row = cos_a * grid_i + sin_a * grid_j + offset_row   # (num_rows, num_cols)
-    src_col = -sin_a * grid_i + cos_a * grid_j + offset_col
-
-    # The four bilinear neighbors are gathered below.  An out of range index is clipped here and zeroed by the mask.
-    lower_row = torch.floor(src_row)
-    lower_col = torch.floor(src_col)
-    frac_row = src_row - lower_row     # (num_rows, num_cols)
-    frac_col = src_col - lower_col
-    r0 = torch.clamp(lower_row.to(torch.int64), 0, num_rows - 1)
-    r1 = torch.clamp(torch.ceil(src_row).to(torch.int64), 0, num_rows - 1)
-    c0 = torch.clamp(lower_col.to(torch.int64), 0, num_cols - 1)
-    c1 = torch.clamp(torch.ceil(src_col).to(torch.int64), 0, num_cols - 1)
-
-    rotated = (((1.0 - frac_row) * (1.0 - frac_col)) * sino_batch[:, r0, c0]
-               + ((1.0 - frac_row) * frac_col) * sino_batch[:, r0, c1]
-               + (frac_row * (1.0 - frac_col)) * sino_batch[:, r1, c0]
-               + (frac_row * frac_col) * sino_batch[:, r1, c1])
-
-    # Zero any output pixel whose sample fell outside the original image.
-    in_bounds = ((src_row >= 0) & (src_row <= num_rows - 1)
-                 & (src_col >= 0) & (src_col <= num_cols - 1)).to(dtype)
-    return rotated * in_bounds
+    angles = torch.full((num_views,), float(det_rotation), dtype=torch.float32, device=device)
+    # A rotation about ``center`` is the rotation about the array center plus the sampling offset
+    # (R - I) (array center - center).
+    offsets = torch.zeros((num_views, 2), dtype=torch.float32, device=device)
+    if center is not None:
+        cos_a, sin_a = math.cos(det_rotation), math.sin(det_rotation)
+        d_row = (num_rows - 1) / 2.0 - float(center[0])
+        d_col = (num_cols - 1) / 2.0 - float(center[1])
+        offsets[:, 0] = (cos_a - 1.0) * d_row + sin_a * d_col
+        offsets[:, 1] = -sin_a * d_row + (cos_a - 1.0) * d_col
+    return _resample_views(sino_batch, angles, offsets)
 
 
 def correct_det_rotation(sino, det_rotation=0.0, batch_size=30, devices=None):
     """
     Rotate every view of a sinogram to remove a detector rotation.
 
-    Takes a numpy array or a tensor and returns a numpy array.
+    The rotation is about the center of the view, with bicubic interpolation, and a sample from
+    outside the view takes the nearest edge value.  Takes a numpy array or a tensor and returns a
+    numpy array.
 
     Args:
         sino (numpy array or tensor): Sinogram, shape (num_views, num_det_rows, num_det_channels).
