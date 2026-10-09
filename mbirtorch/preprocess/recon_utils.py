@@ -1,7 +1,8 @@
 import numpy as np
 import torch
-import mbirtorch.preprocess as mtp
 from mbirtorch import _sharding
+
+__all__ = ['segment_plastic_metal', 'multi_threshold_otsu', 'apply_cylindrical_mask']
 
 # Largest number of elements in one chunk of the per-shard histogram passes.
 _HISTOGRAM_CHUNK_ELEMENTS = 1 << 24
@@ -126,31 +127,24 @@ def _masked_histogram(image, valid_mask, num_bins, xp):
 
 def multi_threshold_otsu(image, classes=2, num_bins=1024, valid_mask=None):
     """
-    Segment an image into multiple intensity classes using Otsu's method.
+    Compute the Otsu thresholds that divide an image into ``classes`` intensity classes.
 
-    This function computes optimal threshold values that divide an image into the specified
-    number of classes by minimizing the intra-class variance. It returns `classes - 1` thresholds
-    that can be used to partition the image intensity range into `classes` distinct segments.
+    The thresholds minimize the within-class variance of the histogram.  Nothing is segmented; apply
+    the thresholds yourself.  A numpy array, a tensor, or a sharded volume is accepted.
 
     Args:
-        image (np.ndarray, torch.Tensor, or Shards):
-            Input image of floating-point values.
-        classes (int, optional):
-            Number of classes to divide the image into. Must be ≥ 2. Defaults to 2.
-        num_bins (int, optional):
-            Number of bins to use when constructing the image histogram. Defaults to 1024.
-        valid_mask (array or None, optional):
-            Broadcastable boolean mask, True on the entries to include.  Used e.g. to restrict the
-            histogram range and counts to a region of interest.  None includes everything.
+        image (numpy.ndarray, torch.Tensor, or Shards): Image of floating-point values.
+        classes (int, optional): The number of classes, at least 2.  Defaults to 2.
+        num_bins (int, optional): Histogram bins.  Defaults to 1024.
+        valid_mask (array or None, optional): Boolean mask of the entries to include.  None includes
+            all.  Defaults to None.
 
     Returns:
-        list of float:
-            A list of `classes - 1` threshold values, given in increasing order. These thresholds
-            can be used to separate the image into `classes` distinct intensity regions.
+        list of float: ``classes - 1`` thresholds in increasing order.
 
     Example:
-        >>> thresholds = multi_threshold_otsu(image, classes=4)
-        >>> # Resulting thresholds will split image into 4 intensity regions
+        >>> low, high = multi_threshold_otsu(recon, classes=3)
+        >>> plastic = (recon > low) & (recon <= high)
     """
     if classes < 2:
         raise ValueError("Number of classes must be at least 2")
@@ -239,34 +233,27 @@ def _otsu_thresholds_dp(hist, num_thresholds):
 
 def segment_plastic_metal(recon, num_metal, radial_margin=None, top_margin=None, bottom_margin=None):
     """
-    Segment a reconstruction into plastic and multiple metal masks using multi-threshold Otsu.
+    Segment a reconstruction into a plastic mask and one mask per metal.
 
-    ``recon`` may be a host numpy array, a torch tensor, or a sharded volume (a ``Shards``
-    container); the class masks are returned in the same form as the input, on the same
-    devices.  A sharded volume is processed shard by shard where it sits: only the small
-    histogram tables travel, never the volume.
+    The volume is masked with :func:`apply_cylindrical_mask` and split into ``num_metal + 2``
+    classes by Otsu thresholds.  The lowest class is background, the next is plastic, and the rest
+    are the metals in order of increasing value.  The scale of a mask is the mean of the volume over
+    it.  A numpy array, a tensor, or a sharded volume is accepted, and the masks come back in the
+    same form.
 
     Args:
-        recon (np.ndarray, torch.Tensor, or Shards): Reconstructed volume.
-        num_metal (int): Number of metal materials to segment.
-        radial_margin (int or None, optional): Margin in pixels to subtract from the cylindrical mask
-            radius.  None (default) uses a size-relative margin, max(2, min(10, min(rows, cols) // 25)):
-            identical to the former fixed 10 for volumes 250 pixels and wider, and proportionally
-            smaller for small volumes (where a fixed 10 would cut real object).
-        top_margin (int or None, optional): Number of slices to mask out from the top of the volume.
-            None (default) uses max(2, min(10, num_slices // 25)) with the same rationale.
-        bottom_margin (int or None, optional): Number of slices to mask out from the bottom.
-            None (default) as for top_margin.
+        recon (numpy.ndarray, torch.Tensor, or Shards): Reconstruction, shape (num_rows, num_cols, num_slices).
+        num_metal (int): The number of metals.
+        radial_margin (int or None, optional): Pixels taken off the cylinder radius.  None uses
+            ``max(2, min(10, min(num_rows, num_cols) // 25))``.  Defaults to None.
+        top_margin (int or None, optional): Slices masked at the top.  None uses
+            ``max(2, min(10, num_slices // 25))``.  Defaults to None.
+        bottom_margin (int or None, optional): Slices masked at the bottom.  None as for
+            ``top_margin``.  Defaults to None.
 
     Returns:
-        tuple: ``(plastic_mask, metal_masks, plastic_scale, metal_scales)``.  Each mask has the same
-        type as ``recon``: numpy in gives numpy out, tensor in gives tensor out, ``Shards`` in gives
-        ``Shards`` out.
-
-            - plastic_mask (np.ndarray, torch.Tensor, or Shards): Binary mask for plastic regions.
-            - metal_masks (list): One binary mask per metal region, each in the same form as ``recon``.
-            - plastic_scale (float): Scaling factor for the plastic region.
-            - metal_scales (list of float): One scaling factor per metal region.
+        tuple: ``(plastic_mask, metal_masks, plastic_scale, metal_scales)``: the plastic mask, a
+        list of ``num_metal`` metal masks, and the scale of each as a float.
     """
     if num_metal <= 0:
         raise ValueError("num_metal must be positive")
@@ -294,7 +281,7 @@ def segment_plastic_metal(recon, num_metal, radial_margin=None, top_margin=None,
         bottom_margin = max(2, min(10, num_slices // 25))
 
     # The mask removes flash at the boundary of the recon.
-    recon = mtp.apply_cylindrical_mask(recon, radial_margin=radial_margin, top_margin=top_margin,
+    recon = apply_cylindrical_mask(recon, radial_margin=radial_margin, top_margin=top_margin,
                                        bottom_margin=bottom_margin)
 
     thresholds = multi_threshold_otsu(recon, classes=num_metal + 2)
@@ -321,7 +308,7 @@ def segment_plastic_metal(recon, num_metal, radial_margin=None, top_margin=None,
         return np.where(in_class, np.float32(1.0), np.float32(0.0)).astype(recon.dtype)
 
     plastic_mask = class_mask(plastic_low_threshold, plastic_metal_threshold)
-    plastic_scale = mtp.compute_scaling_factor(recon, plastic_mask)
+    plastic_scale = compute_scaling_factor(recon, plastic_mask)
 
     metal_masks = []
     metal_scales = []
@@ -330,6 +317,134 @@ def segment_plastic_metal(recon, num_metal, radial_margin=None, top_margin=None,
         upper = thresholds[i + 1] if i + 1 < len(thresholds) else np.inf
         metal_mask = class_mask(lower, upper)
         metal_masks.append(metal_mask)
-        metal_scales.append(mtp.compute_scaling_factor(recon, metal_mask))
+        metal_scales.append(compute_scaling_factor(recon, metal_mask))
 
     return plastic_mask, metal_masks, plastic_scale, metal_scales
+
+
+def apply_cylindrical_mask(recon, radial_margin=0, top_margin=0, bottom_margin=0):
+    """
+    Zero the voxels of a reconstruction outside a centered cylinder.
+
+    The radius of the cylinder is half the larger of the row and column extents, less
+    ``radial_margin``, and ``top_margin`` and ``bottom_margin`` slices are zeroed at the two ends.
+    This removes the flash that a reconstruction leaves at the boundary of the volume.  A numpy
+    array, a tensor, or a sharded volume is masked where it sits and returned in the same form.
+
+    Args:
+        recon (numpy.ndarray, torch.Tensor, or Shards): Reconstruction, shape (num_rows, num_cols, num_slices).
+        radial_margin (int, optional): Pixels taken off the cylinder radius.  Defaults to 0.
+        top_margin (int, optional): Slices zeroed at the top.  Defaults to 0.
+        bottom_margin (int, optional): Slices zeroed at the bottom.  Defaults to 0.
+
+    Returns:
+        The masked reconstruction, the shape and type of ``recon``.
+    """
+    # The top and bottom margins are global slice ranges, so each shard zeroes its own overlap with them.
+    if isinstance(recon, _sharding.Shards):
+        pl = recon.placement
+        num_slices = pl.axis_len
+        out = []
+        for t, (_dev, (s0, s1)) in zip(recon.tensors, pl.shard_ranges()):
+            masked = apply_cylindrical_mask(t, radial_margin=radial_margin)
+            lo = max(s0, 0)
+            hi = min(s1, top_margin)
+            if hi > lo:
+                masked[:, :, lo - s0:hi - s0] = 0
+            lo = max(s0, num_slices - bottom_margin)
+            hi = min(s1, num_slices)
+            if hi > lo:
+                masked[:, :, lo - s0:hi - s0] = 0
+            out.append(masked)
+        return _sharding.Shards(out, pl)
+
+    is_torch = isinstance(recon, torch.Tensor)
+
+    num_recon_rows, num_recon_cols, num_slices = recon.shape
+    row_center = (num_recon_rows - 1) / 2
+    col_center = (num_recon_cols - 1) / 2
+
+    base_radius = max(row_center, col_center)
+    radius = base_radius - radial_margin
+
+    if is_torch:
+        row_coords, col_coords = torch.meshgrid(
+            torch.arange(num_recon_rows, device=recon.device),
+            torch.arange(num_recon_cols, device=recon.device), indexing='ij')
+        dist_sq = (row_coords - row_center) ** 2 + (col_coords - col_center) ** 2
+        circular_mask = (dist_sq <= radius ** 2).to(recon.dtype)
+    else:
+        row_coords, col_coords = np.meshgrid(np.arange(num_recon_rows), np.arange(num_recon_cols), indexing='ij')
+        dist_sq = (row_coords - row_center) ** 2 + (col_coords - col_center) ** 2
+        circular_mask = (dist_sq <= radius ** 2).astype(recon.dtype)
+
+    # This multiply allocates the array that is returned.  The input is not modified.
+    recon = recon * circular_mask[:, :, None]
+
+    # Zero the top and bottom margins in place on that new array.
+    if top_margin > 0:
+        recon[:, :, :top_margin] = 0
+    if bottom_margin > 0:
+        recon[:, :, num_slices - bottom_margin:num_slices] = 0
+
+    return recon
+
+
+def compute_scaling_factor(target_vect, vect_to_scale) -> float:
+    """
+    Approximate the optimal scalar α that minimizes the squared error ‖target_vect – α vect_to_scale‖².
+    This is computed as <target_vect, vect_to_scale> / (<vect_to_scale, vect_to_scale> + epsilon) to
+    avoid division by 0, hence is only approximate for vect_to_scale near 0.
+
+    Args:
+        target_vect (ndarray or tensor):
+            Target reconstruction vector or array of shape (N,) or higher-dimensional.
+        vect_to_scale (ndarray or tensor):
+            Vector or array of same shape as `target_vect`.
+
+    Returns:
+        float:
+            Scalar α minimizing ‖target_vect – α vect_to_scale‖².
+
+    Example:
+        >>> v = np.array([1.0, 2.0, 3.0])
+        >>> u = np.array([0.5, 1.0, 1.5])
+        >>> alpha = compute_scaling_factor(v,u)
+    """
+    # A sharded input is summed on each shard's own device, and the sums are combined on the host.
+    if isinstance(target_vect, _sharding.Shards):
+        numerator = 0.0
+        denominator = 0.0
+        for t, v in zip(target_vect.tensors, vect_to_scale.tensors):
+            n, d = _dot_sums(t, v)
+            numerator += n
+            denominator += d
+        return float(numerator / (denominator + 1e-8))
+
+    if not isinstance(target_vect, torch.Tensor):
+        target_vect = torch.as_tensor(np.asarray(target_vect))
+    if not isinstance(vect_to_scale, torch.Tensor):
+        vect_to_scale = torch.as_tensor(np.asarray(vect_to_scale), device=target_vect.device)
+
+    if target_vect.ndim == 0:
+        numerator = float(vect_to_scale * target_vect)
+        denominator = float(vect_to_scale * vect_to_scale)
+    else:
+        numerator, denominator = _dot_sums(target_vect, vect_to_scale)
+    epsilon = 1e-8
+    return float(numerator / (denominator + epsilon))
+
+
+def _dot_sums(target_vect, vect_to_scale):
+    """The two inner products <v,t> and <v,v>, computed in chunks along the leading axis.  A whole
+    array product would allocate a temporary as large as the input."""
+    numerator = 0.0
+    denominator = 0.0
+    per_row = max(1, int(np.prod(target_vect.shape[1:], dtype=np.int64)))
+    step = max(1, (1 << 27) // per_row)
+    for i in range(0, target_vect.shape[0], step):
+        t = target_vect[i:i + step]
+        v = vect_to_scale[i:i + step]
+        numerator += float(torch.sum(v * t))
+        denominator += float(torch.sum(v * v))
+    return numerator, denominator

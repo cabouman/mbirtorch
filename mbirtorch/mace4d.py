@@ -499,7 +499,7 @@ class MACE4DModel(ParameterHandler):
                 list of devices, one worker per entry.  The CPU may be
                 repeated; a repeated GPU is refused.  None and a count are
                 capped by the count ``MBIRTORCH_NUM_DEVICES`` pins.  See
-                :func:`mbirtorch.mace.resolve_device_pool`.
+                ``mbirtorch.mace.resolve_device_pool``.
 
         Raises:
             ValueError: if the pool names a GPU more than once, or if a

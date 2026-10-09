@@ -187,7 +187,7 @@ class TomographyModel(ParameterHandler):
     Base class for all tomography geometries.  It provides projection
     (:meth:`forward_project`, :meth:`back_project`), reconstruction
     (:meth:`recon`, :meth:`prox_map`, :meth:`recon_direct`), device
-    configuration (:meth:`configure_devices`), and parameter handling.
+    configuration (:meth:`~mbirtorch.TomographyModel.configure_devices`), and parameter handling.
     Users construct a geometry subclass (for example ``ConeBeamModel`` or
     ``ParallelBeamModel``) rather than this class.
 
@@ -339,9 +339,11 @@ class TomographyModel(ParameterHandler):
         geometry parameters and sinogram shape.  Each geometry model defines
         this.
 
-        Note: This function should be run after changing geometry parameters
-        such as ``delta_det_channel``.  It will set reconstruction parameters
-        such as ``recon_shape`` and ``delta_voxel`` to reasonable values.
+        Call this after changing any detector or geometry parameter with
+        ``set_params``, such as ``delta_det_channel``; otherwise the
+        reconstruction comes out at the wrong scale.  It sets ``recon_shape``,
+        ``delta_voxel``, and ``recon_slice_offset`` from the detector, so
+        resize or shift the region of reconstruction only after it.
 
         Args:
             no_compile (bool, optional): If True, do not rebuild the
@@ -517,8 +519,8 @@ class TomographyModel(ParameterHandler):
             >>> mbirtorch.slice_viewer(recon)
         """
         import functools
-        from .preprocess.mar import correct_sino_plastic_metal
-        from .preprocess.segmentation import segment_plastic_metal
+        from .preprocess.beam_hardening import correct_sino_plastic_metal
+        from .preprocess.recon_utils import segment_plastic_metal
         from .utilities import merge_log_files
         from .view_utils import slice_viewer
 
@@ -944,67 +946,33 @@ class TomographyModel(ParameterHandler):
     # ── device configuration ──────────────────────────────────────────────────
     def configure_devices(self, num_devices=1, devices=None, like=None):
         """
-        Set the compute devices the model uses.
+        Choose the devices the model computes on.
 
-        Specify either a CUDA device count (``num_devices=n``), an explicit
-        device list (``devices=['cpu']``, ``['mps']``, or
-        ``['cuda:0', 'cuda:1']``), or another model to match
-        (``like=other_model``).  With more than one device, the sinogram
-        is divided across the devices by view and the reconstruction by
-        slice.
+        Give a number of GPUs, a list of devices, or another model to match::
 
-        ``like=`` exists for a Plug-and-Play or ADMM loop, which alternates
-        :meth:`prox_map` on a reconstruction model with
-        :meth:`~mbirtorch.QGGMRFDenoiser.denoise` on a denoiser over the same
-        volume.  Placing the two models on the same devices lets that volume
-        pass between them in its device form (``output_sharded=True``),
-        instead of being gathered to the host and scattered again on every
-        half-iteration::
+            ct_model.configure_devices(2)                             # the first two GPUs
+            ct_model.configure_devices(devices=['cuda:0', 'cuda:2'])  # these two GPUs
+            ct_model.configure_devices(devices=['cpu'])               # the CPU
+            denoiser.configure_devices(like=ct_model)                 # the same devices as ct_model
 
-            denoiser = QGGMRFDenoiser(ct_model.get_params('recon_shape'))
-            denoiser.configure_devices(like=ct_model)
+        Without a call, the model chooses by itself: a GPU when there is one, and on a machine
+        with several GPUs as many as help at the problem size.  A call turns that choice off for
+        this model, so ``configure_devices(1)`` pins a run to one GPU for a reproducible result.
+        Results differ slightly with the number of GPUs, and the difference shrinks as the
+        iterations proceed.
 
-        The one limit is worth stating plainly: this makes RECON-like arrays
-        interchangeable, not sinogram-like ones.  A denoiser's sinogram IS its
-        image, so its sinogram placement divides an image by slice, while a
-        projection model's divides a sinogram by view; they are different
-        things, and nothing exchanges sinograms with a denoiser anyway.
+        ``like=`` is for a Plug-and-Play loop that passes a volume between a reconstruction model
+        and a denoiser: on the same devices the volume stays on the GPUs between the two.
+        Configure the other model first.
 
-        Without a call to this method, the model chooses its devices
-        automatically: it prefers cuda, then mps, then cpu, and on CUDA it
-        may spread a reconstruction across several devices (see
-        :meth:`recon`).  Calling this method turns the automatic choice off
-        permanently for this model, so ``configure_devices(num_devices=1)``
-        pins a run to one device for reproducibility.  The
-        ``MBIRTORCH_NUM_DEVICES`` environment variable pins the count for a
-        whole process.  Results can differ slightly with the device count,
-        and the difference decays as iterations proceed.
-
-        The device layout is built from the current sinogram and recon
-        shapes, so call this after any geometry change.
-
-        Call this function to set the device layout before any array is placed on the devices.
+        Call this after any change to the sinogram or reconstruction shape.
 
         Args:
-            num_devices (int, optional): number of devices to use.  1 (the
-                default) uses the model's default device (cuda, mps, or
-                cpu); values above 1 require that many CUDA devices.
-            devices (list, optional): explicit device list.  Overrides
-                num_devices.
-            like (TomographyModel, optional): another model (a geometry model
-                or a ``QGGMRFDenoiser``) whose device list this model copies,
-                so that recon-like arrays can pass between the two in their
-                device form.  The two models must agree on their recon shape,
-                which is what makes a volume from one usable by the other;
-                they need not agree on their sinogram shapes, and a denoiser
-                paired with a geometry model never does.  What is copied is the
-                layout the other model has at this moment, so configure that
-                model first: one whose layout is still automatic has not
-                chosen yet -- it settles on its first reconstruction -- and
-                the pair would then end up on different layouts.  ``like``
-                and ``devices`` cannot both be given, and ``num_devices`` is
-                ignored when ``like`` is: it has a default value, so an
-                explicit ``num_devices=1`` cannot be told from the default.
+            num_devices (int, optional): number of GPUs.  Defaults to 1.
+            devices (list, optional): device names, such as ``['cuda:0', 'cuda:1']`` or ``['cpu']``.
+                Overrides num_devices.
+            like (TomographyModel, optional): a model whose devices this model copies.  The two
+                must have the same recon shape.
         """
         if like is not None and devices is not None:
             raise ValueError(
@@ -1071,7 +1039,7 @@ class TomographyModel(ParameterHandler):
 
     def _install_device_layout(self, devices):
         """Rebuild the placements over ``devices``.  Both
-        :meth:`configure_devices` and the automatic choice call this.  It does
+        :meth:`~mbirtorch.TomographyModel.configure_devices` and the automatic choice call this.  It does
         not change ``device_layout_is_automatic``."""
         devices = [torch.device(d) for d in devices]
         self.torch_device = devices[0]
@@ -1468,41 +1436,20 @@ class TomographyModel(ParameterHandler):
     _floor_family = None
 
     def prepare_sino_for_devices(self, sinogram, weights=None):
-        """Place a sinogram (and optionally weights) in the model's device
-        form, once.
+        """
+        Send a sinogram (and optionally weights) to the model's devices once.
 
-        The device form is the layout the reconstruction methods use
-        internally: the sinogram is divided across the configured devices by
-        view.
-
-        Calling this is OPTIONAL: every reconstruction method applies the
-        same placement automatically to a plain input.  Use this function to
-        transfer just once when running several reconstructions on
-        the same large sinogram.  What it returns goes straight into
-        :meth:`recon` and :meth:`prox_map` in place of the sinogram (and the
-        weights), so those calls do no transfer of their own.
-        If the device configuration changes afterwards, the prepared array no
-        longer matches, and the reconstruction methods raise an error; re-run
-        this method to fix it.
-
-        On a model whose device layout is still automatic, this call also
-        decides the layout, and every later reconstruction on the model
-        reuses it.  The layout is sized for a full reconstruction whenever one
-        fits.  On a problem too large for any full reconstruction, the memory
-        check falls back to what this call itself allocates, which is much
-        smaller, the way the direct reconstructions do; preparing a sinogram
-        then succeeds where a full reconstruction could not run.  A later
-        :meth:`recon` on such a layout runs the memory check again and raises
-        ``MemoryPreflightError``, rather than reusing a layout that was never
-        checked for it.
+        Every reconstruction method does this by itself.  Call it when you reconstruct the same
+        large sinogram several times, and pass what it returns to :meth:`recon` or
+        :meth:`prox_map` in place of the sinogram; the copy to the GPUs then happens once.
+        Call it again after any change to the devices.
 
         Args:
             sinogram (numpy or tensor): sinogram in the model's sinogram_shape.
             weights (numpy or tensor, optional): weights of the same shape.
 
         Returns:
-            The prepared sinogram, or a (sinogram, weights) tuple when weights
-            were given.
+            The prepared sinogram, or a (sinogram, weights) tuple when weights were given.
         """
         # The layout is settled before the sinogram is placed.  Placing first would put the
         # whole sinogram on the lead device and then move it again.
@@ -2091,9 +2038,9 @@ class TomographyModel(ParameterHandler):
                                                 sino_indicator[:, :, -1])))
         if edge_frac > 0.02 and self.get_params('verbose') > 0:
             warnings.warn(
-                f"Lateral FoV truncation detected: the object support reaches the detector's "
+                f"Lateral FOV truncation detected: the object support reaches the detector's "
                 f"edge channels in {edge_frac:.0%} of the sampled view-rows.  Consider using "
-                f"scale_recon_shape(s, s) where s >= 1.1 to improve image quality.")
+                f"resize_recon_fov(s, s) where s >= 1.1 to improve image quality.")
 
     def auto_set_sigma_y(self, sinogram, sino_indicator, weights=1):
         """Set sigma_y from the (typically view-subsampled) sinogram, its
@@ -2687,7 +2634,7 @@ class TomographyModel(ParameterHandler):
         Args:
             sinogram (numpy or tensor or Shards): 3D sinogram data with shape
                 (num_views, num_det_rows, num_det_channels).  The device form
-                as returned by :meth:`prepare_sino_for_devices` is accepted
+                as returned by ``prepare_sino_for_devices`` is accepted
                 too, so repeated reconstructions of one large sinogram pay the
                 host-to-device transfer once.
             partitions (list): K partitions, each an (N_subsets, N_indices)
@@ -3051,69 +2998,40 @@ class TomographyModel(ParameterHandler):
               logfile_path='~/.mbirtorch/logs/recon.log', print_logs=True,
               output_sharded=False, rng=None):
         """
-        Perform MBIR reconstruction using the Multi-Granular Vector Coordinate
-        Descent algorithm.  This function takes care of generating its own
-        partitions and partition sequence.
+        Reconstruct a volume from a sinogram by MBIR.
 
-        To restart a recon using the same partition sequence, set
-        first_iteration to the number of iterations completed so far and set
-        init_recon to the output of the previous recon; this continues the
-        partition sequence from where the previous recon left off.
-
-        Device use: on CUDA with several devices, this chooses a device
-        count automatically.  Two rules make the choice: measured speed
-        thresholds decide how many devices are worth using at this problem
-        size, and a memory check confirms the chosen layout fits before the
-        first large allocation.  Nothing needs to change in a calling
-        script.  ``configure_devices(num_devices=n)`` fixes the count
-        instead, and ``configure_devices(num_devices=1)`` pins the run to
-        one device for reproducibility.  The environment variable
-        ``MBIRTORCH_NUM_DEVICES`` pins the count process-wide, which is
-        what a test suite or a nightly should use.
-
-        Reproducibility note: the pixel partitions and the order in which the
-        subsets are visited are drawn from numpy's global random number
-        generator, so reconstructions vary slightly from run to run.  For a
-        reproducible result, call ``np.random.seed(seed)`` before calling this
-        method, or pass ``rng``, which makes the draws independent of anything
-        else the process draws.  Results also differ slightly with the device
-        count, and that difference decays as iterations proceed.
+        The reconstruction runs the Multi-Granular Vector Coordinate Descent algorithm for up to
+        ``max_iterations`` iterations, or until the change between iterations falls below
+        ``stop_threshold_change_pct``.  On a machine with several GPUs it uses them by itself
+        (see :meth:`~mbirtorch.TomographyModel.configure_devices`).  The pixel partitions and their order are drawn from
+        numpy's random number generator, so two runs differ slightly; call ``np.random.seed`` first
+        or pass ``rng`` for the same result every time.
 
         Args:
-            sinogram (numpy or tensor or Shards): 3D sinogram data with shape
-                (num_views, num_det_rows, num_det_channels).  The device form
-                as returned by :meth:`prepare_sino_for_devices` is accepted
-                too, so repeated reconstructions of one large sinogram pay the
-                host-to-device transfer once.
-            weights (numpy or tensor or Shards, optional): 3D positive weights
-                with the same shape as the sinogram, in a plain array or in the
-                device form.  Defaults to None (all 1s).
-            init_recon (array, int, or None, optional): initial reconstruction.
-                If None, recon_direct is called with default arguments.
-            max_iterations (int, optional): maximum number of VCD iterations.
-            stop_threshold_change_pct (float, optional): stop when
-                100 * ||delta_recon||_1 / ||recon||_1 between iterations drops
-                below this value.  Defaults to 0.2; set 0 to guarantee exactly
-                max_iterations.
-            first_iteration (int, optional): the number of iterations previously
-                completed when restarting a recon.  Defaults to 0.
-            logfile_path (str, optional): Path to the output log file ('~' expands to the
-                user's home directory).  If None or empty, no log file is written.
-                Defaults to '~/.mbirtorch/logs/recon.log'.
-            print_logs (bool, optional): If true then print logs to console.  Defaults to True.
-            output_sharded (bool, optional): If False (default), return a
-                numpy array.  If True, return the device form: a torch
-                tensor on a single device, or a Shards container (one
-                tensor per device) on a multi-device model.
-            rng (numpy.random.Generator, optional): the generator every random
-                draw of the run comes from, the partitions and the order of
-                the subsets.  Defaults to None, the global np.random state.
+            sinogram (numpy or tensor): 3D sinogram with shape (num_views, num_det_rows, num_det_channels).
+            weights (numpy or tensor, optional): positive weights of the same shape.  Defaults to None (all 1s).
+            init_recon (array, optional): initial reconstruction.  Defaults to None, a direct reconstruction.
+            max_iterations (int, optional): maximum number of iterations.  Defaults to 15.
+            stop_threshold_change_pct (float, optional): stop when the percent change in the volume between
+                iterations drops below this value.  Defaults to 0.2; set 0 to run exactly max_iterations.
+            first_iteration (int, optional): to continue a reconstruction, the number of iterations already
+                done, with ``init_recon`` the previous result.  Defaults to 0.
+            logfile_path (str, optional): path of the log file.  Defaults to '~/.mbirtorch/logs/recon.log';
+                None writes no file.
+            print_logs (bool, optional): print the log to the console.  Defaults to True.
+            output_sharded (bool, optional): return the volume on the devices instead of as a numpy array.
+                Defaults to False.
+            rng (numpy.random.Generator, optional): the generator for every random draw of the run.
+                Defaults to None, the global numpy state.
 
         Returns:
-            (recon, recon_dict): the reconstruction volume, and a dict
-            with entries 'recon_params' (per-iteration traces and settings),
-            'recon_log' (the run's log text), 'notes', and
-            'model_params' (a snapshot of the model parameters).
+            (recon, recon_dict): the reconstruction volume, and a dict with entries 'recon_params'
+            (settings and per-iteration traces), 'recon_log' (the log text), 'notes', and 'model_params'
+            (the model parameters).  The dict can be given to :func:`~mbirtorch.view_utils.slice_viewer`
+            and :func:`~mbirtorch.export_recon_hdf5`.
+
+        Example:
+            >>> recon, recon_dict = ct_model.recon(sinogram, weights=weights)
         """
         # The initial reconstruction is checked against the shape of the whole volume, which a
         # sharded array does not have, so a sharded init_recon is refused.
@@ -3240,72 +3158,40 @@ class TomographyModel(ParameterHandler):
                  logfile_path='~/.mbirtorch/logs/prox.log', print_logs=True,
                  output_sharded=False, rng=None):
         """
-        Proximal Map function for use in Plug-and-Play applications.  This
-        function is similar to recon, but it essentially uses a prior with a
-        mean of prox_input and a standard deviation of sigma_prox.
+        Compute the proximal map of the data term, for Plug-and-Play loops.
 
-        Reproducibility note: the pixel partitions and the order in which the
-        subsets are visited are drawn from numpy's global random number
-        generator; call ``np.random.seed(seed)`` first for a reproducible
-        result, or pass ``rng``.
+        This is :meth:`recon` with the prior replaced by a Gaussian of mean ``prox_input`` and
+        standard deviation ``sigma_prox``.  A Plug-and-Play loop alternates this method with a
+        denoiser.  The random draws are as in :meth:`recon`.
 
         Args:
-            prox_input (numpy or tensor or Shards): proximal map input with the
-                same shape as the reconstruction.  The device form is accepted
-                too, so a Plug-and-Play loop can feed back what a denoiser
-                returned with ``output_sharded=True``, provided the two models
-                share a device layout (see :meth:`configure_devices`).
-            sinogram (numpy or tensor or Shards): 3D sinogram data with shape
-                (num_views, num_det_rows, num_det_channels).  The device form
-                as returned by :meth:`prepare_sino_for_devices` is accepted
-                too, so a Plug-and-Play loop that prepares its sinogram once
-                pays the host-to-device transfer once rather than on every
-                call.
-            sigma_prox (None or float, optional): standard deviation of the
-                proximal map prior term.  If None, set automatically from the
-                sinogram.  Defaults to None.
-            weights (numpy or tensor or Shards, optional): 3D positive weights
-                with the same shape as the sinogram, in a plain array or in the
-                device form.  Defaults to None (all 1s).
-            init_recon (numpy or tensor, optional): reconstruction used for
-                initialization.  Defaults to None (determined by _vcd_recon).
-            do_initialization (bool, optional): If True, initialize parameters
-                (partitions and regularization) through :meth:`initialize_prox`.
-                Set False if a previous prox_map call on this model, or a call
-                to :meth:`initialize_prox`, already initialized this sinogram.
-            stop_threshold_change_pct (float, optional): stop when the NMAE
-                percent change drops below this value.  Defaults to 0.2.
-            max_iterations (int, optional): maximum VCD iterations, counted
-                from iteration 0: a call resuming at ``first_iteration=k``
-                runs ``max_iterations - k`` iterations.  Defaults to 3.
-            first_iteration (int, optional): cumulative iteration count for
-                restarts.  The partition sequence is advanced by this amount
-                (on the cached ``do_initialization=False`` path too), so a
-                Plug-and-Play loop that passes the total number of prox
-                iterations completed so far walks the sequence coarse to fine
-                and, past its end, stays on its last (typically finest)
-                entry.  Defaults to 0.
-            logfile_path (str, optional): Path to the output log file ('~' expands to the
-                user's home directory).  If None or empty, no log file is written.
-                Defaults to '~/.mbirtorch/logs/prox.log'.  A Plug-and-Play loop
-                that passes do_initialization=False after its first call keeps
-                writing to the log that call opened, so the whole loop lands in
-                one file.
-            print_logs (bool, optional): If true then print logs to console.  Defaults to True.
-            output_sharded (bool, optional): If False (default), return a
-                numpy array.  If True, return the device form: a torch
-                tensor on a single device, or a Shards container (one
-                tensor per device) on a multi-device model.
-            rng (numpy.random.Generator, optional): the generator every random
-                draw of the call comes from, the partitions when this call
-                initializes and the order of the subsets.  Defaults to None,
-                the global np.random state.
+            prox_input (numpy or tensor): the proximal map input, with the shape of the reconstruction.
+            sinogram (numpy or tensor): 3D sinogram with shape (num_views, num_det_rows, num_det_channels).
+            sigma_prox (float, optional): standard deviation of the prior.  Defaults to None, set from the sinogram.
+            weights (numpy or tensor, optional): positive weights of the same shape as the sinogram.
+                Defaults to None (all 1s).
+            init_recon (numpy or tensor, optional): initial reconstruction.  Defaults to None.
+            do_initialization (bool, optional): set False after the first call of a loop on the same
+                sinogram, so the partitions and regularization are not computed again.  Defaults to True.
+            stop_threshold_change_pct (float, optional): stop when the percent change between iterations
+                drops below this value.  Defaults to 0.2.
+            max_iterations (int, optional): maximum number of iterations, counted from iteration 0.
+                Defaults to 3.
+            first_iteration (int, optional): the total number of proximal map iterations done so far in
+                the loop, which continues the partition sequence.  Defaults to 0.
+            logfile_path (str, optional): path of the log file.  Defaults to '~/.mbirtorch/logs/prox.log';
+                None writes no file.
+            print_logs (bool, optional): print the log to the console.  Defaults to True.
+            output_sharded (bool, optional): return the volume on the devices instead of as a numpy array,
+                which a loop can pass to a denoiser on the same devices.  Defaults to False.
+            rng (numpy.random.Generator, optional): the generator for every random draw.  Defaults to
+                None, the global numpy state.
 
         Returns:
-            (recon, recon_dict): the reconstruction volume, and a dict
-            with entries 'recon_params' (per-iteration traces and settings),
-            'recon_log' (the run's log text), 'notes', and
-            'model_params' (a snapshot of the model parameters).
+            (recon, recon_dict): the volume and a dict with the entries of :meth:`recon`.
+
+        Example:
+            >>> recon, _ = ct_model.prox_map(prox_input, sinogram, sigma_prox=0.5)
         """
         # The initial reconstruction is checked against the shape of the whole volume, which a
         # sharded array does not have, so a sharded init_recon is refused.
@@ -3376,17 +3262,19 @@ class TomographyModel(ParameterHandler):
     def gen_weights(sinogram, weight_type):
         return vcd_utils.gen_weights(sinogram, weight_type)
 
-    def scale_recon_shape(self, row_scale=1.0, col_scale=1.0, slice_scale=1.0):
+    def resize_recon_fov(self, row_scale=1.0, col_scale=1.0, slice_scale=1.0):
         """
-        Scale the reconstruction shape by the given scale factors.
+        Resize the reconstruction field of view (FOV) by the given scale factors.
 
-        This can be used before starting a reconstruction to improve results
-        when part of the object projects outside the detector.  The method
-        updates the internal `recon_shape` parameter.
+        The voxel size stays the same; the number of voxels in each direction is
+        multiplied by its scale factor.  This can be used before starting a
+        reconstruction to improve results when part of the object projects
+        outside the detector.  The method updates the internal `recon_shape`
+        parameter.
 
-        For lateral field-of-view truncation (flagged by the "Lateral FoV
-        truncation detected" warning), use ``scale_recon_shape(s, s)`` with
-        ``s`` typically chosen as ``s >= 1.1``.
+        For lateral FOV truncation (flagged by the "Lateral FOV truncation
+        detected" warning), use ``resize_recon_fov(s, s)`` with ``s``
+        typically chosen as ``s >= 1.1``.
 
         Args:
             row_scale (float): Scale factor for the number of recon rows.
@@ -3394,7 +3282,7 @@ class TomographyModel(ParameterHandler):
             slice_scale (float): Scale factor for the number of recon slices.
 
         Returns:
-            tuple[int, int, int]: pixels added to (rows, columns, slices).
+            tuple[int, int, int]: voxels added to (rows, columns, slices).
         """
         old_rows, old_cols, old_slices = self.get_params('recon_shape')
         new_rows = int(old_rows * row_scale)
@@ -3402,6 +3290,11 @@ class TomographyModel(ParameterHandler):
         new_slices = int(old_slices * slice_scale)
         self.set_params(recon_shape=(new_rows, new_cols, new_slices))
         return new_rows - old_rows, new_cols - old_cols, new_slices - old_slices
+
+    def scale_recon_shape(self, row_scale=1.0, col_scale=1.0, slice_scale=1.0):
+        # Deprecated name for resize_recon_fov; kept so old scripts keep running.
+        warnings.warn('scale_recon_shape is deprecated; use resize_recon_fov instead.', FutureWarning, stacklevel=2)
+        return self.resize_recon_fov(row_scale, col_scale, slice_scale)
 
     def recon_slice_z(self, slice_indices=None):
         """The axial coordinate, in ALU, of the center of each recon slice.
@@ -3524,7 +3417,7 @@ class TomographyModel(ParameterHandler):
         """
         Collect the recon parameters, logs, notes, and optionally all model parameters into a dict
         with entries 'recon_params', 'recon_log', 'notes', and 'model_params'.  This dict can be used with
-        :func:`mbirtorch.view_utils.slice_viewer` and :meth:`TomographyModel.save_recon_hdf5`.
+        :func:`mbirtorch.view_utils.slice_viewer` and :func:`mbirtorch.export_recon_hdf5`.
         By default the entries hold their original values; str_format=True serializes each top-level
         entry to a string.
 
@@ -3574,59 +3467,14 @@ class TomographyModel(ParameterHandler):
         return recon_dict
 
     def save_recon_hdf5(self, filepath, recon, recon_dict=None):
-        """
-        Save the reconstruction array and optionally the recon_dict from :meth:`~mbirtorch.TomographyModel.recon`.
-
-        This method creates a file that contains a single dataset named 'recon', with the entries in recon_dict
-        serialized to strings and saved as hdf5 dataset attributes.
-
-        The resulting file can be loaded with :meth:`load_recon_hdf5` or :func:`mbirtorch.view_utils.slice_viewer`.
-
-        Args:
-            filepath (str or Path): Path to the output HDF5 file. Should typically end with a .h5 extension.
-            recon (array-like): The reconstruction volume as a NumPy array, torch tensor, or the
-                sharded device form from ``recon(..., output_sharded=True)``.
-            recon_dict (dict or None, optional): The dictionary of recon attributes from :meth:`get_recon_dict`
-
-        Raises:
-            Exception: If saving the file or directory creation fails.
-
-        Example:
-            >>> recon, recon_dict = ct_model.recon(sinogram)
-            >>> recon_dict['notes'] += 'Test scan'
-            >>> ct_model.save_recon_hdf5("output/my_recon.h5", recon, recon_dict=recon_dict)
-        """
-        from .utilities import save_data_hdf5, _to_host
-        arr = _to_host(recon)
-        save_data_hdf5(filepath, arr, 'recon', recon_dict)
-
-        if self.logger:
-            self.logger.info(f"Saved reconstruction and params to '{filepath}'")
+        """Deprecated: use :func:`mbirtorch.export_recon_hdf5`."""
+        warnings.warn('save_recon_hdf5 is deprecated; use mbirtorch.export_recon_hdf5.', FutureWarning, stacklevel=2)
+        from .utilities import export_recon_hdf5
+        export_recon_hdf5(filepath, recon, recon_dict)
 
     @staticmethod
     def load_recon_hdf5(filepath):
-        """
-        This function loads a numpy array stored in an HDF5 file created by :meth:`~mbirtorch.TomographyModel.save_recon_hdf5`.
-        It also loads any associated attribute dict.
-
-        Args:
-            filepath (str): Path to the HDF5 file containing the reconstructed volume.
-
-        Returns:
-            (recon, recon_dict)
-                - recon (ndarray): The array saved by save_recon_hdf5()
-                - recon_dict (dict): A dict with the same entries as :meth:`get_recon_dict`, with
-                  each value as the string it was stored as in the HDF5 attributes
-
-        Raises:
-            FileNotFoundError: If the file does not exist.
-            ValueError: If more than one dataset is found in the file.
-
-        Example:
-            >>> recon, recon_dict = ct_model.load_recon_hdf5("output/recon_volume.h5")
-            >>> recon.shape
-            (64, 256, 256)
-        """
-        from .utilities import load_data_hdf5
-        recon, recon_dict = load_data_hdf5(filepath)
-        return recon, recon_dict
+        """Deprecated: use :func:`mbirtorch.import_recon_hdf5`."""
+        warnings.warn('load_recon_hdf5 is deprecated; use mbirtorch.import_recon_hdf5.', FutureWarning, stacklevel=2)
+        from .utilities import import_recon_hdf5
+        return import_recon_hdf5(filepath)

@@ -62,7 +62,7 @@ def test_multiaxis_zero_elevation_matches_parallel(device):
 def test_multiaxis_recon_smoke(device):
     m = _small_ma([device])
     rs = m.get_params('recon_shape')
-    phantom = mbirtorch.gen_translation_phantom(rs, 'dots', None, fill_rate=0.05)
+    phantom = mbirtorch.utilities._gen_translation_phantom(rs, 'dots', None, fill_rate=0.05)
     sino = m.forward_project(phantom)
     np.random.seed(0)
     recon, rd = m.recon(sino, max_iterations=3, stop_threshold_change_pct=0.0,

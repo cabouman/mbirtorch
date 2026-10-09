@@ -4310,80 +4310,57 @@ def geometry_viewer(model_or_scene, view_index=0, show_trajectory=False,
                     vmin=None, vmax=None, recon=None, recon_threshold=None,
                     show_sinogram=True, show_recon=True, show_compare=True,
                     block=True):
-    """Launch the interactive geometry viewer on a model.
+    """Open a window that draws the scan geometry of a model, one view at a time.
 
-    This function builds a
-    :class:`~mbirtorch.viewers.geometry_figure.GeometryFigure`, shows it, and
-    returns it.  It is used the way ``mbirtorch.slice_viewer`` is used: one
-    call opens the window, and ``block`` decides whether the call waits for
-    the window to close.
+    Five panels show the source, the detector, the rays, the rotation axis, and the
+    reconstruction volume: a 3D view, the top view (the xy plane), the side view (the yz
+    plane), the detector face in row and channel index, and a panel of derived numbers such
+    as the magnification, the cone angle, and whether the volume projects inside the
+    detector.  A slider steps through the views.  Two markers show detector pixel (0, 0) and
+    voxel (0, 0, 0), so a mirrored channel order or an offset with the wrong sign is visible
+    at once.  The object is held fixed and the source and detector move.  Negative z is
+    drawn at the top, so the volume appears the way its array is indexed.
 
-    The window shows five panels for one view of the scan: a 3D view, a top
-    view of the xy plane, a side view of the yz plane, the detector face in row
-    and channel index, and the derived numbers.  A slider steps through the
-    views, and six toggles sit beside it.  Three of them turn the source's
-    path, the 3D zoom to the volume, and the angle-0 reference on and off, and
-    three turn the sinogram, the phantom, and the comparison on and off.  Every
-    panel draws negative z at the top, and the beam runs from the source on the
-    left to the detector on the right.  Two arrays can be drawn beside the
-    geometry: a sinogram on the detector face and a reconstruction's silhouette
-    in the volume box.
+    A sinogram can be painted on the detector face, and a reconstruction or a phantom drawn
+    as a silhouette in the volume box.  A second geometry can be drawn dashed over the first,
+    and a second window then lists every parameter that differs.
 
     Args:
-        model_or_scene: a ``TomographyModel`` or a ``GeometryScene``.
-        view_index (int, optional): the view to draw first.  Defaults to 0.
-        show_trajectory (bool, optional): whether to draw the source's path
-            over all views.  Defaults to False.
-        compare (optional): a second geometry drawn dashed over the first: a
-            ``GeometryScene``, a model, or a dictionary of parameter overrides
-            such as ``dict(det_channel_offset=12.5)``.  Defaults to None.  A
-            comparison opens a second window, which tables every difference
-            between the two geometries.
-        show_reference (bool, optional): whether to draw the source and the
-            detector at their angle-0 position.  Defaults to True.
-        zoom (str, optional): ``'scan'`` (default) fits the source, the
-            detector, and the volume in the 3D panel; ``'volume'`` fits the
-            volume.
-        title (str, optional): the figure title.  None (default) names the
-            geometry and the shapes.
-        figsize (tuple, optional): the figure size in inches.
-        elevation_deg, azimuth_deg (float, optional): the 3D camera.
-        sinogram (array_like, optional): a sinogram of shape
-            ``(num_views, num_det_rows, num_det_channels)``, painted on the
-            detector face for the view drawn.  Defaults to None, which paints
-            none.  A detector larger than ``SINOGRAM_DISPLAY_PIXELS`` pixels
-            across is subsampled for display, on the device that holds the
-            array.
-        vmin, vmax (float, optional): the gray scale's ends.  Default None
-            takes the smallest and the largest value of the sinogram as
-            displayed.
-        recon (array_like, optional): a reconstruction or a phantom of shape
-            ``recon_shape``, drawn as a silhouette in the volume box of the top
-            view and the side view.  Defaults to None, which draws none.  The
-            array is read a chunk at a time where it lives, so a tensor on a
-            GPU is thresholded there, and the 3D panel draws up to
-            ``PHANTOM_SECTION_COUNT`` outlines of the support in planes across
-            its thinnest direction, with the legend naming the count.
-        recon_threshold (float, optional): the absolute value above which a
-            voxel belongs to that silhouette.  Defaults to None, which uses
-            ``DEFAULT_RECON_THRESHOLD_FRACTION`` of the largest absolute
-            value in ``recon``.
-        show_sinogram (bool, optional): whether the sinogram starts drawn.
-            Defaults to True.  Its toggle turns it on and off.
-        show_recon (bool, optional): whether the phantom starts drawn.
-            Defaults to True.
-        show_compare (bool, optional): whether the comparison starts drawn.
-            Defaults to True.
-        block (bool, optional): If True (default), block until the window is
-            closed.  If False, leave the window open and return immediately;
-            the window becomes fully interactive when the next blocking call
-            runs, and that blocking call closes every earlier nonblocking
-            window when it returns.
+        model_or_scene: A TomographyModel, or a GeometryScene.
+        view_index (int, optional): The view drawn first.  Defaults to 0.
+        show_trajectory (bool, optional): If True, draw the source's path over all views.
+            Defaults to False.
+        compare (optional): A second geometry to draw over the first: a model, a
+            GeometryScene, or a dictionary of parameter overrides such as
+            ``dict(det_channel_offset=12.5)``.  Defaults to None.
+        show_reference (bool, optional): If True, also draw the source and the detector at
+            their angle-0 position.  Defaults to True.
+        zoom (str, optional): 'scan' fits the source, the detector, and the volume in the 3D
+            panel; 'volume' fits the volume.  Defaults to 'scan'.
+        title (str, optional): The window title.  None names the geometry and the shapes.
+            Defaults to None.
+        figsize (tuple, optional): The figure size in inches.  Defaults to (15.0, 9.0).
+        elevation_deg, azimuth_deg (float, optional): The 3D camera angles in degrees.
+            Default to -25 and -40.
+        sinogram (array, optional): A sinogram, shape (num_views, num_det_rows,
+            num_det_channels), painted on the detector face for the view drawn.  A detector
+            wider than 128 pixels is subsampled for display.  Defaults to None.
+        vmin, vmax (float, optional): The gray scale limits for the sinogram.  None uses its
+            smallest and largest values.  Default to None.
+        recon (array, optional): A reconstruction or a phantom, shape ``recon_shape``, drawn
+            as a silhouette in the top and side views.  Defaults to None.
+        recon_threshold (float, optional): A voxel belongs to the silhouette if its absolute
+            value is above this.  None uses a tenth of the largest absolute value.  Defaults
+            to None.
+        show_sinogram, show_recon, show_compare (bool, optional): Whether each overlay starts
+            drawn.  A toggle in the window turns each on and off.  Default to True.
+        block (bool, optional): If True, return when the window is closed.  If False, return
+            at once and leave the window open; it becomes interactive when the next blocking
+            call runs.  Defaults to True.
 
     Returns:
-        GeometryFigure: the figure.  Nonblocking callers may keep it to change
-        the view or save an image; a module-level registry also keeps it alive
-        if the return value is dropped.
+        GeometryFigure: The figure.  A nonblocking caller can use it to change the view or
+        save an image.
     """
     figure = GeometryFigure(model_or_scene, view_index=view_index,
                             show_trajectory=show_trajectory, figsize=figsize,

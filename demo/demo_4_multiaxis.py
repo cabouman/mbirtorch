@@ -1,4 +1,4 @@
-"""Demo 7: the multiaxis parallel geometry (laminography).
+"""Demo 4: the multiaxis parallel geometry (laminography).
 
 In this geometry each view has two angles: the usual rotation about the
 vertical axis (the azimuth), plus a tilt of the beam out of the horizontal
@@ -16,7 +16,7 @@ num_det_channels = 128
 elevation_degrees = 30.0
 
 # Make a phantom and its tilted sinogram.
-phantom, sinogram, params = mbirtorch.generate_demo_data(
+phantom, sinogram, params = mbirtorch.gen_demo_data(
     model_type='multiaxis', elevation_degrees=elevation_degrees,
     num_views=num_views, num_det_rows=num_det_rows,
     num_det_channels=num_det_channels)

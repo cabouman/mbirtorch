@@ -18,7 +18,7 @@ import logging
 import numpy as np
 import olefile
 from pathlib import Path
-from .utilities import _normalize_to_float32
+from ._loader_utils import _normalize_to_float32
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +138,7 @@ def read_xrm(fname, read_metadata, *, normalize_to_float32=True):
             It is injected because the zeiss and zeiss_tct readers extract metadata differently (zeiss
             resolves ReferenceData/MultiReferenceData; zeiss_tct is scalar), so each passes its own.
         normalize_to_float32 (bool, optional): If True, convert the image to float32 and normalize integer
-            data to ``[0, 1]`` (see :func:`mbirtorch.preprocess.utilities._normalize_to_float32`).  If False,
+            data to ``[0, 1]`` (see :func:`mbirtorch.preprocess._loader_utils._normalize_to_float32`).  If False,
             return the raw image; ``read_xrm_dir`` uses False and normalizes once at the stack level.
             Defaults to True.
 

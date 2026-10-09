@@ -4,6 +4,7 @@ import numpy as np
 import warnings
 import mbirtorch as mt
 import mbirtorch.preprocess as mtp
+from . import _loader_utils as lu
 import pprint
 import olefile
 from . import _xradia_ole
@@ -16,39 +17,27 @@ pp = pprint.PrettyPrinter(indent=4)
 def get_sino_and_model(dataset_dir, *, crop_pixels_sides=0, crop_pixels_top=0, crop_pixels_bottom=0,
                        alu_unit='mm', det_rotation=0.0, verbose=1):
     """
-    Load a Zeiss translation-CT (TCT) dataset, compute its sinogram, and return a ready-to-reconstruct
-    model together with a data-specific weight mask.
+    Load a Zeiss translation CT scan, compute its sinogram, and return a model and a weight mask.
 
-    One-call replacement for the ``compute_sino_and_params -> TranslationModel(...) -> set_params ->
-    auto_set_recon_geometry`` sequence: it constructs the TranslationModel, applies the detector
-    parameters, and computes the reconstruction geometry, so the returned model can never be left with a
-    stale (default-pitch) reconstruction grid.
-
-    Unlike the other scanner readers, this one returns ``weights``: a data-specific mask (from
-    ``compute_weight``) that zeros the dark detector-boundary regions of the TCT detector.  Pass it
-    to ``model.recon(sino, weights=weights)``.
+    The scan directory holds ``obj_scan``, ``blank_scan``, and ``dark_scan`` subfolders.  The scans
+    are flipped vertically when loaded.  The background offset is removed with one global value.
+    The weight mask is 0 on the dark border of the detector and 1 elsewhere; pass it to
+    ``model.recon``.
 
     Args:
-        dataset_dir (str): Path to the Zeiss TCT scan directory (``obj_scan`` / ``blank_scan`` /
-            ``dark_scan`` subfolders).
-        crop_pixels_sides (int, optional): Pixels to crop from each lateral side of the detector. Defaults to 0.
-        crop_pixels_top (int, optional): Pixels to crop from the top of the detector. Defaults to 0.
-        crop_pixels_bottom (int, optional): Pixels to crop from the bottom of the detector. Defaults to 0.
-        alu_unit (str, optional): Physical unit for 1 ALU (``'um'``, ``'mm'``, ``'cm'``, ``'m'``). Defaults to ``'mm'``.
-        det_rotation (float, optional): Detector rotation in radians, applied to every view as the
-            sinogram is computed. This is the same rotation that
-            :func:`mbirtorch.preprocess.correct_det_rotation` applies. The value to pass is the estimate
-            returned by :func:`mbirtorch.preprocess.geometry_calibration.estimate_det_rotation`.
-            Defaults to ``0.0``, which leaves the views unrotated.
-        verbose (int, optional): Verbosity level. Defaults to 1.
+        dataset_dir (str): Path to the scan directory.
+        crop_pixels_sides (int, optional): Pixels to crop from each side of the detector.  Defaults to 0.
+        crop_pixels_top (int, optional): Pixels to crop from the top.  Defaults to 0.
+        crop_pixels_bottom (int, optional): Pixels to crop from the bottom.  Defaults to 0.
+        alu_unit (str, optional): The length unit of the model: 'um', 'mm', 'cm', or 'm'.  Defaults to 'mm'.
+        det_rotation (float, optional): Detector rotation in radians, removed from every view.
+            Defaults to 0.0.
+        verbose (int, optional): 0 prints nothing, 1 prints progress.  Defaults to 1.
 
     Returns:
-        tuple: ``(sino, model, weights)`` where
-
-            - ``sino`` (numpy.ndarray): the computed sinogram, shape (num_views, num_det_rows, num_channels).
-            - ``model`` (TranslationModel): a model with its reconstruction geometry already set.
-            - ``weights`` (numpy.ndarray): a 3D weight mask (same shape as ``sino``) that excludes the
-              dark detector boundary.
+        tuple: ``(sino, model, weights)``: the sinogram, shape (num_views, num_det_rows,
+        num_det_channels), a TranslationModel with its parameters set, and the weight mask, the shape
+        of the sinogram.
 
     Example:
         .. code-block:: python
@@ -60,7 +49,7 @@ def get_sino_and_model(dataset_dir, *, crop_pixels_sides=0, crop_pixels_top=0, c
         dataset_dir, crop_pixels_sides=crop_pixels_sides, crop_pixels_top=crop_pixels_top,
         crop_pixels_bottom=crop_pixels_bottom, alu_unit=alu_unit, det_rotation=det_rotation,
         verbose=verbose)
-    sino, model = mtp.finalize_model(sino, required_params, optional_params)
+    sino, model = lu.finalize_model(sino, required_params, optional_params)
     return sino, model, weights
 
 
@@ -297,14 +286,14 @@ def convert_zeiss_to_mbirtorch_params(zeiss_params, crop_pixels_sides=0, crop_pi
     # One ALU is defined as one unit of alu_unit.
     alu_value = 1
 
-    source_iso_dist = mtp.to_alu(source_iso_dist, source_iso_dist_unit, alu_unit)
-    iso_det_dist = mtp.to_alu(iso_det_dist, iso_det_dist_unit, alu_unit)
-    delta_det_channel = mtp.to_alu(delta_det_channel, delta_det_channel_unit, alu_unit)
-    delta_det_row = mtp.to_alu(delta_det_row, delta_det_row_unit, alu_unit)
-    iso_pixel_pitch = mtp.to_alu(iso_pixel_pitch, iso_pixel_pitch_unit, alu_unit)
-    object_x_positions = mtp.to_alu(object_x_positions, object_x_position_unit, alu_unit)
-    object_y_positions = mtp.to_alu(object_y_positions, object_y_position_unit, alu_unit)
-    object_z_positions = mtp.to_alu(object_z_positions, object_z_position_unit, alu_unit)
+    source_iso_dist = lu.to_alu(source_iso_dist, source_iso_dist_unit, alu_unit)
+    iso_det_dist = lu.to_alu(iso_det_dist, iso_det_dist_unit, alu_unit)
+    delta_det_channel = lu.to_alu(delta_det_channel, delta_det_channel_unit, alu_unit)
+    delta_det_row = lu.to_alu(delta_det_row, delta_det_row_unit, alu_unit)
+    iso_pixel_pitch = lu.to_alu(iso_pixel_pitch, iso_pixel_pitch_unit, alu_unit)
+    object_x_positions = lu.to_alu(object_x_positions, object_x_position_unit, alu_unit)
+    object_y_positions = lu.to_alu(object_y_positions, object_y_position_unit, alu_unit)
+    object_z_positions = lu.to_alu(object_z_positions, object_z_position_unit, alu_unit)
 
     source_detector_dist = source_iso_dist + iso_det_dist
 
@@ -327,7 +316,7 @@ def convert_zeiss_to_mbirtorch_params(zeiss_params, crop_pixels_sides=0, crop_pi
 
     # Translation CT has no downsampling, so the raw detector pitch is the final pitch.
     num_views = len(translation_vectors)
-    num_det_rows, num_det_channels, det_row_offset, det_channel_offset = mtp.apply_config_crop(
+    num_det_rows, num_det_channels, det_row_offset, det_channel_offset = lu.apply_config_crop(
         num_det_rows, num_det_channels, det_row_offset, det_channel_offset, delta_det_row, delta_det_channel,
         crop_pixels_top=crop_pixels_top, crop_pixels_bottom=crop_pixels_bottom, crop_pixels_sides=crop_pixels_sides)
 
