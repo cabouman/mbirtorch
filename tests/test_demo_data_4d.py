@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 
 import mbirtorch
-from mbirtorch.phantoms_4d import gen_moving_phantom, rack_and_pinion
+from mbirtorch._phantoms_4d import _gen_moving_phantom, _rack_and_pinion
 
 
 def test_rack_and_pinion_moves_and_keeps_its_mass():
@@ -11,7 +11,7 @@ def test_rack_and_pinion_moves_and_keeps_its_mass():
     within a few percent, since the parts only move.  With the defaults the wheel turns one
     tooth over the scan, so the end state equals the start state and the middle differs."""
     shape = (32, 32, 16)
-    start, middle, end = (rack_and_pinion(shape, t) for t in (0.0, 0.5, 1.0))
+    start, middle, end = (_rack_and_pinion(shape, t) for t in (0.0, 0.5, 1.0))
     assert start.shape == shape and start.dtype == np.float32
     assert set(np.unique(start)) == {0.0, np.float32(0.7), 1.0}
     assert np.any(start != middle)
@@ -21,14 +21,14 @@ def test_rack_and_pinion_moves_and_keeps_its_mass():
 
 def test_gen_moving_phantom_rejects_unknown_names():
     with pytest.raises(ValueError, match='object_type'):
-        gen_moving_phantom('no-such-object', (8, 8, 4), 2)
+        _gen_moving_phantom('no-such-object', (8, 8, 4), 2)
 
 
 def test_demo_data_4d_projects_each_step_from_its_own_object():
     """The sinogram has one view per angle, and the views of a step equal the projection of
     that step's object, so the scan is of a moving object."""
     num_views, num_steps = 24, 4
-    phantom_4d, sinogram, params = mbirtorch.generate_demo_data_4d(
+    phantom_4d, sinogram, params = mbirtorch.gen_demo_data_4d(
         num_views=num_views, num_rotations=1, num_det_rows=8, num_det_channels=32,
         num_steps=num_steps)
     assert phantom_4d.shape == (num_steps, 32, 32, 8)

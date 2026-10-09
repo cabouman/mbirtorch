@@ -11,23 +11,19 @@ import numpy as np
 import mbirtorch
 
 # The candidate scan: a cone-beam scan with 128 candidate angles over a full
-# rotation, of which 25 are to be chosen.
+# rotation, of which 25 are to be chosen.  The reference object is an asymmetric
+# polygon, so some view angles matter more than others.
 num_candidate_views = 128
 num_selected_views = 25
-num_det_rows = 16
-num_det_channels = 128
-cone_angle_degrees = 15.0
 
-candidate_angles = np.linspace(0, 2 * np.pi, num_candidate_views, endpoint=False)
-source_detector_dist = (num_det_channels / 2) / np.tan(np.deg2rad(cone_angle_degrees) / 2)
-ct_model = mbirtorch.ConeBeamModel((num_candidate_views, num_det_rows, num_det_channels), candidate_angles,
-                                   source_detector_dist=source_detector_dist,
-                                   source_iso_dist=source_detector_dist / 2)
+reference, _, params = mbirtorch.gen_demo_data(object_type='polygon', model_type='cone',
+                                               num_views=num_candidate_views, num_det_rows=16,
+                                               num_det_channels=128)
+candidate_angles = params['angles']
+ct_model = mbirtorch.ConeBeamModel((num_candidate_views, 16, 128), candidate_angles,
+                                   source_detector_dist=params['source_detector_dist'],
+                                   source_iso_dist=params['source_iso_dist'])
 ct_model.set_params(verbose=0)
-
-# The reference object: an asymmetric polygon, so some view angles matter more
-# than others.
-reference = mbirtorch.gen_polygon_phantom(ct_model.get_params('recon_shape'))
 
 # Select the views.  r_1 is the fraction of voxels sampled and r_2 the fraction
 # of candidate views tried per step; larger values are slower and more exact.

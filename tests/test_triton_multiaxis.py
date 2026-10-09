@@ -569,7 +569,7 @@ def test_multiaxis_kernel_recon_matches_a_torch_bodies_recon(monkeypatch):
         assert back is _multiaxis_back_view_batch_triton
 
         recon_shape = model.get_params('recon_shape')
-        phantom = mbirtorch.gen_translation_phantom(recon_shape, 'dots', None,
+        phantom = mbirtorch.utilities._gen_translation_phantom(recon_shape, 'dots', None,
                                                     fill_rate=0.05)
         sinogram = np.asarray(model.forward_project(phantom), dtype=np.float32)
         np.random.seed(0)

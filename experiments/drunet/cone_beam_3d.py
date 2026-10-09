@@ -9,7 +9,7 @@ import mbirtorch
 
 def get_data(num_views=128, num_det_rows=128, num_det_channels=128,
              dosage=500.0):
-    phantom, sinogram, params = mbirtorch.generate_demo_data(
+    phantom, sinogram, params = mbirtorch.gen_demo_data(
         model_type='cone', object_type='shepp-logan',
         num_views=num_views, num_det_rows=num_det_rows,
         num_det_channels=num_det_channels, target_max_attenuation=6.0)

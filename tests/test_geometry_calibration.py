@@ -53,7 +53,7 @@ def _make_model(geometry, compile_mode='off'):
 
 def _phantom_sinogram(model):
     """Forward project the Shepp-Logan phantom that fits the model's recon shape."""
-    phantom = mbirtorch.generate_3d_shepp_logan_low_dynamic_range(model.get_params('recon_shape'))
+    phantom = mbirtorch.gen_shepp_logan_3d(model.get_params('recon_shape'))
     return np.asarray(model.forward_project(phantom), dtype=np.float32)
 
 
@@ -178,7 +178,7 @@ def test_check_rotation_direction_on_cone_data(cone_model, cone_sino):
     reversed_model.compile_mode = 'off'
     reversed_model.configure_devices(devices=['cpu'])
     reversed_model.set_params(no_warning=True, verbose=0)
-    phantom = mbirtorch.generate_3d_shepp_logan_low_dynamic_range(
+    phantom = mbirtorch.gen_shepp_logan_3d(
         reversed_model.get_params('recon_shape'))
     reversed_sino = np.asarray(reversed_model.forward_project(phantom), dtype=np.float32)
 

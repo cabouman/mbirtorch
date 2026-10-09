@@ -101,18 +101,13 @@ Saving and loading a reconstruction is described under :ref:`SaveLoadDocs`.
 Synthetic Data Generation
 -------------------------
 
-.. autofunction:: mbirtorch.utilities.generate_demo_data
-.. autofunction:: mbirtorch.utilities.generate_3d_shepp_logan_reference
-.. autofunction:: mbirtorch.utilities.generate_3d_shepp_logan_low_dynamic_range
+The two demo data functions make an object and the sinogram of a scan of it, for the demos and
+for trying the package.  The two Shepp-Logan functions make the classic test phantom on its own.
 
-.. autofunction:: mbirtorch.utilities.gen_translation_phantom
-.. autofunction:: mbirtorch.utilities.gen_polygon_phantom
-
-For 4D reconstruction, a moving phantom and the sinogram of one scan of it:
-
-.. autofunction:: mbirtorch.utilities.generate_demo_data_4d
-.. autofunction:: mbirtorch.phantoms_4d.gen_moving_phantom
-.. autofunction:: mbirtorch.phantoms_4d.rack_and_pinion
+.. autofunction:: mbirtorch.utilities.gen_demo_data
+.. autofunction:: mbirtorch.utilities.gen_demo_data_4d
+.. autofunction:: mbirtorch.utilities.gen_shepp_logan_3d
+.. autofunction:: mbirtorch.utilities.gen_shepp_logan_3d_reference
 
 
 Cache Management

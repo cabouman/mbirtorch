@@ -22,7 +22,7 @@ num_det_channels = 128
 # Make a phantom and its cone-beam sinogram.  target_max_attenuation scales
 # the phantom so the sinogram is in attenuation units (the units of real
 # -log(I/I0) data), roughly in the range [0, 6].
-phantom, sinogram, params = mbirtorch.generate_demo_data(
+phantom, sinogram, params = mbirtorch.gen_demo_data(
     model_type='cone', object_type='shepp-logan',
     num_views=num_views, num_det_rows=num_det_rows,
     num_det_channels=num_det_channels, target_max_attenuation=6.0)

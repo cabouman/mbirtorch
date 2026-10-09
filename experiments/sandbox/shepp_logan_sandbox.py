@@ -59,7 +59,7 @@ def get_data():
     print(f"model = {MODEL_TYPE}, device = {model.torch_device}, "
           f"recon_shape = {recon_shape}")
 
-    phantom = mbirtorch.generate_3d_shepp_logan_low_dynamic_range(recon_shape)
+    phantom = mbirtorch.gen_shepp_logan_3d(recon_shape)
     sinogram = model.forward_project(phantom)
     weights = mbirtorch.gen_weights(sinogram / np.max(sinogram),
                                     weight_type="transmission_root")

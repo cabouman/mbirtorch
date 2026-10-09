@@ -10,7 +10,7 @@ import mbirtorch
 from mbirtorch.viewers.slice_figure4d import PLANE_LABELS, SliceViewer4D
 
 num_frames = 24
-phantom = mbirtorch.generate_3d_shepp_logan_low_dynamic_range((96, 96, 8))
+phantom = mbirtorch.gen_shepp_logan_3d((96, 96, 8))
 frames = []
 for t in range(num_frames):
     angle = np.deg2rad(60 * t)

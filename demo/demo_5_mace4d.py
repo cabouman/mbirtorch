@@ -15,7 +15,7 @@ import mbirtorch
 # sinogram is one normal scan: each view sees the object where it was at that
 # moment.  Small enough for a laptop CPU in a few minutes.
 num_views = 240
-phantom_4d, sinogram, params = mbirtorch.generate_demo_data_4d(
+phantom_4d, sinogram, params = mbirtorch.gen_demo_data_4d(
     object_type='rack-and-pinion', model_type='parallel', num_views=num_views,
     num_rotations=2, num_det_rows=64, num_det_channels=64, num_steps=24)
 angles = params['angles']

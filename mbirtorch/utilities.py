@@ -191,7 +191,7 @@ def _shepp_logan_band(phantom_shape, slice_range, device, max_block_gb, scale=1.
     return band
 
 
-def _generate_3d_shepp_logan_blocked(phantom_shape, device, max_block_gb, scale=1.0):
+def _gen_shepp_logan_3d_blocked(phantom_shape, device, max_block_gb, scale=1.0):
     """Build the phantom on one device, with the rows taken in blocks.  The
     whole slice axis forms a single band.  Return a host numpy array."""
     band = _shepp_logan_band(phantom_shape, (0, phantom_shape[2]), device,
@@ -201,7 +201,7 @@ def _generate_3d_shepp_logan_blocked(phantom_shape, device, max_block_gb, scale=
     return phantom
 
 
-def _generate_3d_shepp_logan_sharded(phantom_shape, devices, max_block_gb, scale=1.0):
+def _gen_shepp_logan_3d_sharded(phantom_shape, devices, max_block_gb, scale=1.0):
     """Build the phantom with the slices split into one band per device.
 
     The bands are the contiguous blocks that :meth:`Placement.shard_ranges`
@@ -221,7 +221,7 @@ def _generate_3d_shepp_logan_sharded(phantom_shape, devices, max_block_gb, scale
     return phantom
 
 
-def generate_3d_shepp_logan_low_dynamic_range(phantom_shape, devices=None,
+def gen_shepp_logan_3d(phantom_shape, devices=None,
                                               max_block_gb=4.0,
                                               target_max_attenuation=None):
     """
@@ -266,9 +266,9 @@ def generate_3d_shepp_logan_low_dynamic_range(phantom_shape, devices=None,
         else _shepp_logan_attenuation_scale(phantom_shape, target_max_attenuation)
     devices = _phantom_devices(devices)
     if len(devices) > 1:
-        return _generate_3d_shepp_logan_sharded(phantom_shape, devices,
+        return _gen_shepp_logan_3d_sharded(phantom_shape, devices,
                                                 max_block_gb, scale)
-    return _generate_3d_shepp_logan_blocked(phantom_shape, devices[0],
+    return _gen_shepp_logan_3d_blocked(phantom_shape, devices[0],
                                             max_block_gb, scale)
 
 
@@ -1675,7 +1675,7 @@ def _gen_ellipsoid(x_grid, y_grid, z_grid, x0, y0, z0, a, b, c, gray_level, alph
     return image.reshape(x_grid.shape)
 
 
-def generate_3d_shepp_logan_reference(phantom_shape):
+def gen_shepp_logan_3d_reference(phantom_shape):
     """
     Generate a 3D Shepp Logan phantom based on below reference.
 
@@ -1726,7 +1726,7 @@ def generate_3d_shepp_logan_reference(phantom_shape):
     return image
 
 
-def gen_translation_phantom(recon_shape, option, text, fill_rate=0.05, font_size=20, text_row_indices=None,
+def _gen_translation_phantom(recon_shape, option, text, fill_rate=0.05, font_size=20, text_row_indices=None,
                             horizontal_offset=0, vertical_offset=0, voxel_slice_aspect=1.0):
     """
     Generate a synthetic ground truth phantom based on the selected option.
@@ -1939,7 +1939,7 @@ def gen_translation_vectors(num_x_translations, num_z_translations, x_spacing, z
     return translation_vectors
 
 
-def gen_polygon_phantom(recon_shape):
+def _gen_polygon_phantom(recon_shape):
     """
     A phantom of one asymmetric convex polygon, the same in every slice, for view selection.
 
@@ -2054,6 +2054,7 @@ def get_helical_half_rotation_slice_range(
 class ObjectType(str, Enum):
     SHEPP_LOGAN = 'shepp-logan'
     CUBE = 'cube'
+    POLYGON = 'polygon'
 
 
 class ModelType(str, Enum):
@@ -2063,7 +2064,7 @@ class ModelType(str, Enum):
     MULTIAXIS = 'multiaxis'
 
 
-def generate_demo_data(
+def gen_demo_data(
     object_type='shepp-logan',
     model_type='cone',
     num_views=64,
@@ -2090,18 +2091,19 @@ def generate_demo_data(
 
     This function will create a 3D volume (aka object or phantom) of the specified type, then use the model type and
     parameters to create a simulated sinogram.  The object type 'shepp-logan' gives a simplified version of the
-    classic Shepp-Logan test phantom, and type 'cube' gives a simple cube object.
+    classic Shepp-Logan test phantom, type 'cube' gives a simple cube object, and type 'polygon' gives one
+    asymmetric five-sided polygon, the same in every slice, whose edges face a few directions so that some view
+    angles matter more than others.  The polygon is the object for sparse view selection.
 
-    The 'translation' model type is the exception: it reconstructs a volume only a few voxels thick, on which both
-    of those objects come out empty, so it always uses :func:`gen_translation_phantom` (a sparse pattern of dots)
-    and ignores object_type.
+    The 'translation' model type is the exception: it reconstructs a volume only a few voxels thick, on which
+    those objects come out empty, so it always uses a sparse pattern of dots and ignores object_type.
 
     The output sinogram has shape (num_views, num_det_rows, num_det_channels); each 2D array
     sinogram[view_index] is a simulated image from the detector, with num_det_rows indicating the
     vertical size and num_det_channels the horizontal size.
 
     Args:
-        object_type (str, optional): One of 'shepp-logan' or 'cube'.  Defaults to 'shepp-logan'.
+        object_type (str, optional): One of 'shepp-logan', 'cube', or 'polygon'.  Defaults to 'shepp-logan'.
             Ignored when model_type is 'translation', which uses its own phantom (see above).
         model_type (str, optional): One of 'parallel', 'cone', 'translation' or 'multiaxis'.  Defaults to 'cone'.
         num_views (int, optional):  Number of views in the output sinogram.  Defaults to 64. Ignored when model_type is 'translation'
@@ -2294,14 +2296,16 @@ def generate_demo_data(
     if model_type == ModelType.TRANSLATION:
         # The translation geometry reconstructs a thin slab, often a single row of voxels.  Both
         # generic phantoms come out empty that thin, so this geometry uses a phantom of dots.
-        phantom_core = gen_translation_phantom(phantom_shape, option='dots', text=None)
+        phantom_core = _gen_translation_phantom(phantom_shape, option='dots', text=None)
     elif object_type == ObjectType.SHEPP_LOGAN:
-        phantom_core = generate_3d_shepp_logan_low_dynamic_range(
+        phantom_core = gen_shepp_logan_3d(
             phantom_shape, target_max_attenuation=target_max_attenuation)
     elif object_type == ObjectType.CUBE:
         # gen_cube_phantom returns a tensor, and this function returns a host
         # numpy array for both object types.
         phantom_core = gen_cube_phantom(phantom_shape).cpu().numpy()
+    elif object_type == ObjectType.POLYGON:
+        phantom_core = _gen_polygon_phantom(phantom_shape)
     else:
         raise ValueError(f'Invalid object type. Expected one of {[o.value for o in ObjectType]}, got {object_type}')
     if model_type == ModelType.CONE and use_helical:
@@ -2320,7 +2324,7 @@ def generate_demo_data(
 
     del ct_model_for_generation
     return phantom, sinogram, params
-def generate_demo_data_4d(
+def gen_demo_data_4d(
     object_type='rack-and-pinion',
     model_type='parallel',
     num_views=240,
@@ -2334,16 +2338,18 @@ def generate_demo_data_4d(
     """
     Create a moving object and the sinogram of one continuous scan of it, for 4D demonstrations.
 
-    The object is a moving phantom from ``mbirtorch.phantoms_4d``, sampled at ``num_steps``
-    evenly spaced times over the scan.  The views are in time order and are divided evenly among
+    The object is a moving phantom sampled at ``num_steps`` evenly spaced times over the scan.
+    The only object so far is 'rack-and-pinion': a toothed bar along the rotation axis and a
+    toothed wheel beside it, the wheel turning by ``rotation_degrees`` over the scan.  A new
+    object is added in the private module ``_phantoms_4d``, as a function of the volume shape and
+    the time in [0, 1], listed by name in its table of moving phantoms.  The views are in time order and are divided evenly among
     the steps: the views of step k are projected from the object at step k.  With 240 views and
     24 steps, views 0 to 9 see the object in its first state, views 10 to 19 in its second, and
     so on.  A 4D reconstruction such as :class:`~mbirtorch.MACE4DModel` divides the views into
     frames on its own; nothing here depends on that.
 
     Args:
-        object_type (str, optional): A name in ``mbirtorch.phantoms_4d.MOVING_PHANTOMS``.
-            Defaults to 'rack-and-pinion'.
+        object_type (str, optional): The moving object.  Defaults to 'rack-and-pinion'.
         model_type (str, optional): 'parallel' or 'cone'.  Defaults to 'parallel'.
         num_views (int, optional): Views in the scan.  Defaults to 240.
         num_rotations (float, optional): Rotations the scan covers.  Defaults to 2.
@@ -2365,7 +2371,7 @@ def generate_demo_data_4d(
               source distances.
     """
     import mbirtorch
-    from .phantoms_4d import gen_moving_phantom
+    from ._phantoms_4d import _gen_moving_phantom
 
     model_type = ModelType(model_type)
     sinogram_shape = (num_views, num_det_rows, num_det_channels)
@@ -2386,7 +2392,7 @@ def generate_demo_data_4d(
         ct_model.configure_devices(devices)
 
     phantom_shape = tuple(int(n) for n in ct_model.get_params('recon_shape'))
-    phantom_4d = gen_moving_phantom(object_type, phantom_shape, num_steps, **object_options)
+    phantom_4d = _gen_moving_phantom(object_type, phantom_shape, num_steps, **object_options)
 
     # Each step's views are projected from that step's object.
     step_of_view = (np.arange(num_views) * num_steps) // num_views

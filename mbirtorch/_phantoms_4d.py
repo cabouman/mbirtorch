@@ -13,7 +13,7 @@ the scanner.
 import numpy as np
 
 
-def rack_and_pinion(phantom_shape, t, rotation_degrees=45.0, num_teeth=8):
+def _rack_and_pinion(phantom_shape, t, rotation_degrees=45.0, num_teeth=8):
     """
     A rack and pinion at time ``t``: a toothed bar along the slice axis and a toothed wheel
     beside it on a horizontal axle.
@@ -80,11 +80,11 @@ def rack_and_pinion(phantom_shape, t, rotation_degrees=45.0, num_teeth=8):
 
 # The moving phantoms by name.  Each takes (phantom_shape, t) and returns the volume at t.
 MOVING_PHANTOMS = {
-    'rack-and-pinion': rack_and_pinion,
+    'rack-and-pinion': _rack_and_pinion,
 }
 
 
-def gen_moving_phantom(object_type, phantom_shape, num_steps, **options):
+def _gen_moving_phantom(object_type, phantom_shape, num_steps, **options):
     """
     The volumes of a moving phantom at ``num_steps`` times: the scan is divided into
     ``num_steps`` equal intervals and the object is sampled at the middle of each.

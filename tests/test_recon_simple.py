@@ -41,7 +41,7 @@ def case(request):
     """A small sinogram plus the two ways to reconstruct it: the one-call
     function and the equivalent model-based calls."""
     geometry = request.param
-    _, sinogram, params = mbirtorch.generate_demo_data(
+    _, sinogram, params = mbirtorch.gen_demo_data(
         model_type=geometry, object_type="cube", **_CELL)
     angles = params["angles"]
 
