@@ -1,16 +1,21 @@
 """Geometry calibration from the sinogram.
 
 ``estimate_det_channel_offset`` estimates the detector channel offset, which sets the center of
-rotation, from the sinogram.  It returns one number and changes nothing; the caller sets it with
-``set_params``.  ``align_sino_views`` removes the small per-view shifts that remain after the
-geometry is set.
+rotation, from the sinogram alone.  It returns one number and changes nothing; the caller sets it
+with ``set_params``.
+
+``fit_det_alignment`` fits each view to the forward projection of a first reconstruction and so
+finds the detector offsets, the detector rotation, and the per-view shifts.  It needs a
+reconstruction, which is the costly part.  It returns values for the model and corrections for the
+data, and ``correct_det_alignment`` resamples the views with those corrections.
+``align_sino_views`` is deprecated in favor of the two.
 
 The order of preprocessing matters.  Run in this order:
  1. defective-pixel interpolation, background offset correction, and stripe removal
  2. ``estimate_det_channel_offset``
- 3. ``align_sino_views``.
+ 3. ``fit_det_alignment`` and ``correct_det_alignment``.
 Stripe removal comes first because a gain stripe sits at a fixed channel, and a geometry estimate
-would take it for a feature of the object.  ``align_sino_views`` comes last because a wrong
+would take it for a feature of the object.  The reprojection fit comes last because a wrong
 ``det_channel_offset`` looks like a per-view shift, which aligning first would partly remove.
 """
 
@@ -25,8 +30,10 @@ from ..cone_beam import ConeBeamModel
 from ..multiaxis_parallel import MultiAxisParallelModel
 from ..parallel_beam import ParallelBeamModel
 from . import _pipeline
+from .corrections import _resample_views
 
-__all__ = ['estimate_det_channel_offset', 'align_sino_views']
+__all__ = ['estimate_det_channel_offset', 'fit_det_alignment', 'correct_det_alignment',
+           'align_sino_views']
 
 # This many views of the full sinogram are read per step when a band of rows is read.
 _READ_VIEW_BATCH = 64
@@ -38,6 +45,12 @@ _NUM_ROWS = 16                        # detector rows compared, before the cone-
 # many times the median gap and this many radians.  A scan over a half rotation is refused.
 _MAX_GAP_RATIO = 3.0
 _MAX_GAP = math.radians(5.0)
+
+# A view whose correlation with its reprojection, after the fit, is below this is a failed fit.
+_ECC_MIN_CORRELATION = 0.2
+# The fit of a view stops after this many iterations or when the correlation gains less than this.
+_ECC_MAX_ITERATIONS = 200
+_ECC_EPS = 1e-6
 
 
 # ── geometry checks ───────────────────────────────────────────────────────────────────────────────
@@ -443,6 +456,10 @@ def _sino_high_pass_filtering(sino, sigma_row=3.0, sigma_col=15.0, subtract_view
         sigma_col (float, optional): Gaussian sigma along detector channels (horizontal). Defaults to 15.0.
         subtract_view_mean (bool, optional): If True, subtract per-view mean (DC offset removal). Defaults to True.
 
+    The blur replicates the edge value outside the view.  A reflected border would make the
+    high-passed copy of a shifted view differ from the shifted high-passed view near the edges,
+    which biases a fit between the two toward too small a shift.
+
     Returns:
         filtered_sino (numpy array): High-pass filtered sinogram, same shape as input.
     """
@@ -468,7 +485,7 @@ def _sino_high_pass_filtering(sino, sigma_row=3.0, sigma_col=15.0, subtract_view
             ksize=(0, 0),
             sigmaX=sigma_col,
             sigmaY=sigma_row,
-            borderType=cv2.BORDER_REFLECT,
+            borderType=cv2.BORDER_REPLICATE,
         )
 
         filtered_sino[view] = single_view - loss_pass_estimate
@@ -476,26 +493,13 @@ def _sino_high_pass_filtering(sino, sigma_row=3.0, sigma_col=15.0, subtract_view
     return filtered_sino
 
 
-def _estimate_sino_view_offset(ct_model, sino, recon_direct):
-    """
-    Estimate per-view 2D shifts for a sinogram.
+def _fit_views(ct_model, sino, recon_direct, rotation):
+    """Fit each view to its reprojection and return the fitted transforms about the detector center.
 
-    This function estimate the shifts in three steps:
-    1. Forward project the preliminary reconstruction using the CT model.
-    2. Apply high-pass filtering to both the sinogram and the
-        forward projection of the preliminary reconstruction.
-    3. For each view, estimate a 2D shift that aligns the sinogram view
-        to the corresponding forward-projected view using an image alignment method from OpenCV
-
-    Args:
-        ct_model (mt.TomographyModel): A CT model object that defined the CT geometry.
-        sino (numpy array or tensor): 3D sinogram data with shape (num_views, num_det_rows, num_det_channels).
-        recon_direct (numpy array or tensor): A preliminary 3D reconstruction of the sinogram.
-
-    Returns:
-        estimated_shifts (numpy.array): A (num_views, 2) array of per-view shift (y, x) in pixels.
-            Each shift specified how much the corresponding sinogram slice should be shifted to match forward projection.
-            Positive x shifts the view right. Positive y shifts the view down.
+    Returns ``(angles, shifts, failed)``: the rotation of each view in radians, in the convention
+    of ``correct_det_rotation``; the sampling offset of each view in pixels as ``(row, channel)``,
+    which is where a view's content sits relative to the reprojection once the rotation about the
+    detector center is taken out; and a boolean mask of the views whose fit failed, which hold zero.
     """
     import cv2
 
@@ -504,23 +508,146 @@ def _estimate_sino_view_offset(ct_model, sino, recon_direct):
         raise ValueError("Input recon shape does not match ct_model's recon shape.")
 
     sino_from_recon = ct_model.forward_project(recon_direct)
-
     filtered_sino = _sino_high_pass_filtering(sino)
     filtered_sino_from_recon = _sino_high_pass_filtering(sino_from_recon)
 
-    num_slices, num_rows, num_channels = sino.shape
-    estimated_shifts = np.zeros((num_slices, 2))
+    num_views, num_rows, num_cols = filtered_sino.shape
+    center = np.array([(num_rows - 1) / 2.0, (num_cols - 1) / 2.0])
+    motion = cv2.MOTION_EUCLIDEAN if rotation else cv2.MOTION_TRANSLATION
+    criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, _ECC_MAX_ITERATIONS, _ECC_EPS)
+    angles = np.zeros(num_views)
+    shifts = np.zeros((num_views, 2))
+    failed = np.zeros(num_views, dtype=bool)
+    for v in range(num_views):
+        template = np.ascontiguousarray(filtered_sino_from_recon[v], dtype=np.float32)
+        view = np.ascontiguousarray(filtered_sino[v], dtype=np.float32)
+        warp = np.eye(2, 3, dtype=np.float32)
+        try:
+            correlation, warp = cv2.findTransformECC(template, view, warp, motion, criteria)
+        except cv2.error:
+            failed[v] = True
+            continue
+        if not correlation >= _ECC_MIN_CORRELATION:
+            failed[v] = True
+            continue
+        # The warp maps a reprojection pixel (x, y) to the view pixel that holds the same content:
+        # view(R p + t) = reprojection(p), with R the rotation about the image corner.  Rewritten
+        # about the detector center, the translation becomes t + (R - I) center.
+        theta = math.atan2(warp[1, 0], warp[0, 0]) if rotation else 0.0
+        t = np.array([warp[1, 2], warp[0, 2]], dtype=np.float64)        # (row, channel)
+        rot = np.array([[math.cos(theta), math.sin(theta)], [-math.sin(theta), math.cos(theta)]])
+        angles[v] = theta
+        shifts[v] = t + rot @ center - center
+    return angles, shifts, failed
 
-    warp_matrix = np.eye(2, 3, dtype=np.float32)
-    for slice_index in range(num_slices):
-        sino_from_recon_view = np.asarray(filtered_sino_from_recon[slice_index, :, :], dtype=np.float32)
-        sino_view = np.asarray(filtered_sino[slice_index, :, :], dtype=np.float32)
-        cc, warp_matrix = cv2.findTransformECC(sino_from_recon_view, sino_view, warp_matrix,
-                                               cv2.MOTION_TRANSLATION)
-        estimated_shifts[slice_index, 0] = -warp_matrix[1, 2]
-        estimated_shifts[slice_index, 1] = -warp_matrix[0, 2]
 
-    return estimated_shifts
+def fit_det_alignment(ct_model, sino, recon_direct, rotation=False):
+    """Fit each view to the reprojection of a first reconstruction for the detector offsets and rotation.
+
+    Each view is compared with the forward projection of ``recon_direct``.  The transform that
+    aligns the two, a 2D shift and optionally a rotation about the detector center, is fit per view
+    on high-passed copies of both.  The median over views of the fitted offsets is the global value
+    of each offset parameter.  Each view's deviation from the median, and its rotation, are
+    corrections for the data.
+
+    Returns the two as dicts.  ``model_params`` holds values to set on the model with
+    ``set_params``: ``det_channel_offset`` and ``det_row_offset``, in ALU.  ``view_params`` holds
+    one array of length ``num_views`` per key, to apply to the data with
+    :func:`correct_det_alignment`: ``det_channel_offset`` and ``det_row_offset`` are the amount by
+    which each view's offset exceeds the model value, in ALU, and, when ``rotation`` is True,
+    ``det_rotation`` is the rotation to remove from each view, in radians, in the convention of
+    :func:`~mbirtorch.preprocess.correct_det_rotation`.
+
+    A view whose fit does not converge, or whose correlation with its reprojection stays weak, is
+    reported in a warning.  It is left out of the medians and gets a zero deviation and the median
+    rotation.  There is no warning on the spread of the per-view values, since per-view motion is
+    what the per-view values are for.
+
+    Args:
+        ct_model (TomographyModel): The model of the scan.  It is not changed.
+        sino (numpy array or tensor): Sinogram, shape (num_views, num_det_rows, num_det_channels).
+        recon_direct (numpy array or tensor): A first reconstruction of ``sino``, such as the output
+            of :meth:`~mbirtorch.TomographyModel.recon_direct`.
+        rotation (bool, optional): Fit a rotation about the detector center as well as a shift.
+            Defaults to False.
+
+    Returns:
+        tuple: ``(model_params, view_params)``, the two dicts described above.
+    """
+    angles, shifts, failed = _fit_views(ct_model, sino, recon_direct, rotation)
+    num_views = len(angles)
+    if failed.all():
+        raise ValueError("No view could be aligned with its reprojection.")
+    if failed.any():
+        warnings.warn(f"The alignment fit failed for {int(failed.sum())} of {num_views} views, "
+                      f"starting with view {int(np.flatnonzero(failed)[0])}.  Each gets no per-view "
+                      "correction and the median rotation.")
+
+    delta_row, delta_channel = (float(d) for d in ct_model.get_params(['delta_det_row', 'delta_det_channel']))
+    row_offset, channel_offset = (float(d) for d in ct_model.get_params(['det_row_offset', 'det_channel_offset']))
+    # A view whose content sits s pixels higher than the reprojection has an offset s * pitch
+    # larger than the model's.
+    row_values = row_offset + shifts[:, 0] * delta_row
+    channel_values = channel_offset + shifts[:, 1] * delta_channel
+    good = ~failed
+    model_params = {'det_channel_offset': float(np.median(channel_values[good])),
+                    'det_row_offset': float(np.median(row_values[good]))}
+    view_params = {'det_channel_offset': np.where(good, channel_values - model_params['det_channel_offset'], 0.0),
+                   'det_row_offset': np.where(good, row_values - model_params['det_row_offset'], 0.0)}
+    if rotation:
+        view_params['det_rotation'] = np.where(good, angles, np.median(angles[good]))
+    return model_params, view_params
+
+
+def correct_det_alignment(ct_model, sino, view_params, batch_size=30, devices=None):
+    """Resample each view of a sinogram by the per-view corrections from :func:`fit_det_alignment`.
+
+    Each view is rotated about the detector center by its ``det_rotation`` and moved by its
+    ``det_channel_offset`` and ``det_row_offset`` deviations, converted from ALU to pixels with the
+    model's pixel pitches, in one bicubic resampling.  A sample from outside the detector takes the
+    nearest edge value.  Any key may be left out, and a missing key means no correction of that kind.
+    The model supplies only the pixel pitches and is not changed.
+
+    Args:
+        ct_model (TomographyModel): The model of the scan.
+        sino (numpy array or tensor): Sinogram, shape (num_views, num_det_rows, num_det_channels).
+        view_params (dict): Arrays of length ``num_views`` under any of the keys
+            ``det_channel_offset`` and ``det_row_offset`` (ALU) and ``det_rotation`` (radians), as
+            :func:`fit_det_alignment` returns them.
+        batch_size (int, optional): Views resampled at a time.  Defaults to 30.
+        devices (sequence or None, optional): The first of these is the device used.  None uses the
+            first CUDA device, or the default device when there is none.  Defaults to None.
+
+    Returns:
+        numpy.ndarray: The corrected sinogram, the shape of ``sino``.
+    """
+    _pipeline.reject_shards('correct_det_alignment', sino=sino)
+    sino = torch.as_tensor(np.asarray(sino)) if not isinstance(sino, torch.Tensor) else sino
+    num_views = sino.shape[0]
+    delta_row, delta_channel = (float(d) for d in ct_model.get_params(['delta_det_row', 'delta_det_channel']))
+
+    def per_view(key, scale):
+        values = view_params.get(key)
+        if values is None:
+            return np.zeros(num_views)
+        values = np.asarray(values, dtype=np.float64).reshape(-1)
+        if values.shape != (num_views,):
+            raise ValueError(f"view_params['{key}'] must have one value per view, got shape {values.shape}.")
+        return values / scale
+
+    angles = per_view('det_rotation', 1.0)
+    offsets = np.stack([per_view('det_row_offset', delta_row), per_view('det_channel_offset', delta_channel)], axis=1)
+
+    device = torch.device(_pipeline.permitted_devices(devices)[0])
+    output = np.empty(tuple(sino.shape), dtype=np.float32 if sino.dtype == torch.float32 else np.float64)
+    with torch.no_grad():
+        for lo in range(0, num_views, batch_size):
+            hi = min(lo + batch_size, num_views)
+            batch = sino[lo:hi].to(device)
+            out = _resample_views(batch, torch.as_tensor(angles[lo:hi], dtype=torch.float32, device=device),
+                                  torch.as_tensor(offsets[lo:hi], dtype=torch.float32, device=device))
+            output[lo:hi] = out.cpu().numpy()
+    return output
 
 
 def _translate_views_bilinear(sino, shifts):
@@ -563,9 +690,14 @@ def align_sino_views(ct_model, sino, recon_direct):
     """
     Shift each view of a sinogram to align it with the forward projection of a first reconstruction.
 
+    Deprecated.  Use :func:`fit_det_alignment` and :func:`correct_det_alignment` instead, which also
+    put the global part of the shift into the model and can fit a detector rotation.  This function
+    warns and will be removed in a later release.
+
     A 2D shift is estimated for each view by comparing it with the forward projection of
     ``recon_direct``, and the view is shifted by that amount.  This corrects small per-view motion
-    of the object.
+    of the object.  The whole shift of each view is applied to the data, and the model is left as it
+    is.
 
     Args:
         ct_model (TomographyModel): The model of the scan.
@@ -576,6 +708,10 @@ def align_sino_views(ct_model, sino, recon_direct):
     Returns:
         numpy.ndarray: The aligned sinogram, the shape of ``sino``.
     """
-    estimated_shifts = _estimate_sino_view_offset(ct_model, sino, recon_direct)
-
-    return _translate_views_bilinear(sino, estimated_shifts).cpu().numpy()
+    warnings.warn("align_sino_views is deprecated; use fit_det_alignment and correct_det_alignment.",
+                  DeprecationWarning, stacklevel=2)
+    model_params, view_params = fit_det_alignment(ct_model, sino, recon_direct, rotation=False)
+    # The model keeps its offsets, so each view's correction includes the global part.
+    for key in ('det_channel_offset', 'det_row_offset'):
+        view_params[key] = view_params[key] + (model_params[key] - float(ct_model.get_params(key)))
+    return correct_det_alignment(ct_model, sino, view_params)

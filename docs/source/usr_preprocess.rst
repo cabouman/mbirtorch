@@ -126,17 +126,30 @@ Calibrating geometry
 --------------------
 
 ``estimate_det_channel_offset`` finds the center of rotation, ``det_channel_offset``, from the
-sinogram, for a scan whose metadata got it wrong.  ``align_sino_views`` removes small per-view
-shifts of the object, using a first reconstruction.  Set the offset first, then align:
+sinogram alone, for a scan whose metadata got it wrong.  It compares each view with the view
+opposite to it, so it needs a scan over a full rotation.  On any other scan it warns and returns
+the model's current value.
+
+``fit_det_alignment`` needs a first reconstruction, which is the costly part.  It fits each view
+to the forward projection of that reconstruction and returns two dicts: ``model_params``, the detector offsets to set on the model, and ``view_params``,
+the per-view corrections to apply to the data, which are each view's deviation from the global
+offsets and, with ``rotation=True``, its detector rotation.  ``correct_det_alignment`` resamples
+the views by those corrections, once, with bicubic interpolation.  Set the channel offset first,
+then estimate, update the model, and resample:
 
 .. code-block:: python
 
     ct_model.set_params(det_channel_offset=mtp.estimate_det_channel_offset(ct_model, sino))
-    sino = mtp.align_sino_views(ct_model, sino, ct_model.recon_direct(sino))
+    model_params, view_params = mtp.fit_det_alignment(ct_model, sino, ct_model.recon_direct(sino),
+                                                           rotation=True)
+    ct_model.set_params(**model_params)
+    sino = mtp.correct_det_alignment(ct_model, sino, view_params)
     recon, recon_dict = ct_model.recon(sino)
 
-The offset estimate compares each view with the view opposite to it, so it needs a scan over a
-full rotation.  On any other scan it warns and returns the model's current value.
+Each step can be skipped.  Leaving out the last line corrects the model and leaves the data as it
+is.  Passing a dict with only the ``det_rotation`` key removes the rotation and nothing else.  A
+second round, with a reconstruction from the corrected data, refines the per-view corrections.
 
-.. autofunction:: align_sino_views
+.. autofunction:: fit_det_alignment
+.. autofunction:: correct_det_alignment
 .. autofunction:: estimate_det_channel_offset
