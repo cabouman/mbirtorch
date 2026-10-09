@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import mbirtorch
 import mbirtorch.preprocess as mtp
+from . import _loader_utils as lu
 
 
 def get_sino_and_model(scan_dir, *, downsample_factor=(1, 1), subsample_view_factor=1, crop_pixels_sides=0,
@@ -63,7 +64,7 @@ def get_sino_and_model(scan_dir, *, downsample_factor=(1, 1), subsample_view_fac
         crop_pixels_sides=crop_pixels_sides, crop_pixels_top=crop_pixels_top, crop_pixels_bottom=crop_pixels_bottom,
         verbose=verbose, min_transmission=min_transmission, background_offset=background_offset,
         sinogram_path=sinogram_path, num_workers=num_workers, batch_size=batch_size)
-    sino, model = mtp.finalize_model(sino, required_params, optional_params, auto_crop=auto_crop)
+    sino, model = lu.finalize_model(sino, required_params, optional_params, auto_crop=auto_crop)
     if verbose > 0:
         print('\n########## Model parameters')
         model.print_params()
@@ -256,7 +257,7 @@ def convert_volumax_to_mbirtorch_params(params, geometry, downsample_factor=(1, 
     num_det_rows, num_det_channels = params['num_det_rows'], params['num_det_channels']
     delta_det_row, delta_det_channel = geometry['delta_det_row'], geometry['delta_det_channel']
     det_row_offset, det_channel_offset = geometry['det_row_offset'], geometry['det_channel_offset_metadata']
-    num_det_rows, num_det_channels, det_row_offset, det_channel_offset = mtp.apply_config_crop(
+    num_det_rows, num_det_channels, det_row_offset, det_channel_offset = lu.apply_config_crop(
         num_det_rows, num_det_channels, det_row_offset, det_channel_offset, delta_det_row, delta_det_channel,
         crop_pixels_top=crop_pixels_top, crop_pixels_bottom=crop_pixels_bottom, crop_pixels_sides=crop_pixels_sides)
     # Block averaging drops the leftover rows and channels at the bottom and right, which moves the detector center
@@ -581,9 +582,9 @@ def volumax_vectors(meta, view_ids=None, axis_vector=(0.0, 0.0, -1.0)):
     O = np.nanmean(meta['object'], axis=0)
     U = np.nanmean(meta['span_u'], axis=0)
     V = np.nanmean(meta['span_v'], axis=0)
-    r_h = mtp.unit_vector(U)
-    v_hat = mtp.unit_vector(V)
-    r_n = mtp.unit_vector(np.cross(r_h, v_hat))
+    r_h = lu.unit_vector(U)
+    v_hat = lu.unit_vector(V)
+    r_n = lu.unit_vector(np.cross(r_h, v_hat))
     if np.dot(r_n, D - S) < 0:
         r_n = -r_n
     r_v = np.cross(r_n, r_h)
@@ -591,7 +592,7 @@ def volumax_vectors(meta, view_ids=None, axis_vector=(0.0, 0.0, -1.0)):
         warnings.warn('The detector span vectors describe a mirrored image: the rows increase opposite to '
                       'r_n x r_h, which the cone-beam model assumes.  The row offset, the detector rotation, and the '
                       'rotation direction will have the wrong sign unless the images are flipped.')
-    r_a = mtp.unit_vector(np.asarray(axis_vector, dtype=np.float64))
+    r_a = lu.unit_vector(np.asarray(axis_vector, dtype=np.float64))
     if np.dot(r_a, r_v) < 0:
         r_a = -r_a
     jitter = {k: float(np.nanmax(np.linalg.norm(meta[k] - meta[k].mean(axis=0), axis=1)))

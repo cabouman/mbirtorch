@@ -4,6 +4,7 @@ import numpy as np
 import warnings
 import mbirtorch
 import mbirtorch.preprocess as mtp
+from . import _loader_utils as lu
 import pprint
 import olefile
 from . import _xradia_ole
@@ -39,7 +40,7 @@ def get_sino_and_model(dataset_dir, *, downsample_factor=(1, 1), subsample_view_
         auto_crop (bool, optional): If True, remove the blank margins of the sinogram and shrink the
             reconstruction to match.  Defaults to False.
         det_rotation (float, optional): Detector rotation in radians, removed from every view.  Use
-            the value from :func:`~mbirtorch.preprocess.geometry_calibration.estimate_det_rotation`.
+            the value from :func:`~mbirtorch.preprocess.estimate_det_rotation`.
             Defaults to 0.0.
         verbose (int, optional): 0 prints nothing, 1 prints progress.  Defaults to 1.
 
@@ -59,7 +60,7 @@ def get_sino_and_model(dataset_dir, *, downsample_factor=(1, 1), subsample_view_
         crop_pixels_sides=crop_pixels_sides, crop_pixels_top=crop_pixels_top,
         crop_pixels_bottom=crop_pixels_bottom, alu_unit=alu_unit, bg_option=bg_option,
         zinger_correction=zinger_correction, det_rotation=det_rotation, verbose=verbose)
-    return mtp.finalize_model(sino, required_params, optional_params, auto_crop=auto_crop)
+    return lu.finalize_model(sino, required_params, optional_params, auto_crop=auto_crop)
 
 
 def _compute_sino_and_params(dataset_dir, downsample_factor=(1, 1), subsample_view_factor=1, crop_pixels_sides=0, crop_pixels_top=0, crop_pixels_bottom=0, alu_unit='mm', bg_option="global", zinger_correction=True, det_rotation=0.0, verbose=1):
@@ -314,11 +315,11 @@ def convert_zeiss_to_mbirtorch_params(zeiss_params, downsample_factor=(1, 1), cr
     # One ALU is defined as one unit of alu_unit.
     alu_value = 1
 
-    source_iso_dist = mtp.to_alu(source_iso_dist, source_iso_dist_unit, alu_unit)
-    iso_det_dist = mtp.to_alu(iso_det_dist, iso_det_dist_unit, alu_unit)
-    delta_det_channel = mtp.to_alu(delta_det_channel, delta_det_channel_unit, alu_unit)
-    delta_det_row = mtp.to_alu(delta_det_row, delta_det_row_unit, alu_unit)
-    iso_pixel_pitch = mtp.to_alu(iso_pixel_pitch, iso_pixel_pitch_unit, alu_unit)
+    source_iso_dist = lu.to_alu(source_iso_dist, source_iso_dist_unit, alu_unit)
+    iso_det_dist = lu.to_alu(iso_det_dist, iso_det_dist_unit, alu_unit)
+    delta_det_channel = lu.to_alu(delta_det_channel, delta_det_channel_unit, alu_unit)
+    delta_det_row = lu.to_alu(delta_det_row, delta_det_row_unit, alu_unit)
+    iso_pixel_pitch = lu.to_alu(iso_pixel_pitch, iso_pixel_pitch_unit, alu_unit)
 
     source_detector_dist = source_iso_dist + iso_det_dist
 
@@ -343,7 +344,7 @@ def convert_zeiss_to_mbirtorch_params(zeiss_params, downsample_factor=(1, 1), cr
     det_row_offset *= delta_det_row
 
     # The crop is in raw detector pixels, and the offsets are in ALU.  Downsampling is applied afterward.
-    num_det_rows, num_det_channels, det_row_offset, det_channel_offset = mtp.apply_config_crop(
+    num_det_rows, num_det_channels, det_row_offset, det_channel_offset = lu.apply_config_crop(
         num_det_rows, num_det_channels, det_row_offset, det_channel_offset, delta_det_row, delta_det_channel,
         crop_pixels_top=crop_pixels_top, crop_pixels_bottom=crop_pixels_bottom, crop_pixels_sides=crop_pixels_sides)
 
@@ -631,7 +632,7 @@ def correct_sino_shifts(sino, zeiss_params, downsample_factor, subsample_view_fa
     else:
         sino_pad = sino
 
-    from .utilities import _translate_views_bilinear
+    from .geometry_calibration import _translate_views_bilinear
     shifts = np.stack([sino_y_offset, sino_x_offset], axis=1)
     corrected_sino = _translate_views_bilinear(sino_pad, shifts).cpu().numpy()
 

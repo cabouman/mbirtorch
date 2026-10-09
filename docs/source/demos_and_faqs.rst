@@ -148,10 +148,8 @@ You can also increase the assumed SNR by setting the parameter ``snr_db=35`` or 
 If the reconstruction remains blurry, it is often the case that some geometry parameter is incorrectly set for your data.
 A common problem is an incorrect center of rotation, which is the parameter ``det_channel_offset``.
 You can estimate that parameter from the sinogram with
-:func:`~mbirtorch.preprocess.geometry_calibration.estimate_det_channel_offset`, or you can reconstruct one slice per
-candidate value with :func:`~mbirtorch.preprocess.geometry_calibration.parameter_sweep` and choose the value by eye.
-The next thing to check is the rotation direction, which
-:func:`~mbirtorch.preprocess.geometry_calibration.check_rotation_direction` decides from the sinogram.
+:func:`~mbirtorch.preprocess.estimate_det_channel_offset`.
+The next thing to check is the rotation direction.
 A blurry cone beam reconstruction can also come from an incorrect ``source_detector_dist`` or ``source_iso_dist``.
 
 Q: Why does my reconstruction have artifacts?
@@ -168,16 +166,13 @@ The scanner loaders in ``mbirtorch.preprocess`` (see :ref:`ScannerLoaders`) do t
 
 In cone-beam scans, it is sometimes the case that the rotation direction is reversed.
 The symptom is a reconstruction that is subtly warped, with shapes distorted and the top and
-bottom of the object mirrored.  The function
-:func:`~mbirtorch.preprocess.geometry_calibration.check_rotation_direction` decides the direction from the sinogram
-and reports the margin between the two answers.  You can also correct the direction by hand, by taking the negative
-of your view angles, or equivalently by reversing their order with ``angles[::-1]``.
+bottom of the object mirrored.  Correct the direction by taking the negative of your view angles, or
+equivalently by reversing their order with ``angles[::-1]``.
 
 A common artifact is rings near the center of the reconstruction that are generated when the center-of-rotation is
 not in the center of the detector.  The parameter that repositions the center-of-rotation is ``det_channel_offset``.
-Estimate it from the sinogram with :func:`~mbirtorch.preprocess.geometry_calibration.estimate_det_channel_offset`,
-or choose it from the slices that :func:`~mbirtorch.preprocess.geometry_calibration.parameter_sweep` reconstructs,
-and apply it with :func:`~mbirtorch.preprocess.geometry_calibration.apply_calibration`.
+Estimate it from the sinogram with :func:`~mbirtorch.preprocess.estimate_det_channel_offset`
+and set it with ``ct_model.set_params(det_channel_offset=...)``.
 
 If your reconstruction is blurry, see the FAQ above.
 

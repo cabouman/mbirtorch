@@ -5,6 +5,7 @@ import numpy as np
 import warnings
 import mbirtorch
 import mbirtorch.preprocess as mtp
+from . import _loader_utils as lu
 import glob
 import pprint
 pp = pprint.PrettyPrinter(indent=4)
@@ -53,7 +54,7 @@ def get_sino_and_model(dataset_dir, *, downsample_factor=(1, 1), subsample_view_
         dataset_dir, downsample_factor=downsample_factor, subsample_view_factor=subsample_view_factor,
         crop_pixels_sides=crop_pixels_sides, crop_pixels_top=crop_pixels_top,
         crop_pixels_bottom=crop_pixels_bottom, verbose=verbose, offset_correction=offset_correction)
-    return mtp.finalize_model(sino, required_params, optional_params, auto_crop=auto_crop)
+    return lu.finalize_model(sino, required_params, optional_params, auto_crop=auto_crop)
 
 
 def _compute_sino_and_params(dataset_dir, downsample_factor=(1, 1), subsample_view_factor=1,
@@ -280,9 +281,9 @@ def load_scans_and_params(dataset_dir, view_id_start=0, view_id_end=None, subsam
         print(f"Pixels to crop from the border of each view = {max_crop}")
         print("############ End NSI geometry parameters ############")
 
-    blank_scan = np.expand_dims(mtp.read_tif_img(blank_scan_path), axis=0)
+    blank_scan = np.expand_dims(lu.read_tif_img(blank_scan_path), axis=0)
     if dark_scan_path is not None:
-        dark_scan = np.expand_dims(mtp.read_tif_img(dark_scan_path), axis=0)
+        dark_scan = np.expand_dims(lu.read_tif_img(dark_scan_path), axis=0)
     else:
         dark_scan = np.zeros(blank_scan.shape)
 
@@ -291,7 +292,7 @@ def load_scans_and_params(dataset_dir, view_id_start=0, view_id_end=None, subsam
     view_ids = np.arange(start=view_id_start, stop=view_id_end, step=subsample_view_factor, dtype=np.int32)
     if verbose > 0:
         print('Loading {} object scans from disk.'.format(len(view_ids)))
-    obj_scan = mtp.read_tif_stack_dir(obj_scan_dir, view_ids)
+    obj_scan = lu.read_tif_stack_dir(obj_scan_dir, view_ids)
     if verbose > 0:
         print('Scans loaded.')
 
@@ -374,7 +375,7 @@ def convert_nsi_to_mbirtorch_params(nsi_params, downsample_factor=(1, 1), crop_p
     recon_slice_offset = - det_row_offset / magnification
 
     # The crop is in raw detector pixels, and the offsets are in ALU.  Downsampling is applied afterward.
-    num_det_rows, num_det_channels, det_row_offset, det_channel_offset = mtp.apply_config_crop(
+    num_det_rows, num_det_channels, det_row_offset, det_channel_offset = lu.apply_config_crop(
         num_det_rows, num_det_channels, det_row_offset, det_channel_offset, delta_det_row, delta_det_channel,
         crop_pixels_top=crop_pixels_top, crop_pixels_bottom=crop_pixels_bottom, crop_pixels_sides=crop_pixels_sides)
 
@@ -558,7 +559,7 @@ def calc_det_rotation(r_a, r_n, r_h, r_v):
     Returns:
         float number specifying the angle between the rotation axis and the detector columns in units of radians.
     """
-    r_a_p = mtp.unit_vector(r_a - mtp.project_vector_to_vector(r_a, r_n))
+    r_a_p = lu.unit_vector(r_a - lu.project_vector_to_vector(r_a, r_n))
     det_rotation = -np.arctan(np.dot(r_a_p, r_h)/np.dot(r_a_p, r_v))
     return det_rotation
 
@@ -579,14 +580,14 @@ def calc_source_detector_params(r_a, r_n, r_h, r_s, r_r):
         - **magnification** (float): Magnification of the cone-beam geometry defined as
             (source to detector distance)/(source to center-of-rotation distance).
     """
-    r_n = mtp.unit_vector(r_n)      # make sure r_n is normalized
+    r_n = lu.unit_vector(r_n)      # make sure r_n is normalized
     r_v = np.cross(r_n, r_h)    # r_v = r_n x r_h
 
     # r_s_r points from the source to the center of rotation along the source to detector line.
-    r_s_r = mtp.project_vector_to_vector(-r_s, r_n) # project -r_s to r_n
+    r_s_r = lu.project_vector_to_vector(-r_s, r_n) # project -r_s to r_n
 
     # r_s_d points from the source to the detector along the source to detector line.
-    r_s_d = mtp.project_vector_to_vector(r_r-r_s, r_n)
+    r_s_d = lu.project_vector_to_vector(r_r-r_s, r_n)
 
     source_detector_dist = np.linalg.norm(r_s_d) # ||r_s_d||
     source_iso_dist = np.linalg.norm(r_s_r) # ||r_s_r||
@@ -613,8 +614,8 @@ def calc_row_channel_params(r_a, r_n, r_h, r_s, r_r, delta_det_channel, delta_de
         - **det_channel_offset** (float): Distance from center of detector to the source-detector line along a row.
         - **det_row_offset** (float): Distance from center of detector to the source-detector line along a column.
     """
-    r_n = mtp.unit_vector(r_n) # make sure r_n is normalized
-    r_h = mtp.unit_vector(r_h) # make sure r_h is normalized
+    r_n = lu.unit_vector(r_n) # make sure r_n is normalized
+    r_h = lu.unit_vector(r_h) # make sure r_h is normalized
     r_v = np.cross(r_n, r_h) # r_v = r_n x r_h
 
     # c_v points from the center of the detector to the first row and column along the detector columns.
@@ -624,10 +625,10 @@ def calc_row_channel_params(r_a, r_n, r_h, r_s, r_r, delta_det_channel, delta_de
     # r_s_r points from the source to the first detector row and column.
     r_s_r = r_r - r_s
     # r_delta points from the source to detector line to the center of the detector.
-    r_delta = r_s_r - mtp.project_vector_to_vector(r_s_r, r_n) + c_v + c_h
+    r_delta = r_s_r - lu.project_vector_to_vector(r_s_r, r_n) + c_v + c_h
     det_channel_offset = -np.dot(r_delta, r_h)
     det_row_offset = -np.dot(r_delta, r_v)
-    r_a = mtp.unit_vector(r_a)  # make sure r_a is normalized
+    r_a = lu.unit_vector(r_a)  # make sure r_a is normalized
     rotation_offset = np.dot(r_s, np.cross(r_n, r_a))
     det_channel_offset += rotation_offset*magnification
     return det_channel_offset, det_row_offset

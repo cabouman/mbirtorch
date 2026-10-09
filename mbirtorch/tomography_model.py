@@ -472,8 +472,8 @@ class TomographyModel(ParameterHandler):
             >>> mbirtorch.slice_viewer(recon)
         """
         import functools
-        from .preprocess.mar import correct_sino_plastic_metal
-        from .preprocess.segmentation import segment_plastic_metal
+        from .preprocess.beam_hardening import correct_sino_plastic_metal
+        from .preprocess.recon_utils import segment_plastic_metal
         from .utilities import merge_log_files
         from .view_utils import slice_viewer
 

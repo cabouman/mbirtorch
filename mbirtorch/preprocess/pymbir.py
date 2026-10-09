@@ -31,13 +31,13 @@ def get_sino_and_model(filename, *, bh_correction=True, auto_crop=False, subsamp
             weights = mbirtorch.gen_weights(sino, weight_type='transmission_root')
             recon, recon_dict = model.recon(sino, weights=weights)
     """
-    import mbirtorch.preprocess as mtp
+    from . import _loader_utils as lu
     sino, required_params, optional_params = _compute_sino_and_params(filename, bh_correction=bh_correction)
     if subsample_view_factor > 1:
         sino = sino[::subsample_view_factor]
         required_params['angles'] = required_params['angles'][::subsample_view_factor]
         required_params['sinogram_shape'] = sino.shape
-    return mtp.finalize_model(sino, required_params, optional_params, auto_crop=auto_crop)
+    return lu.finalize_model(sino, required_params, optional_params, auto_crop=auto_crop)
 
 
 def _compute_sino_and_params(filename, bh_correction=True):

@@ -131,8 +131,8 @@ def _phantom_devices(devices):
     every visible CUDA device, capped by MBIRTORCH_NUM_DEVICES when that
     variable is set.  An explicit list overrides that default.
     """
-    from .preprocess import pipeline
-    return pipeline.permitted_devices(devices)
+    from .preprocess import _pipeline
+    return _pipeline.permitted_devices(devices)
 
 
 def _phantom_block_rows(band_shape, max_block_gb):

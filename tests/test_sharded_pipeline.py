@@ -53,7 +53,7 @@ def _sinogram():
 
 def _run_transmission(devices):
     obj, blank, dark, defective = _scans()
-    return mtp.compute_sino_transmission(obj, blank, dark, defective_pixel_array=defective,
+    return mtp.sinogram.compute_sino_transmission(obj, blank, dark, defective_pixel_array=defective,
                                          batch_size=4, devices=devices)
 
 
@@ -64,7 +64,7 @@ def _run_rotation(devices):
 
 def _run_downsample(devices):
     obj, blank, dark, defective = _scans()
-    return mtp.downsample_view_data(obj, blank, dark, (2, 2), defective_pixel_array=defective,
+    return mtp.sinogram.downsample_view_data(obj, blank, dark, (2, 2), defective_pixel_array=defective,
                                     batch_size=4, devices=devices)[0]
 
 

@@ -76,9 +76,8 @@ Correcting a sinogram
 
 .. currentmodule:: mbirtorch.preprocess
 
-These take the sinogram a scanner loader returns and give back a corrected one.  Beam hardening and stripe
-corrections are applied before the reconstruction.  View alignment needs a first reconstruction,
-so it comes after one.
+These take the sinogram a scanner loader returns and give back a corrected one, before the
+reconstruction.
 
 .. code-block:: python
 
@@ -91,7 +90,6 @@ so it comes after one.
 .. autofunction:: remove_sino_offset
 .. autofunction:: correct_background_offset
 .. autofunction:: correct_det_rotation
-.. autofunction:: align_sino_views
 
 
 Building a sinogram
@@ -114,7 +112,6 @@ scans and the scanner's parameters when you want to start from those.
 .. autofunction:: crop_view_data
 .. autofunction:: scan_to_sino
 .. autofunction:: correct_zinger_pixels
-.. autofunction:: finalize_model
 
 
 Working on a reconstruction
@@ -125,16 +122,13 @@ Working on a reconstruction
 .. autofunction:: multi_threshold_otsu
 
 
-Geometry calibration
+Calibrating geometry
 --------------------
 
-.. currentmodule:: mbirtorch.preprocess.geometry_calibration
-
-The ``geometry_calibration`` module estimates scan geometry from the sinogram itself.  Vendor
-metadata sometimes gets a geometry parameter wrong, and sometimes it leaves the parameter out.  The
-functions here estimate two such parameters from the data: the center of rotation, which is
-``det_channel_offset``, and the detector rotation in radians.  They also show the evidence behind
-each estimate.
+The two estimators here find two scan geometry parameters from the sinogram
+itself, for a scan whose metadata got them wrong or left them out: the center of rotation, which
+is ``det_channel_offset``, and the rotation of the detector about the optical axis, in radians.
+Each function returns one number and changes nothing.
 
 Run these functions after defective-pixel interpolation, background offset correction, and stripe
 removal, and before :func:`~mbirtorch.preprocess.align_sino_views`.  Stripe removal comes first
@@ -143,58 +137,23 @@ feature of the object.  Alignment comes last because it shifts each view on its 
 ``det_channel_offset`` looks like a per-view shift, so aligning first would remove part of the error
 that a calibration is meant to find.
 
-The automatic workflow estimates the channel offset, then the detector rotation at that offset, then
-the channel offset again at that rotation.  The two quantities are coupled, so the second estimate of
-the offset is the better one.  There is no single driver function yet, so the three calls are made in
-order:
+Estimate the channel offset and set it on the model, then estimate the rotation and remove it from
+the sinogram.  The rotation estimate uses the model's channel offset, so the offset comes first:
 
 .. code-block:: python
 
-    from mbirtorch.preprocess import geometry_calibration as gc
-
-    offset = gc.estimate_det_channel_offset(ct_model, sino)
-    rotation = gc.estimate_det_rotation(ct_model, sino, det_channel_offset=offset.value)
-    offset = gc.estimate_det_channel_offset(ct_model, sino, det_rotation=rotation.value)
-    ct_model, sino = gc.apply_calibration(ct_model, sino, [rotation, offset])
+    ct_model.set_params(det_channel_offset=mtp.estimate_det_channel_offset(ct_model, sino))
+    sino = mtp.correct_det_rotation(sino, mtp.estimate_det_rotation(ct_model, sino))
     recon, recon_dict = ct_model.recon(sino)
 
-The manual workflow reconstructs one slice per candidate value and lets you choose the value by eye.
-Use it for a scan the estimators refuse, and to check an estimate the automatic workflow made:
+The estimators accept a parallel-beam or a cone-beam scan over a full rotation.  Three kinds of
+input are refused with an error: a scan over less than a full rotation, a helical scan, and a
+multiaxis scan.  A sinogram that is divided across devices has to be gathered to the host first.
 
-.. code-block:: python
+When the scanner loader supplies a detector tilt, prefer it over the estimate, and check the slices
+far from the central plane before applying an estimate, because a detector rotation displaces
+those slices most.
 
-    import numpy as np
-    import mbirtorch
-    from mbirtorch.preprocess import geometry_calibration as gc
-
-    values = np.linspace(-4.0, 4.0, 17)
-    slices = gc.parameter_sweep(ct_model, sino, 'det_channel_offset', values)
-    mbirtorch.slice_viewer(slices, title='det_channel_offset sweep')
-    chosen = 8                                    # the index of the slice that looked best
-    ct_model.set_params(det_channel_offset=values[chosen])
-
-The estimators accept a parallel-beam or a cone-beam scan over a full rotation.  Four kinds of input
-are refused with an error: a scan over less than a full rotation, a helical scan, a multiaxis scan,
-and a sinogram that is already divided across devices.  A divided sinogram has to be gathered to the
-host first.  :func:`parameter_sweep` accepts any parallel-beam or cone-beam scan, but not a
-translation scan.
-
-When the scanner loader supplies a detector tilt, prefer it over the estimate, and check the slices far from
-the central plane before applying an estimate, because a detector rotation displaces those slices
-most.  Treat a rotation-direction answer that comes with a warning as undecided.
-
+.. autofunction:: align_sino_views
 .. autofunction:: estimate_det_channel_offset
 .. autofunction:: estimate_det_rotation
-.. autofunction:: check_rotation_direction
-.. autofunction:: conjugate_difference
-.. autofunction:: parameter_sweep
-.. autofunction:: apply_calibration
-.. autofunction:: build_reduced_problem
-.. autofunction:: reduce_sinogram
-
-.. The seven field names are excluded because the class docstring above documents each of them.
-   Without the exclusion, autodoc documents every field a second time as "Alias for field number n".
-
-.. autoclass:: CalibrationResult
-   :members:
-   :exclude-members: parameter, value, score, candidates, scores, method, reduction

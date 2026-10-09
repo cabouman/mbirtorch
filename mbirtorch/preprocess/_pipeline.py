@@ -1,6 +1,6 @@
 """Shared driver for the scan -> sinogram preprocessing pipeline.
 
-The per-stage transforms in :mod:`mbirtorch.preprocess.utilities` are pure device-tensor *kernels* (the
+The per-stage transforms in :mod:`mbirtorch.preprocess.sinogram` are pure device-tensor *kernels* (the
 math only).  This module owns the **single** copy of the batching + host<->device transfer +
 in-place-fill scaffolding used by ``compute_sino_transmission`` / ``downsample_view_data`` /
 ``correct_det_rotation`` and the fused ``scan_to_sino``.

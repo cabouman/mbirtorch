@@ -4,6 +4,7 @@ import numpy as np
 import warnings
 import mbirtorch as mt
 import mbirtorch.preprocess as mtp
+from . import _loader_utils as lu
 import pprint
 import olefile
 from . import _xradia_ole
@@ -30,7 +31,7 @@ def get_sino_and_model(dataset_dir, *, crop_pixels_sides=0, crop_pixels_top=0, c
         crop_pixels_bottom (int, optional): Pixels to crop from the bottom.  Defaults to 0.
         alu_unit (str, optional): The length unit of the model: 'um', 'mm', 'cm', or 'm'.  Defaults to 'mm'.
         det_rotation (float, optional): Detector rotation in radians, removed from every view.  Use
-            the value from :func:`~mbirtorch.preprocess.geometry_calibration.estimate_det_rotation`.
+            the value from :func:`~mbirtorch.preprocess.estimate_det_rotation`.
             Defaults to 0.0.
         verbose (int, optional): 0 prints nothing, 1 prints progress.  Defaults to 1.
 
@@ -49,7 +50,7 @@ def get_sino_and_model(dataset_dir, *, crop_pixels_sides=0, crop_pixels_top=0, c
         dataset_dir, crop_pixels_sides=crop_pixels_sides, crop_pixels_top=crop_pixels_top,
         crop_pixels_bottom=crop_pixels_bottom, alu_unit=alu_unit, det_rotation=det_rotation,
         verbose=verbose)
-    sino, model = mtp.finalize_model(sino, required_params, optional_params)
+    sino, model = lu.finalize_model(sino, required_params, optional_params)
     return sino, model, weights
 
 
@@ -286,14 +287,14 @@ def convert_zeiss_to_mbirtorch_params(zeiss_params, crop_pixels_sides=0, crop_pi
     # One ALU is defined as one unit of alu_unit.
     alu_value = 1
 
-    source_iso_dist = mtp.to_alu(source_iso_dist, source_iso_dist_unit, alu_unit)
-    iso_det_dist = mtp.to_alu(iso_det_dist, iso_det_dist_unit, alu_unit)
-    delta_det_channel = mtp.to_alu(delta_det_channel, delta_det_channel_unit, alu_unit)
-    delta_det_row = mtp.to_alu(delta_det_row, delta_det_row_unit, alu_unit)
-    iso_pixel_pitch = mtp.to_alu(iso_pixel_pitch, iso_pixel_pitch_unit, alu_unit)
-    object_x_positions = mtp.to_alu(object_x_positions, object_x_position_unit, alu_unit)
-    object_y_positions = mtp.to_alu(object_y_positions, object_y_position_unit, alu_unit)
-    object_z_positions = mtp.to_alu(object_z_positions, object_z_position_unit, alu_unit)
+    source_iso_dist = lu.to_alu(source_iso_dist, source_iso_dist_unit, alu_unit)
+    iso_det_dist = lu.to_alu(iso_det_dist, iso_det_dist_unit, alu_unit)
+    delta_det_channel = lu.to_alu(delta_det_channel, delta_det_channel_unit, alu_unit)
+    delta_det_row = lu.to_alu(delta_det_row, delta_det_row_unit, alu_unit)
+    iso_pixel_pitch = lu.to_alu(iso_pixel_pitch, iso_pixel_pitch_unit, alu_unit)
+    object_x_positions = lu.to_alu(object_x_positions, object_x_position_unit, alu_unit)
+    object_y_positions = lu.to_alu(object_y_positions, object_y_position_unit, alu_unit)
+    object_z_positions = lu.to_alu(object_z_positions, object_z_position_unit, alu_unit)
 
     source_detector_dist = source_iso_dist + iso_det_dist
 
@@ -316,7 +317,7 @@ def convert_zeiss_to_mbirtorch_params(zeiss_params, crop_pixels_sides=0, crop_pi
 
     # Translation CT has no downsampling, so the raw detector pitch is the final pitch.
     num_views = len(translation_vectors)
-    num_det_rows, num_det_channels, det_row_offset, det_channel_offset = mtp.apply_config_crop(
+    num_det_rows, num_det_channels, det_row_offset, det_channel_offset = lu.apply_config_crop(
         num_det_rows, num_det_channels, det_row_offset, det_channel_offset, delta_det_row, delta_det_channel,
         crop_pixels_top=crop_pixels_top, crop_pixels_bottom=crop_pixels_bottom, crop_pixels_sides=crop_pixels_sides)
 
