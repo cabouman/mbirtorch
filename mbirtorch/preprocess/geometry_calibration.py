@@ -393,28 +393,14 @@ def _estimate_offset_by_correlation(ct_model, sino, pairing_offset=None):
 def estimate_det_channel_offset(ct_model, sino):
     """Estimate ``det_channel_offset`` from the sinogram by comparing each view with its opposite.
 
-    In a scan over a full rotation every ray is measured twice, once from each side.  A voxel at
-    in-plane position x projects to channel ``(x + det_channel_offset) / delta_det_channel`` from
-    the detector center, and after a half rotation it projects to the mirrored position.  A view
-    and its mirrored opposite therefore differ by a shift of twice the offset.  For cone beam the
-    opposite of a channel lies at a view angle that depends on the fan angle, and the comparison
-    uses a band of rows around the central plane.
+    In a scan over a full rotation every ray is measured twice, once from each side, so a view and
+    its mirrored opposite differ by a shift of twice the channel offset.  The shift is found by
+    correlating high-passed profiles of the two over a band of rows at the central plane, as in
+    :func:`align_sino_views`, and refined to a fraction of a channel.  The function warns when the
+    match is weak.
 
-    The comparison follows :func:`align_sino_views`.  The rows of the band are averaged into one
-    profile per view, the mean is removed, and a Gaussian blur 15 channels wide is subtracted, so
-    that edges drive the estimate rather than slow variations.  Each profile is correlated with its
-    mirrored opposite over the channels the two cover in common at every integer shift within a
-    quarter of the detector width of the model's current value, the correlations are summed over
-    the views, and the peak is refined to a fraction of a channel by a parabola through its
-    neighbors and by a search over fractional shifts with cubic resampling.  For cone beam the
-    pairing is recomputed at the estimate and the search repeated.  The function warns when the
-    peak is weak, when the per-view peaks spread widely around it, or when the two sub-pixel
-    estimates disagree.
-
-    The method needs a parallel or cone-beam scan over a full rotation, so that every view has an
-    opposite view at the same axial position.  For any other scan, such as a short scan, a helical
-    scan, or a multiaxis scan, the function warns and returns the model's current value unchanged.
-    A sinogram in the divided device form is refused.
+    A scan without opposite views, such as a short scan, a helical scan, or a multiaxis scan, gets
+    a warning and the model's current value back unchanged.
 
     Args:
         ct_model (TomographyModel): the model of the scan.  Not modified.

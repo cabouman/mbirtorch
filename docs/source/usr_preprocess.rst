@@ -125,28 +125,18 @@ Working on a reconstruction
 Calibrating geometry
 --------------------
 
-``estimate_det_channel_offset`` finds the center of rotation, which is ``det_channel_offset``, from
-the sinogram itself, for a scan whose metadata got it wrong or left it out.  It returns one number
-and changes nothing.
-
-Run it after defective-pixel interpolation, background offset correction, and stripe
-removal, and before :func:`~mbirtorch.preprocess.align_sino_views`.  Stripe removal comes first
-because a gain stripe sits at a fixed channel, and a geometry estimate would take that stripe for a
-feature of the object.  Alignment comes last because it shifts each view on its own.  A wrong
-``det_channel_offset`` looks like a per-view shift, so aligning first would remove part of the error
-that a calibration is meant to find.
-
-Estimate the channel offset and set it on the model:
+``estimate_det_channel_offset`` finds the center of rotation, ``det_channel_offset``, from the
+sinogram, for a scan whose metadata got it wrong.  ``align_sino_views`` removes small per-view
+shifts of the object, using a first reconstruction.  Set the offset first, then align:
 
 .. code-block:: python
 
     ct_model.set_params(det_channel_offset=mtp.estimate_det_channel_offset(ct_model, sino))
+    sino = mtp.align_sino_views(ct_model, sino, ct_model.recon_direct(sino))
     recon, recon_dict = ct_model.recon(sino)
 
-The estimate compares each view with the view opposite to it, so it needs a parallel-beam or
-cone-beam scan over a full rotation.  For any other scan, such as a short scan, a helical scan, or
-a multiaxis scan, the function warns and returns the model's current ``det_channel_offset``
-unchanged.  A sinogram that is divided across devices has to be gathered to the host first.
+The offset estimate compares each view with the view opposite to it, so it needs a scan over a
+full rotation.  On any other scan it warns and returns the model's current value.
 
 .. autofunction:: align_sino_views
 .. autofunction:: estimate_det_channel_offset
