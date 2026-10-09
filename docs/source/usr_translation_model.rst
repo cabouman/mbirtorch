@@ -31,9 +31,11 @@ Constructor
 Reconstruction
 --------------
 
-``recon`` is the iterative reconstruction.  ``recon_fdk`` is the non-iterative reconstruction
-that ``recon`` uses as its starting point.
+``recon`` is the iterative reconstruction.  ``recon_tct`` is the non-iterative reconstruction
+derived for the translation geometry, and ``recon`` uses it as its starting point.  With the
+weights of :func:`mbirtorch.preprocess.zeiss_tct.get_sino_and_model`, ``recon_tct`` leaves out the
+dark border of the detector.
 
 .. automethod:: mbirtorch.TranslationModel.recon
 
-.. automethod:: mbirtorch.TranslationModel.recon_fdk
+.. automethod:: mbirtorch.TranslationModel.recon_tct

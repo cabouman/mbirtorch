@@ -1,6 +1,9 @@
-# This script reconstructs Translation CT BGA data from the Zeiss scanner with two direct methods:
-# the TCT direct reconstruction (TranslationModel.recon_tct_direct) and the FDK direct recon.
-# The setup follows mbirjax/experiments/translation/TCT_BGA_physical_exp.py.
+# This script reconstructs Translation CT BGA data from the Zeiss scanner with the TCT direct reconstruction
+# (TranslationModel.recon_tct) and with MBIR.  The setup follows mbirjax/experiments/translation/TCT_BGA_physical_exp.py.
+#
+# Usage: python TCT_BGA_direct_recon_exp.py [path or URL of purdue_BGA_xrm.tgz] [--direct-only]
+# The path defaults to the lab depot.  The option --direct-only skips MBIR, for example for a quick test on a
+# computer with a small GPU.
 
 import mbirtorch as mt
 import mbirtorch.preprocess as mtp
@@ -10,7 +13,7 @@ import sys
 import time
 
 
-def main(dataset_url="/depot/bouman/data/Translation/purdue_BGA_xrm.tgz"):
+def main(dataset_url="/depot/bouman/data/Translation/purdue_BGA_xrm.tgz", run_mbir=True):
     # Download (or copy) and extract data
     download_dir = "./purdue_BGA_data"
     dataset_dir = mt.download_and_extract(dataset_url, download_dir)
@@ -29,30 +32,34 @@ def main(dataset_url="/depot/bouman/data/Translation/purdue_BGA_xrm.tgz"):
     tct_model.set_params(qggmrf_nbr_wts=[0.1, 1, 1])
     tct_model.print_params()
 
-    # TCT direct reconstruction
-    t0 = time.time()
-    tct_direct_recon = tct_model.recon_tct_direct(sino, weights=weights)
-    print(f'TCT direct recon time: {time.time() - t0:.1f} s')
-
-    # FDK direct reconstruction
-    t0 = time.time()
-    fdk_recon, fdk_dict = tct_model.recon(sino, weights=weights, max_iterations=0)
-    print(f'FDK recon time: {time.time() - t0:.1f} s')
-
-    # Save reconstruction results
     output_path = './output/'  # path to store output recon
     os.makedirs(output_path, exist_ok=True)
-    mt.export_recon_hdf5(os.path.join(output_path, "TCT_BGA_tct_direct_recon.h5"), tct_direct_recon,
+
+    # TCT direct reconstruction.  The weights keep the dark border of the detector out of it.
+    t0 = time.time()
+    direct_recon = tct_model.recon_tct(sino, weights=weights)
+    print(f'TCT direct recon time: {time.time() - t0:.1f} s')
+    mt.export_recon_hdf5(os.path.join(output_path, "TCT_BGA_direct_recon.h5"), direct_recon,
                          recon_dict=None, top_margin=0, bottom_margin=0)
-    mt.export_recon_hdf5(os.path.join(output_path, "TCT_BGA_fdk_recon.h5"), fdk_recon, recon_dict=fdk_dict,
-                         top_margin=0, bottom_margin=0)
+    recons, data_dicts, titles = [direct_recon], [None], ['TCT direct recon']
+
+    # MBIR reconstruction
+    if run_mbir:
+        t0 = time.time()
+        mbir_recon, mbir_dict = tct_model.recon(sino, weights=weights, max_iterations=200,
+                                                stop_threshold_change_pct=0.2)
+        print(f'MBIR recon time: {time.time() - t0:.1f} s')
+        mt.export_recon_hdf5(os.path.join(output_path, "TCT_BGA_mbir_recon.h5"), mbir_recon, recon_dict=mbir_dict,
+                             top_margin=0, bottom_margin=0)
+        recons.append(mbir_recon)
+        data_dicts.append(mbir_dict)
+        titles.append('MBIR recon')
 
     # Display results
-    mt.slice_viewer(fdk_recon.transpose(0, 2, 1), np.asarray(tct_direct_recon).transpose(0, 2, 1),
-                    data_dicts=[fdk_dict, None], vmin=0, vmax=0.5,
-                    title='FDK recon (left) and TCT direct recon (right)', slice_axis=0)
+    mt.slice_viewer(*[np.asarray(recon).transpose(0, 2, 1) for recon in recons], data_dicts=data_dicts,
+                    vmin=0, vmax=0.5, title=' | '.join(titles), slice_axis=0)
 
 
 if __name__ == '__main__':
-    # Optional argument: path or URL of purdue_BGA_xrm.tgz (defaults to the lab depot path)
-    main(*sys.argv[1:2])
+    arguments = [a for a in sys.argv[1:] if a != '--direct-only']
+    main(*arguments[:1], run_mbir='--direct-only' not in sys.argv[1:])
