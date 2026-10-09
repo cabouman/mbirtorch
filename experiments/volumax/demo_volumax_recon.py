@@ -31,10 +31,9 @@ tube = metadata['acquisition']['tubeParameters']
 print(f'Tube: {tube["accelerationVoltageInKV"]} kV, {tube["sourceCurrentInMicroA"]} uA')
 
 # ----------------------------------------------------------------------------------------------
-# 2. Channel offset and detector rotation estimated from the sinogram
+# 2. Channel offset estimated from the sinogram
 # ----------------------------------------------------------------------------------------------
 ct_model.set_params(det_channel_offset=mtp.estimate_det_channel_offset(ct_model, sino))
-sino = mtp.correct_det_rotation(sino, mtp.estimate_det_rotation(ct_model, sino))
 
 # ----------------------------------------------------------------------------------------------
 # 3. Weights, regularization, and reconstruction

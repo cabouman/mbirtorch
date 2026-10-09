@@ -1,14 +1,13 @@
 """Geometry calibration from the sinogram.
 
-Two functions estimate scan geometry that the vendor metadata got wrong or left out: the detector
-channel offset, which sets the center of rotation, and the rotation of the detector about the
-optical axis.  Each returns one number and changes nothing.  The caller sets the offset with
-``set_params`` and removes the rotation with ``correct_det_rotation``.  The third function,
-``align_sino_views``, removes the small per-view shifts that remain after the geometry is set.
+``estimate_det_channel_offset`` estimates the detector channel offset, which sets the center of
+rotation, from the sinogram.  It returns one number and changes nothing; the caller sets it with
+``set_params``.  ``align_sino_views`` removes the small per-view shifts that remain after the
+geometry is set.
 
 The order of preprocessing matters.  Run in this order:
  1. defective-pixel interpolation, background offset correction, and stripe removal
- 2. the two estimators
+ 2. ``estimate_det_channel_offset``
  3. ``align_sino_views``.
 Stripe removal comes first because a gain stripe sits at a fixed channel, and a geometry estimate
 would take it for a feature of the object.  ``align_sino_views`` comes last because a wrong
@@ -27,29 +26,18 @@ from ..multiaxis_parallel import MultiAxisParallelModel
 from ..parallel_beam import ParallelBeamModel
 from . import _pipeline
 
-__all__ = ['estimate_det_channel_offset', 'estimate_det_rotation', 'align_sino_views']
+__all__ = ['estimate_det_channel_offset', 'align_sino_views']
 
 # This many views of the full sinogram are read per step when a band of rows is read.
 _READ_VIEW_BATCH = 64
 
-# The rotation estimate searches within this angle of zero, in radians.  A detector tilt is a small
-# correction, and the resampling that applies it degrades with the angle.
-_MAX_DET_ROTATION = math.radians(5.0)
-
 _NUM_COARSE = 11                      # candidates scored on the coarse grid of a search
 _NUM_ROWS = 16                        # detector rows compared, before the cone-beam limit
-_TRIM_FRACTION = 0.1                  # fraction of the worst view pairs dropped
-_EDGE_MARGIN = 4                      # channels excluded at each edge beyond the shift
 
 # A scan covers a full rotation when no gap between neighboring view angles exceeds both this
 # many times the median gap and this many radians.  A scan over a half rotation is refused.
 _MAX_GAP_RATIO = 3.0
 _MAX_GAP = math.radians(5.0)
-
-# The rotation search stops when its bracket is shorter than the first constant, in radians.
-# The second is an edge displacement in pixels, below which the function warns.
-_ROTATION_TOLERANCE = math.radians(0.005)
-_MIN_EDGE_DISPLACEMENT = 1.0
 
 
 # ── geometry checks ───────────────────────────────────────────────────────────────────────────────
@@ -87,7 +75,7 @@ def _angular_gaps(angles):
     return np.diff(np.append(wrapped, wrapped[0] + 2 * np.pi))
 
 
-def _unsuitable_reason(ct_model, parameter):
+def _unsuitable_reason(ct_model):
     """Why the opposite-view comparison cannot serve this scan, or None when it can.
 
     The comparison needs a parallel or cone-beam scan over a full rotation, so that every view has
@@ -104,8 +92,6 @@ def _unsuitable_reason(ct_model, parameter):
     if gaps.max() > max(_MAX_GAP_RATIO * np.median(gaps), _MAX_GAP):
         return (f'the views cover {math.degrees(2 * np.pi - gaps.max()):.1f} degrees with a gap of '
                 f'{math.degrees(gaps.max()):.1f} degrees, so not every view has an opposite view')
-    if parameter == 'det_rotation' and kind == 'cone' and ct_model.get_params('use_curved_detector'):
-        return 'a rotation cannot be estimated on a curved detector'
     return None
 
 
@@ -123,66 +109,6 @@ def _read_band(sino, view_indices, row_window, device):
             block = _pipeline._stage_batch(sino[view_indices[k0:k1], row_lo:row_hi, :], device)
             out[k0:k1] = block.to('cpu', torch.float32).numpy()
     return out
-
-
-def _rotation_row_margin(det_rotation, max_row_distance, num_channels):
-    """Rows beyond a window that a rotation of the detector can sample from.
-
-    An output pixel at row i and channel j reads the input at a row displaced by
-    ``(cos(a) - 1) * (i - center_row) + sin(a) * (j - center_col)``.  Over the detector's channels
-    that displacement is at most ``(1 - cos(a)) * |i - center_row| + |sin(a)| * num_channels / 2``.
-    The caller passes the largest ``|i - center_row|`` in its window.  One row is added for the
-    bilinear neighbor.
-    """
-    a = abs(float(det_rotation))
-    bound = (1.0 - math.cos(a)) * max_row_distance + math.sin(a) * num_channels / 2.0
-    return int(math.ceil(bound)) + 1
-
-
-def _rotated_band(sino, view_indices, row_window, device, det_rotation):
-    """The band ``row_window`` of the views ``view_indices``, rotated by ``det_rotation`` about the
-    full detector's center with cubic interpolation.
-
-    The band is read from the sinogram with a margin of rows on each side, so the rotation samples
-    nothing outside the rows it has, and it is cropped afterward.  The cubic kernel is used because
-    the bilinear one smooths the data by an amount that grows with the angle, which biases a search
-    over the angle toward its bounds on cone-beam data.
-    """
-    import cv2
-    num_rows, num_channels = sino.shape[1], sino.shape[2]
-    row_lo, row_hi = row_window
-    if det_rotation == 0.0:
-        return _read_band(sino, view_indices, row_window, device)
-    center_row = (num_rows - 1) / 2.0
-    margin = _rotation_row_margin(det_rotation, max(abs(row_lo - center_row), abs(row_hi - 1 - center_row)),
-                                  num_channels)
-    band_lo, band_hi = max(0, row_lo - margin), min(num_rows, row_hi + margin)
-    band = _read_band(sino, view_indices, (band_lo, band_hi), device)
-    matrix = cv2.getRotationMatrix2D(((num_channels - 1) / 2.0, center_row - band_lo),
-                                     math.degrees(det_rotation), 1.0)
-    out = np.empty((band.shape[0], row_hi - row_lo, num_channels), dtype=np.float32)
-    for i in range(band.shape[0]):
-        rotated = cv2.warpAffine(band[i], matrix, (num_channels, band.shape[1]), flags=cv2.INTER_CUBIC,
-                                 borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        out[i] = rotated[row_lo - band_lo:row_hi - band_lo]
-    return out
-
-
-def _fourier_shift_channels(array, shift, spectrum=None):
-    """Shift every row of ``array`` along its last axis by ``shift`` samples.
-
-    The shift is applied in the Fourier domain, which is exact for a band-limited signal.  It is
-    circular, so the samples that leave one end of a row enter at the other.  Positive shifts move
-    content toward higher channel indices.  A caller that shifts the same array many times passes
-    its precomputed ``spectrum``, the result of ``np.fft.rfft(array, axis=-1)``.
-    """
-    if shift == 0.0 and spectrum is None:
-        return array
-    num_channels = array.shape[-1]
-    if spectrum is None:
-        spectrum = np.fft.rfft(array, axis=-1)
-    phase = np.exp(-2j * np.pi * np.fft.rfftfreq(num_channels) * shift).astype(np.complex64)
-    return np.fft.irfft(spectrum * phase, n=num_channels, axis=-1).astype(np.float32)
 
 
 # ── the opposite-view comparison ──────────────────────────────────────────────────────────────────
@@ -283,10 +209,10 @@ class _ConjugatePairs:
         weight = np.mod(t - sorted_angles[low], 2 * np.pi) / gap
         return order[low], order[high], weight.astype(np.float32)
 
-    def bands(self, sino, det_rotation=0.0):
-        """The band of every view and the band of the partner views, rotated by ``det_rotation``."""
-        return (_rotated_band(sino, np.arange(self.num_views), self.row_window, self.device, det_rotation),
-                _rotated_band(sino, self.partner_indices, self.row_window, self.device, det_rotation))
+    def bands(self, sino):
+        """The band of every view and the band of the partner views."""
+        return (_read_band(sino, np.arange(self.num_views), self.row_window, self.device),
+                _read_band(sino, self.partner_indices, self.row_window, self.device))
 
     def pairs(self, bands):
         """The band of every view, and the mirrored opposite ray of every element of it.
@@ -310,52 +236,6 @@ class _ConjugatePairs:
             weight = self.partner_weight[i][:, None]
             opposites[i] = ((1.0 - weight) * low + weight * high).T
         return views, opposites
-
-    def channel_margin(self, max_abs_offset):
-        """Channels excluded at each edge of the comparison for offsets up to ``max_abs_offset``."""
-        return int(math.ceil(2.0 * abs(max_abs_offset) / self.delta)) + _EDGE_MARGIN
-
-    def prepare(self, views, opposites, margin):
-        """What the score needs from a pair set, computed once for every candidate.
-
-        Returns:
-            dict: the interior channel region, the views over it, their per-pair mean square, and
-            the spectrum of the opposites along the channel axis.
-        """
-        region = slice(margin, self.num_channels - margin)
-        if region.stop <= region.start:
-            raise ValueError(f'A margin of {margin} channels at each edge leaves none of the '
-                             f'{self.num_channels} channels to compare.  The margin follows the largest '
-                             'offset the search can reach; narrow the bounds or center them nearer zero.')
-        interior = np.ascontiguousarray(views[:, :, region], dtype=np.float32)
-        energy = np.mean(interior.astype(np.float64) ** 2, axis=(1, 2))
-        if not np.any(energy > 0.0):
-            raise ValueError('The compared band of the sinogram is zero, so no score exists.')
-        return {'region': region, 'views': interior, 'energy': energy,
-                'spectrum': np.fft.rfft(opposites, axis=-1)}
-
-    def per_pair(self, prepared, opposites, det_channel_offset):
-        """The mean squared difference between each view and its shifted opposites, per pair."""
-        shift = 2.0 * float(det_channel_offset) / self.delta
-        shifted = _fourier_shift_channels(opposites, shift, spectrum=prepared['spectrum'])
-        difference = prepared['views'] - shifted[:, :, prepared['region']]
-        return np.mean(difference.astype(np.float64) ** 2, axis=(1, 2))
-
-    def keep_set(self, prepared, opposites, det_channel_offset):
-        """The pairs kept by the trimmed mean: all but the fraction that agree worst at one offset,
-        with each pair's difference measured against its own energy, so that the views with the
-        most object in them are not the ones dropped.  The set is chosen once, so that every
-        candidate is scored on the same pairs."""
-        relative = self.per_pair(prepared, opposites, det_channel_offset) / np.maximum(prepared['energy'], 1e-30)
-        num_kept = max(1, int(round(relative.size * (1.0 - _TRIM_FRACTION))))
-        return np.sort(np.argsort(relative)[:num_kept])
-
-    def score(self, prepared, opposites, det_channel_offset, keep):
-        """The opposite-view score at one channel offset: the mean squared difference over the
-        kept pairs divided by the mean square of their views."""
-        per_pair = self.per_pair(prepared, opposites, det_channel_offset)
-        return float(per_pair[keep].mean() / prepared['energy'][keep].mean())
-
 
 def _search_minimum(score_fn, bounds, tolerance):
     """Find the minimum of a scalar score over ``bounds``.
@@ -406,8 +286,6 @@ def _search_minimum(score_fn, bounds, tolerance):
             evaluated[x2] = f2
     return min(evaluated, key=evaluated.get), notes
 
-
-# ── the estimators ────────────────────────────────────────────────────────────────────────────────
 
 # ── the channel offset ────────────────────────────────────────────────────────────────────────────
 
@@ -545,7 +423,7 @@ def estimate_det_channel_offset(ct_model, sino):
     Returns:
         float: the estimate in ALU, to set with ``ct_model.set_params(det_channel_offset=...)``.
     """
-    reason = _unsuitable_reason(ct_model, 'det_channel_offset')
+    reason = _unsuitable_reason(ct_model)
     if reason is not None:
         warnings.warn(f'estimate_det_channel_offset: {reason}, so det_channel_offset was left at the '
                       f'model\'s value.')
@@ -563,68 +441,6 @@ def estimate_det_channel_offset(ct_model, sino):
         warnings.warn(f'estimate_det_channel_offset: the two sub-pixel estimates differ by '
                       f'{abs(result["parabola"] - result["refined"]):.2f} channels.')
     return float(result['offset'])
-
-
-def estimate_det_rotation(ct_model, sino):
-    """Estimate the detector rotation, in radians, by comparing each view with its opposite.
-
-    A detector rotated about the optical axis records every view rotated by that angle, and
-    mirroring a view in channels reverses the sign of that rotation, so a view and its mirrored
-    opposite differ by twice the angle.  Each candidate angle is applied to a band of rows from
-    every view by cubic resampling about the detector center, the views are paired with their
-    opposites as in :func:`estimate_det_channel_offset`, and the candidate at which they agree best
-    is returned.  The comparison shifts the opposites by twice the model's ``det_channel_offset``,
-    so estimate and set the offset first.
-
-    The search covers five degrees on each side of zero.  Resampling smooths the band, so an
-    estimate that displaces the edge channels by less than about one pixel is uncertain, and the
-    function warns in that case.  When the scanner loader supplies a detector tilt, prefer it over
-    the estimate, and check the slices far from the central plane before applying an estimate,
-    because a rotation displaces those slices most.
-
-    The method needs a parallel or flat-detector cone-beam scan over a full rotation, so that every
-    view has an opposite view at the same axial position.  For any other scan the function warns
-    and returns zero, which leaves the sinogram unchanged.  A sinogram in the divided device form
-    is refused.
-
-    Args:
-        ct_model (TomographyModel): the model of the scan.  Not modified.
-        sino (ndarray or tensor): the sinogram.  Not modified.
-
-    Returns:
-        float: the angle in radians, to remove with
-        :func:`~mbirtorch.preprocess.correct_det_rotation`.
-    """
-    reason = _unsuitable_reason(ct_model, 'det_rotation')
-    if reason is not None:
-        warnings.warn(f'estimate_det_rotation: {reason}, so the rotation was left at zero.')
-        return 0.0
-    _sharding.reject_shards('estimate_det_rotation', sino=sino)
-    bounds = (-_MAX_DET_ROTATION, _MAX_DET_ROTATION)
-    problem = _ConjugatePairs(ct_model)
-    offset = problem.pairing_offset
-    margin = problem.channel_margin(offset)
-
-    # The pairs kept by the trimmed mean are chosen with no rotation applied, and every candidate
-    # is scored on that set.
-    views, opposites = problem.pairs(problem.bands(sino))
-    prepared = problem.prepare(views, opposites, margin)
-    keep = problem.keep_set(prepared, opposites, offset)
-
-    def score_at(det_rotation):
-        views, opposites = problem.pairs(problem.bands(sino, float(det_rotation)))
-        return problem.score(problem.prepare(views, opposites, margin), opposites, offset, keep)
-
-    best, notes = _search_minimum(score_at, bounds, _ROTATION_TOLERANCE)
-    edge_displacement = abs(best) * problem.num_channels / 2.0
-    if edge_displacement < _MIN_EDGE_DISPLACEMENT:
-        notes.append(f'the estimate displaces the edge channels by {edge_displacement:.2f} pixels, '
-                     'below the one pixel at which it is reliable.  Prefer a vendor tilt when the '
-                     'scanner loader supplies one, and check the slices far from the central plane '
-                     'before applying it')
-    for note in notes:
-        warnings.warn(f'estimate_det_rotation: {note}.')
-    return float(best)
 
 
 # ── view alignment ────────────────────────────────────────────────────────────────────────────────

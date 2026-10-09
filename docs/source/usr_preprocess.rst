@@ -125,37 +125,28 @@ Working on a reconstruction
 Calibrating geometry
 --------------------
 
-The two estimators here find two scan geometry parameters from the sinogram
-itself, for a scan whose metadata got them wrong or left them out: the center of rotation, which
-is ``det_channel_offset``, and the rotation of the detector about the optical axis, in radians.
-Each function returns one number and changes nothing.
+``estimate_det_channel_offset`` finds the center of rotation, which is ``det_channel_offset``, from
+the sinogram itself, for a scan whose metadata got it wrong or left it out.  It returns one number
+and changes nothing.
 
-Run these functions after defective-pixel interpolation, background offset correction, and stripe
+Run it after defective-pixel interpolation, background offset correction, and stripe
 removal, and before :func:`~mbirtorch.preprocess.align_sino_views`.  Stripe removal comes first
 because a gain stripe sits at a fixed channel, and a geometry estimate would take that stripe for a
 feature of the object.  Alignment comes last because it shifts each view on its own.  A wrong
 ``det_channel_offset`` looks like a per-view shift, so aligning first would remove part of the error
 that a calibration is meant to find.
 
-Estimate the channel offset and set it on the model, then estimate the rotation and remove it from
-the sinogram.  The rotation estimate uses the model's channel offset, so the offset comes first:
+Estimate the channel offset and set it on the model:
 
 .. code-block:: python
 
     ct_model.set_params(det_channel_offset=mtp.estimate_det_channel_offset(ct_model, sino))
-    sino = mtp.correct_det_rotation(sino, mtp.estimate_det_rotation(ct_model, sino))
     recon, recon_dict = ct_model.recon(sino)
 
-The estimators compare each view with the view opposite to it, so they need a parallel-beam or
+The estimate compares each view with the view opposite to it, so it needs a parallel-beam or
 cone-beam scan over a full rotation.  For any other scan, such as a short scan, a helical scan, or
-a multiaxis scan, each function warns and returns the unchanged value: the model's current
-``det_channel_offset``, or a rotation of zero.  A sinogram that is divided across devices has to
-be gathered to the host first.
-
-When the scanner loader supplies a detector tilt, prefer it over the estimate, and check the slices
-far from the central plane before applying an estimate, because a detector rotation displaces
-those slices most.
+a multiaxis scan, the function warns and returns the model's current ``det_channel_offset``
+unchanged.  A sinogram that is divided across devices has to be gathered to the host first.
 
 .. autofunction:: align_sino_views
 .. autofunction:: estimate_det_channel_offset
-.. autofunction:: estimate_det_rotation

@@ -30,8 +30,7 @@ def get_sino_and_model(dataset_dir, *, crop_pixels_sides=0, crop_pixels_top=0, c
         crop_pixels_top (int, optional): Pixels to crop from the top.  Defaults to 0.
         crop_pixels_bottom (int, optional): Pixels to crop from the bottom.  Defaults to 0.
         alu_unit (str, optional): The length unit of the model: 'um', 'mm', 'cm', or 'm'.  Defaults to 'mm'.
-        det_rotation (float, optional): Detector rotation in radians, removed from every view.  Use
-            the value from :func:`~mbirtorch.preprocess.estimate_det_rotation`.
+        det_rotation (float, optional): Detector rotation in radians, removed from every view.
             Defaults to 0.0.
         verbose (int, optional): 0 prints nothing, 1 prints progress.  Defaults to 1.
 

@@ -39,8 +39,7 @@ def get_sino_and_model(dataset_dir, *, downsample_factor=(1, 1), subsample_view_
             :func:`~mbirtorch.preprocess.correct_zinger_pixels`.  Defaults to True.
         auto_crop (bool, optional): If True, remove the blank margins of the sinogram and shrink the
             reconstruction to match.  Defaults to False.
-        det_rotation (float, optional): Detector rotation in radians, removed from every view.  Use
-            the value from :func:`~mbirtorch.preprocess.estimate_det_rotation`.
+        det_rotation (float, optional): Detector rotation in radians, removed from every view.
             Defaults to 0.0.
         verbose (int, optional): 0 prints nothing, 1 prints progress.  Defaults to 1.
 
