@@ -391,16 +391,17 @@ def _estimate_offset_by_correlation(ct_model, sino, pairing_offset=None):
 
 
 def estimate_det_channel_offset(ct_model, sino):
-    """Estimate ``det_channel_offset`` from the sinogram by comparing each view with its opposite.
+    """Estimate the detector channel offset of a scan over a full rotation.
 
-    In a scan over a full rotation every ray is measured twice, once from each side, so a view and
-    its mirrored opposite differ by a shift of twice the channel offset.  The shift is found by
-    correlating high-passed profiles of the two over a band of rows at the central plane, as in
-    :func:`align_sino_views`, and refined to a fraction of a channel.  The function warns when the
-    match is weak.
+    The estimate is the value of ``det_channel_offset`` at which each view agrees with its opposite
+    view.  In a full rotation every ray is measured twice, once from each side, so a view and its
+    mirrored opposite view are the same up to a shift of twice the channel offset.  The function
+    finds that shift by correlating high-passed profiles of the two, taken from a band of rows at
+    the central plane, and refines it to a fraction of a channel.
 
-    A scan without opposite views, such as a short scan, a helical scan, or a multiaxis scan, gets
-    a warning and the model's current value back unchanged.
+    The scan must be a parallel or cone-beam scan over a full rotation.  For any other scan, such
+    as a short scan, a helical scan, or a multiaxis scan, the function warns and returns the
+    model's current value.  It also warns when the opposite views match weakly.
 
     Args:
         ct_model (TomographyModel): the model of the scan.  Not modified.
