@@ -37,23 +37,25 @@ Put your data in two numpy arrays:
 
 The sinogram holds line integrals, not raw photon counts.  For transmission data, divide each
 view by the air scan and take the negative log of the ratio.  The function
-:func:`mbirtorch.preprocess.compute_sino_transmission` does this, and it also subtracts the
-dark scan and interpolates defective pixels.  See :ref:`PreprocessDocs` for more.
+:func:`mbirtorch.preprocess.scan_to_sino` does this from the object, blank, and dark scans,
+and it also fills the defective pixels.  See :ref:`PreprocessDocs` for more.
 
-A parallel-beam reconstruction is then one call, and a viewer opens with one more::
+Build a model from the sinogram shape and the angles, reconstruct, and open a viewer::
 
     import mbirtorch
-    recon, recon_dict = mbirtorch.recon_simple_parallel(sinogram, angles)
+    ct_model = mbirtorch.ParallelBeamModel(sinogram.shape, angles)
+    recon, recon_dict = ct_model.recon(sinogram)
     mbirtorch.slice_viewer(recon, title='MBIRTorch reconstruction')
 
 The result ``recon`` is a 3D numpy array with shape ``(rows, columns, slices)``.  The dictionary
 ``recon_dict`` holds the parameters used and the run log.
 
-For cone-beam data, two distances are also needed, in the same units as the detector pixel
-pitch::
+For cone-beam data, the model also needs the two source distances, in the same units as the
+detector pixel pitch::
 
-    recon, recon_dict = mbirtorch.recon_simple_cone(sinogram, angles,
-                                                    source_detector_dist, source_iso_dist)
+    ct_model = mbirtorch.ConeBeamModel(sinogram.shape, angles,
+                                       source_detector_dist=source_detector_dist,
+                                       source_iso_dist=source_iso_dist)
 
 The default parameters usually produce a good reconstruction on the first try.
 
@@ -61,19 +63,14 @@ The default parameters usually produce a good reconstruction on the first try.
 4. Adjust the reconstruction
 ----------------------------
 
-The one parameter worth trying first is ``sharpness``.  Its default is 1.0.  A higher value
-gives crisper edges and more noise, and a lower value gives smoother images::
+Every setting is a parameter of the model, set with ``set_params`` before calling ``recon``.
+The one worth trying first is ``sharpness``.  Its default is 1.0.  A higher value gives
+crisper edges and more noise, and a lower value gives smoother images::
 
-    recon, recon_dict = mbirtorch.recon_simple_parallel(sinogram, angles, sharpness=1.5)
-
-For anything else, create a model object and call its methods.  This is the same
-reconstruction with full control over the geometry, the regularization, the devices, and
-the stopping rule::
-
-    ct_model = mbirtorch.ParallelBeamModel(sinogram.shape, angles)
-    ct_model.set_params(sharpness=1.5, det_channel_offset=2.0)
+    ct_model.set_params(sharpness=1.5)
     recon, recon_dict = ct_model.recon(sinogram)
 
-The model classes are :class:`~mbirtorch.ParallelBeamModel` and :class:`~mbirtorch.ConeBeamModel`.
-The parameters are described in :ref:`ParametersDocs`, and the most used functions are
-summarized in :ref:`UserAPIOverviewDocs`.
+The geometry parameters, such as the offset of the center of rotation, are set the same way.
+The parameters are described in :ref:`ParametersDocs`, the model classes are
+:class:`~mbirtorch.ParallelBeamModel` and :class:`~mbirtorch.ConeBeamModel`, and the most used
+functions are summarized in :ref:`UserAPIDocs`.

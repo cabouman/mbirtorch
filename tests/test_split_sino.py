@@ -27,7 +27,7 @@ def _small_cone_case(delta_voxel_scale=1.0):
     model.set_params(no_warning=True, verbose=0)
     _set_hand_pitch(model, delta_voxel_scale)
     rshape = tuple(model.get_params('recon_shape'))
-    phantom = mbirtorch.generate_3d_shepp_logan_low_dynamic_range(rshape)
+    phantom = mbirtorch.gen_shepp_logan_3d(rshape)
     sino = model.forward_project(phantom)
     weights = mbirtorch.gen_weights(sino / sino.max(), weight_type='transmission_root')
     return model, sino, weights
@@ -67,7 +67,7 @@ def _small_parallel_case():
     model.configure_devices(devices=['cpu'])
     model.set_params(no_warning=True, verbose=0)
     rshape = tuple(model.get_params('recon_shape'))
-    phantom = mbirtorch.generate_3d_shepp_logan_low_dynamic_range(rshape)
+    phantom = mbirtorch.gen_shepp_logan_3d(rshape)
     sino = model.forward_project(phantom)
     weights = mbirtorch.gen_weights(sino / sino.max(), weight_type='transmission_root')
     return model, sino, weights

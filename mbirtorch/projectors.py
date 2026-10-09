@@ -17,6 +17,7 @@ body declares its own, much smaller, per-view cost through its
 bodies are torch.compiled (see maybe_compile below).
 """
 
+import logging
 import os
 import threading
 
@@ -28,6 +29,17 @@ _F32 = torch.float32
 
 # ── torch.compile plumbing ────────────────────────────────────────────────────
 # A compile failure falls back to eager and is recorded in _COMPILE_ERRORS.
+
+
+class _DropAutotuneNotice(logging.Filter):
+    """Drops the notice that a GPU is too small for one optional tuning mode of the compiler."""
+
+    def filter(self, record):
+        return 'Not enough SMs' not in record.getMessage()
+
+
+logging.getLogger('torch._inductor.utils').addFilter(_DropAutotuneNotice())
+
 _COMPILE_CACHE = {}
 _COMPILE_ERRORS = {}
 # Triton and inductor compilation is not thread safe, so this lock serializes compiles.

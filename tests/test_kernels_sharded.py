@@ -115,7 +115,7 @@ def problem():
         model = _build(geometry)
         model.configure_devices(1)
         recon_shape = tuple(model.get_params("recon_shape"))
-        phantom = mbirtorch.generate_3d_shepp_logan_low_dynamic_range(recon_shape)
+        phantom = mbirtorch.gen_shepp_logan_3d(recon_shape)
         sinogram = np.asarray(model.forward_project(phantom), dtype=np.float32)
         weights = np.exp(-sinogram / (2 * np.max(sinogram))).astype(np.float32)
         data[geometry] = (sinogram, weights)
@@ -178,7 +178,7 @@ def test_kernels_hold_on_a_single_nonzero_device(geometry, problem):
     torch_model.configure_devices(devices=["cuda:1"])
     _force_torch_bodies(torch_model, geometry)
     recon_shape = tuple(torch_model.get_params("recon_shape"))
-    phantom = mbirtorch.generate_3d_shepp_logan_low_dynamic_range(recon_shape)
+    phantom = mbirtorch.gen_shepp_logan_3d(recon_shape)
     torch_fwd = np.asarray(torch_model.forward_project(phantom), np.float32)
     torch_back = np.asarray(torch_model.back_project(sinogram), np.float32)
 

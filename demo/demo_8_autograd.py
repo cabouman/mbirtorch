@@ -1,4 +1,4 @@
-"""Demo 12: the differentiable projectors.
+"""Demo 8: the differentiable projectors.
 
 Reconstruct by gradient descent instead of by calling recon().  The
 reconstruction is an ordinary torch tensor with requires_grad=True, the
@@ -17,7 +17,7 @@ num_det_channels = 64
 num_steps = 150
 
 # Make a phantom and project it to get a synthetic sinogram.
-phantom, sinogram, params = mbirtorch.generate_demo_data(
+phantom, sinogram, params = mbirtorch.gen_demo_data(
     model_type='parallel', object_type='shepp-logan',
     num_views=num_views, num_det_rows=num_det_rows,
     num_det_channels=num_det_channels)

@@ -10,8 +10,13 @@ synthetic data, and managing the on-disk compile cache.
 Saving and loading models and reconstructions is handled through TomographyModel: :ref:`SaveLoadDocs`.
 
 
-3D Data Viewer
---------------
+.. _Viewer4DDocs:
+
+3D and 4D Data Viewers
+----------------------
+
+The 3D viewer shows one or more volumes slice by slice, and the 4D viewer adds a frame axis
+for a volume that changes in time.
 
 .. autofunction:: mbirtorch.view_utils.slice_viewer
 
@@ -19,17 +24,6 @@ Here is an example showing views of a modified Shepp-Logan phantom, with changin
 
 .. image:: https://www.math.purdue.edu/~buzzard/images/slice_viewer_demo.gif
    :alt: An animated image of the slice viewer.
-
-The slice viewer shows the data.  The scan geometry itself is drawn by
-``mbirtorch.geometry_viewer``, which shows where the source, the detector, and
-the reconstruction volume sit for one view at a time; see
-:ref:`GeometryViewerDocs`.
-
-
-.. _Viewer4DDocs:
-
-4D Data Viewer
---------------
 
 .. autofunction:: mbirtorch.view_utils.slice_viewer4d
 
@@ -49,9 +43,37 @@ the edges, and the static phantom's edges are straight.
          t-y plane, where the edges of the shifting phantom zigzag.
 
 
+.. _GeometryViewerDocs:
+
+Geometry Viewer
+---------------
+
+The geometry viewer draws the scanner geometry of a model: where the source, the detector, and
+the reconstruction volume sit, which way the gantry turns, and whether the volume projects
+inside the detector.  Use it to check a scan before reconstructing it, and to compare an
+estimated geometry with the vendor's by drawing one over the other.
+
+.. code-block:: python
+
+    ct_model = mbirtorch.ConeBeamModel(sinogram.shape, angles,
+                                       source_detector_dist=source_detector_dist,
+                                       source_iso_dist=source_iso_dist)
+    mbirtorch.geometry_viewer(ct_model, sinogram=sinogram, recon=recon,
+                              compare=dict(det_channel_offset=10.0),
+                              title='Cone-beam scan geometry')
+
+.. image:: figs/geometry_viewer_cone.png
+   :alt: The geometry viewer's five panels: a 3D view, a top view of the xy
+         plane, a side view of the yz plane, the detector face in row and
+         channel index, and a text panel of derived numbers.
+
+.. autofunction:: mbirtorch.view_utils.geometry_viewer
+
+
 General Purpose
 ---------------
 
+.. autofunction:: mbirtorch.median_filter3d
 .. autofunction:: mbirtorch.utilities.stitch_arrays
 .. autofunction:: mbirtorch.utilities.get_ct_model
 .. autofunction:: mbirtorch.utilities.copy_ct_model
@@ -68,15 +90,9 @@ Weight Generation
 IO Functions
 ------------
 
-As noted above, saving and loading models and reconstructions is handled through TomographyModel: :ref:`SaveLoadDocs`.
-
-The functions here are for direct interactions with files.
+Saving and loading a reconstruction is described under :ref:`SaveLoadDocs`.
 
 .. autofunction:: mbirtorch.utilities.download_and_extract
-.. autofunction:: mbirtorch.utilities.save_data_hdf5
-.. autofunction:: mbirtorch.utilities.load_data_hdf5
-.. autofunction:: mbirtorch.utilities.export_recon_hdf5
-.. autofunction:: mbirtorch.utilities.import_recon_hdf5
 .. autofunction:: mbirtorch.utilities.save_volume_as_gif
 
 
@@ -85,11 +101,13 @@ The functions here are for direct interactions with files.
 Synthetic Data Generation
 -------------------------
 
-.. autofunction:: mbirtorch.utilities.generate_demo_data
-.. autofunction:: mbirtorch.utilities.generate_3d_shepp_logan_reference
-.. autofunction:: mbirtorch.utilities.generate_3d_shepp_logan_low_dynamic_range
+The two demo data functions make an object and the sinogram of a scan of it, for the demos and
+for trying the package.  The two Shepp-Logan functions make the classic test phantom on its own.
 
-.. autofunction:: mbirtorch.utilities.gen_translation_phantom
+.. autofunction:: mbirtorch.utilities.gen_demo_data
+.. autofunction:: mbirtorch.utilities.gen_demo_data_4d
+.. autofunction:: mbirtorch.utilities.gen_shepp_logan_3d
+.. autofunction:: mbirtorch.utilities.gen_shepp_logan_3d_reference
 
 
 Cache Management

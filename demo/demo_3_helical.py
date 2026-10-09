@@ -1,4 +1,4 @@
-"""Demo 6: helical cone-beam reconstruction.
+"""Demo 3: helical cone-beam reconstruction.
 
 In a helical scan the object moves steadily along the rotation axis while
 the source rotates, so a short detector can cover a long object.  Each view
@@ -20,7 +20,7 @@ helical_pitch = 1.0     # travel per rotation, in detector heights
 helical_z_range = 40.0  # total travel over the scan, in ALU
 
 # Make a phantom and its helical sinogram.
-phantom, sinogram, params = mbirtorch.generate_demo_data(
+phantom, sinogram, params = mbirtorch.gen_demo_data(
     model_type='cone', object_type='shepp-logan',
     num_views=num_views, num_det_rows=num_det_rows,
     num_det_channels=num_det_channels,

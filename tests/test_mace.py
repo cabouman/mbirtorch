@@ -290,7 +290,7 @@ def test_mace_reproduces_the_standard_reconstruction():
     A 30-iteration recon is not, so the consensus overtakes it and the
     distance to it grows with iterations."""
     num_views, det = 64, 64
-    phantom, sinogram, params = mbirtorch.generate_demo_data(
+    phantom, sinogram, params = mbirtorch.gen_demo_data(
         model_type='cone', object_type='shepp-logan', num_views=num_views,
         num_det_rows=det, num_det_channels=det, target_max_attenuation=6.0)
     noise_std = np.sqrt(np.exp(sinogram) / 500.0)

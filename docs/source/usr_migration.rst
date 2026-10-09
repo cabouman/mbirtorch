@@ -46,6 +46,10 @@ The direct reconstruction methods are renamed so that every reconstruction metho
      - ``model.recon_split_sino(sinogram)``
    * - ``preprocess.mar.recon_plastic_metal(model, sinogram, weights)``
      - ``model.recon_plastic_metal(sinogram, weights)``
+   * - ``model.scale_recon_shape(row_scale, col_scale, slice_scale)``
+     - ``model.resize_recon_fov(row_scale, col_scale, slice_scale)``
+
+``scale_recon_shape`` still works but prints a warning.
 
 
 Devices

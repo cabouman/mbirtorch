@@ -4,15 +4,23 @@
 Translation Model
 =================
 
-The ``TranslationModel`` class implements a geometry and reconstruction model for translation computed tomography.
-This class inherits all behaviors and attributes of the :ref:`TomographyModelDocs`.
+.. plot:: figs/geom_translation.py
+   :align: center
+   :width: 60%
 
-This is an experimental tomography model in alpha testing.
-It includes ``recon_fdk`` for direct (non-iterative) reconstruction, used as the
-initializer for the iterative ``recon()``.
+In translation computed tomography (TCT) the object does not rotate.  Each view is a cone beam
+projection of the object after a translation, so the geometry suits thin, flat objects.
+Besides the sinogram shape, the model needs the translation of the object at each view, in
+ALU, and the distance from the source to the detector and from the source to the object.
 
-See the API docs for the :class:`~mbirtorch.TomographyModel` class for details on a wide range
-of functions that can be implemented using the ``TranslationModel``.
+This model is under development, and its interface may change.
+
+.. code-block:: python
+
+    ct_model = mbirtorch.TranslationModel(sinogram.shape, translation_vectors,
+                                          source_detector_dist=source_detector_dist,
+                                          source_iso_dist=source_iso_dist)
+    recon, recon_dict = ct_model.recon(sinogram)
 
 Constructor
 -----------
@@ -20,4 +28,12 @@ Constructor
 .. autoclass:: mbirtorch.TranslationModel
    :show-inheritance:
 
+Reconstruction
+--------------
 
+``recon`` is the iterative reconstruction.  ``recon_fdk`` is the non-iterative reconstruction
+that ``recon`` uses as its starting point.
+
+.. automethod:: mbirtorch.TranslationModel.recon
+
+.. automethod:: mbirtorch.TranslationModel.recon_fdk

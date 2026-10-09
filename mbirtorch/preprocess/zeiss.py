@@ -4,6 +4,7 @@ import numpy as np
 import warnings
 import mbirtorch
 import mbirtorch.preprocess as mtp
+from . import _loader_utils as lu
 import pprint
 import olefile
 from . import _xradia_ole
@@ -18,59 +19,47 @@ def get_sino_and_model(dataset_dir, *, downsample_factor=(1, 1), subsample_view_
                        bg_option="global", zinger_correction=True, auto_crop=False,
                        det_rotation=0.0, verbose=1):
     """
-    Load a Zeiss Ultra/Versa scan dataset, compute its sinogram, and return a ready-to-reconstruct model.
+    Load a Zeiss Versa or Ultra scan, compute its sinogram, and return a model ready to reconstruct.
 
-    One-call replacement for the ``compute_sino_and_params -> (ParallelBeamModel | ConeBeamModel)(...) ->
-    set_params -> auto_set_recon_geometry`` sequence.  It selects the model class from the Zeiss scanner
-    type -- ``'ultra'`` (Xradia Ultra) is treated as parallel-beam and ``'versa'`` (Xradia Versa) as
-    cone-beam -- constructs the model, applies the detector parameters, and computes the reconstruction
-    geometry, so the returned model can never be left with a stale (default-pitch) reconstruction grid.
-
-    Thanks to contributions of Amir Koushyar Ziabari of Oak Ridge National Laboratory (ORNL).
+    An Ultra scan gives a ParallelBeamModel.  A Versa scan, or a scan whose scanner type cannot be
+    read from the file, gives a ConeBeamModel.  The per-view shifts recorded in the file are applied
+    to the sinogram.
 
     Args:
-        dataset_dir (str): Path to the Zeiss ``.txrm`` dataset (``ImageData*/Image*`` scan data and
-            Zeiss OLE metadata streams).
-        downsample_factor (tuple[int, int], optional): Detector row/channel downsampling. Defaults to ``(1, 1)``.
-        subsample_view_factor (int, optional): Keep every n-th view. Defaults to ``1``.
-        crop_pixels_sides (int, optional): Pixels to crop from each lateral side of the detector. Defaults to ``0``.
-        crop_pixels_top (int, optional): Pixels to crop from the top of the detector. Defaults to ``0``.
-        crop_pixels_bottom (int, optional): Pixels to crop from the bottom of the detector. Defaults to ``0``.
-        alu_unit (str, optional): Physical unit for 1 ALU (``'um'``, ``'mm'``, ``'cm'``, ``'m'``). Defaults to ``'mm'``.
-        bg_option (str or None, optional): Background offset correction: ``None``, ``'global'``, or
-            ``'per_view'``. Defaults to ``'global'``.
-        zinger_correction (bool, optional): Detect and interpolate zinger pixels. Defaults to ``True``.
-        auto_crop (bool, optional): If True, detect and remove blank sinogram margins after the sinogram
-            is computed, shrinking the reconstruction. Defaults to False.
-        det_rotation (float, optional): Detector rotation in radians, applied to every view as the
-            sinogram is computed. This is the same rotation that
-            :func:`mbirtorch.preprocess.correct_det_rotation` applies. The value to pass is the estimate
-            returned by :func:`mbirtorch.preprocess.geometry_calibration.estimate_det_rotation`.
-            Defaults to ``0.0``, which leaves the views unrotated.
-        verbose (int, optional): Verbosity level. Defaults to ``1``.
+        dataset_dir (str): Path to the ``.txrm`` file.
+        downsample_factor (tuple[int, int], optional): Detector (row, channel) downsampling.  Defaults to (1, 1).
+        subsample_view_factor (int, optional): Keep every n-th view.  Defaults to 1.
+        crop_pixels_sides (int, optional): Pixels to crop from each side of the detector.  Defaults to 0.
+        crop_pixels_top (int, optional): Pixels to crop from the top.  Defaults to 0.
+        crop_pixels_bottom (int, optional): Pixels to crop from the bottom.  Defaults to 0.
+        alu_unit (str, optional): The length unit of the model: 'um', 'mm', 'cm', or 'm'.  Defaults to 'mm'.
+        bg_option (str or None, optional): Background offset removal, 'global' or 'per_view', or None
+            for none; see :func:`~mbirtorch.preprocess.correct_background_offset`.  Defaults to 'global'.
+        zinger_correction (bool, optional): If True, replace zinger pixels; see
+            :func:`~mbirtorch.preprocess.correct_zinger_pixels`.  Defaults to True.
+        auto_crop (bool, optional): If True, remove the blank margins of the sinogram and shrink the
+            reconstruction to match.  Defaults to False.
+        det_rotation (float, optional): Detector rotation in radians, removed from every view.
+            Defaults to 0.0.
+        verbose (int, optional): 0 prints nothing, 1 prints progress.  Defaults to 1.
 
     Returns:
-        tuple: ``(sino, model)`` where
-
-            - ``sino`` (numpy.ndarray): the computed sinogram, shape (num_views, num_det_rows, num_channels).
-            - ``model`` (ParallelBeamModel or ConeBeamModel): a CT model with its reconstruction geometry already set.
-              (``'ultra'`` -> parallel; ``'versa'`` -> cone; ``'unknown'`` -> cone)
+        tuple: ``(sino, model)``: the sinogram, shape (num_views, num_det_rows, num_det_channels), and
+        the model with its parameters set.  Weights are not returned; make them with
+        ``mbirtorch.gen_weights``.
 
     Example:
         .. code-block:: python
 
-            sino, model = mbirtorch.preprocess.zeiss.get_sino_and_model(dataset_dir)
+            sino, model = mbirtorch.preprocess.zeiss.get_sino_and_model(path_to_txrm)
             recon, recon_dict = model.recon(sino)
-
-    Note:
-        Reconstruction weights are not returned; generate them with ``mbirtorch.gen_weights``.
     """
     sino, required_params, optional_params = _compute_sino_and_params(
         dataset_dir, downsample_factor=downsample_factor, subsample_view_factor=subsample_view_factor,
         crop_pixels_sides=crop_pixels_sides, crop_pixels_top=crop_pixels_top,
         crop_pixels_bottom=crop_pixels_bottom, alu_unit=alu_unit, bg_option=bg_option,
         zinger_correction=zinger_correction, det_rotation=det_rotation, verbose=verbose)
-    return mtp.finalize_model(sino, required_params, optional_params, auto_crop=auto_crop)
+    return lu.finalize_model(sino, required_params, optional_params, auto_crop=auto_crop)
 
 
 def _compute_sino_and_params(dataset_dir, downsample_factor=(1, 1), subsample_view_factor=1, crop_pixels_sides=0, crop_pixels_top=0, crop_pixels_bottom=0, alu_unit='mm', bg_option="global", zinger_correction=True, det_rotation=0.0, verbose=1):
@@ -325,11 +314,11 @@ def convert_zeiss_to_mbirtorch_params(zeiss_params, downsample_factor=(1, 1), cr
     # One ALU is defined as one unit of alu_unit.
     alu_value = 1
 
-    source_iso_dist = mtp.to_alu(source_iso_dist, source_iso_dist_unit, alu_unit)
-    iso_det_dist = mtp.to_alu(iso_det_dist, iso_det_dist_unit, alu_unit)
-    delta_det_channel = mtp.to_alu(delta_det_channel, delta_det_channel_unit, alu_unit)
-    delta_det_row = mtp.to_alu(delta_det_row, delta_det_row_unit, alu_unit)
-    iso_pixel_pitch = mtp.to_alu(iso_pixel_pitch, iso_pixel_pitch_unit, alu_unit)
+    source_iso_dist = lu.to_alu(source_iso_dist, source_iso_dist_unit, alu_unit)
+    iso_det_dist = lu.to_alu(iso_det_dist, iso_det_dist_unit, alu_unit)
+    delta_det_channel = lu.to_alu(delta_det_channel, delta_det_channel_unit, alu_unit)
+    delta_det_row = lu.to_alu(delta_det_row, delta_det_row_unit, alu_unit)
+    iso_pixel_pitch = lu.to_alu(iso_pixel_pitch, iso_pixel_pitch_unit, alu_unit)
 
     source_detector_dist = source_iso_dist + iso_det_dist
 
@@ -354,7 +343,7 @@ def convert_zeiss_to_mbirtorch_params(zeiss_params, downsample_factor=(1, 1), cr
     det_row_offset *= delta_det_row
 
     # The crop is in raw detector pixels, and the offsets are in ALU.  Downsampling is applied afterward.
-    num_det_rows, num_det_channels, det_row_offset, det_channel_offset = mtp.apply_config_crop(
+    num_det_rows, num_det_channels, det_row_offset, det_channel_offset = lu.apply_config_crop(
         num_det_rows, num_det_channels, det_row_offset, det_channel_offset, delta_det_row, delta_det_channel,
         crop_pixels_top=crop_pixels_top, crop_pixels_bottom=crop_pixels_bottom, crop_pixels_sides=crop_pixels_sides)
 
@@ -642,7 +631,7 @@ def correct_sino_shifts(sino, zeiss_params, downsample_factor, subsample_view_fa
     else:
         sino_pad = sino
 
-    from .utilities import _translate_views_bilinear
+    from .geometry_calibration import _translate_views_bilinear
     shifts = np.stack([sino_y_offset, sino_x_offset], axis=1)
     corrected_sino = _translate_views_bilinear(sino_pad, shifts).cpu().numpy()
 

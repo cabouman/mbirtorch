@@ -1,7 +1,149 @@
+"""Corrections applied to a sinogram before reconstruction."""
+
+import math
+import warnings
+
 import numpy as np
+import torch
+
+from . import _pipeline
+
+__all__ = ['correct_background_offset', 'correct_det_rotation', 'remove_all_stripe', 'remove_stripe_fw',
+           'remove_sino_offset']
 
 
-def generate_column_index_matrix(num_rows, num_cols):
+def _rotation_kernel(sino_batch, det_rotation, center=None):
+    """Rotate the (row, channel) plane of each view in a batch by ``det_rotation`` radians.
+
+    The interpolation is bilinear, and a sample from outside the view is zero.  The rotated sampling
+    grid is computed once for the (row, channel) plane and used for every view in the batch.
+
+    Args:
+        sino_batch (tensor): (num_views, num_det_rows, num_det_channels).
+        det_rotation (float): rotation angle in radians.
+        center (tuple of float or None): the ``(row, channel)`` point the rotation turns about, in the
+            index coordinates of ``sino_batch``.  None (the default) is the center of the array.  A
+            caller that rotates a band of rows cut from a taller detector passes the full detector's
+            center, expressed in the band's row indices, so that the band rotates exactly as it would
+            inside the full detector.
+    """
+    num_views, num_rows, num_cols = sino_batch.shape
+    device = sino_batch.device
+    dtype = sino_batch.dtype
+    cos_a = math.cos(det_rotation)
+    sin_a = math.sin(det_rotation)
+    if center is None:
+        center_row = (num_rows - 1) / 2.0
+        center_col = (num_cols - 1) / 2.0
+    else:
+        center_row, center_col = (float(c) for c in center)
+
+    # Each output pixel (i, j) samples the input at R @ pixel + offset, where offset = center - R @ center.
+    grid_i, grid_j = torch.meshgrid(torch.arange(num_rows, dtype=dtype, device=device),
+                                    torch.arange(num_cols, dtype=dtype, device=device), indexing='ij')
+    offset_row = center_row - (cos_a * center_row + sin_a * center_col)
+    offset_col = center_col - (-sin_a * center_row + cos_a * center_col)
+    src_row = cos_a * grid_i + sin_a * grid_j + offset_row   # (num_rows, num_cols)
+    src_col = -sin_a * grid_i + cos_a * grid_j + offset_col
+
+    # The four bilinear neighbors are gathered below.  An out of range index is clipped here and zeroed by the mask.
+    lower_row = torch.floor(src_row)
+    lower_col = torch.floor(src_col)
+    frac_row = src_row - lower_row     # (num_rows, num_cols)
+    frac_col = src_col - lower_col
+    r0 = torch.clamp(lower_row.to(torch.int64), 0, num_rows - 1)
+    r1 = torch.clamp(torch.ceil(src_row).to(torch.int64), 0, num_rows - 1)
+    c0 = torch.clamp(lower_col.to(torch.int64), 0, num_cols - 1)
+    c1 = torch.clamp(torch.ceil(src_col).to(torch.int64), 0, num_cols - 1)
+
+    rotated = (((1.0 - frac_row) * (1.0 - frac_col)) * sino_batch[:, r0, c0]
+               + ((1.0 - frac_row) * frac_col) * sino_batch[:, r0, c1]
+               + (frac_row * (1.0 - frac_col)) * sino_batch[:, r1, c0]
+               + (frac_row * frac_col) * sino_batch[:, r1, c1])
+
+    # Zero any output pixel whose sample fell outside the original image.
+    in_bounds = ((src_row >= 0) & (src_row <= num_rows - 1)
+                 & (src_col >= 0) & (src_col <= num_cols - 1)).to(dtype)
+    return rotated * in_bounds
+
+
+def correct_det_rotation(sino, det_rotation=0.0, batch_size=30, devices=None):
+    """
+    Rotate every view of a sinogram to remove a detector rotation.
+
+    Takes a numpy array or a tensor and returns a numpy array.
+
+    Args:
+        sino (numpy array or tensor): Sinogram, shape (num_views, num_det_rows, num_det_channels).
+        det_rotation (float, optional): The angle between the rotation axis and the detector columns,
+            in radians.  Defaults to 0.0.
+        batch_size (int, optional): Views processed at a time.  Defaults to 30.
+        devices (sequence or None, optional): Devices to spread the views over.  None uses all visible
+            CUDA devices, capped by ``MBIRTORCH_NUM_DEVICES`` when it is set, or the default device
+            when there are none.  Defaults to None.
+
+    Returns:
+        numpy.ndarray: The corrected sinogram, the shape of ``sino``.
+    """
+    _pipeline.reject_shards('correct_det_rotation', sino=sino)
+
+    return _pipeline.map_view_batches(sino, lambda b: _rotation_kernel(b, det_rotation), batch_size,
+                                     devices=_pipeline.permitted_devices(devices))
+
+
+def correct_background_offset(sino, edge_width=9, option='global'):
+    """
+    Subtract the background offset of a sinogram, estimated from its edges.
+
+    The offset of a view is the median of the medians of its left, right, and top edge strips, each
+    ``edge_width`` pixels wide.  With ``option='global'`` one value, the 10th percentile of the
+    per-view offsets, is subtracted from every view.  With ``'per_view'`` each view's own offset is
+    subtracted.
+
+    Args:
+        sino (numpy.ndarray): Sinogram, shape (num_views, num_det_rows, num_det_channels).
+        edge_width (int, optional): Width of the edge strips in pixels, at least 1.  Defaults to 9.
+        option (str or None, optional): 'global', 'per_view', or None to return ``sino`` unchanged.
+            Defaults to 'global'.
+
+    Returns:
+        numpy.ndarray: The corrected sinogram, the shape of ``sino``.
+    """
+
+    if option is None:
+        return sino
+
+    if edge_width < 1:
+        edge_width = 1
+        warnings.warn("edge_width of background regions should be >= 1! Setting edge_width to 1.")
+
+    num_views, _, num_det_channels = sino.shape
+
+    sino_edge_left  = sino[:, :, :edge_width].reshape(num_views, -1)
+    sino_edge_right = sino[:, :, num_det_channels-edge_width:].reshape(num_views, -1)
+    sino_edge_top   = sino[:, :edge_width, :].reshape(num_views, -1)
+
+    med_left  = np.median(sino_edge_left, axis=1)
+    med_right = np.median(sino_edge_right, axis=1)
+    med_top   = np.median(sino_edge_top, axis=1)
+
+    edge_medians = np.stack([med_left, med_right, med_top], axis=1)
+    offset = np.median(edge_medians, axis=1)   # (num_views,)
+
+    if option == "global":
+        percentile = 10
+        offset = np.percentile(offset, percentile)
+        sino_corrected = sino - offset
+
+    elif option == "per_view":
+        sino_corrected = sino - offset[:, None, None]
+
+    else:
+        raise ValueError("option must be None, 'global' or 'per_view'")
+
+    return sino_corrected
+
+def _generate_column_index_matrix(num_rows, num_cols):
     """
     Create a 2D array of indexes used for the sorting technique.
 
@@ -27,7 +169,7 @@ def generate_column_index_matrix(num_rows, num_cols):
     return index_matrix
 
 
-def remove_small_stripes_sorting(sino, filter_size, index_matrix):
+def _remove_small_stripes_sorting(sino, filter_size, index_matrix):
     """
     Remove small-to-medium partial and fulll stripes using the sorting technique.
 
@@ -67,7 +209,7 @@ def remove_small_stripes_sorting(sino, filter_size, index_matrix):
 
     return corrected_sino
 
-def detect_stripe(list_data, snr):
+def _detect_stripe(list_data, snr):
     """
     Used to locate stripes.
     A segmentation algorithm to separate the extremely positive and negative defects from the normal values in the
@@ -112,7 +254,7 @@ def detect_stripe(list_data, snr):
     return list_mask
 
 
-def remove_large_stripes_sorting(sino, snr, filter_size, index_matrix, drop_ratio=0.1):
+def _remove_large_stripes_sorting(sino, snr, filter_size, index_matrix, drop_ratio=0.1):
     """
     Remove large partial and full stripes using the sorting technique.
 
@@ -153,7 +295,7 @@ def remove_large_stripes_sorting(sino, snr, filter_size, index_matrix, drop_rati
         np.ones_like(raw_list)
     )
 
-    list_mask = detect_stripe(normalized_list, snr)
+    list_mask = _detect_stripe(normalized_list, snr)
     list_mask = binary_dilation(list_mask, iterations=1).astype(list_mask.dtype)
     normalized_factor = np.tile(normalized_list, (num_rows, 1))
 
@@ -180,7 +322,7 @@ def remove_large_stripes_sorting(sino, snr, filter_size, index_matrix, drop_rati
     return sino
 
 
-def remove_dead_fluctuating_stripes_interpolation(sino, snr, filter_size, index_matrix):
+def _remove_dead_fluctuating_stripes_interpolation(sino, snr, filter_size, index_matrix):
     """
     Remove unresponsive and fluctuating stripes using the interpolation technique.
     Sorting approach does not work here because the rankings of the grayscales are significantly different between
@@ -222,7 +364,7 @@ def remove_dead_fluctuating_stripes_interpolation(sino, snr, filter_size, index_
         np.ones_like(difference_list_filtered)
     )
 
-    list_mask = detect_stripe(normalized_list, snr)
+    list_mask = _detect_stripe(normalized_list, snr)
     list_mask = binary_dilation(list_mask, iterations=1).astype(list_mask.dtype)
     list_mask[0:2] = 0.0
     list_mask[-2:] = 0.0
@@ -239,46 +381,37 @@ def remove_dead_fluctuating_stripes_interpolation(sino, snr, filter_size, index_
         sino = np.array(sino)
         sino[:, list_x_miss] = np.reshape(estimate_output, matrix_x_miss.shape).astype(sino.dtype)
 
-    corrected_sino = remove_large_stripes_sorting(sino, snr, filter_size, index_matrix)
+    corrected_sino = _remove_large_stripes_sorting(sino, snr, filter_size, index_matrix)
 
     return corrected_sino
 
 def remove_all_stripe(sino, snr=3, large_filter_size=61, small_filter_size=21):
     """
-    Removes all types of stripe artifacts from a sinogram using a combination of three algorithms:
-    1. Interpolation-based removal of unresponsive and fluctuating stripes.
-    2. Sorting-based removal of large partial and full stripes.
-    3. Sorting-based removal of small to medium partial and full stripes.
+    Remove stripe artifacts of all sizes from a sinogram.
 
-    This method is adapted from `tomopy.remove_all_stripes()` and is based on:
-    Vo N, Atwood RC, Drakopoulos M. "Superior techniques for eliminating ring artifacts in x-ray micro-tomography."
-    Optics Express, 26(22):28396–28412, 2018.
+    The three steps of Vo, Atwood, and Drakopoulos, Optics Express 26(22), 2018, as in tomopy's
+    ``remove_all_stripe``: unresponsive and fluctuating stripes are interpolated over, then large
+    stripes and then small stripes are removed by sorting and median filtering.
 
     Args:
-        sino (ndarray): A 3D sinogram array with shape (num_views, num_det_rows, num_det_channels).
-        snr (float, optional): Signal-to-noise ratio used for stripe detection. A typical value is 3.0. Defaults to 3.
-        large_filter_size (int, optional): Median filter window size for removing large stripes. Defaults to 61.
-        small_filter_size (int, optional): Median filter window size for removing small-to-medium stripes. Defaults to 21.
+        sino (numpy.ndarray): Sinogram, shape (num_views, num_det_rows, num_det_channels).
+        snr (float, optional): Signal-to-noise ratio used to detect stripes.  Defaults to 3.
+        large_filter_size (int, optional): Median filter window for the large stripes.  Defaults to 61.
+        small_filter_size (int, optional): Median filter window for the small stripes.  Defaults to 21.
 
     Returns:
-        ndarray: Corrected 3D sinogram array after removing all stripe artifacts.
-
-    Example:
-        >>> import numpy as np
-        >>> import mbirtorch.preprocess as mtp
-        >>> sino = np.ones((180, 128, 256))  # Simulated 3D sinogram
-        >>> cleaned_sino = mtp.remove_all_stripe(sino)
+        numpy.ndarray: The corrected sinogram, the shape of ``sino``.
     """
     from concurrent.futures import ThreadPoolExecutor
     sino = np.asarray(sino, dtype=np.float32)
-    index_matrix = generate_column_index_matrix(sino.shape[2], sino.shape[0])
+    index_matrix = _generate_column_index_matrix(sino.shape[2], sino.shape[0])
 
     result = np.zeros_like(sino)
 
     def process_slice(m):
         sino_slice = sino[:, m, :]
-        sino_slice = remove_dead_fluctuating_stripes_interpolation(sino_slice, snr, large_filter_size, index_matrix)
-        sino_slice = remove_small_stripes_sorting(sino_slice, small_filter_size, index_matrix)
+        sino_slice = _remove_dead_fluctuating_stripes_interpolation(sino_slice, snr, large_filter_size, index_matrix)
+        sino_slice = _remove_small_stripes_sorting(sino_slice, small_filter_size, index_matrix)
         return sino_slice
 
     with ThreadPoolExecutor() as executor:
@@ -292,29 +425,18 @@ def remove_all_stripe(sino, snr=3, large_filter_size=61, small_filter_size=21):
 
 def remove_stripe_fw(sino, wavelet_filter_name="db5", sigma=2):
     """
-    Removes vertical stripe artifacts from a 3D sinogram using a combined wavelet-Fourier filtering technique.
+    Remove vertical stripes from a sinogram by combined wavelet and Fourier filtering.
 
-    This method uses a 2D Discrete Wavelet Transform followed by a 2D Fourier transform to suppress vertical stripes,
-    as described in:
-    Beat Münch et al., "Stripe and ring artifact removal with combined wavelet—Fourier filtering", Optics Express, 2009.
-
-    This implementation is adapted from the Tomopy library's `remove_stripe_fw()`:
-    https://github.com/tomopy/tomopy.git
+    The method of Münch et al., Optics Express 17(10), 2009, as in tomopy's ``remove_stripe_fw``.
 
     Args:
-        sino (ndarray): 3D sinogram data with shape (num_views, num_det_rows, num_det_channels).
-        wavelet_filter_name (str, optional): Wavelet filter type (e.g., 'db5', 'haar'). Defaults to 'db5'.
-        sigma (float, optional): Damping parameter in the Fourier domain. Controls the strength of stripe suppression.
-            Defaults to 2.
+        sino (numpy.ndarray): Sinogram, shape (num_views, num_det_rows, num_det_channels).
+        wavelet_filter_name (str, optional): The wavelet, such as 'db5' or 'haar'.  Defaults to 'db5'.
+        sigma (float, optional): Damping width in the Fourier domain; it sets the strength of the
+            suppression.  Defaults to 2.
 
     Returns:
-        ndarray: Corrected sinogram data with reduced vertical stripe artifacts.
-
-    Example:
-        >>> import numpy as np
-        >>> import mbirtorch.preprocess as mtp
-        >>> sino = np.ones((180, 128, 256))  # Simulated sinogram
-        >>> cleaned_sino = mtp.remove_stripe_fw(sino)
+        numpy.ndarray: The corrected sinogram, the shape of ``sino``.
     """
     import pywt
     sino = np.array(sino, dtype=np.float32)
@@ -351,22 +473,16 @@ def remove_stripe_fw(sino, wavelet_filter_name="db5", sigma=2):
 
 def remove_sino_offset(sino):
     """
-    Remove additive offsets in the sinogram caused by material outside the field of view.
+    Remove from each view the additive offset caused by material outside the field of view.
 
-    This function corrects each row of the sinogram so that the sum over channels is constant
-    across views and equal to the minimum sum observed across all views.
+    For each detector row, the mean over channels is made the same in every view, equal to the
+    smallest of the per-view means.
 
     Args:
-        sino (ndarray): Sinogram with shape (num_views, num_rows, num_channels).
+        sino (numpy.ndarray): Sinogram, shape (num_views, num_det_rows, num_det_channels).
 
     Returns:
-        ndarray: Corrected sinogram with the same shape as the input.
-
-    Example:
-        >>> import numpy as np
-        >>> import mbirtorch.preprocess as mtp
-        >>> sino = np.ones((180, 128, 256)) + np.linspace(0, 1, 180)[:, None, None]
-        >>> corrected_sino = mtp.remove_sino_offset(sino)
+        numpy.ndarray: The corrected sinogram, the shape of ``sino``.
     """
     sino_channel_avg = np.mean(sino, axis=2)
 
