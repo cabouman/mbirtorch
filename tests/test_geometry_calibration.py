@@ -94,6 +94,19 @@ def test_estimate_det_channel_offset_on_parallel_beam(true_offset):
     assert abs(noisy_estimate - true_offset) < 0.1
 
 
+@pytest.mark.parametrize('true_offset', [3.0, -1.7])
+def test_estimate_det_channel_offset_on_cone_beam(true_offset):
+    """On cone-beam data with a 20 degree fan the estimator recovers the offset the data were
+    simulated with, to within a tenth of a channel, starting from zero and from ten channels off."""
+    sino = _sinogram('cone', true_offset)
+    for start in (0.0, true_offset - 10.0):
+        with warnings.catch_warnings():
+            warnings.simplefilter('error')
+            estimate = estimate_det_channel_offset(_cone_model(start), sino)
+        print(f'cone offset {true_offset} from {start}: estimate {estimate:.4f}, error {estimate - true_offset:.4f} channels')
+        assert abs(estimate - true_offset) < 0.1
+
+
 @pytest.mark.parametrize('geometry', ['parallel', 'cone'])
 def test_estimate_det_rotation_recovers_a_rotation(geometry):
     """A rotation of 2 or -3 degrees applied to the sinogram is recovered to within 12 percent,
@@ -131,3 +144,17 @@ def test_estimators_do_not_change_the_caller_state():
     assert _params_equal(params_before, model.get_all_params())
     assert np.array_equal(sino, sino_before)
     assert model.get_params('det_channel_offset') == 0.0
+
+
+def test_unsuitable_scan_returns_the_unchanged_value_with_a_warning():
+    """On a scan over half a rotation, which has no opposite views, the offset estimator returns
+    the model's current offset and the rotation estimator returns zero, each with a warning."""
+    angles = np.linspace(0, np.pi, 32, endpoint=False)
+    model = mbirtorch.ParallelBeamModel((32, 16, 64), angles, compile_mode='off')
+    model.configure_devices(devices=['cpu'])
+    model.set_params(no_warning=True, verbose=0, det_channel_offset=0.7)
+    sino = np.zeros((32, 16, 64), dtype=np.float32)
+    with pytest.warns(UserWarning, match='opposite view'):
+        assert estimate_det_channel_offset(model, sino) == 0.7
+    with pytest.warns(UserWarning, match='opposite view'):
+        assert estimate_det_rotation(model, sino) == 0.0

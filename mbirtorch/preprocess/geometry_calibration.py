@@ -36,10 +36,6 @@ _READ_VIEW_BATCH = 64
 # correction, and the resampling that applies it degrades with the angle.
 _MAX_DET_ROTATION = math.radians(5.0)
 
-_OFFSET_HALF_RANGE_CHANNELS = 4.0     # search range on each side of the model's value
-_OFFSET_MAX_SLIDES = 8                # the search window moves this many times at most
-_OFFSET_TOLERANCE_CHANNELS = 0.01     # where the search stops, as a fraction of a channel
-_MIN_REGION_FRACTION = 0.25           # the least fraction of channels a comparison may use
 _NUM_COARSE = 11                      # candidates scored on the coarse grid of a search
 _NUM_ROWS = 16                        # detector rows compared, before the cone-beam limit
 _TRIM_FRACTION = 0.1                  # fraction of the worst view pairs dropped
@@ -59,19 +55,14 @@ _MIN_EDGE_DISPLACEMENT = 1.0
 # ── geometry checks ───────────────────────────────────────────────────────────────────────────────
 
 def _geometry_kind(ct_model):
-    """Classify a model as 'parallel', 'cone', or 'multiaxis', or raise for anything else.
-
-    The translation geometry has no rotation, so neither quantity estimated here applies to it,
-    and it is refused by name.
-    """
+    """Classify a model as 'parallel', 'cone', 'multiaxis', or 'other'."""
     if isinstance(ct_model, ConeBeamModel):
         return 'cone'
     if isinstance(ct_model, MultiAxisParallelModel):
         return 'multiaxis'
     if isinstance(ct_model, ParallelBeamModel):
         return 'parallel'
-    raise TypeError(f'geometry_calibration supports ConeBeamModel, ParallelBeamModel, and '
-                    f'MultiAxisParallelModel; got {type(ct_model).__name__}.')
+    return 'other'
 
 
 def _is_helical(ct_model):
@@ -96,23 +87,26 @@ def _angular_gaps(angles):
     return np.diff(np.append(wrapped, wrapped[0] + 2 * np.pi))
 
 
-def _require_conjugate_geometry(ct_model, parameter):
-    """Refuse the geometries the opposite-view comparison cannot serve, with the reason."""
+def _unsuitable_reason(ct_model, parameter):
+    """Why the opposite-view comparison cannot serve this scan, or None when it can.
+
+    The comparison needs a parallel or cone-beam scan over a full rotation, so that every view has
+    an opposite view at the same axial position.
+    """
     kind = _geometry_kind(ct_model)
+    if kind == 'other':
+        return f'{type(ct_model).__name__} has no opposite views'
     if kind == 'multiaxis':
-        raise ValueError(f'{parameter} cannot be estimated for a multiaxis parallel model yet.')
+        return 'a multiaxis parallel scan is not supported yet'
     if _is_helical(ct_model):
-        raise ValueError(f'{parameter} is estimated by comparing each view with the opposite view at '
-                         'the same axial position, which a helical scan does not have.')
+        return 'a helical scan has no opposite view at the same axial position'
     gaps = _angular_gaps(_view_angles(ct_model))
     if gaps.max() > max(_MAX_GAP_RATIO * np.median(gaps), _MAX_GAP):
-        raise ValueError(f'{parameter} is estimated by comparing each view with its opposite, which '
-                         f'needs views over a full rotation.  The angles cover '
-                         f'{math.degrees(2 * np.pi - gaps.max()):.1f} degrees, with a gap of '
-                         f'{math.degrees(gaps.max()):.1f} degrees between neighboring views.')
+        return (f'the views cover {math.degrees(2 * np.pi - gaps.max()):.1f} degrees with a gap of '
+                f'{math.degrees(gaps.max()):.1f} degrees, so not every view has an opposite view')
     if parameter == 'det_rotation' and kind == 'cone' and ct_model.get_params('use_curved_detector'):
-        raise ValueError('det_rotation cannot be estimated on a curved detector.  The rotation '
-                         'resamples a flat detector plane.')
+        return 'a rotation cannot be estimated on a curved detector'
+    return None
 
 
 # ── reading a band of rows ────────────────────────────────────────────────────────────────────────
@@ -415,94 +409,163 @@ def _search_minimum(score_fn, bounds, tolerance):
 
 # ── the estimators ────────────────────────────────────────────────────────────────────────────────
 
-def estimate_det_channel_offset(ct_model, sino, *, bounds=None):
+# ── the channel offset ────────────────────────────────────────────────────────────────────────────
+
+_HP_SIGMA_CHANNELS = 15.0      # width of the blur removed from each profile, as in align_sino_views
+_HP_SEARCH_FRACTION = 0.25     # half-width of the integer shift search, as a fraction of the detector
+_HP_MIN_PEAK = 0.2             # a correlation peak below this is reported as weak
+_HP_MAX_SPREAD = 1.0           # per-view peaks further than this many channels from the global one
+
+
+def _high_pass_profiles(band):
+    """One high-passed profile per view from a band of rows: the rows are averaged, the mean is
+    removed, and a Gaussian blur of ``_HP_SIGMA_CHANNELS`` along the channels is subtracted.  The
+    blur extends each end value past the edge, which keeps the ends of a short profile from
+    biasing the estimate, as reflecting the profile does."""
+    from scipy.ndimage import gaussian_filter1d
+    profile = band.astype(np.float64).mean(axis=1)
+    profile -= profile.mean(axis=1, keepdims=True)
+    return profile - gaussian_filter1d(profile, _HP_SIGMA_CHANNELS, axis=1, mode='nearest')
+
+
+def _overlap_correlation(views, opposites, shifts):
+    """The normalized correlation between every view and its opposite moved by each integer shift,
+    over the channels the two cover in common.
+
+    Returns:
+        tuple: ``(global_curve, per_view_curves)``.  ``global_curve[k]`` sums the products over
+        every view before normalizing, so views with more content weigh more.
+        ``per_view_curves[v, k]`` normalizes each view on its own.
+    """
+    num_views, num_channels = views.shape
+    num = np.empty((num_views, shifts.size))
+    den_v = np.empty_like(num)
+    den_o = np.empty_like(num)
+    for k, s in enumerate(shifts):
+        lo, hi = max(0, s), min(num_channels, num_channels + s)
+        v = views[:, lo:hi]
+        o = opposites[:, lo - s:hi - s]
+        num[:, k] = (v * o).sum(axis=1)
+        den_v[:, k] = (v * v).sum(axis=1)
+        den_o[:, k] = (o * o).sum(axis=1)
+    global_curve = num.sum(axis=0) / np.sqrt(den_v.sum(axis=0) * den_o.sum(axis=0))
+    per_view = num / np.sqrt(np.maximum(den_v * den_o, 1e-30))
+    return global_curve, per_view
+
+
+def _fractional_correlation(views, opposites, shift_int, fraction):
+    """The global normalized correlation at the shift ``shift_int + fraction``.
+
+    The opposites are moved by the integer part by indexing, over the channels the two cover in
+    common.  The fraction is then split: the views move by half of it one way and the opposites
+    by half the other way, both resampled by a cubic spline, so that the two sides are blurred
+    alike and the correlation does not favor whole-channel shifts.  Three channels at each end,
+    where the resampling has no neighbors, are left out.
+    """
+    from scipy.ndimage import shift as ndshift
+    num_channels = views.shape[1]
+    lo, hi = max(0, shift_int), min(num_channels, num_channels + shift_int)
+    v = ndshift(views[:, lo:hi], (0.0, -0.5 * fraction), order=3, mode='nearest')[:, 3:-3]
+    o = ndshift(opposites[:, lo - shift_int:hi - shift_int], (0.0, 0.5 * fraction), order=3, mode='nearest')[:, 3:-3]
+    return float((v * o).sum() / math.sqrt((v * v).sum() * (o * o).sum()))
+
+
+def _estimate_offset_by_correlation(ct_model, sino, pairing_offset=None):
+    """One pass of the channel offset estimate: the correlation of high-passed profiles of each view
+    and its mirrored opposite, searched over integer shifts and refined to a fraction of a channel.
+
+    Returns:
+        dict: ``offset`` in ALU; ``shift`` in channels, which is twice the offset; ``peak``, the
+        correlation at the peak; ``parabola`` and ``refined``, the two sub-pixel estimates of the
+        shift; ``spread``, the median distance of the per-view peaks from the global one in
+        channels; and ``curve`` and ``shifts``, the global correlation curve.
+    """
+    problem = _ConjugatePairs(ct_model, pairing_offset=pairing_offset)
+    views, opposites = problem.pairs(problem.bands(sino))
+    views, opposites = _high_pass_profiles(views), _high_pass_profiles(opposites)
+    delta = problem.delta
+    center = int(round(2.0 * problem.model_offset / delta))
+    half = int(round(_HP_SEARCH_FRACTION * problem.num_channels))
+    # The window of integer shifts is centered on the model's value.  A peak at an edge of the
+    # window means the window is in the wrong place, so it moves to center on the peak, a few
+    # times at most, and the overlap never drops below half the detector.
+    limit = problem.num_channels // 2
+    for _ in range(4):
+        shifts = np.arange(max(center - half, -limit), min(center + half, limit) + 1)
+        curve, per_view = _overlap_correlation(views, opposites, shifts)
+        k = int(np.argmax(curve))
+        if 1 < k < shifts.size - 2 or abs(int(shifts[k])) >= limit:
+            break
+        center = int(shifts[k])
+    best = int(shifts[k])
+    if 0 < k < shifts.size - 1:
+        a, b, c = curve[k - 1], curve[k], curve[k + 1]
+        parabola = best + 0.5 * (a - c) / (a - 2.0 * b + c)
+    else:
+        parabola = float(best)
+    score = lambda f: -_fractional_correlation(views, opposites, best, f)
+    fraction, _ = _search_minimum(score, (-1.0, 1.0), 1.0 / 64)
+    refined = best + fraction
+    per_view_peaks = shifts[np.argmax(per_view, axis=1)]
+    spread = float(np.median(np.abs(per_view_peaks - refined)))
+    return dict(offset=refined * delta / 2.0, shift=refined, peak=float(curve[k]), parabola=parabola,
+                refined=refined, spread=spread, curve=curve, shifts=shifts, kind=problem.kind)
+
+
+def estimate_det_channel_offset(ct_model, sino):
     """Estimate ``det_channel_offset`` from the sinogram by comparing each view with its opposite.
 
     In a scan over a full rotation every ray is measured twice, once from each side.  A voxel at
     in-plane position x projects to channel ``(x + det_channel_offset) / delta_det_channel`` from
     the detector center, and after a half rotation it projects to the mirrored position.  A view
-    and its mirrored opposite therefore differ by a shift of twice the offset, and the estimate is
-    the candidate offset at which they agree best.  For cone beam the opposite of a channel lies at
-    a view angle that depends on the fan angle, and the comparison uses a band of rows around the
-    central plane.
+    and its mirrored opposite therefore differ by a shift of twice the offset.  For cone beam the
+    opposite of a channel lies at a view angle that depends on the fan angle, and the comparison
+    uses a band of rows around the central plane.
 
-    The search scores candidates across ``bounds`` on a coarse grid and then narrows the bracket by
-    golden section to a hundredth of a channel.  It warns when the coarse curve has more than one
-    minimum or its minimum sits at an edge of the bounds.  A trimmed mean drops the tenth of the
-    view pairs that agree worst, so a few corrupted views do not move the estimate.
+    The comparison follows :func:`align_sino_views`.  The rows of the band are averaged into one
+    profile per view, the mean is removed, and a Gaussian blur 15 channels wide is subtracted, so
+    that edges drive the estimate rather than slow variations.  Each profile is correlated with its
+    mirrored opposite over the channels the two cover in common at every integer shift within a
+    quarter of the detector width of the model's current value, the correlations are summed over
+    the views, and the peak is refined to a fraction of a channel by a parabola through its
+    neighbors and by a search over fractional shifts with cubic resampling.  For cone beam the
+    pairing is recomputed at the estimate and the search repeated.  The function warns when the
+    peak is weak, when the per-view peaks spread widely around it, or when the two sub-pixel
+    estimates disagree.
 
-    The method needs views over a full rotation and an opposite view at the same axial position, so
-    it refuses a short scan and a helical scan.  A multiaxis parallel model is not supported yet.
-    An offset scan, whose detector is displaced by hundreds of channels, is not served, because the
-    search range is a few channels.  A sinogram in the divided device form is refused.
+    The method needs a parallel or cone-beam scan over a full rotation, so that every view has an
+    opposite view at the same axial position.  For any other scan, such as a short scan, a helical
+    scan, or a multiaxis scan, the function warns and returns the model's current value unchanged.
+    A sinogram in the divided device form is refused.
 
     Args:
-        ct_model (TomographyModel): a parallel or cone model.  Not modified.
+        ct_model (TomographyModel): the model of the scan.  Not modified.
         sino (ndarray or tensor): the sinogram.  Not modified.
-        bounds (tuple of float, optional): the search range in ALU.  None (the default) is a window
-            of four channels on each side of the model's current value.  That window moves to
-            center on the edge where the coarse minimum sits, at the same width, up to eight times.
-            A range given here is not moved.
 
     Returns:
         float: the estimate in ALU, to set with ``ct_model.set_params(det_channel_offset=...)``.
-
-    Raises:
-        ValueError: for a multiaxis model, a helical scan, or views that do not cover a full
-            rotation.
     """
-    _require_conjugate_geometry(ct_model, 'det_channel_offset')
+    reason = _unsuitable_reason(ct_model, 'det_channel_offset')
+    if reason is not None:
+        warnings.warn(f'estimate_det_channel_offset: {reason}, so det_channel_offset was left at the '
+                      f'model\'s value.')
+        return float(ct_model.get_params('det_channel_offset'))
     _sharding.reject_shards('estimate_det_channel_offset', sino=sino)
-    problem = _ConjugatePairs(ct_model)
-    user_bounds = bounds
-    if bounds is None:
-        half_range = _OFFSET_HALF_RANGE_CHANNELS * problem.delta
-        bounds = (problem.model_offset - half_range, problem.model_offset + half_range)
-    margin = problem.channel_margin(max(abs(bounds[0]), abs(bounds[1])))
-    tolerance = _OFFSET_TOLERANCE_CHANNELS * problem.delta
-
-    def search(problem):
-        """One pass over the current bounds: choose the kept pairs at the best candidate of a
-        coarse grid scored on every pair, then search on that fixed set.  The bands are read per
-        pass, because the set of partner views depends on the pairing offset."""
-        views, opposites = problem.pairs(problem.bands(sino))
-        prepared = problem.prepare(views, opposites, margin)
-        every_pair = np.arange(problem.num_views)
-        coarse = np.linspace(bounds[0], bounds[1], _NUM_COARSE)
-        coarse_best = coarse[int(np.argmin([problem.score(prepared, opposites, x, every_pair)
-                                            for x in coarse]))]
-        keep = problem.keep_set(prepared, opposites, float(coarse_best))
-        return _search_minimum(lambda offset: problem.score(prepared, opposites, offset, keep),
-                               bounds, tolerance)
-
-    # A coarse minimum at an edge of the window means the window is in the wrong place,
-    # so the window moves to center on that edge and the search repeats.
-    best, notes = search(problem)
-    slides = 0
-    while ('the coarse minimum sits at an edge of the bounds' in notes and user_bounds is None
-           and slides < _OFFSET_MAX_SLIDES):
-        half_width = 0.5 * (bounds[1] - bounds[0])
-        moved = (best - half_width, best + half_width)
-        moved_margin = problem.channel_margin(max(abs(moved[0]), abs(moved[1])))
-        if problem.num_channels - 2 * moved_margin < _MIN_REGION_FRACTION * problem.num_channels:
-            notes.append('the search window could not move further, because the channels excluded '
-                         'for the circular shift would leave less than a quarter of the detector')
-            break
-        bounds, margin = moved, moved_margin
-        best, notes = search(problem)
-        slides += 1
-
-    # Cone beam uses two passes.  The partner view of a channel depends on the offset, so the
-    # second pass pairs at the estimate from the first pass.
-    if problem.kind == 'cone' and abs(best - problem.pairing_offset) > tolerance:
-        problem = _ConjugatePairs(ct_model, pairing_offset=best)
-        best, notes = search(problem)
-    for note in notes:
-        warnings.warn(f'estimate_det_channel_offset: {note}.')
-    return float(best)
+    result = _estimate_offset_by_correlation(ct_model, sino)
+    if result['kind'] == 'cone':
+        result = _estimate_offset_by_correlation(ct_model, sino, pairing_offset=result['offset'])
+    if result['peak'] < _HP_MIN_PEAK:
+        warnings.warn(f'estimate_det_channel_offset: the correlation peak is weak ({result["peak"]:.2f}).')
+    if result['spread'] > _HP_MAX_SPREAD:
+        warnings.warn(f'estimate_det_channel_offset: the per-view peaks spread {result["spread"]:.1f} '
+                      'channels around the estimate.')
+    if abs(result['parabola'] - result['refined']) > 0.25:
+        warnings.warn(f'estimate_det_channel_offset: the two sub-pixel estimates differ by '
+                      f'{abs(result["parabola"] - result["refined"]):.2f} channels.')
+    return float(result['offset'])
 
 
-def estimate_det_rotation(ct_model, sino, *, bounds=None):
+def estimate_det_rotation(ct_model, sino):
     """Estimate the detector rotation, in radians, by comparing each view with its opposite.
 
     A detector rotated about the optical axis records every view rotated by that angle, and
@@ -513,32 +576,31 @@ def estimate_det_rotation(ct_model, sino, *, bounds=None):
     is returned.  The comparison shifts the opposites by twice the model's ``det_channel_offset``,
     so estimate and set the offset first.
 
-    Resampling smooths the band, so an estimate that displaces the edge channels by less than about
-    one pixel is uncertain, and the function warns in that case.  When the scanner loader supplies
-    a detector tilt, prefer it over the estimate, and check the slices far from the central plane
-    before applying an estimate, because a rotation displaces those slices most.
+    The search covers five degrees on each side of zero.  Resampling smooths the band, so an
+    estimate that displaces the edge channels by less than about one pixel is uncertain, and the
+    function warns in that case.  When the scanner loader supplies a detector tilt, prefer it over
+    the estimate, and check the slices far from the central plane before applying an estimate,
+    because a rotation displaces those slices most.
+
+    The method needs a parallel or flat-detector cone-beam scan over a full rotation, so that every
+    view has an opposite view at the same axial position.  For any other scan the function warns
+    and returns zero, which leaves the sinogram unchanged.  A sinogram in the divided device form
+    is refused.
 
     Args:
-        ct_model (TomographyModel): a parallel or flat-detector cone model.  Not modified.
+        ct_model (TomographyModel): the model of the scan.  Not modified.
         sino (ndarray or tensor): the sinogram.  Not modified.
-        bounds (tuple of float, optional): the search range in radians, within five degrees of
-            zero.  None (the default) is the full five degrees on each side.
 
     Returns:
         float: the angle in radians, to remove with
         :func:`~mbirtorch.preprocess.correct_det_rotation`.
-
-    Raises:
-        ValueError: for a multiaxis model, a helical scan, a curved detector, views that do not
-            cover a full rotation, or bounds beyond the five degree cap.
     """
-    _require_conjugate_geometry(ct_model, 'det_rotation')
+    reason = _unsuitable_reason(ct_model, 'det_rotation')
+    if reason is not None:
+        warnings.warn(f'estimate_det_rotation: {reason}, so the rotation was left at zero.')
+        return 0.0
     _sharding.reject_shards('estimate_det_rotation', sino=sino)
-    if bounds is None:
-        bounds = (-_MAX_DET_ROTATION, _MAX_DET_ROTATION)
-    if max(abs(bounds[0]), abs(bounds[1])) > _MAX_DET_ROTATION:
-        raise ValueError(f'bounds must lie within {math.degrees(_MAX_DET_ROTATION):.0f} degrees of '
-                         f'zero; got {tuple(math.degrees(b) for b in bounds)} degrees.')
+    bounds = (-_MAX_DET_ROTATION, _MAX_DET_ROTATION)
     problem = _ConjugatePairs(ct_model)
     offset = problem.pairing_offset
     margin = problem.channel_margin(offset)

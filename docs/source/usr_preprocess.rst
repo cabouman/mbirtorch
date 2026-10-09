@@ -146,9 +146,11 @@ the sinogram.  The rotation estimate uses the model's channel offset, so the off
     sino = mtp.correct_det_rotation(sino, mtp.estimate_det_rotation(ct_model, sino))
     recon, recon_dict = ct_model.recon(sino)
 
-The estimators accept a parallel-beam or a cone-beam scan over a full rotation.  Three kinds of
-input are refused with an error: a scan over less than a full rotation, a helical scan, and a
-multiaxis scan.  A sinogram that is divided across devices has to be gathered to the host first.
+The estimators compare each view with the view opposite to it, so they need a parallel-beam or
+cone-beam scan over a full rotation.  For any other scan, such as a short scan, a helical scan, or
+a multiaxis scan, each function warns and returns the unchanged value: the model's current
+``det_channel_offset``, or a rotation of zero.  A sinogram that is divided across devices has to
+be gathered to the host first.
 
 When the scanner loader supplies a detector tilt, prefer it over the estimate, and check the slices
 far from the central plane before applying an estimate, because a detector rotation displaces

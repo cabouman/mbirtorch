@@ -4,6 +4,10 @@
 4D Reconstruction
 =================
 
+.. plot:: figs/recon_4d.py
+   :align: center
+   :width: 75%
+
 One continuous scan of a moving object is reconstructed as one volume per time frame.  The
 views are taken in time order and divided into overlapping angular windows, one per frame.
 ``frames_per_rotation`` sets how many frames make up a rotation and ``frame_overlap_factor``
