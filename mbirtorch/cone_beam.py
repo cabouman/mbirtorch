@@ -844,7 +844,12 @@ class ConeBeamModel(TomographyModel):
         """
         This function reduces memory usage for cone beam MBIR reconstruction by approximately a factor of 2
         by splitting the detector rows into two overlapping halves, reconstructing each half separately,
-        and stitching the reconstructions together.
+        and joining the reconstructions.
+
+        When each half fits on half the GPUs, the two halves are reconstructed side by side on two
+        equal groups of GPUs.  Otherwise all the GPUs reconstruct one half and then the other.  A
+        device choice made with ``configure_devices`` limits the GPUs the split may use, and the
+        grouping stays automatic.
 
         The arguments mirror TomographyModel.recon(), and the result is approximately equal to the
         reconstruction recon() returns.  Two differences: ``output_sharded`` is not accepted, and
@@ -877,7 +882,8 @@ class ConeBeamModel(TomographyModel):
         Returns:
             Tuple[np.ndarray, dict]: the reconstructed volume (numpy array), and a
                 metadata dictionary containing recon and model parameters for each
-                half, plus 'split_params' (the overlaps and any alignment shift used).
+                half, plus 'split_params' (the overlaps, any alignment shift used, and the
+                number of GPU groups and GPUs per group used).
                 If the split would leave either half too thin, the method warns,
                 performs a standard recon() instead, and returns that result's
                 dictionary (no per-half entries).

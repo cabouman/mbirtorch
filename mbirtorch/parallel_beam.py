@@ -325,8 +325,8 @@ class ParallelBeamModel(TomographyModel):
         Reduce the memory parallel beam MBIR needs by splitting the detector rows into overlapping
         sections, reconstructing the sections separately, and joining the results.
 
-        In parallel beam geometry detector row r is recon slice r, so a band of detector rows
-        reconstructs exactly the matching band of slices.  The overlap is there for the prior: it
+        In parallel beam geometry detector row r is recon slice r, so a section of detector rows
+        reconstructs exactly the matching section of slices.  The overlap is there for the prior: it
         gives the voxels near a seam their neighbors on the other side, so the seam is not treated
         as a volume boundary.
 

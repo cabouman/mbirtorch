@@ -373,10 +373,18 @@ class TomographyModel(ParameterHandler):
                          align_split_grid=False):
         """
         Perform MBIR reconstruction with less memory than :meth:`recon` by
-        splitting the detector rows into overlapping row bands -- two halves
-        for cone beam, one or more parts for parallel beam -- reconstructing
-        one band at a time, and stitching the results.  The output is
-        approximately equal to the output of :meth:`recon`.
+        splitting the detector rows into overlapping sections -- two halves
+        for cone beam, one or more sections for parallel beam -- reconstructing
+        each section, and joining the results.  The output is approximately
+        equal to the output of :meth:`recon`.
+
+        The GPUs are divided into equal groups, as many as possible, so that
+        each group can hold a section.  The groups reconstruct sections side by
+        side, and each group takes its sections one after another.  When no
+        smaller group holds a section, all the GPUs reconstruct each section in
+        turn.  A device choice made with ``configure_devices`` limits the GPUs
+        the split may use, and the grouping stays automatic.  The result's
+        ``'split_params'`` reports ``'num_groups'`` and ``'gpus_per_group'``.
 
         The split arithmetic is geometry specific, and recon_split_sino may
         not be available for all geometries; geometries without an
