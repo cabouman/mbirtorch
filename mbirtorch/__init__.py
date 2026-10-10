@@ -6,7 +6,7 @@ arrays by default; pass ``output_sharded=True`` to get the device tensor
 instead.  All available GPUs are used automatically.
 """
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 # The torch.compile caches are pinned under ~/.mbirtorch, so compiled code survives a process.
 # These settings take effect only if mbirtorch is imported before torch compiles anything.
