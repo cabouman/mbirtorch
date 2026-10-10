@@ -53,6 +53,28 @@ about a factor of 1.5.
 The full reference for ``estimate_resources`` is on the :ref:`TomographyModelDocs` page.
 
 
+.. _usr_split_groups:
+
+Split reconstruction on several GPUs
+------------------------------------
+
+``recon_split_sino`` reconstructs a volume too large for the GPUs in sections, and it uses the
+GPUs by one rule: the GPUs are divided into equal groups, as many as possible, so that each group
+can hold a section.  The groups reconstruct sections side by side, and each group takes its
+sections one after another.
+
+- With 8 GPUs, where a section needs 3, the GPUs can divide as 8 groups of 1, 4 of 2, 2 of 4, or
+  1 of 8.  Groups of 1 or 2 are too small, so 2 groups of 4 work side by side.
+- With 5 GPUs, where a section needs 3, the only equal groups are 5 of 1 or 1 of 5.  One GPU is
+  too small, so all 5 reconstruct each section in turn.
+
+For parallel beam a section keeps at least ``min_slices_per_section`` slices, 200 by default.
+For cone beam the two halves are the sections, so there are 2 groups when a half fits on half the
+GPUs, and otherwise 1.  The result's ``split_params`` reports the groups used.  A device choice
+made with ``configure_devices`` limits the GPUs the split may use, and the grouping stays
+automatic.
+
+
 Choosing the devices yourself
 -----------------------------
 

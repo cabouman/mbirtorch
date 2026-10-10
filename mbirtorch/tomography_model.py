@@ -12,11 +12,13 @@ reproduces a reconstruction iteration for iteration, so do not reorder the
 arithmetic.
 """
 
+import concurrent.futures
 import contextlib
 import datetime
 import io
 import math
 import os
+import threading
 import warnings
 
 import numpy as np
@@ -411,6 +413,101 @@ class TomographyModel(ParameterHandler):
         """
         raise NotImplementedError(
             f'recon_split_sino is not implemented for {type(self).__name__}.')
+
+    # ── the sections of a split reconstruction ────────────────────────────────
+
+    def _split_devices(self):
+        """Return the devices a split reconstruction divides into groups.
+
+        An explicit device choice is used as made.  Otherwise these are the GPUs the automatic
+        choice could use: every visible GPU, or the count set by MBIRTORCH_NUM_DEVICES.  On a
+        computer with no GPU the list is the model's one device.
+        """
+        if not self.device_layout_is_automatic:
+            return list(self.sino_placement.devices)
+        visible = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        pinned = _memory_ledger.pinned_device_count()
+        if pinned is not None:
+            visible = min(pinned, visible)
+        return self._candidate_devices(visible) if visible > 1 else [self.torch_device]
+
+    def _section_fits(self, section_model, devices, weighted):
+        """Return whether a reconstruction of ``section_model`` fits on ``devices``.
+
+        This is the memory check a reconstruction makes before it starts.  A device with no
+        readable memory, such as the CPU, holds whatever it is asked to.
+        """
+        if self.skip_memory_preflight:
+            return True
+        call_arrays = {}
+        if weighted:
+            # A read-only array of the sinogram's shape that occupies no memory.
+            shape = tuple(int(n) for n in section_model.get_params('sinogram_shape'))
+            call_arrays['weights'] = np.broadcast_to(np.ones(1, dtype=np.float32), shape)
+        ledger = section_model._build_memory_ledger(devices=devices, workload='recon',
+                                                    **call_arrays)
+        if ledger is None:
+            return True
+        fits, _rows = section_model._layout_capacity(devices, ledger, call_arrays)
+        return fits
+
+    @staticmethod
+    def _choose_gpus_per_group(devices, fits, max_groups=None):
+        """Return the number of devices in each group of a split reconstruction.
+
+        The devices are divided into equal groups, as many as possible, so that each group can
+        hold a section: the result is the smallest group size that divides the device count,
+        makes at most ``max_groups`` groups, and passes ``fits``.  ``fits`` takes a list of
+        devices.  When no smaller group passes, all the devices form one group.
+        """
+        num_devices = len(devices)
+        for size in range(1, num_devices):
+            if num_devices % size or (max_groups is not None and num_devices // size > max_groups):
+                continue
+            if fits(devices[:size]):
+                return size
+        return num_devices
+
+    @staticmethod
+    def _run_split_sections(jobs, devices, gpus_per_group):
+        """Run the sections of a split reconstruction and return their results in order.
+
+        Each job reconstructs one section.  It takes a list of devices, or None to let the
+        section's model choose its devices as ``recon`` does, and a random generator for the
+        section's ``recon``, or None for the global np.random state.  With one group, the jobs
+        run one after another with None for both, exactly as a sequence of ``recon`` calls.
+        With several groups, each group runs in its own thread and takes the next waiting job
+        until none are left.  The threads cannot share the global random state, so each
+        section gets a generator seeded from that state before the threads start.
+        """
+        if gpus_per_group >= len(devices):
+            return [job(None, None) for job in jobs]
+        groups = [devices[i:i + gpus_per_group] for i in range(0, len(devices), gpus_per_group)]
+        seeds = np.random.randint(0, 2 ** 31 - 1, size=len(jobs))
+        results = [None] * len(jobs)
+        lock = threading.Lock()
+        state = {'next': 0, 'failed': False}
+
+        def run_group(group):
+            while True:
+                with lock:
+                    index = state['next']
+                    if index >= len(jobs) or state['failed']:
+                        return
+                    state['next'] += 1
+                try:
+                    results[index] = jobs[index](group, np.random.default_rng(int(seeds[index])))
+                except BaseException:
+                    # A failed section stops the other groups from starting new sections.
+                    with lock:
+                        state['failed'] = True
+                    raise
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(groups)) as executor:
+            futures = [executor.submit(run_group, group) for group in groups]
+            for future in futures:
+                future.result()
+        return results
 
     def recon_plastic_metal(self, sino, weights, num_BH_iterations=3, num_constraint_update_iter=10,
                             stop_threshold_change_pct=0.2, num_metal=1, order=3, alpha=1, beta=0.002,

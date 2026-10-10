@@ -319,17 +319,22 @@ class ParallelBeamModel(TomographyModel):
     def recon_split_sino(self, sino, weights=None, half_overlap=5, init_recon=None, max_iterations=15,
                          stop_threshold_change_pct=0.2, first_iteration=0, compute_prior_loss=False,
                          logfile_path='~/.mbirtorch/logs/recon.log', print_logs=True,
-                         align_split_grid=False, slices_per_part=None):
+                         align_split_grid=False, slices_per_section=None, min_slices_per_section=200,
+                         slices_per_part=None):
         """
-        This function reduces the memory needed for parallel beam MBIR reconstruction by splitting the
-        detector rows into overlapping parts, reconstructing one part at a time, and stitching the
-        reconstructions together.  Memory use drops by roughly the number of parts, since only one
-        part is resident at a time.
+        Reduce the memory parallel beam MBIR needs by splitting the detector rows into overlapping
+        sections, reconstructing the sections separately, and joining the results.
 
         In parallel beam geometry detector row r is recon slice r, so a band of detector rows
-        reconstructs exactly the matching band of slices and the parts decouple exactly in the
-        forward model.  The overlap is there for the prior: it gives the voxels near a seam their
-        neighbors on the other side, so the seam is not treated as a volume boundary.
+        reconstructs exactly the matching band of slices.  The overlap is there for the prior: it
+        gives the voxels near a seam their neighbors on the other side, so the seam is not treated
+        as a volume boundary.
+
+        The GPUs are divided into equal groups, as many as possible, so that each group can hold a
+        section of at least ``min_slices_per_section`` slices.  The groups reconstruct sections
+        side by side, and each group takes its sections one after another, so a volume of any
+        size can be reconstructed.  When no smaller group holds such a section, all the GPUs
+        reconstruct each section in turn.
 
         The arguments mirror TomographyModel.recon(), and the result is approximately equal to the
         reconstruction recon() returns.  Two differences: ``output_sharded`` is not accepted, and
@@ -341,8 +346,8 @@ class ParallelBeamModel(TomographyModel):
             weights (numpy or tensor, optional): Optional sinogram weights with the same shape as
                 `sino`.  Not accepted in sharded form, like `sino`.
             half_overlap (int): Number of detector rows, and therefore recon slices, kept past each
-                side of a seam by the part on that side.  Every interior seam is then computed twice
-                over ``2 * half_overlap`` slices, which is the span the stitch blends across.
+                side of a seam by the section on that side.  Every interior seam is then computed
+                twice over ``2 * half_overlap`` slices, which is the span the join blends across.
             init_recon (optional): Same as in the recon method.  Not accepted
                 in sharded form, like `sino`.
             max_iterations (int, optional): Same as in the recon method.
@@ -350,33 +355,36 @@ class ParallelBeamModel(TomographyModel):
             first_iteration (int, optional): Same as in the TomographyModel.recon() method.
             compute_prior_loss (bool, optional): Accepted for interface compatibility; not
                 currently used by the mbirtorch recon.
-            logfile_path (str, optional): Same as in the TomographyModel.recon() method.  The parts'
-                logs are merged into this single file, each under a section header.
+            logfile_path (str, optional): Same as in the TomographyModel.recon() method.  The
+                sections' logs are merged into this single file, each under a header.
             print_logs (bool, optional): Same as in the TomographyModel.recon() method.
             align_split_grid (bool, optional): Accepted for interface compatibility and does
                 nothing here.  Rows and slices share one grid in parallel beam, so the sub-slice
                 misalignment between the sinogram cut and the recon split that this flag corrects
                 for cone beam cannot exist.
-            slices_per_part (int, optional): Number of slices each part keeps, which sets the number
-                of parts.  Must be at least ``2 * half_overlap``.  The default, None, chooses the
-                fewest parts whose reconstruction is modeled to fit the available device memory,
-                using the same memory model the reconstruction itself uses; a value of at least the
-                number of slices asks for a single part, which is a plain recon().
+            slices_per_section (int, optional): Number of slices each section keeps, which sets the
+                number of sections.  Must be at least ``2 * half_overlap``.  The default, None,
+                chooses the sections from the memory of the GPUs, as described above.  A value of
+                at least the number of slices asks for a single section, which is a plain recon().
+            min_slices_per_section (int, optional): The fewest slices a section may keep when the
+                sections are chosen automatically.  Defaults to 200.
+            slices_per_part (int, optional): Deprecated name of ``slices_per_section``.
 
         Returns:
             Tuple[np.ndarray, dict]: the reconstructed volume (numpy array), and a
                 metadata dictionary containing recon and model parameters for each
-                part, plus 'split_params' (the overlap, the number of parts, and the
-                slice range each part contributes).  If the volume has too few slices
-                to split at this half_overlap, the method warns, performs a standard
-                recon() instead, and returns that result's dictionary (no per-part
-                entries).  A single part chosen by the estimate, or asked for through
-                `slices_per_part`, does the same without a warning.
+                section, plus 'split_params' (the overlap, the number of sections, the
+                slice range each section contributes, and the number of GPU groups and GPUs
+                per group used).  If the volume has too few slices to split at this
+                half_overlap, the method warns, performs a standard recon() instead, and
+                returns that result's dictionary (no per-section entries).  A single section,
+                chosen automatically or asked for through `slices_per_section`, does the same
+                without a warning.
 
         Raises:
             ValueError: If inputs are missing or shapes are inconsistent, if half_overlap < 2, if
-                `slices_per_part` would leave a part with fewer than ``2 * half_overlap`` slices, or
-                if `sino`, `weights`, or `init_recon` is in the sharded form.
+                `slices_per_section` would leave a section with fewer than ``2 * half_overlap``
+                slices, or if `sino`, `weights`, or `init_recon` is in the sharded form.
             AssertionError: If array dimensions are invalid.
 
         Example:
@@ -390,11 +398,16 @@ class ParallelBeamModel(TomographyModel):
         from . import _sharding
         from .utilities import copy_ct_model, stitch_arrays, merge_log_files
 
+        if slices_per_part is not None:
+            warnings.warn('slices_per_part is deprecated; use slices_per_section.',
+                          DeprecationWarning, stacklevel=2)
+            if slices_per_section is None:
+                slices_per_section = slices_per_part
         if half_overlap < 2:
             raise ValueError('half_overlap must be >= 2.')
         if sino is None:
             raise ValueError("sino must be provided.")
-        # An input already placed on the devices is refused.  Each part settles a
+        # An input already placed on the devices is refused.  Each section settles a
         # device layout of its own, so this method works from host arrays.
         if (isinstance(sino, _sharding.Shards)
                 or isinstance(weights, _sharding.Shards)
@@ -409,7 +422,7 @@ class ParallelBeamModel(TomographyModel):
             raise AssertionError("weights, if provided, must have the same shape as sino.")
 
         # The split is done on the host, so the full sinogram is never on the devices
-        # at once.  The per-part slices below are host views.
+        # at once.  The per-section slices below are host views.
         if isinstance(sino, torch.Tensor):
             sino = sino.detach().cpu().numpy()
         sino = np.asarray(sino)
@@ -423,63 +436,88 @@ class ParallelBeamModel(TomographyModel):
         num_rows = sino.shape[1]
         recon_rows, recon_cols = self.get_params('recon_shape')[:2]
 
-        def _part_model(num_part_rows):
-            """Return a copy of this model covering ``num_part_rows``
+        def _section_model(num_section_rows):
+            """Return a copy of this model covering ``num_section_rows``
             detector rows, and therefore that many recon slices."""
-            model = copy_ct_model(self, new_num_det_rows=num_part_rows, no_warning=True)
+            model = copy_ct_model(self, new_num_det_rows=num_section_rows, no_warning=True)
             # The regularization values come from the parent, which derives them from
-            # the full sinogram below.  A part must not derive its own from part data.
+            # the full sinogram below.  A section must not derive its own from section data.
             model.set_params(no_warning=True, auto_regularize_flag=False)
-            model.set_params(recon_shape=(recon_rows, recon_cols, num_part_rows))
+            model.set_params(recon_shape=(recon_rows, recon_cols, num_section_rows))
             return model
 
-        def _worst_part_model_rows(num_parts):
-            """Return the number of rows in the largest part model at this
-            part count.  It is the largest kept part plus half_overlap for
+        def _largest_section_rows(num_sections):
+            """Return the number of rows in the largest section model at this
+            section count.  It is the largest kept section plus half_overlap for
             each interior side it has."""
-            biggest_kept = -(-num_rows // num_parts)
-            if num_parts == 1:
+            biggest_kept = -(-num_rows // num_sections)
+            if num_sections == 1:
                 return biggest_kept
-            if num_parts == 2:
+            if num_sections == 2:
                 return biggest_kept + half_overlap
             return biggest_kept + 2 * half_overlap
 
-        # Each part must keep at least 2 * half_overlap slices, so that the overlaps
+        # Each section must keep at least 2 * half_overlap slices, so that the overlaps
         # at its two seams do not run into each other.
-        max_parts = num_rows // (2 * half_overlap)
+        max_sections = num_rows // (2 * half_overlap)
+        weighted = weights is not None
+        devices = self._split_devices()
+        gpus_per_group = len(devices)
         estimated = False
-        if slices_per_part is not None:
-            if slices_per_part < 2 * half_overlap:
+        if slices_per_section is not None:
+            if slices_per_section < 2 * half_overlap:
                 raise ValueError(
-                    f'slices_per_part must be at least 2 * half_overlap = {2 * half_overlap}; '
-                    f'got {slices_per_part}.')
-            num_parts = -(-num_rows // int(slices_per_part))
-            if num_parts > 1 and num_parts > max_parts:
+                    f'slices_per_section must be at least 2 * half_overlap = {2 * half_overlap}; '
+                    f'got {slices_per_section}.')
+            num_sections = -(-num_rows // int(slices_per_section))
+            if num_sections > 1 and num_sections > max_sections:
                 raise ValueError(
-                    f'slices_per_part={slices_per_part} gives {num_parts} parts of about '
-                    f'{num_rows // num_parts} slices each, which is below 2 * half_overlap = '
-                    f'{2 * half_overlap}; use at most {max_parts} parts, or a smaller '
+                    f'slices_per_section={slices_per_section} gives {num_sections} sections of about '
+                    f'{num_rows // num_sections} slices each, which is below 2 * half_overlap = '
+                    f'{2 * half_overlap}; use at most {max_sections} sections, or a smaller '
                     f'half_overlap.')
-        elif max_parts < 2:
-            # With fewer than 4 * half_overlap slices no split leaves both parts the
+            if num_sections > 1:
+                section = _section_model(_largest_section_rows(num_sections))
+                gpus_per_group = self._choose_gpus_per_group(
+                    devices, lambda group: self._section_fits(section, group, weighted))
+        elif max_sections < 2:
+            # With fewer than 4 * half_overlap slices no split leaves both sections the
             # slices their overlaps need, so a normal MBIR recon runs instead.
             warnings.warn(
                 "the volume has too few slices to split at this half_overlap; "
                 "falling back to standard MBIR reconstruction.",
                 UserWarning,
             )
-            num_parts = 1
+            num_sections = 1
         else:
-            # This chooses the fewest parts whose largest part model is priced to
-            # fit the devices.
-            num_parts = max_parts
-            for candidate in range(1, max_parts + 1):
-                if _part_model(_worst_part_model_rows(candidate))._fits_available_devices():
-                    num_parts = candidate
-                    break
+            # The devices are divided into equal groups, as many as possible, so that each
+            # group can hold a section of at least min_slices_per_section slices.
+            min_rows = min(int(min_slices_per_section) + 2 * half_overlap, num_rows)
+            smallest_section = _section_model(min_rows)
+            gpus_per_group = self._choose_gpus_per_group(
+                devices, lambda group: self._section_fits(smallest_section, group, weighted))
+            num_sections = max_sections
+            if gpus_per_group == len(devices):
+                # One group: the fewest sections whose largest model fits the devices.
+                for candidate in range(1, max_sections + 1):
+                    if _section_model(_largest_section_rows(candidate))._fits_available_devices():
+                        num_sections = candidate
+                        break
+            else:
+                # Several groups: the fewest sections that fit one group, and at least one
+                # section per group while each keeps min_slices_per_section slices.
+                group = devices[:gpus_per_group]
+                for candidate in range(1, max_sections + 1):
+                    if self._section_fits(_section_model(_largest_section_rows(candidate)),
+                                          group, weighted):
+                        num_sections = candidate
+                        break
+                num_groups = len(devices) // gpus_per_group
+                num_sections = max(num_sections,
+                                   min(num_groups, num_rows // int(min_slices_per_section), max_sections))
             estimated = True
 
-        if num_parts == 1:
+        if num_sections == 1:
             return self.recon(
                 sino,
                 weights=weights,
@@ -491,66 +529,74 @@ class ParallelBeamModel(TomographyModel):
                 print_logs=print_logs,
             )
 
-        # The kept slice ranges tile [0, num_rows) in nearly equal parts.
-        base, extra = divmod(num_rows, num_parts)
-        part_ranges, start = [], 0
-        for index in range(num_parts):
+        # The kept slice ranges tile [0, num_rows) in nearly equal sections.
+        base, extra = divmod(num_rows, num_sections)
+        section_ranges, start = [], 0
+        for index in range(num_sections):
             stop = start + base + (1 if index < extra else 0)
-            part_ranges.append((start, stop))
+            section_ranges.append((start, stop))
             start = stop
 
         # The regularization parameters come from the full sinogram and its weights, the same
-        # inputs recon uses, so the parts get the values recon would set.  The parts copy them
-        # and set auto_regularize_flag=False.
+        # inputs recon uses, so the sections get the values recon would set.  The sections copy
+        # them and set auto_regularize_flag=False.
         self.auto_set_regularization_params(sino, weights=weights)
 
-        def _recon_one_part(model_lo, model_hi, part_logfile_path):
+        def _recon_one_section(model_lo, model_hi, section_logfile_path, devices, rng):
             """Reconstruct one band of detector rows and return (host_recon,
             recon_dict).
 
-            The part's model, sinogram slice, and weights are local, so they
-            are released when this returns.  Only one part's inputs are
-            resident at a time.  The returned reconstruction is a host array.
+            ``devices`` is the section's group of devices, or None to let the
+            section model choose its devices as recon does.  ``rng`` is the random
+            generator for recon, or None.  The section's model,
+            sinogram slice, and weights are local, so they are released when this
+            returns.  The returned reconstruction is a host array.
             """
-            model = _part_model(model_hi - model_lo)
+            model = _section_model(model_hi - model_lo)
+            if devices is not None:
+                model.configure_devices(devices=devices)
 
             # The sinogram and weight slices are host views, and nothing writes them.
             # A weights value of None passes through to the constant-weight path.
-            sino_part = sino[:, model_lo:model_hi, :]
-            weights_part = None if weights is None else weights[:, model_lo:model_hi, :]
-            # Rows are slices, so the part's initial reconstruction is the
+            sino_section = sino[:, model_lo:model_hi, :]
+            weights_section = None if weights is None else weights[:, model_lo:model_hi, :]
+            # Rows are slices, so the section's initial reconstruction is the
             # matching slice band.
-            part_init = None if init_recon is None else init_recon[:, :, model_lo:model_hi]
+            section_init = None if init_recon is None else init_recon[:, :, model_lo:model_hi]
 
-            return model.recon(sino_part, weights=weights_part, init_recon=part_init,
+            return model.recon(sino_section, weights=weights_section, init_recon=section_init,
                                max_iterations=max_iterations,
                                stop_threshold_change_pct=stop_threshold_change_pct,
                                first_iteration=first_iteration,
-                               logfile_path=part_logfile_path,
-                               print_logs=print_logs)
+                               logfile_path=section_logfile_path,
+                               print_logs=print_logs, rng=rng)
 
-        # The parts are reconstructed one at a time, and each logs to its own file.
-        # The merge runs in a finally block so that logs from a failure are kept.
+        # Each section logs to its own file.  The merge runs in a finally block so that logs
+        # from a failure are kept.
         if logfile_path:
             log_path = os.path.expanduser(logfile_path)
-            part_log_paths = [log_path + '.part{}'.format(index) for index in range(num_parts)]
+            section_log_paths = [log_path + '.section{}'.format(index) for index in range(num_sections)]
         else:
-            log_path, part_log_paths = None, [None] * num_parts
-        part_recons, part_dicts = [], []
+            log_path, section_log_paths = None, [None] * num_sections
+
+        def _job(index, lo, hi):
+            """Return the job that reconstructs section ``index``.  The section's model spans its
+            kept rows plus half_overlap on each interior side."""
+            model_lo, model_hi = max(lo - half_overlap, 0), min(hi + half_overlap, num_rows)
+            return lambda group, rng: _recon_one_section(model_lo, model_hi, section_log_paths[index],
+                                                         group, rng)
+
+        jobs = [_job(index, lo, hi) for index, (lo, hi) in enumerate(section_ranges)]
         try:
-            for index, (lo, hi) in enumerate(part_ranges):
-                # The part's model spans its kept rows plus half_overlap on
-                # each interior side.
-                model_lo, model_hi = max(lo - half_overlap, 0), min(hi + half_overlap, num_rows)
-                part_recon, part_dict = _recon_one_part(model_lo, model_hi, part_log_paths[index])
-                part_recons.append(part_recon)
-                part_dicts.append(part_dict)
+            results = self._run_split_sections(jobs, devices, gpus_per_group)
         finally:
             if log_path:
-                labels = ['recon_split_sino: part {} of {} (slices {}-{})'.format(
-                    index + 1, num_parts, lo, hi - 1)
-                    for index, (lo, hi) in enumerate(part_ranges)]
-                merge_log_files(log_path, zip(labels, part_log_paths))
+                labels = ['recon_split_sino: section {} of {} (slices {}-{})'.format(
+                    index + 1, num_sections, lo, hi - 1)
+                    for index, (lo, hi) in enumerate(section_ranges)]
+                merge_log_files(log_path, zip(labels, section_log_paths))
+        section_recons = [recon for recon, _ in results]
+        section_dicts = [recon_dict for _, recon_dict in results]
 
         # stitch_arrays assembles the full volume on the host, with an overlap of
         # half_overlap on each side of every seam.  ramp_overlap sets which slices
@@ -558,25 +604,27 @@ class ParallelBeamModel(TomographyModel):
         ramp_overlap = 4
         ramp_overlap = min(ramp_overlap, half_overlap)
         ramp_overlap -= ramp_overlap % 2
-        recon_full = stitch_arrays(part_recons, axis=2, overlap=2 * half_overlap,
+        recon_full = stitch_arrays(section_recons, axis=2, overlap=2 * half_overlap,
                                    ramp_overlap=ramp_overlap)
 
-        # The dictionary holds one entry per part, in part order.  The last three
+        # The dictionary holds one entry per section, in section order.  The last three
         # split_params entries have no meaning for parallel beam, and are carried
         # so that both geometries return the same fields.
-        recon_full_dict = {'recon_params_parts': [d.get('recon_params') for d in part_dicts],
-                           'recon_log_parts': [d.get('recon_log', '# Log info not saved.')
-                                               for d in part_dicts],
-                           'notes_parts': [d.get('notes', '# No notes saved') for d in part_dicts],
-                           'model_params_parts': [d.get('model_params') for d in part_dicts],
+        recon_full_dict = {'recon_params_sections': [d.get('recon_params') for d in section_dicts],
+                           'recon_log_sections': [d.get('recon_log', '# Log info not saved.')
+                                                  for d in section_dicts],
+                           'notes_sections': [d.get('notes', '# No notes saved') for d in section_dicts],
+                           'model_params_sections': [d.get('model_params') for d in section_dicts],
                            'split_params': {'half_overlap_sino': int(half_overlap),
                                             'half_overlap_recon': int(half_overlap),
-                                            'num_parts': int(num_parts),
-                                            'part_slice_ranges': [(int(lo), int(hi))
-                                                                  for lo, hi in part_ranges],
-                                            'slices_per_part': int(max(hi - lo for lo, hi
-                                                                       in part_ranges)),
+                                            'num_sections': int(num_sections),
+                                            'section_slice_ranges': [(int(lo), int(hi))
+                                                                     for lo, hi in section_ranges],
+                                            'slices_per_section': int(max(hi - lo for lo, hi
+                                                                          in section_ranges)),
                                             'estimated': bool(estimated),
+                                            'num_groups': len(devices) // gpus_per_group,
+                                            'gpus_per_group': int(gpus_per_group),
                                             'align_split_grid': bool(align_split_grid),
                                             'grid_shift_alu': 0.0,
                                             'split_cut_mismatch_slices': 0.0}, }

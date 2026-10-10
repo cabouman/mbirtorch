@@ -34,7 +34,7 @@ file is memory mapped and an HDF5 file is read as hyperslabs, so in both cases o
 band is in memory.  The angles are radians, one per view, or `--angle-span 180` makes
 equally spaced views over 180 degrees.  Weights are `none`, `transmission`, or
 `transmission_root`, computed per band, or a `.npy` file read per band.  `--num-gpus` pins
-the GPU count; `--slices-per-part` overrides the band size.
+the GPU count; `--slices-per-section` overrides the band size.
 
 For a test without data, make a phantom sinogram first, then check the result:
 

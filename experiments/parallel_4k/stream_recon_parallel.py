@@ -90,7 +90,7 @@ def parse_args():
     dev = p.add_argument_group('devices and memory')
     dev.add_argument('--num-gpus', type=int, help='pin the GPU count (default: all visible GPUs)')
     dev.add_argument('--devices', help="explicit device list for every band, e.g. 'cpu' or 'cuda:0,cuda:1'")
-    dev.add_argument('--slices-per-part', type=int,
+    dev.add_argument('--slices-per-section', type=int,
                      help='slices per band (default: the most the memory model says fit the GPUs)')
     dev.add_argument('--margin', type=float, default=0.3,
                      help='safety margin of the memory check when choosing the band: a band fits when '
@@ -259,7 +259,7 @@ def choose_num_parts(full_model, num_rows, half_overlap, margin, weights_supplie
     This is the choice recon_split_sino makes, with the margin as a parameter."""
     if not torch.cuda.is_available():
         raise SystemExit('without CUDA the memory model cannot read a GPU budget; '
-                         'give --slices-per-part')
+                         'give --slices-per-section')
     max_parts = max(1, num_rows // (2 * half_overlap))
     for num_parts in range(1, max_parts + 1):
         model = band_model(full_model, worst_part_rows(num_rows, num_parts, half_overlap))
@@ -330,8 +330,8 @@ def main():
           + ', '.join(f'{k}={v:.4g}' for k, v in regularization.items()), flush=True)
 
     ho = args.half_overlap
-    if args.slices_per_part is not None:
-        num_parts = max(1, -(-num_rows // args.slices_per_part))
+    if args.slices_per_section is not None:
+        num_parts = max(1, -(-num_rows // args.slices_per_section))
     else:
         num_parts = choose_num_parts(full, num_rows, ho, args.margin, weights_supplied)
     if num_parts > 1 and num_rows // num_parts < 2 * ho:

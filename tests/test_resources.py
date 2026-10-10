@@ -57,12 +57,12 @@ def test_parallel_split_parts_match_a_real_split():
     model = _small_model('parallel')
     sino = np.asarray(model.forward_project(np.ones(model.get_params('recon_shape'), np.float32)))
     _, recon_dict = model.recon_split_sino(sino, max_iterations=1, print_logs=False, logfile_path=None,
-                                           slices_per_part=14)
-    num_parts = recon_dict['split_params']['num_parts']
-    largest = max(p['sinogram_shape'][1] for p in recon_dict['model_params_parts'])
+                                           slices_per_section=14)
+    num_parts = recon_dict['split_params']['num_sections']
+    largest = max(p['sinogram_shape'][1] for p in recon_dict['model_params_sections'])
     # The estimate uses the bound recon_split_sino uses to choose the number of parts, which can
     # exceed the real largest part by a row when the parts are unequal.
-    assert largest <= resources._parallel_largest_part_rows(40, num_parts, 5) <= largest + 1
+    assert largest <= resources._parallel_largest_section_rows(40, num_parts, 5) <= largest + 1
 
 
 def test_estimate_reports_and_leaves_the_model_unchanged():
@@ -86,3 +86,24 @@ def test_missing_information_is_reported_not_raised(monkeypatch):
     assert estimate.split.gpu_memory_gib is None
     assert 'not available' in str(estimate)
     assert 'translation' not in str(estimate)
+
+
+def test_estimate_reports_the_split_layout():
+    """The estimate's split uses the group rule recon_split_sino uses, with the stated GPUs."""
+    # Cone beam on 8 H100s: the hexagonal scan's larger half needs 84 GiB on 4 GPUs, so the halves
+    # run one after another on all 8.  On GPUs with 100 GB a half fits on 4, so 2 groups of 4.
+    estimate = mbirtorch.estimate_resources(_hexagonal_scan_model(), gpu_model='H100', num_gpus=8)
+    assert estimate.split.fits is True and 'groups' not in estimate.split.note
+    estimate = mbirtorch.estimate_resources(_hexagonal_scan_model(), gpu_model='H100', num_gpus=8,
+                                            gpu_memory_gb=100)
+    assert '2 groups of 4 GPUs' in estimate.split.note
+    # Parallel beam: 1200 slices on 4 GPUs of 80 GB give 4 groups of 1 GPU, one section each.
+    model = mbirtorch.ParallelBeamModel((256, 1200, 512), np.linspace(0, np.pi, 256, endpoint=False),
+                                        compile_mode='off')
+    model.configure_devices(devices=['cpu'])
+    model.set_params(no_warning=True, verbose=0)
+    estimate = mbirtorch.estimate_resources(model, gpu_model='H100', num_gpus=4)
+    assert '4 sections' in estimate.split.note and '4 groups of 1 GPUs' in estimate.split.note
+    # With almost no GPU memory, nothing fits on fewer than all 4, so one group of 4.
+    estimate = mbirtorch.estimate_resources(model, gpu_model='H100', num_gpus=4, gpu_memory_gb=2.5)
+    assert 'groups' not in estimate.split.note

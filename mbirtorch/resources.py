@@ -15,6 +15,7 @@ import torch
 from .cone_beam import ConeBeamModel
 from .multiaxis_parallel import MultiAxisParallelModel
 from .parallel_beam import ParallelBeamModel
+from .tomography_model import TomographyModel
 from .translation_model import TranslationModel
 from .utilities import copy_ct_model
 
@@ -24,6 +25,9 @@ _GIB = 2 ** 30
 
 #: The overlap recon_split_sino uses by default, in detector rows.
 _SPLIT_HALF_OVERLAP = 5
+
+#: The default fewest slices of a parallel beam section, as in ParallelBeamModel.recon_split_sino.
+_MIN_SLICES_PER_SECTION = 200
 
 #: The memory a GPU driver keeps for itself when the speed file has no value for the GPU model, in GiB.
 _DEFAULT_DRIVER_RESERVE_GIB = 2.0
@@ -166,11 +170,11 @@ def estimate_resources(ct_model, gpu_model='H100', num_gpus=1, gpu_memory_gb=Non
     host = {'sinogram': sino_gib, 'weights': sino_gib, 'recon': recon_gib,
             'total': 2 * sino_gib + recon_gib}
 
-    def step(model, workload, iterations):
-        """Return the _StepEstimate of one ordinary reconstruction of ``model``."""
-        memory = _gpu_memory_gib(model, num_gpus, workload)
+    def step(model, workload, iterations, gpus=num_gpus):
+        """Return the _StepEstimate of one ordinary reconstruction of ``model`` on ``gpus`` GPUs."""
+        memory = _gpu_memory_gib(model, gpus, workload)
         fits = None if usable is None else memory <= usable
-        minutes, reason = _time_minutes(model, speeds, speed_reason, gpu_model, num_gpus, workload, iterations)
+        minutes, reason = _time_minutes(model, speeds, speed_reason, gpu_model, gpus, workload, iterations)
         return _StepEstimate(memory, fits, minutes, reason or '')
 
     direct = step(ct_model, 'direct', 1)
@@ -237,22 +241,46 @@ def _gpu_memory_gib(ct_model, num_gpus, workload, weights=True):
 # ── split reconstruction ────────────────────────────────────────────────────────────────
 
 def _split_estimate(ct_model, num_gpus, usable, step, max_iterations):
-    """Return the _StepEstimate of ``recon_split_sino``: the largest part's memory and the sum of the parts' times."""
+    """Return the _StepEstimate of ``recon_split_sino``: the largest section's memory and the time of the slowest group.
+
+    The GPUs are divided into groups by the same method recon_split_sino uses.  Groups run
+    side by side, and each group runs its sections one after another.
+    """
+    devices = list(range(num_gpus))
+
+    def fits_all(sections):
+        return lambda group: all(_gpu_memory_gib(section, len(group), 'recon') <= usable for section in sections)
+
     if isinstance(ct_model, ConeBeamModel):
-        parts, note = _cone_split_parts(ct_model)
+        sections, note = _cone_split_parts(ct_model)
+        gpus_per_group = num_gpus
+        if sections is not None and len(sections) == 2 and usable is not None:
+            gpus_per_group = TomographyModel._choose_gpus_per_group(devices, fits_all(sections), max_groups=2)
     elif isinstance(ct_model, ParallelBeamModel):
-        parts, note = _parallel_split_parts(ct_model, num_gpus, usable)
+        sections, note, gpus_per_group = _parallel_split_sections(ct_model, num_gpus, usable)
     else:
         return _StepEstimate(note=f'{type(ct_model).__name__} has no split reconstruction')
-    if parts is None:
+    if sections is None:
         return _StepEstimate(note=note)
-    estimates = [step(part, 'recon', max_iterations) for part in parts]
+    num_groups = num_gpus // gpus_per_group
+    if num_groups > 1:
+        note = f'{note}; {num_groups} groups of {gpus_per_group} GPUs side by side'
+    estimates = [step(section, 'recon', max_iterations, gpus_per_group) for section in sections]
     memory = max(e.gpu_memory_gib for e in estimates)
     fits = None if usable is None else memory <= usable
     times = [e.time_minutes for e in estimates]
-    minutes = None if any(t is None for t in times) else sum(times)
+    minutes = None if any(t is None for t in times) else _slowest_group_minutes(times, num_groups)
     time_note = next((e.note for e in estimates if e.note), '')
     return _StepEstimate(memory, fits, minutes, '; '.join(n for n in (note, time_note) if n))
+
+
+def _slowest_group_minutes(times, num_groups):
+    """Return when the last group finishes, when each group takes the next waiting section."""
+    finish = [0.0] * num_groups
+    for minutes in times:
+        group = finish.index(min(finish))
+        finish[group] += minutes
+    return max(finish)
 
 
 def _cone_split_parts(ct_model):
@@ -292,49 +320,56 @@ def _cone_split_parts(ct_model):
     return parts, f'2 parts of {rows[0]} and {rows[1]} detector rows'
 
 
-def _parallel_split_parts(ct_model, num_gpus, usable):
-    """Return the part models ParallelBeamModel.recon_split_sino reconstructs, and a note.
+def _parallel_split_sections(ct_model, num_gpus, usable):
+    """Return the section models ParallelBeamModel.recon_split_sino reconstructs, a note, and the GPUs per group.
 
-    The number of parts is the fewest whose largest part fits on the stated GPUs, as
-    recon_split_sino chooses it on the GPUs present.
+    The sections and the groups follow the rule recon_split_sino applies on the GPUs present,
+    with the stated GPUs instead.
     """
     num_rows = int(ct_model.get_params('sinogram_shape')[1])
     recon_rows, recon_cols = (int(n) for n in ct_model.get_params('recon_shape')[:2])
     half_overlap = _SPLIT_HALF_OVERLAP
-    max_parts = num_rows // (2 * half_overlap)
-    if max_parts < 2:
-        return [ct_model], 'the volume is too thin to split, so it runs as one reconstruction'
+    max_sections = num_rows // (2 * half_overlap)
+    if max_sections < 2:
+        return [ct_model], 'the volume is too thin to split, so it runs as one reconstruction', num_gpus
+    if usable is None:
+        return (None, 'not available: the number of sections depends on the GPU memory, which is not known',
+                num_gpus)
 
-    def largest_part_rows(num_parts):
-        return _parallel_largest_part_rows(num_rows, num_parts, half_overlap)
-
-    def part(num_parts):
-        rows = largest_part_rows(num_parts)
+    def section(rows):
         return _part_model(ct_model, rows, (recon_rows, recon_cols, rows))
 
-    if usable is None:
-        return None, 'not available: the number of parts depends on the GPU memory, which is not known'
-    num_parts = max_parts
-    for candidate in range(1, max_parts + 1):
-        if _gpu_memory_gib(part(candidate), num_gpus, 'recon') <= usable:
-            num_parts = candidate
+    def fits(rows, gpus):
+        return _gpu_memory_gib(section(rows), gpus, 'recon') <= usable
+
+    min_rows = min(_MIN_SLICES_PER_SECTION + 2 * half_overlap, num_rows)
+    gpus_per_group = TomographyModel._choose_gpus_per_group(list(range(num_gpus)),
+                                                            lambda group: fits(min_rows, len(group)))
+    num_sections = max_sections
+    for candidate in range(1, max_sections + 1):
+        if fits(_parallel_largest_section_rows(num_rows, candidate, half_overlap), gpus_per_group):
+            num_sections = candidate
             break
-    if num_parts == 1:
-        return [ct_model], 'it fits without splitting, so it runs as one reconstruction'
-    return [part(num_parts)] * num_parts, f'{num_parts} parts of up to {largest_part_rows(num_parts)} detector rows'
+    num_groups = num_gpus // gpus_per_group
+    if num_groups > 1:
+        num_sections = max(num_sections, min(num_groups, num_rows // _MIN_SLICES_PER_SECTION, max_sections))
+    if num_sections == 1:
+        return [ct_model], 'it fits without splitting, so it runs as one reconstruction', num_gpus
+    rows = _parallel_largest_section_rows(num_rows, num_sections, half_overlap)
+    return [section(rows)] * num_sections, f'{num_sections} sections of up to {rows} detector rows', gpus_per_group
 
 
-def _parallel_largest_part_rows(num_rows, num_parts, half_overlap):
-    """Return the detector rows of the largest part when ParallelBeamModel.recon_split_sino makes ``num_parts`` parts.
+def _parallel_largest_section_rows(num_rows, num_sections, half_overlap):
+    """Return the detector rows of the largest section when ParallelBeamModel.recon_split_sino makes ``num_sections``.
 
-    It is the bound recon_split_sino uses to choose the number of parts: the largest kept part
-    plus ``half_overlap`` rows for each side it shares with another part.  It can exceed the real
-    largest part by a row when the parts are unequal.
+    It is the bound recon_split_sino uses to choose the number of sections: the largest kept
+    section plus ``half_overlap`` rows for each side it shares with another section.  It can
+    exceed the real largest section by a row when the sections are unequal.
     """
-    biggest = -(-num_rows // num_parts)
-    if num_parts == 1:
+    biggest = -(-num_rows // num_sections)
+    if num_sections == 1:
         return biggest
-    return biggest + (half_overlap if num_parts == 2 else 2 * half_overlap)
+    return biggest + (half_overlap if num_sections == 2 else 2 * half_overlap)
 
 
 def _part_model(ct_model, num_rows, recon_shape):

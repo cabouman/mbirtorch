@@ -41,7 +41,8 @@ Reconstruction
 
 ``recon`` is the iterative reconstruction.  ``recon_fdk`` is Feldkamp-Davis-Kress filtered back
 projection, fast and non-iterative, which ``recon`` uses as its starting point.
-``recon_split_sino`` reconstructs a sinogram too large for memory in two overlapping halves.
+``recon_split_sino`` reconstructs a sinogram too large for memory in two overlapping halves, side
+by side on two groups of GPUs when each half fits on half the GPUs.
 
 .. automethod:: mbirtorch.ConeBeamModel.recon
 

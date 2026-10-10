@@ -1045,14 +1045,8 @@ class ConeBeamModel(TomographyModel):
         # and set auto_regularize_flag=False.
         self.auto_set_regularization_params(sino, weights=weights)
 
-        def _recon_one_half(lo, hi, recon_shape, recon_slice_offset, is_top, half_logfile_path):
-            """Reconstruct one detector-row half and return (host_recon,
-            recon_dict).
-
-            The half's model, sinogram slice, and weights are local, so they
-            are released when this returns.  Only one half's inputs are
-            resident at a time.  The returned reconstruction is a host array.
-            """
+        def _half_model(lo, hi, recon_shape, recon_slice_offset):
+            """Return the model of one detector-row half."""
             num_rows = hi - lo
             det_center = (num_rows - 1) / 2.0
             det_row_offset = full_det_row_offset + (full_det_center - (det_center + lo)) * delta_det_row
@@ -1064,6 +1058,21 @@ class ConeBeamModel(TomographyModel):
             model.set_params(no_warning=True, auto_regularize_flag=False)
             model.set_params(recon_shape=recon_shape)
             model.set_params(recon_slice_offset=recon_slice_offset)
+            return model
+
+        def _recon_one_half(model, lo, hi, is_top, half_logfile_path, devices, rng):
+            """Reconstruct one detector-row half and return (host_recon,
+            recon_dict).
+
+            ``devices`` is the half's group of devices, or None to let the half
+            model choose its devices as recon does.  ``rng`` is the random
+            generator for recon, or None.  The half's sinogram slice
+            and weights are local, so they are released when this returns.  The
+            returned reconstruction is a host array.
+            """
+            recon_shape = model.get_params('recon_shape')
+            if devices is not None:
+                model.configure_devices(devices=devices)
 
             # The sinogram and weight slices are host views, and nothing writes them.
             # A weights value of None passes through to the constant-weight path.
@@ -1081,7 +1090,7 @@ class ConeBeamModel(TomographyModel):
                                                  stop_threshold_change_pct=stop_threshold_change_pct,
                                                  first_iteration=first_iteration,
                                                  logfile_path=half_logfile_path,
-                                                 print_logs=print_logs)
+                                                 print_logs=print_logs, rng=rng)
             return recon_half, recon_dict
 
         # The halves are reconstructed one at a time, and each logs to its own file.
@@ -1091,13 +1100,20 @@ class ConeBeamModel(TomographyModel):
             half_log_paths = (log_path + '.top', log_path + '.bot')
         else:
             log_path, half_log_paths = None, (None, None)
+        top_model = _half_model(top_lo, top_hi, top_recon_shape, top_recon_slice_offset)
+        bot_model = _half_model(bot_lo, bot_hi, bot_recon_shape, bot_recon_slice_offset)
+
+        # The halves run side by side on 2 equal groups of devices when each half fits on one
+        # group, and otherwise one after the other on all the devices.
+        devices = self._split_devices()
+        gpus_per_group = self._choose_gpus_per_group(
+            devices, lambda group: all(self._section_fits(model, group, weights is not None)
+                                       for model in (top_model, bot_model)), max_groups=2)
+        jobs = [lambda group, rng: _recon_one_half(top_model, top_lo, top_hi, True, half_log_paths[0], group, rng),
+                lambda group, rng: _recon_one_half(bot_model, bot_lo, bot_hi, False, half_log_paths[1], group, rng)]
         try:
-            recon_top_half, recon_top_dict = _recon_one_half(top_lo, top_hi, top_recon_shape,
-                                                             top_recon_slice_offset, is_top=True,
-                                                             half_logfile_path=half_log_paths[0])
-            recon_bot_half, recon_bot_dict = _recon_one_half(bot_lo, bot_hi, bot_recon_shape,
-                                                             bot_recon_slice_offset, is_top=False,
-                                                             half_logfile_path=half_log_paths[1])
+            (recon_top_half, recon_top_dict), (recon_bot_half, recon_bot_dict) = \
+                self._run_split_sections(jobs, devices, gpus_per_group)
         finally:
             if log_path:
                 merge_log_files(log_path, zip(('recon_split_sino: top half', 'recon_split_sino: bottom half'),
@@ -1126,7 +1142,9 @@ class ConeBeamModel(TomographyModel):
                                             'half_overlap_recon': int(half_overlap_recon),
                                             'align_split_grid': bool(align_split_grid),
                                             'grid_shift_alu': float(grid_shift_alu),
-                                            'split_cut_mismatch_slices': split_cut_mismatch}, }
+                                            'split_cut_mismatch_slices': split_cut_mismatch,
+                                            'num_groups': len(devices) // gpus_per_group,
+                                            'gpus_per_group': int(gpus_per_group)}, }
 
         return recon_full, recon_full_dict
 

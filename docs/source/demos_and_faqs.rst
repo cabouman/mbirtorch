@@ -216,10 +216,10 @@ To check before you submit a job whether a reconstruction fits and how long it t
 If you have no GPU, all processing is done on the CPU.
 
 If your reconstruction is still too large, use :meth:`~mbirtorch.TomographyModel.recon_split_sino`, which splits the
-detector rows into overlapping bands, reconstructs one band at a time, and stitches the results together.  A cone beam
-reconstruction splits into two halves; a parallel beam reconstruction splits into as many parts as the memory requires,
-either the number estimated from the memory available on your devices or the number you ask for with
-``slices_per_part``.  With a cone beam system you can also reconstruct a subset of the slices by shrinking and moving the region of
+detector rows into overlapping sections, reconstructs each section, and joins the results.  A cone beam
+reconstruction splits into two halves.  A parallel beam reconstruction splits into as many sections as the memory
+requires, either the number chosen from the memory of your GPUs or the number you ask for with
+``slices_per_section``.  On several GPUs the sections are reconstructed side by side; see :ref:`usr_split_groups`.  With a cone beam system you can also reconstruct a subset of the slices by shrinking and moving the region of
 reconstruction, as in the question on the region of reconstruction above, and you can make sure axial padding is
 disabled (``axial_pad_fraction=0``, the default) if that padding is what pushes you over the memory limit.
 
