@@ -19,7 +19,9 @@ would take it for a feature of the object.  The reprojection fit comes last beca
 ``det_channel_offset`` looks like a per-view shift, which aligning first would partly remove.
 """
 
+import concurrent.futures
 import math
+import os
 import warnings
 
 import numpy as np
@@ -522,7 +524,10 @@ def _fit_views(ct_model, sino, recon_direct, rotation):
     angles = np.zeros(num_views)
     shifts = np.zeros((num_views, 2))
     failed = np.zeros(num_views, dtype=bool)
-    for v in range(num_views):
+
+    def fit_view(v):
+        # Each thread writes only its own index v.  OpenCV releases the Python lock during the
+        # fit, so the views run in parallel on the host's cores.
         template = np.ascontiguousarray(filtered_sino_from_recon[v], dtype=np.float32)
         view = np.ascontiguousarray(filtered_sino[v], dtype=np.float32)
         warp = np.eye(2, 3, dtype=np.float32)
@@ -530,10 +535,10 @@ def _fit_views(ct_model, sino, recon_direct, rotation):
             correlation, warp = cv2.findTransformECC(template, view, warp, motion, criteria)
         except cv2.error:
             failed[v] = True
-            continue
+            return
         if not correlation >= _ECC_MIN_CORRELATION:
             failed[v] = True
-            continue
+            return
         # The warp maps a reprojection pixel (x, y) to the view pixel that holds the same content:
         # view(R p + t) = reprojection(p), with R the rotation about the image corner.  Rewritten
         # about the detector center, the translation becomes t + (R - I) center.
@@ -542,6 +547,9 @@ def _fit_views(ct_model, sino, recon_direct, rotation):
         rot = np.array([[math.cos(theta), math.sin(theta)], [-math.sin(theta), math.cos(theta)]])
         angles[v] = theta
         shifts[v] = t + rot @ center - center
+
+    with concurrent.futures.ThreadPoolExecutor(min(32, os.cpu_count() or 1)) as executor:
+        list(executor.map(fit_view, range(num_views)))
     return angles, shifts, failed
 
 
