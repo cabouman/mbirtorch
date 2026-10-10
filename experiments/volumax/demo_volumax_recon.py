@@ -13,6 +13,7 @@ scan_dir = '/depot/bouman/data/ORNL/volumax/Hexagonal_volumax/proj/M0685 - Hexag
 # scan_dir = '/depot/bouman/data/ORNL/volumax/HIP_Can_Proj/HIP Can - Vanshika 92.8um Res_2025-09-12T14-46-58'
 downsample_factor = (2, 2)        # detector (rows, channels) block averaging
 subsample_view_factor = 1         # keep every n-th view
+fit_alignment = True              # refine the detector offsets and remove per-view jitter and rotation
 sharpness = 1.0
 snr_db = 35.0
 max_iterations = 15
@@ -36,7 +37,20 @@ print(f'Tube: {tube["accelerationVoltageInKV"]} kV, {tube["sourceCurrentInMicroA
 ct_model.set_params(det_channel_offset=mtp.estimate_det_channel_offset(ct_model, sino))
 
 # ----------------------------------------------------------------------------------------------
-# 3. Weights, regularization, and reconstruction
+# 3. Offsets and rotation refined from the reprojection of a direct reconstruction
+# ----------------------------------------------------------------------------------------------
+# fit_det_alignment compares each view with the reprojection of a first reconstruction.  The
+# median over views of the fitted offsets goes into the model; each view's deviation from the
+# median and its rotation are resampled out of the data by correct_det_alignment.
+if fit_alignment:
+    recon_direct = ct_model.recon_direct(sino)
+    model_params, view_params = mtp.fit_det_alignment(ct_model, sino, recon_direct, rotation=True)
+    ct_model.set_params(**model_params)
+    sino = mtp.correct_det_alignment(ct_model, sino, view_params)
+    del recon_direct
+
+# ----------------------------------------------------------------------------------------------
+# 4. Weights, regularization, and reconstruction
 # ----------------------------------------------------------------------------------------------
 weights = None if weight_type is None else mbirtorch.gen_weights(sino, weight_type=weight_type)
 ct_model.set_params(sharpness=sharpness, snr_db=snr_db)
@@ -47,7 +61,7 @@ recon = np.asarray(recon)
 print(f'Reconstruction {recon.shape} in {time.time() - t0:.1f} s; min {recon.min():.4f}, max {recon.max():.4f}')
 
 # ----------------------------------------------------------------------------------------------
-# 4. Optional: save the reconstruction
+# 5. Optional: save the reconstruction
 # ----------------------------------------------------------------------------------------------
 if output_path is not None:
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
@@ -55,7 +69,7 @@ if output_path is not None:
     print(f'Reconstruction saved to {output_path}')
 
 # ----------------------------------------------------------------------------------------------
-# 5. View the reconstruction
+# 6. View the reconstruction
 # ----------------------------------------------------------------------------------------------
 if show_viewer:
     mbirtorch.slice_viewer(recon, data_dicts=[recon_dict], vmin=0.0, vmax=0.1,

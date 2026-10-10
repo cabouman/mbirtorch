@@ -422,6 +422,10 @@ def estimate_det_channel_offset(ct_model, sino):
 
     Returns:
         float: the estimate in ALU, to set with ``ct_model.set_params(det_channel_offset=...)``.
+
+    Example:
+        >>> det_channel_offset = mtp.estimate_det_channel_offset(ct_model, sino)  # from the sinogram alone
+        >>> ct_model.set_params(det_channel_offset=det_channel_offset)  # update the model
     """
     reason = _unsuitable_reason(ct_model)
     if reason is not None:
@@ -573,6 +577,12 @@ def fit_det_alignment(ct_model, sino, recon_direct, rotation=False):
 
     Returns:
         tuple: ``(model_params, view_params)``, the two dicts described above.
+
+    Example:
+        >>> recon_direct = ct_model.recon_direct(sino)  # reconstruct object
+        >>> model_params, view_params = mtp.fit_det_alignment(ct_model, sino, recon_direct, rotation=True)
+        >>> ct_model.set_params(**model_params)  # update offset parameters
+        >>> sino = mtp.correct_det_alignment(ct_model, sino, view_params)  # correct per-view jitter and rotation
     """
     angles, shifts, failed = _fit_views(ct_model, sino, recon_direct, rotation)
     num_views = len(angles)
@@ -620,6 +630,16 @@ def correct_det_alignment(ct_model, sino, view_params, batch_size=30, devices=No
 
     Returns:
         numpy.ndarray: The corrected sinogram, the shape of ``sino``.
+
+    Example:
+        >>> recon_direct = ct_model.recon_direct(sino)  # reconstruct object
+        >>> model_params, view_params = mtp.fit_det_alignment(ct_model, sino, recon_direct, rotation=True)
+        >>> ct_model.set_params(**model_params)  # update offset parameters
+        >>> sino = mtp.correct_det_alignment(ct_model, sino, view_params)  # correct per-view jitter and rotation
+
+        To skip the per-view shifts and remove only each view's rotation:
+
+        >>> sino = mtp.correct_det_alignment(ct_model, sino, {'det_rotation': view_params['det_rotation']})
     """
     _pipeline.reject_shards('correct_det_alignment', sino=sino)
     sino = torch.as_tensor(np.asarray(sino)) if not isinstance(sino, torch.Tensor) else sino

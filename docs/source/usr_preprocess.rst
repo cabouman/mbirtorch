@@ -139,15 +139,15 @@ then estimate, update the model, and resample:
 
 .. code-block:: python
 
-    ct_model.set_params(det_channel_offset=mtp.estimate_det_channel_offset(ct_model, sino))
-    model_params, view_params = mtp.fit_det_alignment(ct_model, sino, ct_model.recon_direct(sino),
-                                                           rotation=True)
-    ct_model.set_params(**model_params)
-    sino = mtp.correct_det_alignment(ct_model, sino, view_params)
+    ct_model.set_params(det_channel_offset=mtp.estimate_det_channel_offset(ct_model, sino))  # cheap, sinogram only
+    recon_direct = ct_model.recon_direct(sino)  # reconstruct object
+    model_params, view_params = mtp.fit_det_alignment(ct_model, sino, recon_direct, rotation=True)
+    ct_model.set_params(**model_params)  # update offset parameters
+    sino = mtp.correct_det_alignment(ct_model, sino, view_params)  # correct per-view jitter and rotation
     recon, recon_dict = ct_model.recon(sino)
 
-Each step can be skipped.  Leaving out the last line corrects the model and leaves the data as it
-is.  Passing a dict with only the ``det_rotation`` key removes the rotation and nothing else.  A
+Each step can be skipped.  Leaving out ``correct_det_alignment`` corrects the model and leaves the
+data as it is.  Passing a dict with only the ``det_rotation`` key removes the rotation and nothing else.  A
 second round, with a reconstruction from the corrected data, refines the per-view corrections.
 
 .. autofunction:: fit_det_alignment
