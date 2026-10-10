@@ -8,7 +8,7 @@ float32 and truncating where numpy's is float64 with an edge-correction pass
 (see _sharded_masked_histogram) -- so a future volume that trips it is a
 tolerance question, not a bug in this gate.
 
-The second test covers the HDF5 writers.  save_data_hdf5 and export_recon_hdf5
+The second test covers the HDF5 writers.  _save_array_hdf5 and export_recon_hdf5
 take shards directly and must write exactly what writing the gathered volume
 writes, on both sharding axes.
 """
@@ -59,7 +59,7 @@ def test_sharded_segmentation_matches_unsharded():
 
 
 def test_sharded_hdf5_writes_match_the_whole_volume_write(tmp_path, monkeypatch):
-    """save_data_hdf5 and export_recon_hdf5 take a Shards directly and write
+    """_save_array_hdf5 and export_recon_hdf5 take a Shards directly and write
     exactly what writing the gathered volume writes -- same shape, dtype and
     content.  The slab size is shrunk so the sharded writes stream several
     slabs instead of gathering the whole volume, and both sharding axes are
@@ -81,10 +81,10 @@ def test_sharded_hdf5_writes_match_the_whole_volume_write(tmp_path, monkeypatch)
 
     ref_path = os.path.join(str(tmp_path), 'ref_save.h5')
     out_path = os.path.join(str(tmp_path), 'sharded_save.h5')
-    mbirtorch.save_data_hdf5(ref_path, vol, 'recon')
-    mbirtorch.save_data_hdf5(out_path, shard_on(vol, 0, 2), 'recon')
-    ref, _ = mbirtorch.load_data_hdf5(ref_path)
-    out, _ = mbirtorch.load_data_hdf5(out_path)
+    utilities._save_array_hdf5(ref_path, vol, "recon")
+    utilities._save_array_hdf5(out_path, shard_on(vol, 0, 2), 'recon')
+    ref, _ = utilities._load_array_hdf5(ref_path)
+    out, _ = utilities._load_array_hdf5(out_path)
     assert out.shape == ref.shape == vol.shape
     assert out.dtype == ref.dtype
     assert np.array_equal(out, ref)

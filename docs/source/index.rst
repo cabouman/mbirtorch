@@ -10,10 +10,11 @@ MBIRTorch: High-performance tomographic reconstruction
 **Key features:**
 
 
-* Vectorized Coordinate Descent algorithm for fast, robust convergence :cite:`2024CV4SciencePoster`.
+* Fast, robust convergence using Vectorized Coordinate Descent :cite:`2024CV4SciencePoster`.
+* Supports a wide and increasing range of geometries (see :ref:`GeometryModelsDocs`).
+* Supports integration of AI models using the Plug-and-Play priors framework :cite:`venkatakrishnan2013plug` :cite:`sreehari2016plug`.
 * Automatic parameter selection, with fine-tuning using intuitive meta-parameters.
-* Support for Plug-and-Play prior models that can dramatically improve image quality :cite:`venkatakrishnan2013plug` :cite:`sreehari2016plug`.
-* 4D reconstruction of a moving object from a single continuous scan, using multi-agent consensus equilibrium (MACE) :cite:`mace4d` --- see :ref:`MACE4DDocs`.
+* 4D reconstruction of a moving object from a single continuous scan :cite:`mace4d`.
 * Modular, extensible, easy-to-use, object-oriented Python interface.
 * Fast, portable, seamless use on CPUs or GPUs through the use of PyTorch_.
 
@@ -84,7 +85,6 @@ MBIRTorch: High-performance tomographic reconstruction
    :caption: User Guide
 
    install
-   usr_migration
    unit_conversion
    usr_api
    usr_multi_gpu
@@ -95,10 +95,10 @@ MBIRTorch: High-performance tomographic reconstruction
    :maxdepth: 4
    :caption: Developer Guide
 
+   usr_migration
    dev_performance_dashboard
    dev_sharding_overview
-   dev_projector_kernels
-   dev_api
+   dev_adding_geometry
    dev_maintenance
 
 

@@ -55,8 +55,17 @@ extensions = [
     'sphinx.ext.viewcode',
     'sphinx_design',
     'sphinx_copybutton',
-    'sphinxext.opengraph'
+    'sphinxext.opengraph',
+    'matplotlib.sphinxext.plot_directive',
 ]
+
+# The geometry figures are drawn at build time by the scripts in figs/, so no
+# image files are stored.  Only the picture is shown: no source, no links.
+plot_include_source = False
+plot_html_show_source_link = False
+plot_html_show_formats = False
+plot_formats = [('png', 150)]
+plot_rcparams = {'savefig.bbox': 'tight'}
 
 
 # Warn on every cross-reference that fails to resolve.  Unresolved references otherwise
@@ -77,6 +86,9 @@ nitpick_ignore = [
     # torch's inherited one, which refers to "Module" unqualified.  Both are external.
     ('py:class', 'torch.nn.modules.module.Module'),
     ('py:class', 'Module'),
+    # The model classes inherit from ParameterHandler, an internal base class that the
+    # user never calls, so it is not documented; :show-inheritance: still names it.
+    ('py:class', 'mbirtorch.parameter_handler.ParameterHandler'),
 ]
 
 # Exclude __init__ method from documentation
@@ -139,6 +151,9 @@ html_theme = 'sphinx_book_theme'
 # Theme options are theme-specific and customize the look and feel of a theme
 # further.  For a list of options available for each theme, see the
 # documentation.
+# The right-hand page menu lists methods by name only, without the class prefix.
+toc_object_entries_show_parents = 'hide'
+
 html_theme_options = {
     'show_toc_level': 2,
     'repository_url': 'https://github.com/cabouman/mbirtorch',

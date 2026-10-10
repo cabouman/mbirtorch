@@ -314,6 +314,23 @@ class ConeBeamModel(TomographyModel):
         use_curved_detector (bool): False (default) = flat panel; True = a
             cylindrical detector of radius source_detector_dist.
         view_batch_size, compile_mode: as in ParallelBeamModel.
+
+    Note:
+        Two parameters are not constructor arguments.  Set them with ``set_params`` after the
+        model is built.
+
+        **recon_slice_offset** (float, default 0.0): The position of the center of the
+        reconstruction along the rotation axis, in ALU.  ``auto_set_recon_geometry`` sets it so
+        that the reconstruction is centered on the band of the object the detector sees, which is
+        ``-det_row_offset / magnification`` plus the center of any helical travel.  Set it after
+        that to shift the reconstruction up or down.  A positive value moves it down relative to
+        the detector, toward the higher detector row indices.
+
+        **axial_pad_fraction** (float or (top, bottom) pair, default 0.0): How far
+        ``auto_set_recon_geometry`` extends the reconstruction at each end of the rotation axis,
+        as a fraction of the distance the outermost rays reach past the band at iso: 0 adds
+        nothing, 1 pads to the deepest point any measured ray reaches.  A pair gives the top and
+        bottom fractions separately; the top is the low slice and detector row indices.
     """
 
     def __init__(self, sinogram_shape, angles, source_detector_dist, source_iso_dist,
@@ -1023,9 +1040,10 @@ class ConeBeamModel(TomographyModel):
 
         full_det_center = (full_num_rows - 1) / 2.0
 
-        # The regularization parameters come from the full sinogram.  The halves copy
-        # them and set auto_regularize_flag=False.
-        self.auto_set_regularization_params(sino)
+        # The regularization parameters come from the full sinogram and its weights, the same
+        # inputs recon uses, so the halves get the values recon would set.  The halves copy them
+        # and set auto_regularize_flag=False.
+        self.auto_set_regularization_params(sino, weights=weights)
 
         def _recon_one_half(lo, hi, recon_shape, recon_slice_offset, is_top, half_logfile_path):
             """Reconstruct one detector-row half and return (host_recon,

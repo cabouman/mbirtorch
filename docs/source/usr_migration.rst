@@ -4,191 +4,108 @@
 Migrating from MBIRJAX
 ======================
 
-MBIRTorch replaces MBIRJAX, which is now legacy software.  The two packages were written to
-have the same interface, so most scripts run after changing the import line.  This page lists
-the places where the two packages differ, so that you can find and fix them in your own code.
+MBIRTorch replaces MBIRJAX, which is now legacy software.  The two packages have the same
+interface, so most scripts run after the import line is changed.  This page lists the
+differences that a script is likely to hit.  See :ref:`InstallationDocs` to install MBIRTorch.
 
-Installation
-------------
-
-Install MBIRTorch from PyPI into a Python 3.11 or later environment::
-
-    pip install mbirtorch
-
-The ``torch`` dependency installs automatically, and on a Linux machine with an NVIDIA GPU the
-default torch wheel includes CUDA support.  See :ref:`InstallationDocs` for installation from
-source and for the conda environment used by the test suite and the documentation build.
 
 Imports
 -------
 
-Replace the package name in the import line.  ``import mbirjax`` becomes ``import mbirtorch``,
-and ``import mbirjax as mj`` becomes ``import mbirtorch as mt``.
+Change the package name in the import line.  ``import mbirjax`` becomes ``import mbirtorch``.
+The submodule paths are unchanged, so ``mbirjax.preprocess`` becomes ``mbirtorch.preprocess``.
 
-The submodule paths are unchanged.  ``mbirjax.preprocess``, ``mbirjax.hsnt``, ``mbirjax.vcls``
-and ``mbirjax.mace4d`` become ``mbirtorch.preprocess``, ``mbirtorch.hsnt``, ``mbirtorch.vcls``
-and ``mbirtorch.mace4d``.  The loaders keep their module names as well, so
-``mbirjax.preprocess.nsi`` becomes ``mbirtorch.preprocess.nsi``.
 
-Arrays and devices
-------------------
+Arrays
+------
 
-Both packages accept a numpy array wherever a sinogram, a weight array, or a volume is asked
-for, and both return a numpy array by default.  A script that reads its data with numpy and
-displays the result with the slice viewer needs no change here.
+Both packages accept a numpy array wherever a sinogram, a weight array, or a volume is expected,
+and both return numpy arrays by default.  A script that reads its data with numpy needs no
+change.  Where MBIRJAX accepts a JAX array, MBIRTorch accepts a torch tensor.
 
-The other accepted input forms differ.  MBIRJAX accepts a JAX array.  MBIRTorch accepts a
-torch tensor, on the host or on a device, and it also accepts the sharded form returned by
-``prepare_sino_for_devices``.  Passing the sharded form to several reconstructions of one
-large sinogram moves the data to the devices once.
 
-The device form of the output differs in the same way.  With ``output_sharded=True``, MBIRJAX
-returns a JAX array sharded across the model's devices.  MBIRTorch returns a torch tensor when
-the model uses one device, and a ``Shards`` container holding one tensor per device when the
-model uses several.
-
-MBIRTorch chooses its devices without being asked.  It prefers CUDA, then MPS, then the CPU.
-On a machine with several CUDA devices, the first reconstruction on a model chooses how many
-of them to use, based on measured speed at that problem size and on whether the layout fits in
-memory.  Call ``model.configure_devices(num_devices=n)`` to fix the count instead, or set the
-environment variable ``MBIRTORCH_NUM_DEVICES`` to fix it for a whole process.  MBIRJAX has no
-counterpart to that environment variable, and its own ``MBIRJAX_NUM_CPU_DEVICES`` has no
-counterpart in MBIRTorch.
-
-API differences
+Renamed methods
 ---------------
 
-Each row below is a change to make in code that calls MBIRJAX.
+The direct reconstruction methods are renamed so that every reconstruction method starts with
+``recon``.  The arguments are unchanged.
 
 .. list-table::
    :header-rows: 1
-   :widths: 36 36 28
+   :widths: 50 50
 
    * - MBIRJAX
      - MBIRTorch
-     - Note
    * - ``model.direct_recon(sinogram)``
      - ``model.recon_direct(sinogram)``
-     - Renamed.  The arguments are the same.
    * - ``model.fbp_recon(sinogram)``
      - ``model.recon_fbp(sinogram)``
-     - Renamed.  Parallel beam and multi-axis parallel beam.
    * - ``model.fdk_recon(sinogram)``
      - ``model.recon_fdk(sinogram)``
-     - Renamed.  Cone beam and translation.
-   * - ``model.split_sino_recon(sino)``
-     - ``model.recon_split_sino(sino)``
-     - Renamed.  The arguments are the same.
-   * - ``preprocess.mar.recon_plastic_metal(model, sino, weights)``
-     - ``model.recon_plastic_metal(sino, weights)``
-     - A function became a method.  The model is no longer the first
-       argument, and there is no ``output_sharded`` argument.
-   * - ``model.recon(..., compute_prior_loss=True)``
-     - ``model.recon(...)``
-     - The ``compute_prior_loss`` argument is gone from ``recon`` and from
-       ``initialize_recon``.  Remove it from the call.
-   * - ``model.set_params(use_gpu='none')``
-     - ``model.configure_devices(devices=['cpu'])``
-     - ``use_gpu`` is not a parameter in MBIRTorch.
-   * - ``model.configure_devices(devices)``
-     - ``model.configure_devices(num_devices=1, devices=None, like=None)``
-     - The device count, an explicit device list, and another model to
-       match are now separate arguments.
-   * - ``model.set_view_parameters(view_params)``
-     - ``model.set_params(angles=new_angles)``
-     - No separate method.  Set the view parameter array through
-       ``set_params``, using the name reported by
-       ``get_params('view_params_name')``.
-   * - ``model.vcd_recon(...)``
-     - none
-     - Not part of the public interface in MBIRTorch.  Call ``recon``.
-   * - ``preprocess.nsi.convert_nsi_to_mbirjax_params``
-     - ``preprocess.nsi.convert_nsi_to_mbirtorch_params``
-     - The package name appears in the function name.
-   * - ``preprocess.zeiss.convert_zeiss_to_mbirjax_params``
-     - ``preprocess.zeiss.convert_zeiss_to_mbirtorch_params``
-     - The same rename applies in ``preprocess.zeiss_tct``.
-   * - ``logfile_path='~/.mbirjax/logs/recon.log'``
-     - ``logfile_path='~/.mbirtorch/logs/recon.log'``
-     - The default log path follows the package name.
-   * - ``ParallelBeamModel(sinogram_shape, angles)``
-     - ``ParallelBeamModel(sinogram_shape, angles, view_batch_size=None, compile_mode='auto')``
-     - Two optional arguments are added.  Existing calls need no change.
-       The same two arguments are added to ``ConeBeamModel``,
-       ``MultiAxisParallelModel``, ``TranslationModel`` and
-       ``TomographyModel``.
+   * - ``model.split_sino_recon(sinogram)``
+     - ``model.recon_split_sino(sinogram)``
+   * - ``preprocess.mar.recon_plastic_metal(model, sinogram, weights)``
+     - ``model.recon_plastic_metal(sinogram, weights)``
+   * - ``model.scale_recon_shape(row_scale, col_scale, slice_scale)``
+     - ``model.resize_recon_fov(row_scale, col_scale, slice_scale)``
 
-These names exist in MBIRJAX and have no counterpart in MBIRTorch:
-``get_platform``, ``get_device_platform``, ``memory_report``,
-``display_translation_vectors``, ``debug_plot_partitions``, ``debug_plot_indices``,
-``plot_granularity_and_loss``, ``make_figure_folder``, ``download_and_extract_tar``,
-``gen_pixel_partition_grid`` and ``gen_pixel_partition_blue_noise``.
+``scale_recon_shape`` still works but prints a warning.
 
-The names that MBIRTorch adds are listed under `Features new in MBIRTorch`_ below.
 
-A side by side example
-----------------------
+Devices
+-------
 
-The following script makes a phantom, projects it to get a sinogram, reconstructs the
-sinogram, and displays the result.  The MBIRJAX version reads as follows.
+MBIRTorch chooses its devices on its own.  It prefers CUDA, then Apple's Metal, then the CPU.
+To choose the devices yourself, call ``model.configure_devices``, for example
+``model.configure_devices(devices=['cpu'])``.  The MBIRJAX parameter ``use_gpu`` does not exist.
+See :ref:`usr_multi_gpu` for reconstruction on several GPUs.
 
-.. code-block:: python
 
-    import numpy as np
-    import mbirjax
+Hyperspectral neutron data (hsnt)
+---------------------------------
 
-    phantom, sinogram, params = mbirjax.generate_demo_data(
-        model_type='parallel', object_type='shepp-logan',
-        num_views=128, num_det_rows=128, num_det_channels=128)
-    angles = params['angles']
+``hsnt.dehydrate`` and ``hsnt.hyper_denoise`` keep their names, but they fit the Poisson
+likelihood of the counts instead of the scikit-learn NMF that MBIRJAX called, and they return a
+basis of rank ``num_materials`` rather than ``safety_factor * num_materials``.  The arguments
+after ``num_materials`` are keyword only, and MBIRJAX's NMF keywords (``safety_factor``,
+``beta_loss``, ``max_iter``, ``tolerance``, ``batch_size``, ``random_state``) raise a
+``TypeError``.  The same holds for ``mbirtorch.dehydrate`` and ``mbirtorch.hyper_denoise``.
 
-    ct_model = mbirjax.ParallelBeamModel(sinogram.shape, angles)
-    ct_model.set_params(sharpness=1.0)
-    recon, recon_dict = ct_model.recon(sinogram)
+.. list-table::
+   :header-rows: 1
+   :widths: 50 50
 
-    nrmse = np.linalg.norm(recon - phantom) / np.linalg.norm(phantom)
-    print(f'Normalized RMS error: {nrmse:.3f}')
+   * - MBIRJAX
+     - MBIRTorch
+   * - ``hsnt.dehydrate(data, num_materials=3, safety_factor=2)``
+     - ``hsnt.dehydrate(data, num_materials=3)``
+   * - ``hsnt.hyper_denoise(data, num_materials=3, safety_factor=2)``
+     - ``hsnt.hyper_denoise(data, num_materials=3)``
+   * - ``hsnt.generate_hyper_data(material_basis, detector_rows, detector_columns, dosage_rate, material_thickness)``
+       (MBIRJAX 0.6.11 to 0.6.15)
+     - ``hsnt.generate_hyper_data(material_basis, num_angles, detector_rows, detector_columns, dosage_rate,
+       material_density)``
 
-    mbirjax.slice_viewer(phantom, recon, data_dicts=[None, recon_dict],
-                         title='Phantom (left) and MBIR reconstruction (right)')
+Without ``num_materials`` the rank is estimated.  ``mode`` and ``chunk_pixels`` bound the
+memory, as ``batch_size`` did, and ``verbose=2`` prints the rank search rather than plotting it.
+``subspace_basis`` keeps its meaning, with the given spectra always held fixed (MBIRJAX refitted
+them for data of up to 2**27 entries); leave out ``num_materials`` then, since the rank is the
+basis's number of rows.  ``generate_hyper_data`` returns the Poisson counts and the open beam
+(noiseless, ``dosage_rate`` everywhere) rather than an attenuation: divide the counts by the open
+beam and pass the result to ``dehydrate`` with ``dataset_type='transmission'``, as measured counts
+are normalized by their open beam.  A seed therefore gives different data, and ``noisy=False``
+(keyword only) returns the noiseless counts.  Its ``material_density`` is a volume fraction that
+scales a rounded bar about 10 thick at its center, not a thickness, so the MBIRJAX 0.6.11 to
+0.6.15 values do not carry over (the defaults 2, 2, 10 became 0.2, 0.2, 1), and it returns
+``[counts, open_beam, angles, truth]``, each of shape (views, rows, columns, bins), with ``truth``
+the noiseless attenuation.  The ``hsnt`` module also adds
+``estimate_rank`` and the ``mbirtorch-hsnt`` command line.  See
+:ref:`HSNTDocs`.
 
-The MBIRTorch version differs only in the package name.
 
-.. code-block:: python
+Removed names
+-------------
 
-    import numpy as np
-    import mbirtorch
-
-    phantom, sinogram, params = mbirtorch.generate_demo_data(
-        model_type='parallel', object_type='shepp-logan',
-        num_views=128, num_det_rows=128, num_det_channels=128)
-    angles = params['angles']
-
-    ct_model = mbirtorch.ParallelBeamModel(sinogram.shape, angles)
-    ct_model.set_params(sharpness=1.0)
-    recon, recon_dict = ct_model.recon(sinogram)
-
-    nrmse = np.linalg.norm(recon - phantom) / np.linalg.norm(phantom)
-    print(f'Normalized RMS error: {nrmse:.3f}')
-
-    mbirtorch.slice_viewer(phantom, recon, data_dicts=[None, recon_dict],
-                           title='Phantom (left) and MBIR reconstruction (right)')
-
-Features new in MBIRTorch
--------------------------
-
-MBIRTorch adds several things that MBIRJAX does not have.  The forward and back projectors are
-available as differentiable PyTorch operations, so the physics operator can be used as a layer
-in a training pipeline, described in :ref:`AutogradDocs`.  A geometry viewer draws the source,
-the detector, and the reconstruction volume for a model, through ``geometry_viewer`` and the
-``GeometryScene`` and ``GeometryFigure`` classes.  The functions ``recon_simple_parallel`` and
-``recon_simple_cone`` reconstruct from a sinogram and the projection angles in one call.  The
-``mbirtorch.mace`` module provides a general multi-agent consensus equilibrium framework, which
-in MBIRJAX exists only as the 4D reconstruction model ``MACE4DModel``.  The preprocessing
-subpackage adds ``preprocess.geometry_calibration`` for estimating detector offset and
-detector rotation from the data.  ``QGGMRFDenoiser`` adds ``denoise_stack`` for denoising a
-stack of volumes in batches, and ``TomographyModel`` adds ``project_points``, ``recon_slice_z``
-and ``nearest_recon_slice``.  Finally, the compiled projector kernels are cached under
-``~/.mbirtorch``, so compiled code is reused by later runs, and ``clear_cache`` empties that
-cache.  Both packages can spread one reconstruction across several GPUs, and
-:ref:`usr_multi_gpu` describes how MBIRTorch chooses the number of devices.
+MBIRJAX helper functions specific to JAX, and its debugging and plotting utilities, have no
+counterpart in MBIRTorch.  A name that fails to import is one of these.  The features that
+MBIRTorch adds are described in :doc:`overview`.

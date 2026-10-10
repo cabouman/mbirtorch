@@ -4,6 +4,7 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.vscode/
 
 # build artifacts
 build/
@@ -25,3 +26,10 @@ dev_scripts/_widening_floor_runs/
 # macOS Finder metadata
 .DS_Store
 ._*
+
+# pixi environments
+.pixi/
+
+# outputs of the experiments/hsnt scripts
+experiments/hsnt/processed_data
+experiments/hsnt/binaries/

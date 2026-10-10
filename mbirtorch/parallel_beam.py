@@ -82,39 +82,21 @@ def _parallel_back_view_batch(sino_batch, pixel_indices, view_params_batch,
 
 class ParallelBeamModel(TomographyModel):
     """
-    A class designed for handling forward and backward projections in a parallel
-    beam geometry, extending :class:`TomographyModel`.  This class offers
-    specialized methods and parameters tailored for parallel beam setups.
-
-    This class inherits all methods and properties from TomographyModel and
-    overrides some to suit parallel beam geometrical requirements.  See the
-    parent class for standard methods like setting parameters and performing
-    projections and reconstructions.
-
-    Parameters not included in the constructor can be set using the set_params
-    method of TomographyModel.
+    A model of the parallel beam geometry: the rays of every view are parallel and the object
+    rotates about an axis parallel to the detector columns.
 
     Args:
-        sinogram_shape (tuple):
-            Shape of the sinogram as a tuple in the form (views, rows, channels),
-            where 'views' is the number of different projection angles, 'rows'
-            correspond to the number of detector rows, and 'channels' index
-            columns of the detector that are assumed to be aligned with the
-            rotation axis.
-        angles (ndarray):
-            A 1D array of projection angles, in radians, specifying the angle of
-            each projection relative to the origin.
-        view_batch_size (int or None, optional): number of views processed
-            per projection call.  Smaller values reduce peak memory and may
-            reduce speed.  None (default) chooses automatically.
-        compile_mode (str, optional): 'auto' (default) compiles the
-            computational kernels with torch.compile; 'off' runs without
-            compilation.
+        sinogram_shape (tuple): (num_views, num_det_rows, num_det_channels).  The channels run
+            across the detector, perpendicular to the rotation axis.
+        angles (ndarray): The rotation angle of each view, in radians.
+        view_batch_size (int or None, optional): Views projected at a time.  Smaller values use
+            less memory and may be slower.  None chooses automatically.  Defaults to None.
+        compile_mode (str, optional): 'auto' compiles the projection kernels with
+            ``torch.compile``; 'off' does not.  Defaults to 'auto'.
 
     Example:
-        >>> import numpy as np, mbirtorch
         >>> angles = np.linspace(0, np.pi, 180, endpoint=False)
-        >>> model = mbirtorch.ParallelBeamModel((180, 256, 10), angles)
+        >>> ct_model = mbirtorch.ParallelBeamModel((180, 256, 10), angles)
     """
 
     def __init__(self, sinogram_shape, angles,
@@ -517,9 +499,10 @@ class ParallelBeamModel(TomographyModel):
             part_ranges.append((start, stop))
             start = stop
 
-        # The regularization parameters come from the full sinogram.  The parts copy
-        # them and set auto_regularize_flag=False.
-        self.auto_set_regularization_params(sino)
+        # The regularization parameters come from the full sinogram and its weights, the same
+        # inputs recon uses, so the parts get the values recon would set.  The parts copy them
+        # and set auto_regularize_flag=False.
+        self.auto_set_regularization_params(sino, weights=weights)
 
         def _recon_one_part(model_lo, model_hi, part_logfile_path):
             """Reconstruct one band of detector rows and return (host_recon,

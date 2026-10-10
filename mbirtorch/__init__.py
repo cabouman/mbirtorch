@@ -6,7 +6,7 @@ arrays by default; pass ``output_sharded=True`` to get the device tensor
 instead.  All available GPUs are used automatically.
 """
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 # The torch.compile caches are pinned under ~/.mbirtorch, so compiled code survives a process.
 # These settings take effect only if mbirtorch is imported before torch compiles anything.
@@ -18,6 +18,11 @@ _os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
 # Triton caches its kernels separately from inductor, so that cache is pinned too.
 _os.environ.setdefault("TRITON_CACHE_DIR",
                        _os.path.expanduser("~/.mbirtorch/triton_cache"))
+
+# A warning when torch has one host thread on a machine with more cores, which a shell
+# variable set to one causes and which slows every host-side operation of the package.
+from ._host_threads import warn_if_threads_unused as _warn_if_threads_unused
+_warn_if_threads_unused()
 
 from typing import TYPE_CHECKING
 
@@ -35,14 +40,14 @@ from .vcd_utils import (gen_weights, gen_weights_mar, gen_full_indices,
 from .denoising import median_filter3d
 from .qggmrf import (qggmrf_gradient_and_hessian_at_indices, get_b_from_nbr_wts,
                      b_tilde_by_definition, qggmrf_loss)
-from .utilities import (generate_3d_shepp_logan_low_dynamic_range, clear_cache,
+from .utilities import (gen_shepp_logan_3d, clear_cache,
                         makedirs, load_data_hdf5, save_data_hdf5,
                         export_recon_hdf5, import_recon_hdf5,
                         build_model, download_and_extract,
                         copy_ct_model, stitch_arrays, save_volume_as_gif,
-                        get_ct_model, generate_demo_data,
-                        generate_3d_shepp_logan_reference, gen_cube_phantom,
-                        gen_translation_vectors, gen_translation_phantom,
+                        get_ct_model, gen_demo_data, gen_demo_data_4d,
+                        gen_shepp_logan_3d_reference, gen_cube_phantom,
+                        gen_translation_vectors,
                         get_helical_half_rotation_slice_range,
                         merge_log_files)
 from .memory_stats import get_memory_stats
@@ -58,22 +63,25 @@ __all__ = [
     "median_filter3d", "download_and_extract", "build_model",
     "save_data_hdf5", "load_data_hdf5", "export_recon_hdf5",
     "import_recon_hdf5",
-    "generate_3d_shepp_logan_low_dynamic_range", "clear_cache",
+    "gen_shepp_logan_3d", "clear_cache",
     "get_memory_stats", "SliceViewer", "VolumeStack", "slice_viewer",
     "GeometryScene", "GeometryFigure", "geometry_viewer",
+    "SliceViewer4D", "VolumeStack4D", "slice_viewer4d",
     "stitch_arrays", "get_ct_model", "copy_ct_model", "save_volume_as_gif",
     "MACE4DModel", "temporal_filter_matrix", "apply_temporal_filter",
-    "generate_demo_data", "generate_3d_shepp_logan_reference",
+    "gen_demo_data", "gen_demo_data_4d", "gen_shepp_logan_3d_reference",
     # These hsnt and vcls names resolve lazily through __getattr__.
     "hyper_denoise", "dehydrate", "rehydrate", "import_hsnt_data_hdf5",
     "create_hsnt_metadata", "export_hsnt_data_hdf5", "generate_hyper_data",
+    "synthetic_material_basis", "gen_material_phantom", "generate_hyper_sinogram",
     "get_opt_views", "show_image_with_projection_rays",
 ]
 
 # Lazy exports (PEP 562) resolve on first attribute access, so importing mbirtorch does
 # not pull in matplotlib or the preprocess, hsnt and vcls dependencies.
 _VIEWER_EXPORTS = ("SliceViewer", "VolumeStack", "slice_viewer",
-                   "GeometryScene", "GeometryFigure", "geometry_viewer")
+                   "GeometryScene", "GeometryFigure", "geometry_viewer",
+                   "SliceViewer4D", "VolumeStack4D", "slice_viewer4d")
 
 _LAZY_MODULES = ("preprocess", "hsnt", "vcls", "mace")
 
@@ -83,6 +91,8 @@ _LAZY_NAMES = {
     'hyper_denoise': 'hsnt', 'dehydrate': 'hsnt', 'rehydrate': 'hsnt',
     'import_hsnt_data_hdf5': 'hsnt', 'create_hsnt_metadata': 'hsnt',
     'export_hsnt_data_hdf5': 'hsnt', 'generate_hyper_data': 'hsnt',
+    'synthetic_material_basis': 'hsnt', 'gen_material_phantom': 'hsnt',
+    'generate_hyper_sinogram': 'hsnt',
     'subsample_R_gamma': 'vcls', 'max_abs_neighbor_diff': 'vcls',
     'get_opt_views': 'vcls', 'compute_view_basis_functions': 'vcls',
     'compute_cov_matrix': 'vcls', 'compute_vcl': 'vcls',
@@ -104,13 +114,16 @@ _LAZY_NAMES = {
 if TYPE_CHECKING:
     from . import preprocess, hsnt, vcls, mace
     from .view_utils import (SliceViewer, VolumeStack, slice_viewer,
-                             GeometryScene, GeometryFigure, geometry_viewer)
+                             GeometryScene, GeometryFigure, geometry_viewer,
+                             SliceViewer4D, VolumeStack4D, slice_viewer4d)
     from .mace import (MACE, Task, ForwardProxAgent, QGGMRFDenoiserAgent, HyperplaneAgent,
                        resolve_device_pool)
     from .mace4d import MACE4DModel, temporal_filter_matrix, apply_temporal_filter
     from .hsnt import (hyper_denoise, dehydrate, rehydrate,
                        import_hsnt_data_hdf5, create_hsnt_metadata,
-                       export_hsnt_data_hdf5, generate_hyper_data)
+                       export_hsnt_data_hdf5, generate_hyper_data,
+                       synthetic_material_basis, gen_material_phantom,
+                       generate_hyper_sinogram)
     from .vcls import (subsample_R_gamma, max_abs_neighbor_diff, get_opt_views,
                        compute_view_basis_functions, compute_cov_matrix,
                        compute_vcl, compute_opt_angle_subset,

@@ -17,7 +17,7 @@ num_det_rows = 128
 num_det_channels = 128
 
 # Make a phantom and project it to get a synthetic sinogram.
-phantom, sinogram, params = mbirtorch.generate_demo_data(
+phantom, sinogram, params = mbirtorch.gen_demo_data(
     model_type='parallel', object_type='shepp-logan',
     num_views=num_views, num_det_rows=num_det_rows,
     num_det_channels=num_det_channels)

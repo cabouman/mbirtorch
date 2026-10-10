@@ -485,7 +485,16 @@ class VolumeStack:
                     str(k): v.decode() if isinstance(v, bytes) else str(v)
                     for k, v in dataset.attrs.items()
                 } or None
-                return dataset[()], data_dict
+                array = dataset[()]
+            # A file that states its axis order is permuted to the display order,
+            # (row, col, slice) or (time, row, col, slice).
+            axes = (data_dict or {}).get('axes')
+            if axes:
+                names = axes.split(',')
+                wanted = [n for n in ('time', 'row', 'col', 'slice') if n in names]
+                if sorted(names) == sorted(wanted) and len(names) == array.ndim:
+                    array = np.transpose(array, [names.index(n) for n in wanted])
+            return array, data_dict
         raise ValueError("Unsupported file type: {}".format(ext))
 
     def load_array(self, image_index, new_array, data_dict=None):
@@ -535,21 +544,30 @@ class VolumeStack:
         return replaced
 
 
-def _save_data_hdf5(file_path, array, array_name='volume', attributes_dict=None):
+def _save_data_hdf5(file_path, array, array_name='recon', attributes_dict=None):
     """Default save function: one HDF5 dataset with string attributes.
 
-    The layout is a single named dataset whose attributes hold the data dict,
-    so files round-trip through :meth:`VolumeStack.read_file_array`.
-    Host packages can inject a richer
-    writer through ``slice_viewer(..., save_fn=...)``.
+    The layout is the one mbirtorch's export_recon_hdf5 writes: the dataset
+    ``recon`` in right-hand axis order, (slice, col, row) for a 3D volume and
+    (time, slice, col, row) for a 4D one, with the attributes ``format`` and
+    ``axes`` stating the layout and the data dict as text attributes.  Files
+    round-trip through :meth:`VolumeStack.read_file_array`.  Host packages can
+    inject another writer through ``slice_viewer(..., save_fn=...)``.
     """
     import h5py
+    array = np.asarray(array)
+    axes = {3: 'slice,col,row', 4: 'time,slice,col,row'}.get(array.ndim)
+    if axes is not None:
+        array = np.transpose(array, {3: (2, 1, 0), 4: (0, 3, 2, 1)}[array.ndim])
     directory = os.path.dirname(os.path.abspath(file_path))
     os.makedirs(directory, exist_ok=True)
     with h5py.File(file_path, 'w') as f:
-        dataset = f.create_dataset(array_name, data=np.asarray(array))
+        dataset = f.create_dataset(array_name, data=array)
         for key, value in (attributes_dict or {}).items():
             dataset.attrs[str(key)] = str(value)
+        if axes is not None:
+            dataset.attrs['format'] = 'mbirtorch_recon_v2'
+            dataset.attrs['axes'] = axes
 
 
 # Native Tk dialogs.  Each creates a hidden Tk root at call time and destroys it
@@ -2171,7 +2189,7 @@ class SliceViewer:
             if result[0] == 'save':
                 self.stack.data_dicts[i] = result[1] or None
         try:
-            self.save_fn(path, self.stack.original_data[i], 'volume',
+            self.save_fn(path, self.stack.original_data[i], 'recon',
                          self.stack.data_dicts[i])
         except Exception as e:
             self._file_error(f"Failed to save: {e}")

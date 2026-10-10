@@ -32,7 +32,7 @@ def test_cone_adjointness(device):
 def test_cone_recon_smoke(device):
     m = _small_cone(device)
     rs = m.get_params('recon_shape')
-    phantom = mbirtorch.generate_3d_shepp_logan_low_dynamic_range(rs)
+    phantom = mbirtorch.gen_shepp_logan_3d(rs)
     sino = m.forward_project(phantom)
     np.random.seed(0)
     recon, rd = m.recon(sino, max_iterations=3, stop_threshold_change_pct=0.0)

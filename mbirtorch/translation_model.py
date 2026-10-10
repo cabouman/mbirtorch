@@ -237,7 +237,7 @@ class TranslationModel(TomographyModel):
         translation_vectors (ndarray): (num_views, 3) array of object
             translations (x, y, z) in ALU.  Each view moves the object by minus
             its vector, in the object frame that
-            :meth:`~mbirtorch.TomographyModel.project_points` describes: a
+            ``project_points`` describes: a
             positive t_x moves the object toward -x, so its image moves toward
             lower channel index; a positive t_y moves it toward -y, away from
             the source, so its image shrinks toward the point where the central

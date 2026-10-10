@@ -5,8 +5,8 @@
 #   dev_scripts/release.sh 0.2.0              # final: open the pull request to main
 #   dev_scripts/release.sh 0.2.0 --publish    # after main advances: publish to PyPI
 #
-# Requires the gh CLI, logged in.  Uploads still need approval of the pypi
-# environment on the workflow run page.
+# Requires the gh CLI, logged in.  GitHub Actions publishes to PyPI with no
+# manual approval step.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -24,16 +24,27 @@ if [[ "$PUBLISH" == "--publish" && "$STAGE" == "rc" ]]; then
 fi
 
 if [[ "$PUBLISH" == "--publish" ]]; then
-  # The tag must point at main, so main must already carry this version.
+  # The PR is merged, so main carries this version.  Bring prerelease up to
+  # main, then tag the shared commit and let CI publish.
   git fetch -q origin main
   if ! git show origin/main:$INIT | grep -q "__version__ = \"$VERSION\""; then
     echo "main does not have __version__ = \"$VERSION\"; merge the PR first" >&2
     exit 1
   fi
+  # Fast-forward prerelease to main so the two branches are identical.
+  git checkout -q prerelease
+  git pull -q origin prerelease
+  if ! git merge -q --ff-only origin/main; then
+    echo "could not fast-forward prerelease to main; merge the PR with the" >&2
+    echo "default 'Create a merge commit' option, then run --publish again" >&2
+    exit 1
+  fi
+  git push -q origin prerelease
+  git branch -f main origin/main        # local main to the same commit
   gh release create "v$VERSION" --target main --title "MBIRTorch v$VERSION" \
     --generate-notes
-  echo "Release v$VERSION created.  Approve the pypi environment on the"
-  echo "workflow run page, then check with:"
+  echo "Release v$VERSION created.  main, prerelease, and the v$VERSION tag are"
+  echo "all on the same commit.  GitHub Actions is publishing to PyPI; check with:"
   echo "  dev_scripts/check_published_wheel.sh --version $VERSION"
   exit 0
 fi

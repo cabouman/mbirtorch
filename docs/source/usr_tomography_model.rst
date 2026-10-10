@@ -21,68 +21,54 @@ Reconstruction and Projection
 
 .. automethod:: mbirtorch.TomographyModel.recon_direct
 
-.. automethod:: mbirtorch.TomographyModel.prox_map
+.. automethod:: mbirtorch.TomographyModel.recon_split_sino
+
+.. automethod:: mbirtorch.TomographyModel.recon_plastic_metal
 
 .. automethod:: mbirtorch.TomographyModel.forward_project
 
 .. automethod:: mbirtorch.TomographyModel.back_project
 
-.. automethod:: mbirtorch.TomographyModel.recon_split_sino
+``prox_map`` is for Plug-and-Play loops that alternate a reconstruction step with a denoiser.
 
-.. automethod:: mbirtorch.TomographyModel.recon_plastic_metal
-
-.. automethod:: mbirtorch.TomographyModel.project_points
+.. automethod:: mbirtorch.TomographyModel.prox_map
 
 
 Parameter Handling
 ------------------
 
-``TomographyModel`` inherits its parameter accessors from ``ParameterHandler``.  That class
-is not exported at package level, so it is documented explicitly here.  This also supplies
-the cross-reference target that ``:show-inheritance:`` needs on every model class.
-
-.. autoclass:: mbirtorch.parameter_handler.ParameterHandler
-
 .. automethod:: mbirtorch.TomographyModel.set_params
 
-.. automethod:: mbirtorch.parameter_handler.ParameterHandler.get_params
+.. automethod:: mbirtorch.TomographyModel.get_params
 
-.. automethod:: mbirtorch.parameter_handler.ParameterHandler.print_params
-
-.. automethod:: mbirtorch.TomographyModel.get_all_params
-
-.. automethod:: mbirtorch.TomographyModel.get_recon_dict
+.. automethod:: mbirtorch.TomographyModel.print_params
 
 
-Recon Shape and Voxel Spacing
------------------------------
+Recon FOV and Voxel Spacing
+---------------------------
+
+The region of reconstruction and the voxel size are computed from the detector once, when the
+model is built.  After changing a detector or geometry parameter with ``set_params``, call
+``auto_set_recon_geometry`` to recompute them, or the reconstruction comes out at the wrong
+scale.  Then, if needed, enlarge or shrink the region with ``resize_recon_fov``.  The FAQ on the
+region of reconstruction in :ref:`DemosFAQs` walks through both.
 
 .. automethod:: mbirtorch.TomographyModel.auto_set_recon_geometry
 
-.. automethod:: mbirtorch.TomographyModel.scale_recon_shape
+.. automethod:: mbirtorch.TomographyModel.resize_recon_fov
 
 .. automethod:: mbirtorch.TomographyModel.get_magnification
 
 
-Device Configuration
---------------------
+Choosing the GPUs
+-----------------
 
-On a machine with multiple GPUs, MBIRTorch automatically divides a reconstruction across
-them to increase the available memory and reduce reconstruction time -- with no change to
-your script, and for every geometry.  The device count is chosen once per model, when its
-first reconstruction starts: measured speed thresholds decide how many devices are worth
-using, and a memory check confirms the layout fits.  The methods below give explicit
-control over which devices are used.  Per-device memory use is reported by ``mbirtorch.get_memory_stats()``.
-See :doc:`usr_multi_gpu` for a full discussion.
+On a machine with several GPUs, a reconstruction uses them with no change to your script.
+Call ``configure_devices`` to choose the devices yourself, or set the environment variable
+``MBIRTORCH_NUM_DEVICES`` to set the number of GPUs for a whole process.  See
+:doc:`usr_multi_gpu` for how several GPUs are used and how to get the most out of them.
 
 .. automethod:: mbirtorch.TomographyModel.configure_devices
-
-.. automethod:: mbirtorch.TomographyModel.prepare_sino_for_devices
-
-.. REPLACED(device_summary): MBIRJAX documents a ``device_summary`` property here, which
-   reports the devices its automatic selection chose.  MBIRTorch reports the layout a run
-   settled on in the run log's device line, and ``get_memory_stats`` covers the per-device
-   reporting, so the property will not be ported.
 
 
 .. _SaveLoadDocs:
@@ -90,14 +76,25 @@ See :doc:`usr_multi_gpu` for a full discussion.
 Saving and Loading
 ------------------
 
-.. automethod:: mbirtorch.TomographyModel.save_recon_hdf5
+``export_recon_hdf5`` writes a reconstruction and its ``recon_dict`` to one HDF5 file, and
+``import_recon_hdf5`` reads them back::
 
-.. automethod:: mbirtorch.TomographyModel.load_recon_hdf5
+    recon, recon_dict = ct_model.recon(sinogram)
+    mbirtorch.export_recon_hdf5('output/recon.h5', recon, recon_dict)
+    recon, recon_dict = mbirtorch.import_recon_hdf5('output/recon.h5')
+
+The file holds the volume as the dataset ``recon`` in right-hand axis order, (slice, col, row),
+so that other programs read it the natural way, and it holds the recon parameters, model
+parameters, log, and notes as attributes.  The slice viewers open it.
+
+.. autofunction:: mbirtorch.export_recon_hdf5
+
+.. autofunction:: mbirtorch.import_recon_hdf5
 
 
 .. _detailed-parameter-docs:
 
-Parameter Documentation
------------------------
+Parameters
+----------
 
-See the :ref:`Primary Parameters <ParametersDocs>` page.
+The parameters a model holds, with their defaults, are listed on the :ref:`ParametersDocs` page.

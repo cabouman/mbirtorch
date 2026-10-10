@@ -131,8 +131,8 @@ def _phantom_devices(devices):
     every visible CUDA device, capped by MBIRTORCH_NUM_DEVICES when that
     variable is set.  An explicit list overrides that default.
     """
-    from .preprocess import pipeline
-    return pipeline.permitted_devices(devices)
+    from .preprocess import _pipeline
+    return _pipeline.permitted_devices(devices)
 
 
 def _phantom_block_rows(band_shape, max_block_gb):
@@ -191,7 +191,7 @@ def _shepp_logan_band(phantom_shape, slice_range, device, max_block_gb, scale=1.
     return band
 
 
-def _generate_3d_shepp_logan_blocked(phantom_shape, device, max_block_gb, scale=1.0):
+def _gen_shepp_logan_3d_blocked(phantom_shape, device, max_block_gb, scale=1.0):
     """Build the phantom on one device, with the rows taken in blocks.  The
     whole slice axis forms a single band.  Return a host numpy array."""
     band = _shepp_logan_band(phantom_shape, (0, phantom_shape[2]), device,
@@ -201,7 +201,7 @@ def _generate_3d_shepp_logan_blocked(phantom_shape, device, max_block_gb, scale=
     return phantom
 
 
-def _generate_3d_shepp_logan_sharded(phantom_shape, devices, max_block_gb, scale=1.0):
+def _gen_shepp_logan_3d_sharded(phantom_shape, devices, max_block_gb, scale=1.0):
     """Build the phantom with the slices split into one band per device.
 
     The bands are the contiguous blocks that :meth:`Placement.shard_ranges`
@@ -221,7 +221,7 @@ def _generate_3d_shepp_logan_sharded(phantom_shape, devices, max_block_gb, scale
     return phantom
 
 
-def generate_3d_shepp_logan_low_dynamic_range(phantom_shape, devices=None,
+def gen_shepp_logan_3d(phantom_shape, devices=None,
                                               max_block_gb=4.0,
                                               target_max_attenuation=None):
     """
@@ -266,9 +266,9 @@ def generate_3d_shepp_logan_low_dynamic_range(phantom_shape, devices=None,
         else _shepp_logan_attenuation_scale(phantom_shape, target_max_attenuation)
     devices = _phantom_devices(devices)
     if len(devices) > 1:
-        return _generate_3d_shepp_logan_sharded(phantom_shape, devices,
+        return _gen_shepp_logan_3d_sharded(phantom_shape, devices,
                                                 max_block_gb, scale)
-    return _generate_3d_shepp_logan_blocked(phantom_shape, devices[0],
+    return _gen_shepp_logan_3d_blocked(phantom_shape, devices[0],
                                             max_block_gb, scale)
 
 
@@ -290,35 +290,11 @@ def _to_host(array):
     return np.asarray(array)
 
 
-def load_data_hdf5(file_path):
-    """
-    Load a numpy array from an HDF5 file.
-
-    This function loads an array stored in an HDF5 file using :func:`save_data_hdf5`.
-    It also loads any associated attributes and returns them as a dict.
-
-    Args:
-        file_path (str): Path to the HDF5 file containing the array.
-
-    Returns:
-        tuple: (array, data_dict)
-            - array (ndarray): The array saved by :func:`save_data_hdf5`
-            - data_dict (dict): A dict with the attributes for the data array.
-
-    Raises:
-        FileNotFoundError: If the file does not exist.
-        ValueError: If the file contains more than one dataset.
-        IndexError: If the file contains no dataset.
-
-    Example:
-        >>> import mbirtorch
-        >>> recon, recon_dict = mbirtorch.load_data_hdf5("output/recon_volume.h5")
-        >>> recon.shape
-        (64, 256, 256)
-    """
+def _load_array_hdf5(file_path):
+    """Return (array, attributes) from a file holding one dataset, the attributes as stored."""
     import h5py
     with h5py.File(file_path, "r") as f:
-        array_names = [key for key in f.keys()]  # A file from save_data_hdf5 has exactly one key.
+        array_names = [key for key in f.keys()]
         if len(array_names) > 1:
             raise ValueError('More than one array found in {}. Unable to load.'.format(file_path))
         data_name = array_names[0]
@@ -328,6 +304,12 @@ def load_data_hdf5(file_path):
             data_dict[name] = f[data_name].attrs[name]
 
         return array, data_dict
+
+
+def load_data_hdf5(file_path):
+    """Deprecated: use :func:`import_recon_hdf5`."""
+    warnings.warn('load_data_hdf5 is deprecated; use import_recon_hdf5.', FutureWarning, stacklevel=2)
+    return _load_array_hdf5(file_path)
 
 
 def _shard_axis_block(shards, i0, i1):
@@ -370,7 +352,7 @@ def _sharded_host_shape_dtype(shards):
 _HDF5_SLAB_BYTES = 1 << 30
 
 
-def _write_hdf5_streaming(file_path, array_name, out_shape, dtype, produce_slab, attributes_dict=None):
+def _write_hdf5_streaming(file_path, array_name, out_shape, dtype, produce_slab, attributes_dict=None, chunks=None):
     """Create an HDF5 dataset with the given shape and dtype, then fill it one
     slab at a time along axis 0.  The call produce_slab(i0, i1) returns the
     contiguous slab written to dset[i0:i1].  Only one slab is held at a time.
@@ -379,7 +361,7 @@ def _write_hdf5_streaming(file_path, array_name, out_shape, dtype, produce_slab,
     from .view_utils import convert_subdicts_to_strings
     makedirs(file_path)
     with h5py.File(file_path, 'w') as f:
-        dset = f.create_dataset(array_name, shape=out_shape, dtype=dtype)
+        dset = f.create_dataset(array_name, shape=out_shape, dtype=dtype, chunks=chunks)
         if len(out_shape) == 0:
             dset[...] = produce_slab(0, 0)
         else:
@@ -393,37 +375,10 @@ def _write_hdf5_streaming(file_path, array_name, out_shape, dtype, produce_slab,
                 dset.attrs[key] = value
 
 
-def save_data_hdf5(file_path, array, array_name='array', attributes_dict=None):
-    """
-    Save an array to an HDF5 file, optionally including metadata as attributes.
-    The resulting structure has a single dataset with one array and associated text attributes.
-    These can be retrieved using :func:`load_data_hdf5`.
-
-    Large arrays and sharded volumes (a ``Shards`` container) are written one slab at a time,
-    so no full copy of the array is built on the host.
-
-    Args:
-        file_path (str): Full path to the output HDF5 file. Directories will be created if they do not exist.
-        array (ndarray, tensor, or Shards): The volume data to save.
-        array_name (str): Name of the dataset within the HDF5 file. Defaults to 'array'.
-        attributes_dict (dict, optional): Dictionary of attributes to store as metadata in the dataset.
-            Keys must be strings, and values should be serializable as HDF5 attributes.
-
-    Returns:
-        None
-
-    Example:
-        >>> import numpy as np
-        >>> volume = np.random.rand(64, 64, 64)
-        >>> attrs = {'voxel_size': '1.0mm', 'modality': 'CT'}
-        >>> save_data_hdf5('output/recon.h5', volume, array_name='recon', attributes_dict=attrs)
-
-    Example:
-        >>> recon, recon_dict = ct_model.recon(sinogram)
-        >>> recon_info = {'ALU units': '0.3mm', 'sinogram name': 'test part 038'}
-        >>> file_path = './output/test_part_038.h5'
-        >>> mbirtorch.save_data_hdf5(file_path, recon, recon_info)
-    """
+def _save_array_hdf5(file_path, array, array_name='array', attributes_dict=None):
+    """Write one array, of any shape, as the dataset ``array_name`` with the entries of
+    ``attributes_dict`` as text attributes.  A numpy array, a tensor, or a sharded volume is
+    written one slab at a time, so no full copy is made on the host."""
     if isinstance(array, _sharding.Shards):
         out_shape, dtype, produce_slab = _sharded_slab_source(array)
         _write_hdf5_streaming(file_path, array_name, out_shape, dtype, produce_slab, attributes_dict)
@@ -437,6 +392,12 @@ def save_data_hdf5(file_path, array, array_name='array', attributes_dict=None):
         return np.asarray(array) if array.ndim == 0 else np.ascontiguousarray(array[i0:i1])
 
     _write_hdf5_streaming(file_path, array_name, array.shape, array.dtype, produce_slab, attributes_dict)
+
+
+def save_data_hdf5(file_path, array, array_name='array', attributes_dict=None):
+    """Deprecated: use :func:`export_recon_hdf5`."""
+    warnings.warn('save_data_hdf5 is deprecated; use export_recon_hdf5.', FutureWarning, stacklevel=2)
+    _save_array_hdf5(file_path, array, array_name, attributes_dict)
 
 
 def _sharded_slab_source(shards):
@@ -482,66 +443,137 @@ def _sharded_slab_source(shards):
     return out_shape, dtype, produce_slab
 
 
+# The layout of a reconstruction file.  The volume is the dataset 'recon' in right-hand axis
+# order, (slice, col, row) for a 3D volume and (time, slice, col, row) for a 4D one, and the
+# attribute 'axes' states that order.  The transposes map memory order to file order and back.
+_RECON_FORMAT = 'mbirtorch_recon_v2'
+_RECON_AXES = {3: 'slice,col,row', 4: 'time,slice,col,row'}
+_RECON_TRANSPOSE = {3: (2, 1, 0), 4: (0, 3, 2, 1)}
+
+
+def _json_default(value):
+    """Encode what json cannot: arrays, tensors, numpy scalars, sets, and anything else as text."""
+    if hasattr(value, 'detach'):
+        value = value.detach().cpu().numpy()
+    if isinstance(value, np.ndarray):
+        return {'__ndarray__': value.tolist(), 'dtype': str(value.dtype)}
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, (set, tuple)):
+        return list(value)
+    return str(value)
+
+
+def _json_object_hook(obj):
+    if len(obj) == 2 and '__ndarray__' in obj and 'dtype' in obj:
+        return np.asarray(obj['__ndarray__'], dtype=obj['dtype'])
+    return obj
+
+
+def _recon_attributes(recon_dict, ndim):
+    """Return the attributes of a reconstruction file: the format tag, the axis order, the
+    package version, and one attribute per entry of recon_dict.  A dict entry becomes JSON text
+    so that it reads back; a string stays as it is; anything else becomes text."""
+    import json
+    from . import __version__
+    attrs = {'format': _RECON_FORMAT, 'axes': _RECON_AXES[ndim], 'mbirtorch_version': __version__}
+    for key, value in (recon_dict or {}).items():
+        if isinstance(value, dict):
+            attrs[key] = json.dumps(value, default=_json_default)
+        elif isinstance(value, str):
+            attrs[key] = value
+        else:
+            attrs[key] = str(value)
+    return attrs
+
+
 def export_recon_hdf5(file_path, recon, recon_dict=None, remove_flash=False, radial_margin=10, top_margin=10, bottom_margin=10):
     """
-    Export a 3D reconstruction volume to an HDF5 file with optional post-processing.
+    Write a reconstruction and its recon_dict to an HDF5 file.
 
-    This function works with numpy arrays, torch tensors, and sharded volumes (a ``Shards``
-    container).  A sharded volume is copied to the host and written one slab at a time, so the
-    file equals the single-device export.
-    The function also transposes the reconstruction to right-hand coordinates (slice, col, row),
-    and writes the reconstruction and optional metadata to an HDF5 file.
+    The file holds the volume as the dataset ``recon`` in right-hand axis order, (slice, col, row)
+    for a 3D volume and (time, slice, col, row) for a 4D one, so that other programs read it the
+    natural way; the attribute ``axes`` states the order.  The entries of ``recon_dict`` are
+    attributes, the dicts as JSON and the log and notes as text.  :func:`import_recon_hdf5` reads
+    the file back, and the slice viewers open it.
 
     Args:
-        file_path (str): Full path to the output HDF5 file. Parent directories will be created if they do not exist.
-        recon (ndarray, tensor, or Shards): 3D volume in (row, col, slice) order. Will be converted to NumPy before writing.
-        recon_dict (dict, optional): Dictionary of attributes to store as metadata in the dataset.
-        remove_flash (bool, optional): Whether to apply a cylindrical mask to remove peripheral and top/bottom slices. Defaults to False.
-        radial_margin (int, optional): Margin in pixels to subtract from the cylinder radius. Defaults to 10.
-        top_margin (int, optional): Number of top slices to set to zero along the Z-axis. Defaults to 10.
-        bottom_margin (int, optional): Number of bottom slices to set to zero along the Z-axis. Defaults to 10.
+        file_path (str): Path of the output file.  Missing directories are created.
+        recon (ndarray, tensor, or Shards): the volume in (row, col, slice) order, or a 4D volume in
+            (time, row, col, slice) order.  A volume sharded by slice is streamed from the devices
+            without a host copy.
+        recon_dict (dict, optional): the dict returned by :meth:`~mbirtorch.TomographyModel.recon`.
+        remove_flash (bool, optional): If True, zero the voxels outside a cylinder and the top and
+            bottom slices before writing.  Defaults to False.
+        radial_margin (int, optional): Voxels taken off the cylinder radius.  Defaults to 10.
+        top_margin (int, optional): Slices zeroed at the top.  Defaults to 10.
+        bottom_margin (int, optional): Slices zeroed at the bottom.  Defaults to 10.
 
     Example:
-        >>> import numpy as np
-        >>> recon = np.ones((128, 128, 64))  # (row, col, slice) order
-        >>> export_recon_hdf5("output/recon_volume.h5", recon, recon_dict={"scan_id": "sample1"})
+        >>> recon, recon_dict = ct_model.recon(sinogram)
+        >>> mbirtorch.export_recon_hdf5('output/recon.h5', recon, recon_dict)
+        >>> mbirtorch.export_recon_hdf5('output/recon.h5', recon, recon_dict, remove_flash=True)
     """
-    # A three dimensional volume sharded on the slice axis is streamed one slab at a time from
-    # the devices.  Every other input is copied to a single host array first.
+    from . import preprocess
+
+    def mask(block, s0, s1):
+        # block holds slices [s0, s1) of a volume of num_slices slices, in (row, col, slice) order.
+        ds = s1 - s0
+        local_top = min(max(top_margin - s0, 0), ds)
+        local_bottom = min(max(s1 - (num_slices - bottom_margin), 0), ds)
+        return preprocess.apply_cylindrical_mask(block, radial_margin, local_top, local_bottom)
+
+    # A 3D volume sharded on the slice axis is streamed one slab at a time from the devices.
+    # Every other input is copied to a single host array first.
     if (isinstance(recon, _sharding.Shards) and recon.tensors[0].ndim == 3
             and recon.placement.axis % 3 == 2):
         (num_rows, num_cols, num_slices), np_dtype = _sharded_host_shape_dtype(recon)
+        ndim = 3
 
         def get_block(s0, s1):
-            return _shard_axis_block(recon, s0, s1)          # (rows, cols, ds) on the host
+            return _shard_axis_block(recon, s0, s1)
     else:
         recon = _to_host(recon)
-        num_rows, num_cols, num_slices = recon.shape
         np_dtype = recon.dtype
+        ndim = recon.ndim
+        if ndim == 3:
+            num_rows, num_cols, num_slices = recon.shape
 
-        def get_block(s0, s1):
-            return recon[:, :, s0:s1]
+            def get_block(s0, s1):
+                return recon[:, :, s0:s1]
+        elif ndim == 4:
+            num_times, num_rows, num_cols, num_slices = recon.shape
+        else:
+            raise ValueError(f'recon must be a 3D or 4D volume; got shape {recon.shape}')
 
     # Each slab is masked, transposed, and written on its own, so no full transposed volume is
-    # built.  A slab holds all rows and columns, so the circular mask is the same for every slab.
-    from . import preprocess
+    # built.  A 3D slab holds all rows and columns, so the circular mask is the same for every slab.
+    if ndim == 3:
+        def produce_slab(s0, s1):
+            block = get_block(s0, s1)
+            if remove_flash:
+                block = mask(block, s0, s1)
+            return np.ascontiguousarray(np.transpose(block, _RECON_TRANSPOSE[3]))   # (ds, cols, rows)
 
-    def produce_slab(s0, s1):
-        block = get_block(s0, s1)
-        if remove_flash:
-            ds = s1 - s0
-            local_top = min(max(top_margin - s0, 0), ds)                       # Top slices falling in this slab.
-            local_bottom = min(max(s1 - (num_slices - bottom_margin), 0), ds)  # Bottom slices falling in this slab.
-            block = preprocess.apply_cylindrical_mask(block, radial_margin, local_top, local_bottom)
-        return np.ascontiguousarray(np.transpose(block, (2, 1, 0)))            # (ds, cols, rows)
+        out_shape = (num_slices, num_cols, num_rows)
+        chunks = (1, num_cols, num_rows)
+    else:
+        def produce_slab(t0, t1):
+            block = recon[t0:t1]
+            if remove_flash:
+                block = np.stack([mask(frame, 0, num_slices) for frame in block])
+            return np.ascontiguousarray(np.transpose(block, _RECON_TRANSPOSE[4]))   # (dt, slices, cols, rows)
 
-    _write_hdf5_streaming(file_path, 'recon', (num_slices, num_cols, num_rows), np_dtype,
-                          produce_slab, recon_dict)
+        out_shape = (num_times, num_slices, num_cols, num_rows)
+        chunks = (1, 1, num_cols, num_rows)
+
+    _write_hdf5_streaming(file_path, 'recon', out_shape, np_dtype, produce_slab,
+                          _recon_attributes(recon_dict, ndim), chunks=chunks)
 
 
 def _resolve_geometry_class(geometry_type):
     """Return the model class named by a ``geometry_type`` string.  That string
-    is recorded by ``get_all_params`` and by the scan readers."""
+    is recorded by ``get_all_params`` and by the scanner loaders."""
     import mbirtorch
     geometry_type = str(geometry_type)
     for name in ('ConeBeamModel', 'MultiAxisParallelBeamModel',
@@ -578,12 +610,12 @@ def _recon_shape_at_pitch(recon_shape, automatic_pitch, pitch, slices_are_rows=F
 def build_model(required_params, optional_params=None, regularization=None):
     """
     Construct a model from the parameter dicts returned by
-    :meth:`~mbirtorch.TomographyModel.get_all_params`.
+    ``get_all_params``.
 
     The model class is taken from the ``geometry_type`` entry of ``required_params``.  The model is
     constructed, the optional parameters and regularization are applied, and ``auto_set_recon_geometry``
     sets the reconstruction geometry the dicts do not carry.  A ``recon_shape``, ``delta_voxel``, or
-    ``recon_slice_offset`` the dicts do carry, from a reader or from a model whose values were set by
+    ``recon_slice_offset`` the dicts do carry, from a scanner loader or from a model whose values were set by
     hand, is kept; when a pitch is supplied without a shape, the automatic shape is sized at that pitch.
 
     Args:
@@ -1477,31 +1509,59 @@ def calc_tct_recon_params(source_det_dist, source_iso_dist, delta_det_row, delta
 
 def import_recon_hdf5(file_path):
     """
-    Import a 3D reconstruction volume from an HDF5 file.
+    Read a reconstruction and its recon_dict from a file written by :func:`export_recon_hdf5`.
 
-    This function loads a reconstruction volume and associated metadata from an HDF5 file,
-    and reorders the volume axes from the file's (slice, col, row) layout to (row, col, slice)
-    to match MBIRTORCH conventions, so a volume written by export_recon_hdf5 is recovered unchanged.
+    The volume comes back in (row, col, slice) order, or (time, row, col, slice) for a 4D volume,
+    and the recon_dict with the entries and types it was written with.  A file written before the
+    layout was recorded in the file is read by its dataset name, with a warning: ``recon`` is taken
+    to be in (slice, col, row) order, and ``volume`` or ``array`` in (row, col, slice) order; its
+    attributes come back as the strings they were stored as.
 
     Args:
-        file_path (str): Path to the HDF5 file containing the reconstruction volume.
+        file_path (str): Path of the file.
 
     Returns:
-        Tuple[np.ndarray, dict]: A tuple containing:
-            - recon (np.ndarray): The reconstructed 3D volume in (row, col, slice) order.
-            - recon_dict (dict): Dictionary containing metadata associated with the reconstruction.
+        (recon, recon_dict)
 
     Example:
-        >>> from mbirtorch import import_recon_hdf5
-        >>> recon, recon_dict = import_recon_hdf5("output/recon_volume.h5")
-        >>> print(recon.shape)
-        (128, 128, 64)
+        >>> recon, recon_dict = mbirtorch.import_recon_hdf5('output/recon.h5')
     """
-    recon, recon_dict = load_data_hdf5(file_path=file_path)
+    import json
+    import h5py
+    with h5py.File(file_path, 'r') as f:
+        names = list(f.keys())
+        if 'recon' in names:
+            name = 'recon'
+        elif len(names) == 1:
+            name = names[0]
+        else:
+            raise ValueError(f'{file_path} holds {len(names)} datasets and none is named recon')
+        recon = f[name][()]
+        attrs = {k: (v.decode() if isinstance(v, bytes) else v) for k, v in f[name].attrs.items()}
 
-    recon = np.transpose(recon, axes=(2, 1, 0))
+    if attrs.pop('format', None) == _RECON_FORMAT:
+        axes = attrs.pop('axes')
+        attrs.pop('mbirtorch_version', None)
+        recon = np.transpose(recon, _RECON_TRANSPOSE[len(axes.split(','))])
+        recon_dict = {}
+        for key, value in attrs.items():
+            if isinstance(value, str) and value[:1] == '{':
+                try:
+                    value = json.loads(value, object_hook=_json_object_hook)
+                except ValueError:
+                    pass
+            recon_dict[key] = value
+        return recon, recon_dict
 
-    return recon, recon_dict
+    # A file from before the layout was recorded.  Its writer fixed the dataset name.
+    if name == 'recon':
+        warnings.warn(f'{file_path} is in the old layout; it is read as (slice, col, row), so a file '
+                      f'written by save_recon_hdf5 comes back transposed.')
+        if recon.ndim == 3:
+            recon = np.transpose(recon, (2, 1, 0))
+    else:
+        warnings.warn(f'{file_path} is in the old layout; it is read as stored.')
+    return recon, attrs
 
 
 def merge_log_files(merged_path, labeled_paths):
@@ -1615,7 +1675,7 @@ def _gen_ellipsoid(x_grid, y_grid, z_grid, x0, y0, z0, a, b, c, gray_level, alph
     return image.reshape(x_grid.shape)
 
 
-def generate_3d_shepp_logan_reference(phantom_shape):
+def gen_shepp_logan_3d_reference(phantom_shape):
     """
     Generate a 3D Shepp Logan phantom based on below reference.
 
@@ -1666,7 +1726,7 @@ def generate_3d_shepp_logan_reference(phantom_shape):
     return image
 
 
-def gen_translation_phantom(recon_shape, option, text, fill_rate=0.05, font_size=20, text_row_indices=None,
+def _gen_translation_phantom(recon_shape, option, text, fill_rate=0.05, font_size=20, text_row_indices=None,
                             horizontal_offset=0, vertical_offset=0, voxel_slice_aspect=1.0):
     """
     Generate a synthetic ground truth phantom based on the selected option.
@@ -1879,6 +1939,31 @@ def gen_translation_vectors(num_x_translations, num_z_translations, x_spacing, z
     return translation_vectors
 
 
+def _gen_polygon_phantom(recon_shape):
+    """
+    A phantom of one asymmetric convex polygon, the same in every slice, for view selection.
+
+    The polygon has five sides and no symmetry, so its edges face a few directions and the
+    best view angles are not evenly spaced.  Its vertices are scaled to the volume.
+
+    Args:
+        recon_shape (tuple of int): (num_rows, num_cols, num_slices).
+
+    Returns:
+        numpy.ndarray: The phantom, float32, 1.0 inside the polygon and 0 elsewhere.
+    """
+    from matplotlib.path import Path
+
+    num_rows, num_cols, num_slices = recon_shape
+    # Vertices as (row, col) on a 512 by 512 grid, scaled to this one.
+    vertices = np.array([[100, 440], [80, 260], [280, 60], [420, 280], [360, 460]], dtype=np.float64)
+    vertices *= np.array([num_rows, num_cols]) / 512.0
+    rows, cols = np.meshgrid(np.arange(num_rows), np.arange(num_cols), indexing='ij')
+    inside = Path(vertices).contains_points(np.stack([rows.ravel(), cols.ravel()], axis=-1))
+    image = inside.reshape(num_rows, num_cols).astype(np.float32)
+    return np.repeat(image[:, :, None], num_slices, axis=2)
+
+
 def gen_cube_phantom(recon_shape, device=None):
     """Code to generate a simple phantom """
     import torch
@@ -1969,6 +2054,7 @@ def get_helical_half_rotation_slice_range(
 class ObjectType(str, Enum):
     SHEPP_LOGAN = 'shepp-logan'
     CUBE = 'cube'
+    POLYGON = 'polygon'
 
 
 class ModelType(str, Enum):
@@ -1978,7 +2064,7 @@ class ModelType(str, Enum):
     MULTIAXIS = 'multiaxis'
 
 
-def generate_demo_data(
+def gen_demo_data(
     object_type='shepp-logan',
     model_type='cone',
     num_views=64,
@@ -2005,18 +2091,19 @@ def generate_demo_data(
 
     This function will create a 3D volume (aka object or phantom) of the specified type, then use the model type and
     parameters to create a simulated sinogram.  The object type 'shepp-logan' gives a simplified version of the
-    classic Shepp-Logan test phantom, and type 'cube' gives a simple cube object.
+    classic Shepp-Logan test phantom, type 'cube' gives a simple cube object, and type 'polygon' gives one
+    asymmetric five-sided polygon, the same in every slice, whose edges face a few directions so that some view
+    angles matter more than others.  The polygon is the object for sparse view selection.
 
-    The 'translation' model type is the exception: it reconstructs a volume only a few voxels thick, on which both
-    of those objects come out empty, so it always uses :func:`gen_translation_phantom` (a sparse pattern of dots)
-    and ignores object_type.
+    The 'translation' model type is the exception: it reconstructs a volume only a few voxels thick, on which
+    those objects come out empty, so it always uses a sparse pattern of dots and ignores object_type.
 
     The output sinogram has shape (num_views, num_det_rows, num_det_channels); each 2D array
     sinogram[view_index] is a simulated image from the detector, with num_det_rows indicating the
     vertical size and num_det_channels the horizontal size.
 
     Args:
-        object_type (str, optional): One of 'shepp-logan' or 'cube'.  Defaults to 'shepp-logan'.
+        object_type (str, optional): One of 'shepp-logan', 'cube', or 'polygon'.  Defaults to 'shepp-logan'.
             Ignored when model_type is 'translation', which uses its own phantom (see above).
         model_type (str, optional): One of 'parallel', 'cone', 'translation' or 'multiaxis'.  Defaults to 'cone'.
         num_views (int, optional):  Number of views in the output sinogram.  Defaults to 64. Ignored when model_type is 'translation'
@@ -2209,14 +2296,16 @@ def generate_demo_data(
     if model_type == ModelType.TRANSLATION:
         # The translation geometry reconstructs a thin slab, often a single row of voxels.  Both
         # generic phantoms come out empty that thin, so this geometry uses a phantom of dots.
-        phantom_core = gen_translation_phantom(phantom_shape, option='dots', text=None)
+        phantom_core = _gen_translation_phantom(phantom_shape, option='dots', text=None)
     elif object_type == ObjectType.SHEPP_LOGAN:
-        phantom_core = generate_3d_shepp_logan_low_dynamic_range(
+        phantom_core = gen_shepp_logan_3d(
             phantom_shape, target_max_attenuation=target_max_attenuation)
     elif object_type == ObjectType.CUBE:
         # gen_cube_phantom returns a tensor, and this function returns a host
         # numpy array for both object types.
         phantom_core = gen_cube_phantom(phantom_shape).cpu().numpy()
+    elif object_type == ObjectType.POLYGON:
+        phantom_core = _gen_polygon_phantom(phantom_shape)
     else:
         raise ValueError(f'Invalid object type. Expected one of {[o.value for o in ObjectType]}, got {object_type}')
     if model_type == ModelType.CONE and use_helical:
@@ -2235,3 +2324,83 @@ def generate_demo_data(
 
     del ct_model_for_generation
     return phantom, sinogram, params
+def gen_demo_data_4d(
+    object_type='rack-and-pinion',
+    model_type='parallel',
+    num_views=240,
+    num_rotations=2,
+    num_det_rows=64,
+    num_det_channels=64,
+    num_steps=24,
+    devices=None,
+    **object_options,
+):
+    """
+    Create a moving object and the sinogram of one continuous scan of it, for 4D demonstrations.
+
+    The object is a moving phantom sampled at ``num_steps`` evenly spaced times over the scan.
+    The only object so far is 'rack-and-pinion': a toothed bar along the rotation axis and a
+    toothed wheel beside it, the wheel turning by ``rotation_degrees`` over the scan.  A new
+    object is added in the private module ``_phantoms_4d``, as a function of the volume shape and
+    the time in [0, 1], listed by name in its table of moving phantoms.  The views are in time order and are divided evenly among
+    the steps: the views of step k are projected from the object at step k.  With 240 views and
+    24 steps, views 0 to 9 see the object in its first state, views 10 to 19 in its second, and
+    so on.  A 4D reconstruction such as :class:`~mbirtorch.MACE4DModel` divides the views into
+    frames on its own; nothing here depends on that.
+
+    Args:
+        object_type (str, optional): The moving object.  Defaults to 'rack-and-pinion'.
+        model_type (str, optional): 'parallel' or 'cone'.  Defaults to 'parallel'.
+        num_views (int, optional): Views in the scan.  Defaults to 240.
+        num_rotations (float, optional): Rotations the scan covers.  Defaults to 2.
+        num_det_rows (int, optional): Detector rows.  Defaults to 64.
+        num_det_channels (int, optional): Detector channels.  Defaults to 64.
+        num_steps (int, optional): Times at which the object is sampled.  Defaults to 24.
+        devices (sequence of devices, optional): Devices to project on.  Defaults to None, the
+            model's automatic choice.
+        **object_options: Passed to the phantom function, such as ``rotation_degrees`` for the
+            rack and pinion.
+
+    Returns:
+        tuple: (phantom_4d, sinogram, params)
+            - phantom_4d: the object at each step, float32, shape (num_steps, num_rows,
+              num_cols, num_slices).  The volume shape is the model's reconstruction shape.
+            - sinogram: shape (num_views, num_det_rows, num_det_channels), a host numpy array.
+            - params (dict): 'angles', the angle of each view; 'step_of_view', the step each view
+              was projected from; 'num_rotations' and 'num_steps'; and for 'cone' the two
+              source distances.
+    """
+    import mbirtorch
+    from ._phantoms_4d import _gen_moving_phantom
+
+    model_type = ModelType(model_type)
+    sinogram_shape = (num_views, num_det_rows, num_det_channels)
+    angles = 2.0 * np.pi * num_rotations * np.arange(num_views) / num_views
+    params = {'angles': angles, 'num_rotations': num_rotations, 'num_steps': num_steps}
+    if model_type == ModelType.PARALLEL:
+        ct_model = mbirtorch.ParallelBeamModel(sinogram_shape, angles)
+    elif model_type == ModelType.CONE:
+        source_detector_dist = 4 * num_det_channels
+        source_iso_dist = source_detector_dist / 2
+        ct_model = mbirtorch.ConeBeamModel(sinogram_shape, angles, source_detector_dist=source_detector_dist,
+                                           source_iso_dist=source_iso_dist)
+        params.update(source_detector_dist=source_detector_dist, source_iso_dist=source_iso_dist)
+    else:
+        raise ValueError(f"model_type must be 'parallel' or 'cone' for 4D data; got {model_type.value!r}.")
+    ct_model.set_params(verbose=0)
+    if devices is not None:
+        ct_model.configure_devices(devices)
+
+    phantom_shape = tuple(int(n) for n in ct_model.get_params('recon_shape'))
+    phantom_4d = _gen_moving_phantom(object_type, phantom_shape, num_steps, **object_options)
+
+    # Each step's views are projected from that step's object.
+    step_of_view = (np.arange(num_views) * num_steps) // num_views
+    params['step_of_view'] = step_of_view
+    sinogram = np.zeros(sinogram_shape, dtype=np.float32)
+    for step in range(num_steps):
+        views = step_of_view == step
+        sinogram[views] = ct_model.forward_project(phantom_4d[step])[views]
+    return phantom_4d, sinogram, params
+
+
