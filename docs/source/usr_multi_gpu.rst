@@ -28,6 +28,31 @@ Later reconstructions on the same model reuse the choice.  It is made again only
 sinogram shape or the reconstruction shape changes.
 
 
+.. _usr_estimate_resources:
+
+Checking memory and time before a job
+-------------------------------------
+
+``estimate_resources`` tells you how much GPU memory a reconstruction needs and about how long
+it takes on the GPUs you name.  It needs no data and no GPU, so you can run it on a laptop
+before you submit a job::
+
+    estimate = mbirtorch.estimate_resources(ct_model, gpu_model='H100', num_gpus=8)
+    print(estimate)
+
+It reports the direct, full, and split reconstructions::
+
+                                  GPU memory needed    fits    time, 15 iterations
+    direct reconstruction         56.9 GiB             yes     about 1 minute
+    full reconstruction           78.3 GiB             no      about 70 minutes
+    split reconstruction          44.9 GiB             yes     about 71 minutes
+
+Here the full reconstruction does not fit, so use ``recon_split_sino``.  Times are accurate to
+about a factor of 1.5.
+
+The full reference for ``estimate_resources`` is on the :ref:`TomographyModelDocs` page.
+
+
 Choosing the devices yourself
 -----------------------------
 

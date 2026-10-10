@@ -32,12 +32,22 @@ Reconstruct
 
 See :ref:`TomographyModelDocs` and :ref:`ParametersDocs`.
 
+Check memory and time
+---------------------
+
+.. autosummary::
+
+   estimate_resources
+
+See :ref:`usr_estimate_resources`.
+
 View and save
 -------------
 
 .. autosummary::
 
    view_utils.slice_viewer
+   view_utils.slice_viewer4d
    export_recon_hdf5
 
 See :ref:`Utilities`.
@@ -57,6 +67,7 @@ More
 * :ref:`DenoisingDocs`: the MAP denoiser, for Plug-and-Play loops.
 * :ref:`AutogradDocs`: the projectors as differentiable PyTorch operations.
 * :ref:`usr_multi_gpu`: reconstruction across several GPUs.
+* :ref:`HSNTDocs`: hyperspectral neutron transmission data, with its HDF5 import and export.
 
 .. toctree::
    :hidden:

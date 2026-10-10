@@ -211,6 +211,8 @@ Note that a 2K x 2K x 2K reconstruction occupies 32GB of memory, not counting th
 If your machine has multiple GPUs, MBIRTorch automatically divides the reconstruction across them: the memory
 available for the problem grows roughly in proportion to the number of GPUs.  Large reconstructions typically get
 faster as well, but small ones do not; see :doc:`usr_multi_gpu` for the measured behavior and the details.
+To check before you submit a job whether a reconstruction fits and how long it takes, use
+``mbirtorch.estimate_resources``, described in :ref:`usr_estimate_resources`.
 If you have no GPU, all processing is done on the CPU.
 
 If your reconstruction is still too large, use :meth:`~mbirtorch.TomographyModel.recon_split_sino`, which splits the

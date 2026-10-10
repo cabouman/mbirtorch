@@ -1,6 +1,7 @@
 import os
 import time
 import numpy as np
+import torch
 import mbirtorch
 import mbirtorch.preprocess as mtp
 from mbirtorch.preprocess import volumax
@@ -11,12 +12,15 @@ from mbirtorch.preprocess import volumax
 # The scan folder: the folder that contains AcquisitionParameters.json.
 scan_dir = '/depot/bouman/data/ORNL/volumax/Hexagonal_volumax/proj/M0685 - Hexagonal Part (Scanning Stragety Optimization)_2026-08-31T10-07-09'
 # scan_dir = '/depot/bouman/data/ORNL/volumax/HIP_Can_Proj/HIP Can - Vanshika 92.8um Res_2025-09-12T14-46-58'
+# Full resolution, downsample_factor = (1, 1), needs 8 GPUs of 80 GB.  The script reconstructs in
+# parts with recon_split_sino when the full reconstruction does not fit on the GPUs it runs on.
 downsample_factor = (2, 2)        # detector (rows, channels) block averaging
 subsample_view_factor = 1         # keep every n-th view
 fit_alignment = True              # refine the detector offsets and remove per-view jitter and rotation
 sharpness = 1.0
 snr_db = 35.0
 max_iterations = 15
+gpu_model = 'H100'                # the GPUs the job runs on, for the memory and time estimate
 weight_type = None                # None, or a weight type for mbirtorch.gen_weights, e.g. 'transmission'
 sinogram_path = None              # optional precomputed -log sinogram (.npy)
 output_path = None                # e.g. './output/volumax_recon.h5'; None skips saving
@@ -56,7 +60,17 @@ weights = None if weight_type is None else mbirtorch.gen_weights(sino, weight_ty
 ct_model.set_params(sharpness=sharpness, snr_db=snr_db)
 
 t0 = time.time()
-recon, recon_dict = ct_model.recon(sino, weights=weights, max_iterations=max_iterations)
+num_gpus = torch.cuda.device_count()
+fits = True
+if num_gpus > 0:
+    estimate = mbirtorch.estimate_resources(ct_model, gpu_model=gpu_model, num_gpus=num_gpus,
+                                            max_iterations=max_iterations)
+    print(estimate)
+    fits = estimate.recon.fits is not False      # an unknown answer runs the full reconstruction
+if fits:
+    recon, recon_dict = ct_model.recon(sino, weights=weights, max_iterations=max_iterations)
+else:
+    recon, recon_dict = ct_model.recon_split_sino(sino, weights=weights, max_iterations=max_iterations)
 recon = np.asarray(recon)
 print(f'Reconstruction {recon.shape} in {time.time() - t0:.1f} s; min {recon.min():.4f}, max {recon.max():.4f}')
 

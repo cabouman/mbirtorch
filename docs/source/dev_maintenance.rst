@@ -40,17 +40,26 @@ Dry run on TestPyPI (optional, recommended the first time)
 Release to PyPI
 +++++++++++++++
 
-1. Open the release pull request::
+1. Update the measured GPU speeds that ``estimate_resources`` uses::
+
+       python dev_scripts/update_gpu_speeds.py
+
+   The script reads the newest nightly performance records, prints the old and new times side
+   by side, and writes ``mbirtorch/data/gpu_speeds.json``.  Read the printout, then commit the
+   file and merge it into ``prerelease``.  If the nightly records cannot be read, the script
+   leaves the file unchanged, and the release goes ahead with the previous speeds.
+
+2. Open the release pull request::
 
        dev_scripts/release.sh 0.X.Y
 
    Sets the version on ``prerelease``, pushes it, and opens the pull request to
    ``main``.  Nothing is published yet.
 
-2. Review the pull request on GitHub.  The tests run on it automatically, so
+3. Review the pull request on GitHub.  The tests run on it automatically, so
    their result shows next to the Merge button.  When you are happy, merge it.
 
-3. Publish the release::
+4. Publish the release::
 
        dev_scripts/release.sh 0.X.Y --publish
 
@@ -58,7 +67,7 @@ Release to PyPI
    match, tags the shared commit ``v0.X.Y``, and CI builds and publishes it to
    PyPI.  No approval step.
 
-4. Confirm it is live::
+5. Confirm it is live::
 
        pip install mbirtorch
 

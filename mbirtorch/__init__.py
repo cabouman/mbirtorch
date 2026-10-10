@@ -51,6 +51,7 @@ from .utilities import (gen_shepp_logan_3d, clear_cache,
                         get_helical_half_rotation_slice_range,
                         merge_log_files)
 from .memory_stats import get_memory_stats
+from .resources import estimate_resources
 
 # __all__ is the declared public surface, and autodoc documents exactly these names.
 # The other imported names remain importable, but they are not promised as public API.
@@ -64,7 +65,7 @@ __all__ = [
     "save_data_hdf5", "load_data_hdf5", "export_recon_hdf5",
     "import_recon_hdf5",
     "gen_shepp_logan_3d", "clear_cache",
-    "get_memory_stats", "SliceViewer", "VolumeStack", "slice_viewer",
+    "get_memory_stats", "estimate_resources", "SliceViewer", "VolumeStack", "slice_viewer",
     "GeometryScene", "GeometryFigure", "geometry_viewer",
     "SliceViewer4D", "VolumeStack4D", "slice_viewer4d",
     "stitch_arrays", "get_ct_model", "copy_ct_model", "save_volume_as_gif",

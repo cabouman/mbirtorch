@@ -70,6 +70,11 @@ Call ``configure_devices`` to choose the devices yourself, or set the environmen
 
 .. automethod:: mbirtorch.TomographyModel.configure_devices
 
+Before you choose, ``estimate_resources`` reports the GPU memory and time a reconstruction
+needs on the GPUs you name.  See :ref:`usr_estimate_resources`.
+
+.. autofunction:: mbirtorch.estimate_resources
+
 
 .. _SaveLoadDocs:
 

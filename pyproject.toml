@@ -91,5 +91,9 @@ version = {attr = "mbirtorch.__version__"}
 # wheel).
 find = {include = ["mbirtorch*"]}
 
+[tool.setuptools.package-data]
+# The measured GPU speeds that mbirtorch.estimate_resources reads.
+mbirtorch = ["data/*.json"]
+
 [project.urls]
 source = "https://github.com/cabouman/mbirtorch"
