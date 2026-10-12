@@ -12,16 +12,13 @@ import numpy as np
 import torch
 
 from . import _sharding, tomography_utils
-from .cone_beam import _cone_channel_coordinate, _cone_row_coordinate
+from .cone_beam import (ConeBeamModel, _cone_channel_coordinate,
+                        _cone_row_coordinate)
 from .geometry_rules import channel_index, pixel_xy, row_index
 from .horizontal_fan import fan_back_batch, fan_forward_batch
 from .tomography_model import TomographyModel
 
 _F32 = torch.float32
-
-# The TCT filter pads every detector row to twice its length, so it filters this many
-# views at a time to bound the padded copy.
-TCT_FILTER_VIEW_BATCH = 16
 
 
 def _translation_pixel_xy_mag(pixel_indices, t_x, t_y, num_rows, num_cols,
@@ -201,47 +198,30 @@ def _translation_back_view_batch(sino_batch, pixel_indices, view_params_batch,
     return out
 
 
-def _translation_levels(values):
-    """Group nearly equal translation coordinates into levels, which tolerates a
-    small jitter in the scanner positions.  Returns the sorted level centers and
-    the level index of every value."""
-    order = np.sort(values)
-    span = order[-1] - order[0]
-    tolerance = 1e-3 * span if span > 0 else 1.0
-    starts = np.concatenate([[0], np.where(np.diff(order) > tolerance)[0] + 1])
-    ends = np.append(starts[1:], len(order))
-    centers = np.array([order[s:e].mean() for s, e in zip(starts, ends)])
-    index = np.argmin(np.abs(values[:, None] - centers[None, :]), axis=1)
-    return centers, index
+def _find_obj_positions(translation_vectors, axis):
+    """This function finds the unique object positions along one axis (x, y, or z).
 
-
-def _largest_valid_rectangle(valid_mask):
-    """Return (first_row, last_row, first_channel, last_channel) of the largest
-    detector rectangle in which every pixel of the boolean mask, shape
-    (num_det_rows, num_det_channels), is True."""
-    num_rows, num_channels = valid_mask.shape
-    # heights[c] counts the consecutive valid pixels in channel c that end at
-    # the current row.  The largest valid rectangle that ends at this row is the
-    # largest rectangle under these heights, which a stack of increasing heights
-    # finds in one pass over the channels.
-    heights = np.zeros(num_channels, dtype=np.int64)
-    best_area, best = 0, None
-    for row in range(num_rows):
-        heights = np.where(valid_mask[row], heights + 1, 0)
-        stack = []
-        for channel in range(num_channels + 1):
-            height = int(heights[channel]) if channel < num_channels else 0
-            start = channel
-            while stack and stack[-1][1] >= height:
-                start, stacked_height = stack.pop()
-                area = stacked_height * (channel - start)
-                if area > best_area:
-                    best_area = area
-                    best = (row - stacked_height + 1, row, start, channel - 1)
-            stack.append((start, height))
-    if best is None:
-        raise ValueError('The weights are not positive at any detector pixel.')
-    return best
+    The input ``translation_vectors`` is the (num_views, 3) array of the model, and ``axis`` is
+    'x', 'y', or 'z'.  The recorded translation vectors at the same x, y or z position differ by small position
+    errors. So this function computes each unique object position by taking the mean of the
+    translation vector values of all the views with the same x, y or z position.  It returns the unique positions
+    in increasing order with shape (num_x_translations,), (num_y_translations,), or (num_z_translations,).
+    and the index of the position of each view with shape (num_views,).
+    """
+    if axis not in ('x', 'y', 'z'):
+        raise ValueError(f"axis must be 'x', 'y', or 'z'; got {axis!r}.")
+    translations = np.asarray(translation_vectors)[:, 'xyz'.index(axis)]
+    sorted_translations = np.sort(translations)
+    full_range = sorted_translations[-1] - sorted_translations[0]
+    # Two translations are the same position when they differ by less than 0.1% of the range.
+    tolerance = 1e-3 * full_range if full_range > 0 else 1.0
+    # A new position starts wherever two neighboring sorted translations differ by more than
+    # the tolerance.
+    starts = np.concatenate([[0], np.where(np.diff(sorted_translations) > tolerance)[0] + 1])
+    ends = np.append(starts[1:], len(sorted_translations))
+    positions = np.array([sorted_translations[s:e].mean() for s, e in zip(starts, ends)])
+    position_index = np.argmin(np.abs(translations[:, None] - positions[None, :]), axis=1)
+    return positions, position_index
 
 
 class TranslationModel(TomographyModel):
@@ -414,163 +394,46 @@ class TranslationModel(TomographyModel):
         view, so this warning is not needed."""
         return
 
-    def tct_filter(self, sinogram, weights=None, filter_name="ramp", output_sharded=False):
+    def tct_filter(self, sinogram, filter_name="ramp", output_sharded=False):
         """
-        Perform the filtering of the TCT direct reconstruction :meth:`recon_tct`.
+        This method applies the filter of the TCT direct reconstruction to a sinogram.
 
-        Each detector row is extended at each end by half its length with its end
-        value, weighted by D / sqrt(u^2 + v^2 + D^2) with D the source to detector
-        distance, ramp filtered, and cropped back to its length.  The result is
-        scaled by the translation step and by cos(theta) cos(phi).  This last
-        weight cancels the ray length inside a voxel that the backprojection
-        applies.
-
-        Args:
-            sinogram (numpy or tensor): input with shape
-                (num_views, num_det_rows, num_det_channels).
-            weights (numpy or tensor, optional): sinogram weights with the shape
-                of ``sinogram``.  Only the largest detector rectangle in which
-                every weight is positive is used.  Defaults to None, which uses
-                the whole detector.
-            filter_name (string, optional): Name of the filter.  Defaults to "ramp".
-            output_sharded (bool, optional): If False (default), return numpy;
-                if True, return the device form.
-
-        Returns:
-            The filtered sinogram with the shape of ``sinogram``.  It is zero
-            outside the used detector rectangle.
+        Each detector row is extended at each end by half its length with its end value,
+        pre-weighted by the cosine weight, ramp filtered, and cropped back to its length.
+        The result is scaled by a factor that depends on the translation step, the voxel
+        size, and the angles of the ray to each detector pixel.
         """
-        rectangle = self._tct_detector_rectangle(weights)
-        return self._tct_filter_rectangle(sinogram, rectangle, filter_name, output_sharded)
-
-    def recon_tct(self, sinogram, weights=None, filter_name="ramp", output_sharded=False):
-        """
-        Perform the TCT direct reconstruction: :meth:`tct_filter`, then the exact
-        adjoint of the forward projector as the backprojection, then the average
-        over the translation paths.
-
-        A translation path is the set of views that share one z translation.
-        Each voxel is divided by the number of translation paths that record it,
-        that is, whose detector row for the voxel lies on the used detector rows.
-
-        Args:
-            sinogram (numpy or tensor): 3D sinogram data with shape
-                (num_views, num_det_rows, num_det_channels).
-            weights (numpy or tensor, optional): sinogram weights with the shape
-                of ``sinogram``, for example the weights of
-                :func:`mbirtorch.preprocess.zeiss_tct.get_sino_and_model`.  The
-                reconstruction uses the largest detector rectangle in which every
-                weight is positive.  Defaults to None, which uses the whole detector.
-            filter_name (string, optional): The name of the filter to use.
-                Defaults to 'ramp'.
-            output_sharded (bool, optional): If False (default), return a
-                numpy array.  If True, return the device form: a torch
-                tensor on a single device, or a Shards container (one
-                tensor per device) on a multi-device model.
-
-        Returns:
-            recon (numpy or tensor): The reconstructed volume.
-
-        Note:
-            The translation vectors must form translation paths along x at a set
-            of z translations.  A translation scan measures a limited set of
-            directions, so the reconstruction contains only the measured
-            frequencies.
-        """
-        # The device layout is settled before the first large allocation.  The workload
-        # name prices this direct reconstruction rather than a full iterative recon.
-        self._apply_device_policy(workload='direct')
-        rectangle = self._tct_detector_rectangle(weights)
-        # The filter places the sinogram on the devices.  This method keeps no reference to the
-        # device sinogram during the back projection.
-        filtered_sinogram = self._tct_filter_rectangle(sinogram, rectangle, filter_name,
-                                                       output_sharded=True)
-        recon = self._back_project(filtered_sinogram, output_sharded=True)
-        del filtered_sinogram
-
-        # A voxel that no translation path records has a zero backprojection, so a
-        # count of zero is replaced by one.
-        path_count = self._tct_path_count(rectangle[0], rectangle[1])
-        inverse_count = (1.0 / np.maximum(path_count, 1.0)).astype(np.float32)
-        if isinstance(recon, _sharding.Shards):
-            num_slices = int(self.get_params('recon_shape')[2])
-            for i, (dev, (s0, s1)) in enumerate(recon.placement.shard_ranges(num_slices)):
-                recon.tensors[i].mul_(torch.as_tensor(inverse_count[:, s0:s1], device=dev)[:, None, :])
-        else:
-            recon.mul_(torch.as_tensor(inverse_count, device=recon.device)[:, None, :])
-        return recon if output_sharded else self._gather_recon(recon)
-
-    def recon_direct(self, sinogram, filter_name="ramp", output_sharded=False):
-        """Direct reconstruction by :meth:`recon_tct` on the whole detector.
-        See :meth:`TomographyModel.recon_direct` for the argument and return
-        conventions."""
-        return self.recon_tct(sinogram, filter_name=filter_name,
-                              output_sharded=output_sharded)
-
-    def direct_filter(self, sinogram, filter_name="ramp", output_sharded=False):
-        """Filtering as needed for a direct recon; equivalent to
-        :meth:`tct_filter` with the whole detector."""
-        return self.tct_filter(sinogram, filter_name=filter_name,
-                               output_sharded=output_sharded)
-
-    def _tct_detector_rectangle(self, weights):
-        """Return (first_row, last_row, first_channel, last_channel) of the
-        detector rectangle that the TCT direct reconstruction uses: the whole
-        detector without weights, otherwise the largest rectangle in which every
-        weight is positive in every view."""
-        _, num_rows, num_channels = (int(x) for x in self.get_params('sinogram_shape'))
-        if weights is None or np.ndim(weights) == 0:
-            return 0, num_rows - 1, 0, num_channels - 1
-        if isinstance(weights, _sharding.Shards):
-            weights = self._gather_sinogram(weights)
-        elif torch.is_tensor(weights):
-            weights = weights.detach().cpu().numpy()
-        valid_mask = np.all(np.asarray(weights) > 0, axis=0)
-        return _largest_valid_rectangle(valid_mask)
-
-    def _tct_translation_step(self):
-        """Return the translation step along a translation path, the median
-        spacing of the distinct x translations."""
-        translation_vectors = np.asarray(self.get_params('translation_vectors'), dtype=np.float64)
-        x_levels, _ = _translation_levels(translation_vectors[:, 0])
-        if len(x_levels) < 2:
-            raise ValueError('The TCT direct reconstruction needs at least two '
-                             'distinct x translations.')
-        return float(np.median(np.diff(x_levels)))
-
-    def _tct_filter_rectangle(self, sinogram, rectangle, filter_name, output_sharded):
-        """The TCT filter of :meth:`tct_filter` on the given detector rectangle."""
         sinogram = self._shard_sinogram(sinogram)
+        # The sinogram can be a Shards container, so the shape comes from the parameters.
         _, num_rows, num_channels = (int(x) for x in self.get_params('sinogram_shape'))
-        first_row, last_row, first_channel, last_channel = rectangle
-        rows = slice(first_row, last_row + 1)
-        channels = slice(first_channel, last_channel + 1)
         source_detector_dist = self.get_params('source_detector_dist')
-        (delta_det_channel, delta_det_row, det_channel_offset, det_row_offset) = self.get_params(
-            ['delta_det_channel', 'delta_det_row', 'det_channel_offset', 'det_row_offset'])
+        delta_det_channel, delta_det_row, det_channel_offset, det_row_offset = (
+            self.get_params(['delta_det_channel', 'delta_det_row', 'det_channel_offset',
+                             'det_row_offset']))
         delta_voxel, voxel_row_aspect, voxel_slice_aspect = self.get_params(
             ['delta_voxel', 'voxel_row_aspect', 'voxel_slice_aspect'])
         voxel_volume = delta_voxel ** 3 * voxel_row_aspect * voxel_slice_aspect
 
-        # The cone FDK filter scales by delta_det_row / voxel_volume and by
-        # pi / (num_views * M_0).  The TCT filter replaces pi / (num_views * M_0)
-        # by translation_step / source_detector_dist.
         filter_scale = (self._tct_translation_step() * delta_det_row
                         / (source_detector_dist * voxel_volume))
 
-        # Detector coordinates are the inverses of channel_index and row_index.
-        # Each row is extended at each end by half the rectangle width.
-        width = last_channel - first_channel + 1
-        pad = width // 2
-        u = (np.arange(first_channel - pad, last_channel + pad + 1)
-             - (num_channels - 1) / 2) * delta_det_channel - det_channel_offset
-        v = (np.arange(first_row, last_row + 1) - (num_rows - 1) / 2) * delta_det_row - det_row_offset
+        # Each row is extended at each end by half the detector width, preweighted by cosine
+        # weight, ramp filtered, and cropped back to its length.
+        pad = num_channels // 2
+        u, v = ConeBeamModel.detector_mn_to_uv(
+            np.arange(num_rows)[:, None],
+            np.arange(-pad, num_channels + pad)[None, :],
+            delta_det_channel, delta_det_row, det_channel_offset, det_row_offset,
+            num_rows, num_channels)
         d2 = source_detector_dist ** 2
-        pre_weight = source_detector_dist / np.sqrt(u[None, :] ** 2 + v[:, None] ** 2 + d2)
-        u_used = u[pad:pad + width]
-        post_weight = (filter_scale * (source_detector_dist / np.sqrt(u_used[None, :] ** 2 + d2))
-                       * (source_detector_dist / np.sqrt(v[:, None] ** 2 + d2)))
-        recon_filter = tomography_utils.generate_direct_recon_filter(width + 2 * pad,
+        pre_weight = source_detector_dist / np.sqrt(u ** 2 + v ** 2 + d2)
+        u_used = u[:, pad:pad + num_channels]
+        # The back projection multiplies each value by the path length of the ray through a
+        # voxel.  This length is proportional to 1 / (cos(theta) cos(phi)), and the post
+        # weight cancels it.
+        post_weight = (filter_scale * (source_detector_dist / np.sqrt(u_used ** 2 + d2))
+                       * (source_detector_dist / np.sqrt(v ** 2 + d2)))
+        recon_filter = tomography_utils.generate_direct_recon_filter(num_channels + 2 * pad,
                                                                      filter_name=filter_name)
 
         def filter_views(sino_t):
@@ -578,15 +441,9 @@ class TranslationModel(TomographyModel):
             pre_t = torch.as_tensor(pre_weight.astype(np.float32), device=dev)
             post_t = torch.as_tensor(post_weight.astype(np.float32), device=dev)
             filter_t = torch.as_tensor(recon_filter, device=dev)
-            filtered = torch.zeros_like(sino_t)
-            for v0 in range(0, sino_t.shape[0], TCT_FILTER_VIEW_BATCH):
-                views = slice(v0, v0 + TCT_FILTER_VIEW_BATCH)
-                block = sino_t[views, rows, channels]
-                block = torch.cat([block[..., :1].expand(-1, -1, pad), block,
-                                   block[..., -1:].expand(-1, -1, pad)], dim=-1)
-                block = tomography_utils.apply_row_filter(block, filter_t, row_weight=pre_t)
-                filtered[views, rows, channels] = block[..., pad:pad + width] * post_t
-            return filtered
+            filtered = tomography_utils.apply_row_filter(sino_t, filter_t, row_weight=pre_t,
+                                                         edge_pad=pad)
+            return filtered.mul_(post_t)
 
         if isinstance(sinogram, _sharding.Shards):
             filtered = _sharding.Shards(
@@ -597,29 +454,112 @@ class TranslationModel(TomographyModel):
             filtered = filter_views(sinogram)
         return filtered if output_sharded else self._gather_sinogram(filtered)
 
-    def _tct_path_count(self, first_row, last_row):
-        """Return the number of translation paths that record each voxel, shape
-        (num_recon_rows, num_recon_slices).  A path records a voxel when the
-        voxel's detector row lies between first_row and last_row."""
-        num_det_rows = int(self.get_params('sinogram_shape')[1])
-        source_detector_dist, magnification = (self.get_params('source_detector_dist'),
-                                               self.get_magnification())
-        delta_det_row, det_row_offset = self.get_params(['delta_det_row', 'det_row_offset'])
-        delta_voxel, voxel_row_aspect, voxel_slice_aspect, recon_shape = self.get_params(
-            ['delta_voxel', 'voxel_row_aspect', 'voxel_slice_aspect', 'recon_shape'])
-        num_recon_rows, _, num_recon_slices = (int(x) for x in recon_shape)
-        translation_vectors = np.asarray(self.get_params('translation_vectors'), dtype=np.float64)
-        z_levels, path_index = _translation_levels(translation_vectors[:, 2])
+    def recon_tct(self, sinogram, filter_name="ramp", output_sharded=False):
+        """
+        This method reconstructs a volume from a sinogram by TCT direct reconstruction algorithm.
 
-        y = (np.arange(num_recon_rows) - (num_recon_rows - 1) / 2)[:, None] * delta_voxel * voxel_row_aspect
-        z = (np.arange(num_recon_slices) - (num_recon_slices - 1) / 2)[None, :] * delta_voxel * voxel_slice_aspect
-        path_count = np.zeros((num_recon_rows, num_recon_slices))
-        for level in range(len(z_levels)):
-            t_y, t_z = translation_vectors[path_index == level, 1:3].mean(axis=0)
-            pixel_mag = 1.0 / (1.0 / magnification - (y - t_y) / source_detector_dist)
-            row = row_index(pixel_mag * (z - t_z), delta_det_row, det_row_offset, num_det_rows)
-            path_count += (row >= first_row - 0.5) & (row <= last_row + 0.5)
-        return path_count
+        The method first filters the sinogram. It then back projects the result with the exact
+        adjoint of the forward projector. Finally, each reconstructed voxel value is divided by the
+        number of translation rows that record it. A translation row is
+        the set of views that share one z translation.
+
+        Args:
+            sinogram (numpy or tensor): 3D sinogram data with shape
+                (num_views, num_det_rows, num_det_channels).
+            filter_name (string, optional): The name of the filter to use.
+                Defaults to 'ramp'.
+            output_sharded (bool, optional): If False, the method returns a numpy array.  If
+                True, the method returns the result on the devices.  This result is a torch
+                tensor for a model on one device, or a Shards container with one tensor per
+                device for a model on several devices.  Defaults to False.
+
+        Returns:
+            recon (numpy or tensor): The reconstructed volume.
+        """
+        # This call chooses the GPUs and checks memory for a direct reconstruction before any allocation.
+        self._apply_device_policy(workload='direct')
+        # The filter places the sinogram on the devices.  This method keeps no reference to the
+        # device sinogram during the back projection.
+        filtered_sinogram = self.tct_filter(sinogram, filter_name=filter_name,
+                                            output_sharded=True)
+        recon = self._back_project(filtered_sinogram, output_sharded=True)
+        del filtered_sinogram
+
+        # Each voxel is divided by the number of translation rows that record it.  A voxel that
+        # no translation row records has a zero back projection, and it is divided by one
+        # instead of zero.
+        translation_row_count = self._count_translation_rows()
+        inverse_count = (1.0 / np.maximum(translation_row_count, 1.0)).astype(np.float32)
+        if isinstance(recon, _sharding.Shards):
+            num_slices = int(self.get_params('recon_shape')[2])
+            for i, (dev, (s0, s1)) in enumerate(recon.placement.shard_ranges(num_slices)):
+                inverse_count_t = torch.as_tensor(inverse_count[:, s0:s1], device=dev)
+                recon.tensors[i].mul_(inverse_count_t[:, None, :])
+        else:
+            recon.mul_(torch.as_tensor(inverse_count, device=recon.device)[:, None, :])
+        return recon if output_sharded else self._gather_recon(recon)
+
+    def recon_direct(self, sinogram, filter_name="ramp", output_sharded=False):
+        """This method reconstructs a volume by the TCT direct reconstruction algorithm.
+
+        This method is the same as :meth:`recon_tct`.  See
+        :meth:`TomographyModel.recon_direct` for the arguments and return value.
+        """
+        return self.recon_tct(sinogram, filter_name=filter_name,
+                              output_sharded=output_sharded)
+
+    def direct_filter(self, sinogram, filter_name="ramp", output_sharded=False):
+        return self.tct_filter(sinogram, filter_name=filter_name,
+                               output_sharded=output_sharded)
+
+    def _tct_translation_step(self):
+        """This method finds the translation step along x.
+
+        The step is the median spacing between neighboring object positions along x, in ALU.
+        """
+        translation_vectors = np.asarray(self.get_params('translation_vectors'), dtype=np.float64)
+        x_positions, _ = _find_obj_positions(translation_vectors, 'x')
+        if len(x_positions) < 2:
+            raise ValueError('The TCT direct reconstruction needs at least two '
+                             'distinct x translations.')
+        return float(np.median(np.diff(x_positions)))
+
+    def _count_translation_rows(self):
+        """This method counts the number of translation rows that record each voxel.
+
+        A translation row records a voxel when the voxel projects onto the detector. The count does
+        not depend on the column position of the voxel, so the method returns an array with shape
+        (num_recon_rows, num_recon_slices). So all voxels with the same row index and slice index
+        are recorded by the same number of translation rows.
+        """
+        num_det_rows = int(self.get_params('sinogram_shape')[1])
+        source_detector_dist = self.get_params('source_detector_dist')
+        delta_det_row, det_row_offset = self.get_params(['delta_det_row', 'det_row_offset'])
+        delta_voxel, voxel_row_aspect, recon_shape = self.get_params(
+            ['delta_voxel', 'voxel_row_aspect', 'recon_shape'])
+        num_recon_rows, _, num_recon_slices = (int(x) for x in recon_shape)
+        translation_vectors = np.asarray(self.get_params('translation_vectors'),
+                                         dtype=np.float64)
+        z_positions, z_position_index = _find_obj_positions(translation_vectors, 'z')
+        # Each translation row has one t_y and one t_z, the means over the views of the row.
+        row_means = np.array([translation_vectors[z_position_index == k].mean(axis=0)
+                              for k in range(len(z_positions))])
+        t_y, t_z = row_means[:, 1], row_means[:, 2]
+
+        # y is the depth of each recon row, and z is the height of each recon slice.
+        y = ((np.arange(num_recon_rows) - (num_recon_rows - 1) / 2) * delta_voxel
+             * voxel_row_aspect)
+        z = self.recon_slice_z()
+        # pixel_mag has shape (number of translation rows, num_recon_rows).  It does not depend
+        # on x, so x is set to zero.
+        _, _, pixel_mag = _translation_xy_mag(np.zeros_like(y), y, np.zeros_like(t_y), t_y,
+                                              self.get_magnification(), source_detector_dist)
+        translation_row_count = np.zeros((num_recon_rows, num_recon_slices))
+        for k in range(len(z_positions)):
+            v = _cone_row_coordinate(pixel_mag[k][:, None], z[None, :] - t_z[k])
+            row = row_index(v, delta_det_row, det_row_offset, num_det_rows)
+            translation_row_count += (row >= -0.5) & (row <= num_det_rows - 0.5)
+        return translation_row_count
 
     def _get_estimate_of_recon_std(self, sinogram, sino_indicator):
         """This method estimates the standard deviation of the reconstruction from the

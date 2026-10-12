@@ -35,9 +35,9 @@ def main(dataset_url="/depot/bouman/data/Translation/purdue_BGA_xrm.tgz", run_mb
     output_path = './output/'  # path to store output recon
     os.makedirs(output_path, exist_ok=True)
 
-    # TCT direct reconstruction.  The weights keep the dark border of the detector out of it.
+    # TCT direct reconstruction
     t0 = time.time()
-    direct_recon = tct_model.recon_tct(sino, weights=weights)
+    direct_recon = tct_model.recon_tct(sino)
     print(f'TCT direct recon time: {time.time() - t0:.1f} s')
     mt.export_recon_hdf5(os.path.join(output_path, "TCT_BGA_direct_recon.h5"), direct_recon,
                          recon_dict=None, top_margin=0, bottom_margin=0)
