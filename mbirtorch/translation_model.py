@@ -198,26 +198,21 @@ def _translation_back_view_batch(sino_batch, pixel_indices, view_params_batch,
     return out
 
 
-def _find_obj_positions(translation_vectors, axis):
-    """This function finds the unique object positions along one axis (x, y, or z).
+def _find_obj_positions(translation_vectors, axis, voxel_pitch):
+    """This function finds the unique object positions along one axis.
 
-    The input ``translation_vectors`` is the (num_views, 3) array of the model, and ``axis`` is
-    'x', 'y', or 'z'.  The recorded translation vectors at the same x, y or z position differ by small position
-    errors. So this function computes each unique object position by taking the mean of the
-    translation vector values of all the views with the same x, y or z position.  It returns the unique positions
-    in increasing order with shape (num_x_translations,), (num_y_translations,), or (num_z_translations,).
-    and the index of the position of each view with shape (num_views,).
+    ``axis`` is 'x', 'y', or 'z'.  The translations recorded at one position differ by small
+    position errors.  Two translations are the same position when they differ by less than
+    ``voxel_pitch``.  Each position is the mean of its translations.  The function returns the
+    positions in increasing order and the position index of each view, with shape (num_views,).
     """
     if axis not in ('x', 'y', 'z'):
         raise ValueError(f"axis must be 'x', 'y', or 'z'; got {axis!r}.")
     translations = np.asarray(translation_vectors)[:, 'xyz'.index(axis)]
     sorted_translations = np.sort(translations)
-    full_range = sorted_translations[-1] - sorted_translations[0]
-    # Two translations are the same position when they differ by less than 0.1% of the range.
-    tolerance = 1e-3 * full_range if full_range > 0 else 1.0
     # A new position starts wherever two neighboring sorted translations differ by more than
-    # the tolerance.
-    starts = np.concatenate([[0], np.where(np.diff(sorted_translations) > tolerance)[0] + 1])
+    # one voxel pitch.
+    starts = np.concatenate([[0], np.where(np.diff(sorted_translations) > voxel_pitch)[0] + 1])
     ends = np.append(starts[1:], len(sorted_translations))
     positions = np.array([sorted_translations[s:e].mean() for s, e in zip(starts, ends)])
     position_index = np.argmin(np.abs(translations[:, None] - positions[None, :]), axis=1)
@@ -518,7 +513,8 @@ class TranslationModel(TomographyModel):
         The step is the median spacing between neighboring object positions along x, in ALU.
         """
         translation_vectors = np.asarray(self.get_params('translation_vectors'), dtype=np.float64)
-        x_positions, _ = _find_obj_positions(translation_vectors, 'x')
+        x_positions, _ = _find_obj_positions(translation_vectors, 'x',
+                                             self.get_params('delta_voxel'))
         if len(x_positions) < 2:
             raise ValueError('The TCT direct reconstruction needs at least two '
                              'distinct x translations.')
@@ -535,12 +531,13 @@ class TranslationModel(TomographyModel):
         num_det_rows = int(self.get_params('sinogram_shape')[1])
         source_detector_dist = self.get_params('source_detector_dist')
         delta_det_row, det_row_offset = self.get_params(['delta_det_row', 'det_row_offset'])
-        delta_voxel, voxel_row_aspect, recon_shape = self.get_params(
-            ['delta_voxel', 'voxel_row_aspect', 'recon_shape'])
+        delta_voxel, voxel_row_aspect, voxel_slice_aspect, recon_shape = self.get_params(
+            ['delta_voxel', 'voxel_row_aspect', 'voxel_slice_aspect', 'recon_shape'])
         num_recon_rows, _, num_recon_slices = (int(x) for x in recon_shape)
         translation_vectors = np.asarray(self.get_params('translation_vectors'),
                                          dtype=np.float64)
-        z_positions, z_position_index = _find_obj_positions(translation_vectors, 'z')
+        z_positions, z_position_index = _find_obj_positions(translation_vectors, 'z',
+                                                            delta_voxel * voxel_slice_aspect)
         # Each translation row has one t_y and one t_z, the means over the views of the row.
         row_means = np.array([translation_vectors[z_position_index == k].mean(axis=0)
                               for k in range(len(z_positions))])
