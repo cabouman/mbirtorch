@@ -389,7 +389,7 @@ class TranslationModel(TomographyModel):
         view, so this warning is not needed."""
         return
 
-    def tct_filter(self, sinogram, filter_name="ramp", output_sharded=False):
+    def tct_direct_filter(self, sinogram, filter_name="ramp", output_sharded=False):
         """
         This method applies the filter of the TCT direct reconstruction to a sinogram.
 
@@ -449,7 +449,7 @@ class TranslationModel(TomographyModel):
             filtered = filter_views(sinogram)
         return filtered if output_sharded else self._gather_sinogram(filtered)
 
-    def recon_tct(self, sinogram, filter_name="ramp", output_sharded=False):
+    def recon_tct_direct(self, sinogram, filter_name="ramp", output_sharded=False):
         """
         This method reconstructs a volume from a sinogram by TCT direct reconstruction algorithm.
 
@@ -475,8 +475,8 @@ class TranslationModel(TomographyModel):
         self._apply_device_policy(workload='direct')
         # The filter places the sinogram on the devices.  This method keeps no reference to the
         # device sinogram during the back projection.
-        filtered_sinogram = self.tct_filter(sinogram, filter_name=filter_name,
-                                            output_sharded=True)
+        filtered_sinogram = self.tct_direct_filter(sinogram, filter_name=filter_name,
+                                                   output_sharded=True)
         recon = self._back_project(filtered_sinogram, output_sharded=True)
         del filtered_sinogram
 
@@ -497,15 +497,15 @@ class TranslationModel(TomographyModel):
     def recon_direct(self, sinogram, filter_name="ramp", output_sharded=False):
         """This method reconstructs a volume by the TCT direct reconstruction algorithm.
 
-        This method is the same as :meth:`recon_tct`.  See
+        This method is the same as :meth:`recon_tct_direct`.  See
         :meth:`TomographyModel.recon_direct` for the arguments and return value.
         """
-        return self.recon_tct(sinogram, filter_name=filter_name,
-                              output_sharded=output_sharded)
+        return self.recon_tct_direct(sinogram, filter_name=filter_name,
+                                     output_sharded=output_sharded)
 
     def direct_filter(self, sinogram, filter_name="ramp", output_sharded=False):
-        return self.tct_filter(sinogram, filter_name=filter_name,
-                               output_sharded=output_sharded)
+        return self.tct_direct_filter(sinogram, filter_name=filter_name,
+                                      output_sharded=output_sharded)
 
     def _tct_translation_step(self):
         """This method finds the translation step along x.
