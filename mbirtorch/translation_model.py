@@ -470,6 +470,10 @@ class TranslationModel(TomographyModel):
 
         Returns:
             recon (numpy or tensor): The reconstructed volume.
+
+        Note:
+            Translation tomography is a limited angle geometry, so this reconstruction is
+            approximate.  It is intended as an initial value for ``recon()``.
         """
         # This call chooses the GPUs and checks memory for a direct reconstruction before any allocation.
         self._apply_device_policy(workload='direct')
