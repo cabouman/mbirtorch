@@ -25,6 +25,11 @@ _PATIENCE = 5
 _COMPILE_MIN_ELEMENTS = 5e8
 # The largest number of times the joint solve restarts after it replaces zero components with random values.
 _MAX_RESEEDS = 2
+# The quick stop ends the joint solve when the Newton step is below this size in units of the noise, both over all
+# parameters and over the spectra alone.
+_QUICK_TOL = 0.1
+# The quick stop needs this many accepted steps in a row below _QUICK_TOL.
+_QUICK_PATIENCE = 2
 
 
 def _resolve_compile(compile_mode, T, device=None):
@@ -264,7 +269,7 @@ def solve_W(T, H, W_init=None, max_steps=100, rel_tol=1e-12, nonneg=True, compil
     return W
 
 def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, nnal=None, deriv=None,
-                      nonneg_W=True, w_mask=None, patience=1):
+                      nonneg_W=True, w_mask=None, patience=1, quick=False, stats=None):
     """This function solves for W and H together by a truncated Newton method with preconditioned
     CG.  It starts from the given W and H, and returns (W, H, steps, total_cg).
 
@@ -273,6 +278,12 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, 
     step.  The solve stops after ``patience`` accepted steps in a row with a relative loss change
     of at most rel_tol.  With nonneg_W=False, W is not constrained to be nonnegative.  When
     ``w_mask`` is given, the coefficients outside the mask stay at their current values.
+
+    With quick=True, the solve also stops after _QUICK_PATIENCE accepted steps in a row whose
+    Newton step is below _QUICK_TOL in units of the noise.  The noise comes from the effective
+    dose, the inverse of the mean Pearson residual.  When ``stats`` is a dict, the function sets
+    stats['effective_dose'] to the last estimate and stats['quick_stop'] to True when the quick
+    stop ended the solve.
     """
     nnal = stable_nnal if nnal is None else nnal
     deriv = stable_nnal_derivatives if deriv is None else deriv
@@ -287,6 +298,7 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, 
     step = 0
     gnorm0 = None
     quiet = 0
+    quick_quiet = 0
     for step in range(1, max_steps + 1):
         X = W @ H
         G, Z = deriv(X, T, prep)
@@ -383,22 +395,41 @@ def _joint_newton_pcg(T, W, H, max_steps=50, cg_max=60, rel_tol=0.0, prep=None, 
         lam = max(lam * 0.3, 1e-14)
         # At the limit of float precision, no step is accepted, and the test lam > 1e6 ends the solve.
         rel_change = torch.abs(loss - new_loss) / torch.abs(new_loss).clamp_min(torch.finfo(torch.float64).tiny)
+        if quick:
+            # The size of the full Newton step, in units of the noise: over all R (P + K - R) free
+            # parameters, and over the R K spectrum entries alone.
+            dose = T.numel() / (G * G / Z.clamp_min(torch.finfo(Z.dtype).tiny)).sum(dtype=torch.float64).clamp_min(
+                torch.finfo(torch.float64).tiny)
+            # The products are formed in place, so this test needs no more memory than a CG step.
+            P, K = T.shape
+            dX = W @ (xH * fH)
+            u_spectra = torch.sqrt(dose * (Z * dX).mul_(dX).sum(dtype=torch.float64) / (rank * K))
+            dX.addmm_(xW * fW, H)
+            u_all = torch.sqrt(dose * (Z * dX).mul_(dX).sum(dtype=torch.float64) / (rank * (P + K - rank)))
+            quick_quiet = quick_quiet + 1 if bool(max(u_all, u_spectra) < _QUICK_TOL) else 0
+            if stats is not None:
+                stats["effective_dose"] = float(dose)
         W, H, loss = Wn, Hn, new_loss
         quiet = quiet + 1 if bool(rel_change <= rel_tol) else 0
         if rel_tol > 0 and quiet >= patience:
+            break
+        if quick and quick_quiet >= _QUICK_PATIENCE:
+            if stats is not None:
+                stats["quick_stop"] = True
             break
     return W, H, step, total_cg
 
 
 def joint_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True, W_init=None, H_init=None,
-                          warmup_steps=5, cg_max=10, compile_mode=None):
+                          warmup_steps=5, cg_max=10, compile_mode=None, quick=False, stats=None):
     """This function minimizes the loss over W and H.  It first takes a few block Newton steps,
     and then it solves for W and H together by a preconditioned Newton method.
 
     The first block Newton steps bring the factors near the solution.  The joint solve then
     converges quickly.  With update_H=False, this function solves only for W, by block Newton
     steps.  When the map or spectrum of a component becomes zero, ``_reseed_dead`` replaces the
-    component with small random values.
+    component with small random values.  The arguments ``quick`` and ``stats`` go to the joint
+    solve (``_joint_newton_pcg``).
     """
     if not update_H:
         return block_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=False, W_init=W_init,
@@ -418,7 +449,8 @@ def joint_newton_optimize(T, num_materials, max_steps, rel_tol, update_H=True, W
         if steps >= max_steps:
             break
         W, H, taken, _ = _joint_newton_pcg(T, W, H, max_steps=max_steps - steps, cg_max=cg_max, rel_tol=rel_tol,
-                                           prep=prep, nnal=nnal_fn, deriv=deriv_fn, patience=_PATIENCE)
+                                           prep=prep, nnal=nnal_fn, deriv=deriv_fn, patience=_PATIENCE, quick=quick,
+                                           stats=stats)
         steps += taken
         if before is not None and bool(nnal_fn(W @ H, T, prep, dtype=torch.float64) >= before[2]):
             W, H, steps = before[0], before[1], before[3]           # restore the saved W, H, and step count

@@ -77,7 +77,8 @@ def _to_transmission(data, dataset_type):
 
 
 def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_basis=None, spectra="mle", dose=None,
-              penalty="auto", max_steps=1000, rel_tol=1e-8, max_rank=6, device=None,
+              penalty="auto", max_steps=1000, rel_tol=1e-8, quick=False, init=None, fix_spectra=False, max_rank=6,
+              device=None,
               compile_mode="auto", mode="auto", chunk_pixels=None, max_passes=5, sample_mask=None, check_mask=False,
               verbose=1, **kwargs):
     """This function factors the attenuation of a hyperspectral dataset as X = W H by maximum
@@ -94,7 +95,8 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
         dataset_type (str, optional): 'attenuation' or 'transmission'. Defaults to 'attenuation'.
         num_materials (int, optional): The rank :math:`N_m`.  Defaults to None, in which case
             this function estimates the rank.
-        subspace_basis (numpy.ndarray or torch.Tensor, optional): Spectra of shape
+        subspace_basis (numpy.ndarray or torch.Tensor, optional): This argument is deprecated.
+            Use init=(None, H) and fix_spectra=True instead.  Spectra of shape
             :math:`(N_m, N_k)`.  When it is given, this function holds the spectra fixed and
             computes only the maps.  Defaults to None.
         spectra (str, optional): The method for estimating the spectra.  'mle' gives the
@@ -108,6 +110,22 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
         max_steps (int, optional): The maximum number of solver iterations.  Defaults to 1000.
         rel_tol (float, optional): The solver stops when the relative change in the loss falls
             below this value.  Defaults to 1e-8.
+        quick (bool, optional): If True, the solver also stops when its next step is small
+            compared with the noise in the data.  This is often several times faster at high
+            counts, and the result is usually within a few tenths of a dB of the full solve.  At
+            low counts the maps can stop short, and this function then warns.  To refine a quick
+            result, call this function again with ``init`` and quick=False.  Defaults to False.
+        init (tuple, optional): Starting factors (W, H), for example the first two outputs of
+            an earlier call on the same data.  Either factor may be None.  W has the leading axes
+            of the data, or one axis of pixels, followed by an axis of length :math:`N_m`.  H has
+            shape :math:`(N_m, N_k)`.  The solve continues from these factors, and the rank comes
+            from them.  When the data are streamed, a given H replaces the first fit on a subset
+            of the pixels.  Defaults to None.
+        fix_spectra (bool, optional): If True, this function holds the spectra H of ``init``
+            fixed and computes only the maps.  For example, a large scan can then be dehydrated
+            piece by piece against spectra fitted on part of it.  It needs ``init`` with H, and
+            ``spectra`` must be 'mle'.  The quick stop does not apply, because the maps of each
+            pixel are solved separately.  Defaults to False.
         max_rank (int, optional): The largest rank that the rank estimate considers.  Defaults
             to 6.
         device (str, optional): The torch device.  Defaults to None, which uses CUDA when it is
@@ -155,13 +173,24 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
     T = T_all if mask is None else np.ascontiguousarray(T_all[mask])
     pixels = f"{T.shape[0]}" if mask is None else f"{T.shape[0]} of {T_all.shape[0]} (sample_mask)"
     if subspace_basis is not None:
+        warnings.warn("subspace_basis is deprecated and will be removed in a future release; use init=(None, H) "
+                      "and fix_spectra=True.", DeprecationWarning, stacklevel=2)
+        if init is not None:
+            raise ValueError("init and subspace_basis cannot both be given")
+        init, fix_spectra = (None, _check_basis(subspace_basis, shape[-1], num_materials, spectra)), True
+    if init is not None:
+        init, num_materials = _check_init(init, T_all.shape[0], shape[-1], num_materials, mask)
+    if fix_spectra:
+        if init is None or init[1] is None:
+            raise ValueError("fix_spectra=True needs the spectra: give init=(None, H) or init=(W, H)")
+        if spectra != "mle":
+            raise ValueError(f"spectra={spectra!r} re-estimates the spectra, which fix_spectra=True holds fixed")
         from ._fit import _fit_fixed_basis
-        H = _check_basis(subspace_basis, shape[-1], num_materials, spectra)
-        W, H, rep = _fit_fixed_basis(T, H, device=device, mode=mode, chunk_pixels=chunk_pixels, max_steps=max_steps,
-                                     rel_tol=rel_tol, compile_mode=compile_mode)
+        W, H, rep = _fit_fixed_basis(T, init[1], device=device, mode=mode, chunk_pixels=chunk_pixels,
+                                     max_steps=max_steps, rel_tol=rel_tol, compile_mode=compile_mode, W_init=init[0])
         if verbose >= 1:
             print("dehydrate(): ")
-            print("   -Spectral dimension: ", shape[-1], " -> rank: ", H.shape[0], "(the given subspace_basis)")
+            print("   -Spectral dimension: ", shape[-1], " -> rank: ", H.shape[0], "(the given spectra, held fixed)")
             print("   -Pixels: ", pixels, f"; maps for the given basis ({rep['chunks']} chunk(s))")
     else:
         note = f"rank {num_materials} given"
@@ -170,9 +199,11 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
                                                     max_rank=max_rank, verbose=max(0, verbose - 1))
         W, H, rep = _fit(T, int(num_materials), spectra=spectra, dose=dose, penalty=penalty, device=device, mode=mode,
                          chunk_pixels=chunk_pixels, max_steps=max_steps, rel_tol=rel_tol, max_passes=int(max_passes),
-                         compile_mode=compile_mode)
+                         compile_mode=compile_mode, init=init, quick=bool(quick))
         if verbose >= 1:
             solve = f"{rep['steps']} steps" if "steps" in rep else f"streamed, {rep['passes']} polish passes"
+            if rep.get("quick_stop"):
+                solve += ", quick stop"
             print("dehydrate(): ")
             print("   -Spectral dimension: ", shape[-1], " -> rank: ", int(num_materials), f"({note})")
             print("   -Pixels: ", pixels, f"; spectra: {spectra} ({solve})")
@@ -184,6 +215,36 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
         W_all[mask] = W
         W = W_all
     return [W.reshape(*lead, H.shape[0]), H, dataset_type]
+
+
+def _check_init(init, pixels, bins, num_materials, mask):
+    """This function checks the starting factors (W, H) of ``dehydrate``.  Either factor may be
+    None.  It returns the factors as float32 numpy arrays, with W restricted to the pixels in
+    ``mask``, and the rank."""
+    try:
+        W, H = init
+    except (TypeError, ValueError):
+        raise ValueError("init must be a pair (W, H)") from None
+    if W is None and H is None:
+        raise ValueError("init must give W, H, or both")
+    W = None if W is None else np.asarray(_to_host(W), dtype=np.float32)
+    H = None if H is None else np.asarray(_to_host(H), dtype=np.float32)
+    if H is not None and (H.ndim != 2 or H.shape[1] != bins):
+        raise ValueError(f"init H must have shape (num_materials, {bins}), got {H.shape}")
+    rank = H.shape[0] if H is not None else W.shape[-1]
+    if num_materials is not None and int(num_materials) != rank:
+        raise ValueError(f"num_materials is {num_materials}, but init has {rank} components")
+    if W is not None:
+        if W.shape[-1] != rank or W.size != pixels * rank:
+            raise ValueError(f"init W must hold {pixels} pixels of {rank} components, got shape {W.shape}")
+        W = W.reshape(pixels, rank)
+        if mask is not None:
+            W = W[mask]
+        W = np.ascontiguousarray(W)
+    for f in (W, H):
+        if f is not None and ((f < 0).any() or not np.isfinite(f).all()):
+            raise ValueError("init W and H must be finite and nonnegative")
+    return (W, None if H is None else np.ascontiguousarray(H)), rank
 
 
 def _sample_mask(sample_mask, lead):
