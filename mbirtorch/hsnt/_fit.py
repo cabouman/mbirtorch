@@ -25,6 +25,9 @@ _FIXED_BYTES = 2**29
 # Otherwise, it sizes the streamed chunks and the warm-up fit to use 0.6 of the available memory.
 _FULL_SHARE, _STREAM_SHARE = 0.8, 0.6
 _MIN_WARMUP_PIXELS = 4096
+# With the quick stop, the fit warns when the effective dose (counts per pixel and bin) is below this value.  At such
+# low counts the quick stop can end before the maps have converged.
+_QUICK_LOW_DOSE = 10.0
 SPECTRA = ("mle", "unconstrained", "support")
 
 
@@ -136,10 +139,10 @@ def _report_zero_counts(rep, W, H, T, device, chunk):
 
 
 def _fit_fixed_basis(T, H, device="cpu", mode="auto", chunk_pixels=None, max_steps=1000, rel_tol=1e-8,
-                     compile_mode="auto", report=None):
+                     compile_mode="auto", report=None, W_init=None):
     """This function computes the maps W >= 0 for a fixed basis H.  It uses block Newton steps on
-    chunks of pixels.  It returns (W, H, report), and it fills ``report`` in the same way as
-    :func:`_fit`."""
+    chunks of pixels, starting from ``W_init`` when it is given.  It returns (W, H, report), and it
+    fills ``report`` in the same way as :func:`_fit`."""
     from ._newton import _resolve_compile, solve_W
     P, K = T.shape
     Hd = torch.as_tensor(np.ascontiguousarray(H, dtype=np.float32), device=device)
@@ -155,7 +158,8 @@ def _fit_fixed_basis(T, H, device="cpu", mode="auto", chunk_pixels=None, max_ste
     parts = []
     for i in range(0, P, chunk):
         Tc = torch.from_numpy(T[i:i + chunk]).to(device)
-        parts.append(solve_W(Tc, Hd, max_steps=max_steps, rel_tol=rel_tol,
+        W0 = None if W_init is None else torch.from_numpy(W_init[i:i + chunk]).to(device)
+        parts.append(solve_W(Tc, Hd, W_init=W0, max_steps=max_steps, rel_tol=rel_tol,
                              compile_mode=_resolve_compile(compile_mode, Tc)).cpu())
         del Tc
     W = torch.cat(parts)
@@ -174,7 +178,7 @@ def _fit_fixed_basis(T, H, device="cpu", mode="auto", chunk_pixels=None, max_ste
 
 def _fit(T, rank, spectra="mle", dose=None, penalty="auto", wald_screen=0.0, device="cpu",
          mode="auto", chunk_pixels=None, max_steps=1000, rel_tol=1e-8, max_passes=5, warmup_pixels=16384,
-         compile_mode="auto", report=None):
+         compile_mode="auto", report=None, init=None, quick=False):
     """This function fits the transmission T at the given rank.  T is a float32 numpy array with
     shape (pixels, bins).  The function returns (W, H, report).  W and H are the numpy factors,
     and ``report`` is a dict that describes what the fit did.
@@ -182,7 +186,9 @@ def _fit(T, rank, spectra="mle", dose=None, penalty="auto", wald_screen=0.0, dev
     The argument ``spectra`` is 'mle', 'unconstrained', or 'support'.  The value 'support' needs
     the dose.  The argument ``penalty`` is the penalty per component of the support selection.
     It is either 'auto' or a multiple of log K.  The function fills ``report`` in place.  As a
-    result, the caller has the memory plan even when the solve fails.
+    result, the caller has the memory plan even when the solve fails.  The argument ``init`` is a
+    pair (W, H) of numpy starting factors, either of which may be None.  The argument ``quick``
+    selects the quick stop.
     """
     from ._streaming import _stream_factorization
     from .factorization import _nnal_factorization
@@ -204,24 +210,34 @@ def _fit(T, rank, spectra="mle", dose=None, penalty="auto", wald_screen=0.0, dev
     stats = {}
     if mode == "full":
         Td = torch.from_numpy(T).to(device)
-        W, H, steps = _nnal_factorization(Td, rank, max_steps=max_steps, rel_tol=rel_tol, compile_mode=compile_mode)
+        W0, H0 = [None if f is None else torch.from_numpy(f).to(device) for f in (init or (None, None))]
+        W, H, steps = _nnal_factorization(Td, rank, max_steps=max_steps, rel_tol=rel_tol, compile_mode=compile_mode,
+                                          W_init=W0, H_init=H0, quick=quick, stats=stats)
         rep["steps"] = int(steps)
     else:
         chunks = [torch.from_numpy(T[i:i + chunk]) for i in range(0, P, chunk)]
         support = (dict(dose=dose, penalty=penalty, wald_screen=wald_screen)
                    if spectra == "support" else None)
+        W0, H0 = [None if f is None else torch.from_numpy(f) for f in (init or (None, None))]
         W_chunks, H, passes = _stream_factorization(chunks, rank, max_passes=max_passes, rel_tol=rel_tol,
                                                     warmup_pixels=warmup, device=device,
                                                     verbose=int(log.isEnabledFor(logging.DEBUG)), stats=stats,
                                                     nonneg_W=(spectra != "unconstrained"), support_selection=support,
                                                     compile_mode="on" if compile_mode == "on" else "off",
-                                                    chunk_sizes=[c.shape[0] for c in chunks])
+                                                    chunk_sizes=[c.shape[0] for c in chunks], W_init=W0, H_init=H0,
+                                                    quick=quick)
         W = torch.cat(W_chunks)
         rep.update(passes=int(passes), loss_per_pass=stats.get("loss"), kkt_per_pass=stats.get("kkt"))
         Td = None
     if device.startswith("cuda"):
         torch.cuda.synchronize(device)
     rep["solve_seconds"] = round(time.perf_counter() - t0, 2)
+    if quick:
+        rep.update(quick_stop=bool(stats.get("quick_stop", False)), effective_dose=stats.get("effective_dose"))
+        if rep["effective_dose"] is not None and rep["effective_dose"] < _QUICK_LOW_DOSE:
+            log.warning("the quick stop was used at %.3g counts per pixel and bin.  At such low counts it can stop "
+                        "before the maps have converged.  For more precision, refine the result: call dehydrate "
+                        "again with init=(W, H) and quick=False.", rep["effective_dose"])
     if mode == "full":
         rep["loss_mle"] = _loss(W, H, T, device)
     # Otherwise, the loss of the last pass is at the final W and H.  With unconstrained W, this

@@ -41,7 +41,7 @@ _W_REL_TOL, _W_MAX_STEPS, _LS_TRIALS = 1e-8, 300, 4
 
 def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warmup_pixels=16384, device=None,
                           compile_mode='off', verbose=0, stats=None, nonneg_W=True, support_selection=None,
-                          chunk_sizes=None):
+                          chunk_sizes=None, W_init=None, H_init=None, quick=False):
     """This function factorizes a dataset that is too large for device memory.
 
     The function processes the data one chunk of pixels at a time.  It first fits H by a joint
@@ -77,6 +77,18 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
         chunk_sizes (sequence of int, optional): The number of pixels in each chunk.  With this
             argument, the function does not need to load a chunk to find its size.
             Defaults to None.
+        W_init (torch.Tensor, optional): Starting maps for all pixels, with shape (pixels, R), on
+            the CPU.  Defaults to None.
+        H_init (torch.Tensor, optional): Starting spectra, with shape (R, bins).  When it is
+            given, the function skips the fit on the subset and starts the passes from it.
+            When only ``W_init`` is given, the fit on the subset starts from the subset's rows of
+            ``W_init``.  Defaults to None.
+        quick (bool, optional): If True, the fit on the subset uses the quick stop of the
+            in-memory solver, and the passes also stop after _newton._QUICK_PATIENCE passes in
+            a row whose change is below _newton._QUICK_TOL in units of the noise.  The change
+            is measured over all parameters and over the spectra alone.  The function then
+            sets stats['quick_stop'] to True, and it records stats['effective_dose'].
+            Defaults to False.
 
     Returns:
         (W_chunks, H, passes): W_chunks is a list of CPU tensors, one for each chunk.  H is the
@@ -97,9 +109,16 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
         local = picks[(picks >= offsets[i]) & (picks < offsets[i + 1])] - offsets[i]
         if local.size:
             parts.append(c[torch.from_numpy(local).to(c.device)])
-    T_sub = torch.cat(parts, 0).to(device)
-    _, H, _ = _nnal_factorization(T_sub, R, max_steps=300, rel_tol=1e-6, compile_mode=compile_mode)
-    del T_sub
+    if W_init is not None:
+        W_chunks = [W_init[offsets[i]:offsets[i + 1]].clone() for i in range(len(chunks))]
+    if H_init is not None:
+        H = H_init.to(device)
+    else:
+        T_sub = torch.cat(parts, 0).to(device)
+        W_sub = None if W_init is None else W_init[torch.from_numpy(picks)].to(device=device, dtype=T_sub.dtype)
+        _, H, _ = _nnal_factorization(T_sub, R, max_steps=300, rel_tol=1e-6, compile_mode=compile_mode, W_init=W_sub,
+                                      quick=quick)
+        del T_sub, W_sub
     rows, cols = torch.triu_indices(R, R, device=H.device)
     pin = torch.device(device).type == 'cuda'
 
@@ -120,7 +139,12 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
         prev_loss = None
         passes = 0
         last = None                                   # (W_chunks, H) from the last finite pass.
+        quick_quiet = 0
+        q_H_step = None                               # The last step on H, in counts (sum of F dX^2 / dose).
         for p in range(passes_max + 1):
+            pearson = q_W = torch.zeros((), dtype=torch.float64, device=H.device)
+            n_entries = 0
+            changed = True                            # False when every chunk has a W from the last pass.
             # The first loop over the chunks solves for W with H fixed.  It also sums the
             # gradient and Hessian of H over the chunks in float64.
             grad = torch.zeros(H.shape, dtype=torch.float64, device=H.device)
@@ -137,6 +161,19 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
                 W0 = W_chunks[i].to(device=device, dtype=H.dtype) if W_chunks[i] is not None else None
                 W = solve_chunk(Tc, W0, i)
                 W_chunks[i] = W.cpu()
+                if quick:
+                    # The Pearson residual gives the effective dose, and the change of W since the
+                    # last pass is measured in the same units as the joint solve's quick stop.
+                    E = torch.exp(-(W @ H))
+                    pearson = pearson + ((Tc - E) ** 2 / E.clamp_min(torch.finfo(E.dtype).tiny)).sum(dtype=torch.float64)
+                    n_entries += Tc.numel()
+                    if W0 is None:
+                        changed = False
+                    else:
+                        dX = (W - W0) @ H
+                        q_W = q_W + (E * dX).mul_(dX).sum(dtype=torch.float64)
+                        del dX
+                    del E
                 g_c, f_c, b_c = _h_stats_accumulate(W, H, Tc, prep, rows, cols, deriv, rowwise)
                 grad += g_c
                 flat += f_c
@@ -167,6 +204,19 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
                 print(f'  pass {p}{tag}: full-data loss {loss.item():.6e}  KKT residual {kkt:.2e}', flush=True)
             if prev_loss is not None and rel_tol > 0 and bool(torch.abs(loss - prev_loss) <= rel_tol * torch.abs(loss)):
                 break
+            if quick:
+                dose = n_entries / max(pearson.item(), np.finfo(np.float64).tiny)
+                P_all, K = int(offsets[-1]), H.shape[1]
+                if stats is not None:
+                    stats['effective_dose'] = dose
+                if changed and q_H_step is not None:
+                    u_H = np.sqrt(dose * q_H_step / (R * K))
+                    u_all = np.sqrt(dose * (q_W.item() + q_H_step) / (R * (P_all + K - R)))
+                    quick_quiet = quick_quiet + 1 if max(u_H, u_all) < _newton._QUICK_TOL else 0
+                if quick_quiet >= _newton._QUICK_PATIENCE:
+                    if stats is not None:
+                        stats['quick_stop' + tag] = True
+                    break
             if p == passes_max:
                 if prev_loss is not None and rel_tol > 0:
                     change = abs(loss.item() - prev_loss.item()) / max(abs(loss.item()), np.finfo(np.float64).tiny)
@@ -193,6 +243,7 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
             # The second loop over the chunks sums the loss of each bin at every trial step.
             trial = torch.zeros(_LS_TRIALS, H.shape[1], dtype=torch.float64, device=H.device)
             trial_snap = torch.zeros_like(trial) if with_snap else None
+            q_bin = torch.zeros(H.shape[1], dtype=torch.float64, device=H.device) if quick else None
             nxt = to_device(chunks[0])
             for i in range(len(chunks)):
                 Tc = nxt
@@ -203,6 +254,8 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
                 X = W @ H
                 B = W @ d.T
                 Bs = W @ snap.T if with_snap else None
+                if quick:
+                    q_bin += (torch.exp(-X) * B).mul_(B).sum(0, dtype=torch.float64)
                 for t in range(_LS_TRIALS):
                     Xt = X - alphas[t][None, :] * B
                     trial[t] += rowwise(Xt, Tc, prep, 0, dtype=torch.float64)
@@ -227,6 +280,8 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
                 keep = ok.any(0) & (trial_snap.gather(0, first).squeeze(0) <= chosen + noise)
                 Ht = torch.where(keep[:, None] & (snap > 0), torch.zeros_like(Ht), Ht)
             H = Ht.T.contiguous()
+            if quick:
+                q_H_step = float((accepted.double() ** 2 * q_bin).sum())
             passes = p + 1
         return passes
 

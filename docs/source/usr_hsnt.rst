@@ -32,8 +32,12 @@ The dehydrated form ``[maps, spectra, dataset_type]`` is small: the maps have on
 the spectra one per component and bin.  ``rehydrate`` returns the same quantity as the input, transmission or
 attenuation.  When the number of components is not given, it is estimated by likelihood-ratio tests.  The components
 span the materials' spectra but need not be the materials themselves.  Data too large for the device are fitted by
-chunks of pixels.  Given a ``subspace_basis``, ``dehydrate`` fits only the maps, so a large scan can be dehydrated
-piece by piece against spectra fitted on part of it.  Given a ``sample_mask``, ``dehydrate`` fits only the pixels
+chunks of pixels.  With ``quick=True``, the solver stops once its steps are small compared with the noise, which is
+often several times faster; at low counts it warns, and the result can be refined by a second call with
+``init=(maps, spectra)``.  Given ``init``, ``dehydrate`` starts from earlier factors, either of which may be ``None``.
+With ``fix_spectra=True`` as well, ``dehydrate`` holds the spectra of ``init`` fixed and fits only the maps, so a large
+scan can be dehydrated piece by piece against spectra fitted on part of it.  ``subspace_basis`` is deprecated: use
+``init=(None, spectra)`` and ``fix_spectra=True``.  Given a ``sample_mask``, ``dehydrate`` fits only the pixels
 inside the mask and sets the maps to zero outside it.  With ``check_mask=True``, it warns when the pixels outside hold
 more attenuation than noise explains.
 
