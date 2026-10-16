@@ -19,7 +19,7 @@ def _initial_factors(T, num_materials):
 
 
 def _nnal_factorization(T, num_materials, max_steps=1000, rel_tol=1e-8, compile_mode='auto', W_init=None,
-                        H_init=None):
+                        H_init=None, quick=False, stats=None):
     """This function factorizes the transmission ratio as T ~= exp(-W @ H) with W, H >= 0.
 
     The function minimizes the non-negative attenuation loss.  This loss equals the Poisson
@@ -40,6 +40,10 @@ def _nnal_factorization(T, num_materials, max_steps=1000, rel_tol=1e-8, compile_
         W_init, H_init (torch.Tensor, optional): The starting factors.  If only one factor is
             given, the function fits the other one by non-negative least squares.  If neither is
             given, the function uses an NNDSVDa start.  Defaults to None.
+        quick (bool, optional): If True, the solver also stops when its step is small compared
+            with the noise (see ``_newton._joint_newton_pcg``).  Defaults to False.
+        stats (dict, optional): If given, the solver records the effective dose and whether the
+            quick stop ended the solve.  Defaults to None.
 
     Returns:
         (W, H, steps): W has shape (pixels, num_materials), and H has shape (num_materials,
@@ -56,7 +60,7 @@ def _nnal_factorization(T, num_materials, max_steps=1000, rel_tol=1e-8, compile_
     elif H_init is None:
         H_init = _nonneg_least_squares_start(_attenuation_for_start(T).T, W_init.T).T
     return joint_newton_optimize(T, num_materials, max_steps, rel_tol, W_init=W_init, H_init=H_init,
-                                 compile_mode=compile_mode)
+                                 compile_mode=compile_mode, quick=quick, stats=stats)
 
 
 # A zero-count entry whose attenuation is at least this fraction of _newton._X_MAX is treated as
