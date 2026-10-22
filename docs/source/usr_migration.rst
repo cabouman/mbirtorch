@@ -94,7 +94,7 @@ memory, as ``batch_size`` did, and ``verbose=2`` prints the rank search rather t
 them for data of up to 2**27 entries); leave out ``num_materials`` then, since the rank is the
 basis's number of rows.  ``generate_hyper_data`` returns the Poisson counts and the open beam
 (noiseless, ``dosage_rate`` everywhere) rather than an attenuation: divide the counts by the open
-beam and pass the result to ``dehydrate`` with ``dataset_type='transmission'``, as measured counts
+beam and pass the result to ``dehydrate`` with ``dataset_input_type='transmission'``, as measured counts
 are normalized by their open beam.  A seed therefore gives different data, and ``noisy=False``
 (keyword only) returns the noiseless counts.  Its ``material_density`` is a volume fraction that
 scales a rounded bar about 10 thick at its center, not a thickness, so the MBIRJAX 0.6.11 to

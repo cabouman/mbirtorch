@@ -72,7 +72,7 @@ def _to_transmission(data, dataset_type):
     return np.ascontiguousarray(T, dtype=np.float32), shape
 
 
-def dehydrate(data, dataset_type="transmission", num_materials=None, *, spectra=None,
+def dehydrate(data, dataset_input_type="transmission", num_materials=None, *, spectra=None,
               max_steps=1000, rel_tol=1e-8, max_num_est_materials=6, device=None,
               mode="auto", max_passes=5, sample_mask=None,
               verbose=1, **kwargs):
@@ -95,7 +95,7 @@ def dehydrate(data, dataset_type="transmission", num_materials=None, *, spectra=
             the last axis and the pixels on the other axes, for example (views, rows, cols).
             A NaN or infinite transmission counts as zero counts.  A negative transmission is
             clipped to zero.
-        dataset_type (str, optional): 'attenuation' or 'transmission'.  Defaults to
+        dataset_input_type (str, optional): 'attenuation' or 'transmission'.  Defaults to
             'transmission'.
         num_materials (int, optional): The number of spectra :math:`N_m`.  Defaults to None,
             which estimates it from the data.
@@ -132,7 +132,7 @@ def dehydrate(data, dataset_type="transmission", num_materials=None, *, spectra=
         raise ValueError(f"mode must be 'auto', 'full' or 'stream', got {mode!r}")
     if int(max_passes) < 0:
         raise ValueError(f"max_passes must be at least 0, got {max_passes}")
-    T_all, shape = _to_transmission(data, dataset_type)
+    T_all, shape = _to_transmission(data, dataset_input_type)
     device = _default_device(device)
     lead = shape[:-1]
     mask = _sample_mask(sample_mask, lead)
@@ -214,11 +214,11 @@ def hyper_denoise(data, dataset_type="attenuation", num_materials=None, **kwargs
         numpy.ndarray: The denoised float32 data, with the shape and dataset_type of the input.
     """
     _reject_unknown_keywords("hyper_denoise", {k: v for k, v in kwargs.items() if k in _L2_KEYWORDS})
-    return rehydrate(dehydrate(data, dataset_type=dataset_type, num_materials=num_materials, **kwargs),
-                     dataset_type=dataset_type)
+    return rehydrate(dehydrate(data, dataset_input_type=dataset_type, num_materials=num_materials, **kwargs),
+                     dataset_output_type=dataset_type)
 
 
-def rehydrate(dehydrated, dataset_type="attenuation", hyperspectral_idx=None):
+def rehydrate(dehydrated, dataset_output_type="attenuation", hyperspectral_idx=None):
     """This function restores hyperspectral data from the output of ``dehydrate``.  It multiplies
     the maps by the spectra, for all bins or for selected bins.  The spectral axis of the
     returned data is always the last axis.  The method is described in
@@ -229,7 +229,7 @@ def rehydrate(dehydrated, dataset_type="attenuation", hyperspectral_idx=None):
         dehydrated: The list [maps, spectra] that ``dehydrate`` returns.  maps holds ``W``,
             with the materials on the last axis.  spectra holds ``H``,
             with shape :math:`(N_m, N_k)`.
-        dataset_type (str, optional): The quantity to return.  'attenuation' returns ``W H``.
+        dataset_output_type (str, optional): The quantity to return.  'attenuation' returns ``W H``.
             'transmission' returns ``exp(-W H)``.  Defaults to 'attenuation'.
         hyperspectral_idx: The indices of the bins to restore.  Defaults to None, which
             restores all bins.
@@ -238,8 +238,8 @@ def rehydrate(dehydrated, dataset_type="attenuation", hyperspectral_idx=None):
         numpy.ndarray: The restored data.  Its last axis holds the bins, and its other axes match
             maps.
     """
-    if dataset_type not in ("attenuation", "transmission"):
-        raise ValueError("'dataset_type' must be either 'attenuation' or 'transmission'.")
+    if dataset_output_type not in ("attenuation", "transmission"):
+        raise ValueError("'dataset_output_type' must be either 'attenuation' or 'transmission'.")
     maps, spectra = dehydrated[0], dehydrated[1]
 
     if hyperspectral_idx is None:
@@ -247,7 +247,7 @@ def rehydrate(dehydrated, dataset_type="attenuation", hyperspectral_idx=None):
     else:
         rehydrated_data = maps @ spectra[:, hyperspectral_idx]
 
-    if dataset_type == 'transmission':
+    if dataset_output_type == 'transmission':
         rehydrated_data = np.exp(-rehydrated_data)
 
     return rehydrated_data

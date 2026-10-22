@@ -33,7 +33,7 @@ print(f'hyperspectral sinogram: {counts.shape} (views, rows, channels, wavelengt
 # transmission.  The components span the materials' spectra but need not be
 # the materials themselves.
 transmission = counts / open_beam
-maps, spectra = hsnt.dehydrate(transmission, dataset_type='transmission', num_materials=3, verbose=0)
+maps, spectra = hsnt.dehydrate(transmission, dataset_input_type='transmission', num_materials=3, verbose=0)
 print(f'dehydrated to component sinograms {maps.shape} and spectra {spectra.shape}')
 
 # Reconstruct each component's sinogram as an ordinary scan.

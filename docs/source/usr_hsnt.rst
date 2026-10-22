@@ -27,13 +27,13 @@ counts divided by the open beam.  A zero count is simply a zero transmission:
 .. code-block:: python
 
    transmission = counts / open_beam                       # normalize by the detector calibration
-   maps, spectra = hsnt.dehydrate(transmission, dataset_type='transmission')
-   denoised = hsnt.rehydrate([maps, spectra], dataset_type='transmission')
+   maps, spectra = hsnt.dehydrate(transmission, dataset_input_type='transmission')
+   denoised = hsnt.rehydrate([maps, spectra], dataset_output_type='transmission')
 
 The output ``[maps, spectra]`` takes far less memory than the data.  The data hold one value per pixel and
 bin.  The maps hold one value per pixel and material, and the spectra hold one value per material and bin.
 With a few materials and hundreds of bins, that is a reduction of about a hundred times.  The maps and spectra
-always describe attenuation.  ``rehydrate`` returns attenuation or transmission, as its ``dataset_type`` says.
+always describe attenuation.  ``rehydrate`` returns attenuation or transmission, as its ``dataset_output_type`` says.
 
 A few more facts about ``dehydrate``:
 

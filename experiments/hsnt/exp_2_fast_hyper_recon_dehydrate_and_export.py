@@ -64,7 +64,7 @@ def main():
     ct_model.set_params(snr_db=recon_snr_db, verbose=0)
 
     # Perform dehydration
-    maps, spectra = hsnt.dehydrate(transmission, dataset_type='transmission', num_materials=num_materials,
+    maps, spectra = hsnt.dehydrate(transmission, dataset_input_type='transmission', num_materials=num_materials,
                                    verbose=verbose)
 
     # Reconstruct the map of each material
