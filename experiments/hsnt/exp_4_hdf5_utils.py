@@ -31,12 +31,10 @@ def main():
 
     # 3. Export the dehydrated and the hyperspectral data to separate files
     filename_dehydrated = os.path.join(output_path, "hsnt_dehydrated.h5")
-    hsnt.export_hsnt_data_hdf5(filename_dehydrated, [maps, spectra], name="hsnt_dehydrated",
-                               angles=np.array([0, 45, 90]))
+    hsnt.export_hsnt_data_hdf5(filename_dehydrated, [maps, spectra], name="hsnt_dehydrated")
 
     filename_hyperspectral = os.path.join(output_path, "hsnt_hyperspectral.h5")
-    hsnt.export_hsnt_data_hdf5(filename_hyperspectral, hyperspectral, "attenuation", name="hsnt_hyperspectral",
-                               angles=np.array([0, 45, 90]))
+    hsnt.export_hsnt_data_hdf5(filename_hyperspectral, hyperspectral, "attenuation", name="hsnt_hyperspectral")
 
     # 4. Import both files back
     dehydrated_imported, metadata_dehydrated = hsnt.import_hsnt_data_hdf5(filename_dehydrated)

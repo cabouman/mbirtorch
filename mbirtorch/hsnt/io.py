@@ -3,13 +3,13 @@
 A file holds either hyperspectral data or dehydrated data.  The root of the file carries these
 attributes: ``format`` ("mbirtorch-hsnt"), ``format_version`` (1), ``mbirtorch_version``,
 ``written`` (the date and time), ``kind`` ("hyperspectral" or "dehydrated"), ``dataset_type``
-("attenuation" or "transmission", hyperspectral only), ``name`` (optional), and ``model`` (optional,
-the parameters of the tomography model as JSON, from which ``mbirtorch.build_model`` rebuilds the
-model).  A hyperspectral
+("attenuation" or "transmission", hyperspectral only), ``domain`` ("sinogram" or "recon"), ``name``
+(optional), and ``model`` (optional, the parameters of the tomography model as JSON, from which
+``mbirtorch.build_model`` rebuilds the model).  A hyperspectral
 file holds the float32 dataset ``data`` with the spectral axis last.  A dehydrated file holds the
 float32 datasets ``maps``, with the materials on the last axis, and ``spectra``, with shape
-(materials, bins).  Either file may hold the datasets ``wavelengths``, in angstroms, and
-``angles``, in degrees.  Each of these two carries a ``units`` attribute.
+(materials, bins).  Either file may hold the dataset ``wavelengths``, in angstroms, which carries a
+``units`` attribute.
 """
 import datetime
 import json
@@ -20,11 +20,12 @@ import numpy as np
 FORMAT = "mbirtorch-hsnt"
 FORMAT_VERSION = 1
 DATASET_TYPES = ("attenuation", "transmission")
+DOMAINS = ("sinogram", "recon")
 # These are the units of the optional arrays.  The reader refuses any other unit.
-UNITS = {"wavelengths": "angstrom", "angles": "degree"}
+UNITS = {"wavelengths": "angstrom"}
 
 
-def export_hsnt_data_hdf5(filename, data, dataset_type=None, *, name=None, wavelengths=None, angles=None,
+def export_hsnt_data_hdf5(filename, data, dataset_type=None, *, domain="sinogram", name=None, wavelengths=None,
                           model=None):
     """This function writes hyperspectral data or dehydrated data to an hsnt HDF5 file.
     The spectral axis of hyperspectral data is always the last axis.
@@ -35,11 +36,14 @@ def export_hsnt_data_hdf5(filename, data, dataset_type=None, *, name=None, wavel
             or dehydrated data as the list ``[maps, spectra]`` that ``dehydrate`` returns.
         dataset_type (str, optional): 'attenuation' or 'transmission'.  Required for
             hyperspectral data.  Not allowed for dehydrated data, which is always attenuation.
+        domain (str, optional): 'sinogram' when the pixel axes are (views, rows, cols), or
+            'recon' when they are the axes of a reconstructed volume.  Defaults to 'sinogram'.
         name (str, optional): A name for the dataset.  Defaults to None.
         wavelengths (array, optional): The wavelength of each bin, in angstroms.  Defaults to None.
-        angles (array, optional): The view angle of each view, in degrees.  Defaults to None.
         model (TomographyModel, optional): The model of the scan.  Its parameters are stored,
-            and ``import_hsnt_data_hdf5`` rebuilds the model from them.  Defaults to None.
+            and ``import_hsnt_data_hdf5`` rebuilds the model from them.  When given, the pixel
+            axes of the data must match the model's sinogram shape or reconstruction shape, as
+            ``domain`` says.  Defaults to None.
     """
     from .. import __version__
     from ..utilities import _json_default
@@ -60,12 +64,22 @@ def export_hsnt_data_hdf5(filename, data, dataset_type=None, *, name=None, wavel
         if data.ndim < 2:
             raise ValueError(f"hyperspectral data needs at least two axes, with the bins last; got shape {data.shape}")
 
+    if domain not in DOMAINS:
+        raise ValueError(f"domain must be one of {DOMAINS}; got {domain!r}")
+    if model is not None:
+        pixel_axes = tuple((maps if dehydrated else data).shape[:-1])
+        expected = tuple(model.get_params("sinogram_shape" if domain == "sinogram" else "recon_shape"))
+        if pixel_axes != expected:
+            raise ValueError(f"the pixel axes of the data are {pixel_axes}, but the model's {domain} shape is "
+                             f"{expected}")
+
     with h5py.File(filename, "w") as f:
         f.attrs["format"] = FORMAT
         f.attrs["format_version"] = FORMAT_VERSION
         f.attrs["mbirtorch_version"] = __version__
         f.attrs["written"] = datetime.datetime.now().isoformat(timespec="seconds")
         f.attrs["kind"] = "dehydrated" if dehydrated else "hyperspectral"
+        f.attrs["domain"] = domain
         if dehydrated:
             f.create_dataset("maps", data=maps)
             f.create_dataset("spectra", data=spectra)
@@ -76,7 +90,7 @@ def export_hsnt_data_hdf5(filename, data, dataset_type=None, *, name=None, wavel
             f.attrs["name"] = str(name)
         if model is not None:
             f.attrs["model"] = json.dumps(model.get_all_params(), default=_json_default)
-        for key, value in (("wavelengths", wavelengths), ("angles", angles)):
+        for key, value in (("wavelengths", wavelengths),):
             if value is not None:
                 d = f.create_dataset(key, data=np.asarray(value, dtype=np.float64))
                 d.attrs["units"] = UNITS[key]
@@ -92,8 +106,8 @@ def import_hsnt_data_hdf5(filename):
     Returns:
         list: The list ``[data, metadata]``.  For a hyperspectral file, ``data`` is the array.
             For a dehydrated file, ``data`` is the list ``[maps, spectra]``.  ``metadata`` is a
-            dict with the keys ``dataset_type`` (None for a dehydrated file), ``name``,
-            ``wavelengths``, ``angles``, ``model``, ``mbirtorch_version``, and ``written``.
+            dict with the keys ``dataset_type`` (None for a dehydrated file), ``domain``, ``name``,
+            ``wavelengths``, ``model``, ``mbirtorch_version``, and ``written``.
             ``model`` is the tomography model of the scan, rebuilt from the file.  A key that
             the file does not hold has the value None.
     """
@@ -113,7 +127,8 @@ def import_hsnt_data_hdf5(filename):
             data = f["data"][()]
         else:
             raise ValueError(f"{filename} has an unknown kind {kind!r}")
-        metadata = {key: f.attrs.get(key) for key in ("dataset_type", "name", "mbirtorch_version", "written")}
+        metadata = {key: f.attrs.get(key) for key in ("dataset_type", "domain", "name", "mbirtorch_version",
+                                                      "written")}
         for key, units in UNITS.items():
             metadata[key] = None
             if key in f:

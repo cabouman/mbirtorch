@@ -94,11 +94,14 @@ def test_the_hsnt_file_round_trips_both_kinds_and_the_model(tmp_path):
     hsnt.export_hsnt_data_hdf5(deh, [maps, spectra], name="t", wavelengths=np.arange(9) + 1.0, model=model)
     (maps2, spectra2), meta = hsnt.import_hsnt_data_hdf5(deh)
     assert np.array_equal(maps2, maps) and np.array_equal(spectra2, spectra) and meta["dataset_type"] is None
-    assert meta["name"] == "t" and np.array_equal(meta["wavelengths"], np.arange(9) + 1.0) and meta["angles"] is None
+    assert meta["name"] == "t" and meta["domain"] == "sinogram"
+    assert np.array_equal(meta["wavelengths"], np.arange(9) + 1.0)
     assert type(meta["model"]) is mt.ParallelBeamModel and np.allclose(meta["model"].get_params("angles"), angles)
     hsnt.export_hsnt_data_hdf5(hyp, maps @ spectra, "transmission")
     data, meta = hsnt.import_hsnt_data_hdf5(hyp)
     assert np.allclose(data, maps @ spectra) and meta["dataset_type"] == "transmission" and meta["model"] is None
+    with pytest.raises(ValueError, match="recon shape"):                 # the maps are not a volume of the model
+        hsnt.export_hsnt_data_hdf5(deh, [maps, spectra], domain="recon", model=model)
     with pytest.raises(ValueError, match="always attenuation"):
         hsnt.export_hsnt_data_hdf5(deh, [maps, spectra], "attenuation")
     with h5py.File(str(tmp_path / "old.h5"), "w") as f:

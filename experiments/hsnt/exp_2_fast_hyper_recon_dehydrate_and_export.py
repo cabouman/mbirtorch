@@ -77,7 +77,7 @@ def main():
 
     # Export dehydrated reconstructions into HDF5 file.
     filename = os.path.join(output_path, dataset_name + ".h5")
-    hsnt.export_hsnt_data_hdf5(filename, [map_recons, spectra], name=dataset_name, model=ct_model)
+    hsnt.export_hsnt_data_hdf5(filename, [map_recons, spectra], domain='recon', name=dataset_name, model=ct_model)
 
     print(f'Total time elapsed: {time.time() - start_time:.2f} seconds')
 
