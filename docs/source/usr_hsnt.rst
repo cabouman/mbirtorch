@@ -37,7 +37,6 @@ always describe attenuation.  ``rehydrate`` returns attenuation or transmission,
 
 A few more facts about ``dehydrate``:
 
-* If ``num_materials`` is not given, it is estimated by likelihood-ratio tests.
 * The fitted spectra span the materials' spectra, but they need not be the spectra of pure materials.
 * Data too large for the GPU are fitted in chunks of pixels.
 * Given a ``subspace_basis``, only the maps are fitted.  This is how a large scan is dehydrated piece by piece,
