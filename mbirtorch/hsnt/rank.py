@@ -96,6 +96,7 @@ def _subsample(T, n):
 
 def estimate_rank(data, dataset_type="attenuation", max_rank=6, device=None, pool="auto", verbose=0):
     """This function estimates the number of spectral components in a hyperspectral dataset.
+    The spectral axis of the data is always the last axis.
 
     The function fits the data with ranks 1 to ``max_rank`` in turn.  It keeps adding components
     while the gain in log-likelihood of each new component is well above the gain expected from

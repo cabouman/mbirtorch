@@ -5,10 +5,10 @@ Hyperspectral CT
 ================
 
 The ``hsnt`` module processes hyperspectral neutron transmission data: the transmission of every detector pixel in
-each of many wavelength bins.  A sample made of a few materials has a low-rank attenuation X = W H, with a
-nonnegative spectrum per component in H and a map per component in W.  The module estimates W and H from the data
-(dehydration), multiplies them back into denoised data (rehydration), estimates the number of components, and
-reads and writes the hsnt HDF5 layout.  The scripts in
+each of many wavelength bins.  The spectral axis of the data is always the last axis.  A sample made of a few
+materials has a low-rank attenuation X = W H, with a nonnegative spectrum per component in H and a map per
+component in W.  The module estimates W and H from the data (dehydration), multiplies them back into denoised data
+(rehydration), estimates the number of components, and reads and writes the hsnt HDF5 layout.  The scripts in
 `experiments/hsnt <https://github.com/cabouman/mbirtorch/blob/main/experiments/hsnt/>`__ are worked examples, and
 `Command line`_ runs the same steps on files.
 
@@ -25,13 +25,14 @@ and a zero count is simply a zero transmission:
 .. code-block:: python
 
    transmission = counts / open_beam                       # normalize by the detector calibration
-   maps, spectra, dataset_type = hsnt.dehydrate(transmission, dataset_type='transmission')
-   denoised = hsnt.rehydrate([maps, spectra, dataset_type])
+   maps, spectra = hsnt.dehydrate(transmission, dataset_type='transmission')
+   denoised = hsnt.rehydrate([maps, spectra], dataset_type='transmission')
 
-The dehydrated form ``[maps, spectra, dataset_type]`` is small: the maps have one entry per pixel and component, and
-the spectra one per component and bin.  ``rehydrate`` returns the same quantity as the input, transmission or
-attenuation.  When the number of components is not given, it is estimated by likelihood-ratio tests.  The components
-span the materials' spectra but need not be the materials themselves.  Data too large for the device are fitted by
+The dehydrated form ``[maps, spectra]`` is small: the maps have one entry per pixel and component, and
+the spectra one per component and bin.  The maps and spectra always describe attenuation, and
+``rehydrate`` returns attenuation or transmission, as its ``dataset_type`` says.  When the number of components is
+not given, it is estimated by likelihood-ratio tests.  The components span the materials' spectra but need not be
+the materials themselves.  Data too large for the device are fitted by
 chunks of pixels.  Given a ``subspace_basis``, ``dehydrate`` fits only the maps, so a large scan can be dehydrated
 piece by piece against spectra fitted on part of it.  Given a ``sample_mask``, ``dehydrate`` fits only the pixels
 inside the mask and sets the maps to zero outside it.  With ``check_mask=True``, it warns when the pixels outside hold

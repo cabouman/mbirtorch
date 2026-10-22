@@ -170,9 +170,8 @@ def _load_basis(path, ds):
     if not os.path.isfile(path):
         raise FileNotFoundError(f"--basis: file not found: {path}")
     with h5py.File(path, "r") as f:
-        if not all(k in f for k in ("subspace_data", "subspace_basis", "dataset_type")):
-            raise InputError(f"--basis {path}: not a dehydrated file (needs subspace_data, subspace_basis and "
-                             "dataset_type)")
+        if not all(k in f for k in ("subspace_data", "subspace_basis")):
+            raise InputError(f"--basis {path}: not a dehydrated file (needs subspace_data and subspace_basis)")
         H = f["subspace_basis"][()]
         has_bins = "bin_indices" in f
         bins = _file_source_bins(f, H.shape[-1]) if H.ndim == 2 else None
@@ -393,7 +392,7 @@ def _pipeline(args, denoise):
     W, H, rep = solve(ds, args, device)
     R, out_type, outputs = H.shape[0], _out_type(ds, args), []
     if not (denoise and args.no_dehydrated):          # the result is written before any diagnostic runs
-        outputs.append(write_dehydrated(base + "_dehydrated.h5", W.reshape(*ds.spatial_shape, R), H, out_type,
+        outputs.append(write_dehydrated(base + "_dehydrated.h5", W.reshape(*ds.spatial_shape, R), H,
                                         ds.bin_indices, _run_attrs(ds, rep, args, rank=R, loss=rep["loss_final"]),
                                         ds.metadata))
     rep["fit"] = fit_quality(ds.T, W, H, ds.dose, device, ds.dose_per_bin, ds.open_beam_observations)
@@ -436,9 +435,9 @@ def cmd_rehydrate(args):
         raise FileNotFoundError(f"input not found: {args.input}")
     data, meta = import_hsnt_data_hdf5(args.input)
     if not isinstance(data, list):
-        raise InputError(f"{args.input}: not a dehydrated file (needs subspace_data, subspace_basis and "
-                         "dataset_type); run `mbirtorch-hsnt dehydrate` first")
-    W4, H, dtype = data
+        raise InputError(f"{args.input}: not a dehydrated file (needs subspace_data and subspace_basis); run "
+                         "`mbirtorch-hsnt dehydrate` first")
+    W4, H = data
     K_file = H.shape[1]
     if W4.ndim == 3:
         W4 = W4[None]
@@ -460,7 +459,7 @@ def cmd_rehydrate(args):
         raise InputError(f"--wave-range {args.wave_range} selects none of the file's source bins "
                          f"{file_bins[0]}..{file_bins[-1]}")
     V, rows, cols, R = W4.shape
-    out_type = args.as_type or dtype
+    out_type = args.as_type or "attenuation"
     log.info("%s: %d component(s), %d view(s) x %d x %d pixels, %d of %d bins -> %s", args.input, R, V, rows, cols,
              H.shape[1], K_file, out_type)
     stem = re.sub(r"_dehydrated$", "", os.path.splitext(os.path.basename(args.input))[0])
@@ -656,7 +655,7 @@ def build_parser(show_all=False):
 
     s = sub.add_parser("rehydrate",
                        help="multiply a dehydrated file back into hyperspectral data (all bins or a range)")
-    s.add_argument("input", help="a dehydrated .h5 (subspace_data, subspace_basis, dataset_type), as written by "
+    s.add_argument("input", help="a dehydrated .h5 (subspace_data, subspace_basis), as written by "
                                  "dehydrate")
     g = s.add_argument_group("selection")
     opt.add(g, "--wave-range", metavar="A:B", help="source wavelength bins to rehydrate (default: all)")
@@ -665,7 +664,7 @@ def build_parser(show_all=False):
     opt.add(g, "-o", "--output", metavar="PATH", help="output directory (default: current directory), or a .h5 "
                                                      "path; default name <stem>_rehydrated.h5")
     opt.add(g, "--as-type", choices=("attenuation", "transmission"),
-            help="quantity to write (default: the file's dataset_type)")
+            help="quantity to write (default: attenuation)")
     opt.add(g, "--overwrite", action="store_true", help="replace the output if it already exists")
     opt.run(s)
     s.set_defaults(func=cmd_rehydrate)

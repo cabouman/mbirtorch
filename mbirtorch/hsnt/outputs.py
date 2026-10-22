@@ -122,7 +122,7 @@ def _provenance(path, bin_indices, attrs, metadata=None):
         f.attrs.update(attrs)
 
 
-def write_dehydrated(path, W4, H, out_type, bin_indices, attrs, metadata=None):
+def write_dehydrated(path, W4, H, bin_indices, attrs, metadata=None):
     """This function writes the maps and spectra to an hsnt file in the format that
     ``dehydrate`` returns.  It also records the source bin indices, the metadata, and the run
     attributes.
@@ -131,8 +131,6 @@ def write_dehydrated(path, W4, H, out_type, bin_indices, attrs, metadata=None):
         path (str): The output .h5 path.
         W4 (numpy.ndarray): The maps, with shape (views, rows, cols, rank).
         H (numpy.ndarray): The spectra, with shape (rank, bins).
-        out_type (str): 'attenuation' or 'transmission'.  This is the quantity that
-            ``rehydrate`` returns.
         bin_indices (array): The source spectral index of each column of H.
         attrs (dict): The HDF5 attributes to record.
         metadata (dict, optional): The hsnt metadata of the input.  Defaults to None.
@@ -142,8 +140,7 @@ def write_dehydrated(path, W4, H, out_type, bin_indices, attrs, metadata=None):
     """
     total, contrib, n_mat = mean_pixel_spectrum(W4.reshape(-1, H.shape[0]), H)
     with _written_atomically(path) as tmp:
-        export_hsnt_data_hdf5(tmp, [W4, H, out_type], {"dataset_type": out_type,
-                                                       "dataset_modality": "hyperspectral neutron"})
+        export_hsnt_data_hdf5(tmp, [W4, H], {"dataset_modality": "hyperspectral neutron"})
         _provenance(tmp, bin_indices, attrs, metadata)
         with h5py.File(tmp, "a") as f:
             d = f.create_dataset("mean_pixel_spectrum", data=total.astype(np.float32))

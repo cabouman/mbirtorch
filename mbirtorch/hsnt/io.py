@@ -56,6 +56,7 @@ def _with_key_docstring(style):
 
 def import_hsnt_data_hdf5(filename):
     """This function imports a hyperspectral dataset and its metadata from an HDF5 file.
+    The spectral axis of hyperspectral data is always the last axis.
 
     The file can hold the data in hyperspectral form or in dehydrated form.  If the function
     cannot read the data, it warns and returns None for the data.
@@ -65,7 +66,7 @@ def import_hsnt_data_hdf5(filename):
 
     Returns:
         [data, metadata]: For hyperspectral data, data is an ndarray with the spectral axis last.
-            For dehydrated data, data is the list [subspace_data, subspace_basis, dataset_type].
+            For dehydrated data, data is the list [subspace_data, subspace_basis].
             metadata is a dict with the keys of ``create_hsnt_metadata``.
     """
     data = None
@@ -75,21 +76,18 @@ def import_hsnt_data_hdf5(filename):
         with h5py.File(filename, "r") as f:
             group = f
 
-            dehydrated = all(k in group for k in ["subspace_data", "subspace_basis", "dataset_type"])
+            dehydrated = "subspace_data" in group and "subspace_basis" in group
 
             if dehydrated:
-                dataset_type = group["dataset_type"][()]
-                if isinstance(dataset_type, (bytes, np.bytes_)):
-                    dataset_type = dataset_type.decode()
-                data = [group["subspace_data"][()],
-                        group["subspace_basis"][()],
-                        dataset_type]
+                data = [group["subspace_data"][()], group["subspace_basis"][()]]
             elif "data" in group:
                 data = group["data"][()]
             else:
                 warnings.warn(f"No HSNT data found in HDF5 file '{filename}'. Returning data=None.")
 
             for key in ALLOWED_KEYS:
+                if key == "dataset_type" and dehydrated:    # dehydrated data is always attenuation
+                    continue
                 if key in group:
                     value = group[key][()]
                     if isinstance(value, (bytes, np.bytes_)):
@@ -137,20 +135,18 @@ def create_hsnt_metadata(**kwargs):
 
 def export_hsnt_data_hdf5(filename, data, metadata=None):
     """This function exports a hyperspectral dataset and its metadata to an HDF5 file.
+    The spectral axis of hyperspectral data is always the last axis.
 
     Args:
         filename (str): The path to the HDF5 file.
         data (ndarray or list): For hyperspectral data, an ndarray with the spectral axis last.
-            For dehydrated data, the list [subspace_data, subspace_basis, dataset_type].
+            For dehydrated data, the list [subspace_data, subspace_basis].
         metadata (dict, optional): The dict from ``create_hsnt_metadata``.  Defaults to None.
     """
     if metadata is None:
         metadata = {}
 
-    dehydrated = (isinstance(data, list)
-                  and len(data) == 3
-                  and isinstance(data[2], str)
-                  and data[2] in VALIDATION_RULES["dataset_type"][1:])
+    dehydrated = isinstance(data, list) and len(data) == 2
 
     for key, value in metadata.items():
         _validate_key(key, value)
@@ -161,7 +157,6 @@ def export_hsnt_data_hdf5(filename, data, metadata=None):
         if dehydrated:
             group.create_dataset("subspace_data", data=data[0])
             group.create_dataset("subspace_basis", data=data[1])
-            group.create_dataset("dataset_type", data=np.bytes_(data[2]))
         else:
             group.create_dataset("data", data=data)
 

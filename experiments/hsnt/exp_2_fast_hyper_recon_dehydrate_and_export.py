@@ -64,7 +64,7 @@ def main():
     ct_model.set_params(snr_db=recon_snr_db, verbose=0)
 
     # Perform dehydration
-    subspace_data, subspace_basis, _ = hsnt.dehydrate(transmission, dataset_type='transmission',
+    subspace_data, subspace_basis = hsnt.dehydrate(transmission, dataset_type='transmission',
                                                       num_materials=num_materials, mode='stream',
                                                       chunk_pixels=16384, verbose=verbose)
 
@@ -76,9 +76,8 @@ def main():
         subspace_recons.append(subspace_recon)
     subspace_recons = np.stack(subspace_recons, axis=-1)
 
-    # Export dehydrated reconstructions into HDF5 file. The reconstructions are linear attenuation coefficients, so
-    # rehydrating them gives attenuation, whatever the type of the projection data was.
-    hsnt_dehydrated_recons = [subspace_recons, subspace_basis, 'attenuation']
+    # Export dehydrated reconstructions into HDF5 file.
+    hsnt_dehydrated_recons = [subspace_recons, subspace_basis]
     metadata = hsnt.create_hsnt_metadata(dataset_name=dataset_name)
     filename = os.path.join(output_path, dataset_name + ".h5")
     hsnt.export_hsnt_data_hdf5(filename, hsnt_dehydrated_recons, metadata)

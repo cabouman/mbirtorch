@@ -24,7 +24,6 @@ def main():
     hsnt_dehydrated = [
         np.random.rand(3, 64, 64, 5).astype(np.float32),  # subspace_data
         np.random.rand(5, 1000).astype(np.float32),  # subspace_basis
-        "attenuation",  # dataset_type
     ]
     print("Dehydrated data shape:", hsnt_dehydrated[0].shape)
 

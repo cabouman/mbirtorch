@@ -26,7 +26,7 @@ def spheres():
 def _dehydrate(T, mask, **kwargs):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        W, H, _ = hsnt.dehydrate(T, "transmission", 3, sample_mask=mask, verbose=0, **kwargs)
+        W, H = hsnt.dehydrate(T, "transmission", 3, sample_mask=mask, verbose=0, **kwargs)
     return W, H, [str(w.message) for w in caught]
 
 
