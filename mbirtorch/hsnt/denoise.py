@@ -72,7 +72,7 @@ def _to_transmission(data, dataset_type):
     return np.ascontiguousarray(T, dtype=np.float32), shape
 
 
-def dehydrate(data, dataset_type="transmission", num_materials=None, *, subspace_basis=None,
+def dehydrate(data, dataset_type="transmission", num_materials=None, *, spectra=None,
               max_steps=1000, rel_tol=1e-8, max_num_est_materials=6, device=None,
               mode="auto", max_passes=5, sample_mask=None,
               verbose=1, **kwargs):
@@ -99,7 +99,7 @@ def dehydrate(data, dataset_type="transmission", num_materials=None, *, subspace
             'transmission'.
         num_materials (int, optional): The number of spectra :math:`N_m`.  Defaults to None,
             which estimates it from the data.
-        subspace_basis (numpy.ndarray or torch.Tensor, optional): Fixed spectra ``H`` of shape
+        spectra (numpy.ndarray or torch.Tensor, optional): Fixed spectra ``H`` of shape
             :math:`(N_m, N_k)`.  When given, only the maps ``W`` are computed.  Defaults to None.
         max_steps (int, optional): The maximum number of solver iterations.  Defaults to 1000.
         rel_tol (float, optional): The solver stops when the relative change in the loss falls
@@ -120,10 +120,9 @@ def dehydrate(data, dataset_type="transmission", num_materials=None, *, subspace
             search for ``num_materials``.  Defaults to 1.
 
     Returns:
-        list: The list [subspace_data, subspace_basis].  subspace_data is the maps ``W``, with
-            the pixel axes of the data followed by an axis of length :math:`N_m`.
-            subspace_basis is the spectra ``H``, with shape :math:`(N_m, N_k)`.  Both are
-            float32, and ``W H`` is the attenuation at each pixel and bin.
+        list: The list [maps, spectra].  maps is ``W``, with the pixel axes of the data followed
+            by an axis of length :math:`N_m`.  spectra is ``H``, with shape :math:`(N_m, N_k)`.
+            Both are float32, and ``W H`` is the attenuation at each pixel and bin.
     """
     from ._device import _default_device
     from ._fit import _fit
@@ -139,13 +138,13 @@ def dehydrate(data, dataset_type="transmission", num_materials=None, *, subspace
     mask = _sample_mask(sample_mask, lead)
     T = T_all if mask is None else np.ascontiguousarray(T_all[mask])
     pixels = f"{T.shape[0]}" if mask is None else f"{T.shape[0]} of {T_all.shape[0]} (sample_mask)"
-    if subspace_basis is not None:
+    if spectra is not None:
         from ._fit import _fit_fixed_basis
-        H = _check_basis(subspace_basis, shape[-1], num_materials)
+        H = _check_basis(spectra, shape[-1], num_materials)
         W, H, rep = _fit_fixed_basis(T, H, device=device, mode=mode, max_steps=max_steps, rel_tol=rel_tol)
         if verbose >= 1:
             print("dehydrate(): ")
-            print("   -Spectral dimension: ", shape[-1], " -> rank: ", H.shape[0], "(the given subspace_basis)")
+            print("   -Spectral dimension: ", shape[-1], " -> rank: ", H.shape[0], "(the given spectra)")
             print("   -Pixels: ", pixels, f"; maps for the given basis ({rep['chunks']} chunk(s))")
     else:
         note = f"rank {num_materials} given"
@@ -187,16 +186,16 @@ def _sample_mask(sample_mask, lead):
     return np.ascontiguousarray(m).reshape(-1)
 
 
-def _check_basis(subspace_basis, bins, num_materials):
-    """This function checks ``subspace_basis`` against the data and returns it as a float32 array
+def _check_basis(spectra, bins, num_materials):
+    """This function checks the given ``spectra`` against the data and returns it as a float32 array
     of shape (rank, bins)."""
-    H = np.asarray(_to_host(subspace_basis), dtype=np.float32)
+    H = np.asarray(_to_host(spectra), dtype=np.float32)
     if H.ndim != 2 or H.shape[1] != bins:
-        raise ValueError(f"subspace_basis must have shape (rank, {bins}) for data with {bins} bins; got {H.shape}")
+        raise ValueError(f"spectra must have shape (num_materials, {bins}) for data with {bins} bins; got {H.shape}")
     if not np.isfinite(H).all() or (H < 0).any():
-        raise ValueError("subspace_basis must be finite and nonnegative")
+        raise ValueError("spectra must be finite and nonnegative")
     if num_materials is not None and int(num_materials) != H.shape[0]:
-        raise ValueError(f"num_materials={num_materials} disagrees with the {H.shape[0]} rows of subspace_basis")
+        raise ValueError(f"num_materials={num_materials} disagrees with the {H.shape[0]} rows of spectra")
     return H
 
 
@@ -219,7 +218,7 @@ def hyper_denoise(data, dataset_type="attenuation", num_materials=None, **kwargs
                      dataset_type=dataset_type)
 
 
-def rehydrate(dehydrated_data, dataset_type="attenuation", hyperspectral_idx=None):
+def rehydrate(dehydrated, dataset_type="attenuation", hyperspectral_idx=None):
     """This function restores hyperspectral data from the output of ``dehydrate``.  It multiplies
     the maps by the spectra, for all bins or for selected bins.  The spectral axis of the
     returned data is always the last axis.  The method is described in
@@ -227,8 +226,8 @@ def rehydrate(dehydrated_data, dataset_type="attenuation", hyperspectral_idx=Non
     pp. 663-677, 2025, doi:10.1109/TCI.2025.3567854.
 
     Args:
-        dehydrated_data: The list [subspace_data, subspace_basis].  subspace_data holds the
-            maps ``W``, with the component axis last.  subspace_basis holds the spectra ``H``,
+        dehydrated: The list [maps, spectra] that ``dehydrate`` returns.  maps holds ``W``,
+            with the materials on the last axis.  spectra holds ``H``,
             with shape :math:`(N_m, N_k)`.
         dataset_type (str, optional): The quantity to return.  'attenuation' returns ``W H``.
             'transmission' returns ``exp(-W H)``.  Defaults to 'attenuation'.
@@ -237,16 +236,16 @@ def rehydrate(dehydrated_data, dataset_type="attenuation", hyperspectral_idx=Non
 
     Returns:
         numpy.ndarray: The restored data.  Its last axis holds the bins, and its other axes match
-            subspace_data.
+            maps.
     """
     if dataset_type not in ("attenuation", "transmission"):
         raise ValueError("'dataset_type' must be either 'attenuation' or 'transmission'.")
-    subspace_data, subspace_basis = dehydrated_data[0], dehydrated_data[1]
+    maps, spectra = dehydrated[0], dehydrated[1]
 
     if hyperspectral_idx is None:
-        rehydrated_data = subspace_data @ subspace_basis
+        rehydrated_data = maps @ spectra
     else:
-        rehydrated_data = subspace_data @ subspace_basis[:, hyperspectral_idx]
+        rehydrated_data = maps @ spectra[:, hyperspectral_idx]
 
     if dataset_type == 'transmission':
         rehydrated_data = np.exp(-rehydrated_data)

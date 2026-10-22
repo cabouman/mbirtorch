@@ -1,170 +1,128 @@
-import warnings
+"""This module reads and writes the hsnt HDF5 file.
+
+A file holds either hyperspectral data or dehydrated data.  The root of the file carries these
+attributes: ``format`` ("mbirtorch-hsnt"), ``format_version`` (1), ``mbirtorch_version``,
+``written`` (the date and time), ``kind`` ("hyperspectral" or "dehydrated"), ``dataset_type``
+("attenuation" or "transmission", hyperspectral only), ``name`` (optional), and ``model`` (optional,
+the parameters of the tomography model as JSON, from which ``mbirtorch.build_model`` rebuilds the
+model).  A hyperspectral
+file holds the float32 dataset ``data`` with the spectral axis last.  A dehydrated file holds the
+float32 datasets ``maps``, with the materials on the last axis, and ``spectra``, with shape
+(materials, bins).  Either file may hold the datasets ``wavelengths``, in angstroms, and
+``angles``, in degrees.  Each of these two carries a ``units`` attribute.
+"""
+import datetime
+import json
 
 import h5py
 import numpy as np
 
-
-# This dict lists the allowed metadata keys and describes the value of each one.
-KEY_DESCRIPTIONS = {
-    "dataset_name": "Character string with the name of the dataset.",
-    "dataset_type": "'attenuation' or 'transmission'.",
-    "dataset_modality": "'hyperspectral neutron'.",
-    "wavelengths": "Array of wavelength values in Angstroms.",
-    "alu_unit": "Character string defining geometry unit (e.g., 'mm' or 'cm').",
-    "alu_value": "Float that represents the value of 1 ALU in the defined unit.",
-    "delta_det_channel": "Detector channel spacing in ALU.",
-    "delta_det_row": "Detector row spacing in ALU.",
-    "dataset_geometry": "'parallel' or 'cone'.",
-    "angles": "Array of view angles in degrees.",
-    "det_channel_offset": "Assumed offset between center of rotation and center of detector in ALU.",
-    "source_detector_dist": "Distance from source to detector in ALU.",
-    "source_iso_dist": "Distance from source to iso in ALU."
-}
-
-# This dict lists the values that each of these keys accepts.
-VALIDATION_RULES = {
-    "dataset_type": (None, "attenuation", "transmission"),
-    "dataset_modality": (None, "hyperspectral neutron"),
-    "dataset_geometry": (None, "parallel", "cone"),
-}
-
-ALLOWED_KEYS = list(KEY_DESCRIPTIONS.keys())
+FORMAT = "mbirtorch-hsnt"
+FORMAT_VERSION = 1
+DATASET_TYPES = ("attenuation", "transmission")
+# These are the units of the optional arrays.  The reader refuses any other unit.
+UNITS = {"wavelengths": "angstrom", "angles": "degree"}
 
 
-def _validate_key(key, value):
-    """This function warns when a key in ``VALIDATION_RULES`` has a value that is not allowed."""
-    if key in VALIDATION_RULES and value not in VALIDATION_RULES[key]:
-        valid_options = [v for v in VALIDATION_RULES[key] if v is not None]
-        warnings.warn(f"Invalid '{key}': should be one of {valid_options}.")
+def export_hsnt_data_hdf5(filename, data, dataset_type=None, *, name=None, wavelengths=None, angles=None,
+                          model=None):
+    """This function writes hyperspectral data or dehydrated data to an hsnt HDF5 file.
+    The spectral axis of hyperspectral data is always the last axis.
 
+    Args:
+        filename (str): The path of the file to write.
+        data (numpy.ndarray or list): Hyperspectral data as an array with the spectral axis last,
+            or dehydrated data as the list ``[maps, spectra]`` that ``dehydrate`` returns.
+        dataset_type (str, optional): 'attenuation' or 'transmission'.  Required for
+            hyperspectral data.  Not allowed for dehydrated data, which is always attenuation.
+        name (str, optional): A name for the dataset.  Defaults to None.
+        wavelengths (array, optional): The wavelength of each bin, in angstroms.  Defaults to None.
+        angles (array, optional): The view angle of each view, in degrees.  Defaults to None.
+        model (TomographyModel, optional): The model of the scan.  Its parameters are stored,
+            and ``import_hsnt_data_hdf5`` rebuilds the model from them.  Defaults to None.
+    """
+    from .. import __version__
+    from ..utilities import _json_default
+    dehydrated = isinstance(data, (list, tuple))
+    if dehydrated:
+        if len(data) != 2:
+            raise ValueError(f"dehydrated data is the list [maps, spectra]; got {len(data)} elements")
+        if dataset_type is not None:
+            raise ValueError("dehydrated data is always attenuation; do not pass dataset_type")
+        maps, spectra = (np.asarray(a, dtype=np.float32) for a in data)
+        if spectra.ndim != 2 or maps.ndim < 2 or maps.shape[-1] != spectra.shape[0]:
+            raise ValueError(f"maps must have shape (..., materials) and spectra (materials, bins); got "
+                             f"{maps.shape} and {spectra.shape}")
+    else:
+        if dataset_type not in DATASET_TYPES:
+            raise ValueError(f"dataset_type must be one of {DATASET_TYPES}; got {dataset_type!r}")
+        data = np.asarray(data, dtype=np.float32)
+        if data.ndim < 2:
+            raise ValueError(f"hyperspectral data needs at least two axes, with the bins last; got shape {data.shape}")
 
-def _with_key_docstring(style):
-    """This function returns a decorator that replaces ``{_KEY_DOCS}`` in a docstring with the
-    descriptions of the metadata keys."""
-    indent = "\t- " if style == "dict" else "\t"
-    text = "\n".join(f"{indent}{k}: {v}" for k, v in KEY_DESCRIPTIONS.items())
-
-    def decorator(func):
-        if func.__doc__:
-            func.__doc__ = func.__doc__.replace("{_KEY_DOCS}", text)
-        return func
-
-    return decorator
+    with h5py.File(filename, "w") as f:
+        f.attrs["format"] = FORMAT
+        f.attrs["format_version"] = FORMAT_VERSION
+        f.attrs["mbirtorch_version"] = __version__
+        f.attrs["written"] = datetime.datetime.now().isoformat(timespec="seconds")
+        f.attrs["kind"] = "dehydrated" if dehydrated else "hyperspectral"
+        if dehydrated:
+            f.create_dataset("maps", data=maps)
+            f.create_dataset("spectra", data=spectra)
+        else:
+            f.attrs["dataset_type"] = dataset_type
+            f.create_dataset("data", data=data)
+        if name is not None:
+            f.attrs["name"] = str(name)
+        if model is not None:
+            f.attrs["model"] = json.dumps(model.get_all_params(), default=_json_default)
+        for key, value in (("wavelengths", wavelengths), ("angles", angles)):
+            if value is not None:
+                d = f.create_dataset(key, data=np.asarray(value, dtype=np.float64))
+                d.attrs["units"] = UNITS[key]
 
 
 def import_hsnt_data_hdf5(filename):
-    """This function imports a hyperspectral dataset and its metadata from an HDF5 file.
-    The spectral axis of hyperspectral data is always the last axis.
-
-    The file can hold the data in hyperspectral form or in dehydrated form.  If the function
-    cannot read the data, it warns and returns None for the data.
-
-    Args:
-        filename (str): The path to the HDF5 file.
-
-    Returns:
-        [data, metadata]: For hyperspectral data, data is an ndarray with the spectral axis last.
-            For dehydrated data, data is the list [subspace_data, subspace_basis].
-            metadata is a dict with the keys of ``create_hsnt_metadata``.
-    """
-    data = None
-    metadata = {key: None for key in ALLOWED_KEYS}
-
-    try:
-        with h5py.File(filename, "r") as f:
-            group = f
-
-            dehydrated = "subspace_data" in group and "subspace_basis" in group
-
-            if dehydrated:
-                data = [group["subspace_data"][()], group["subspace_basis"][()]]
-            elif "data" in group:
-                data = group["data"][()]
-            else:
-                warnings.warn(f"No HSNT data found in HDF5 file '{filename}'. Returning data=None.")
-
-            for key in ALLOWED_KEYS:
-                if key == "dataset_type" and dehydrated:    # dehydrated data is always attenuation
-                    continue
-                if key in group:
-                    value = group[key][()]
-                    if isinstance(value, (bytes, np.bytes_)):
-                        value = value.decode()
-                    elif isinstance(value, np.ndarray) and value.shape == ():
-                        value = value.item()
-                    metadata[key] = value
-    except Exception as error:
-        warnings.warn(f"Could not import HSNT data from HDF5 file '{filename}': {error}. Returning data=None.")
-        data = None
-
-    for key, value in metadata.items():
-        _validate_key(key, value)
-
-    return [data, metadata]
-
-
-@_with_key_docstring("arg")
-def create_hsnt_metadata(**kwargs):
-    """This function creates the metadata dict of a dataset.
-
-    Each key that is not given has the value None.
-
-    Args:
-    {_KEY_DOCS}
-
-    Returns:
-        dict: The metadata.
-
-    Example:
-        >>> metadata = create_hsnt_metadata(dataset_name="sample1", dataset_type="transmission",
-        ...     wavelengths=np.linspace(1.0, 5.0, 50), angles=np.linspace(0, 180, 10))
-    """
-    for key in kwargs.keys():
-        if key not in ALLOWED_KEYS:
-            warnings.warn(f"Ignoring invalid key '{key}' in arguments.")
-
-    metadata = {k: kwargs.get(k, None) for k in ALLOWED_KEYS}
-
-    for key, value in metadata.items():
-        _validate_key(key, value)
-
-    return metadata
-
-
-def export_hsnt_data_hdf5(filename, data, metadata=None):
-    """This function exports a hyperspectral dataset and its metadata to an HDF5 file.
+    """This function reads an hsnt HDF5 file written by ``export_hsnt_data_hdf5``.
     The spectral axis of hyperspectral data is always the last axis.
 
     Args:
-        filename (str): The path to the HDF5 file.
-        data (ndarray or list): For hyperspectral data, an ndarray with the spectral axis last.
-            For dehydrated data, the list [subspace_data, subspace_basis].
-        metadata (dict, optional): The dict from ``create_hsnt_metadata``.  Defaults to None.
+        filename (str): The path of the file to read.
+
+    Returns:
+        list: The list ``[data, metadata]``.  For a hyperspectral file, ``data`` is the array.
+            For a dehydrated file, ``data`` is the list ``[maps, spectra]``.  ``metadata`` is a
+            dict with the keys ``dataset_type`` (None for a dehydrated file), ``name``,
+            ``wavelengths``, ``angles``, ``model``, ``mbirtorch_version``, and ``written``.
+            ``model`` is the tomography model of the scan, rebuilt from the file.  A key that
+            the file does not hold has the value None.
     """
-    if metadata is None:
-        metadata = {}
-
-    dehydrated = isinstance(data, list) and len(data) == 2
-
-    for key, value in metadata.items():
-        _validate_key(key, value)
-
-    with h5py.File(filename, "w") as f:
-        group = f
-
-        if dehydrated:
-            group.create_dataset("subspace_data", data=data[0])
-            group.create_dataset("subspace_basis", data=data[1])
+    with h5py.File(filename, "r") as f:
+        if f.attrs.get("format") != FORMAT:
+            raise ValueError(f"{filename} is not an hsnt file: the root has no 'format' attribute of "
+                             f"'{FORMAT}'.  Files written before version 1 of the format are not supported.")
+        version = int(f.attrs["format_version"])
+        if version > FORMAT_VERSION:
+            raise ValueError(f"{filename} has format version {version}, written by mbirtorch "
+                             f"{f.attrs.get('mbirtorch_version')}; this mbirtorch reads versions up to "
+                             f"{FORMAT_VERSION}")
+        kind = f.attrs["kind"]
+        if kind == "dehydrated":
+            data = [f["maps"][()], f["spectra"][()]]
+        elif kind == "hyperspectral":
+            data = f["data"][()]
         else:
-            group.create_dataset("data", data=data)
-
-        for key, value in metadata.items():
-            if key not in ALLOWED_KEYS:
-                warnings.warn(f"Ignoring invalid key '{key}' in metadata.")
-                continue
-            if value is None or (key == "dataset_type" and dehydrated):
-                continue
-            if isinstance(value, str):
-                group.create_dataset(key, data=np.bytes_(value))
-            else:
-                group.create_dataset(key, data=value)
+            raise ValueError(f"{filename} has an unknown kind {kind!r}")
+        metadata = {key: f.attrs.get(key) for key in ("dataset_type", "name", "mbirtorch_version", "written")}
+        for key, units in UNITS.items():
+            metadata[key] = None
+            if key in f:
+                found = f[key].attrs.get("units")
+                if found != units:
+                    raise ValueError(f"{filename}: {key} has units {found!r}; expected {units!r}")
+                metadata[key] = f[key][()]
+        metadata["model"] = None
+        if "model" in f.attrs:
+            from ..utilities import _json_object_hook, build_model
+            metadata["model"] = build_model(*json.loads(f.attrs["model"], object_hook=_json_object_hook))
+    return [data, metadata]
