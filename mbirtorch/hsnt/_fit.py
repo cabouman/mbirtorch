@@ -11,11 +11,7 @@ import torch
 log = logging.getLogger("mbirtorch.hsnt")
 
 # This is the device memory of a full solve, in bytes per data entry, including T itself.
-_BYTES_PER_ENTRY = dict(compiled=dict(mle=41, unconstrained=42, support=42, basis=54),
-                        eager=dict(mle=58, unconstrained=60, support=60, basis=54))
-# This is the extra memory of support selection, in bytes per entry of one block of
-# ``spectra._FREE_SET_ELEMS`` entries.
-_BYTES_PER_BLOCK_ENTRY = 32
+_BYTES_PER_ENTRY = dict(compiled=dict(mle=41, basis=54), eager=dict(mle=58, basis=54))
 # This is the device memory of a streamed solve, in bytes per entry of one chunk.
 _BYTES_PER_CHUNK_ENTRY = 72
 # This is the memory in bytes that the float64 blocks of the loss and the fit quality use at
@@ -25,7 +21,6 @@ _FIXED_BYTES = 2**29
 # Otherwise, it sizes the streamed chunks and the warm-up fit to use 0.6 of the available memory.
 _FULL_SHARE, _STREAM_SHARE = 0.8, 0.6
 _MIN_WARMUP_PIXELS = 4096
-SPECTRA = ("mle", "unconstrained", "support")
 
 
 def _device_memory(device):
@@ -60,9 +55,6 @@ def _plan(P, K, device, spectra="mle", mode="auto", chunk_pixels=None, compile_m
         from ..kernel_availability import triton_available
         compiled = triton_available()[0]
     need_full = P * K * _BYTES_PER_ENTRY["compiled" if compiled else "eager"][spectra] + _FIXED_BYTES
-    if spectra == "support":
-        from .spectra import _FREE_SET_ELEMS
-        need_full += min(P * K, _FREE_SET_ELEMS) * _BYTES_PER_BLOCK_ENTRY
     note = (f"{name}: {budget / 2**30:.1f} GiB available of {total / 2**30:.1f}{remark}; a full "
             f"{'compiled' if compiled else 'eager'} solve needs about {need_full / 2**30:.1f} GiB")
     if mode == "auto":
@@ -172,29 +164,21 @@ def _fit_fixed_basis(T, H, device="cpu", mode="auto", chunk_pixels=None, max_ste
     return W.numpy().astype(np.float32), np.asarray(H, dtype=np.float32), rep
 
 
-def _fit(T, rank, spectra="mle", dose=None, penalty="auto", wald_screen=0.0, device="cpu",
-         mode="auto", chunk_pixels=None, max_steps=1000, rel_tol=1e-8, max_passes=5, warmup_pixels=16384,
-         compile_mode="auto", report=None):
+def _fit(T, rank, device="cpu", mode="auto", chunk_pixels=None, max_steps=1000, rel_tol=1e-8, max_passes=5,
+         warmup_pixels=16384, compile_mode="auto", report=None):
     """This function fits the transmission T at the given rank.  T is a float32 numpy array with
     shape (pixels, bins).  The function returns (W, H, report).  W and H are the numpy factors,
     and ``report`` is a dict that describes what the fit did.
 
-    The argument ``spectra`` is 'mle', 'unconstrained', or 'support'.  The value 'support' needs
-    the dose.  The argument ``penalty`` is the penalty per component of the support selection.
-    It is either 'auto' or a multiple of log K.  The function fills ``report`` in place.  As a
-    result, the caller has the memory plan even when the solve fails.
+    The function fills ``report`` in place.  As a result, the caller has the memory plan even
+    when the solve fails.
     """
     from ._streaming import _stream_factorization
     from .factorization import _nnal_factorization
-    from .spectra import _support_selected_spectra, _unconstrained_spectra
-    if spectra not in SPECTRA:
-        raise ValueError(f"spectra must be one of {SPECTRA}, got {spectra!r}")
-    if spectra == "support" and dose is None:
-        raise ValueError("support selection needs the dose (open-beam counts per pixel and bin)")
     P, K = T.shape
-    mode, chunk, warmup, note = _plan(P, K, device, spectra, mode, chunk_pixels, compile_mode, warmup_pixels)
+    mode, chunk, warmup, note = _plan(P, K, device, "mle", mode, chunk_pixels, compile_mode, warmup_pixels)
     rep = {} if report is None else report
-    rep.update(mode=mode, memory_plan=note, spectra=spectra)
+    rep.update(mode=mode, memory_plan=note)
     if mode == "stream":
         rep["chunk_pixels"] = chunk
         if str(device).startswith("cuda"):           # Each chunk and the next one are held as pinned host copies.
@@ -208,12 +192,9 @@ def _fit(T, rank, spectra="mle", dose=None, penalty="auto", wald_screen=0.0, dev
         rep["steps"] = int(steps)
     else:
         chunks = [torch.from_numpy(T[i:i + chunk]) for i in range(0, P, chunk)]
-        support = (dict(dose=dose, penalty=penalty, wald_screen=wald_screen)
-                   if spectra == "support" else None)
         W_chunks, H, passes = _stream_factorization(chunks, rank, max_passes=max_passes, rel_tol=rel_tol,
                                                     warmup_pixels=warmup, device=device,
                                                     verbose=int(log.isEnabledFor(logging.DEBUG)), stats=stats,
-                                                    nonneg_W=(spectra != "unconstrained"), support_selection=support,
                                                     compile_mode="on" if compile_mode == "on" else "off",
                                                     chunk_sizes=[c.shape[0] for c in chunks])
         W = torch.cat(W_chunks)
@@ -224,36 +205,16 @@ def _fit(T, rank, spectra="mle", dose=None, penalty="auto", wald_screen=0.0, dev
     rep["solve_seconds"] = round(time.perf_counter() - t0, 2)
     if mode == "full":
         rep["loss_mle"] = _loss(W, H, T, device)
-    # Otherwise, the loss of the last pass is at the final W and H.  With unconstrained W, this
-    # loss is not the MLE loss.
-    else:
-        rep["loss_mle"] = stats["loss"][-1] if spectra != "unconstrained" else None
+    else:                                            # The loss of the last pass is at the final W and H.
+        rep["loss_mle"] = stats["loss"][-1]
     steps_text = f"{rep['steps']} steps" if "steps" in rep else f"{rep['passes']} polish passes"
     log.info("factorization: %s, %s in %.1f s, loss %s", mode, steps_text, rep["solve_seconds"],
-             "n/a" if rep["loss_mle"] is None else f"{rep['loss_mle']:.6g}")
+             f"{rep['loss_mle']:.6g}")
     if mode == "full":
         rep["mle_hit_max_steps"] = rep["steps"] >= max_steps
         if rep["mle_hit_max_steps"] and rel_tol > 0:
             log.warning("the maximum-likelihood fit stopped at max_steps (%d) before its rel_tol stop", max_steps)
-    if spectra == "unconstrained" and mode == "full":
-        t1 = time.perf_counter()
-        W, H, st = _unconstrained_spectra(Td, W, H, compile_mode=compile_mode)
-        rep.update(unconstrained_steps=int(st), unconstrained_seconds=round(time.perf_counter() - t1, 2))
-    elif spectra == "support" and mode == "full":
-        t1 = time.perf_counter()
-        W, H, S, st = _support_selected_spectra(Td, W, H, dose, penalty=penalty, wald_screen=wald_screen,
-                                                compile_mode=compile_mode)
-        rep.update(support_steps=int(st), support_seconds=round(time.perf_counter() - t1, 2),
-                   mean_support_size=S.sum(1).double().mean().item())
-    elif spectra == "support":
-        S = torch.cat(stats["support_chunks"])
-        rep.update(mean_support_size=S.sum(1).double().mean().item(), support_refit_passes=int(stats["refit_passes"]),
-                   loss_per_pass_refit=stats.get("loss_refit"))
-    rep["loss_final"] = rep["loss_mle"] if spectra == "mle" else _loss(W, H, T, device)
-    if spectra != "mle":
-        support_text = (f", mean {rep['mean_support_size']:.2f} materials per pixel" if "mean_support_size" in rep
-                        else "")
-        log.info("%s spectra%s: loss %.6g", spectra, support_text, rep["loss_final"])
+    rep["loss_final"] = rep["loss_mle"]
     # These checks apply to the returned factors in every mode.
     _report_zero_counts(rep, W, H, Td if mode == "full" else T, device, P if mode == "full" else chunk)
     if not (bool(torch.isfinite(W).all()) and bool(torch.isfinite(H).all())):

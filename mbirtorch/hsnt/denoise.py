@@ -72,8 +72,8 @@ def _to_transmission(data, dataset_type):
     return np.ascontiguousarray(T, dtype=np.float32), shape
 
 
-def dehydrate(data, dataset_type="transmission", num_materials=None, *, subspace_basis=None, spectra="mle", dose=None,
-              penalty="auto", max_steps=1000, rel_tol=1e-8, max_rank=6, device=None,
+def dehydrate(data, dataset_type="transmission", num_materials=None, *, subspace_basis=None,
+              max_steps=1000, rel_tol=1e-8, max_rank=6, device=None,
               compile_mode="auto", mode="auto", chunk_pixels=None, max_passes=5, sample_mask=None,
               verbose=1, **kwargs):
     """This function dehydrates hyperspectral data.  It computes a non-negative factorization
@@ -101,14 +101,6 @@ def dehydrate(data, dataset_type="transmission", num_materials=None, *, subspace
             which estimates it from the data.
         subspace_basis (numpy.ndarray or torch.Tensor, optional): Fixed spectra ``H`` of shape
             :math:`(N_m, N_k)`.  When given, only the maps ``W`` are computed.  Defaults to None.
-        spectra (str, optional): How the spectra are estimated.  'mle' is the maximum
-            likelihood estimate.  'unconstrained' removes the bias that W >= 0 causes at low
-            dose.  'support' also selects which spectra are present in each pixel, and it
-            requires ``dose``.  Defaults to 'mle'.
-        dose (float, optional): The open beam counts per pixel and bin, used only by
-            'support'.  Defaults to None.
-        penalty (str or float, optional): The penalty per spectrum for 'support', as a
-            multiple of log(N_k), or 'auto'.  Defaults to 'auto'.
         max_steps (int, optional): The maximum number of solver iterations.  Defaults to 1000.
         rel_tol (float, optional): The solver stops when the relative change in the loss falls
             below this value.  Defaults to 1e-8.
@@ -155,7 +147,7 @@ def dehydrate(data, dataset_type="transmission", num_materials=None, *, subspace
     pixels = f"{T.shape[0]}" if mask is None else f"{T.shape[0]} of {T_all.shape[0]} (sample_mask)"
     if subspace_basis is not None:
         from ._fit import _fit_fixed_basis
-        H = _check_basis(subspace_basis, shape[-1], num_materials, spectra)
+        H = _check_basis(subspace_basis, shape[-1], num_materials)
         W, H, rep = _fit_fixed_basis(T, H, device=device, mode=mode, chunk_pixels=chunk_pixels, max_steps=max_steps,
                                      rel_tol=rel_tol, compile_mode=compile_mode)
         if verbose >= 1:
@@ -167,14 +159,14 @@ def dehydrate(data, dataset_type="transmission", num_materials=None, *, subspace
         if num_materials is None:
             num_materials, note, _ = _estimate_rank(T_all, spatial_shape=_spatial_shape(lead), device=device,
                                                     max_rank=max_rank, verbose=max(0, verbose - 1))
-        W, H, rep = _fit(T, int(num_materials), spectra=spectra, dose=dose, penalty=penalty, device=device, mode=mode,
+        W, H, rep = _fit(T, int(num_materials), device=device, mode=mode,
                          chunk_pixels=chunk_pixels, max_steps=max_steps, rel_tol=rel_tol, max_passes=int(max_passes),
                          compile_mode=compile_mode)
         if verbose >= 1:
             solve = f"{rep['steps']} steps" if "steps" in rep else f"streamed, {rep['passes']} polish passes"
             print("dehydrate(): ")
             print("   -Spectral dimension: ", shape[-1], " -> rank: ", int(num_materials), f"({note})")
-            print("   -Pixels: ", pixels, f"; spectra: {spectra} ({solve})")
+            print("   -Pixels: ", pixels, f" ({solve})")
     if mask is not None:
         W_all = np.zeros((T_all.shape[0], W.shape[1]), dtype=np.float32)
         W_all[mask] = W
@@ -202,7 +194,7 @@ def _sample_mask(sample_mask, lead):
     return np.ascontiguousarray(m).reshape(-1)
 
 
-def _check_basis(subspace_basis, bins, num_materials, spectra):
+def _check_basis(subspace_basis, bins, num_materials):
     """This function checks ``subspace_basis`` against the data and returns it as a float32 array
     of shape (rank, bins)."""
     H = np.asarray(_to_host(subspace_basis), dtype=np.float32)
@@ -212,8 +204,6 @@ def _check_basis(subspace_basis, bins, num_materials, spectra):
         raise ValueError("subspace_basis must be finite and nonnegative")
     if num_materials is not None and int(num_materials) != H.shape[0]:
         raise ValueError(f"num_materials={num_materials} disagrees with the {H.shape[0]} rows of subspace_basis")
-    if spectra != "mle":
-        raise ValueError(f"spectra={spectra!r} re-estimates the spectra, which a given subspace_basis holds fixed")
     return H
 
 

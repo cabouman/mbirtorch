@@ -131,10 +131,6 @@ def test_library_dehydrate_and_hyper_denoise(stacks, capsys):
     assert est[0].shape == (ROWS, COLS, R)
     den_t = hsnt.hyper_denoise(np.exp(-A), "transmission", num_materials=R, verbose=0)    # transmission in and out
     assert den_t.shape == A.shape and 0 < den_t.min() and _relative_error(-np.log(den_t), X) < 0.35
-    sup = hsnt.dehydrate(A, "attenuation", num_materials=R, spectra="support", dose=DOSE, verbose=0)
-    assert sup[0].shape == sub_data.shape and sup[0].min() >= 0
-    with pytest.raises(ValueError, match="dose"):
-        hsnt.dehydrate(A, "attenuation", num_materials=R, spectra="support", verbose=0)
     capsys.readouterr()
     streamed = hsnt.dehydrate(A, "attenuation", num_materials=R, mode="stream", chunk_pixels=40, max_passes=2,
                               verbose=1)
@@ -150,8 +146,7 @@ def test_library_dehydrate_and_hyper_denoise(stacks, capsys):
     assert np.array_equal(same, basis) and np.abs(maps - sub_data).max() < 1e-3 * sub_data.max()
     chunked = hsnt.dehydrate(A, "attenuation", subspace_basis=basis, mode="stream", chunk_pixels=40, verbose=1)[0]
     assert "3 chunk(s)" in capsys.readouterr().out and np.abs(chunked - maps).max() < 1e-4 * maps.max()
-    for bad in (dict(num_materials=R + 1), dict(spectra="support", dose=DOSE)):
-        with pytest.raises(ValueError, match="subspace_basis"):
-            hsnt.dehydrate(A, "attenuation", subspace_basis=basis, verbose=0, **bad)
+    with pytest.raises(ValueError, match="subspace_basis"):
+        hsnt.dehydrate(A, "attenuation", subspace_basis=basis, num_materials=R + 1, verbose=0)
     with pytest.raises(TypeError, match="MBIRJAX"):
         hsnt.hyper_denoise(A, num_materials=R, safety_factor=2, verbose=0)          # the NMF's keywords are refused

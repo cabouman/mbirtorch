@@ -1,5 +1,5 @@
 """Tests for the NNAL solvers in mbirtorch.hsnt: the maximum-likelihood fit, its stop and compiled kernels, the rank
-estimate, the spectra estimators and streaming.
+estimate and streaming.
 
 Self-contained: small random nonnegative factorizations with mixed pixels stand in for a phantom. Each test runs on
 every device of the repository's ``device`` fixture except MPS, which lacks the float64 the solvers accumulate in.
@@ -15,8 +15,6 @@ from mbirtorch.hsnt import _newton
 from mbirtorch.hsnt._loss import _nnal_prep, stable_nnal, stable_nnal_derivatives
 from mbirtorch.hsnt._streaming import _stream_factorization
 from mbirtorch.hsnt.factorization import _initial_factors, _nnal_factorization
-from mbirtorch.hsnt.spectra import (_auto_penalty, _empty_fit_loss, _guard_components, _select_supports,
-                                    _support_selected_spectra, _unconstrained_spectra)
 from hsnt_basis import material_basis
 
 
@@ -196,83 +194,6 @@ def test_rank_estimate_finds_the_rank_with_pooling(dev):
     T = _sphere_problem(dev).reshape(48, 48, -1)
     n, _, detail = hsnt.estimate_rank(T, "transmission", max_rank=5, device=dev, pool=2)
     assert n == 3 and detail["rank_full"] == 3 and detail["pool_block"] == 2 and detail["pooled"]["pixels"] == 24 * 24
-
-
-def test_spectra_estimators(dev):
-    """The unconstrained estimate keeps W >= 0. Support selection holds the coefficients off its supports at zero,
-    and with no penalty keeps at least as many. A component selected almost nowhere reverts to the maximum-likelihood
-    treatment."""
-    T, _, _ = _problem(dev)
-    W, H, _ = _mle(T)
-    Wu, Hu, _ = _unconstrained_spectra(T, W, H)
-    Ws, Hs, support, _ = _support_selected_spectra(T, W, H, dose=10.0)
-    assert Wu.min() >= 0 and Hu.shape == H.shape and Ws.min() >= 0 and Hs.min() >= 0
-    assert bool((Ws[~support] == 0).all())
-    Wz, Hz, support_z, _ = _support_selected_spectra(T, W, H, dose=10.0, penalty=0.0)
-    assert support_z.sum() >= support.sum() and Wz.min() >= 0 and bool((Wz[~support_z] == 0).all())
-    P = 5000
-    guard = torch.rand(P, 3, device=dev) > 0.5
-    guard[:, 1] = False
-    guard[:3, 1] = True
-    W_mle, W0 = torch.rand(P, 3, device=dev), torch.zeros(P, 3, device=dev)
-    with pytest.warns(UserWarning):
-        weak = _guard_components(guard, W_mle, W0)
-    assert weak.tolist() == [False, True, False] and bool(guard[:, 1].all()) and torch.equal(W0[:, 1], W_mle[:, 1])
-
-
-def _enumerated_supports(T, W, H, dose, lam):
-    """The reference search: every subset of the R materials, fitted by a constrained W solve."""
-    R = H.shape[0]
-    prep = _nnal_prep(T)
-    rowwise = _newton._kernels("off")[2]
-    subsets = [list(c) for r in range(1, R + 1) for c in itertools.combinations(range(R), r)]
-    f0 = _empty_fit_loss(T, prep)
-    crit, fits, W_sub = [f0 * dose], [f0], []
-    for S in subsets:
-        Ws = _newton.solve_W(T, H[S].contiguous(), W[:, S].contiguous(), 100, 1e-12)
-        f = rowwise(Ws @ H[S], T, prep, 1, dtype=torch.float64)
-        crit.append(f * dose + lam * len(S))
-        fits.append(f)
-        W_sub.append(Ws)
-    best = torch.stack(crit, 1).argmin(1)
-    W0 = torch.zeros_like(W)
-    for j, S in enumerate(subsets):
-        m = (best == j + 1).nonzero().squeeze(1)
-        W0[m[:, None], torch.tensor(S, device=T.device)[None, :]] = W_sub[j][m]
-    return W0 > 0, torch.stack(fits, 1).gather(1, best[:, None]).squeeze(1)
-
-
-def _dense_rank5(dev, dose=1000.0):
-    """Rank 5 at high dose, every material in every sample pixel; the enumeration's criterion and supports."""
-    T, _, _ = _problem(dev, P=512, K=100, R=5, dose=dose, alpha=1.0, absent=0.0)
-    W, H, _ = _nnal_factorization(T, 5, max_steps=200, rel_tol=1e-8, compile_mode="off")
-    lam = 2 * np.log(T.shape[1])
-    s_enum, f_enum = _enumerated_supports(T, W, H, dose, lam)
-    return T, W, H, (dose * f_enum + lam * s_enum.sum(1)).sum().item(), s_enum
-
-
-def test_branch_and_bound_matches_the_enumeration(dev):
-    """Branch and bound reproduces the exhaustive search's supports on nearly every pixel of the test problem at the
-    same criterion, at rank 3 and on dense rank-5 mixtures. 'auto' is the penalty it names."""
-    T, _, _ = _problem(dev, dose=10.0)
-    W, H, _ = _mle(T)
-    lam = 2 * np.log(T.shape[1])
-    s_enum, f_enum = _enumerated_supports(T, W, H, 10.0, lam)
-    s_bb, W_bb, f_bb = _select_supports(T, W, H, dose=10.0, penalty=2.0)
-
-    def criterion(s, f):
-        return (10.0 * f + lam * s.sum(1)).sum().item()
-
-    assert (s_bb == s_enum).all(1).double().mean() > 0.95
-    assert criterion(s_bb, f_bb) <= criterion(s_enum, f_enum) * (1 + 2e-3)
-    assert W_bb.min() >= 0 and bool((W_bb[~s_bb] == 0).all()) and s_bb.dtype == torch.bool
-    # At rank 5 on dense mixtures, where a third of the pixels keep all five components, it matches as well.
-    T5, W5, H5, crit_enum5, s_enum5 = _dense_rank5(dev)
-    s5, _, f5 = _select_supports(T5, W5, H5, dose=1000.0, penalty=2.0)
-    assert (s5.sum(1) == 5).double().mean() > 0.2 and (s5 == s_enum5).all(1).double().mean() > 0.95
-    assert (1000.0 * f5 + 2 * np.log(T5.shape[1]) * s5.sum(1)).sum().item() <= crit_enum5 * (1 + 1e-4)
-    s_auto = _select_supports(T, W, H, dose=10.0, penalty="auto")[0]
-    assert torch.equal(s_auto, _select_supports(T, W, H, dose=10.0, penalty=_auto_penalty(T.mean(1), 10.0))[0])
 
 
 def test_streaming_matches_the_full_solve(dev):
