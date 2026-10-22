@@ -1,15 +1,12 @@
-"""Tests of the loader and of dehydrate and hyper_denoise on synthetic TIFF and HDF5 inputs."""
-import os
+"""Tests of dehydrate and hyper_denoise on a synthetic attenuation dataset."""
 
 import h5py
 import numpy as np
 import pytest
-import tifffile
 import torch
 
 import mbirtorch.hsnt as hsnt
 from mbirtorch.hsnt._fit import _fit, _fit_fixed_basis
-from mbirtorch.hsnt.loading import _tif_names, infer_input_type, load_dataset
 from hsnt_basis import material_basis
 
 ROWS, COLS, K, R, DOSE = 12, 10, 40, 2, 50.0
@@ -41,81 +38,19 @@ def _relative_error(estimate, X):
 
 @pytest.fixture(scope="module")
 def stacks(tmp_path_factory):
-    """A TIFF stack of counts, two open-beam observations, and the same data as an HDF5 attenuation file."""
-    root = tmp_path_factory.mktemp("hsnt_cli")
+    """The synthetic data as an HDF5 attenuation file."""
+    root = tmp_path_factory.mktemp("hsnt")
     W, H = _truth()
     rng = np.random.default_rng(1)
     X = (W @ H).reshape(ROWS, COLS, K)
-    ob_true = np.full((ROWS, COLS, K), DOSE)
     counts = rng.poisson(DOSE * np.exp(-X)).astype(np.float32)
-    sample = root / "sample"
-    sample.mkdir()
-    for k in range(K):
-        tifffile.imwrite(sample / f"wave_idx_{k:05d}.tif", counts[:, :, k])
-    ob_root = root / "open_beam"
-    for o in range(2):
-        d = ob_root / f"observation_{o + 1:02d}"
-        d.mkdir(parents=True)
-        obs = rng.poisson(ob_true).astype(np.float32)
-        for k in range(K):
-            tifffile.imwrite(d / f"wave_idx_{k:05d}.tif", obs[:, :, k])
     A = -np.log(np.maximum(counts / DOSE, 1e-6)).astype(np.float32)
     h5 = root / "processed.h5"
     with h5py.File(h5, "w") as f:
         g = f.create_group("sample_dataset")
         g.create_dataset("data", data=A[None])                      # (views, rows, cols, bins)
         g.create_dataset("dataset_type", data=np.bytes_("attenuation"))
-    return dict(root=root, sample=str(sample), open_beam=str(ob_root), h5=str(h5), counts=counts)
-
-
-def test_input_types_are_inferred_and_tiffs_read_in_natural_order(stacks, tmp_path):
-    rng = np.random.default_rng(0)
-    assert infer_input_type(rng.uniform(0, 1, 1000))[0] == "transmission"
-    assert infer_input_type(rng.poisson(1.0, 1000).astype(np.float32))[0] == "counts"      # low-dose counts
-    assert infer_input_type(rng.uniform(0, 1, 1000), source_dtype="uint16")[0] == "counts"
-    assert infer_input_type(rng.normal(0.5, 0.4, 1000))[0] == "attenuation"
-    with pytest.raises(ValueError, match="--input-type"):
-        infer_input_type(rng.poisson(1.0, 1000) + rng.uniform(0, 1e-3, 1000))           # noisy transmission or not
-    for name in ("img_10.TIF", "img_2.tif", "img_1.tiff"):
-        (tmp_path / name).write_bytes(b"")
-    assert [os.path.basename(f) for f in _tif_names(str(tmp_path))] == ["img_1.tiff", "img_2.tif", "img_10.TIF"]
-
-
-def test_background_boxes_calibrate_each_tile(tmp_path):
-    """A sample run whose exposure differs from the open beam's by tile reads T = 1 in every sample-free corner after
-    the calibration, and the dose becomes the sample's; transmission and attenuation files of several views, binned
-    and downsampled, are calibrated per view to their true transmission."""
-    rng = np.random.default_rng(3)
-    n, k, dose, exposure = 16, 12, 200.0, np.array([[1.15, 0.9], [1.1, 1.2]])
-    X = np.zeros((n, n, k))
-    X[4:12, 4:12] = rng.uniform(0.2, 1.0, (8, 8, k))                     # the sample, clear of the corners
-    f = np.kron(exposure, np.ones((n // 2, n // 2)))[:, :, None]
-    stacks = {"sample": rng.poisson(dose * f * np.exp(-X)), "ob/observation_01": rng.poisson(np.full(X.shape, dose)),
-              "ob/observation_02": rng.poisson(np.full(X.shape, dose))}
-    for name, counts in stacks.items():
-        (tmp_path / name).mkdir(parents=True)
-        for j, img in enumerate(np.moveaxis(counts.astype(np.float32), -1, 0)):
-            tifffile.imwrite(tmp_path / name / f"wave_idx_{j:05d}.tif", img)
-    sample, ob = str(tmp_path / "sample"), [str(tmp_path / "ob")]
-    boxes = [(0, 3, 0, 3), (0, 3, 13, 16), (13, 16, 0, 3), (13, 16, 13, 16)]
-    corners = [(slice(0, 3), slice(0, 3)), (slice(0, 3), slice(13, 16)), (slice(13, 16), slice(0, 3)),
-               (slice(13, 16), slice(13, 16))]
-    plain = load_dataset(sample, open_beam=ob)
-    ds = load_dataset(sample, open_beam=ob, background_boxes=boxes, background_tiles=(2, 2))
-    for c, e in zip(corners, exposure.ravel()):
-        assert abs(ds.T.reshape(n, n, k)[c].mean() - 1) < 0.02 and abs(plain.T.reshape(n, n, k)[c].mean() - e) < 0.04
-    factor = ds.info["background"]["factor_median"]
-    assert ds.dose == pytest.approx(plain.dose * factor) and factor == pytest.approx(exposure.mean(), abs=0.02)
-    per_bin, (lo, hi) = ds.dose_per_bin / plain.dose_per_bin, ds.info["background"]["factor_range"]
-    assert abs(per_bin.mean() - exposure.mean()) < 0.02 and np.all((per_bin >= lo) & (per_bin <= hi))
-    assert ds.open_beam_observations == pytest.approx(2 / factor)       # dose x observations: the open beam's count
-    views = np.stack([np.exp(-X), np.exp(-X[::-1])]) * np.stack([f, f[::-1, ::-1] * 0.9])[..., None][..., 0]
-    truth = np.stack([np.exp(-X), np.exp(-X[::-1])])[:, ::2, ::2].reshape(2, n // 2, n // 2, k // 2, 2).mean(-1)
-    for kind, data in (("transmission", views), ("attenuation", -np.log(views))):
-        path = str(tmp_path / f"{kind}.h5")
-        hsnt.export_hsnt_data_hdf5(path, data.astype(np.float32), hsnt.create_hsnt_metadata(dataset_type=kind))
-        cal = load_dataset(path, background_boxes=boxes, background_tiles=(2, 2), wave_bin=2, downsample=2)
-        assert np.allclose(cal.T, truth.reshape(-1, k // 2), atol=1e-5)
+    return dict(h5=str(h5))
 
 
 def test_library_dehydrate_and_hyper_denoise(stacks):

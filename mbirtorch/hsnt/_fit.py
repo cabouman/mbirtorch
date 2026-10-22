@@ -4,6 +4,7 @@ it solves for all pixels at once.  Otherwise, it streams chunks of pixels to the
 factorization, it computes the spectra by the method that the caller selects."""
 import logging
 import time
+import warnings
 
 import numpy as np
 import torch
@@ -76,6 +77,18 @@ def _plan(P, K, device, spectra="mle", mode="auto", chunk_pixels=None, compile_m
                 note += f"; the warm-up fits {warmup:,} pixels, not {asked:,}, to stay within the memory"
     log.info("plan: %s solve. %s", mode, note)
     return mode, chunk_pixels, warmup, note
+
+
+def _check_host_memory(n_bytes, what):
+    """This function raises MemoryError if an allocation exceeds the available CPU memory.  It
+    warns if the allocation exceeds half of the available memory."""
+    import psutil
+    avail = psutil.virtual_memory().available
+    if n_bytes > avail:
+        raise MemoryError(f"{what} needs {n_bytes / 2**30:.1f} GiB of host memory but {avail / 2**30:.1f} GiB is "
+                          "available")
+    if n_bytes > 0.5 * avail:
+        warnings.warn(f"{what} needs {n_bytes / 2**30:.1f} GiB of the {avail / 2**30:.1f} GiB of host memory available")
 
 
 def _loss(W, H, T_host, device):
@@ -182,7 +195,6 @@ def _fit(T, rank, device="cpu", mode="auto", chunk_pixels=None, max_steps=1000, 
     if mode == "stream":
         rep["chunk_pixels"] = chunk
         if str(device).startswith("cuda"):           # Each chunk and the next one are held as pinned host copies.
-            from .loading import _check_host_memory
             _check_host_memory(2 * min(chunk, P) * K * T.dtype.itemsize, "the stream's pinned chunk copies")
     t0 = time.perf_counter()
     stats = {}
