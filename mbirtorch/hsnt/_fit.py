@@ -90,7 +90,7 @@ def _loss(W, H, T_host, device):
     """This function computes the float64 NNAL loss of W @ H against the data in host memory.
     It moves the data to the device in chunks of pixels."""
     from ._loss import stable_nnal
-    from .outputs import _CHUNK_ELEMENTS
+    from ._loss import _CHUNK_ELEMENTS
     Hd = H.to(device).double()
     chunk = max(1, _CHUNK_ELEMENTS // T_host.shape[1])
     total = 0.0

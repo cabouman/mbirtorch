@@ -6,7 +6,7 @@ data.  The function ``hyper_denoise`` denoises data by calling both, and ``estim
 estimates the number of spectra.  The functions ``import_hsnt_data_hdf5``,
 ``create_hsnt_metadata``, and ``export_hsnt_data_hdf5`` read and write the hsnt HDF5 format.  The
 functions ``generate_hyper_sinogram``, ``gen_material_phantom``, ``synthetic_material_basis``, and
-``generate_hyper_data`` simulate data.  The ``cli`` module provides the mbirtorch-hsnt command.
+``generate_hyper_data`` simulate data.
 """
 from .denoise import hyper_denoise, dehydrate, rehydrate
 from .rank import estimate_rank

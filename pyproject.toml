@@ -57,10 +57,6 @@ dependencies = [
     "psutil",
 ]
 
-[project.scripts]
-# hsnt from the shell: inspect / convert / dehydrate / rehydrate / denoise (mbirtorch/hsnt/cli.py).
-mbirtorch-hsnt = "mbirtorch.hsnt.cli:main"
-
 [project.optional-dependencies]
 
 test = ["pytest", "pytest-xdist"]

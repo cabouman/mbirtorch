@@ -9,8 +9,7 @@ each of many wavelength bins.  The spectral axis of the data is always the last 
 materials has a low-rank attenuation X = W H, with a nonnegative spectrum per component in H and a map per
 component in W.  The module estimates W and H from the data (dehydration), multiplies them back into denoised data
 (rehydration), estimates the number of components, and reads and writes the hsnt HDF5 layout.  The scripts in
-`experiments/hsnt <https://github.com/cabouman/mbirtorch/blob/main/experiments/hsnt/>`__ are worked examples, and
-`Command line`_ runs the same steps on files.
+`experiments/hsnt <https://github.com/cabouman/mbirtorch/blob/main/experiments/hsnt/>`__ are worked examples.
 
 .. currentmodule:: mbirtorch.hsnt
 
@@ -63,18 +62,3 @@ and the hyperspectral sinogram of the phantom through a tomography model, with P
 .. autofunction:: synthetic_material_basis
 .. autofunction:: generate_hyper_sinogram
 .. autofunction:: generate_hyper_data
-
-
-Command line
-------------
-
-``mbirtorch-hsnt`` runs the same steps from the shell, on an HDF5 file in the hsnt layout or on a directory of TIFF
-images, one per wavelength bin.  Its subcommands are ``inspect``, ``convert`` (TIFFs to HDF5, normalized by an open
-beam), ``dehydrate``, ``rehydrate`` and ``denoise``:
-
-.. code-block:: bash
-
-   mbirtorch-hsnt convert sample_tifs/ --open-beam open_beam/ -o sample.h5
-   mbirtorch-hsnt denoise sample.h5 -o results/
-
-``mbirtorch-hsnt <subcommand> -h`` lists the options.

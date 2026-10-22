@@ -1,7 +1,4 @@
-"""Tests for the mbirtorch-hsnt command line and the library entry points: loading and conversion of synthetic TIFF
-and HDF5 inputs, and dehydrate / rehydrate / denoise runs whose outputs read back through the package's HDF5
-importer."""
-import json
+"""Tests of the loader and of dehydrate and hyper_denoise on synthetic TIFF and HDF5 inputs."""
 import os
 
 import h5py
@@ -11,7 +8,6 @@ import tifffile
 import torch
 
 import mbirtorch.hsnt as hsnt
-from mbirtorch.hsnt.cli import main
 from mbirtorch.hsnt.loading import _tif_names, infer_input_type, load_dataset
 from hsnt_basis import material_basis
 
@@ -36,11 +32,6 @@ def _truth(seed=0):
     W[np.arange(ROWS * COLS), m] = rng.uniform(0.3, 1.5, ROWS * COLS)
     W[: ROWS * COLS // 5] = 0
     return W, H
-
-
-def _report(out, stem):
-    with open(os.path.join(out, f"{stem}_report.json")) as f:
-        return json.load(f)
 
 
 def _relative_error(estimate, X):
@@ -84,57 +75,9 @@ def test_input_types_are_inferred_and_tiffs_read_in_natural_order(stacks, tmp_pa
     assert infer_input_type(rng.normal(0.5, 0.4, 1000))[0] == "attenuation"
     with pytest.raises(ValueError, match="--input-type"):
         infer_input_type(rng.poisson(1.0, 1000) + rng.uniform(0, 1e-3, 1000))           # noisy transmission or not
-    with pytest.raises(SystemExit, match="open-beam"):
-        main(["inspect", stacks["sample"], "-q"])                        # counts without an open beam
     for name in ("img_10.TIF", "img_2.tif", "img_1.tiff"):
         (tmp_path / name).write_bytes(b"")
     assert [os.path.basename(f) for f in _tif_names(str(tmp_path))] == ["img_1.tiff", "img_2.tif", "img_10.TIF"]
-
-
-def test_conversion_matches_the_direct_load(stacks, tmp_path, capsys):
-    """TIFF counts with an open beam and HDF5 attenuation, converted in blocks below one --wave-bin group (one group
-    per block), give what load_dataset gives; the dose, source bins and open-beam observations are recorded. A
-    directory of view directories is read as the views, which share the open beam."""
-    assert main(["inspect", stacks["sample"], "--open-beam", stacks["open_beam"], "-q"]) == 0
-    out = capsys.readouterr().out
-    assert "type counts" in out and f"x {K} bins" in out and "unknown" not in out.split("dose:")[1].split("\n")[0]
-    conv = str(tmp_path / "blocks.h5")
-    assert main(["convert", stacks["sample"], "--open-beam", stacks["open_beam"], "-o", conv, "--as-type",
-                 "transmission", "--wave-bin", "4", "--downsample", "2", "--memory-budget", "0.01", "-q"]) == 0
-    data, meta = hsnt.import_hsnt_data_hdf5(conv)
-    ds = load_dataset(stacks["sample"], open_beam=[stacks["open_beam"]], wave_bin=4, downsample=2)
-    assert ds.T.shape == ((ROWS + 1) // 2 * ((COLS + 1) // 2), K // 4) and ds.open_beam_observations == 2
-    assert meta["dataset_type"] == "transmission" and np.allclose(data.reshape(-1, K // 4), ds.T, atol=1e-6)
-    assert not any("--background-boxes" in c.message for c in ds.checks)          # matched exposures raise no alarm
-    with h5py.File(conv) as f:
-        assert f.attrs["block_bins"] == 4 and f["bin_indices"][()].tolist() == list(range(0, K, 4))
-        assert f.attrs["open_beam_observations"] == 2 and abs(f.attrs["dose"] - ds.dose) / ds.dose < 0.05
-        recorded = float(f.attrs["dose"])
-    back = load_dataset(conv)                                            # read back from the converted file
-    assert back.dose == pytest.approx(recorded) and back.open_beam_observations == 2
-    assert back.bin_indices.tolist() == list(range(0, K, 4)) and back.dose_per_bin.shape == (K // 4,)
-    views = tmp_path / "views"                                           # a directory of view directories
-    for v, counts in enumerate((stacks["counts"], stacks["counts"][::-1])):
-        (views / f"view_{v}").mkdir(parents=True)
-        for k in range(K):
-            tifffile.imwrite(views / f"view_{v}" / f"wave_idx_{k:05d}.tif", counts[:, :, k])
-    both = load_dataset(str(views), open_beam=[stacks["open_beam"]])
-    second = load_dataset(str(views / "view_1"), open_beam=[stacks["open_beam"]])
-    assert both.spatial_shape == (2, ROWS, COLS) and both.info["view_directories"] == ["view_0", "view_1"]
-    assert np.array_equal(both.T, np.concatenate([load_dataset(stacks["sample"], open_beam=[stacks["open_beam"]]).T,
-                                                  second.T]))
-    assert np.array_equal(load_dataset(str(views), open_beam=[stacks["open_beam"]], views=(1, 2)).T, second.T)
-    conv = str(tmp_path / "views.h5")
-    assert main(["convert", str(views), "--open-beam", stacks["open_beam"], "-o", conv, "--memory-budget", "0.01",
-                 "-q"]) == 0
-    assert hsnt.import_hsnt_data_hdf5(conv)[0].shape == (2, ROWS, COLS, K)
-    conv = str(tmp_path / "h5h5.h5")                                     # attenuation in and out
-    assert main(["convert", stacks["h5"], "-o", conv, "--wave-bin", "2", "--downsample", "2", "--memory-budget",
-                 "0.01", "-q"]) == 0
-    data, meta = hsnt.import_hsnt_data_hdf5(conv)
-    with np.errstate(divide="ignore"):
-        ref = -np.log(load_dataset(stacks["h5"], wave_bin=2, downsample=2).T)
-    assert meta["dataset_type"] == "attenuation" and np.allclose(data.reshape(-1, K // 2), ref, atol=1e-5)
 
 
 def test_background_boxes_calibrate_each_tile(tmp_path):
@@ -172,55 +115,6 @@ def test_background_boxes_calibrate_each_tile(tmp_path):
         hsnt.export_hsnt_data_hdf5(path, data.astype(np.float32), hsnt.create_hsnt_metadata(dataset_type=kind))
         cal = load_dataset(path, background_boxes=boxes, background_tiles=(2, 2), wave_bin=2, downsample=2)
         assert np.allclose(cal.T, truth.reshape(-1, k // 2), atol=1e-5)
-
-
-def test_dehydrate_rehydrate_and_denoise_write_readable_outputs(stacks, tmp_path, capsys):
-    out = str(tmp_path / "res")
-    assert main(["dehydrate", stacks["h5"], "-o", out, "--dry-run", "-q"]) == 0          # a dry run writes nothing
-    assert "dry run" in capsys.readouterr().out and not os.listdir(out)
-    run = ["dehydrate", stacks["h5"], "-o", out, "--dose", str(DOSE), "--max-steps", "200", "-q"]
-    assert main(run) == 0
-    assert all(os.path.exists(os.path.join(out, "processed" + s)) for s in ("_dehydrated.h5", "_report.json",
-                                                                              "_maps.png", "_spectra.png"))
-    deh = os.path.join(out, "processed_dehydrated.h5")
-    (W4, H4), _ = hsnt.import_hsnt_data_hdf5(deh)
-    assert W4.shape == (1, ROWS, COLS, R) and H4.shape == (R, K) and W4.min() >= 0
-    W, H = _truth()
-    assert _relative_error(hsnt.rehydrate([W4, H4]), W @ H) < 0.35               # near the true attenuation
-    rep = _report(out, "processed")["result"]
-    assert rep["rank"] == R and "estimated" in rep["rank_note"] and rep["components"]["proportional_pairs"] == []
-    assert 0.5 < rep["fit"]["reduced_chi2"] < 2.0                        # the fit sits at the Poisson noise level
-    with pytest.raises(SystemExit, match="--overwrite"):
-        main(run)
-    assert main(["rehydrate", deh, "-o", out, "-q"]) == 0                # all bins, as attenuation
-    data, meta = hsnt.import_hsnt_data_hdf5(os.path.join(out, "processed_rehydrated.h5"))
-    assert meta["dataset_type"] == "attenuation" and np.allclose(data, W4 @ H4, atol=1e-5)
-    sub = os.path.join(out, "part.h5")                                   # a range, as transmission
-    assert main(["rehydrate", deh, "-o", sub, "--wave-range", "5:15", "--as-type", "transmission", "-q"]) == 0
-    part, meta = hsnt.import_hsnt_data_hdf5(sub)
-    assert meta["dataset_type"] == "transmission" and np.allclose(part, np.exp(-(W4 @ H4[:, 5:15])), atol=1e-5)
-    fixed = str(tmp_path / "fixed")                                      # maps for the spectra of a fitted file
-    assert main(["dehydrate", stacks["h5"], "-o", fixed, "--basis", deh, "--dose", str(DOSE), "--no-plots", "-q"]) == 0
-    (W5, H5), _ = hsnt.import_hsnt_data_hdf5(os.path.join(fixed, "processed_dehydrated.h5"))
-    assert np.array_equal(H5, H4) and np.abs(W5 - W4).max() < 1e-3 * W4.max()
-    assert "from the basis" in _report(fixed, "processed")["result"]["rank_note"]
-    with pytest.raises(SystemExit, match="source bins"):
-        main(["dehydrate", stacks["h5"], "-o", fixed, "--basis", deh, "--wave-range", "0:20", "--overwrite", "-q"])
-    with pytest.raises(SystemExit, match="is an input"):                 # the basis is never replaced
-        main(["dehydrate", stacks["h5"], "-o", out, "--basis", deh, "--overwrite", "-q"])
-    with pytest.raises(SystemExit, match="is an input"):
-        main(["rehydrate", deh, "-o", deh, "--overwrite", "-q"])
-    with pytest.raises(SystemExit, match="not a dehydrated file"):
-        main(["rehydrate", stacks["h5"], "-o", out, "-q"])
-    with h5py.File(deh) as f:
-        assert "subspace_basis" in f                                     # the dehydrated file is intact
-    den = str(tmp_path / "den")
-    assert main(["denoise", stacks["sample"], "--open-beam", stacks["open_beam"], "-o", den, "--rank", str(R),
-                 "--no-dehydrated", "--as-type", "transmission", "--no-plots", "--max-steps", "100", "-q"]) == 0
-    assert sorted(os.listdir(den)) == ["sample_denoised.h5", "sample_report.json"]
-    data, meta = hsnt.import_hsnt_data_hdf5(os.path.join(den, "sample_denoised.h5"))
-    assert meta["dataset_type"] == "transmission" and 0 < data.min() and data.max() < 2
-    assert _relative_error(-np.log(data), W @ H) < 0.35
 
 
 def test_library_dehydrate_and_hyper_denoise(stacks, capsys):

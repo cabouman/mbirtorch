@@ -1,5 +1,9 @@
 import torch
 
+# This is the number of entries per block when a loss or a fit quality is computed in blocks of
+# pixels: 64 MiB per float64 array.
+_CHUNK_ELEMENTS = 2 ** 23
+
 
 def _nnal_prep(T):
     """This function computes the quantities in the loss that depend only on the transmission T.

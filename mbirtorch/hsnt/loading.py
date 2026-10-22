@@ -1313,7 +1313,7 @@ def convert_to_hdf5(path, output=None, open_beam=None, input_type="auto", datase
             columns = range(src.first_index, src.first_index + nb)
             _write_metadata(f, _selected_metadata(src.file_metadata, views, columns, wave_bin, downsample))
             attrs = dict(source=path if isinstance(src, _TiffBlocks) else src.desc, input_type=itype,
-                         downsample=downsample, wave_bin=wave_bin, block_bins=block, mbirtorch_hsnt_cli="1",
+                         downsample=downsample, wave_bin=wave_bin, block_bins=block,
                          checks=json.dumps([dict(level=c.level, message=c.message) for c in checks]))
             if dose is not None:
                 attrs["dose"] = float(dose)
