@@ -8,6 +8,7 @@ import tifffile
 import torch
 
 import mbirtorch.hsnt as hsnt
+from mbirtorch.hsnt._fit import _fit, _fit_fixed_basis
 from mbirtorch.hsnt.loading import _tif_names, infer_input_type, load_dataset
 from hsnt_basis import material_basis
 
@@ -117,7 +118,7 @@ def test_background_boxes_calibrate_each_tile(tmp_path):
         assert np.allclose(cal.T, truth.reshape(-1, k // 2), atol=1e-5)
 
 
-def test_library_dehydrate_and_hyper_denoise(stacks, capsys):
+def test_library_dehydrate_and_hyper_denoise(stacks):
     with h5py.File(stacks["h5"]) as f:
         A = f["sample_dataset/data"][()]                                 # (1, ROWS, COLS, K) attenuation
     sub_data, basis = hsnt.dehydrate(A, "attenuation", num_materials=R, verbose=0)
@@ -131,21 +132,18 @@ def test_library_dehydrate_and_hyper_denoise(stacks, capsys):
     assert est[0].shape == (ROWS, COLS, R)
     den_t = hsnt.hyper_denoise(np.exp(-A), "transmission", num_materials=R, verbose=0)    # transmission in and out
     assert den_t.shape == A.shape and 0 < den_t.min() and _relative_error(-np.log(den_t), X) < 0.35
-    capsys.readouterr()
-    streamed = hsnt.dehydrate(A, "attenuation", num_materials=R, mode="stream", chunk_pixels=40, max_passes=2,
-                              verbose=1)
-    assert "streamed, " in capsys.readouterr().out and streamed[0].shape == sub_data.shape
-    assert streamed[0].min() >= 0 and _relative_error(hsnt.rehydrate(streamed), X) < 0.35
-    with pytest.raises(ValueError, match="chunk_pixels"):
-        hsnt.dehydrate(A, "attenuation", num_materials=R, chunk_pixels=0, verbose=0)
+    T2 = np.exp(-A).reshape(-1, K).astype(np.float32)                 # the streamed fit, in chunks of 40 pixels
+    W_s, H_s, rep = _fit(T2, R, mode="stream", chunk_pixels=40, max_passes=2)
+    assert rep["mode"] == "stream" and W_s.shape == (ROWS * COLS, R) and W_s.min() >= 0
+    assert _relative_error(W_s @ H_s, X) < 0.35
     phantom = material_basis()
     counts, open_beam, _, truth = hsnt.generate_hyper_data(phantom, 1, 8, 8, 300, None, 0)  # the 7th argument is verbose
     assert counts.shape == open_beam.shape == truth.shape == (1, 8, 8, phantom.shape[1])
     assert np.all(open_beam == 300) and np.abs(counts / open_beam - np.exp(-truth)).max() > 1e-2
     maps, same = hsnt.dehydrate(A, "attenuation", subspace_basis=basis, verbose=0)  # the maps of a given basis
     assert np.array_equal(same, basis) and np.abs(maps - sub_data).max() < 1e-3 * sub_data.max()
-    chunked = hsnt.dehydrate(A, "attenuation", subspace_basis=basis, mode="stream", chunk_pixels=40, verbose=1)[0]
-    assert "3 chunk(s)" in capsys.readouterr().out and np.abs(chunked - maps).max() < 1e-4 * maps.max()
+    W_c, _, rep = _fit_fixed_basis(T2, basis, mode="stream", chunk_pixels=40)
+    assert rep["chunks"] == 3 and np.abs(W_c.reshape(maps.shape) - maps).max() < 1e-4 * maps.max()
     with pytest.raises(ValueError, match="subspace_basis"):
         hsnt.dehydrate(A, "attenuation", subspace_basis=basis, num_materials=R + 1, verbose=0)
     with pytest.raises(TypeError, match="MBIRJAX"):

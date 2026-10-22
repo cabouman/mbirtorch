@@ -74,7 +74,7 @@ def _to_transmission(data, dataset_type):
 
 def dehydrate(data, dataset_type="transmission", num_materials=None, *, subspace_basis=None,
               max_steps=1000, rel_tol=1e-8, max_num_est_materials=6, device=None,
-              mode="auto", chunk_pixels=None, max_passes=5, sample_mask=None,
+              mode="auto", max_passes=5, sample_mask=None,
               verbose=1, **kwargs):
     """This function dehydrates hyperspectral data.  It computes a non-negative factorization
     of the data in the attenuation domain.  The spectral axis of the data is always the last axis.
@@ -110,8 +110,6 @@ def dehydrate(data, dataset_type="transmission", num_materials=None, *, subspace
             available and the CPU otherwise.
         mode (str, optional): 'full' holds all pixels in device memory.  'stream' processes
             the pixels in chunks.  'auto' chooses by the available memory.  Defaults to 'auto'.
-        chunk_pixels (int, optional): The pixels per chunk in 'stream' mode.  Defaults to
-            None, which sets it from the available memory.
         max_passes (int, optional): The passes over the chunks in 'stream' mode.  Defaults
             to 5.
         sample_mask (numpy.ndarray or torch.Tensor, optional): A boolean array, True where the
@@ -133,8 +131,6 @@ def dehydrate(data, dataset_type="transmission", num_materials=None, *, subspace
     _reject_unknown_keywords("dehydrate", kwargs)
     if mode not in ("auto", "full", "stream"):
         raise ValueError(f"mode must be 'auto', 'full' or 'stream', got {mode!r}")
-    if chunk_pixels is not None and int(chunk_pixels) < 1:
-        raise ValueError(f"chunk_pixels must be a positive number of pixels, got {chunk_pixels}")
     if int(max_passes) < 0:
         raise ValueError(f"max_passes must be at least 0, got {max_passes}")
     T_all, shape = _to_transmission(data, dataset_type)
@@ -146,8 +142,7 @@ def dehydrate(data, dataset_type="transmission", num_materials=None, *, subspace
     if subspace_basis is not None:
         from ._fit import _fit_fixed_basis
         H = _check_basis(subspace_basis, shape[-1], num_materials)
-        W, H, rep = _fit_fixed_basis(T, H, device=device, mode=mode, chunk_pixels=chunk_pixels, max_steps=max_steps,
-                                     rel_tol=rel_tol)
+        W, H, rep = _fit_fixed_basis(T, H, device=device, mode=mode, max_steps=max_steps, rel_tol=rel_tol)
         if verbose >= 1:
             print("dehydrate(): ")
             print("   -Spectral dimension: ", shape[-1], " -> rank: ", H.shape[0], "(the given subspace_basis)")
@@ -158,8 +153,8 @@ def dehydrate(data, dataset_type="transmission", num_materials=None, *, subspace
             num_materials, note, _ = _estimate_rank(T_all, spatial_shape=_spatial_shape(lead), device=device,
                                                     max_rank=max_num_est_materials,
                                                     verbose=max(0, verbose - 1))
-        W, H, rep = _fit(T, int(num_materials), device=device, mode=mode, chunk_pixels=chunk_pixels,
-                         max_steps=max_steps, rel_tol=rel_tol, max_passes=int(max_passes))
+        W, H, rep = _fit(T, int(num_materials), device=device, mode=mode, max_steps=max_steps, rel_tol=rel_tol,
+                         max_passes=int(max_passes))
         if verbose >= 1:
             solve = f"{rep['steps']} steps" if "steps" in rep else f"streamed, {rep['passes']} polish passes"
             print("dehydrate(): ")
