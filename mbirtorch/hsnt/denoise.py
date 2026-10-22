@@ -8,10 +8,6 @@ from ..utilities import _to_host
 
 # These keywords belong to the MBIRJAX version of dehydrate, which used scikit-learn.  mbirtorch rejects them.
 _L2_KEYWORDS = ("safety_factor", "beta_loss", "max_iter", "tolerance", "batch_size", "random_state")
-# check_mask flags an outside pixel when twice its gain in log likelihood exceeds this chi-square quantile.
-_MASK_CHECK_LEVEL = 0.999
-# check_mask warns when the share of flagged outside pixels exceeds this value.
-_MASK_CHECK_WARN = 0.01
 
 
 def _reject_unknown_keywords(name, kwargs):
@@ -78,7 +74,7 @@ def _to_transmission(data, dataset_type):
 
 def dehydrate(data, dataset_type="transmission", num_materials=None, *, subspace_basis=None, spectra="mle", dose=None,
               penalty="auto", max_steps=1000, rel_tol=1e-8, max_rank=6, device=None,
-              compile_mode="auto", mode="auto", chunk_pixels=None, max_passes=5, sample_mask=None, check_mask=False,
+              compile_mode="auto", mode="auto", chunk_pixels=None, max_passes=5, sample_mask=None,
               verbose=1, **kwargs):
     """This function dehydrates hyperspectral data.  It computes a non-negative factorization
     of the data in the attenuation domain.  The spectral axis of the data is always the last axis.
@@ -132,9 +128,6 @@ def dehydrate(data, dataset_type="transmission", num_materials=None, *, subspace
             sample may be.  Its shape is (rows, cols) for one region shared by all views, or
             (views, rows, cols) for a region per view.  ``W`` is set to zero outside the mask
             and fit only inside it.  Defaults to None.
-        check_mask (bool, optional): When True, the pixels outside ``sample_mask`` are also
-            fit, and a warning is issued when more of them hold attenuation than noise
-            explains.  Defaults to False.
         verbose (int, optional): 0 prints nothing.  1 prints a summary.  2 also prints the
             search for ``num_materials``.  Defaults to 1.
 
@@ -183,9 +176,6 @@ def dehydrate(data, dataset_type="transmission", num_materials=None, *, subspace
             print("   -Spectral dimension: ", shape[-1], " -> rank: ", int(num_materials), f"({note})")
             print("   -Pixels: ", pixels, f"; spectra: {spectra} ({solve})")
     if mask is not None:
-        if check_mask and not mask.all():
-            _check_outside(T, W, np.ascontiguousarray(T_all[~mask]), H, dose, device, mode, chunk_pixels, max_steps,
-                           rel_tol, compile_mode, verbose)
         W_all = np.zeros((T_all.shape[0], W.shape[1]), dtype=np.float32)
         W_all[mask] = W
         W = W_all
@@ -210,48 +200,6 @@ def _sample_mask(sample_mask, lead):
     if not m.any():
         raise ValueError("sample_mask is False everywhere: there are no pixels to fit")
     return np.ascontiguousarray(m).reshape(-1)
-
-
-def _check_outside(T_in, W_in, T_out, H, dose, device, mode, chunk_pixels, max_steps, rel_tol, compile_mode, verbose):
-    """This function checks whether the pixels outside ``sample_mask`` hold attenuation.
-
-    It fits each outside pixel to the spectra H and computes the gain in log likelihood over
-    W = 0, in counts.  It uses ``dose`` when it is given.  Otherwise it uses the effective dose of
-    the fit inside the mask, as the rank estimate does.  When the mask is correct, twice the gain
-    is at most a chi-square variable with rank degrees of freedom.  This function flags the pixels
-    above the _MASK_CHECK_LEVEL quantile of that variable, and it warns when the flagged share
-    exceeds _MASK_CHECK_WARN.  It returns the flagged share."""
-    import torch
-    from scipy.stats import chi2
-    from ._fit import _fit_fixed_basis
-    from ._loss import _nnal_prep, _nnal_rowwise
-    from .outputs import _CHUNK_ELEMENTS
-    from .rank import _loss_and_residual
-    if dose is None:
-        resid = _loss_and_residual(torch.from_numpy(T_in), torch.from_numpy(W_in), torch.from_numpy(H))[1]
-        dose = 1.0 / max(resid, np.finfo(np.float64).tiny)
-    W_out, _, _ = _fit_fixed_basis(T_out, H, device=device, mode=mode, chunk_pixels=chunk_pixels, max_steps=max_steps,
-                                   rel_tol=rel_tol, compile_mode=compile_mode)
-    R, K = H.shape
-    Hd = torch.as_tensor(H, device=device)
-    rows = max(1, _CHUNK_ELEMENTS // K)
-    gains = []
-    for i in range(0, T_out.shape[0], rows):
-        Tc = torch.from_numpy(T_out[i:i + rows]).to(device)
-        prep = _nnal_prep(Tc)
-        X = torch.from_numpy(W_out[i:i + rows]).to(device) @ Hd
-        gains.append((_nnal_rowwise(torch.zeros_like(X), Tc, prep, 1, dtype=torch.float64)
-                      - _nnal_rowwise(X, Tc, prep, 1, dtype=torch.float64)).cpu())
-    gain = float(dose) * torch.cat(gains).numpy()
-    share = float(np.mean(2 * gain > chi2.ppf(_MASK_CHECK_LEVEL, R)))
-    chance = 100 * (1 - _MASK_CHECK_LEVEL)
-    if verbose >= 1:
-        print(f"   -Outside the sample_mask: {T_out.shape[0]} pixels.  {100 * share:.3g}% hold more attenuation "
-              f"than noise explains, and {chance:.3g}% would by chance.")
-    if share > _MASK_CHECK_WARN:
-        warnings.warn(f"{100 * share:.3g}% of the pixels outside the sample_mask hold more attenuation than noise "
-                      f"explains, and {chance:.3g}% would by chance.  The sample may extend beyond the mask.")
-    return share
 
 
 def _check_basis(subspace_basis, bins, num_materials, spectra):
