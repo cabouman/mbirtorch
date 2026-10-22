@@ -90,7 +90,7 @@ after ``num_materials`` are keyword only, and MBIRJAX's NMF keywords (``safety_f
 
 Without ``num_materials`` the rank is estimated.  ``mode`` and ``chunk_pixels`` bound the
 memory, as ``batch_size`` did, and ``verbose=2`` prints the rank search rather than plotting it.
-``subspace_basis`` keeps its meaning, with the given spectra always held fixed (MBIRJAX refitted
+``spectra``, formerly ``subspace_basis``, keeps its meaning, with the given spectra always held fixed (MBIRJAX refitted
 them for data of up to 2**27 entries); leave out ``num_materials`` then, since the rank is the
 basis's number of rows.  ``generate_hyper_data`` returns the Poisson counts and the open beam
 (noiseless, ``dosage_rate`` everywhere) rather than an attenuation: divide the counts by the open

@@ -46,16 +46,13 @@ def stacks(tmp_path_factory):
     counts = rng.poisson(DOSE * np.exp(-X)).astype(np.float32)
     A = -np.log(np.maximum(counts / DOSE, 1e-6)).astype(np.float32)
     h5 = root / "processed.h5"
-    with h5py.File(h5, "w") as f:
-        g = f.create_group("sample_dataset")
-        g.create_dataset("data", data=A[None])                      # (views, rows, cols, bins)
-        g.create_dataset("dataset_type", data=np.bytes_("attenuation"))
+    hsnt.export_hsnt_data_hdf5(h5, A[None], "attenuation")            # (views, rows, cols, bins)
     return dict(h5=str(h5))
 
 
 def test_library_dehydrate_and_hyper_denoise(stacks):
-    with h5py.File(stacks["h5"]) as f:
-        A = f["sample_dataset/data"][()]                                 # (1, ROWS, COLS, K) attenuation
+    A, meta = hsnt.import_hsnt_data_hdf5(stacks["h5"])                 # (1, ROWS, COLS, K) attenuation
+    assert meta["dataset_type"] == "attenuation" and A.shape == (1, ROWS, COLS, K)
     sub_data, basis = hsnt.dehydrate(A, "attenuation", num_materials=R, verbose=0)
     assert sub_data.shape == (1, ROWS, COLS, R) and basis.shape == (R, K)
     assert sub_data.min() >= 0 and basis.min() >= 0 and sub_data.dtype == np.float32
@@ -75,11 +72,36 @@ def test_library_dehydrate_and_hyper_denoise(stacks):
     counts, open_beam, _, truth = hsnt.generate_hyper_data(phantom, 1, 8, 8, 300, None, 0)  # the 7th argument is verbose
     assert counts.shape == open_beam.shape == truth.shape == (1, 8, 8, phantom.shape[1])
     assert np.all(open_beam == 300) and np.abs(counts / open_beam - np.exp(-truth)).max() > 1e-2
-    maps, same = hsnt.dehydrate(A, "attenuation", subspace_basis=basis, verbose=0)  # the maps of a given basis
+    maps, same = hsnt.dehydrate(A, "attenuation", spectra=basis, verbose=0)  # the maps of a given basis
     assert np.array_equal(same, basis) and np.abs(maps - sub_data).max() < 1e-3 * sub_data.max()
     W_c, _, rep = _fit_fixed_basis(T2, basis, mode="stream", chunk_pixels=40)
     assert rep["chunks"] == 3 and np.abs(W_c.reshape(maps.shape) - maps).max() < 1e-4 * maps.max()
-    with pytest.raises(ValueError, match="subspace_basis"):
-        hsnt.dehydrate(A, "attenuation", subspace_basis=basis, num_materials=R + 1, verbose=0)
+    with pytest.raises(ValueError, match="spectra"):
+        hsnt.dehydrate(A, "attenuation", spectra=basis, num_materials=R + 1, verbose=0)
     with pytest.raises(TypeError, match="MBIRJAX"):
         hsnt.hyper_denoise(A, num_materials=R, safety_factor=2, verbose=0)          # the NMF's keywords are refused
+
+
+def test_the_hsnt_file_round_trips_both_kinds_and_the_model(tmp_path):
+    """A dehydrated file and a hyperspectral file read back as written, with the model rebuilt from the file;
+    a file without the format header and a dehydrated file given a dataset_type are refused."""
+    import mbirtorch as mt
+    angles = np.linspace(0, np.pi, 4, endpoint=False)
+    model = mt.ParallelBeamModel((4, 6, 6), angles)
+    maps = np.random.default_rng(0).random((4, 6, 6, 2), dtype=np.float32)
+    spectra = np.random.default_rng(1).random((2, 9), dtype=np.float32)
+    deh, hyp = str(tmp_path / "deh.h5"), str(tmp_path / "hyp.h5")
+    hsnt.export_hsnt_data_hdf5(deh, [maps, spectra], name="t", wavelengths=np.arange(9) + 1.0, model=model)
+    (maps2, spectra2), meta = hsnt.import_hsnt_data_hdf5(deh)
+    assert np.array_equal(maps2, maps) and np.array_equal(spectra2, spectra) and meta["dataset_type"] is None
+    assert meta["name"] == "t" and np.array_equal(meta["wavelengths"], np.arange(9) + 1.0) and meta["angles"] is None
+    assert type(meta["model"]) is mt.ParallelBeamModel and np.allclose(meta["model"].get_params("angles"), angles)
+    hsnt.export_hsnt_data_hdf5(hyp, maps @ spectra, "transmission")
+    data, meta = hsnt.import_hsnt_data_hdf5(hyp)
+    assert np.allclose(data, maps @ spectra) and meta["dataset_type"] == "transmission" and meta["model"] is None
+    with pytest.raises(ValueError, match="always attenuation"):
+        hsnt.export_hsnt_data_hdf5(deh, [maps, spectra], "attenuation")
+    with h5py.File(str(tmp_path / "old.h5"), "w") as f:
+        f.create_dataset("data", data=maps)
+    with pytest.raises(ValueError, match="not an hsnt file"):
+        hsnt.import_hsnt_data_hdf5(str(tmp_path / "old.h5"))

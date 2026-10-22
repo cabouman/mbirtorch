@@ -39,7 +39,7 @@ A few more facts about ``dehydrate``:
 
 * The fitted spectra span the materials' spectra, but they need not be the spectra of pure materials.
 * Data too large for the GPU are fitted in chunks of pixels.
-* Given a ``subspace_basis``, only the maps are fitted.  This is how a large scan is dehydrated piece by piece,
+* Given ``spectra``, only the maps are fitted.  This is how a large scan is dehydrated piece by piece,
   against spectra fitted on part of it.
 * Given a ``sample_mask``, only the pixels inside the mask are fitted.  The maps are zero outside it.
 
@@ -51,9 +51,12 @@ A few more facts about ``dehydrate``:
 Import/Export
 -------------
 
-.. autofunction:: import_hsnt_data_hdf5
-.. autofunction:: create_hsnt_metadata
+``export_hsnt_data_hdf5`` writes hyperspectral data or dehydrated data to one HDF5 file, and
+``import_hsnt_data_hdf5`` reads it back.  The root of the file carries a format version and the mbirtorch
+version that wrote it, so a later mbirtorch can tell what it is reading.
+
 .. autofunction:: export_hsnt_data_hdf5
+.. autofunction:: import_hsnt_data_hdf5
 
 
 Synthetic data
