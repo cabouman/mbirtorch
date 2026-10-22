@@ -15,6 +15,7 @@ from mbirtorch.hsnt import _newton
 from mbirtorch.hsnt._loss import _nnal_prep, stable_nnal, stable_nnal_derivatives
 from mbirtorch.hsnt._streaming import _stream_factorization
 from mbirtorch.hsnt.factorization import _initial_factors, _nnal_factorization
+from mbirtorch.hsnt.rank import estimate_rank
 from hsnt_basis import material_basis
 
 
@@ -190,9 +191,9 @@ def test_compiled_and_eager_solves_agree():
 
 def test_rank_estimate_finds_the_rank_with_pooling(dev):
     """The sphere phantom has rank 3 at full resolution and pooled.  (A rank estimated from attenuation data is run
-    by the dehydrate call in test_hsnt_cli.py.)"""
+    by the dehydrate call in test_hsnt_library.py.)"""
     T = _sphere_problem(dev).reshape(48, 48, -1)
-    n, _, detail = hsnt.estimate_rank(T, "transmission", max_rank=5, device=dev, pool=2)
+    n, _, detail = estimate_rank(T, "transmission", max_rank=5, device=dev, pool=2)
     assert n == 3 and detail["rank_full"] == 3 and detail["pool_block"] == 2 and detail["pooled"]["pixels"] == 24 * 24
 
 

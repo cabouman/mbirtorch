@@ -73,7 +73,7 @@ def _to_transmission(data, dataset_type):
 
 
 def dehydrate(data, dataset_type="transmission", num_materials=None, *, subspace_basis=None,
-              max_steps=1000, rel_tol=1e-8, max_rank=6, device=None,
+              max_steps=1000, rel_tol=1e-8, max_num_est_materials=6, device=None,
               mode="auto", chunk_pixels=None, max_passes=5, sample_mask=None,
               verbose=1, **kwargs):
     """This function dehydrates hyperspectral data.  It computes a non-negative factorization
@@ -104,8 +104,8 @@ def dehydrate(data, dataset_type="transmission", num_materials=None, *, subspace
         max_steps (int, optional): The maximum number of solver iterations.  Defaults to 1000.
         rel_tol (float, optional): The solver stops when the relative change in the loss falls
             below this value.  Defaults to 1e-8.
-        max_rank (int, optional): The largest :math:`N_m` that the estimate of
-            ``num_materials`` tries.  Defaults to 6.
+        max_num_est_materials (int, optional): Only used when ``num_materials`` is not given.
+            The estimate tries 1 to this many materials.  Defaults to 6.
         device (str, optional): The torch device.  Defaults to None, which uses CUDA when
             available and the CPU otherwise.
         mode (str, optional): 'full' holds all pixels in device memory.  'stream' processes
@@ -156,7 +156,8 @@ def dehydrate(data, dataset_type="transmission", num_materials=None, *, subspace
         note = f"rank {num_materials} given"
         if num_materials is None:
             num_materials, note, _ = _estimate_rank(T_all, spatial_shape=_spatial_shape(lead), device=device,
-                                                    max_rank=max_rank, verbose=max(0, verbose - 1))
+                                                    max_rank=max_num_est_materials,
+                                                    verbose=max(0, verbose - 1))
         W, H, rep = _fit(T, int(num_materials), device=device, mode=mode, chunk_pixels=chunk_pixels,
                          max_steps=max_steps, rel_tol=rel_tol, max_passes=int(max_passes))
         if verbose >= 1:

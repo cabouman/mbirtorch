@@ -4,11 +4,14 @@
 Hyperspectral CT
 ================
 
-The ``hsnt`` module processes hyperspectral neutron transmission data: the transmission of every detector pixel in
-each of many wavelength bins.  The spectral axis of the data is always the last axis.  A sample made of a few
-materials has a low-rank attenuation X = W H, with a nonnegative spectrum per component in H and a map per
-component in W.  The module estimates W and H from the data (dehydration), multiplies them back into denoised data
-(rehydration), estimates the number of components, and reads and writes the hsnt HDF5 layout.  The scripts in
+The ``hsnt`` module works on hyperspectral neutron data.  Each detector pixel holds a spectrum: one
+value per wavelength bin.  The spectral axis of the data is always the last axis.
+
+A sample made of a few materials has an attenuation of low rank, ``X = W H``.  Each row of ``H`` is the
+spectrum of one material, and each column of ``W`` is the map of that material over the pixels.  Both are
+nonnegative.  The module fits ``W`` and ``H`` to the data, which we call dehydration, and multiplies them back
+into denoised data, which we call rehydration.  It also estimates the number of materials, and it reads and
+writes the hsnt HDF5 file.  The scripts in
 `experiments/hsnt <https://github.com/cabouman/mbirtorch/blob/main/experiments/hsnt/>`__ are worked examples.
 
 .. currentmodule:: mbirtorch.hsnt
@@ -17,9 +20,9 @@ component in W.  The module estimates W and H from the data (dehydration), multi
 Dehydration and rehydration
 ---------------------------
 
-Dehydration fits W and H by maximum likelihood: the Poisson likelihood of the counts, written in terms of the
-transmission T = exp(-X).  The natural input is therefore the transmission, the counts divided by the open beam,
-and a zero count is simply a zero transmission:
+``dehydrate`` fits ``W`` and ``H`` by maximum likelihood.  The counts are Poisson, and the likelihood is
+written in terms of the transmission, ``T = exp(-W H)``.  So the natural input is the transmission, which is the
+counts divided by the open beam.  A zero count is simply a zero transmission:
 
 .. code-block:: python
 
@@ -27,20 +30,23 @@ and a zero count is simply a zero transmission:
    maps, spectra = hsnt.dehydrate(transmission, dataset_type='transmission')
    denoised = hsnt.rehydrate([maps, spectra], dataset_type='transmission')
 
-The dehydrated form ``[maps, spectra]`` is small: the maps have one entry per pixel and component, and
-the spectra one per component and bin.  The maps and spectra always describe attenuation, and
-``rehydrate`` returns attenuation or transmission, as its ``dataset_type`` says.  When the number of components is
-not given, it is estimated by likelihood-ratio tests.  The components span the materials' spectra but need not be
-the materials themselves.  Data too large for the device are fitted by
-chunks of pixels.  Given a ``subspace_basis``, ``dehydrate`` fits only the maps, so a large scan can be dehydrated
-piece by piece against spectra fitted on part of it.  Given a ``sample_mask``, ``dehydrate`` fits only the pixels
-inside the mask and sets the maps to zero outside it.  With ``check_mask=True``, it warns when the pixels outside hold
-more attenuation than noise explains.
+The output ``[maps, spectra]`` takes far less memory than the data.  The data hold one value per pixel and
+bin.  The maps hold one value per pixel and material, and the spectra hold one value per material and bin.
+With a few materials and hundreds of bins, that is a reduction of about a hundred times.  The maps and spectra
+always describe attenuation.  ``rehydrate`` returns attenuation or transmission, as its ``dataset_type`` says.
+
+A few more facts about ``dehydrate``:
+
+* If ``num_materials`` is not given, it is estimated by likelihood-ratio tests.
+* The fitted spectra span the materials' spectra, but they need not be the spectra of pure materials.
+* Data too large for the GPU are fitted in chunks of pixels.
+* Given a ``subspace_basis``, only the maps are fitted.  This is how a large scan is dehydrated piece by piece,
+  against spectra fitted on part of it.
+* Given a ``sample_mask``, only the pixels inside the mask are fitted.  The maps are zero outside it.
 
 .. autofunction:: dehydrate
 .. autofunction:: rehydrate
 .. autofunction:: hyper_denoise
-.. autofunction:: estimate_rank
 
 
 Import/Export

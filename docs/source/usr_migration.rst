@@ -100,9 +100,7 @@ are normalized by their open beam.  A seed therefore gives different data, and `
 scales a rounded bar about 10 thick at its center, not a thickness, so the MBIRJAX 0.6.11 to
 0.6.15 values do not carry over (the defaults 2, 2, 10 became 0.2, 0.2, 1), and it returns
 ``[counts, open_beam, angles, truth]``, each of shape (views, rows, columns, bins), with ``truth``
-the noiseless attenuation.  The ``hsnt`` module also adds
-``estimate_rank``.  See
-:ref:`HSNTDocs`.
+the noiseless attenuation.  See :ref:`HSNTDocs`.
 
 
 Removed names
