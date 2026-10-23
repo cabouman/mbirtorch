@@ -18,6 +18,8 @@ from .geometry_rules import channel_index, pixel_xy, rotate_about_z, row_index
 from .horizontal_fan import fan_back_batch, fan_forward_batch
 from .projectors import maybe_compile
 from .qggmrf import qggmrf_slice_pair_sum
+from ._redundancy import (_FULL_ROTATION_TOL, _apply_view_channel_weights, _redundancy_weights,
+                          _whole_rotations)
 from .tomography_model import TomographyModel
 from .vcd_utils import get_support_radius
 
@@ -743,7 +745,112 @@ class ConeBeamModel(TomographyModel):
         coverage = np.sum(visible, axis=1)
         return np.where(coverage > 0, num_views / np.maximum(coverage, 1), 0.0)
 
-    def recon_fdk(self, sinogram, filter_name="ramp", output_sharded=False):
+    def get_scan_range(self):
+        """This method returns the angular range of the views in radians.
+
+        The views are assumed to be equally spaced.  The range is the view spacing times the
+        number of views, so a full rotation of equally spaced views has a range of 2 pi.  A
+        model with one view has a range of zero.
+
+        Returns:
+            scan_range (float): The angular range in radians.
+        """
+        angles = np.asarray(self.get_params('view_params_array'), dtype=np.float64)[:, 0]
+        num_views = angles.size
+        if num_views < 2:
+            return 0.0
+        return float(abs(angles[-1] - angles[0]) * num_views / (num_views - 1))
+
+    def redundancy_weights(self):
+        """This method returns the redundancy weights that FDK needs for a circular scan whose
+        views do not cover a whole number of rotations.
+
+        FDK counts every measurement of a line through the object equally.  That is right when
+        the views cover a whole number of rotations, because every line is then measured the
+        same number of times.  Over any other range some lines are measured more often than
+        others, and the weights make the measurements of each line add up to one.  For a short
+        scan, which covers less than a full rotation, the weights are the Parker weights in the
+        form of Wesarg, Ebert and Bortfeld (Med. Phys. 29, 2002), and the range must be at least
+        180 degrees plus the fan angle.  For a range above a full rotation, the weights ramp up
+        over the excess beyond the whole rotations at the start of the range and ramp down over
+        the same excess at the end.  The weights include the factor that corrects the filter
+        scale of :meth:`recon_fdk`, which is set for a full rotation.  :meth:`recon_fdk`
+        applies the weights itself, so most users do not call this method.
+
+        Returns:
+            weights (ndarray or None): A (num_views, num_det_channels) float32 array that
+            multiplies the sinogram before the FDK filter, or None when the views cover a whole
+            number of rotations.  The method also returns None, with a warning, when the range
+            is shorter than 180 degrees plus the fan angle, because such a scan does not
+            measure every line through the object.
+        """
+        angles = np.asarray(self.get_params('view_params_array'), dtype=np.float64)[:, 0]
+        num_views = angles.size
+        scan_range = self.get_scan_range()
+        if num_views < 2 or _whole_rotations(scan_range) is not None:
+            return None
+        gamma = self._channel_fan_angles()
+        if not self._warn_if_range_too_short(scan_range, gamma):
+            return None
+        # Each view is the center of its bin, and the bins tile the range [0, scan_range].
+        beta = (np.arange(num_views) + 0.5) * scan_range / num_views
+        if angles[-1] < angles[0]:
+            beta = beta[::-1].copy()
+        weights = _redundancy_weights(beta[:, None], gamma[None, :], scan_range)
+        # recon_fdk scales the filter by pi / num_views, which is the weight of a full rotation.
+        weights = weights * (scan_range / np.pi)
+        return weights.astype(np.float32)
+
+    def _channel_fan_angles(self):
+        """This method returns minus the fan angle of each channel, for the redundancy
+        weights.
+
+        In this geometry the source turns clockwise as the view angle grows, and a channel with
+        positive u lies counterclockwise of the central ray.  The line of view angle theta and
+        channel u is measured again at view angle theta + pi - 2 atan(u / source_detector_dist)
+        and channel -u.  The weight formula pairs the positions beta and beta + pi + 2 gamma,
+        so gamma is minus the fan angle.
+        """
+        _, num_rows, num_channels = (int(x) for x in self.get_params('sinogram_shape'))
+        (delta_det_channel, delta_det_row, det_channel_offset, det_row_offset,
+         source_detector_dist, use_curved_detector) = self.get_params(
+            ['delta_det_channel', 'delta_det_row', 'det_channel_offset', 'det_row_offset',
+             'source_detector_dist', 'use_curved_detector'])
+        u, _ = self.detector_mn_to_uv(0.0, np.arange(num_channels), delta_det_channel,
+                                      delta_det_row, det_channel_offset, det_row_offset,
+                                      num_rows, num_channels)
+        if use_curved_detector:
+            return -u / source_detector_dist
+        return -np.arctan(u / source_detector_dist)
+
+    @staticmethod
+    def _warn_if_range_too_short(scan_range, gamma):
+        """This method returns False, with a warning, when a range is shorter than 180 degrees
+        plus the fan angle, and True otherwise."""
+        gamma_max = float(np.max(np.abs(gamma)))
+        if 0.5 * (scan_range - np.pi) < gamma_max - _FULL_ROTATION_TOL:
+            warnings.warn('The views cover {:.1f} degrees, which is less than 180 degrees plus '
+                          'the fan angle of {:.1f} degrees.  Such a scan does not measure every '
+                          'line through the object, so recon_fdk applies no redundancy '
+                          'weights.'.format(np.degrees(scan_range), np.degrees(2 * gamma_max)),
+                          UserWarning)
+            return False
+        return True
+
+    def _apply_redundancy_weights(self, sinogram):
+        """This method multiplies a sinogram on the devices by the redundancy weights of a
+        circular scan.  It returns the weighted sinogram and True, or the sinogram unchanged and
+        False when no weights apply, which includes every helical scan."""
+        helical_z_shifts = np.asarray(self.get_params('view_params_array'))[:, 1]
+        if float(np.max(helical_z_shifts) - np.min(helical_z_shifts)) > 0:
+            return sinogram, False
+        weights = self.redundancy_weights()
+        if weights is None:
+            return sinogram, False
+        return _apply_view_channel_weights(sinogram, weights), True
+
+    def recon_fdk(self, sinogram, filter_name="ramp", output_sharded=False,
+                  redundancy_weighting=True):
         """
         This method reconstructs a volume from a sinogram by the FDK algorithm.
 
@@ -758,19 +865,30 @@ class ConeBeamModel(TomographyModel):
                 True, the method returns the result on the devices.  This result is a torch
                 tensor for a model on one device, or a Shards container with one tensor per
                 device for a model on several devices.  Defaults to False.
+            redundancy_weighting (bool, optional): If True, the method multiplies the sinogram of
+                a circular scan by the weights of :meth:`redundancy_weights` before the filter, so
+                that every line through the object counts once when the views do not cover a
+                whole number of rotations.  If False, the method applies no such weights, and a
+                short scan gives a shaded result with a wrong scale.  A helical scan gets no
+                weights either way.  Defaults to True.
 
         Returns:
             recon (numpy or tensor): The reconstructed volume.
 
         Note:
-            FDK assumes equally spaced views over the full angular range.  It applies no
-            short-scan weighting.  For helical scans, FDK gives an approximate result.  The FDK
-            result is useful as an initial value for ``recon()``.
+            FDK assumes equally spaced views.  A circular scan may cover any range of at least
+            180 degrees plus the fan angle.  For a helical scan, FDK scales each slice by the
+            inverse of the fraction of the views that see it (:meth:`helical_fdk_z_weight`),
+            which gives an approximate result.  The FDK result is useful as an initial value for
+            ``recon()``.
         """
         # This call chooses the GPUs and checks memory for a direct reconstruction before any allocation.
         self._apply_device_policy(workload='direct')
         # The filter places the sinogram on the devices.  This method keeps no reference to the
         # device sinogram during the back projection.
+        sinogram = self._shard_sinogram(sinogram)
+        if redundancy_weighting:
+            sinogram, _ = self._apply_redundancy_weights(sinogram)
         filtered_sinogram = self.fdk_filter(sinogram, filter_name=filter_name,
                                             output_sharded=True)
         recon = self._back_project(filtered_sinogram, output_sharded=True)
