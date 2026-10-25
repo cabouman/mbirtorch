@@ -8,6 +8,8 @@ import warnings
 import numpy as np
 import torch
 
+from ._redundancy import (_FULL_ROTATION_TOL, _apply_view_channel_weights, _redundancy_weights,
+                          _whole_half_rotations)
 from .geometry_rules import channel_index, pixel_xy, rotate_about_z
 from .horizontal_fan import fan_back_batch, fan_forward_batch
 from .tomography_model import TomographyModel
@@ -247,16 +249,76 @@ class ParallelBeamModel(TomographyModel):
                                                filter_scale=scaling_factor,
                                                output_sharded=output_sharded)
 
-    def recon_fbp(self, sinogram, filter_name="ramp", output_sharded=False):
+    def get_scan_range(self):
+        """This method returns the angular range of the views in radians.
+
+        The views are assumed to be equally spaced.  The range is the view spacing times the
+        number of views, so 180 degrees of equally spaced views has a range of pi.  A model with
+        one view has a range of zero.
+
+        Returns:
+            scan_range (float): The angular range in radians.
+        """
+        angles = np.asarray(self.get_params('angles'), dtype=np.float64)
+        num_views = angles.size
+        if num_views < 2:
+            return 0.0
+        return float(abs(angles[-1] - angles[0]) * num_views / (num_views - 1))
+
+    def redundancy_weights(self):
+        """This method returns the redundancy weights that FBP needs when the views do not cover a
+        whole number of half rotations.
+
+        FBP counts every measurement of a line through the object equally.  A parallel beam
+        measures the line of view angle theta again at theta + pi, so every line is measured the
+        same number of times when the views cover a whole number of half rotations.  Over any
+        other range of at least 180 degrees, the weights make the measurements of each line add
+        up to one: they ramp up at the start of the range and down at its end, over the excess
+        beyond 180 degrees for a range below a full rotation, and over the excess beyond the
+        whole rotations above it.  These are the weights of :meth:`ConeBeamModel.redundancy_weights`
+        with a fan angle of zero.  The weights include the factor that corrects the filter scale
+        of :meth:`recon_fbp`, which is set for 180 degrees.  :meth:`recon_fbp` applies the weights
+        itself, so most users do not call this method.
+
+        Returns:
+            weights (ndarray or None): A (num_views, num_det_channels) float32 array that
+            multiplies the sinogram before the FBP filter, or None when the views cover a whole
+            number of half rotations.  The method also returns None, with a warning, when the
+            range is shorter than 180 degrees, because such a scan does not measure every line
+            through the object.
+        """
+        angles = np.asarray(self.get_params('angles'), dtype=np.float64)
+        num_views = angles.size
+        scan_range = self.get_scan_range()
+        if num_views < 2 or _whole_half_rotations(scan_range) is not None:
+            return None
+        if scan_range < np.pi - _FULL_ROTATION_TOL:
+            warnings.warn('The views cover {:.1f} degrees, which is less than 180 degrees.  Such a '
+                          'scan does not measure every line through the object, so recon_fbp '
+                          'applies no redundancy weights.'.format(np.degrees(scan_range)),
+                          UserWarning)
+            return None
+        # Each view is the center of its bin, and the bins tile the range [0, scan_range].
+        beta = (np.arange(num_views) + 0.5) * scan_range / num_views
+        if angles[-1] < angles[0]:
+            beta = beta[::-1].copy()
+        num_channels = int(self.get_params('sinogram_shape')[2])
+        weights = _redundancy_weights(beta[:, None], np.zeros((1, num_channels)), scan_range)
+        # recon_fbp scales the filter by pi / num_views, which is the weight of 180 degrees.
+        weights = weights * (scan_range / np.pi)
+        return weights.astype(np.float32)
+
+    def recon_fbp(self, sinogram, filter_name="ramp", output_sharded=False,
+                  redundancy_weighting=True):
         """
         This method reconstructs a volume from a sinogram by filtered back projection (FBP).
 
         The back projection is the exact adjoint of the forward projector.
 
         Note:
-            FBP assumes equally spaced view angles over the full angular range.  For other data,
-            FBP gives an approximate result.  This result is useful as an initial value for
-            ``recon()``.
+            FBP assumes equally spaced view angles.  The views may cover any range of at least
+            180 degrees.  For other data, FBP gives an approximate result.  The FBP result is
+            useful as an initial value for ``recon()``.
 
         Args:
             sinogram (numpy or tensor): The sinogram, with shape
@@ -266,12 +328,21 @@ class ParallelBeamModel(TomographyModel):
                 True, the method returns the result on the devices.  This result is a torch
                 tensor for a model on one device, or a Shards container with one tensor per
                 device for a model on several devices.  Defaults to False.
+            redundancy_weighting (bool, optional): If True, the method multiplies the sinogram by
+                the weights of :meth:`redundancy_weights` before the filter, so that every line
+                through the object counts once when the views do not cover a whole number of
+                half rotations.  If False, the method applies no such weights.  Defaults to True.
 
         Returns:
             recon (numpy or tensor): The reconstructed volume.
         """
         # This call chooses the GPUs and checks memory for a direct reconstruction before any allocation.
         self._apply_device_policy(workload='direct')
+        if redundancy_weighting:
+            weights = self.redundancy_weights()
+            if weights is not None:
+                # The weighting makes a new array on the devices; the caller's sinogram is not changed.
+                sinogram = _apply_view_channel_weights(self._shard_sinogram(sinogram), weights)
         # The filter places the sinogram on the devices.  This method keeps no reference to the
         # device sinogram during the back projection.
         filtered_sinogram = self.fbp_filter(sinogram, filter_name=filter_name,
