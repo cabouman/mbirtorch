@@ -251,6 +251,29 @@ def _dense_rank5(dev, dose=1000.0):
     return T, W, H, (dose * f_enum + lam * s_enum.sum(1)).sum().item(), s_enum
 
 
+def test_support_selection_refits_from_a_start_past_the_bound(dev, monkeypatch):
+    """A selected start with a coefficient past the attenuation bound, on a pixel with no counts, still lets the
+    refit move: the spectra change, and the refit ends inside the bound."""
+    import mbirtorch.hsnt.spectra as spectra
+    T, _, _ = _problem(dev)
+    T = T.clone()
+    T[0] = 0                                                               # a pixel with no counts pushes its coefficients up
+    W, H, _ = _mle(T)
+    select = spectra._select_supports
+
+    def past_bound(*args, **kwargs):
+        support, W0, rest = select(*args, **kwargs)
+        W0 = W0.clone()
+        W0[0, 0] = 2 * _newton._X_MAX / H[0].max()                         # twice the bound
+        support[0, 0] = True
+        return support, W0, rest
+
+    monkeypatch.setattr(spectra, "_select_supports", past_bound)
+    Ws, Hs, _, _ = _support_selected_spectra(T, W, H, dose=10.0)
+    assert float((Hs - H).abs().max()) > 0
+    assert float((Ws.max(0).values * Hs.max(1).values).max()) <= _newton._X_MAX * (1 + 1e-4)
+
+
 def test_branch_and_bound_matches_the_enumeration(dev):
     """Branch and bound reproduces the exhaustive search's supports on nearly every pixel of the test problem at the
     same criterion, at rank 3 and on dense rank-5 mixtures. 'auto' is the penalty it names."""

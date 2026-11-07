@@ -10,7 +10,7 @@ import warnings
 import torch
 
 from ._loss import _nnal_prep, _nnal_rowwise, stable_nnal_derivatives
-from ._newton import _ARMIJO_FLOOR, _joint_newton_pcg, _kernels, _resolve_compile, solve_W
+from ._newton import _ARMIJO_FLOOR, _joint_newton_pcg, _kernels, _partner_bound, _resolve_compile, solve_W
 
 
 # These are the maximum steps and the relative tolerance of the unconstrained re-estimate.
@@ -334,6 +334,10 @@ def _support_selected_spectra(T, W, H, dose, penalty='auto', wald_screen=0.0, co
     prep = _nnal_prep(T, weights)
     support, W0, _ = _select_supports(T, W, H, dose, penalty=penalty, wald_screen=wald_screen, weights=weights)
     _guard_components(support, W, W0)
+    # Dropping a material from a pixel can push the pixel's other coefficients past the attenuation bound.  From such a
+    # start, every trial step of the refit clips the spectra to the bound, so the refit accepts no step.  The start is
+    # therefore clipped to the bound first.
+    W0 = W0.clamp(max=_partner_bound(H, 1))
     Wn, Hn, steps, _ = _joint_newton_pcg(T, W0, H, max_steps=_REFIT_MAX_STEPS, cg_max=_CG_MAX, rel_tol=_REFIT_REL_TOL,
                                          prep=prep, nnal=nnal_fn, deriv=deriv, w_mask=support)
     _warn_collinear_rows(Hn)
