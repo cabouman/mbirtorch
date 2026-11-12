@@ -1,6 +1,7 @@
 """Tests for the 4D reconstruction model and the frame-axis filter.
 
-The filter matrix is checked against the transform it replaces.  The model
+The SOR filter matrix is checked on the harmonics of the frame angle that it
+removes and on the terms that it keeps.  The model
 is checked on a 24-view cone-beam scan with a smooth sinogram.  A four-frame
 run with the filter on differs from the same run with it off, and a seeded
 four-frame run gives the same image on two CPU workers as on one.  The smooth sinogram is
@@ -11,11 +12,9 @@ which the qGGMRF line search computes zero over zero.
 import numpy as np
 import pytest
 import torch
-from scipy.fft import dct, idct
 
 import mbirtorch
-from mbirtorch.mace4d import (MACE4DModel, apply_temporal_filter,
-                              temporal_filter_matrix)
+from mbirtorch.mace4d import MACE4DModel, _frame_angles, apply_temporal_filter, sor_filter_matrix
 
 NUM_VIEWS = 24          # 24 views over 360 degrees, 15 degrees per view
 DET_ROWS = 8
@@ -47,88 +46,111 @@ def _smooth_sino(num_views=NUM_VIEWS, rows=DET_ROWS, cols=DET_COLS):
 
 
 def _four_frame_model():
-    """A four-frame model of the 24-view scan, at a period the frame count can
-    carry, so the filter stays on without a warning."""
+    """A four-frame model of the 24-view scan.  Its filter removes only the
+    first harmonic, so it keeps two of the four modes and stays on without a
+    warning."""
     model = MACE4DModel(_small_model(), frames_per_rotation=4, frame_overlap_factor=1.0)
-    model.set_params(verbose=0)
+    model.set_params(verbose=0, sor_order=1)
     return model
 
 
 # ── the frame-axis filter matrix ─────────────────────────────────────────────
-def _dct_filter(x, period, harmonics=True, band_width=1):
-    """The frame-axis filter written as transforms: the reference the matrix
-    must reproduce.  Zeroes the DCT-I modes at the period and its harmonics,
-    with band_width modes on each side, along axis 0."""
-    x = np.asarray(x, dtype=np.float32)
-    num_frames = x.shape[0]
-    if harmonics is False:
-        harmonic_list = [1]
-    elif harmonics is True:
-        harmonic_list = list(range(1, int(np.floor(period / 2)) + 1))
-    else:
-        harmonic_list = list(harmonics)
-    coefficients = dct(x, type=1, norm='ortho', axis=0)
-    for harmonic in harmonic_list:
-        center = int(round(2 * (num_frames - 1) / (period / harmonic)))
-        low, high = max(0, center - band_width), min(num_frames, center + band_width + 1)
-        if low < high:
-            coefficients[low:high, ...] = 0
-    return idct(coefficients, type=1, norm='ortho', axis=0).astype(np.float32)
-
-
-def test_filter_matrix_equals_the_transform_filter():
-    """The matrix reproduces the transform filter on random inputs and on
-    unit impulses at the first and last frames, where the end behavior of
-    the transform shows.  The tolerance is float32 rounding relative to the
-    largest input value.  At period 6 the filter removes every mode of a
-    three-frame axis, one frame cannot be filtered and is refused, and
-    applying the matrix along another axis equals moving that axis to the
-    front and filtering there."""
-    num_frames = 12
-    matrix = temporal_filter_matrix(num_frames, period=6)
-    assert matrix.shape == (num_frames, num_frames) and matrix.dtype == torch.float32
-    rng = np.random.default_rng(num_frames)
-    inputs = [rng.standard_normal((num_frames, 4, 5, 3)).astype(np.float32)]
-    for frame in (0, num_frames - 1):
-        impulse = np.zeros((num_frames, 1, 1, 1), dtype=np.float32)
-        impulse[frame] = 1.0
-        inputs.append(impulse)
-    worst = 0.0
-    for x in inputs:
-        reference = _dct_filter(x, period=6)
-        filtered = apply_temporal_filter(torch.as_tensor(x), matrix, axis=0).numpy()
-        worst = max(worst, float(np.max(np.abs(filtered - reference)) / np.max(np.abs(x))))
-    print(f"filter matrix vs transform filter, {num_frames} frames: {worst:.2e}")
-    assert worst < 1e-5
-    # A symmetric projection, to the same rounding.
+def test_sor_filter_removes_the_harmonics_of_the_frame_angle():
+    """At 6 frames per rotation over 4 whole turns, the filter of order 3 removes 5
+    harmonics, because sin(3 theta) is zero at these angles.  It removes cos(theta),
+    sin(2 theta), and cos(3 theta) terms and keeps a constant.  At order 1, it removes the
+    cos(theta) term and keeps the rest.  The matrix is symmetric and idempotent, and its rows
+    sum to 1.  The tolerance is float32 rounding.  One frame is refused.  Applying the matrix to
+    a tensor gives the same result, and applying it along another axis equals moving that
+    axis to the front and filtering there."""
+    frames_per_rotation, num_turns = 6, 4
+    theta = 0.3 - 2 * np.pi / frames_per_rotation * np.arange(frames_per_rotation * num_turns)
+    matrix = sor_filter_matrix(theta, 3)
+    assert matrix.dtype == torch.float32
     m = matrix.numpy().astype(np.float64)
     symmetry, idempotence = np.max(np.abs(m - m.T)), np.max(np.abs(m @ m - m))
-    print(f"symmetry {symmetry:.2e}, idempotence {idempotence:.2e}")
-    assert symmetry < 1e-5 and idempotence < 1e-5
+    row_sum = np.max(np.abs(m.sum(axis=1) - 1))
+    removed = int(round(len(theta) - np.trace(m)))
+    print(f"harmonics removed {removed}, symmetry {symmetry:.2e}, idempotence {idempotence:.2e}, "
+          f"row sums {row_sum:.2e}")
+    assert m.shape == (len(theta), len(theta)) and removed == 5
+    assert symmetry < 1e-5 and idempotence < 1e-5 and row_sum < 1e-5
 
-    # Three frames at period 6: every mode removed.  The zero is exact, since
-    # the transform of a zeroed coefficient array is zero.
-    assert torch.equal(temporal_filter_matrix(3, period=6), torch.zeros(3, 3))
+    once = 0.2 * np.cos(theta)
+    higher = -0.1 * np.sin(2 * theta) + 0.05 * np.cos(3 * theta)
+    constant = 0.7
+    assert np.max(np.abs(m @ (constant + once + higher) - constant)) < 1e-5
+    first = sor_filter_matrix(theta, 1).numpy().astype(np.float64)
+    assert np.max(np.abs(first @ (constant + once + higher) - (constant + higher))) < 1e-5
+
     with pytest.raises(ValueError, match='at least 2'):
-        temporal_filter_matrix(1, period=6)
+        sor_filter_matrix([0.0], 3)
 
+    # On a tensor with the same signal at every voxel, the filter leaves the constant.
+    signal = torch.as_tensor(constant + once + higher, dtype=torch.float32)
+    filtered = apply_temporal_filter(signal[:, None, None].expand(-1, 2, 3), matrix, axis=0)
+    assert float(torch.max(torch.abs(filtered - constant))) < 1e-5
     # Along another axis: data movement, so the check is exact.
     torch.manual_seed(1)
-    axis_matrix = temporal_filter_matrix(12, period=6)
-    x = torch.randn(5, 12, 4, 3)
-    along_axis_1 = apply_temporal_filter(x, axis_matrix, axis=1)
-    moved = apply_temporal_filter(x.movedim(1, 0), axis_matrix, axis=0).movedim(0, 1)
+    x = torch.randn(5, len(theta), 4, 3)
+    along_axis_1 = apply_temporal_filter(x, matrix, axis=1)
+    moved = apply_temporal_filter(x.movedim(1, 0), matrix, axis=0).movedim(0, 1)
     assert torch.equal(along_axis_1, moved)
 
 
+def test_frame_angles_are_the_middle_of_each_frame():
+    """With a view every -2.5 degrees and frames of 48 views every 24 views, the center of
+    frame k is the angle of view 24 k + 23.5.  This holds also for frames past the first
+    turn."""
+    angles = np.radians(-2.5 * np.arange(400))
+    view_slices = [slice(24 * k, 24 * k + 48) for k in range(15)]
+    expected = np.radians(-2.5 * (24 * np.arange(15) + 23.5))
+    difference = np.angle(np.exp(1j * (_frame_angles(angles, view_slices) - expected)))
+    assert np.max(np.abs(difference)) < 1e-12
+
+
+def test_model_filter_from_float32_angles_equals_the_filter_of_the_exact_angles():
+    """A model holds its angles in float32.  On a scan of 600 views, one every -2.5 degrees,
+    the filter that the model builds at 6 frames per rotation and order 3 removes 5 harmonics.
+    It equals the filter of the exact frame angles to float32 rounding.  This holds when
+    the angles grow past 2 pi and when they are given mod 2 pi."""
+    num_views, frames_per_rotation = 600, 6
+    exact = np.radians(-2.5 * np.arange(num_views))
+    for angles in (exact, np.mod(exact, 2 * np.pi)):
+        ct_model = mbirtorch.ParallelBeamModel((num_views, 2, 8), angles)
+        ct_model.set_params(no_warning=True, verbose=0)
+        model = MACE4DModel(ct_model, frames_per_rotation=frames_per_rotation)
+        matrix, note = model._temporal_filter()
+        centers = np.array([exact[s].mean() for s in model.view_slices])
+        reference = sor_filter_matrix(centers, 3)
+        removed = int(round(model.num_frames - float(matrix.trace())))
+        difference = float(torch.max(torch.abs(matrix - reference)))
+        print(f"{model.num_frames} frames: harmonics removed {removed}, "
+              f"difference {difference:.2e}")
+        assert removed == 5 and '5 of 24 modes removed' in note
+        assert difference < 1e-5
+
+
+def test_model_turns_the_filter_off_when_it_would_remove_all_change():
+    """Four frames at 90 degree steps hold three modes besides their mean.  At order 3 the
+    filter would remove all three, so the model returns no matrix.  At order 1 it removes two
+    modes and keeps two."""
+    model = MACE4DModel(_small_model(), frames_per_rotation=4, frame_overlap_factor=1.0)
+    assert model.num_frames == 4 and model.get_params('sor_order') == 3
+    matrix, note = model._temporal_filter()
+    assert matrix is None and 'turned off' in note
+    model.set_params(sor_order=1)
+    matrix, note = model._temporal_filter()
+    assert matrix is not None and '2 of 4 modes removed' in note
+
+
 def test_reconstructions_run_end_to_end_with_and_without_the_filter(device):
-    """A four-frame run at a period the frame count can carry runs the filter
-    path: two iterations give finite values of the 4D shape that differ from
-    the filter-off run, and the denoiser strength, estimated from the
-    filtered initial image, differs from the filter-off value.  Four frames
-    per rotation with no overlap give four frames from the 24 views, and at
-    four frames the period-4 filter keeps one mode, the zeroth cosine mode,
-    so the filtered stack is not zero."""
+    """A four-frame run with a filter of order 1 runs the filter path: two
+    iterations give finite values of the 4D shape that differ from the
+    filter-off run, and the denoiser strength, estimated from the filtered
+    initial image, differs from the filter-off value.  Four frames per
+    rotation with no overlap give four frames from the 24 views, and the
+    filter keeps two of their four modes, so the filtered stack is not zero."""
     np.random.seed(0)
     filtered = _four_frame_model()
     assert filtered.num_frames == 4
@@ -140,6 +162,7 @@ def test_reconstructions_run_end_to_end_with_and_without_the_filter(device):
                                  stop_threshold_change_pct=0)
     assert on.shape == shape and np.all(np.isfinite(on))
     assert on_dict['recon_params']['iterations completed'] == 2
+    assert '2 of 4 modes removed' in on_dict['recon_params']['temporal filter']
     filtered.set_params(dejitter=False)
     np.random.seed(0)
     off, off_dict = filtered.recon(_smooth_sino(), init_recon=init, max_iterations=2,

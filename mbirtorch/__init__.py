@@ -66,7 +66,7 @@ __all__ = [
     "GeometryScene", "GeometryFigure", "geometry_viewer",
     "SliceViewer4D", "VolumeStack4D", "slice_viewer4d",
     "stitch_arrays", "get_ct_model", "copy_ct_model", "save_volume_as_gif",
-    "MACE4DModel", "temporal_filter_matrix", "apply_temporal_filter",
+    "MACE4DModel", "sor_filter_matrix", "apply_temporal_filter",
     "gen_demo_data", "gen_demo_data_4d", "gen_shepp_logan_3d_reference",
     # Python imports these names on first access through __getattr__.
     "hyper_denoise", "dehydrate", "rehydrate", "import_hsnt_data_hdf5",
@@ -103,7 +103,7 @@ _LAZY_NAMES = {
     'QGGMRFDenoiserAgent': 'mace', 'HyperplaneAgent': 'mace',
     'resolve_device_pool': 'mace',
     'MACE4DModel': 'mace4d',
-    'temporal_filter_matrix': 'mace4d', 'apply_temporal_filter': 'mace4d',
+    'sor_filter_matrix': 'mace4d', 'apply_temporal_filter': 'mace4d',
 }
 
 # These imports are for editors and type checkers only.  tests/test_lazy_exports.py checks
@@ -115,7 +115,7 @@ if TYPE_CHECKING:
                              SliceViewer4D, VolumeStack4D, slice_viewer4d)
     from .mace import (MACE, Task, ForwardProxAgent, QGGMRFDenoiserAgent, HyperplaneAgent,
                        resolve_device_pool)
-    from .mace4d import MACE4DModel, temporal_filter_matrix, apply_temporal_filter
+    from .mace4d import MACE4DModel, sor_filter_matrix, apply_temporal_filter
     from .hsnt import (hyper_denoise, dehydrate, rehydrate,
                        import_hsnt_data_hdf5,
                        export_hsnt_data_hdf5, generate_hyper_data,

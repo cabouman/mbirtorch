@@ -18,7 +18,7 @@ import torch
 import mbirtorch
 from mbirtorch.mace import (MACE, ForwardProxAgent, HyperplaneAgent,
                             QGGMRFDenoiserAgent, Task)
-from mbirtorch.mace4d import apply_temporal_filter, temporal_filter_matrix
+from mbirtorch.mace4d import apply_temporal_filter, sor_filter_matrix
 
 
 def _rel_max(out, ref):
@@ -230,9 +230,9 @@ def test_hyperplane_agent_equals_the_unbatched_operation(device):
     movement, so the check is exact; the denoiser itself checks that the
     frame index comes second in every stack it receives.  With a filter
     matrix, each slab is filtered along the frame axis before denoising:
-    with the zero matrix of three frames at period 6 the identity denoiser
-    returns zeros, and with twelve frames the result equals the filter
-    applied to the whole array."""
+    with the zero matrix of three frames the identity denoiser returns
+    zeros, and with the SOR filter of twelve frames at 6 frames per
+    rotation the result equals the filter applied to the whole array."""
     axis = 2
     torch.manual_seed(7)
     w = torch.randn(3, 5, 6, 7, device=device)
@@ -249,9 +249,9 @@ def test_hyperplane_agent_equals_the_unbatched_operation(device):
 
     torch.manual_seed(12)
     filtered_in = torch.randn(3, 4, 4, 5)
-    agent = HyperplaneAgent(3, lambda dev: (lambda stack: stack), filter_matrix=temporal_filter_matrix(3, 6))
+    agent = HyperplaneAgent(3, lambda dev: (lambda stack: stack), filter_matrix=torch.zeros(3, 3))
     assert torch.equal(agent(filtered_in, 0), torch.zeros_like(filtered_in))
-    matrix = temporal_filter_matrix(12, 6)
+    matrix = sor_filter_matrix(-2 * np.pi / 6 * np.arange(12), 3)
     filtered_in = torch.randn(12, 4, 4, 5)
     agent = HyperplaneAgent(2, lambda dev: (lambda stack: stack), filter_matrix=matrix, batch_size=3)
     rel = _rel_max(agent(filtered_in, 0), apply_temporal_filter(filtered_in, matrix, axis=0))

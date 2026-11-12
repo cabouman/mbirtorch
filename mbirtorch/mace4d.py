@@ -4,7 +4,7 @@ The module divides the scan into overlapping angular windows, one for each time 
 reconstructs one volume for each frame.  :class:`MACE4DModel` holds the volumes in one array
 of shape ``(frames, x, y, z)``.  It computes them as the MACE consensus of a data-fit agent
 and three qGGMRF denoisers.  The overlapping windows produce a periodic modulation along the
-frame axis.  :func:`temporal_filter_matrix` builds a filter that removes this modulation.
+frame axis.  :func:`sor_filter_matrix` builds the filter that removes this modulation.
 """
 
 import concurrent.futures
@@ -30,6 +30,11 @@ _DENOISE_MAX_ITERATIONS = 15
 _DENOISE_STOP_THRESHOLD_PCT = 0.05
 # The size in bytes of each slab when the filter is applied to the data-fit outputs.
 _FILTER_SLAB_BYTES = 64 * 2 ** 20
+# The relative singular value below which sor_filter_matrix leaves out a harmonic.  A harmonic is
+# left out when it is zero at the frame angles or repeats other harmonics there, as
+# sin(3 theta) does at 6 frames per rotation.  A model holds its angles in float32.  The
+# rounding of these angles gives such a harmonic a relative singular value of up to about 1e-5.
+_HARMONIC_RANK_TOL = 1e-4
 
 # The name of each denoiser orientation and the spatial axis that it holds fixed.  The axis
 # index uses the order (frames, x, y, z).
@@ -40,57 +45,13 @@ _TIMING_FIELDS = ['iteration', 'prox_total_sec', 'denoise_total_sec', 'makespan_
 _TASK_FIELDS = ['iteration', 'kind', 'index', 'part', 'worker', 'start_sec', 'end_sec']
 
 
-def temporal_filter_matrix(num_frames, period, harmonics=True, band_width=1):
-    """
-    This function returns the matrix of a filter along the frame axis that removes a periodic
-    modulation.  The filter sets to zero the type-I discrete cosine modes at the period and at
-    its harmonics.  It also sets to zero ``band_width`` modes on each side of each such mode.
-    Use :func:`apply_temporal_filter` to apply the filter.  The number of frames must be
-    several times the period, or the filter removes most of the variation along the frame axis.
-
-    Args:
-        num_frames (int): The number of frames.  It must be at least 2.
-        period (float): The main period of the modulation, in frames.
-        harmonics (bool or list of int, optional): True removes the main period and every
-            harmonic with a period of at least two frames.  False removes only the main period.
-            A list gives the indices of the harmonics to remove.  Defaults to True.
-        band_width (int, optional): The number of modes set to zero on each side of a removed
-            mode.  Defaults to 1.
-
-    Returns:
-        torch.Tensor: The float32 matrix of shape (num_frames, num_frames), on the CPU.
-    """
-    from scipy.fft import dct, idct
-
-    num_frames = int(num_frames)
-    if num_frames < 2:
-        raise ValueError(f'the frame axis needs at least 2 frames to filter; got {num_frames}.')
-    if harmonics is False:
-        harmonic_list = [1]
-    elif harmonics is True:
-        harmonic_list = list(range(1, int(np.floor(period / 2)) + 1))
-    else:
-        harmonic_list = list(harmonics)
-
-    coefficients = dct(np.eye(num_frames, dtype=np.float32), type=1, norm='ortho', axis=0)
-    for harmonic in harmonic_list:
-        removed_period = period / harmonic
-        center = int(round(2 * (num_frames - 1) / removed_period))
-        low = max(0, center - band_width)
-        high = min(num_frames, center + band_width + 1)
-        if low < high:
-            coefficients[low:high, :] = 0
-    matrix = idct(coefficients, type=1, norm='ortho', axis=0).astype(np.float32, copy=False)
-    return torch.as_tensor(np.ascontiguousarray(matrix))
-
-
 def apply_temporal_filter(x, matrix, axis=0):
     """
     This function applies a filter matrix along one axis of a tensor.
 
     Args:
         x (torch.Tensor): The array to filter.
-        matrix (torch.Tensor): A square matrix from :func:`temporal_filter_matrix`.  Its size
+        matrix (torch.Tensor): A square matrix from :func:`sor_filter_matrix`.  Its size
             equals the length of ``axis``.  The function moves it to the device and dtype of
             ``x``.
         axis (int, optional): The axis along which the matrix acts.  Defaults to 0.
@@ -102,6 +63,56 @@ def apply_temporal_filter(x, matrix, axis=0):
     moved = x.movedim(axis, 0)
     filtered = torch.tensordot(matrix, moved, dims=1)
     return filtered.movedim(0, axis)
+
+
+def sor_filter_matrix(angles, order):
+    """
+    This function returns the filter matrix P of Sensor Orthogonal Reconstruction (SOR).  P
+    acts along the frame axis.  The filter removes the part of each voxel that
+    varies with the sensor angle theta of the frame.  At each voxel, it removes the
+    least-squares fit of cos(m theta) and sin(m theta) for m = 1 to p, and it keeps the mean
+    over the frames.  :class:`MACE4DModel` uses this filter when ``dejitter`` is on.  Use
+    :func:`apply_temporal_filter` to apply P to another array.
+
+    Args:
+        angles (array): The sensor angle theta of each frame, in radians.  It is the center
+            angle of the views of the frame.  It needs at least 2 frames.
+        order (int): The highest harmonic p of theta that the filter removes.  A larger p
+            removes changes that vary faster with the angle.
+
+    Returns:
+        torch.Tensor: The float32 matrix P of shape (num_frames, num_frames), on the CPU.
+    """
+    theta = np.asarray(angles, dtype=np.float64)
+    if theta.ndim != 1 or len(theta) < 2:
+        raise ValueError('angles must be a 1D array of at least 2 angles; '
+                         f'got shape {theta.shape}.')
+
+    # The columns of harmonics are cos(m theta) and sin(m theta) for m = 1 to p.  Their means
+    # are removed, so the filter keeps the mean over the frames.  P = I - Q Q^T, where the
+    # columns of Q are an orthonormal basis of the harmonics.
+    harmonics = np.stack([f(m * theta) for m in range(1, int(order) + 1)
+                          for f in (np.cos, np.sin)], axis=1)
+    harmonics -= harmonics.mean(axis=0)
+    basis, singular_values, _ = np.linalg.svd(harmonics, full_matrices=False)
+    basis = basis[:, singular_values > _HARMONIC_RANK_TOL * singular_values.max()]
+    matrix = np.eye(len(theta)) - basis @ basis.T
+    return torch.as_tensor(matrix.astype(np.float32))
+
+
+def _frame_angles(angles, view_slices):
+    """This function returns the sensor angle of each frame, in radians.  It is the center
+    angle of the views of the frame.
+
+    Args:
+        angles (array): The angle of each view of the scan, in radians.
+        view_slices (list of slice): The views of each frame, as in ``MACE4DModel.view_slices``.
+    """
+    angles = np.asarray(angles, dtype=np.float64)
+    # The angle of the summed unit vectors is the center of the views, also when the angles
+    # wrap past 2 pi.
+    return np.array([np.arctan2(np.sin(angles[s]).sum(), np.cos(angles[s]).sum())
+                     for s in view_slices])
 
 
 def _normalize_prior_weights(prior_weight):
@@ -132,19 +143,17 @@ def _write_run_info(path, run_settings):
         f.write('\n'.join(lines) + '\n')
 
 
-def _describe_filter(matrix, num_frames, period):
+def _describe_filter(matrix, order):
     """This function returns one line of text that describes the filter.
 
-    The line lists the periods that the filter removes.  It also gives the number of modes
-    along the frame axis that the filter removes and keeps.
+    The line gives the harmonics of the frame angle that the filter removes.  It also gives
+    the number of modes along the frame axis that the filter removes and keeps.
     """
-    harmonics = list(range(1, int(np.floor(period / 2)) + 1))
-    periods = [period / h for h in harmonics]
+    num_frames = int(matrix.shape[0])
     kept = int(round(float(matrix.trace())))
     removed = num_frames - kept
-    words = ', '.join(f'{p:g}' for p in periods)
-    return (f'removes periods of {words} frames; {removed} of {num_frames} modes removed, '
-            f'{kept} kept')
+    return (f'removes the harmonics 1 to {order} of the frame angle; {removed} of '
+            f'{num_frames} modes removed, {kept} kept')
 
 
 def _permutation(axis):
@@ -318,8 +327,8 @@ class MACE4DModel(ParameterHandler):
     Args:
         ct_model (TomographyModel): The model of the full scan.  It is a ConeBeamModel or a
             ParallelBeamModel with one angle for each view.
-        frames_per_rotation (int, optional): The number of frames in each full rotation.  This
-            number is also the period of the temporal filter.  Defaults to 6.
+        frames_per_rotation (int, optional): The number of frames in each full rotation.
+            Defaults to 6.
         frame_overlap_factor (float, optional): The number of frames that cover any one view.
             Each frame spans ``frame_overlap_factor * 360 / frames_per_rotation`` degrees.
             Defaults to 2.0.
@@ -355,7 +364,7 @@ class MACE4DModel(ParameterHandler):
                         mace_prior_weight=0.5, rho_mann=0.5, prox_num_iterations=3,
                         prox_partition_advance=1.0,
                         prox_warm_start=True, denoiser_warm_start=False, sigma_prox=None,
-                        dejitter=True, dejitter_verbose=0,
+                        dejitter=True, sor_order=3, dejitter_verbose=0,
                         sigma_noise=None, nbr_weight_time=1.0, sharpness=0.0,
                         denoise_slab_gb=2.0)
         self._devices = None
@@ -393,8 +402,10 @@ class MACE4DModel(ParameterHandler):
                 the data.  Defaults to None.
             dejitter (bool): If True, the method applies the temporal filter along the frame
                 axis.  Defaults to True.
-            dejitter_verbose (int): If nonzero, the method logs the periods that the filter
-                removes and the modes that it keeps.  Defaults to 0.
+            sor_order (int): The highest harmonic p of the frame angle that the temporal filter
+                removes.  Defaults to 3.
+            dejitter_verbose (int): If nonzero, the method logs the harmonics that the filter
+                removes and the number of modes that it keeps.  Defaults to 0.
             sigma_noise (float or None): The noise level of all three denoisers.  None
                 estimates it from the initial image.  Defaults to None.
             sigma_x (float): The prior strength of all three denoisers.  Setting it turns off
@@ -505,8 +516,9 @@ class MACE4DModel(ParameterHandler):
                 then it cannot estimate the noise level of the denoisers.
 
         Warns:
-            UserWarning: If the temporal filter is on but there are fewer frames than
-                ``frames_per_rotation``.  The run then continues with the filter off.
+            UserWarning: If the temporal filter is on but it would remove all change between the
+                frames, as it does with too few frames.  The run then continues with the filter
+                off.
 
         Example:
             >>> recon_4d, recon_dict = mace.recon(sinogram, weights=weights, log_dir='./logs')
@@ -531,28 +543,17 @@ class MACE4DModel(ParameterHandler):
             init_recon = self._validate_init_recon(init_recon)
             init_source = 'provided by caller'
 
-        # The filter is turned off when there are fewer frames than the period, or when the
-        # filter would remove every mode.
+        # The filter is turned off when it would remove all change between the frames.
         filter_matrix = None
         dejitter_note = None
         if dejitter:
-            if num_frames < self.frames_per_rotation:
-                dejitter_note = (f'turned off: {num_frames} frames are fewer than the filter period '
-                                 f'of {self.frames_per_rotation}')
-            else:
-                filter_matrix = temporal_filter_matrix(num_frames, period=self.frames_per_rotation)
-                if not bool(torch.any(filter_matrix != 0)):
-                    filter_matrix = None
-                    dejitter_note = (f'turned off: the filter removes every mode of {num_frames} '
-                                     f'frames at a period of {self.frames_per_rotation}')
+            filter_matrix, dejitter_note = self._temporal_filter()
             if filter_matrix is None:
                 dejitter = False
-                warnings.warn(f'The temporal filter was {dejitter_note}.  Use more frames, or set '
-                              'dejitter=False to silence this warning.')
-            else:
-                dejitter_note = _describe_filter(filter_matrix, num_frames, self.frames_per_rotation)
-                if self.get_params('dejitter_verbose'):
-                    self.logger.info(f'[MACE] Temporal filter: {dejitter_note}')
+                warnings.warn(f'The temporal filter was {dejitter_note}.  Use more frames or a '
+                              'smaller sor_order, or set dejitter=False to silence this warning.')
+            elif self.get_params('dejitter_verbose'):
+                self.logger.info(f'[MACE] Temporal filter: {dejitter_note}')
 
         pool = self.devices
         frame_devices = [pool[t % len(pool)] for t in range(num_frames)]
@@ -703,6 +704,25 @@ class MACE4DModel(ParameterHandler):
             'model_params': self.params.copy(),
         }
         return result, recon_dict
+
+    def _temporal_filter(self):
+        """This method returns the matrix of the temporal filter and one line of text that
+        describes the filter.
+
+        The matrix is the SOR filter matrix of the frame angles.  The matrix is None when the
+        filter would remove all change between the frames.
+        """
+        order = int(self.get_params('sor_order'))
+        if self.num_frames > 1:
+            required_params, _, _ = self.ct_model.get_all_params()
+            angles = _frame_angles(required_params['angles'], self.view_slices)
+            matrix = sor_filter_matrix(angles, order)
+            # The trace is the number of modes that the filter keeps.  One of them is the mean
+            # over the frames.
+            if round(float(matrix.trace())) > 1:
+                return matrix, _describe_filter(matrix, order)
+        return None, (f'turned off: at order {order} it would remove all change between the '
+                      f'{self.num_frames} frames')
 
     def _prior_params(self):
         """This method returns the qGGMRF parameters of every denoiser.
@@ -930,6 +950,7 @@ class MACE4DModel(ParameterHandler):
             'denoise slab budget (GB)': float(self.get_params('denoise_slab_gb')),
             'denoiser pixel partitions': 'one per orientation, drawn once from the seed',
             'dejitter': self.get_params('dejitter'),
+            'sor_order': self.get_params('sor_order'),
             'frames_per_rotation': self.frames_per_rotation,
             'frame_overlap_factor': self.frame_overlap_factor,
         }

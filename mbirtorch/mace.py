@@ -809,7 +809,7 @@ class HyperplaneAgent:
         filter_matrix (torch.Tensor, optional): A square matrix whose size is
             the number of frames.  The agent applies this matrix along the frame
             axis of each batch before it denoises the batch.  One example is the
-            matrix from :func:`mbirtorch.mace4d.temporal_filter_matrix`.
+            matrix from :func:`mbirtorch.mace4d.sor_filter_matrix`.
         use_warm_start (bool, optional): If True, the agent keeps the output of
             the previous call.  It passes the matching part of that output to
             the stack denoiser as ``init_stack``.  Defaults to False.
