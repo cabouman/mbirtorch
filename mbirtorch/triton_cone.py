@@ -92,7 +92,8 @@ def _cone_back_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
                       delta_voxel_slice, slice_center, inv_sdd, num_rows_f,
                       PSF_RADIUS: tl.constexpr, COEFF_POWER: tl.constexpr,
                       ACCUMULATE: tl.constexpr,
-                      BLOCK_P: tl.constexpr, BLOCK_L: tl.constexpr):
+                      BLOCK_P: tl.constexpr, BLOCK_L: tl.constexpr,
+                      CHANNEL_RADIUS: tl.constexpr):
     """This function is the Triton back projection kernel.  Each Triton program computes
     one block of pixels and one block of slices of the output.
 
@@ -155,10 +156,10 @@ def _cone_back_kernel(n_p_ptr, centers_ptr, w_p_c_ptr, weight_scale_ptr,
             m_row = tl.minimum(tl.maximum(m_tap_i, 0), num_rows - 1)
 
             row_vals = tl.zeros((BLOCK_P, BLOCK_L), dtype=tl.float32)
-            for tc in _tap_range(0, 2 * PSF_RADIUS + 1):
+            for tc in _tap_range(0, 2 * CHANNEL_RADIUS + 1):
                 # The weight is zero where the tap is outside the detector.  Then the
                 # index is clamped into range.
-                n_tap = centers + (tc - PSF_RADIUS)
+                n_tap = centers + (tc - CHANNEL_RADIUS)
                 w_chan = tl.maximum((w_p_c + 1.0) / 2.0
                                     - _tl_abs(n_p - n_tap.to(tl.float32)), 0.0)
                 w_chan = tl.minimum(w_chan, tl.minimum(w_p_c, 1.0)) * weight_scale
@@ -224,7 +225,7 @@ def _cone_back_view_batch_triton(sino_batch, pixel_indices, view_params_batch,
                                  source_detector_dist, use_curved_detector,
                                  psf_radius, bp_psf_radius, coeff_power=1,
                                  slice_start=0, band_slices=None, plan=None,
-                                 accumulate_into=None):
+                                 accumulate_into=None, channel_psf_radius=None):
     """This function computes the cone beam back projection of one batch of views with
     Triton.  It replaces :func:`mbirtorch.cone_beam._cone_back_view_batch`.
 
@@ -251,8 +252,11 @@ def _cone_back_view_batch_triton(sino_batch, pixel_indices, view_params_batch,
             recon_slice_offset, magnification, source_detector_dist,
             use_curved_detector, psf_radius, bp_psf_radius,
             coeff_power=coeff_power, slice_start=slice_start,
-            band_slices=band_slices, plan=plan)
+            band_slices=band_slices, plan=plan,
+            channel_psf_radius=channel_psf_radius)
         return block if accumulate_into is None else accumulate_into.add_(block)
+    if channel_psf_radius is None:
+        channel_psf_radius = psf_radius
 
     angles = view_params_batch[:, 0]
     z_shifts = view_params_batch[:, 1]
@@ -285,7 +289,7 @@ def _cone_back_view_batch_triton(sino_batch, pixel_indices, view_params_batch,
     inv_sdd = (0.0 if math.isinf(float(source_detector_dist))
                else 1.0 / float(source_detector_dist))
     launch_key = ('back', sino_batch.device.index, int(psf_radius),
-                  int(coeff_power), target is not None, block_p, block_l,
+                  int(channel_psf_radius), int(coeff_power), target is not None, block_p, block_l,
                   int(num_views), int(num_pixels), int(num_channels),
                   int(num_rows_r), launch_band, int(slice_start))
     first_launch = launch_key not in _COMPILED_LAUNCH_KEYS
@@ -303,6 +307,7 @@ def _cone_back_view_batch_triton(sino_batch, pixel_indices, view_params_batch,
             PSF_RADIUS=int(psf_radius), COEFF_POWER=int(coeff_power),
             ACCUMULATE=target is not None,
             BLOCK_P=block_p, BLOCK_L=block_l,
+            CHANNEL_RADIUS=int(channel_psf_radius),
             num_warps=CONE_BACK_NUM_WARPS, num_stages=CONE_BACK_NUM_STAGES)
     _COMPILED_LAUNCH_KEYS.add(launch_key)
     if target is not None:
@@ -455,7 +460,7 @@ def _cone_forward_view_batch_triton(values, pixel_indices, view_params_batch,
                                     recon_slice_offset, magnification,
                                     source_detector_dist, use_curved_detector,
                                     psf_radius, bp_psf_radius, slice_start=0,
-                                    plan=None):
+                                    plan=None, channel_psf_radius=None):
     """This function computes the cone beam forward projection of one batch of views with
     Triton.  It replaces :func:`mbirtorch.cone_beam._cone_forward_view_batch`.
 
@@ -469,6 +474,9 @@ def _cone_forward_view_batch_triton(values, pixel_indices, view_params_batch,
                            'triton installed; the selection in '
                            'ConeBeamModel._view_batch_bodies should have kept '
                            'the torch body (see kernel_availability).')
+    # The forward kernel uses the PSF radius only for the channel taps.
+    if channel_psf_radius is not None:
+        psf_radius = channel_psf_radius
     angles = view_params_batch[:, 0]
     z_shifts = view_params_batch[:, 1]
     n_p, centers, w_p_c, weight_scale, pixel_mag = _cone_horizontal_data(
