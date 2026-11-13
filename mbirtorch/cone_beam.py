@@ -160,14 +160,17 @@ def _cone_forward_view_batch(values, pixel_indices, view_params_batch,
                              det_channel_offset, det_row_offset, recon_slice_offset,
                              magnification, source_detector_dist,
                              use_curved_detector, psf_radius, bp_psf_radius,
-                             slice_start=0, plan=None):
+                             slice_start=0, plan=None, channel_psf_radius=None):
     """This function computes the cone-beam forward projection of one batch of views.
 
     The output has shape (Vb, R, C).  ``values`` can hold only some of the slices.  In that case
     ``values`` has shape (P, L) and holds the L slices that start at ``slice_start``.  The sum of
     the outputs over a set of slice ranges that covers all slices equals the full projection.
+    ``channel_psf_radius`` is the tap radius along the channels, and None uses ``psf_radius``.
     The function ignores ``plan``.
     """
+    if channel_psf_radius is None:
+        channel_psf_radius = psf_radius
     angles = view_params_batch[:, 0]
     z_shifts = view_params_batch[:, 1]
     n_p, centers, W_p_c, weight_scale, pixel_mag = _cone_horizontal_data(
@@ -212,7 +215,7 @@ def _cone_forward_view_batch(values, pixel_indices, view_params_batch,
         det_col = det_col + A * g
 
     acc = fan_forward_batch((n_p, centers, W_p_c, weight_scale), det_col,
-                            num_channels, psf_radius)
+                            num_channels, channel_psf_radius)
     return acc.permute(0, 2, 1)
 
 
@@ -224,13 +227,16 @@ def _cone_back_view_batch(sino_batch, pixel_indices, view_params_batch,
                           det_row_offset, recon_slice_offset, magnification,
                           source_detector_dist, use_curved_detector, psf_radius,
                           bp_psf_radius, coeff_power=1, slice_start=0,
-                          band_slices=None, plan=None):
+                          band_slices=None, plan=None, channel_psf_radius=None):
     """This function computes the cone-beam back projection of one batch of views.
 
     The function sums the result over the views in the batch.  The output has shape (P, S).  If
     ``band_slices`` is given, the output has shape (P, band_slices) and holds the slices that
-    start at ``slice_start``.  The function ignores ``plan``.
+    start at ``slice_start``.  ``channel_psf_radius`` is the tap radius along the channels, and
+    None uses ``psf_radius``.  The function ignores ``plan``.
     """
+    if channel_psf_radius is None:
+        channel_psf_radius = psf_radius
     angles = view_params_batch[:, 0]
     z_shifts = view_params_batch[:, 1]
     n_p, centers, W_p_c, weight_scale, pixel_mag = _cone_horizontal_data(
@@ -242,7 +248,7 @@ def _cone_back_view_batch(sino_batch, pixel_indices, view_params_batch,
 
     sino_T = sino_batch.permute(0, 2, 1).contiguous()
     det_col = fan_back_batch(sino_T, (n_p, centers, W_p_c, weight_scale),
-                             num_channels, psf_radius,
+                             num_channels, channel_psf_radius,
                              coeff_power=coeff_power, reduce_views=False)
 
     m0, W_p_r, z_offset = _cone_vertical_affine(
@@ -363,7 +369,7 @@ class ConeBeamModel(TomographyModel):
         (ddr, ddc, dro, dco, sdd, dv, vra, vsa, rso, curved) = self.get_params(gp_names)
         sinogram_shape = self.get_params('sinogram_shape')
         recon_shape = self.get_params('recon_shape')
-        psf_radius, bp_psf_radius = self.get_psf_radii()
+        psf_radius, bp_psf_radius, channel_psf_radius = self._tap_radii()
         return dict(num_rows_r=sinogram_shape[1], num_channels=sinogram_shape[2],
                     num_recon_rows=recon_shape[0], num_recon_cols=recon_shape[1],
                     num_slices=recon_shape[2], delta_voxel=dv,
@@ -372,7 +378,8 @@ class ConeBeamModel(TomographyModel):
                     det_channel_offset=dco, det_row_offset=dro,
                     recon_slice_offset=rso, magnification=self.get_magnification(),
                     source_detector_dist=sdd, use_curved_detector=curved,
-                    psf_radius=psf_radius, bp_psf_radius=bp_psf_radius)
+                    psf_radius=psf_radius, bp_psf_radius=bp_psf_radius,
+                    channel_psf_radius=channel_psf_radius)
 
     def _transient_cols(self, band_cols):
         # The cone-beam projection functions hold temporary arrays of shape (Vb, P, S) and
@@ -509,6 +516,23 @@ class ConeBeamModel(TomographyModel):
         Returns:
             tuple of int: (psf_radius, bp_psf_radius).
         """
+        return self._tap_radii()[:2]
+
+    def get_channel_psf_radius(self):
+        """This method returns the integer PSF radius along the detector channels.
+
+        A voxel's footprint along the channels depends only on its in-plane pitches, so this
+        radius leaves out the slice pitch.  It equals the radius from :meth:`get_psf_radii`
+        unless the slices are thicker than the in-plane voxels.
+
+        Returns:
+            int: the channel PSF radius.
+        """
+        return self._tap_radii()[2]
+
+    def _tap_radii(self):
+        # This method returns (psf_radius, bp_psf_radius, channel_psf_radius).  The row taps
+        # use psf_radius, and the channel taps use channel_psf_radius.
         (delta_det_row, delta_det_channel, source_detector_dist, recon_shape,
          delta_voxel, voxel_row_aspect, voxel_slice_aspect) = self.get_params(
             ['delta_det_row', 'delta_det_channel', 'source_detector_dist',
@@ -533,7 +557,10 @@ class ConeBeamModel(TomographyModel):
         min_voxel_pitch = min(delta_voxel, delta_voxel_row, delta_voxel_slice)
         max_voxels_per_detector = delta_det / (min_magnification * min_voxel_pitch)
         bp_psf_radius = int(np.ceil(np.ceil(max_voxels_per_detector) / 2))
-        return psf_radius, bp_psf_radius
+        max_in_plane_pitch = max(delta_voxel, delta_voxel_row)
+        channel_psf_radius = int(np.ceil(np.ceil(max_in_plane_pitch * max_magnification
+                                                 / delta_det) / 2))
+        return psf_radius, bp_psf_radius, channel_psf_radius
 
     def get_psf_radius(self):
         """This method returns the integer radius of the PSF in detector channels."""
