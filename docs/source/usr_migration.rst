@@ -92,7 +92,8 @@ Without ``num_materials`` the rank is estimated.  ``mode`` and ``chunk_pixels`` 
 memory, as ``batch_size`` did, and ``verbose=2`` prints the rank search rather than plotting it.
 ``subspace_basis`` keeps its meaning, with the given spectra always held fixed (MBIRJAX refitted
 them for data of up to 2**27 entries); leave out ``num_materials`` then, since the rank is the
-basis's number of rows.  ``generate_hyper_data`` returns the Poisson counts and the open beam
+basis's number of rows.  It is deprecated: use ``init=(None, spectra)`` and
+``fix_spectra=True``.  ``generate_hyper_data`` returns the Poisson counts and the open beam
 (noiseless, ``dosage_rate`` everywhere) rather than an attenuation: divide the counts by the open
 beam and pass the result to ``dehydrate`` with ``dataset_type='transmission'``, as measured counts
 are normalized by their open beam.  A seed therefore gives different data, and ``noisy=False``
