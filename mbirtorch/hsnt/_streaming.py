@@ -37,6 +37,31 @@ def _h_direction(H, grad, flat, rows, cols, jitter_rel=1e-9, ub=None):
 # _W_REL_TOL and _W_MAX_STEPS are the tolerance and the step limit of the block Newton solve for
 # W in each chunk.  _LS_TRIALS is the number of step lengths that each line search on H tries.
 _W_REL_TOL, _W_MAX_STEPS, _LS_TRIALS = 1e-8, 300, 4
+# _START_MAX_STEPS and _START_REL_TOL are the step limit and the tolerance of the joint Newton
+# solve that finds the starting spectra, on a subset of the pixels or on averaged blocks of pixels.
+_START_MAX_STEPS, _START_REL_TOL = 300, 1e-6
+
+
+def _subset_fit(chunks, num_materials, warmup_pixels, device, compile_mode, sizes=None, W_init=None, quick=False,
+                weights=None):
+    """This function fits W and H by a joint Newton solve on a random subset of the pixels.  The
+    subset holds ``warmup_pixels`` pixels, drawn from all chunks with seed 0.  The streamed solve
+    starts from the H of this fit when it is given no starting spectra.  When ``W_init`` is given,
+    the fit starts from the subset's rows of it.  The function returns (T_sub, W_sub, H): the
+    subset's transmission and maps on the device, and the spectra."""
+    sizes = np.array(sizes if sizes is not None else [c.shape[0] for c in chunks])
+    offsets = np.concatenate([[0], np.cumsum(sizes)])
+    picks = np.sort(np.random.default_rng(0).choice(offsets[-1], min(warmup_pixels, offsets[-1]), replace=False))
+    parts = []
+    for i, c in enumerate(chunks):
+        local = picks[(picks >= offsets[i]) & (picks < offsets[i + 1])] - offsets[i]
+        if local.size:
+            parts.append(c[torch.from_numpy(local).to(c.device)])
+    T_sub = torch.cat(parts, 0).to(device)
+    W_sub = None if W_init is None else W_init[torch.from_numpy(picks)].to(device=device, dtype=T_sub.dtype)
+    W_sub, H, _ = _nnal_factorization(T_sub, num_materials, max_steps=_START_MAX_STEPS, rel_tol=_START_REL_TOL,
+                                      compile_mode=compile_mode, W_init=W_sub, quick=quick, weights=weights)
+    return T_sub, W_sub, H
 
 
 def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, warmup_pixels=16384, device=None,
@@ -107,22 +132,13 @@ def _stream_factorization(chunks, num_materials, max_passes=5, rel_tol=1e-6, war
     # The first fit of H uses a random subset of pixels, drawn from all chunks with seed 0.
     sizes = np.array(chunk_sizes if chunk_sizes is not None else [c.shape[0] for c in chunks])
     offsets = np.concatenate([[0], np.cumsum(sizes)])
-    picks = np.sort(np.random.default_rng(0).choice(offsets[-1], min(warmup_pixels, offsets[-1]), replace=False))
-    parts = []
-    for i, c in enumerate(chunks):
-        local = picks[(picks >= offsets[i]) & (picks < offsets[i + 1])] - offsets[i]
-        if local.size:
-            parts.append(c[torch.from_numpy(local).to(c.device)])
     if W_init is not None:
         W_chunks = [W_init[offsets[i]:offsets[i + 1]].clone() for i in range(len(chunks))]
     if H_init is not None:
         H = H_init.to(device)
     else:
-        T_sub = torch.cat(parts, 0).to(device)
-        W_sub = None if W_init is None else W_init[torch.from_numpy(picks)].to(device=device, dtype=T_sub.dtype)
-        _, H, _ = _nnal_factorization(T_sub, R, max_steps=300, rel_tol=1e-6, compile_mode=compile_mode, W_init=W_sub,
-                                      quick=quick, weights=weights)
-        del T_sub, W_sub
+        H = _subset_fit(chunks, R, warmup_pixels, device, compile_mode, sizes=sizes, W_init=W_init, quick=quick,
+                        weights=weights)[2]
     rows, cols = torch.triu_indices(R, R, device=H.device)
     pin = torch.device(device).type == 'cuda'
 

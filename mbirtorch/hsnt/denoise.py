@@ -151,8 +151,8 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
             an earlier call on the same data.  Either factor may be None.  W has the leading axes
             of the data, or one axis of pixels, followed by an axis of length :math:`N_m`.  H has
             shape :math:`(N_m, N_k)`.  The solve continues from these factors, and the rank comes
-            from them.  When the data are streamed, a given H replaces the first fit on a subset
-            of the pixels.  Defaults to None.
+            from them.  When the data are streamed, a given H replaces the fit that finds the
+            starting spectra.  Defaults to None.
         fix_spectra (bool, optional): If True, this function holds the spectra H of ``init``
             fixed and computes only the maps.  For example, a large scan can then be dehydrated
             piece by piece against spectra fitted on part of it.  It needs ``init`` with H, and
@@ -165,7 +165,9 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
         compile_mode (str, optional): 'auto', 'on', or 'off'.  The value sets whether this
             function uses torch.compile.  Defaults to 'auto'.
         mode (str, optional): 'full', 'stream', or 'auto'.  'stream' processes the pixels in
-            chunks.  Defaults to 'auto'.
+            chunks.  When the data have image axes and few counts, a streamed fit without
+            ``init`` starts from spectra fitted to averaged blocks of neighboring pixels.
+            Defaults to 'auto'.
         chunk_pixels (int, optional): The number of pixels in each chunk when streaming.
             Defaults to None, in which case this function sets it from the available memory.
         max_passes (int, optional): The number of passes over the chunks when streaming.
@@ -240,7 +242,9 @@ def dehydrate(data, dataset_type="attenuation", num_materials=None, *, subspace_
                                                     weights=weights)
         W, H, rep = _fit(T, int(num_materials), spectra=spectra, dose=dose, penalty=penalty, device=device, mode=mode,
                          chunk_pixels=chunk_pixels, max_steps=max_steps, rel_tol=rel_tol, max_passes=int(max_passes),
-                         compile_mode=compile_mode, init=init, quick=bool(quick), weights=weights)
+                         compile_mode=compile_mode, init=init, quick=bool(quick), weights=weights,
+                         spatial_shape=_spatial_shape(lead), pool_T=None if mask is None else T_all,
+                         pool_mask=mask)
         if verbose >= 1:
             solve = f"{rep['steps']} steps" if "steps" in rep else f"streamed, {rep['passes']} polish passes"
             if rep.get("quick_stop"):

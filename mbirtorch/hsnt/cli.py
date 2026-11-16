@@ -247,7 +247,7 @@ def solve(ds, args, device):
                      wald_screen=args.wald_screen, device=device, mode=args.mode,
                      chunk_pixels=args.chunk_pixels, max_steps=args.max_steps, rel_tol=args.rel_tol,
                      max_passes=args.max_passes, compile_mode=args.compile, report=args.fit_report,
-                     weights=ds.bin_weights)
+                     weights=ds.bin_weights, spatial_shape=ds.spatial_shape)
     rep.update(rank=args.rank_value, rank_note=args.rank_note, rank_search=args.rank_detail)
     args.fit_report = {"solved": True}                  # a later device failure happens after the solve
     return W, H, rep
@@ -644,10 +644,12 @@ class _Options:
                  help="pixels per chunk in stream mode (default: from available memory); halve it if the device runs "
                       "out of memory")
         self.add(g, "--max-passes", type=_nonneg_int, default=5, advanced=True,
-                 help="stream mode: polish passes over the data after the fit on a pixel subsample, stopping early on "
+                 help="stream mode: polish passes over the data after the fit that finds the starting spectra (on "
+                      "averaged blocks of pixels at low counts, on a pixel subsample otherwise), stopping early on "
                       "the first pass that changes the loss by at most --rel-tol, relatively; 0 keeps that fit "
                       "(default 5). More passes trade time for SNR: on a 1M-pixel test phantom at 3 counts per bin, 40 "
-                      "passes brought the streamed spectra within 0.5 dB of the fit solved whole, at 4-6x the time")
+                      "passes brought the streamed spectra within 0.5 dB of the fit solved whole, at 4-6x the time, "
+                      "measured with the subsample start")
 
 
 def build_parser(show_all=False):
