@@ -343,6 +343,23 @@ def test_a_streamed_fit_at_low_counts_starts_from_averaged_blocks():
     assert np.array_equal(H, H1) and np.array_equal(W, W1)
 
 
+def test_the_streamed_support_refit_keeps_w_under_the_bound_and_its_loss_does_not_rise():
+    """This test runs the streamed support refit on data with one detector column of zero-count pixels in each view.
+    The refit's loss does not rise from one pass to the next.  Each coefficient times the peak of its spectrum stays
+    at or below the attenuation bound."""
+    from mbirtorch.hsnt._fit import _fit
+    dose, dead_column = 3.0, 7
+    T, (V, R, C) = _block_problem(dose)
+    T = T.reshape(V, R, C, -1)
+    T[:, :, dead_column] = 0
+    T = T.reshape(V * R * C, -1)
+    W, H, rep = _fit(T, 3, spectra="support", dose=dose, device="cpu", mode="stream", chunk_pixels=2048,
+                     max_passes=8, compile_mode="off")
+    losses = rep["loss_per_pass_refit"]
+    assert len(losses) >= 2 and all(b <= a * (1 + 1e-9) for a, b in zip(losses, losses[1:]))
+    assert float((W * H.max(1)).max()) <= _newton._X_MAX * (1 + 1e-4)
+
+
 def test_the_averaged_start_pools_only_inside_the_sample_mask_and_a_tensor_on_its_device():
     """With a sample mask, the averaged start fits only the blocks that lie wholly inside the mask.  A tensor is
     pooled on its own device to the same averages as the numpy path."""

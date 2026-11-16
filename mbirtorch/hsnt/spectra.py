@@ -10,7 +10,7 @@ import warnings
 import torch
 
 from ._loss import _nnal_prep, _nnal_rowwise, stable_nnal_derivatives
-from ._newton import _ARMIJO_FLOOR, _joint_newton_pcg, _kernels, _partner_bound, _resolve_compile, solve_W
+from ._newton import _ACTIVE_TOL, _ARMIJO_FLOOR, _joint_newton_pcg, _kernels, _partner_bound, _resolve_compile, solve_W
 
 
 # These are the maximum steps and the relative tolerance of the unconstrained re-estimate.
@@ -48,34 +48,39 @@ def _weight_rows(weights, rows):
     return weights if weights is None or weights.dim() < 2 or weights.shape[0] == 1 else weights[rows]
 
 
-def _fit_free_sets(T, H, idx, valid, w0, steps=8, rows=None, weights=None):
+def _fit_free_sets(T, H, idx, valid, w0, steps=8, rows=None, weights=None, ub=None):
     """This function fits the coefficients w >= 0 of each pixel on its own small set of materials.
     It uses projected Newton steps on chunks of pixels.  The array ``idx`` (P, m) holds material
     indices, ``valid`` marks the entries of ``idx`` that are real, and ``w0`` is the starting value.
-    ``weights`` multiplies each entry's loss (see ``_nnal_prep``).  The function returns (w, f),
-    where f is the loss of each pixel."""
+    ``weights`` multiplies each entry's loss (see ``_nnal_prep``).  ``ub`` is None or a tensor of
+    shape (rank,) with the largest allowed coefficient of each material.  When it is given, every
+    coefficient stays at or below the value for its material.  The function returns (w, f), where f
+    is the loss of each pixel."""
     P, m = idx.shape
     chunk = max(1, _FREE_SET_ELEMS // (m * H.shape[1]))
     if P <= chunk and rows is None:
-        return _fit_free_sets_block(T, H, idx, valid, w0, steps, weights)
+        return _fit_free_sets_block(T, H, idx, valid, w0, steps, weights, ub)
     ws, fs = [], []
     for s in range(0, P, chunk):
         e = min(P, s + chunk)
         Tc = T[s:e] if rows is None else T[rows[s:e]]
         wc = _weight_rows(weights, slice(s, e) if rows is None else rows[s:e])
-        w, f = _fit_free_sets_block(Tc, H, idx[s:e], valid[s:e], w0[s:e], steps, wc)
+        w, f = _fit_free_sets_block(Tc, H, idx[s:e], valid[s:e], w0[s:e], steps, wc, ub)
         ws.append(w)
         fs.append(f)
         del Tc
     return torch.cat(ws), torch.cat(fs)
 
 
-def _fit_free_sets_block(T, H, idx, valid, w0, steps, weights=None):
+def _fit_free_sets_block(T, H, idx, valid, w0, steps, weights=None, ub=None):
     m = idx.shape[1]
     dev = T.device
     prep = _nnal_prep(T, weights)
     Hf = H[idx.clamp(min=0)] * valid[:, :, None]                                       # (P, m, K)
-    w = (w0 * valid).clone()
+    # The tensor ``top`` holds the largest allowed value of each entry of w.  Without ``ub``, w has no
+    # upper bound.
+    top = torch.full_like(w0, float("inf")) if ub is None else ub[idx.clamp(min=0)].to(w0.dtype)
+    w = (torch.minimum(w0, top) * valid).clone()
     X = torch.einsum('pm,pmk->pk', w, Hf)
     f = _nnal_rowwise(X, T, prep, 1, dtype=torch.float64)
     eye = torch.eye(m, device=dev, dtype=T.dtype)
@@ -83,21 +88,23 @@ def _fit_free_sets_block(T, H, idx, valid, w0, steps, weights=None):
         G, Z = stable_nnal_derivatives(X, T, prep)
         g = torch.einsum('pk,pmk->pm', G, Hf)
         Hs = torch.einsum('pk,pmk,pnk->pmn', Z, Hf, Hf) + 1e-6 * eye
-        free = valid & ~((w <= 0) & (g > 0))
+        # An entry at a bound whose gradient points out of the feasible set is held fixed.
+        free = valid & ~((w <= 0) & (g > 0)) & ~((w >= top * (1 - _ACTIVE_TOL)) & (g < 0))
         Hs = torch.where(free[:, :, None] & free[:, None, :], Hs, eye.expand_as(Hs))
         rhs = torch.where(free, g, torch.zeros_like(g))
         # The code uses pinv because identical or zero spectra make Hs singular.
         d = (torch.linalg.pinv(Hs) @ rhs.unsqueeze(-1)).squeeze(-1) * free
         slope = (g * d).sum(1)
         d = torch.where((slope <= 0)[:, None], rhs / Hs.diagonal(dim1=1, dim2=2).clamp(min=1e-12), d)
-        # The step is not limited to the largest feasible step.  Instead, the projection clips w at zero.
+        # The step is not limited to the largest feasible step.  Instead, the projection clips w at
+        # zero and at its upper bound.
         alpha = torch.ones_like(slope)
         accepted = torch.zeros_like(alpha)
         done = torch.zeros_like(alpha, dtype=torch.bool)
         for _ in range(8):
             trial = torch.where(done, torch.zeros_like(alpha), alpha)
             wt = (w - trial[:, None] * d)
-            wt = wt.clamp(min=0) * valid
+            wt = torch.minimum(wt.clamp(min=0), top) * valid
             decrease = (g * (w - wt)).sum(1).clamp(min=0)              # This is the first-order decrease along the projected step.
             ft = _nnal_rowwise(torch.einsum('pm,pmk->pk', wt, Hf), T, prep, 1, dtype=torch.float64)
             ok = (ft <= f - 1e-4 * decrease + _ARMIJO_FLOOR * torch.finfo(T.dtype).eps * f.abs()) | (trial == 0)
@@ -107,7 +114,7 @@ def _fit_free_sets_block(T, H, idx, valid, w0, steps, weights=None):
                 break
             alpha = alpha * 0.5
         w_new = (w - accepted[:, None] * d)
-        w_new = w_new.clamp(min=0) * valid
+        w_new = torch.minimum(w_new.clamp(min=0), top) * valid
         X = torch.einsum('pm,pmk->pk', w_new, Hf)
         f_new = _nnal_rowwise(X, T, prep, 1, dtype=torch.float64)
         moved = (f - f_new).abs() > 1e-9 * f.abs()
@@ -151,9 +158,11 @@ def _support_sets(support, W):
 
 def _solve_W_on_support(T, H, W, support, steps=30, weights=None):
     """This function solves for W >= 0 with H fixed.  It solves each pixel by Newton steps on the
-    support of that pixel.  ``weights`` multiplies each entry's loss (see ``_nnal_prep``)."""
+    support of that pixel.  ``weights`` multiplies each entry's loss (see ``_nnal_prep``).  Each
+    coefficient stays at or below the bound that ``_partner_bound`` gives its component, as in
+    ``solve_W``."""
     idx, valid, w0 = _support_sets(support, W.clamp(min=0))
-    w, _ = _fit_free_sets(T, H, idx, valid, w0, steps=steps, weights=weights)
+    w, _ = _fit_free_sets(T, H, idx, valid, w0, steps=steps, weights=weights, ub=_partner_bound(H, 1)[0])
     return _scatter_support(idx, valid, w, W.shape[1])[1]
 
 
