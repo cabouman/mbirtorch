@@ -74,7 +74,7 @@ def _to_transmission(data, dataset_type):
 
 def dehydrate(data, dataset_input_type="transmission", num_materials=None, *, spectra=None,
               max_steps=1000, rel_tol=1e-8, max_num_est_materials=6, device=None,
-              mode="auto", max_passes=5, sample_mask=None,
+              mode="auto", max_passes=5, sample_mask=None, open_beam=None,
               verbose=1, **kwargs):
     """This function dehydrates hyperspectral data.  It computes a non-negative factorization
     of the data in the attenuation domain.  The spectral axis of the data is always the last axis.
@@ -116,6 +116,12 @@ def dehydrate(data, dataset_input_type="transmission", num_materials=None, *, sp
             sample may be.  Its shape is (rows, cols) for one region shared by all views, or
             (views, rows, cols) for a region per view.  ``W`` is set to zero outside the mask
             and fit only inside it.  Defaults to None.
+        open_beam (float or numpy.ndarray, optional): The open beam count of each spectral bin,
+            as a 1-D array of length :math:`N_k`.  Use it when the open beam differs between
+            bins.  Each bin's loss is then weighted by its open beam count divided by the mean
+            count, so that the loss is the Poisson negative log-likelihood of the counts.  A
+            scalar, or an array with the same count in every bin, gives every bin the same
+            weight.  Defaults to None, which gives every bin the same weight.
         verbose (int, optional): 0 prints nothing.  1 prints a summary.  2 also prints the
             search for ``num_materials``.  Defaults to 1.
 
@@ -133,6 +139,7 @@ def dehydrate(data, dataset_input_type="transmission", num_materials=None, *, sp
     if int(max_passes) < 0:
         raise ValueError(f"max_passes must be at least 0, got {max_passes}")
     T_all, shape = _to_transmission(data, dataset_input_type)
+    weights = _bin_weights(open_beam, shape[-1])
     device = _default_device(device)
     lead = shape[:-1]
     mask = _sample_mask(sample_mask, lead)
@@ -141,7 +148,8 @@ def dehydrate(data, dataset_input_type="transmission", num_materials=None, *, sp
     if spectra is not None:
         from ._fit import _fit_fixed_basis
         H = _check_basis(spectra, shape[-1], num_materials)
-        W, H, rep = _fit_fixed_basis(T, H, device=device, mode=mode, max_steps=max_steps, rel_tol=rel_tol)
+        W, H, rep = _fit_fixed_basis(T, H, device=device, mode=mode, max_steps=max_steps, rel_tol=rel_tol,
+                                     weights=weights)
         if verbose >= 1:
             print("dehydrate(): ")
             print("   -Spectral dimension: ", shape[-1], " -> rank: ", H.shape[0], "(the given spectra)")
@@ -151,9 +159,9 @@ def dehydrate(data, dataset_input_type="transmission", num_materials=None, *, sp
         if num_materials is None:
             num_materials, note, _ = _estimate_rank(T_all, spatial_shape=_spatial_shape(lead), device=device,
                                                     max_rank=max_num_est_materials,
-                                                    verbose=max(0, verbose - 1))
+                                                    verbose=max(0, verbose - 1), weights=weights)
         W, H, rep = _fit(T, int(num_materials), device=device, mode=mode, max_steps=max_steps, rel_tol=rel_tol,
-                         max_passes=int(max_passes))
+                         max_passes=int(max_passes), weights=weights)
         if verbose >= 1:
             solve = f"{rep['steps']} steps" if "steps" in rep else f"streamed, {rep['passes']} polish passes"
             print("dehydrate(): ")
@@ -164,6 +172,24 @@ def dehydrate(data, dataset_input_type="transmission", num_materials=None, *, sp
         W_all[mask] = W
         W = W_all
     return [W.reshape(*lead, H.shape[0]), H]
+
+
+def _bin_weights(open_beam, bins):
+    """This function converts the ``open_beam`` of ``dehydrate`` to the weight of each bin.  The
+    weight is the bin's open beam count divided by the mean count.  It returns None when every bin
+    has the same weight, so that the fit is then the unweighted fit."""
+    if open_beam is None:
+        return None
+    d = np.asarray(_to_host(open_beam), dtype=np.float64)
+    if not (np.isfinite(d).all() and (d > 0).all()):
+        raise ValueError("open_beam must be finite and positive in every bin")
+    if d.ndim == 0:
+        return None
+    if d.ndim != 1 or d.shape[0] != bins:
+        raise ValueError(f"open_beam must hold one count per spectral bin, with shape ({bins},); got shape {d.shape}")
+    if (d == d[0]).all():
+        return None
+    return d / d.mean()
 
 
 def _sample_mask(sample_mask, lead):
