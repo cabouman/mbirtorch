@@ -46,13 +46,15 @@ def _nll(T, W, H):
 
 @pytest.mark.parametrize("mode", ["full", "stream"])
 def test_an_equal_open_beam_is_the_unweighted_fit(data, mode):
-    """open_beam=None, a scalar, and an array with the same count in every bin give the same fit, bit for bit."""
+    """A scalar open beam and an array with the same count in every bin give equal bin weights and the same fit, bit
+    for bit.  Without open_beam the weights are also equal, but the counts that set the start are estimated."""
+    from mbirtorch.hsnt.denoise import _bin_weights
     T, _ = data
     kw = dict(mode=mode, verbose=0)
-    plain = hsnt.dehydrate(T, "transmission", R, **kw)
-    for open_beam in (50.0, np.full(K, 50.0)):
-        out = hsnt.dehydrate(T, "transmission", R, open_beam=open_beam, **kw)
-        assert np.array_equal(out[0], plain[0]) and np.array_equal(out[1], plain[1])
+    assert _bin_weights(None, K) is None and _bin_weights(50.0, K) is None and _bin_weights(np.full(K, 50.0), K) is None
+    scalar = hsnt.dehydrate(T, "transmission", R, open_beam=50.0, **kw)
+    out = hsnt.dehydrate(T, "transmission", R, open_beam=np.full(K, 50.0), **kw)
+    assert np.array_equal(out[0], scalar[0]) and np.array_equal(out[1], scalar[1])
 
 
 @pytest.mark.parametrize("mode", ["full", "stream"])

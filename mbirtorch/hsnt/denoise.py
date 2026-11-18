@@ -151,7 +151,9 @@ def dehydrate(data, dataset_input_type="transmission", num_materials=None, *, sp
             bins.  Each bin's loss is then weighted by its open beam count divided by the mean
             count, so that the loss is the Poisson negative log-likelihood of the counts.  A
             scalar, or an array with the same count in every bin, gives every bin the same
-            weight.  Defaults to None, which gives every bin the same weight.
+            weight.  The mean count also sets the size of the blocks of pixels that are averaged
+            to find the starting spectra.  Defaults to None, which gives every bin the same
+            weight and estimates the counts from the data.
         verbose (int, optional): 0 prints nothing.  1 prints a summary.  2 also prints the
             search for ``num_materials``.  Defaults to 1.
 
@@ -171,6 +173,7 @@ def dehydrate(data, dataset_input_type="transmission", num_materials=None, *, sp
         raise ValueError(f"max_passes must be at least 0, got {max_passes}")
     T_all, shape = _to_transmission(data, dataset_input_type)
     weights = _bin_weights(open_beam, shape[-1])
+    dose = None if open_beam is None else float(np.mean(np.asarray(_to_host(open_beam), dtype=np.float64)))
     device = _default_device(device)
     lead = shape[:-1]
     mask = _sample_mask(sample_mask, lead)
@@ -198,7 +201,7 @@ def dehydrate(data, dataset_input_type="transmission", num_materials=None, *, sp
                                                     verbose=max(0, verbose - 1), weights=weights)
         W, H, rep = _fit(T, int(num_materials), device=device, mode=mode, max_steps=max_steps, rel_tol=rel_tol,
                          max_passes=int(max_passes), weights=weights, spatial_shape=_spatial_shape(lead),
-                         pool_T=None if mask is None else T_all, pool_mask=mask)
+                         pool_T=None if mask is None else T_all, pool_mask=mask, dose=dose)
         if verbose >= 1:
             solve = f"{rep['steps']} steps" if "steps" in rep else f"streamed, {rep['passes']} polish passes"
             print("dehydrate(): ")

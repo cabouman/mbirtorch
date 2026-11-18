@@ -113,11 +113,20 @@ def _pool_pixels(T, spatial_shape, block):
     return out.reshape(-1, out.shape[-1])
 
 
+def _subsample_rows(total, n):
+    """This function returns the indices of at most n of ``total`` rows, chosen at random with a
+    fixed seed and sorted, or None when n covers every row."""
+    return np.sort(np.random.default_rng(0).choice(total, n, replace=False)) if total > n else None
+
+
 def _subsample(T, n):
     """This function returns at most n rows of T as a float32 array.  It chooses the rows at
-    random with a fixed seed, and it keeps them in their original order."""
-    rows = np.sort(np.random.default_rng(0).choice(T.shape[0], n, replace=False)) if T.shape[0] > n else slice(None)
-    return np.ascontiguousarray(T[rows], dtype=np.float32)
+    random with a fixed seed, and it keeps them in their original order.  A tensor keeps its
+    device, and the same rows are chosen as for a numpy array."""
+    rows = _subsample_rows(T.shape[0], n)
+    if torch.is_tensor(T):
+        return (T if rows is None else T[torch.from_numpy(rows).to(T.device)]).float().contiguous()
+    return np.ascontiguousarray(T if rows is None else T[rows], dtype=np.float32)
 
 
 def estimate_rank(data, dataset_type="attenuation", max_rank=6, device=None, pool="auto", verbose=0):
