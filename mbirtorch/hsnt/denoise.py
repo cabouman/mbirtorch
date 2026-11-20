@@ -146,14 +146,16 @@ def dehydrate(data, dataset_input_type="transmission", num_materials=None, *, sp
             sample may be.  Its shape is (rows, cols) for one region shared by all views, or
             (views, rows, cols) for a region per view.  ``W`` is set to zero outside the mask
             and fit only inside it.  Defaults to None.
-        open_beam (float or numpy.ndarray, optional): The open beam count of each spectral bin,
-            as a 1-D array of length :math:`N_k`.  Use it when the open beam differs between
-            bins.  Each bin's loss is then weighted by its open beam count divided by the mean
-            count, so that the loss is the Poisson negative log-likelihood of the counts.  A
-            scalar, or an array with the same count in every bin, gives every bin the same
-            weight.  The mean count also sets the size of the blocks of pixels that are averaged
-            to find the starting spectra.  Defaults to None, which gives every bin the same
-            weight and estimates the counts from the data.
+        open_beam (float, numpy.ndarray or torch.Tensor, optional): The open beam counts.  It
+            may be a 1-D array with one count per spectral bin, or a full open beam scan with the
+            :math:`N_k` bins on the last axis, for example (rows, cols, bins) or (scans, rows,
+            cols, bins).  A scan is averaged over all axes but the last.  Use it when the open
+            beam differs between bins.  Each bin's loss is then weighted by its open beam count
+            divided by the mean count, so that the loss is the Poisson negative log-likelihood of
+            the counts.  A scalar, or an array with the same count in every bin, gives every bin
+            the same weight.  The mean count also sets the size of the blocks of pixels that are
+            averaged to find the starting spectra.  Defaults to None, which gives every bin the
+            same weight and estimates the counts from the data.
         verbose (int, optional): 0 prints nothing.  1 prints a summary.  2 also prints the
             search for ``num_materials``.  Defaults to 1.
 
@@ -172,8 +174,9 @@ def dehydrate(data, dataset_input_type="transmission", num_materials=None, *, sp
     if int(max_passes) < 0:
         raise ValueError(f"max_passes must be at least 0, got {max_passes}")
     T_all, shape = _to_transmission(data, dataset_input_type)
+    open_beam = _open_beam_per_bin(open_beam, shape[-1])
     weights = _bin_weights(open_beam, shape[-1])
-    dose = None if open_beam is None else float(np.mean(np.asarray(_to_host(open_beam), dtype=np.float64)))
+    dose = None if open_beam is None else float(np.mean(open_beam))
     device = _default_device(device)
     lead = shape[:-1]
     mask = _sample_mask(sample_mask, lead)
@@ -214,20 +217,35 @@ def dehydrate(data, dataset_input_type="transmission", num_materials=None, *, sp
     return [W.reshape(*lead, H.shape[0]), H]
 
 
+def _open_beam_per_bin(open_beam, bins):
+    """This function converts the ``open_beam`` of ``dehydrate`` to a float64 scalar or a 1-D
+    float64 array with one count per bin.  A full open beam scan is averaged over all axes but the
+    last.  It returns None when ``open_beam`` is None."""
+    if open_beam is None:
+        return None
+    import torch
+    if torch.is_tensor(open_beam):
+        t = open_beam.detach()
+        if t.ndim > 1:
+            t = t.reshape(-1, t.shape[-1]).mean(dim=0, dtype=torch.float64)
+        d = t.cpu().numpy().astype(np.float64)
+    else:
+        d = _to_host(open_beam)
+        d = d.reshape(-1, d.shape[-1]).mean(axis=0, dtype=np.float64) if d.ndim > 1 else d.astype(np.float64)
+    if d.ndim == 1 and d.shape[0] != bins:
+        raise ValueError(f"open_beam must have the {bins} spectral bins on its last axis; got shape "
+                         f"{tuple(open_beam.shape)}")
+    if not (np.isfinite(d).all() and (d > 0).all()):
+        raise ValueError("open_beam must be finite and positive in every bin")
+    return d
+
+
 def _bin_weights(open_beam, bins):
     """This function converts the ``open_beam`` of ``dehydrate`` to the weight of each bin.  The
     weight is the bin's open beam count divided by the mean count.  It returns None when every bin
     has the same weight, so that the fit is then the unweighted fit."""
-    if open_beam is None:
-        return None
-    d = np.asarray(_to_host(open_beam), dtype=np.float64)
-    if not (np.isfinite(d).all() and (d > 0).all()):
-        raise ValueError("open_beam must be finite and positive in every bin")
-    if d.ndim == 0:
-        return None
-    if d.ndim != 1 or d.shape[0] != bins:
-        raise ValueError(f"open_beam must hold one count per spectral bin, with shape ({bins},); got shape {d.shape}")
-    if (d == d[0]).all():
+    d = _open_beam_per_bin(open_beam, bins)
+    if d is None or d.ndim == 0 or (d == d[0]).all():
         return None
     return d / d.mean()
 

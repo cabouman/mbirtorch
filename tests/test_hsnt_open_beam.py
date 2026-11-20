@@ -101,8 +101,28 @@ def test_given_spectra_with_a_per_bin_open_beam(data, mode):
 
 def test_a_bad_open_beam_is_refused(data):
     T, _ = data
-    for bad, match in ((np.full(K - 1, 50.0), "one count per spectral bin"), (np.full((1, K), 50.0), "shape"),
+    for bad, match in ((np.full(K - 1, 50.0), "spectral bins on its last axis"), (np.full((3, K - 1), 50.0), "shape"),
                        (np.r_[OPEN_BEAM[:-1], 0.0], "positive"), (np.r_[OPEN_BEAM[:-1], np.nan], "finite"),
                        (-1.0, "positive")):
         with pytest.raises(ValueError, match=match):
             hsnt.dehydrate(T, "transmission", R, open_beam=bad, verbose=0)
+
+
+def test_a_full_open_beam_scan_is_averaged_to_one_count_per_bin(data):
+    """An open beam scan of shape (scans, rows, cols, bins), as an array or a tensor, gives the fit of its per-bin
+    mean.  Single pixels may hold zero counts, as long as every bin's mean is positive."""
+    from mbirtorch.hsnt.denoise import _bin_weights
+    T, _ = data
+    rng = np.random.default_rng(1)
+    scan = rng.poisson(OPEN_BEAM, (2, N, N, K)).astype(np.float32)
+    assert (scan == 0).any()
+    per_bin = scan.reshape(-1, K).mean(axis=0, dtype=np.float64)
+    np.testing.assert_allclose(_bin_weights(scan, K), per_bin / per_bin.mean(), rtol=1e-12)
+    np.testing.assert_allclose(_bin_weights(torch.from_numpy(scan), K), per_bin / per_bin.mean(), rtol=1e-12)
+    kw = dict(mode="full", max_steps=50, verbose=0)
+    ref = hsnt.dehydrate(T, "transmission", R, open_beam=per_bin, **kw)
+    out = hsnt.dehydrate(T, "transmission", R, open_beam=scan, **kw)
+    for a, b in zip(ref, out):
+        np.testing.assert_array_equal(a, b)
+    with pytest.raises(ValueError, match="positive"):
+        hsnt.dehydrate(T, "transmission", R, open_beam=np.zeros((N, N, K)), verbose=0)
