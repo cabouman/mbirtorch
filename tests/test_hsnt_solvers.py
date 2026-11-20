@@ -205,3 +205,81 @@ def test_streaming_matches_the_full_solve(dev):
     W_chunks, H, passes = _stream_factorization(tiles, 3, max_passes=3, rel_tol=1e-8, warmup_pixels=1024, device=dev)
     W = torch.cat([w.to(dev) for w in W_chunks])
     assert passes >= 1 and W.min() >= 0 and _loss(W, H, T) <= 1.01 * _loss(Wm, Hm, T)
+
+
+def _block_problem(dose, seed=0, views=2, side=64, K=200):
+    """This function returns two views of rectangular blocks of three materials on air, as a numpy transmission T and
+    its image shape (views, rows, cols).  Neighboring pixels share their materials, as in a radiograph."""
+    rng = np.random.default_rng(seed)
+    lam = np.linspace(1.5, 4.5, K)
+    H = np.stack([0.3 + 0.08 * lam + 0.25 * (lam > e) * np.exp(-(lam - e)) for e in (2.0, 2.9, 3.6)])
+    D = np.zeros((views, side, side, 3))
+    for v in range(views):
+        for i in range(3):
+            cy, cx = rng.integers(side // 5, 4 * side // 5, 2)
+            h, w = rng.integers(side // 6, side // 3, 2)
+            D[v, max(0, cy - h // 2):cy + h // 2, max(0, cx - w // 2):cx + w // 2, i] = rng.uniform(0.6, 1.4)
+    T = (rng.poisson(dose * np.exp(-D.reshape(-1, 3) @ H)) / dose).astype(np.float32)
+    return T, (views, side, side)
+
+
+def test_a_streamed_fit_at_low_counts_starts_from_averaged_blocks():
+    """At 3 counts per bin a streamed fit of data with image axes starts from spectra fitted to blocks of neighboring
+    pixels averaged to about 64 counts per bin (the averaged start of the PNF estimate), and it ends at a lower loss
+    than from the old start on random single pixels (by 80 nats here).  At 100 counts per bin the blocks are single
+    pixels, so the start and the fit are unchanged."""
+    from mbirtorch.hsnt._fit import _fit
+    kw = dict(device="cpu", mode="stream", chunk_pixels=2048, max_passes=20, warmup_pixels=1024, compile_mode="off")
+    T, shape = _block_problem(3.0)
+    _, _, avg = _fit(T, 3, spatial_shape=shape, **kw)
+    _, _, sub = _fit(T, 3, spatial_shape=shape, start="subset", **kw)
+    assert avg["start"]["kind"] == "averaged" and avg["start"]["block"] > 1
+    assert avg["loss_mle"] < sub["loss_mle"]
+    T, shape = _block_problem(100.0)
+    W, H, rep = _fit(T, 3, spatial_shape=shape, **kw)
+    W1, H1, _ = _fit(T, 3, start="subset", **kw)
+    assert rep["start"]["kind"] == "subset" and rep["start"]["block"] == 1
+    assert np.array_equal(H, H1) and np.array_equal(W, W1)
+
+
+def test_the_averaged_start_pools_only_inside_the_sample_mask_and_a_tensor_on_its_device():
+    """With a sample mask, the averaged start fits only the blocks that lie wholly inside the mask.  A tensor is
+    pooled on its own device to the same averages as the numpy path."""
+    from mbirtorch.hsnt._fit import _averaged_start, _pooled
+    from mbirtorch.hsnt.rank import _pool_pixels
+    T, shape = _block_problem(3.0)
+    assert np.allclose(_pooled(torch.from_numpy(T), shape, 5), _pool_pixels(T, shape, 5), atol=1e-6)
+    mask = np.zeros(shape, bool)
+    mask[:, 10:40, 10:40] = True
+    chunks = [torch.from_numpy(T[mask.reshape(-1)])]
+    _, info = _averaged_start(chunks, T, shape, 3, 1024, "cpu", "off", [chunks[0].shape[0]], pool_mask=mask.reshape(-1))
+    b = info["block"]
+    whole = _pool_pixels(mask.reshape(-1, 1).astype(np.float32), shape, b)[:, 0]
+    assert info["kind"] == "averaged" and b > 1 and info["pixels"] == int((whole == 1).sum()) < whole.size
+
+
+def test_open_beam_weights(dev):
+    """Weights of 1 change nothing.  Per-bin weights give the derivatives of the weighted loss, and a weighted fit of
+    counts drawn with a varying open beam has a lower Poisson negative log-likelihood than the unweighted fit."""
+    T, _, _ = _problem(dev, P=1024, K=120, dose=20.0, seed=3, dtype=torch.float64)
+    ones = torch.ones(1, T.shape[1], dtype=T.dtype, device=dev)
+    W, H, _ = _nnal_factorization(T, 3, compile_mode="off")
+    W1, H1, _ = _nnal_factorization(T, 3, compile_mode="off", weights=ones)
+    assert torch.equal(W, W1) and torch.equal(H, H1)
+
+    # The derivatives of the weighted loss match autograd.
+    w = torch.linspace(0.3, 1.7, T.shape[1], dtype=T.dtype, device=dev)[None, :]
+    X = (W @ H).detach().requires_grad_(True)
+    stable_nnal(X, T, _nnal_prep(T, w)).backward()
+    G, _ = stable_nnal_derivatives(X.detach(), T, _nnal_prep(T, w))
+    assert torch.allclose(X.grad, G, rtol=1e-10, atol=1e-12)
+
+    # Counts drawn with the open beam 20 * w: the weighted fit is the better fit of their likelihood.
+    _, Wt, Ht = _problem(dev, P=1024, K=120, dose=20.0, seed=3, dtype=torch.float64, noisy=False)
+    g = torch.Generator(device=dev).manual_seed(5)
+    I0 = 20.0 * w
+    Tw = torch.poisson(I0 * torch.exp(-(Wt @ Ht)), generator=g) / I0
+    nll = lambda W_, H_: float((I0 * (torch.exp(-(W_ @ H_)) + Tw * (W_ @ H_))).sum())
+    Wu, Hu, _ = _nnal_factorization(Tw, 3, compile_mode="off")
+    Ww, Hw, _ = _nnal_factorization(Tw, 3, compile_mode="off", weights=w)
+    assert nll(Ww, Hw) < nll(Wu, Hu)
