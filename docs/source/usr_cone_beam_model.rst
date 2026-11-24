@@ -40,12 +40,20 @@ Reconstruction
 --------------
 
 ``recon`` is the iterative reconstruction.  ``recon_fdk`` is Feldkamp-Davis-Kress filtered back
-projection, fast and non-iterative, which ``recon`` uses as its starting point.
+projection, fast and non-iterative, which ``recon`` uses as its starting point.  When the views
+of a circular scan do not cover a whole number of rotations (a short scan of at least 180
+degrees plus the fan angle, or more than one rotation), ``recon_fdk`` applies the weights of
+``redundancy_weights``, so that each line through the object counts once.  For a helical scan it
+scales each slice by the inverse of the fraction of the views that see it.
 ``recon_split_sino`` reconstructs a sinogram too large for memory in two overlapping halves, side
 by side on two groups of GPUs when each half fits on half the GPUs.
 
 .. automethod:: mbirtorch.ConeBeamModel.recon
 
 .. automethod:: mbirtorch.ConeBeamModel.recon_fdk
+
+.. automethod:: mbirtorch.ConeBeamModel.redundancy_weights
+
+.. automethod:: mbirtorch.ConeBeamModel.get_scan_range
 
 .. automethod:: mbirtorch.ConeBeamModel.recon_split_sino

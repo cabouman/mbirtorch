@@ -31,12 +31,18 @@ Reconstruction
 --------------
 
 ``recon`` is the iterative reconstruction.  ``recon_fbp`` is filtered back projection, fast and
-non-iterative, which ``recon`` uses as its starting point.  ``recon_split_sino`` reconstructs a
-sinogram too large for memory in overlapping sections of detector rows, on groups of GPUs side
-by side.
+non-iterative, which ``recon`` uses as its starting point.  When the views do not cover a whole
+number of half rotations (a range between 180 and 360 degrees, or more than one rotation),
+``recon_fbp`` applies the weights of ``redundancy_weights``, so that each line through the object
+counts once.  ``recon_split_sino`` reconstructs a sinogram too large for memory in overlapping
+sections of detector rows, on groups of GPUs side by side.
 
 .. automethod:: mbirtorch.ParallelBeamModel.recon
 
 .. automethod:: mbirtorch.ParallelBeamModel.recon_fbp
+
+.. automethod:: mbirtorch.ParallelBeamModel.redundancy_weights
+
+.. automethod:: mbirtorch.ParallelBeamModel.get_scan_range
 
 .. automethod:: mbirtorch.ParallelBeamModel.recon_split_sino
