@@ -37,7 +37,8 @@ band.  A progress file beside the output records each finished band, and ``--res
 continues an interrupted run from the first unfinished band.
 
 Private library calls.  The band size uses ``TomographyModel._fits_available_devices``,
-the memory check ``recon_split_sino`` itself uses.  Everything else is public API.
+the memory check ``recon_split_sino`` itself uses.  The format and axes attributes of the HDF5
+output come from ``mbirtorch.utilities._recon_attributes``.  Everything else is public API.
 """
 
 import argparse
@@ -57,10 +58,12 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
 import mbirtorch  # noqa: E402
+from mbirtorch.utilities import _recon_attributes  # noqa: E402
 
 GB = 1e9
 GiB = 1024 ** 3
 FLOAT_BYTES = 4
+VOLUME_NDIM = 3
 # Bands are written to disk in slabs of this many slices.  A slab of a 4096 x 4096 volume
 # is 4.3 GB.
 WRITE_SLAB = 64
@@ -182,6 +185,9 @@ class VolumeSink:
                 self.dset = self._file.create_dataset(
                     'recon', shape=(self.num_slices, self.num_cols, self.num_rows),
                     dtype=np.float32, chunks=(1, self.num_cols, self.num_rows))
+                # The new file is flushed at once, so that it can be opened again if the process
+                # is killed during the first band.
+                self._file.flush()
             # (row, col, slice) -> (slice, col, row) is its own inverse.
             self._to_file, self._from_file = (2, 1, 0), (2, 1, 0)
         else:
@@ -212,6 +218,11 @@ class VolumeSink:
         if self.is_hdf5:
             for key, value in attributes.items():
                 self.dset.attrs[key] = value
+
+    def flush(self):
+        """Write the buffered data to disk.  If the process is killed before the next write, the
+        file can be opened again, and it holds all data written so far."""
+        (self._file if self.is_hdf5 else self.dset).flush()
 
     def close(self):
         if self.is_hdf5:
@@ -279,6 +290,16 @@ def blend_ramp(half_overlap):
 def peak_host_bytes():
     rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return rss if sys.platform == 'darwin' else rss * 1024
+
+
+def save_json(path, record):
+    """Write record to path.  The folder of path is created if it does not exist.  The file at
+    path is replaced in one step, so a process that is killed during the write leaves either the
+    old file or the new file."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path + '.tmp', 'w') as f:
+        json.dump(record, f, indent=1)
+    os.replace(path + '.tmp', path)
 
 
 # ── the run ──────────────────────────────────────────────────────────────────
@@ -360,11 +381,15 @@ def main():
         if [p['index'] for p in done] != list(range(len(done))):
             raise SystemExit(f'{progress_path} has bands out of order; start over')
         print(f'resuming after {len(done)} finished band(s)', flush=True)
-    sink = VolumeSink(args.output, recon_shape, resume=args.resume)
 
     def save_progress():
-        with open(progress_path, 'w') as f:
-            json.dump({'config': config, 'parts': done}, f, indent=1)
+        save_json(progress_path, {'config': config, 'parts': done})
+
+    # A new run replaces the progress file of an earlier run before it creates the output file.
+    # --resume then cannot skip bands that the new output file does not hold.
+    if not args.resume:
+        save_progress()
+    sink = VolumeSink(args.output, recon_shape, resume=args.resume)
 
     if args.seed is not None:
         np.random.seed(args.seed)
@@ -412,6 +437,9 @@ def main():
         else:
             sink.write(band, mlo)
         del band
+        # The output is flushed before the band is recorded.  A process that is killed later
+        # then leaves an output file that holds every recorded band.
+        sink.flush()
         t_write = time.time() - t_band - t_read - t_recon
 
         entry = {'index': k, 'kept': [lo, hi], 'model_rows': [mlo, mhi],
@@ -426,6 +454,8 @@ def main():
 
     finished = len(done) == num_parts
     if finished:
+        # The format and axes attributes let import_recon_hdf5 read the file without a warning.
+        sink.set_attributes(_recon_attributes({}, VOLUME_NDIM))
         sink.set_attributes({'sinogram_shape': str(source.shape), 'num_parts': num_parts,
                              'half_overlap': ho, 'weights': args.weights, 'sharpness': args.sharpness,
                              'snr_db': args.snr_db, 'mbirtorch_version': mbirtorch.__version__,
