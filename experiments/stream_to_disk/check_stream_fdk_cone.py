@@ -6,7 +6,7 @@
 For each case, the script writes a sinogram of white noise to a temporary folder, so that every
 detector row and channel has its own content.  It runs ``stream_fdk_cone.py`` for several
 numbers of slabs, and it compares each result with ``ConeBeamModel.recon_fdk`` of the whole
-scan.  The script also runs seven other checks:
+scan.  The script also runs eight other checks:
 
   band      The band of each slab must hold every detector row that the slab touches.  A
             forward projection of the slab finds these rows.
@@ -19,6 +19,9 @@ scan.  The script also runs seven other checks:
             same file as a run without a stop.
   kill      A run whose process ends without cleanup while it writes the third slab, and that is
             continued with ``--resume``, must also give the same file.
+  restart   A new run has the output name of a finished run, and its process ends without cleanup
+            while it writes the first slab.  Continued with ``--resume``, it must give the same
+            file.
   HDF5 in   A sinogram in an HDF5 file must give the same result as the ``.npy`` sinogram.
   phantom   The sinogram that ``make_synthetic_cone_sinogram.py`` makes one slab at a time must
             equal the forward projection of the whole phantom.
@@ -55,8 +58,8 @@ RESUME_STOP = 2                   # slabs that the first run of the resume and k
 PHANTOM_SLAB_SLICES = 11          # slices that the sinogram generator projects at a time
 TOLERANCE = 1e-4                  # largest accepted difference, relative to the largest value
 SEED = 5
-# This program runs stream_fdk_cone.py and ends its process without cleanup after the write of
-# slab RESUME_STOP, before the script records that slab as finished.
+# This program runs stream_fdk_cone.py.  After {stop} finished slabs, its process ends without
+# cleanup after the write of the next slab, before the script records that slab as finished.
 KILL_PROGRAM = """
 import os, sys
 import stream_fdk_cone
@@ -167,11 +170,12 @@ def band_and_control(model, sino, x_whole):
     return bands_hold, smallest
 
 
-def run_killed(options):
+def run_killed(options, finished_slabs):
     """Run stream_fdk_cone.py with the given options in a process that ends without cleanup while
-    it writes slab RESUME_STOP.  Return the number of slabs that the progress file then records."""
+    it writes the slab after finished_slabs slabs.  Return the number of slabs that the progress
+    file then records."""
     output = options[options.index('--output') + 1]
-    subprocess.run([sys.executable, '-c', KILL_PROGRAM.format(stop=RESUME_STOP)] + options,
+    subprocess.run([sys.executable, '-c', KILL_PROGRAM.format(stop=finished_slabs)] + options,
                    cwd=os.path.dirname(os.path.abspath(__file__)), stdout=subprocess.DEVNULL,
                    stderr=subprocess.DEVNULL)
     with open(os.path.splitext(output)[0] + '_progress.json') as f:
@@ -237,13 +241,23 @@ def main():
             print(f'resume, {extension}: the resumed run {"equals" if same else "DIFFERS FROM"} the run without a stop')
 
             killed_path = os.path.join(folder, 'killed' + extension)
-            recorded = run_killed(stream_options + ['--output', killed_path, '--num-slabs', str(RESUME_SLABS)])
+            recorded = run_killed(stream_options + ['--output', killed_path, '--num-slabs', str(RESUME_SLABS)],
+                                  RESUME_STOP)
             check(recorded == RESUME_STOP, f'the killed {extension} run recorded {recorded} slabs, not {RESUME_STOP}')
             run_stream(stream_options + ['--output', killed_path, '--resume'])
             same = np.array_equal(read_volume(killed_path), read_volume(reference))
             check(same, f'the killed and resumed {extension} run differs from the run without a stop')
             print(f'kill, {extension}: the killed and resumed run {"equals" if same else "DIFFERS FROM"} the run '
                   'without a stop')
+
+            # The file at killed_path now holds a finished run.  The new run takes its name.
+            recorded = run_killed(stream_options + ['--output', killed_path, '--num-slabs', str(RESUME_SLABS)], 0)
+            check(recorded == 0, f'the new {extension} run left a progress file that records {recorded} slabs')
+            run_stream(stream_options + ['--output', killed_path, '--resume'])
+            same = np.array_equal(read_volume(killed_path), read_volume(reference))
+            check(same, f'the new {extension} run, killed and resumed, differs from the run without a stop')
+            print(f'restart, {extension}: the new run, killed in its first slab and resumed, '
+                  f'{"equals" if same else "DIFFERS FROM"} the run without a stop')
 
         sino_h5_path = os.path.join(folder, 'sino.h5')
         with h5py.File(sino_h5_path, 'w') as f:

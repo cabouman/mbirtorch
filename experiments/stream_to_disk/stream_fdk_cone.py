@@ -66,9 +66,10 @@ import torch  # noqa: E402
 import mbirtorch  # noqa: E402
 from mbirtorch.utilities import _recon_attributes  # noqa: E402
 
-# The reader of the sinogram file and the writer of the volume file are those of the
-# parallel-beam script.
-from stream_recon_parallel import FLOAT_BYTES, GB, GiB, SinogramSource, VolumeSink, peak_host_bytes  # noqa: E402
+# The reader of the sinogram file, the writer of the volume file, and the writer of the progress
+# file are those of the parallel-beam script.
+from stream_recon_parallel import (  # noqa: E402
+    FLOAT_BYTES, GB, GiB, VOLUME_NDIM, SinogramSource, VolumeSink, peak_host_bytes, save_json)
 
 DEFAULT_ANGLE_SPAN_DEG = 360.0
 # In a test of FDK by slabs on H100 GPUs, the smaller margin of the package accepted a slab that
@@ -77,7 +78,6 @@ DEFAULT_ANGLE_SPAN_DEG = 360.0
 DEFAULT_MARGIN = 0.3
 # This many rows are added at each end of a band, against the rounding of the row index.
 BAND_SAFETY_ROWS = 1
-VOLUME_NDIM = 3
 # These model parameters determine the result.  The progress file records them, so that
 # --resume can refuse to continue a run that had other settings.
 RESULT_PARAMS = ('source_detector_dist', 'source_iso_dist', 'use_curved_detector',
@@ -313,20 +313,6 @@ def gpu_peaks():
             [round(torch.cuda.max_memory_reserved(index) / GiB, 2) for index in range(gpu_count())])
 
 
-def flush_volume(sink):
-    """Write the buffered data of the output file to disk.  After this call, an interrupted run
-    has lost at most the slab that it was writing."""
-    (sink._file if sink.is_hdf5 else sink.dset).flush()
-
-
-def save_json(path, record):
-    """Write record to path.  The file at path is replaced in one step, so an interrupted run
-    leaves either the old file or the new file."""
-    with open(path + '.tmp', 'w') as f:
-        json.dump(record, f, indent=1)
-    os.replace(path + '.tmp', path)
-
-
 def write_recon_attributes(sink, recon_dict):
     """Write the attributes of an export_recon_hdf5 file to an HDF5 output.  An attribute that
     the HDF5 library refuses, for example because it is too large, is reported and left out."""
@@ -393,10 +379,11 @@ def main(argv=None):
     largest_band = max(row_hi - row_lo for _lo, _hi, row_lo, row_hi in plan)
     print(f'{num_slabs} slab(s) of about {-(-num_slices // num_slabs)} slices; the largest band has '
           f'{largest_band} of {num_rows} detector rows', flush=True)
+    # A new run replaces the progress file of an earlier run before it creates the output file.
+    # --resume then cannot skip slabs that the new output file does not hold.
+    if not args.resume:
+        save_json(progress_path, {'config': config, 'slabs': done})
     sink = VolumeSink(args.output, recon_shape, resume=args.resume)
-    # A new run replaces the progress file of an earlier run at once, because the output file of
-    # that run no longer exists.
-    save_json(progress_path, {'config': config, 'slabs': done})
 
     for k, (slice_lo, slice_hi, row_lo, row_hi) in enumerate(plan):
         if k < len(done):
@@ -423,7 +410,9 @@ def main(argv=None):
             t_recon = time.time() - t_slab - t_read
         sink.write(slab, slice_lo)
         del slab
-        flush_volume(sink)
+        # The output is flushed before the slab is recorded.  A process that is killed later
+        # then leaves an output file that holds every recorded slab.
+        sink.flush()
         t_write = time.time() - t_slab - t_read - t_recon
 
         entry.update({'read_s': round(t_read, 1), 'recon_s': round(t_recon, 1), 'write_s': round(t_write, 1),
