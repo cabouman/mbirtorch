@@ -1,9 +1,9 @@
-"""Make a synthetic cone-beam sinogram for testing stream_fdk_cone.py, and check a
+"""Make a synthetic cone-beam sinogram for testing recon_direct_on_disk_cone.py, and check a
 reconstruction against its phantom.
 
-The phantom is the set of ellipsoids of ``make_synthetic_sinogram.py``.  It is defined relative
-to the shape of the volume, so the same phantom serves any volume.  The script builds the
-phantom one slab of slices at a time.  It forward projects each slab through an mbirtorch
+The phantom is the set of ellipsoids of ``make_synthetic_parallel_sinogram.py``.  It is defined
+relative to the shape of the volume, so the same phantom serves any volume.  The script builds
+the phantom one slab of slices at a time.  It forward projects each slab through an mbirtorch
 cone-beam model of the slab and of the band of detector rows that the slab touches, and it adds
 the result to these rows of the sinogram file.  The sum over the slabs is the forward
 projection of the whole phantom.  The file is a ``.npy`` memory map, so the host holds only one
@@ -12,23 +12,25 @@ slab of the phantom and one band of the sinogram.
     python make_synthetic_cone_sinogram.py 1601,3048,3048 sino.npy --source-detector-dist 5080 --source-iso-dist 2540
     python make_synthetic_cone_sinogram.py --check recon.h5 --slices 5
 
-The geometry options are those of ``stream_fdk_cone.py``, and the reconstruction must be given
-the same options.
+The geometry options are those of ``recon_direct_on_disk_cone.py``, and the reconstruction must
+be given the same options.
 
-``--check`` reads a few slices of a reconstruction written by ``stream_fdk_cone.py`` and reports
-the NRMSE of each slice against the phantom.  It reads only those slices, so it works on a
-volume of any size.  FDK is an approximate reconstruction, and its error grows toward the two
+``--check`` reads a few slices of a reconstruction written by ``recon_direct_on_disk_cone.py``
+and reports the NRMSE of each slice against the phantom.  It reads only those slices, so it
+works on a volume of any size.  FDK is an approximate reconstruction, and its error grows toward the two
 ends of the rotation axis.
 """
 
 import argparse
 import time
 
+# on_disk_common sets the allocator option of torch, so this import comes before that of torch.
+from on_disk_common import GB
+
 import numpy as np
 
-import stream_fdk_cone
-from make_synthetic_sinogram import check, phantom_band
-from stream_common import GB
+import recon_direct_on_disk_cone
+from make_synthetic_parallel_sinogram import check, phantom_band
 
 DEFAULT_SLAB_SLICES = 64
 
@@ -37,13 +39,15 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__.split('\n\n')[0],
                                 formatter_class=argparse.RawDescriptionHelpFormatter,
                                 epilog=__doc__)
-    p.add_argument('shape', nargs='?', type=stream_fdk_cone.shape_from_text, metavar='VIEWS,ROWS,CHANNELS',
-                   help='sinogram shape to make')
+    p.add_argument('shape', nargs='?', type=recon_direct_on_disk_cone.shape_from_text,
+                   metavar='VIEWS,ROWS,CHANNELS', help='sinogram shape to make')
     p.add_argument('path', nargs='?', help='output .npy file for the sinogram')
-    stream_fdk_cone.add_geometry_arguments(p)
+    recon_direct_on_disk_cone.add_geometry_arguments(p)
     p.add_argument('--slab-slices', type=int, default=DEFAULT_SLAB_SLICES,
                    help='slices of the phantom projected at a time (default %(default)s)')
     p.add_argument('--devices', help="device list for the projection, e.g. 'cpu' (default: the package chooses)")
+    p.add_argument('--compile-off', action='store_true',
+                   help='build the models without torch.compile, for a test on a CPU')
     p.add_argument('--check', metavar='RECON',
                    help='compare this reconstruction file with the phantom instead of making a sinogram')
     p.add_argument('--slices', type=int, default=5, help='with --check: slices to compare (default %(default)s)')
@@ -51,7 +55,7 @@ def parse_args():
     if args.check is None:
         if args.shape is None or args.path is None:
             p.error('give VIEWS,ROWS,CHANNELS and an output path, or --check RECON')
-        stream_fdk_cone.require_distances(p, args)
+        recon_direct_on_disk_cone.require_distances(p, args)
     return args
 
 
@@ -65,9 +69,9 @@ def make_sinogram(model, path, slab_slices):
     t0 = time.time()
     for slice_lo in range(0, num_slices, slab_slices):
         slice_hi = min(slice_lo + slab_slices, num_slices)
-        row_lo, row_hi = stream_fdk_cone.band_rows(model, slice_lo, slice_hi)
+        row_lo, row_hi = recon_direct_on_disk_cone.band_rows(model, slice_lo, slice_hi)
         if row_hi > row_lo:
-            part = stream_fdk_cone.part_model(model, row_lo, row_hi, slice_lo, slice_hi)
+            part = recon_direct_on_disk_cone.part_model(model, slice_lo, slice_hi, row_lo, row_hi)
             slab = phantom_band(num_recon_rows, num_recon_cols, num_slices, slice_lo, slice_hi, part.torch_device)
             sino[:, row_lo:row_hi, :] += np.asarray(part.forward_project(slab))
             del slab, part
@@ -82,7 +86,7 @@ def main():
     if args.check:
         check(args.check, args.slices)
         return
-    model = stream_fdk_cone.scan_model(args, args.shape)
+    model = recon_direct_on_disk_cone.scan_model(args, args.shape)
     if args.devices:
         model.configure_devices(devices=args.devices.split(','))
     print(f'volume {tuple(int(s) for s in model.get_params("recon_shape"))}, '

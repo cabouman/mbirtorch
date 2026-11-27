@@ -5,20 +5,20 @@ as a whole.  A slab is a range of slices, and a band is a range of detector rows
 filter acts along each detector row alone, and the back projection of a voxel reads only the
 rows that the voxel touches.  For this reason, a slab can be reconstructed from the band of
 rows that its voxels touch.  For each slab, the script reads the band from the sinogram file,
-reconstructs the slab on the GPUs with ``ConeBeamModel.recon_fdk``, and writes the slab to the
-output file.  The host holds one band of the sinogram and one slab of the volume.  The volume
-exists only on disk.
+reconstructs the slab on the GPUs with ``ConeBeamModel.recon_direct``, and writes the slab to
+the output file.  The host holds one band of the sinogram and one slab of the volume.  The
+volume exists only on disk.
 
 The result equals the FDK reconstruction of the whole volume, up to the rounding of float32
 arithmetic.  The slabs need no overlap and no blending.  The bands of neighboring slabs
 overlap, so the script reads and filters some detector rows more than once.  The script
 supports circular scans only.
 
-    python stream_fdk_cone.py --sino sino.npy --source-detector-dist 5080 --source-iso-dist 2540 --output recon.h5
+    python recon_direct_on_disk_cone.py --sino sino.npy --source-detector-dist 5080 --source-iso-dist 2540 \
+        --output recon.h5
 
-For a test without data, ``make_synthetic_cone_sinogram.py`` writes a phantom sinogram and
-checks a reconstruction against the phantom.  ``check_stream_fdk_cone.py`` compares this script
-with ``recon_fdk`` of the whole volume on small scans.
+The function ``recon_direct_on_disk_cone`` does the reconstruction.  It takes the
+``ConeBeamModel`` of the whole scan, so that it can become a method of the model.
 
 Inputs.  The sinogram is a ``.npy`` file, which is memory mapped, or an HDF5 file.  In both
 cases the script reads only the rows of one band at a time.  The axes are (views, detector
@@ -27,40 +27,34 @@ rows, detector channels) in float32.  The angles are radians in a ``.npy`` file,
 the names of the ``ConeBeamModel`` parameters, and an option that is not given keeps the
 default of the package.  ``--param`` sets any other parameter of the model.
 
-Slabs.  ``--num-slabs`` sets the number of slabs.  Without it, the script uses the smallest
-number of slabs for which the memory check of the package accepts every slab on the GPUs.  The
-check accepts a slab if (1 + margin) times the estimated peak memory of its reconstruction is
-at most the free memory of each GPU.  ``--margin`` sets the margin.  If two or more GPUs are
-visible and ``--devices`` is not given, the package runs the same check with this margin before
-it reconstructs each slab.  On a device that is not a GPU, the check has no limit, and
-``--num-slabs`` is required.
+Slabs.  ``--slices-per-section`` sets the largest number of slices of a slab.  Without it, the
+script uses the smallest number of slabs for which the memory check of the package accepts
+every slab on the GPUs.  The check accepts a slab if (1 + margin) times the estimated peak
+memory of its reconstruction is at most the free memory of each GPU.  ``--margin`` sets the
+margin.  If two or more GPUs are visible and ``--devices`` is not given, the package runs the
+same check with this margin before it reconstructs each slab.  On a device that is not a GPU,
+the check has no limit, and ``--slices-per-section`` is required.
 
 Output.  A ``.h5`` path gives an HDF5 file in the layout of ``export_recon_hdf5``: dataset
 ``recon`` with axes (slice, col, row), readable with ``import_recon_hdf5``.  A ``.npy`` path
-gives a memory mapped array with axes (slice, row, col).  The script writes one slab at a
-time.  A progress file beside the output records each finished slab.  The same command with
-``--resume`` continues an interrupted run from the first unfinished slab.
+gives a memory mapped array with axes (slice, row, col).  A progress file beside the output
+records each finished slab.  The same command with ``--resume`` continues an interrupted run
+from the first unfinished slab.
 
-Private library calls.  The choice of the number of slabs uses
-``TomographyModel._fits_available_devices``, which is the memory check of the package.  The
-attributes of the HDF5 output come from ``mbirtorch.utilities._recon_attributes``, which
-``stream_common.py`` calls.  Everything else is public API.
-
-Shared code.  ``stream_common.py`` holds the code that this script shares with
-``stream_recon_parallel.py``: the reader of the sinogram file, the writer of the output file,
-the progress file, and the loop over the slabs.
+Shared code.  ``on_disk_common.py`` holds the direct reconstruction by parts, which
+``recon_direct_on_disk_parallel.py`` also uses, and the reader and writer of the files.  This
+script holds the model of the scan, the bands of the slabs, and the model of one slab.  The
+choice of the number of slabs uses ``TomographyModel._fits_available_devices``, which is the
+memory check of the package and a private function.
 """
 
 import argparse
-import hashlib
 import json
-import time
 
-# stream_common sets the allocator option of torch, so this import comes before that of torch.
-from stream_common import (
-    ProgressFile, SinogramSource, add_angle_arguments, add_device_arguments, add_input_arguments,
-    add_output_arguments, device_list, finish_output, open_output, print_sizes, print_summary, run_parts,
-    smallest_fitting_count, view_angles)
+# on_disk_common sets the allocator option of torch, so this import comes before that of torch.
+from on_disk_common import (
+    add_angle_arguments, add_device_arguments, add_input_arguments, add_output_arguments,
+    apply_device_options, compile_mode, read_sinogram_shape, recon_direct_on_disk, view_angles)
 
 import numpy as np
 
@@ -69,14 +63,10 @@ import mbirtorch
 DEFAULT_ANGLE_SPAN_DEG = 360.0
 # The name of a part of the run in the messages and in the help texts.
 PART_NAME = 'slab'
+# The name of the method in the attributes of an HDF5 output.
+METHOD = 'FDK by slabs (recon_direct_on_disk_cone.py)'
 # This many rows are added at each end of a band, against the rounding of the row index.
 BAND_SAFETY_ROWS = 1
-# These model parameters determine the result.  The progress file records them, so that
-# --resume can refuse to continue a run that had other settings.
-RESULT_PARAMS = ('source_detector_dist', 'source_iso_dist', 'use_curved_detector',
-                 'delta_det_channel', 'delta_det_row', 'det_channel_offset', 'det_row_offset',
-                 'delta_voxel', 'voxel_row_aspect', 'voxel_slice_aspect', 'recon_slice_offset',
-                 'use_ror_mask')
 # These geometry options are passed to the model under the same name when they are given.
 GEOMETRY_OPTIONS = ('delta_det_channel', 'delta_det_row', 'det_channel_offset', 'det_row_offset',
                     'delta_voxel', 'recon_slice_offset')
@@ -113,8 +103,6 @@ def add_geometry_arguments(parser):
     geo.add_argument('--param', action='append', default=[], metavar='NAME=VALUE',
                      help='another model parameter, for example voxel_slice_aspect=1.5 or use_ror_mask=false; '
                           'VALUE is read as JSON; the option can be repeated')
-    geo.add_argument('--compile-off', action='store_true',
-                     help='build the models without torch.compile, for a test on a CPU')
 
 
 def parse_args(argv=None):
@@ -124,11 +112,9 @@ def parse_args(argv=None):
     add_input_arguments(p)
     add_geometry_arguments(p)
     add_output_arguments(p, PART_NAME)
-    dev = add_device_arguments(p, PART_NAME)
-    dev.add_argument('--num-slabs', type=int,
-                     help='number of slabs (default: the smallest number that the memory check accepts)')
+    add_device_arguments(p, PART_NAME)
     rec = p.add_argument_group('reconstruction')
-    rec.add_argument('--filter-name', default='ramp', help='filter of recon_fdk (default %(default)s)')
+    rec.add_argument('--filter-name', default='ramp', help='filter of recon_direct (default %(default)s)')
     args = p.parse_args(argv)
     require_distances(p, args)
     return args
@@ -148,7 +134,7 @@ def scan_model(args, sinogram_shape):
                 'angles': view_angles(args, sinogram_shape[0]),
                 'source_detector_dist': args.source_detector_dist, 'source_iso_dist': args.source_iso_dist,
                 'use_curved_detector': args.curved_detector,
-                'compile_mode': 'off' if args.compile_off else 'auto'}
+                'compile_mode': compile_mode(args)}
     optional = {name: getattr(args, name) for name in GEOMETRY_OPTIONS if getattr(args, name) is not None}
     if args.recon_shape is not None:
         optional['recon_shape'] = args.recon_shape
@@ -200,8 +186,8 @@ def band_rows(model, slice_lo, slice_hi):
     return (row_lo, row_hi) if row_hi > row_lo else (0, 0)
 
 
-def part_model(base, row_lo, row_hi, slice_lo, slice_hi):
-    """Return the model for detector rows [row_lo, row_hi) and slices [slice_lo, slice_hi) of
+def part_model(base, slice_lo, slice_hi, row_lo, row_hi):
+    """Return the model for slices [slice_lo, slice_hi) and detector rows [row_lo, row_hi) of
     base.  Each voxel and each detector element of the part has the same position as in base.
     The part uses the devices that were set for base with configure_devices, and it uses the
     margin of the memory check of base."""
@@ -229,92 +215,32 @@ def slab_plan(model, num_slabs):
             for slice_lo, slice_hi in zip(edges[:-1], edges[1:])]
 
 
-def largest_slabs(plan):
-    """Return the slabs of plan that need the most memory.  A slab is left out if another slab
-    has at least as many slices and at least as many band rows."""
-    sizes = {(slice_hi - slice_lo, row_hi - row_lo): (slice_lo, slice_hi, row_lo, row_hi)
-             for slice_lo, slice_hi, row_lo, row_hi in plan if row_hi > row_lo}
-    return [slab for size, slab in sizes.items()
-            if not any(other != size and other[0] >= size[0] and other[1] >= size[1] for other in sizes)]
+# ── the reconstruction ───────────────────────────────────────────────────────
+def recon_direct_on_disk_cone(model, sino_file, output_file, filter_name='ramp', slices_per_section=None,
+                              dataset=None, resume=False, max_parts=None):
+    """Reconstruct a circular cone-beam scan by FDK, one slab of slices at a time, from the
+    sinogram file sino_file to the output file output_file.
+
+    model is the ConeBeamModel of the whole scan.  Its devices and the margin of its memory check
+    apply to every slab.  slices_per_section sets the largest number of slices of a slab.  If it
+    is None, the function takes the smallest number of slabs that the memory check accepts.  The
+    other arguments are those of on_disk_common.recon_direct_on_disk."""
+    z_shifts = np.asarray(model.get_params('view_params_array'))[:, 1]
+    if np.ptp(z_shifts) > 0:
+        raise SystemExit('recon_direct_on_disk_cone supports circular scans only')
+    recon_direct_on_disk(model, sino_file, output_file, lambda count: slab_plan(model, count),
+                         lambda *part: part_model(model, *part), PART_NAME, METHOD, filter_name=filter_name,
+                         slices_per_section=slices_per_section, dataset=dataset, resume=resume,
+                         max_parts=max_parts)
 
 
-def plan_fits(model, plan):
-    """Return True if the memory check of the package accepts the FDK reconstruction of every
-    slab of plan.  The check uses the margin of model."""
-    return all(part_model(model, row_lo, row_hi, slice_lo, slice_hi)._fits_available_devices(workload='direct')
-               for slice_lo, slice_hi, row_lo, row_hi in largest_slabs(plan))
-
-
-def choose_num_slabs(model):
-    """Return the smallest number of slabs whose plan passes the memory check of the package.
-    The check uses the margin of model.  Use this function when the user gave no number of
-    slabs.  The devices of model must be GPUs."""
-    if any(device.type != 'cuda' for device in model.sino_placement.devices):
-        raise SystemExit('the memory check has no limit for a device that is not a GPU; give --num-slabs')
-    num_slices = int(model.get_params('recon_shape')[2])
-    num_slabs = smallest_fitting_count(lambda count: plan_fits(model, slab_plan(model, count)), num_slices)
-    if num_slabs is None:
-        raise SystemExit('the band of detector rows of a single slice does not fit the GPUs at margin '
-                         f'{model.memory_check_margin}')
-    return num_slabs
-
-
-# ── the run ──────────────────────────────────────────────────────────────────
 def main(argv=None):
     args = parse_args(argv)
-    devices = device_list(args)
-
-    t_start = time.time()
-    source = SinogramSource(args.sino, args.dataset)
-    num_rows = source.shape[1]
-    full = scan_model(args, source.shape)
-    if devices:
-        full.configure_devices(devices=devices)
-    # Every slab takes this margin, both for the choice of the number of slabs and for the memory
-    # check of the package before each reconstruction.
-    full.memory_check_margin = args.margin
-    recon_shape = tuple(int(s) for s in full.get_params('recon_shape'))
-    num_slices = recon_shape[2]
-    print_sizes(source.shape, recon_shape)
-
-    # The progress file makes the run resumable and records the cost of each slab.
-    progress = ProgressFile(args.output, PART_NAME, args.resume)
-    num_slabs = progress.num_parts(args.num_slabs, lambda: choose_num_slabs(full))
-    if not 1 <= num_slabs <= num_slices:
-        raise SystemExit(f'the number of slabs must be between 1 and the number of slices, {num_slices}')
-    plan = slab_plan(full, num_slabs)
-    largest_band = max(row_hi - row_lo for _lo, _hi, row_lo, row_hi in plan)
-    print(f'{num_slabs} slab(s) of about {-(-num_slices // num_slabs)} slices; the largest band has '
-          f'{largest_band} of {num_rows} detector rows', flush=True)
-    angles = np.asarray(full.get_params('view_params_array'))[:, 0]
-    config = {'sinogram_shape': list(source.shape), 'recon_shape': list(recon_shape), 'num_parts': num_slabs,
-              'filter_name': args.filter_name,
-              'angles_sha256': hashlib.sha256(np.ascontiguousarray(angles, dtype=np.float32).tobytes()).hexdigest(),
-              'model_params': {name: full.get_params(name) for name in RESULT_PARAMS}}
-    sink = open_output(args.output, recon_shape, progress, config)
-
-    def read(k):
-        """Return the band of detector rows of slab k, or None if the slab touches no row."""
-        _slice_lo, _slice_hi, row_lo, row_hi = plan[k]
-        return source.read_rows(row_lo, row_hi) if row_hi > row_lo else None
-
-    def reconstruct(k, band):
-        """Return the FDK reconstruction of slab k from its band.  This script records no value
-        of its own for a slab."""
-        slice_lo, slice_hi, row_lo, row_hi = plan[k]
-        if band is None:
-            # No detector row measures this slab, so its back projection is zero.
-            return np.zeros(recon_shape[:2] + (slice_hi - slice_lo,), dtype=np.float32), {}
-        part = part_model(full, row_lo, row_hi, slice_lo, slice_hi)
-        return part.recon_fdk(band, filter_name=args.filter_name), {}
-
-    run_parts(plan, read, reconstruct, sink, progress, args.max_parts)
-
-    recon_params = dict(config, method='FDK by slabs (stream_fdk_cone.py)')
-    del recon_params['model_params']
-    finish_output(sink, progress, full, recon_params)
-    source.close()
-    print_summary(progress, time.time() - t_start, args.output)
+    model = scan_model(args, read_sinogram_shape(args.sino, args.dataset))
+    apply_device_options(model, args)
+    recon_direct_on_disk_cone(model, args.sino, args.output, filter_name=args.filter_name,
+                              slices_per_section=args.slices_per_section, dataset=args.dataset,
+                              resume=args.resume, max_parts=args.max_parts)
 
 
 if __name__ == '__main__':

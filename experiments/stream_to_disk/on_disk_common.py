@@ -1,13 +1,14 @@
-"""Code that the two reconstruction scripts of this folder share.
+"""Code that the reconstruction scripts of this folder share.
 
-``stream_recon_parallel.py`` and ``stream_fdk_cone.py`` reconstruct a scan in parts, and they
-write each part to the output file before they continue.  A part is a band of the parallel-beam
-script or a slab of the cone-beam script.  This module holds what does not depend on the
-geometry or on the reconstruction method: the options that both scripts have, the reader of the
-sinogram file, the writer of the output file, the progress file, the search for the number of
-parts, and the loop over the parts.
+Each reconstruction script of this folder reconstructs a scan in parts, and it writes each part
+to the output file before it continues.  A part is a range of slices.  The parallel-beam scripts
+call a part a band, and the cone-beam script calls it a slab.  This module holds what does not
+depend on the geometry or on the reconstruction method: the options that the scripts share, the
+reader of the sinogram file, the writer of the output file, the progress file, the choice of the
+number of parts, the loop over the parts, and the direct reconstruction by parts.
 """
 
+import hashlib
 import json
 import math
 import os
@@ -35,12 +36,13 @@ VOLUME_NDIM = 3
 WRITE_SLAB = 64
 # The package uses a smaller margin, 0.15.  In a test of FDK by slabs on H100 GPUs, the margin of
 # the package accepted a slab that ran out of memory.  This margin rejects the two slabs that
-# ran out of memory in that test, and it accepts the three slabs that finished.  The original
-# parallel-beam script has the same default.
+# ran out of memory in that test, and it accepts the three slabs that finished.
 DEFAULT_MARGIN = 0.3
+# These model parameters do not change the result, so the progress file does not record them.
+UNRECORDED_PARAMS = ('verbose',)
 
 
-# ── the options that both scripts have ───────────────────────────────────────
+# ── the options that the scripts share ───────────────────────────────────────
 def add_input_arguments(parser):
     """Add the option group 'input' with the options of the sinogram file to parser.  Return the
     group, so that a script can add its own options to it."""
@@ -75,19 +77,31 @@ def add_device_arguments(parser, part_name):
     group = parser.add_argument_group('devices and memory')
     group.add_argument('--num-gpus', type=int, help='pin the GPU count (default: the package chooses)')
     group.add_argument('--devices', help=f"explicit device list for every {part_name}, e.g. 'cpu' or 'cuda:0,cuda:1'")
+    group.add_argument('--compile-off', action='store_true',
+                       help='build the models without torch.compile, for a test on a CPU')
+    group.add_argument('--slices-per-section', type=int,
+                       help=f'slices per {part_name} (default: the smallest number of {part_name}s that the '
+                            'memory check accepts)')
     group.add_argument('--margin', type=float, default=DEFAULT_MARGIN,
-                       help=f'safety margin of the memory check that chooses the number of {part_name}s: a '
-                            f'{part_name} fits when (1 + margin) x its estimated peak is at most the free GPU '
-                            'memory (default %(default)s; the package uses 0.15)')
+                       help=f'safety margin of the memory check of each {part_name}: a {part_name} fits when '
+                            '(1 + margin) x its estimated peak is at most the free GPU memory (default '
+                            '%(default)s; the package uses 0.15)')
     return group
 
 
-def device_list(args):
-    """Apply --num-gpus.  Return the devices of --devices as a list, or None if the option is
-    not given."""
+def compile_mode(args):
+    """Return the compile_mode of the models that the option --compile-off asks for."""
+    return 'off' if args.compile_off else 'auto'
+
+
+def apply_device_options(model, args):
+    """Apply the options --num-gpus, --devices, and --margin to model, which is the model of the
+    whole scan.  Every part model takes these settings from model."""
     if args.num_gpus is not None:
         os.environ['MBIRTORCH_NUM_DEVICES'] = str(args.num_gpus)
-    return args.devices.split(',') if args.devices else None
+    if args.devices:
+        model.configure_devices(devices=args.devices.split(','))
+    model.memory_check_margin = args.margin
 
 
 def view_angles(args, num_views):
@@ -98,6 +112,13 @@ def view_angles(args, num_views):
             raise SystemExit(f'{args.angles} holds {angles.shape[0]} angles for {num_views} views')
         return angles
     return np.linspace(0, np.deg2rad(args.angle_span), num_views, endpoint=False, dtype=np.float32)
+
+
+def read_sinogram_shape(path, dataset=None):
+    """Return the shape of the sinogram in the file at path."""
+    source = SinogramSource(path, dataset)
+    source.close()
+    return source.shape
 
 
 def print_sizes(sinogram_shape, recon_shape):
@@ -144,6 +165,17 @@ class SinogramSource:
     def close(self):
         if self._file is not None:
             self._file.close()
+
+
+def open_sinogram(path, dataset, model):
+    """Return the SinogramSource of the file at path.  The function stops if the shape of the
+    sinogram differs from the sinogram shape of model."""
+    source = SinogramSource(path, dataset)
+    expected = tuple(int(s) for s in model.get_params('sinogram_shape'))
+    if source.shape != expected:
+        source.close()
+        raise SystemExit(f'{path} holds a sinogram of shape {source.shape}; the model expects {expected}')
+    return source
 
 
 # ── the volume on disk ───────────────────────────────────────────────────────
@@ -241,6 +273,23 @@ def save_json(path, record):
     os.replace(path + '.tmp', path)
 
 
+def model_settings(model):
+    """Return the parameters of model in a form that a JSON file holds.  An array parameter, such
+    as the angles, is replaced by the SHA-256 hash of its bytes.  The progress file records these
+    settings, so that --resume can refuse to continue a run of another model."""
+    required, optional, regularization = model.get_all_params()
+    settings = {}
+    for name, value in {**required, **optional, **regularization}.items():
+        if name in UNRECORDED_PARAMS:
+            continue
+        if isinstance(value, np.ndarray):
+            value = 'sha256 ' + hashlib.sha256(np.ascontiguousarray(value).tobytes()).hexdigest()
+        elif isinstance(value, np.generic):
+            value = value.item()
+        settings[name] = value
+    return settings
+
+
 class ProgressFile:
     """The record of a run, in a JSON file beside the output file.
 
@@ -311,6 +360,26 @@ def open_output(path, recon_shape, progress, config):
 
 
 # ── the number of parts ──────────────────────────────────────────────────────
+def num_parts_for(slices_per_section, num_slices):
+    """Return the number of parts of at most slices_per_section slices each, or None if
+    slices_per_section is None."""
+    if slices_per_section is None:
+        return None
+    if slices_per_section < 1:
+        raise SystemExit('--slices-per-section must be at least 1')
+    return -(-num_slices // slices_per_section)
+
+
+def largest_parts(plan):
+    """Return the parts of plan that need the most memory.  A part is left out if another part
+    has at least as many slices and at least as many detector rows.  A part with no detector row
+    is left out too."""
+    sizes = {(slice_hi - slice_lo, row_hi - row_lo): (slice_lo, slice_hi, row_lo, row_hi)
+             for slice_lo, slice_hi, row_lo, row_hi in plan if row_hi > row_lo}
+    return [part for size, part in sizes.items()
+            if not any(other != size and other[0] >= size[0] and other[1] >= size[1] for other in sizes)]
+
+
 def smallest_fitting_count(fits, max_count):
     """Return the smallest number of parts, from 1 to max_count, for which fits(count) is true.
     Return None if no number fits.  fits(count) must be true for every number above the first
@@ -322,6 +391,36 @@ def smallest_fitting_count(fits, max_count):
         if fits(count):
             return count
     return max_count
+
+
+def choose_num_parts(model, plan_of, part_model_of, max_count, part_name, workload, **call_arrays):
+    """Return the smallest number of parts, from 1 to max_count, for which the memory check of the
+    package accepts every part.  Use this function when the user gave no size of a part.
+
+    model is the model of the whole scan, and its devices must be GPUs.  plan_of(count) returns the
+    plan of count parts.  part_model_of(slice_lo, slice_hi, row_lo, row_hi) returns the model of a
+    part.  workload and call_arrays are the arguments of the memory check."""
+    if any(device.type != 'cuda' for device in model.sino_placement.devices):
+        raise SystemExit('the memory check has no limit for a device that is not a GPU; give --slices-per-section')
+
+    def fits(count):
+        return all(part_model_of(*part)._fits_available_devices(workload=workload, **call_arrays)
+                   for part in largest_parts(plan_of(count)))
+
+    num_parts = smallest_fitting_count(fits, max_count)
+    if num_parts is None:
+        raise SystemExit(f'no number of {part_name}s up to {max_count} fits the GPUs at margin '
+                         f'{model.memory_check_margin}')
+    return num_parts
+
+
+def print_plan(plan, part_name, num_rows):
+    """Print the number of parts of plan, their largest number of slices, and the largest number
+    of detector rows that a part reads."""
+    largest_slices = max(slice_hi - slice_lo for slice_lo, slice_hi, _row_lo, _row_hi in plan)
+    largest_rows = max(row_hi - row_lo for _slice_lo, _slice_hi, row_lo, row_hi in plan)
+    print(f'{len(plan)} {part_name}(s) of up to {largest_slices} slices; the largest {part_name} reads '
+          f'{largest_rows} of {num_rows} detector rows', flush=True)
 
 
 # ── the run ──────────────────────────────────────────────────────────────────
@@ -416,11 +515,69 @@ def print_summary(progress, seconds, output_path):
     print(f'\n{"finished" if progress.finished else "stopped"}: {len(done)} of {progress.config["num_parts"]} '
           f'{name}(s), {seconds:.0f} s this run, peak host RSS {peak_host_bytes() / GB:.0f} GB; output {output_path}')
     for index in range(gpu_count()):
-        # A part that an earlier process recorded can have values for fewer GPUs, or no values.
+        # A part that an earlier process recorded can have values for fewer GPUs.
         allocated = max((entry['gpu_peak_GiB'][index] for entry in done
-                         if index < len(entry.get('gpu_peak_GiB', []))), default=0.0)
+                         if index < len(entry['gpu_peak_GiB'])), default=0.0)
         reserved = max((entry['gpu_reserved_peak_GiB'][index] for entry in done
-                        if index < len(entry.get('gpu_reserved_peak_GiB', []))), default=0.0)
+                        if index < len(entry['gpu_reserved_peak_GiB'])), default=0.0)
         total_memory = torch.cuda.get_device_properties(index).total_memory
         print(f'  GPU {index}: largest peak of a {name} {allocated:.1f} GiB allocated, {reserved:.1f} GiB reserved '
               f'of {total_memory / GiB:.1f} GiB')
+
+
+# ── the direct reconstruction by parts ───────────────────────────────────────
+def recon_direct_on_disk(model, sino_file, output_file, plan_of, part_model_of, part_name, method,
+                         filter_name='ramp', slices_per_section=None, dataset=None, resume=False, max_parts=None):
+    """Reconstruct the scan of model by its direct method, one part at a time, from sino_file to
+    output_file.  A script of this folder calls this function with the two functions of its
+    geometry.
+
+    Every part is reconstructed with recon_direct of its own model from the detector rows that the
+    part reads.  plan_of(count) returns the plan of count parts, as run_parts takes it.
+    part_model_of(slice_lo, slice_hi, row_lo, row_hi) returns the model of a part.  The result
+    equals recon_direct of the whole scan if the rows of each part hold every row that its voxels
+    touch.
+
+    model is the model of the whole scan.  Its devices and the margin of its memory check apply
+    to every part.  part_name is the name of a part in the messages.  method is the name of the
+    method in the attributes of an HDF5 output.  slices_per_section sets the largest number of
+    slices of a part.  If it is None, the function takes the smallest number of parts that the
+    memory check accepts.  With resume, the function continues the interrupted run of
+    output_file.  The function stops before the part of index max_parts if max_parts is not
+    None."""
+    t_start = time.time()
+    source = open_sinogram(sino_file, dataset, model)
+    recon_shape = tuple(int(s) for s in model.get_params('recon_shape'))
+    num_slices = recon_shape[2]
+    print_sizes(source.shape, recon_shape)
+
+    progress = ProgressFile(output_file, part_name, resume)
+    num_parts = progress.num_parts(
+        num_parts_for(slices_per_section, num_slices),
+        lambda: choose_num_parts(model, plan_of, part_model_of, num_slices, part_name, workload='direct'))
+    if not 1 <= num_parts <= num_slices:
+        raise SystemExit(f'the number of {part_name}s must be between 1 and the number of slices, {num_slices}')
+    plan = plan_of(num_parts)
+    print_plan(plan, part_name, source.shape[1])
+    config = {'num_parts': num_parts, 'filter_name': filter_name, 'model_params': model_settings(model)}
+    sink = open_output(output_file, recon_shape, progress, config)
+
+    def read(k):
+        """Return the detector rows of part k, or None if the part reads no row."""
+        _slice_lo, _slice_hi, row_lo, row_hi = plan[k]
+        return source.read_rows(row_lo, row_hi) if row_hi > row_lo else None
+
+    def reconstruct(k, rows):
+        """Return the direct reconstruction of part k from its detector rows.  The function
+        records no value of its own for a part."""
+        slice_lo, slice_hi, _row_lo, _row_hi = plan[k]
+        if rows is None:
+            # No detector row measures this part, so its back projection is zero.
+            return np.zeros(recon_shape[:2] + (slice_hi - slice_lo,), dtype=np.float32), {}
+        return part_model_of(*plan[k]).recon_direct(rows, filter_name=filter_name), {}
+
+    run_parts(plan, read, reconstruct, sink, progress, max_parts)
+
+    finish_output(sink, progress, model, {'method': method, 'num_parts': num_parts, 'filter_name': filter_name})
+    source.close()
+    print_summary(progress, time.time() - t_start, output_file)

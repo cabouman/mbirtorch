@@ -1,5 +1,5 @@
-"""Make a synthetic parallel-beam sinogram for testing the large reconstruction scripts, and
-check a reconstruction against its phantom.
+"""Make a synthetic parallel-beam sinogram for testing the parallel-beam scripts of this folder,
+and check a reconstruction against its phantom.
 
 The phantom is a set of ellipsoids, a low dynamic range variant of the Shepp-Logan head.  It
 is defined in coordinates where the reconstruction's inscribed circle has radius 1 and the
@@ -10,28 +10,31 @@ own geometry conventions by construction.  In parallel beam a detector row is a 
 bands are exact pieces of the whole sinogram.  The file is written band by band as a ``.npy``
 memory map, so it never has to fit in host memory.
 
-    python make_synthetic_sinogram.py 900,4096,4096 sino_4k.npy
-    python make_synthetic_sinogram.py --check recon_4k.h5 --slices 5
+    python make_synthetic_parallel_sinogram.py 900,4096,4096 sino_4k.npy
+    python make_synthetic_parallel_sinogram.py --check recon_4k.h5 --slices 5
 
 The reconstruction scripts must be given the same angles: equally spaced over
 ``--angle-span`` degrees (default 180), or the ``--angles`` file.
 
-``--check`` reads a few slices of a reconstruction written by ``recon_parallel_split.py`` or
-``stream_recon_parallel.py`` (an HDF5 file in the ``export_recon_hdf5`` layout, or the
-streaming harness's ``.npy`` file) and reports each slice's NRMSE against the phantom.  It
-reads only those slices, so it works on a volume of any size.
+``--check`` reads a few slices of a reconstruction written by a script of this folder (an HDF5
+file in the ``export_recon_hdf5`` layout, or a ``.npy`` file with axes (slice, row, col)) and
+reports each slice's NRMSE against the phantom.  It reads only those slices, so it works on a
+volume of any size.
 """
 
 import argparse
 import math
 import time
 
+# on_disk_common sets the allocator option of torch, so this import comes before that of torch.
+from on_disk_common import GB, add_angle_arguments, view_angles
+
 import numpy as np
 import torch
 
 import mbirtorch
 
-GB = 1e9
+from recon_on_disk_parallel import DEFAULT_ANGLE_SPAN_DEG
 
 # Ellipsoids as (x0, y0, z0, a, b, c, angle_deg, value).  The head is 1.0 in its shell and
 # 0.2 inside, with features of 0.1 to 0.3.
@@ -58,9 +61,7 @@ def parse_args():
                                 epilog=__doc__)
     p.add_argument('shape', nargs='?', metavar='VIEWS,ROWS,CHANNELS', help='sinogram shape to make')
     p.add_argument('path', nargs='?', help='output .npy file for the sinogram')
-    p.add_argument('--angles', help='.npy file of view angles in radians, one per view')
-    p.add_argument('--angle-span', type=float, default=180.0,
-                   help='without --angles: equally spaced views over this many degrees (default 180)')
+    add_angle_arguments(p, DEFAULT_ANGLE_SPAN_DEG)
     p.add_argument('--band-rows', type=int, default=64,
                    help='detector rows projected per band (default 64)')
     p.add_argument('--devices', help="device list for the projection, e.g. 'cpu' (default: one GPU "
@@ -123,9 +124,9 @@ def make_sinogram(num_views, num_rows, num_channels, angles, path, band_rows, de
 
 
 class ReconFile:
-    """Reads single slices of a reconstruction file in (row, col) order.  A ``.npy`` file is the
-    streaming harness's (slice, row, col) array; anything else is the ``export_recon_hdf5``
-    layout, dataset ``recon`` with axes (slice, col, row)."""
+    """Reads single slices of a reconstruction file in (row, col) order.  A ``.npy`` file is a
+    (slice, row, col) array; anything else is the ``export_recon_hdf5`` layout, dataset
+    ``recon`` with axes (slice, col, row)."""
 
     def __init__(self, path):
         self._file = None
@@ -169,13 +170,7 @@ def main():
         check(args.check, args.slices)
         return
     num_views, num_rows, num_channels = (int(v) for v in args.shape.split(','))
-    if args.angles:
-        angles = np.load(args.angles).astype(np.float32).reshape(-1)
-        if angles.shape[0] != num_views:
-            raise SystemExit(f'{args.angles} holds {angles.shape[0]} angles for {num_views} views')
-    else:
-        angles = np.linspace(0, np.deg2rad(args.angle_span), num_views, endpoint=False,
-                             dtype=np.float32)
+    angles = view_angles(args, num_views)
     devices = args.devices.split(',') if args.devices else None
     make_sinogram(num_views, num_rows, num_channels, angles, args.path, args.band_rows, devices)
 
