@@ -41,7 +41,9 @@ MULTIAXIS_BACK_VIEW_CHUNK = 128
 
 MULTIAXIS_FWD_BLOCK_P = 8
 MULTIAXIS_FWD_BLOCK_R = 128
-MULTIAXIS_FWD_NUM_WARPS = 8
+# 4 warps were 3 to 4% faster than 8 on an H100 under Triton 3.8 and 3.9, with relaxed atomics
+# (2026-11-27).
+MULTIAXIS_FWD_NUM_WARPS = 4
 MULTIAXIS_FWD_NUM_STAGES = 1
 MULTIAXIS_FWD_MIN_TILE = 8
 MULTIAXIS_FWD_VIEW_CHUNK = 128
@@ -421,7 +423,11 @@ def _multiaxis_forward_kernel(n_p_ptr, centers_ptr, m0_ptr,
         n_chan = tl.minimum(tl.maximum(n_tap, 0), num_channels - 1)
         out_ptrs = (out_view_ptr + n_chan.to(tl.int64)[:, None] * out_row_stride
                     + r_offs[None, :])
-        tl.atomic_add(out_ptrs, w_chan[:, None] * det_col,
+        # Relaxed ordering is enough, because no program reads the output while the kernel runs.
+        # The default ordering puts a memory fence around every atomic add, and relaxed ordering
+        # made this kernel 1.7 to 1.8 times as fast on an H100 under Triton 3.8 and 3.9
+        # (2026-11-27).
+        tl.atomic_add(out_ptrs, w_chan[:, None] * det_col, sem="relaxed",
                       mask=tile_mask & ((n_tap >= 0)
                                         & (n_tap < num_channels))[:, None])
 

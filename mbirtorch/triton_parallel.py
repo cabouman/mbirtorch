@@ -43,10 +43,15 @@ PARALLEL_FWD_MIN_TILE = 8
 PARALLEL_FWD_VIEW_CHUNK = 128
 
 # These constants are for the forward kernel that sorts the pixels by channel.
-PARALLEL_SORTED_BLOCK_P = 32
+# The tile sizes and the warp count were measured on an H100 on 2026-11-27, under Triton 3.8
+# and Triton 3.9.  Triton 3.9 made the earlier choice (BLOCK_P 32, BLOCK_R 128, 8 warps) about
+# twice as slow: 88 ms under Triton 3.8 and 180 ms under Triton 3.9 for a 512x448x384 forward
+# projection.  This choice takes 58 ms and 60 ms.  BLOCK_P stays at least 16, because it is one
+# dimension of the tl.dot product.
+PARALLEL_SORTED_BLOCK_P = 16
 PARALLEL_SORTED_WINDOW = 16
-PARALLEL_SORTED_BLOCK_R = 128
-PARALLEL_SORTED_NUM_WARPS = 8
+PARALLEL_SORTED_BLOCK_R = 64
+PARALLEL_SORTED_NUM_WARPS = 2
 PARALLEL_SORTED_NUM_STAGES = 1
 # tl.dot needs every dimension to be at least 16.
 PARALLEL_SORTED_MIN_R = 16
@@ -326,7 +331,9 @@ def _parallel_forward_kernel(n_p_ptr, centers_ptr, w_p_c_ptr,
         n_chan = tl.minimum(tl.maximum(n_tap, 0), num_channels - 1)
         out_ptrs = (out_view_ptr + n_chan.to(tl.int64)[:, None] * num_cols
                     + r_offs[None, :])
-        tl.atomic_add(out_ptrs, w_chan[:, None] * vals,
+        # Relaxed ordering is enough, because no program reads the output while the kernel runs.
+        # The default ordering puts a memory fence around every atomic add.
+        tl.atomic_add(out_ptrs, w_chan[:, None] * vals, sem="relaxed",
                       mask=tile_mask & ((n_tap >= 0)
                                         & (n_tap < num_channels))[:, None])
 
@@ -398,8 +405,8 @@ def _parallel_forward_sorted_kernel(n_p_ptr, centers_ptr, w_p_c_ptr,
                         + c_addr.to(tl.int64)[:, None] * num_cols
                         + r_offs[None, :])
             # This mask stops channels beyond the span of the tile from doing
-            # an atomic add.
-            tl.atomic_add(win_ptrs, out_window,
+            # an atomic add.  The ordering is relaxed, as in the tap loop below.
+            tl.atomic_add(win_ptrs, out_window, sem="relaxed",
                           mask=(v_ok
                                 & ((j <= (c_hi - c_lo))
                                    & (c >= 0)
@@ -416,7 +423,9 @@ def _parallel_forward_sorted_kernel(n_p_ptr, centers_ptr, w_p_c_ptr,
                 out_ptrs = (out_view_ptr
                             + n_chan.to(tl.int64)[:, None] * num_cols
                             + r_offs[None, :])
-                tl.atomic_add(out_ptrs, w_chan[:, None] * vals,
+                # Relaxed ordering is enough, because no program reads the output while the
+                # kernel runs.  The default ordering puts a memory fence around every atomic add.
+                tl.atomic_add(out_ptrs, w_chan[:, None] * vals, sem="relaxed",
                               mask=(v_ok & tile_mask
                                     & ((n_tap >= 0)
                                        & (n_tap < num_channels))[:, None]))
