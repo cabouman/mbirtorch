@@ -12,6 +12,7 @@ volume exists only on disk.
 | `stream_fdk_cone.py` | FDK reconstruction of a circular cone-beam scan, one slab of slices at a time. |
 | `make_synthetic_cone_sinogram.py` | Phantom sinogram for the cone-beam script, and comparison of a reconstruction with the phantom. |
 | `check_stream_fdk_cone.py` | Comparison of `stream_fdk_cone.py` with the FDK reconstruction of the whole volume, on small scans. |
+| `stream_common.py` | Code that the two reconstruction scripts share. |
 
 `python <script> --help` lists the options of each script.
 
@@ -19,7 +20,16 @@ The two reconstruction scripts use two private functions of the package:
 `TomographyModel._fits_available_devices` is the memory check, and
 `mbirtorch.utilities._recon_attributes` gives the attributes of the HDF5 output.
 
-## Files that the two reconstruction scripts read and write
+## What the two reconstruction scripts share
+
+Each script reconstructs the scan in parts.  A part is a band of the parallel-beam script or
+a slab of the cone-beam script.  `stream_common.py` holds the code that does not depend on
+the geometry or on the reconstruction method: the options for the files, the devices, and the
+memory check, the reader of the sinogram file, the writer of the output file, the progress
+file, and the loop over the parts.  Each script holds its own options, its model, its
+division of the scan into parts, and its reconstruction of one part.  The parallel-beam
+script also holds the blending of two bands.  The two scripts therefore read and write the
+same files, and they record and resume a run in the same way.
 
 The sinogram is a `.npy` file, which is memory mapped, or an HDF5 file.  Its axes are (views,
 detector rows, detector channels) in float32.  The script reads only the detector rows that
@@ -31,10 +41,11 @@ mapped array with axes (slice, row, col).
 
 A progress file beside the output, `<output name>_progress.json`, records each finished
 part.  The same command with `--resume` continues an interrupted run from the first
-unfinished part.  The script flushes the output file before it records a part, so the output
-of a process that is killed during a reconstruction holds every recorded part.  The HDF5
-library does not guarantee that an `.h5` file can be opened again if the process is killed
-while it writes to the file.  A `.npy` output does not have this limit.
+unfinished part, with the number of parts of the interrupted run.  The script flushes the
+output file before it records a part, so the output of a process that is killed during a
+reconstruction holds every recorded part.  The HDF5 library does not guarantee that an `.h5`
+file can be opened again if the process is killed while it writes to the file.  A `.npy`
+output does not have this limit.
 
 ## Parallel beam: `stream_recon_parallel.py`
 
@@ -52,7 +63,7 @@ python stream_recon_parallel.py --sino sino.npy --angle-span 180 --slices-per-se
 python make_synthetic_sinogram.py --check recon.h5
 ```
 
-This example has two bands, and it runs on a CPU in about two minutes.
+This example has two bands.  It runs in about one minute on a CPU with four cores.
 
 A resumed run does not give exactly the result of a run without a stop.  The bands after the
 stop use other random pixel partitions, as a second run of the same command does.  If the
@@ -60,7 +71,8 @@ process stopped while it wrote a band, the resumed run also blends the seam of t
 twice, and the slices of the seam then have other blending weights.
 
 The script and the generator come from `experiments/parallel_4k`.  The generator is an
-unchanged copy.  The script differs from the original in three points:
+unchanged copy.  The part of the script that the cone-beam script also needs is now in
+`stream_common.py`.  The script differs from the original in five points:
 
 - It flushes an `.h5` output when it creates the file, and it flushes the output after each
   band.  The `.h5` output of the original cannot be opened after the process is killed, and
@@ -69,11 +81,16 @@ unchanged copy.  The script differs from the original in three points:
   With the original, `--resume` after a new run that was killed in its first band skips the
   bands that the earlier run recorded.  In a `.npy` output, the slices of these bands are
   then zero.
-- It writes the `format` and `axes` attributes of `export_recon_hdf5`.  Without them,
-  `import_recon_hdf5` warns of an old layout.
+- A resumed run keeps the number of bands of the interrupted run.  The original chooses the
+  number again, and it refuses to resume if the choice differs.
+- It writes the attributes of `export_recon_hdf5`.  `import_recon_hdf5` then reads the file
+  without a warning, and it returns the parameters of the model and of the reconstruction.
+- It records the peak GPU memory of each band in the progress file.  For this, it releases the
+  unused GPU memory of torch before each band.
 
-The README of `experiments/parallel_4k` gives the memory and the time of the original script
-for a 4096 x 4096 detector.
+The README of `experiments/parallel_4k` gives the measured memory and time of the original
+script for 900 views of 500 x 4096 pixels on one GPU, and the modeled memory for a
+4096 x 4096 detector.
 
 ## Cone beam: `stream_fdk_cone.py`
 
@@ -107,8 +124,10 @@ The script supports circular scans only.
 `python check_stream_fdk_cone.py` runs on a CPU in less than one minute.  It checks that
 `stream_fdk_cone.py` gives the result of `recon_fdk` of the whole volume for ten geometries,
 that the `.npy` and `.h5` outputs are equal, and that a run that was stopped or killed and
-then resumed gives the result of a run without a stop.
+then resumed gives the result of a run without a stop.  The last checks run the code of
+`stream_common.py`, which both reconstruction scripts use.
 
-The folder has no test of `stream_recon_parallel.py`.
+The folder has no test of the code that only `stream_recon_parallel.py` holds.
 
-No GPU has run `stream_fdk_cone.py` or `make_synthetic_cone_sinogram.py`.
+No GPU has run the scripts of this folder.  The original parallel-beam script in
+`experiments/parallel_4k` has run on one GPU.

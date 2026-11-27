@@ -43,39 +43,32 @@ time.  A progress file beside the output records each finished slab.  The same c
 
 Private library calls.  The choice of the number of slabs uses
 ``TomographyModel._fits_available_devices``, which is the memory check of the package.  The
-attributes of the HDF5 output come from ``mbirtorch.utilities._recon_attributes``.  Everything
-else is public API.
+attributes of the HDF5 output come from ``mbirtorch.utilities._recon_attributes``, which
+``stream_common.py`` calls.  Everything else is public API.
+
+Shared code.  ``stream_common.py`` holds the code that this script shares with
+``stream_recon_parallel.py``: the reader of the sinogram file, the writer of the output file,
+the progress file, and the loop over the slabs.
 """
 
 import argparse
 import hashlib
 import json
-import math
-import os
 import time
 
-# The memory allocator of torch can hold reserved memory that a new request cannot use.  The
-# parallel-beam script uses this setting, which halved that memory in an iterative
-# reconstruction at no cost in time.  Its effect on this script has not been measured.  The
-# setting must be in the environment before torch is imported.
-os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+# stream_common sets the allocator option of torch, so this import comes before that of torch.
+from stream_common import (
+    ProgressFile, SinogramSource, add_angle_arguments, add_device_arguments, add_input_arguments,
+    add_output_arguments, device_list, finish_output, open_output, print_sizes, print_summary, run_parts,
+    smallest_fitting_count, view_angles)
 
-import numpy as np  # noqa: E402
-import torch  # noqa: E402
+import numpy as np
 
-import mbirtorch  # noqa: E402
-from mbirtorch.utilities import _recon_attributes  # noqa: E402
-
-# The reader of the sinogram file, the writer of the volume file, and the writer of the progress
-# file are those of the parallel-beam script.
-from stream_recon_parallel import (  # noqa: E402
-    FLOAT_BYTES, GB, GiB, VOLUME_NDIM, SinogramSource, VolumeSink, peak_host_bytes, save_json)
+import mbirtorch
 
 DEFAULT_ANGLE_SPAN_DEG = 360.0
-# In a test of FDK by slabs on H100 GPUs, the smaller margin of the package accepted a slab that
-# ran out of memory.  This margin rejects the two slabs that ran out of memory in that test, and
-# it accepts the three slabs that finished.
-DEFAULT_MARGIN = 0.3
+# The name of a part of the run in the messages and in the help texts.
+PART_NAME = 'slab'
 # This many rows are added at each end of a band, against the rounding of the row index.
 BAND_SAFETY_ROWS = 1
 # These model parameters determine the result.  The progress file records them, so that
@@ -112,9 +105,7 @@ def add_geometry_arguments(parser):
     geo.add_argument('--det-channel-offset', type=float, help='offset of the detector center along the channels')
     geo.add_argument('--det-row-offset', type=float, help='offset of the detector center along the rows')
     geo.add_argument('--curved-detector', action='store_true', help='the detector is a cylinder around the source')
-    geo.add_argument('--angles', help='.npy file of view angles in radians, one per view')
-    geo.add_argument('--angle-span', type=float, default=DEFAULT_ANGLE_SPAN_DEG,
-                     help='without --angles: equally spaced views over this many degrees (default %(default)s)')
+    add_angle_arguments(geo, DEFAULT_ANGLE_SPAN_DEG)
     geo.add_argument('--delta-voxel', type=float, help='voxel pitch')
     geo.add_argument('--recon-shape', type=shape_from_text, metavar='ROWS,COLS,SLICES', help='shape of the volume')
     geo.add_argument('--recon-slice-offset', type=float,
@@ -130,29 +121,15 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split('\n\n')[0],
                                 formatter_class=argparse.RawDescriptionHelpFormatter,
                                 epilog=__doc__)
-    src = p.add_argument_group('input')
-    src.add_argument('--sino', help='sinogram file: .npy (memory mapped) or .h5/.hdf5')
-    src.add_argument('--dataset', help='dataset name inside an HDF5 sinogram (default: the only one)')
+    add_input_arguments(p)
     add_geometry_arguments(p)
-    out = p.add_argument_group('output')
-    out.add_argument('--output', help='reconstruction file: .h5 (export_recon_hdf5 layout) or .npy')
-    out.add_argument('--resume', action='store_true',
-                     help='continue an interrupted run from its progress file')
-    dev = p.add_argument_group('devices and memory')
-    dev.add_argument('--num-gpus', type=int, help='pin the GPU count (default: the package chooses for each slab)')
-    dev.add_argument('--devices', help="explicit device list for every slab, e.g. 'cpu' or 'cuda:0,cuda:1'")
+    add_output_arguments(p, PART_NAME)
+    dev = add_device_arguments(p, PART_NAME)
     dev.add_argument('--num-slabs', type=int,
                      help='number of slabs (default: the smallest number that the memory check accepts)')
-    dev.add_argument('--margin', type=float, default=DEFAULT_MARGIN,
-                     help='safety margin of the memory check of each slab: a slab fits when (1 + margin) x its '
-                          'estimated peak is at most the free GPU memory (default %(default)s; the package '
-                          'uses a smaller margin)')
     rec = p.add_argument_group('reconstruction')
     rec.add_argument('--filter-name', default='ramp', help='filter of recon_fdk (default %(default)s)')
-    rec.add_argument('--max-slabs', type=int, help='stop after this many slabs (for testing resume)')
     args = p.parse_args(argv)
-    if args.sino is None or args.output is None:
-        p.error('--sino and --output are required')
     require_distances(p, args)
     return args
 
@@ -164,16 +141,6 @@ def require_distances(parser, args):
 
 
 # ── the model of the scan ────────────────────────────────────────────────────
-def view_angles(args, num_views):
-    """Return the angles of the views in radians, from the file of --angles or from --angle-span."""
-    if args.angles:
-        angles = np.load(args.angles).astype(np.float32).reshape(-1)
-        if angles.shape[0] != num_views:
-            raise SystemExit(f'{args.angles} holds {angles.shape[0]} angles for {num_views} views')
-        return angles
-    return np.linspace(0, np.deg2rad(args.angle_span), num_views, endpoint=False, dtype=np.float32)
-
-
 def scan_model(args, sinogram_shape):
     """Return the ConeBeamModel of the whole scan and the whole volume that the geometry options
     describe.  No array of the size of this model is placed on a device."""
@@ -281,165 +248,73 @@ def plan_fits(model, plan):
 def choose_num_slabs(model):
     """Return the smallest number of slabs whose plan passes the memory check of the package.
     The check uses the margin of model.  Use this function when the user gave no number of
-    slabs and the devices of model are GPUs."""
+    slabs.  The devices of model must be GPUs."""
+    if any(device.type != 'cuda' for device in model.sino_placement.devices):
+        raise SystemExit('the memory check has no limit for a device that is not a GPU; give --num-slabs')
     num_slices = int(model.get_params('recon_shape')[2])
-    # A slab of one slice needs the least memory.  If it does not fit, no number of slabs fits.
-    if not plan_fits(model, slab_plan(model, num_slices)):
+    num_slabs = smallest_fitting_count(lambda count: plan_fits(model, slab_plan(model, count)), num_slices)
+    if num_slabs is None:
         raise SystemExit('the band of detector rows of a single slice does not fit the GPUs at margin '
                          f'{model.memory_check_margin}')
-    for num_slabs in range(1, num_slices + 1):
-        if plan_fits(model, slab_plan(model, num_slabs)):
-            return num_slabs
+    return num_slabs
 
 
 # ── the run ──────────────────────────────────────────────────────────────────
-def gpu_count():
-    return torch.cuda.device_count() if torch.cuda.is_available() else 0
-
-
-def start_gpu_peaks():
-    """Release the unused GPU memory and restart the peak counters.  The peaks of a slab then do
-    not include memory that an earlier slab reserved."""
-    for index in range(gpu_count()):
-        with torch.cuda.device(index):
-            torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats(index)
-
-
-def gpu_peaks():
-    """Return two lists with one value in GiB for each GPU: the peak memory that torch allocated
-    since start_gpu_peaks, and the peak memory that torch reserved."""
-    return ([round(torch.cuda.max_memory_allocated(index) / GiB, 2) for index in range(gpu_count())],
-            [round(torch.cuda.max_memory_reserved(index) / GiB, 2) for index in range(gpu_count())])
-
-
-def write_recon_attributes(sink, recon_dict):
-    """Write the attributes of an export_recon_hdf5 file to an HDF5 output.  An attribute that
-    the HDF5 library refuses, for example because it is too large, is reported and left out."""
-    for key, value in _recon_attributes(recon_dict, VOLUME_NDIM).items():
-        try:
-            sink.set_attributes({key: value})
-        except (OSError, RuntimeError) as error:
-            print(f'the attribute {key!r} was not written: {error}')
-
-
 def main(argv=None):
     args = parse_args(argv)
-    if args.num_gpus is not None:
-        os.environ['MBIRTORCH_NUM_DEVICES'] = str(args.num_gpus)
+    devices = device_list(args)
 
     t_start = time.time()
     source = SinogramSource(args.sino, args.dataset)
-    num_views, num_rows, num_channels = source.shape
+    num_rows = source.shape[1]
     full = scan_model(args, source.shape)
-    if args.devices:
-        full.configure_devices(devices=args.devices.split(','))
+    if devices:
+        full.configure_devices(devices=devices)
     # Every slab takes this margin, both for the choice of the number of slabs and for the memory
     # check of the package before each reconstruction.
     full.memory_check_margin = args.margin
     recon_shape = tuple(int(s) for s in full.get_params('recon_shape'))
     num_slices = recon_shape[2]
-    print(f'sinogram {source.shape} ({num_views * num_rows * num_channels * FLOAT_BYTES / GB:.1f} GB), '
-          f'volume {recon_shape} ({math.prod(recon_shape) * FLOAT_BYTES / GB:.1f} GB)', flush=True)
+    print_sizes(source.shape, recon_shape)
 
     # The progress file makes the run resumable and records the cost of each slab.
-    progress_path = os.path.splitext(args.output)[0] + '_progress.json'
-    record = None
-    if args.resume:
-        if not os.path.exists(progress_path):
-            raise SystemExit(f'--resume needs {progress_path}, which does not exist')
-        with open(progress_path) as f:
-            record = json.load(f)
-        # A resumed run keeps the slabs of the interrupted run.
-        num_slabs = record['config']['num_slabs']
-        if args.num_slabs is not None and args.num_slabs != num_slabs:
-            raise SystemExit(f'{progress_path} was written by a run with {num_slabs} slabs')
-    elif args.num_slabs is not None:
-        num_slabs = args.num_slabs
-    else:
-        if any(device.type != 'cuda' for device in full.sino_placement.devices):
-            raise SystemExit('the memory check has no limit for a device that is not a GPU; give --num-slabs')
-        num_slabs = choose_num_slabs(full)
+    progress = ProgressFile(args.output, PART_NAME, args.resume)
+    num_slabs = progress.num_parts(args.num_slabs, lambda: choose_num_slabs(full))
     if not 1 <= num_slabs <= num_slices:
         raise SystemExit(f'the number of slabs must be between 1 and the number of slices, {num_slices}')
     plan = slab_plan(full, num_slabs)
-    angles = np.asarray(full.get_params('view_params_array'))[:, 0]
-    config = {'sinogram_shape': list(source.shape), 'recon_shape': list(recon_shape), 'num_slabs': num_slabs,
-              'filter_name': args.filter_name,
-              'angles_sha256': hashlib.sha256(np.ascontiguousarray(angles, dtype=np.float32).tobytes()).hexdigest(),
-              'model_params': {name: full.get_params(name) for name in RESULT_PARAMS}}
-    done = []
-    if record is not None:
-        if record['config'] != config:
-            raise SystemExit(f'{progress_path} was written by a run with different settings')
-        done = record['slabs']
-        if [entry['index'] for entry in done] != list(range(len(done))):
-            raise SystemExit(f'{progress_path} has slabs out of order; start over')
-        print(f'resuming after {len(done)} finished slab(s)', flush=True)
     largest_band = max(row_hi - row_lo for _lo, _hi, row_lo, row_hi in plan)
     print(f'{num_slabs} slab(s) of about {-(-num_slices // num_slabs)} slices; the largest band has '
           f'{largest_band} of {num_rows} detector rows', flush=True)
-    # A new run replaces the progress file of an earlier run before it creates the output file.
-    # --resume then cannot skip slabs that the new output file does not hold.
-    if not args.resume:
-        save_json(progress_path, {'config': config, 'slabs': done})
-    sink = VolumeSink(args.output, recon_shape, resume=args.resume)
+    angles = np.asarray(full.get_params('view_params_array'))[:, 0]
+    config = {'sinogram_shape': list(source.shape), 'recon_shape': list(recon_shape), 'num_parts': num_slabs,
+              'filter_name': args.filter_name,
+              'angles_sha256': hashlib.sha256(np.ascontiguousarray(angles, dtype=np.float32).tobytes()).hexdigest(),
+              'model_params': {name: full.get_params(name) for name in RESULT_PARAMS}}
+    sink = open_output(args.output, recon_shape, progress, config)
 
-    for k, (slice_lo, slice_hi, row_lo, row_hi) in enumerate(plan):
-        if k < len(done):
-            continue
-        if args.max_slabs is not None and k >= args.max_slabs:
-            print(f'stopping after {k} slab(s) as asked; resume with --resume', flush=True)
-            break
-        print(f'\n=== slab {k + 1} of {num_slabs}: slices {slice_lo}-{slice_hi - 1}, '
-              f'detector rows {row_lo}-{row_hi - 1} ===', flush=True)
-        t_slab = time.time()
-        entry = {'index': k, 'slices': [slice_lo, slice_hi], 'rows': [row_lo, row_hi]}
-        if row_hi == row_lo:
+    def read(k):
+        """Return the band of detector rows of slab k, or None if the slab touches no row."""
+        _slice_lo, _slice_hi, row_lo, row_hi = plan[k]
+        return source.read_rows(row_lo, row_hi) if row_hi > row_lo else None
+
+    def reconstruct(k, band):
+        """Return the FDK reconstruction of slab k from its band.  This script records no value
+        of its own for a slab."""
+        slice_lo, slice_hi, row_lo, row_hi = plan[k]
+        if band is None:
             # No detector row measures this slab, so its back projection is zero.
-            slab = np.zeros(recon_shape[:2] + (slice_hi - slice_lo,), dtype=np.float32)
-            t_read = t_recon = 0.0
-        else:
-            band = source.read_rows(row_lo, row_hi)
-            t_read = time.time() - t_slab
-            part = part_model(full, row_lo, row_hi, slice_lo, slice_hi)
-            start_gpu_peaks()
-            slab = part.recon_fdk(band, filter_name=args.filter_name)
-            entry['gpu_peak_GiB'], entry['gpu_reserved_peak_GiB'] = gpu_peaks()
-            del band, part
-            t_recon = time.time() - t_slab - t_read
-        sink.write(slab, slice_lo)
-        del slab
-        # The output is flushed before the slab is recorded.  A process that is killed later
-        # then leaves an output file that holds every recorded slab.
-        sink.flush()
-        t_write = time.time() - t_slab - t_read - t_recon
+            return np.zeros(recon_shape[:2] + (slice_hi - slice_lo,), dtype=np.float32), {}
+        part = part_model(full, row_lo, row_hi, slice_lo, slice_hi)
+        return part.recon_fdk(band, filter_name=args.filter_name), {}
 
-        entry.update({'read_s': round(t_read, 1), 'recon_s': round(t_recon, 1), 'write_s': round(t_write, 1),
-                      'peak_host_rss_GB': round(peak_host_bytes() / GB, 1)})
-        done.append(entry)
-        save_json(progress_path, {'config': config, 'slabs': done})
-        print(f'slab {k + 1} done: read {t_read:.0f} s, recon {t_recon:.0f} s, write {t_write:.0f} s; '
-              f'peak host RSS {entry["peak_host_rss_GB"]:.0f} GB', flush=True)
+    run_parts(plan, read, reconstruct, sink, progress, args.max_parts)
 
-    finished = len(done) == num_slabs
-    if finished and sink.is_hdf5:
-        recon_params = dict(config, method='FDK by slabs (stream_fdk_cone.py)')
-        del recon_params['model_params']
-        write_recon_attributes(sink, full.get_recon_dict(recon_params=recon_params, save_log=False))
-    sink.close()
+    recon_params = dict(config, method='FDK by slabs (stream_fdk_cone.py)')
+    del recon_params['model_params']
+    finish_output(sink, progress, full, recon_params)
     source.close()
-
-    total = time.time() - t_start
-    print(f'\n{"finished" if finished else "stopped"}: {len(done)} of {num_slabs} slab(s), '
-          f'{total:.0f} s this run, peak host RSS {peak_host_bytes() / GB:.0f} GB; output {args.output}')
-    for index in range(gpu_count()):
-        allocated = max((entry['gpu_peak_GiB'][index] for entry in done if 'gpu_peak_GiB' in entry), default=0.0)
-        reserved = max((entry['gpu_reserved_peak_GiB'][index] for entry in done if 'gpu_reserved_peak_GiB' in entry),
-                       default=0.0)
-        total_memory = torch.cuda.get_device_properties(index).total_memory
-        print(f'  GPU {index}: largest peak of a slab {allocated:.1f} GiB allocated, {reserved:.1f} GiB reserved '
-              f'of {total_memory / GiB:.1f} GiB')
+    print_summary(progress, time.time() - t_start, args.output)
 
 
 if __name__ == '__main__':

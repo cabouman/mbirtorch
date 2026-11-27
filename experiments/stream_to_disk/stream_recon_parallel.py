@@ -37,68 +37,50 @@ band.  A progress file beside the output records each finished band, and ``--res
 continues an interrupted run from the first unfinished band.
 
 Private library calls.  The band size uses ``TomographyModel._fits_available_devices``,
-the memory check ``recon_split_sino`` itself uses.  The format and axes attributes of the HDF5
-output come from ``mbirtorch.utilities._recon_attributes``.  Everything else is public API.
+the memory check ``recon_split_sino`` itself uses.  The attributes of the HDF5 output come from
+``mbirtorch.utilities._recon_attributes``, which ``stream_common.py`` calls.  Everything else
+is public API.
+
+Shared code.  ``stream_common.py`` holds the code that this script shares with
+``stream_fdk_cone.py``: the reader of the sinogram file, the writer of the output file, the
+progress file, and the loop over the bands.
 """
 
 import argparse
-import json
-import math
 import os
-import resource
-import sys
 import time
 
-# torch's caching allocator holds memory it is not using.  This setting lets it return
-# that memory and was measured to halve the reserve at no time cost.  It must be in the
-# environment before torch is imported.
-os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+# stream_common sets the allocator option of torch, so this import comes before that of torch.
+from stream_common import (
+    ProgressFile, SinogramSource, add_angle_arguments, add_device_arguments, add_input_arguments,
+    add_output_arguments, device_list, finish_output, open_output, print_sizes, print_summary, run_parts,
+    smallest_fitting_count, view_angles)
 
-import numpy as np  # noqa: E402
-import torch  # noqa: E402
+import numpy as np
+import torch
 
-import mbirtorch  # noqa: E402
-from mbirtorch.utilities import _recon_attributes  # noqa: E402
+import mbirtorch
 
-GB = 1e9
-GiB = 1024 ** 3
-FLOAT_BYTES = 4
-VOLUME_NDIM = 3
-# Bands are written to disk in slabs of this many slices.  A slab of a 4096 x 4096 volume
-# is 4.3 GB.
-WRITE_SLAB = 64
+DEFAULT_ANGLE_SPAN_DEG = 180.0
+# The name of a part of the run in the messages and in the help texts.
+PART_NAME = 'band'
 
 
-
-
-def parse_args():
+def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split('\n\n')[0],
                                 formatter_class=argparse.RawDescriptionHelpFormatter,
                                 epilog=__doc__)
-    src = p.add_argument_group('input')
-    src.add_argument('--sino', help='sinogram file: .npy (memory mapped) or .h5/.hdf5')
-    src.add_argument('--dataset', help='dataset name inside an HDF5 sinogram (default: the only one)')
-    src.add_argument('--angles', help='.npy file of view angles in radians, one per view')
-    src.add_argument('--angle-span', type=float, default=180.0,
-                     help='without --angles: equally spaced views over this many degrees (default 180)')
+    src = add_input_arguments(p)
+    add_angle_arguments(src, DEFAULT_ANGLE_SPAN_DEG)
     src.add_argument('--weights', default='none',
                      help="'none' (default), 'transmission', 'transmission_root', or a .npy file")
-    out = p.add_argument_group('output')
-    out.add_argument('--output', help='reconstruction file: .h5 (export_recon_hdf5 layout) or .npy')
-    out.add_argument('--resume', action='store_true',
-                     help='continue an interrupted run from its progress file')
+    out = add_output_arguments(p, PART_NAME)
     out.add_argument('--log', default='~/.mbirtorch/logs/stream_recon_parallel.log',
                      help='merged reconstruction log (default ~/.mbirtorch/logs/stream_recon_parallel.log)')
     out.add_argument('--quiet', action='store_true', help='do not print the per-iteration log lines')
-    dev = p.add_argument_group('devices and memory')
-    dev.add_argument('--num-gpus', type=int, help='pin the GPU count (default: all visible GPUs)')
-    dev.add_argument('--devices', help="explicit device list for every band, e.g. 'cpu' or 'cuda:0,cuda:1'")
+    dev = add_device_arguments(p, PART_NAME)
     dev.add_argument('--slices-per-section', type=int,
                      help='slices per band (default: the most the memory model says fit the GPUs)')
-    dev.add_argument('--margin', type=float, default=0.3,
-                     help='safety margin of the memory check when choosing the band: a band fits when '
-                          '(1 + margin) x its modeled peak is below the free GPU memory (default 0.3; '
-                          'the library uses 0.15)')
     dev.add_argument('--half-overlap', type=int, default=5,
                      help='rows kept past each seam on each side (default 5)')
     rec = p.add_argument_group('reconstruction')
@@ -110,125 +92,7 @@ def parse_args():
     rec.add_argument('--snr-db', type=float, default=30.0)
     rec.add_argument('--positivity', action='store_true')
     rec.add_argument('--seed', type=int, help='numpy seed for the pixel partitions')
-    rec.add_argument('--max-parts', type=int, help='stop after this many bands (for testing resume)')
-    args = p.parse_args()
-    if args.sino is None or args.output is None:
-        p.error('--sino and --output are required')
-    return args
-
-
-# ── the sinogram on disk ─────────────────────────────────────────────────────
-class SinogramSource:
-    """Reads bands of detector rows from a sinogram file without loading the file."""
-
-    def __init__(self, path, dataset=None):
-        self.path = path
-        ext = os.path.splitext(path)[1].lower()
-        self._file = None
-        if ext == '.npy':
-            self.array = np.load(path, mmap_mode='r')
-        elif ext in ('.h5', '.hdf5'):
-            import h5py
-            self._file = h5py.File(path, 'r')
-            names = list(self._file.keys())
-            if dataset is None:
-                if len(names) != 1:
-                    raise ValueError(f'{path} holds datasets {names}; name one with --dataset')
-                dataset = names[0]
-            self.array = self._file[dataset]
-        else:
-            raise ValueError(f'unrecognized sinogram file type {ext!r}; use .npy or .h5')
-        if self.array.ndim != 3:
-            raise ValueError(f'the sinogram must be 3D (views, rows, channels); got {self.array.shape}')
-        self.shape = tuple(int(s) for s in self.array.shape)
-
-    def read_rows(self, lo, hi):
-        """The rows [lo, hi) as a contiguous float32 array (views, hi - lo, channels)."""
-        return np.ascontiguousarray(self.array[:, lo:hi, :], dtype=np.float32)
-
-    def view_subsample(self, max_views=20):
-        """About ``max_views`` equally spaced views, as a host array, for the
-        regularization statistics.  The stride is the one subsample_views uses."""
-        step = max(1, self.shape[0] // max_views)
-        return np.ascontiguousarray(self.array[::step], dtype=np.float32)
-
-    def close(self):
-        if self._file is not None:
-            self._file.close()
-
-
-# ── the volume on disk ───────────────────────────────────────────────────────
-class VolumeSink:
-    """Writes and reads bands of slices of the output volume.
-
-    An ``.h5`` path is the layout of export_recon_hdf5, dataset 'recon' with axes
-    (slice, col, row), one chunk per slice so that an unfinished run has written only the
-    chunks it finished.  A ``.npy`` path is a memory mapped array with axes
-    (slice, row, col).  Bands arrive and leave in the library's (row, col, slice) order."""
-
-    def __init__(self, path, recon_shape, resume):
-        self.path = path
-        self.num_rows, self.num_cols, self.num_slices = (int(s) for s in recon_shape)
-        self.is_hdf5 = os.path.splitext(path)[1].lower() != '.npy'
-        parent = os.path.dirname(os.path.abspath(path))
-        os.makedirs(parent, exist_ok=True)
-        if self.is_hdf5:
-            import h5py
-            if resume:
-                self._file = h5py.File(path, 'r+')
-                self.dset = self._file['recon']
-                if self.dset.shape != (self.num_slices, self.num_cols, self.num_rows):
-                    raise ValueError(f'{path} holds a volume of shape {self.dset.shape}, not '
-                                     f'{(self.num_slices, self.num_cols, self.num_rows)}')
-            else:
-                self._file = h5py.File(path, 'w')
-                self.dset = self._file.create_dataset(
-                    'recon', shape=(self.num_slices, self.num_cols, self.num_rows),
-                    dtype=np.float32, chunks=(1, self.num_cols, self.num_rows))
-                # The new file is flushed at once, so that it can be opened again if the process
-                # is killed during the first band.
-                self._file.flush()
-            # (row, col, slice) -> (slice, col, row) is its own inverse.
-            self._to_file, self._from_file = (2, 1, 0), (2, 1, 0)
-        else:
-            shape = (self.num_slices, self.num_rows, self.num_cols)
-            if resume:
-                self.dset = np.load(path, mmap_mode='r+')
-                if self.dset.shape != shape:
-                    raise ValueError(f'{path} holds a volume of shape {self.dset.shape}, not {shape}')
-            else:
-                self.dset = np.lib.format.open_memmap(path, mode='w+', dtype=np.float32, shape=shape)
-            # (row, col, slice) -> (slice, row, col), and back.
-            self._to_file, self._from_file = (2, 0, 1), (1, 2, 0)
-
-    def write(self, band, z0):
-        """Write ``band`` (rows, cols, n) to slices [z0, z0 + n), one slab at a time."""
-        n = band.shape[2]
-        for a in range(0, n, WRITE_SLAB):
-            b = min(a + WRITE_SLAB, n)
-            self.dset[z0 + a:z0 + b] = np.ascontiguousarray(
-                np.transpose(band[:, :, a:b], self._to_file))
-
-    def read(self, z0, z1):
-        """The slices [z0, z1) as an array (rows, cols, z1 - z0)."""
-        block = np.asarray(self.dset[z0:z1])
-        return np.ascontiguousarray(np.transpose(block, self._from_file))
-
-    def set_attributes(self, attributes):
-        if self.is_hdf5:
-            for key, value in attributes.items():
-                self.dset.attrs[key] = value
-
-    def flush(self):
-        """Write the buffered data to disk.  If the process is killed before the next write, the
-        file can be opened again, and it holds all data written so far."""
-        (self._file if self.is_hdf5 else self.dset).flush()
-
-    def close(self):
-        if self.is_hdf5:
-            self._file.close()
-        else:
-            self.dset.flush()
+    return p.parse_args(argv)
 
 
 # ── the bands ────────────────────────────────────────────────────────────────
@@ -272,13 +136,17 @@ def choose_num_parts(full_model, num_rows, half_overlap, margin, weights_supplie
         raise SystemExit('without CUDA the memory model cannot read a GPU budget; '
                          'give --slices-per-section')
     max_parts = max(1, num_rows // (2 * half_overlap))
-    for num_parts in range(1, max_parts + 1):
+
+    def fits(num_parts):
         model = band_model(full_model, worst_part_rows(num_rows, num_parts, half_overlap))
         model.memory_check_margin = margin
         call_arrays = {'weights': 'supplied'} if weights_supplied else {}
-        if model._fits_available_devices(**call_arrays):
-            return num_parts
-    raise SystemExit(f'no band of at least {2 * half_overlap} slices fits the GPUs at margin {margin}')
+        return model._fits_available_devices(**call_arrays)
+
+    num_parts = smallest_fitting_count(fits, max_parts)
+    if num_parts is None:
+        raise SystemExit(f'no band of at least {2 * half_overlap} slices fits the GPUs at margin {margin}')
+    return num_parts
 
 
 def blend_ramp(half_overlap):
@@ -287,41 +155,15 @@ def blend_ramp(half_overlap):
     return ramp - ramp % 2
 
 
-def peak_host_bytes():
-    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    return rss if sys.platform == 'darwin' else rss * 1024
-
-
-def save_json(path, record):
-    """Write record to path.  The folder of path is created if it does not exist.  The file at
-    path is replaced in one step, so a process that is killed during the write leaves either the
-    old file or the new file."""
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path + '.tmp', 'w') as f:
-        json.dump(record, f, indent=1)
-    os.replace(path + '.tmp', path)
-
-
 # ── the run ──────────────────────────────────────────────────────────────────
-def main():
-    args = parse_args()
-    if args.num_gpus is not None:
-        os.environ['MBIRTORCH_NUM_DEVICES'] = str(args.num_gpus)
-    devices = args.devices.split(',') if args.devices else None
-
-    def angles_of(num_views):
-        if args.angles:
-            angles = np.load(args.angles).astype(np.float32).reshape(-1)
-            if angles.shape[0] != num_views:
-                raise ValueError(f'{args.angles} holds {angles.shape[0]} angles for {num_views} views')
-            return angles
-        return np.linspace(0, np.deg2rad(args.angle_span), num_views, endpoint=False,
-                           dtype=np.float32)
+def main(argv=None):
+    args = parse_args(argv)
+    devices = device_list(args)
 
     t_start = time.time()
     source = SinogramSource(args.sino, args.dataset)
-    num_views, num_rows, num_channels = source.shape
-    angles = angles_of(num_views)
+    num_views, num_rows = source.shape[:2]
+    angles = view_angles(args, num_views)
     weights_source = None
     if args.weights.endswith('.npy'):
         weights_source = SinogramSource(args.weights)
@@ -345,64 +187,39 @@ def main():
         sample_weights = None
     regularization = full.auto_set_regularization_params(sample, weights=sample_weights)
     del sample, sample_weights
-    print(f'sinogram {source.shape} ({num_views * num_rows * num_channels * FLOAT_BYTES / GB:.1f} GB), '
-          f'volume {recon_shape} ({math.prod(recon_shape) * FLOAT_BYTES / GB:.1f} GB)')
+    print_sizes(source.shape, recon_shape)
     print('regularization from the whole sinogram: '
           + ', '.join(f'{k}={v:.4g}' for k, v in regularization.items()), flush=True)
 
+    # The progress file makes the run resumable and records each band's cost.
+    progress = ProgressFile(args.output, PART_NAME, args.resume)
     ho = args.half_overlap
-    if args.slices_per_section is not None:
-        num_parts = max(1, -(-num_rows // args.slices_per_section))
-    else:
-        num_parts = choose_num_parts(full, num_rows, ho, args.margin, weights_supplied)
+    given = None if args.slices_per_section is None else max(1, -(-num_rows // args.slices_per_section))
+    num_parts = progress.num_parts(
+        given, lambda: choose_num_parts(full, num_rows, ho, args.margin, weights_supplied))
     if num_parts > 1 and num_rows // num_parts < 2 * ho:
         raise SystemExit(f'{num_parts} bands leave fewer than {2 * ho} slices each; use fewer bands '
                          'or a smaller --half-overlap')
-    ranges = band_ranges(num_rows, num_parts, ho)
+    # Each entry of the plan holds the kept slices of a band and the rows of its model.
+    plan = [(lo, hi, mlo, mhi) for (lo, hi), (mlo, mhi) in band_ranges(num_rows, num_parts, ho)]
     print(f'{num_parts} band(s) of about {-(-num_rows // num_parts)} slices, overlap {ho} rows per seam',
           flush=True)
-
-    # The progress file makes the run resumable and records each band's cost.
-    progress_path = os.path.splitext(args.output)[0] + '_progress.json'
     config = {'sinogram_shape': list(source.shape), 'recon_shape': list(recon_shape),
               'num_parts': num_parts, 'half_overlap': ho, 'weights': args.weights,
               'max_iterations': args.max_iterations, 'stop_pct': args.stop_pct,
               'sharpness': args.sharpness, 'snr_db': args.snr_db,
               'regularization': regularization}
-    done = []
-    if args.resume:
-        if not os.path.exists(progress_path):
-            raise SystemExit(f'--resume needs {progress_path}, which does not exist')
-        with open(progress_path) as f:
-            record = json.load(f)
-        if record['config'] != config:
-            raise SystemExit(f'{progress_path} was written by a run with different settings')
-        done = record['parts']
-        if [p['index'] for p in done] != list(range(len(done))):
-            raise SystemExit(f'{progress_path} has bands out of order; start over')
-        print(f'resuming after {len(done)} finished band(s)', flush=True)
-
-    def save_progress():
-        save_json(progress_path, {'config': config, 'parts': done})
-
-    # A new run replaces the progress file of an earlier run before it creates the output file.
-    # --resume then cannot skip bands that the new output file does not hold.
-    if not args.resume:
-        save_progress()
-    sink = VolumeSink(args.output, recon_shape, resume=args.resume)
+    sink = open_output(args.output, recon_shape, progress, config)
 
     if args.seed is not None:
         np.random.seed(args.seed)
     log_path = os.path.expanduser(args.log)
     part_logs = [f'{log_path}.part{k}' for k in range(num_parts)]
     ramp = blend_ramp(ho)
-    for k, ((lo, hi), (mlo, mhi)) in enumerate(ranges):
-        if k < len(done):
-            continue
-        if args.max_parts is not None and k >= args.max_parts:
-            print(f'stopping after {k} band(s) as asked; resume with --resume', flush=True)
-            break
-        t_band = time.time()
+
+    def read(k):
+        """Return the sinogram rows of the model of band k, and their weights."""
+        _lo, _hi, mlo, mhi = plan[k]
         sino_band = source.read_rows(mlo, mhi)
         if weights_source is not None:
             weights = weights_source.read_rows(mlo, mhi)
@@ -410,23 +227,26 @@ def main():
             weights = mbirtorch.gen_weights(sino_band, weight_type=args.weights)
         else:
             weights = None
-        t_read = time.time() - t_band
+        return sino_band, weights
 
+    def reconstruct(k, data):
+        """Return the reconstruction of band k, and its number of iterations for the record."""
+        sino_band, weights = data
+        _lo, _hi, mlo, mhi = plan[k]
         model = band_model(full, mhi - mlo)
         if devices:
             model.configure_devices(devices=devices)
-        print(f'\n=== band {k + 1} of {num_parts}: slices {lo}-{hi - 1}, model rows {mlo}-{mhi - 1} ===',
-              flush=True)
         band, band_dict = model.recon(sino_band, weights=weights, max_iterations=args.max_iterations,
                                       stop_threshold_change_pct=args.stop_pct,
                                       logfile_path=part_logs[k], print_logs=not args.quiet)
-        del sino_band, weights, model
-        t_recon = time.time() - t_band - t_read
+        return band, {'iterations': int(band_dict['recon_params']['num_iterations'])}
 
+    def write(k, band):
         # The band's first 2 * ho slices are the seam it shares with the previous band, whose
         # last 2 * ho slices are already on disk.  The blend is stitch_arrays over those two
         # slabs, so it is the blend recon_split_sino computes.  The rest of the band is
         # written as it is; its own last 2 * ho slices wait for the next band's blend.
+        mlo = plan[k][2]
         if k > 0:
             seam = 2 * ho
             previous_tail = sink.read(mlo, mlo + seam)
@@ -436,50 +256,20 @@ def main():
             sink.write(band[:, :, seam:], mlo + seam)
         else:
             sink.write(band, mlo)
-        del band
-        # The output is flushed before the band is recorded.  A process that is killed later
-        # then leaves an output file that holds every recorded band.
-        sink.flush()
-        t_write = time.time() - t_band - t_read - t_recon
 
-        entry = {'index': k, 'kept': [lo, hi], 'model_rows': [mlo, mhi],
-                 'iterations': int(band_dict['recon_params']['num_iterations']),
-                 'read_s': round(t_read, 1), 'recon_s': round(t_recon, 1), 'write_s': round(t_write, 1),
-                 'peak_host_rss_GB': round(peak_host_bytes() / GB, 1)}
-        done.append(entry)
-        save_progress()
-        print(f'band {k + 1} done: read {t_read:.0f} s, recon {t_recon:.0f} s '
-              f'({entry["iterations"]} iterations), write {t_write:.0f} s; '
-              f'peak host RSS {entry["peak_host_rss_GB"]:.0f} GB', flush=True)
+    run_parts(plan, read, reconstruct, sink, progress, args.max_parts, write=write)
 
-    finished = len(done) == num_parts
-    if finished:
-        # The format and axes attributes let import_recon_hdf5 read the file without a warning.
-        sink.set_attributes(_recon_attributes({}, VOLUME_NDIM))
-        sink.set_attributes({'sinogram_shape': str(source.shape), 'num_parts': num_parts,
-                             'half_overlap': ho, 'weights': args.weights, 'sharpness': args.sharpness,
-                             'snr_db': args.snr_db, 'mbirtorch_version': mbirtorch.__version__,
-                             'iterations_per_part': str([p['iterations'] for p in done])})
-    sink.close()
+    recon_params = dict(config, method='MBIR by bands (stream_recon_parallel.py)',
+                        iterations_per_part=[entry['iterations'] for entry in progress.done])
+    finish_output(sink, progress, full, recon_params)
     source.close()
     if weights_source is not None:
         weights_source.close()
-    if finished:
+    if progress.finished:
         labels = [f'stream_recon_parallel: band {k + 1} of {num_parts} (slices {lo}-{hi - 1})'
-                  for k, ((lo, hi), _m) in enumerate(ranges)]
+                  for k, (lo, hi, _mlo, _mhi) in enumerate(plan)]
         mbirtorch.merge_log_files(log_path, zip(labels, part_logs))
-
-    total = time.time() - t_start
-    gpu_lines = []
-    for entry in mbirtorch.get_memory_stats(print_results=False):
-        if str(entry['id']).startswith('GPU'):
-            gpu_lines.append(f'  {entry["id"]}: peak allocated {entry["peak_bytes_in_use"] / GiB:.1f} GiB, '
-                             f'peak reserved {entry["peak_reserved_bytes"] / GiB:.1f} GiB '
-                             f'of {entry["bytes_limit"] / GiB:.1f} GiB')
-    print(f'\n{"finished" if finished else "stopped"}: {len(done)} of {num_parts} band(s), '
-          f'{total:.0f} s this run, peak host RSS {peak_host_bytes() / GB:.0f} GB; output {args.output}')
-    for line in gpu_lines:
-        print(line)
+    print_summary(progress, time.time() - t_start, args.output)
 
 
 if __name__ == '__main__':

@@ -62,15 +62,16 @@ SEED = 5
 # cleanup after the write of the next slab, before the script records that slab as finished.
 KILL_PROGRAM = """
 import os, sys
+import stream_common
 import stream_fdk_cone
 writes = []
-write = stream_fdk_cone.VolumeSink.write
+write = stream_common.VolumeSink.write
 def write_then_end(self, band, z0):
     write(self, band, z0)
     writes.append(z0)
     if len(writes) > {stop}:
         os._exit(1)
-stream_fdk_cone.VolumeSink.write = write_then_end
+stream_common.VolumeSink.write = write_then_end
 stream_fdk_cone.main(sys.argv[1:])
 """
 
@@ -179,7 +180,7 @@ def run_killed(options, finished_slabs):
                    cwd=os.path.dirname(os.path.abspath(__file__)), stdout=subprocess.DEVNULL,
                    stderr=subprocess.DEVNULL)
     with open(os.path.splitext(output)[0] + '_progress.json') as f:
-        return len(json.load(f)['slabs'])
+        return len(json.load(f)['parts'])
 
 
 def main():
@@ -233,7 +234,7 @@ def main():
         for extension in ('.h5', '.npy'):
             resumed_path = os.path.join(folder, 'resumed' + extension)
             first = stream_options + ['--output', resumed_path, '--num-slabs', str(RESUME_SLABS)]
-            run_stream(first + ['--max-slabs', str(RESUME_STOP)])
+            run_stream(first + ['--max-parts', str(RESUME_STOP)])
             run_stream(stream_options + ['--output', resumed_path, '--resume'])
             reference = h5_path if extension == '.h5' else npy_path
             same = np.array_equal(read_volume(resumed_path), read_volume(reference))

@@ -28,7 +28,7 @@ import numpy as np
 
 import stream_fdk_cone
 from make_synthetic_sinogram import check, phantom_band
-from stream_recon_parallel import GB
+from stream_common import GB
 
 DEFAULT_SLAB_SLICES = 64
 
