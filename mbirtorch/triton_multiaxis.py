@@ -424,9 +424,9 @@ def _multiaxis_forward_kernel(n_p_ptr, centers_ptr, m0_ptr,
         out_ptrs = (out_view_ptr + n_chan.to(tl.int64)[:, None] * out_row_stride
                     + r_offs[None, :])
         # Relaxed ordering is enough, because no program reads the output while the kernel runs.
-        # The default ordering puts a memory fence around every atomic add, and relaxed ordering
-        # made this kernel 1.7 to 1.8 times as fast on an H100 under Triton 3.8 and 3.9
-        # (2026-11-27).
+        # The default ordering, acq_rel, also orders each add against the other memory accesses.
+        # Relaxed ordering made this kernel 1.7 to 1.8 times as fast on an H100 under Triton 3.8
+        # and 3.9 (2026-11-27).
         tl.atomic_add(out_ptrs, w_chan[:, None] * det_col, sem="relaxed",
                       mask=tile_mask & ((n_tap >= 0)
                                         & (n_tap < num_channels))[:, None])

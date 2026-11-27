@@ -332,7 +332,7 @@ def _parallel_forward_kernel(n_p_ptr, centers_ptr, w_p_c_ptr,
         out_ptrs = (out_view_ptr + n_chan.to(tl.int64)[:, None] * num_cols
                     + r_offs[None, :])
         # Relaxed ordering is enough, because no program reads the output while the kernel runs.
-        # The default ordering puts a memory fence around every atomic add.
+        # The default ordering, acq_rel, also orders each add against the other memory accesses.
         tl.atomic_add(out_ptrs, w_chan[:, None] * vals, sem="relaxed",
                       mask=tile_mask & ((n_tap >= 0)
                                         & (n_tap < num_channels))[:, None])
@@ -424,7 +424,8 @@ def _parallel_forward_sorted_kernel(n_p_ptr, centers_ptr, w_p_c_ptr,
                             + n_chan.to(tl.int64)[:, None] * num_cols
                             + r_offs[None, :])
                 # Relaxed ordering is enough, because no program reads the output while the
-                # kernel runs.  The default ordering puts a memory fence around every atomic add.
+                # kernel runs.  The default ordering, acq_rel, also orders each add against the
+                # other memory accesses.
                 tl.atomic_add(out_ptrs, w_chan[:, None] * vals, sem="relaxed",
                               mask=(v_ok & tile_mask
                                     & ((n_tap >= 0)
